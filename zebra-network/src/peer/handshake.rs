@@ -77,6 +77,9 @@ where
     minimum_peer_version: MinimumPeerVersion<C>,
     nonces: Arc<futures::lock::Mutex<IndexSet<Nonce>>>,
 
+    #[cfg(feature = "p2p-tracing")]
+    p2p_tracer: crate::p2p_tracing::P2pTracer,
+
     parent_span: Span,
 }
 
@@ -116,6 +119,8 @@ where
             inv_collector: self.inv_collector.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
             nonces: self.nonces.clone(),
+            #[cfg(feature = "p2p-tracing")]
+            p2p_tracer: self.p2p_tracer.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -139,6 +144,10 @@ pub struct ConnectionInfo {
     /// Derived from `remote.version` and the
     /// [current `zebra_network` protocol version](constants::CURRENT_NETWORK_PROTOCOL_VERSION).
     pub negotiated_version: Version,
+
+    /// Monotonic connection ID for P2P message tracing.
+    #[cfg(feature = "p2p-tracing")]
+    pub connection_id: u64,
 }
 
 /// The peer address that we are handshaking with.
@@ -407,6 +416,9 @@ where
     address_book_updater: Option<tokio::sync::mpsc::Sender<MetaAddrChange>>,
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
     latest_chain_tip: C,
+
+    #[cfg(feature = "p2p-tracing")]
+    p2p_tracer: Option<crate::p2p_tracing::P2pTracer>,
 }
 
 impl<S, C> Builder<S, C>
@@ -488,6 +500,8 @@ where
             user_agent: self.user_agent,
             relay: self.relay,
             inv_collector: self.inv_collector,
+            #[cfg(feature = "p2p-tracing")]
+            p2p_tracer: self.p2p_tracer,
         }
     }
 
@@ -496,6 +510,13 @@ where
     /// If this is unset, the node will not request transactions.
     pub fn want_transactions(mut self, relay: bool) -> Self {
         self.relay = Some(relay);
+        self
+    }
+
+    /// Provide a P2P message tracer for recording all wire messages. Optional.
+    #[cfg(feature = "p2p-tracing")]
+    pub fn with_p2p_tracer(mut self, tracer: crate::p2p_tracing::P2pTracer) -> Self {
+        self.p2p_tracer = Some(tracer);
         self
     }
 
@@ -534,6 +555,10 @@ where
             inv_collector,
             minimum_peer_version,
             nonces,
+            #[cfg(feature = "p2p-tracing")]
+            p2p_tracer: self
+                .p2p_tracer
+                .unwrap_or_else(crate::p2p_tracing::P2pTracer::noop),
             parent_span: Span::current(),
         })
     }
@@ -558,6 +583,8 @@ where
             address_book_updater: None,
             inv_collector: None,
             latest_chain_tip: NoChainTip,
+            #[cfg(feature = "p2p-tracing")]
+            p2p_tracer: None,
         }
     }
 }
@@ -580,6 +607,7 @@ pub async fn negotiate_version<PeerTransport>(
     our_services: PeerServices,
     relay: bool,
     mut minimum_peer_version: MinimumPeerVersion<impl ChainTip>,
+    #[cfg(feature = "p2p-tracing")] p2p_tracer: &crate::p2p_tracing::P2pTracer,
 ) -> Result<Arc<ConnectionInfo>, HandshakeError>
 where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -688,13 +716,40 @@ where
     }
     .into();
 
-    debug!(?our_version, "sending initial version message");
-    peer_conn.send(our_version).await?;
+    #[cfg(feature = "p2p-tracing")]
+    let hs_conn_id = crate::p2p_tracing::next_connection_id();
+    #[cfg(feature = "p2p-tracing")]
+    let hs_seq = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(feature = "p2p-tracing")]
+    let hs_peer_label: Arc<str> = connected_addr.get_transient_addr_label().into();
 
-    let mut remote_msg = peer_conn
-        .next()
-        .await
-        .ok_or(HandshakeError::ConnectionClosed)??;
+    debug!(?our_version, "sending initial version message");
+    send_handshake_message(
+        peer_conn,
+        our_version,
+        #[cfg(feature = "p2p-tracing")]
+        p2p_tracer,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_peer_label,
+        #[cfg(feature = "p2p-tracing")]
+        hs_conn_id,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_seq,
+    )
+    .await?;
+
+    let mut remote_msg = recv_handshake_message(
+        peer_conn,
+        #[cfg(feature = "p2p-tracing")]
+        p2p_tracer,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_peer_label,
+        #[cfg(feature = "p2p-tracing")]
+        hs_conn_id,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_seq,
+    )
+    .await?;
 
     // Wait for next message if the one we got is not Version
     let remote: VersionMessage = loop {
@@ -704,10 +759,18 @@ where
                 break version_message;
             }
             _ => {
-                remote_msg = peer_conn
-                    .next()
-                    .await
-                    .ok_or(HandshakeError::ConnectionClosed)??;
+                remote_msg = recv_handshake_message(
+                    peer_conn,
+                    #[cfg(feature = "p2p-tracing")]
+                    p2p_tracer,
+                    #[cfg(feature = "p2p-tracing")]
+                    &hs_peer_label,
+                    #[cfg(feature = "p2p-tracing")]
+                    hs_conn_id,
+                    #[cfg(feature = "p2p-tracing")]
+                    &hs_seq,
+                )
+                .await?;
                 debug!(?remote_msg, "ignoring non-version message from remote peer");
             }
         }
@@ -784,6 +847,8 @@ where
         connected_addr: *connected_addr,
         remote,
         negotiated_version,
+        #[cfg(feature = "p2p-tracing")]
+        connection_id: hs_conn_id,
     });
 
     debug!(
@@ -813,12 +878,32 @@ where
     )
     .set(connection_info.remote.version.0 as f64);
 
-    peer_conn.send(Message::Verack).await?;
+    send_handshake_message(
+        peer_conn,
+        Message::Verack,
+        #[cfg(feature = "p2p-tracing")]
+        p2p_tracer,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_peer_label,
+        #[cfg(feature = "p2p-tracing")]
+        hs_conn_id,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_seq,
+    )
+    .await?;
 
-    let mut remote_msg = peer_conn
-        .next()
-        .await
-        .ok_or(HandshakeError::ConnectionClosed)??;
+    let mut remote_msg = recv_handshake_message(
+        peer_conn,
+        #[cfg(feature = "p2p-tracing")]
+        p2p_tracer,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_peer_label,
+        #[cfg(feature = "p2p-tracing")]
+        hs_conn_id,
+        #[cfg(feature = "p2p-tracing")]
+        &hs_seq,
+    )
+    .await?;
 
     // Wait for next message if the one we got is not Verack
     loop {
@@ -828,16 +913,62 @@ where
                 break;
             }
             _ => {
-                remote_msg = peer_conn
-                    .next()
-                    .await
-                    .ok_or(HandshakeError::ConnectionClosed)??;
+                remote_msg = recv_handshake_message(
+                    peer_conn,
+                    #[cfg(feature = "p2p-tracing")]
+                    p2p_tracer,
+                    #[cfg(feature = "p2p-tracing")]
+                    &hs_peer_label,
+                    #[cfg(feature = "p2p-tracing")]
+                    hs_conn_id,
+                    #[cfg(feature = "p2p-tracing")]
+                    &hs_seq,
+                )
+                .await?;
                 debug!(?remote_msg, "ignoring non-verack message from remote peer");
             }
         }
     }
 
     Ok(connection_info)
+}
+
+async fn send_handshake_message<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+    msg: Message,
+    #[cfg(feature = "p2p-tracing")] p2p_tracer: &crate::p2p_tracing::P2pTracer,
+    #[cfg(feature = "p2p-tracing")] peer_label: &Arc<str>,
+    #[cfg(feature = "p2p-tracing")] connection_id: u64,
+    #[cfg(feature = "p2p-tracing")] seq: &std::sync::atomic::AtomicU64,
+) -> Result<(), SerializationError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(feature = "p2p-tracing")]
+    p2p_tracer.trace_msg("send", &msg, peer_label, connection_id, seq);
+
+    peer_conn.send(msg).await
+}
+
+async fn recv_handshake_message<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+    #[cfg(feature = "p2p-tracing")] p2p_tracer: &crate::p2p_tracing::P2pTracer,
+    #[cfg(feature = "p2p-tracing")] peer_label: &Arc<str>,
+    #[cfg(feature = "p2p-tracing")] connection_id: u64,
+    #[cfg(feature = "p2p-tracing")] seq: &std::sync::atomic::AtomicU64,
+) -> Result<Message, HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let msg = peer_conn
+        .next()
+        .await
+        .ok_or(HandshakeError::ConnectionClosed)??;
+
+    #[cfg(feature = "p2p-tracing")]
+    p2p_tracer.trace_msg("recv", &msg, peer_label, connection_id, seq);
+
+    Ok(msg)
 }
 
 /// A handshake request.
@@ -900,6 +1031,8 @@ where
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        #[cfg(feature = "p2p-tracing")]
+        let p2p_tracer = self.p2p_tracer.clone();
 
         // # Security
         //
@@ -931,6 +1064,8 @@ where
                 our_services,
                 relay,
                 minimum_peer_version,
+                #[cfg(feature = "p2p-tracing")]
+                &p2p_tracer,
             )
             .await
             {
@@ -1130,6 +1265,8 @@ where
                 connection_tracker,
                 connection_info.clone(),
                 alternate_addrs.collect(),
+                #[cfg(feature = "p2p-tracing")]
+                p2p_tracer.clone(),
             );
 
             let connection_task = tokio::spawn(

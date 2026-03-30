@@ -93,6 +93,9 @@ progress-bar = [
 
 prometheus = ["metrics-exporter-prometheus"]
 
+# P2P message tracing for network experiments
+p2p-tracing = ["zebra-network/p2p-tracing"]
+
 # Production features that modify dependency behaviour
 
 # Enable additional error debugging in release builds

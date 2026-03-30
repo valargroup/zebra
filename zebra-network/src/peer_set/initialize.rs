@@ -181,6 +181,10 @@ where
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
         use crate::protocol::external::types::PeerServices;
+
+        #[cfg(feature = "p2p-tracing")]
+        let p2p_tracer = crate::p2p_tracing::init_tracing().await;
+
         let hs = peer::Handshake::builder()
             .with_config(config.clone())
             .with_inbound_service(inbound_service)
@@ -189,9 +193,12 @@ where
             .with_advertised_services(PeerServices::NODE_NETWORK)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
-            .want_transactions(true)
-            .finish()
-            .expect("configured all required parameters");
+            .want_transactions(true);
+
+        #[cfg(feature = "p2p-tracing")]
+        let hs = hs.with_p2p_tracer(p2p_tracer);
+
+        let hs = hs.finish().expect("configured all required parameters");
         (
             hs_timeout.layer(hs.clone()),
             hs_timeout.layer(peer::Connector::new(hs)),

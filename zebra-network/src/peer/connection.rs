@@ -614,6 +614,18 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Non-blocking P2P message tracer.
+    #[cfg(feature = "p2p-tracing")]
+    p2p_tracer: crate::p2p_tracing::P2pTracer,
+
+    /// Shared peer label for tracing to avoid per-message string clones.
+    #[cfg(feature = "p2p-tracing")]
+    p2p_peer_label: Arc<str>,
+
+    /// Per-connection sequence counter for message ID generation.
+    #[cfg(feature = "p2p-tracing")]
+    trace_seq: std::sync::atomic::AtomicU64,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -640,6 +652,7 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Return a new connection from its channels, services, shared state, and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inbound_service: S,
         client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
@@ -648,8 +661,11 @@ where
         connection_tracker: ConnectionTracker,
         connection_info: Arc<ConnectionInfo>,
         initial_cached_addrs: Vec<MetaAddr>,
+        #[cfg(feature = "p2p-tracing")] p2p_tracer: crate::p2p_tracing::P2pTracer,
     ) -> Self {
         let metrics_label = connection_info.connected_addr.get_transient_addr_label();
+        #[cfg(feature = "p2p-tracing")]
+        let p2p_peer_label: Arc<str> = Arc::from(metrics_label.clone());
 
         Connection {
             connection_info,
@@ -664,7 +680,42 @@ where
             metrics_label,
             last_metrics_state: None,
             last_overload_time: None,
+            #[cfg(feature = "p2p-tracing")]
+            p2p_tracer,
+            #[cfg(feature = "p2p-tracing")]
+            p2p_peer_label,
+            #[cfg(feature = "p2p-tracing")]
+            trace_seq: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+}
+
+impl<S, Tx> Connection<S, Tx>
+where
+    Tx: Sink<Message, Error = SerializationError> + Unpin,
+{
+    async fn send_message(&mut self, msg: Message) -> Result<(), PeerError> {
+        #[cfg(feature = "p2p-tracing")]
+        self.trace_msg("send", &msg);
+
+        self.peer_tx.send(msg).await
+    }
+
+    /// Trace a P2P message send or receive. No-op when the p2p-tracing feature is off.
+    #[cfg(feature = "p2p-tracing")]
+    fn trace_msg(&self, direction: &'static str, msg: &Message) {
+        self.p2p_tracer.trace_msg(
+            direction,
+            msg,
+            &self.p2p_peer_label,
+            self.connection_info.connection_id,
+            &self.trace_seq,
+        );
+    }
+
+    #[cfg(feature = "p2p-tracing")]
+    fn trace_received_message(&self, msg: &Message) {
+        self.trace_msg("recv", msg);
     }
 }
 
@@ -754,6 +805,9 @@ where
                         }
                         Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
+                            #[cfg(feature = "p2p-tracing")]
+                            self.trace_received_message(&msg);
+
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -864,6 +918,9 @@ where
                         }
                         Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
+                            #[cfg(feature = "p2p-tracing")]
+                            self.trace_received_message(&peer_msg);
+
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
 
                             // Try to process the message using the handler.
@@ -1041,29 +1098,23 @@ where
 
                 Ok(Handler::Finished(Ok(Response::Peers(response_addrs))))
             }
-            (AwaitingRequest, Peers) => self
-                .peer_tx
-                .send(Message::GetAddr)
-                .await
-                .map(|()| Handler::Peers),
+            (AwaitingRequest, Peers) => {
+                let msg = Message::GetAddr;
+                self.send_message(msg).await.map(|()| Handler::Peers)
+            }
 
             (AwaitingRequest, Ping(nonce)) => {
                 let ping_sent_at = Instant::now();
-
-                self
-                    .peer_tx
-                    .send(Message::Ping(nonce))
-                    .await
+                let msg = Message::Ping(nonce);
+                self.send_message(msg).await
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
             (AwaitingRequest, BlocksByHash(hashes)) => {
-                self
-                    .peer_tx
-                    .send(Message::GetData(
-                        hashes.iter().map(|h| (*h).into()).collect(),
-                    ))
-                    .await
+                let msg = Message::GetData(
+                    hashes.iter().map(|h| (*h).into()).collect(),
+                );
+                self.send_message(msg).await
                     .map(|()|
                          Handler::BlocksByHash {
                              blocks: Vec::with_capacity(hashes.len()),
@@ -1072,12 +1123,10 @@ where
                     )
             }
             (AwaitingRequest, TransactionsById(ids)) => {
-                self
-                    .peer_tx
-                    .send(Message::GetData(
-                        ids.iter().map(Into::into).collect(),
-                    ))
-                    .await
+                let msg = Message::GetData(
+                    ids.iter().map(Into::into).collect(),
+                );
+                self.send_message(msg).await
                     .map(|()|
                          Handler::TransactionsById {
                              transactions: Vec::with_capacity(ids.len()),
@@ -1086,42 +1135,26 @@ where
             }
 
             (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
-                self
-                    .peer_tx
-                    .send(Message::GetBlocks { known_blocks, stop })
-                    .await
-                    .map(|()|
-                         Handler::FindBlocks
-                    )
+                let msg = Message::GetBlocks { known_blocks, stop };
+                self.send_message(msg).await
+                    .map(|()| Handler::FindBlocks)
             }
             (AwaitingRequest, FindHeaders { known_blocks, stop }) => {
-                self
-                    .peer_tx
-                    .send(Message::GetHeaders { known_blocks, stop })
-                    .await
-                    .map(|()|
-                         Handler::FindHeaders
-                    )
+                let msg = Message::GetHeaders { known_blocks, stop };
+                self.send_message(msg).await
+                    .map(|()| Handler::FindHeaders)
             }
 
             (AwaitingRequest, MempoolTransactionIds) => {
-                self
-                    .peer_tx
-                    .send(Message::Mempool)
-                    .await
-                    .map(|()|
-                         Handler::MempoolTransactionIds
-                    )
+                let msg = Message::Mempool;
+                self.send_message(msg).await
+                    .map(|()| Handler::MempoolTransactionIds)
             }
 
             (AwaitingRequest, PushTransaction(transaction)) => {
-                self
-                    .peer_tx
-                    .send(Message::Tx(transaction))
-                    .await
-                    .map(|()|
-                         Handler::Finished(Ok(Response::Nil))
-                    )
+                let msg = Message::Tx(transaction);
+                self.send_message(msg).await
+                    .map(|()| Handler::Finished(Ok(Response::Nil)))
             }
             (AwaitingRequest, AdvertiseTransactionIds(hashes)) => {
                 let max_tx_inv_in_message: usize = MAX_TX_INV_IN_SENT_MESSAGE
@@ -1145,23 +1178,14 @@ where
                 }
 
                 let hashes = hashes.into_iter().take(max_tx_inv_in_message).map(Into::into).collect();
-
-                self
-                    .peer_tx
-                    .send(Message::Inv(hashes))
-                    .await
-                    .map(|()|
-                         Handler::Finished(Ok(Response::Nil))
-                    )
+                let msg = Message::Inv(hashes);
+                self.send_message(msg).await
+                    .map(|()| Handler::Finished(Ok(Response::Nil)))
             }
             (AwaitingRequest, AdvertiseBlock(hash) | AdvertiseBlockToAll(hash)) => {
-                self
-                    .peer_tx
-                    .send(Message::Inv(vec![hash.into()]))
-                    .await
-                    .map(|()|
-                         Handler::Finished(Ok(Response::Nil))
-                    )
+                let msg = Message::Inv(vec![hash.into()]);
+                self.send_message(msg).await
+                    .map(|()| Handler::Finished(Ok(Response::Nil)))
             }
         };
 
@@ -1196,7 +1220,8 @@ where
         let req = match msg {
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
-                if let Err(e) = self.peer_tx.send(Message::Pong(nonce)).await {
+                let pong = Message::Pong(nonce);
+                if let Err(e) = self.send_message(pong).await {
                     self.fail_with(e).await;
                 }
                 Consumed
@@ -1461,7 +1486,8 @@ where
         match rsp.clone() {
             Response::Nil => { /* generic success, do nothing */ }
             Response::Peers(addrs) => {
-                if let Err(e) = self.peer_tx.send(Message::Addr(addrs)).await {
+                let msg = Message::Addr(addrs);
+                if let Err(e) = self.send_message(msg).await {
                     self.fail_with(e).await;
                 }
             }
@@ -1476,7 +1502,8 @@ where
                 for transaction in transactions.into_iter() {
                     match transaction {
                         Available((transaction, _)) => {
-                            if let Err(e) = self.peer_tx.send(Message::Tx(transaction)).await {
+                            let msg = Message::Tx(transaction);
+                            if let Err(e) = self.send_message(msg).await {
                                 self.fail_with(e).await;
                                 return;
                             }
@@ -1486,7 +1513,8 @@ where
                 }
 
                 if !missing_ids.is_empty() {
-                    if let Err(e) = self.peer_tx.send(Message::NotFound(missing_ids)).await {
+                    let msg = Message::NotFound(missing_ids);
+                    if let Err(e) = self.send_message(msg).await {
                         self.fail_with(e).await;
                         return;
                     }
@@ -1500,7 +1528,8 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
-                            if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
+                            let msg = Message::Block(block);
+                            if let Err(e) = self.send_message(msg).await {
                                 self.fail_with(e).await;
                                 return;
                             }
@@ -1510,23 +1539,22 @@ where
                 }
 
                 if !missing_hashes.is_empty() {
-                    if let Err(e) = self.peer_tx.send(Message::NotFound(missing_hashes)).await {
+                    let msg = Message::NotFound(missing_hashes);
+                    if let Err(e) = self.send_message(msg).await {
                         self.fail_with(e).await;
                         return;
                     }
                 }
             }
             Response::BlockHashes(hashes) => {
-                if let Err(e) = self
-                    .peer_tx
-                    .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
-                    .await
-                {
+                let msg = Message::Inv(hashes.into_iter().map(Into::into).collect());
+                if let Err(e) = self.send_message(msg).await {
                     self.fail_with(e).await
                 }
             }
             Response::BlockHeaders(headers) => {
-                if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
+                let msg = Message::Headers(headers);
+                if let Err(e) = self.send_message(msg).await {
                     self.fail_with(e).await
                 }
             }
@@ -1554,7 +1582,8 @@ where
                     .map(Into::into)
                     .collect();
 
-                if let Err(e) = self.peer_tx.send(Message::Inv(hashes)).await {
+                let msg = Message::Inv(hashes);
+                if let Err(e) = self.send_message(msg).await {
                     self.fail_with(e).await
                 }
             }

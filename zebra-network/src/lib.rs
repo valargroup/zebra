@@ -157,6 +157,8 @@ mod address_book;
 mod address_book_updater;
 mod isolated;
 mod meta_addr;
+#[cfg(feature = "p2p-tracing")]
+pub(crate) mod p2p_tracing;
 mod peer;
 mod peer_cache_updater;
 mod peer_set;
