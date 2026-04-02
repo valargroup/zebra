@@ -40,6 +40,8 @@ pub struct LocalTestnetGenesisOptions {
     pub latest_network_upgrade: NetworkUpgrade,
     /// If true, skip Equihash proof-of-work validation.
     pub disable_pow: bool,
+    /// Target block spacing in seconds (post-Blossom). If `None`, uses the default (75s).
+    pub target_spacing_secs: Option<u32>,
 }
 
 impl Default for LocalTestnetGenesisOptions {
@@ -48,6 +50,7 @@ impl Default for LocalTestnetGenesisOptions {
             network_name: "KreskoLocalGenesis".to_string(),
             latest_network_upgrade: NetworkUpgrade::Nu6_1,
             disable_pow: true,
+            target_spacing_secs: None,
         }
     }
 }
