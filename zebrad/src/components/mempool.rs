@@ -45,6 +45,7 @@ use zebra_state as zs;
 use zebra_state::{ChainTipChange, TipAction};
 
 use crate::components::sync::SyncStatus;
+use tracing_jsonl::MempoolTracer;
 
 pub mod config;
 mod crawler;
@@ -54,6 +55,7 @@ pub mod gossip;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
+mod tracing_jsonl;
 
 #[cfg(test)]
 mod tests;
@@ -115,6 +117,9 @@ enum ActiveState {
         ///
         /// In some tests, this is initialized to the latest chain tip, then updated in `poll_ready()` before each request.
         last_seen_tip_hash: block::Hash,
+
+        /// Last seen chain tip height that mempool transactions have been verified against.
+        last_seen_tip_height: block::Height,
     },
 }
 
@@ -238,6 +243,9 @@ pub struct Mempool {
     /// Used to construct the transaction downloader.
     tx_verifier: TxVerifier,
 
+    /// Structured tracer for mempool lifecycle and churn.
+    tracer: MempoolTracer,
+
     /// Sender part of a gossip transactions channel.
     /// Used to broadcast transaction ids to peers.
     transaction_sender: broadcast::Sender<MempoolChange>,
@@ -294,6 +302,7 @@ impl Mempool {
             outbound,
             state,
             tx_verifier,
+            tracer: MempoolTracer::from_env(),
             transaction_sender,
             misbehavior_sender,
             #[cfg(feature = "progress-bar")]
@@ -370,6 +379,7 @@ impl Mempool {
                     storage: storage::Storage::new(&self.config),
                     tx_downloads,
                     last_seen_tip_hash,
+                    last_seen_tip_height: tip_height,
                 };
             }
 
@@ -546,12 +556,34 @@ impl Service<Request> for Mempool {
         // But if the mempool was just freshly enabled,
         // skip resetting and removing mined transactions for this tip.
         if !is_state_changed && matches!(tip_action, Some(TipAction::Reset { .. })) {
+            let tip_action = tip_action
+                .as_ref()
+                .expect("reset branch only matches when a tip action exists");
+
             info!(
-                tip_height = ?tip_action.as_ref().unwrap().best_tip_height(),
+                tip_height = ?tip_action.best_tip_height(),
                 "resetting mempool: switched best chain, skipped blocks, or activated network upgrade"
             );
 
             let previous_state = self.active_state.take();
+            if let ActiveState::Enabled {
+                storage,
+                last_seen_tip_hash,
+                last_seen_tip_height,
+                ..
+            } = &previous_state
+            {
+                self.tracer.trace_churn(
+                    "tip_reset",
+                    *last_seen_tip_hash,
+                    *last_seen_tip_height,
+                    tip_action,
+                    storage.transaction_count(),
+                    storage.total_serialized_size(),
+                    previous_state.transaction_retry_requests().len(),
+                    Some("resetting_mempool"),
+                );
+            }
             let tx_retries = previous_state.transaction_retry_requests();
 
             // Use the same code for dropping and resetting the mempool,
@@ -563,7 +595,7 @@ impl Service<Request> for Mempool {
             std::mem::drop(previous_state);
 
             // Re-initialise an empty state.
-            self.update_state(tip_action.as_ref());
+            self.update_state(Some(tip_action));
 
             // Re-verify the transactions that were pending or valid at the previous tip.
             // This saves us the time and data needed to re-download them.
@@ -589,6 +621,7 @@ impl Service<Request> for Mempool {
             storage,
             tx_downloads,
             last_seen_tip_hash,
+            last_seen_tip_height,
         } = &mut self.active_state
         {
             // Collect inserted transaction ids.
@@ -610,6 +643,7 @@ impl Service<Request> for Mempool {
                         // mempool re-verifies all pending tx_downloads when there's a `TipAction::Reset`.
                         if best_tip_height == expected_tip_height {
                             let tx_id = tx.transaction.id;
+                            let tx_size = tx.transaction.size;
                             let insert_result =
                                 storage.insert(tx, spent_mempool_outpoints, best_tip_height);
 
@@ -618,17 +652,44 @@ impl Service<Request> for Mempool {
                                 "got Ok(_) transaction verify, tried to store",
                             );
 
-                            if let Ok(inserted_id) = insert_result {
-                                // Save transaction ids that we will send to peers
-                                send_to_peers_ids.insert(inserted_id);
-                            } else {
-                                invalidated_ids.insert(tx_id);
-                            }
+                            match insert_result {
+                                Ok(inserted_id) => {
+                                    // Save transaction ids that we will send to peers
+                                    send_to_peers_ids.insert(inserted_id);
+                                    self.tracer.trace_tx(
+                                        inserted_id,
+                                        "verified_inserted",
+                                        "download_verify",
+                                        None,
+                                        None,
+                                        Some(tx_size),
+                                        best_tip_height,
+                                        storage.transaction_count(),
+                                        storage.total_serialized_size(),
+                                    );
 
-                            // Send the result to responder channel if one was provided.
-                            if let Some(rsp_tx) = rsp_tx {
-                                let _ = rsp_tx
-                                    .send(insert_result.map(|_| ()).map_err(|err| err.into()));
+                                    if let Some(rsp_tx) = rsp_tx {
+                                        let _ = rsp_tx.send(Ok(()));
+                                    }
+                                }
+                                Err(err) => {
+                                    invalidated_ids.insert(tx_id);
+                                    self.tracer.trace_tx(
+                                        tx_id,
+                                        "verify_rejected",
+                                        "download_verify",
+                                        Some("storage_rejected"),
+                                        Some(err.to_string()),
+                                        Some(tx_size),
+                                        best_tip_height,
+                                        storage.transaction_count(),
+                                        storage.total_serialized_size(),
+                                    );
+
+                                    if let Some(rsp_tx) = rsp_tx {
+                                        let _ = rsp_tx.send(Err(err.into()));
+                                    }
+                                }
                             }
                         } else {
                             tracing::trace!("chain grew during tx verification, retrying ..",);
@@ -657,6 +718,17 @@ impl Service<Request> for Mempool {
 
                         metrics::counter!("mempool.failed.verify.tasks.total", "reason" => error.to_string()).increment(1);
 
+                        self.tracer.trace_tx(
+                            tx_id,
+                            "verify_failed",
+                            "download_verify",
+                            Some(classify_download_error(&error)),
+                            Some(error.to_string()),
+                            None,
+                            best_tip_height,
+                            storage.transaction_count(),
+                            storage.total_serialized_size(),
+                        );
                         invalidated_ids.insert(tx_id);
                         storage.reject_if_needed(tx_id, error);
                     }
@@ -676,7 +748,13 @@ impl Service<Request> for Mempool {
             // Handle best chain tip changes
             if let Some(TipAction::Grow { block }) = tip_action {
                 tracing::trace!(block_height = ?block.height, "handling blocks added to tip");
+                let old_tip_hash = *last_seen_tip_hash;
+                let old_tip_height = *last_seen_tip_height;
                 *last_seen_tip_hash = block.hash;
+                *last_seen_tip_height = block.height;
+                let grow_action = TipAction::Grow {
+                    block: block.clone(),
+                };
 
                 // Cancel downloads/verifications/storage of transactions
                 // with the same mined IDs as recently mined transactions.
@@ -691,6 +769,44 @@ impl Service<Request> for Mempool {
                 // the new block was added to the tip.
                 storage.clear_tip_rejections();
 
+                let mempool_transactions = storage.transaction_count();
+                let mempool_bytes = storage.total_serialized_size();
+                self.tracer.trace_churn(
+                    "tip_grow",
+                    old_tip_hash,
+                    old_tip_height,
+                    &grow_action,
+                    mempool_transactions,
+                    mempool_bytes,
+                    0,
+                    None,
+                );
+                for tx_id in &mined {
+                    self.tracer.trace_tx(
+                        *tx_id,
+                        "mined_removed",
+                        "chain_tip",
+                        Some("mined"),
+                        None,
+                        None,
+                        best_tip_height,
+                        mempool_transactions,
+                        mempool_bytes,
+                    );
+                }
+                for tx_id in &invalidated {
+                    self.tracer.trace_tx(
+                        *tx_id,
+                        "same_effects_invalidated",
+                        "chain_tip",
+                        Some("duplicate_spend"),
+                        None,
+                        None,
+                        best_tip_height,
+                        mempool_transactions,
+                        mempool_bytes,
+                    );
+                }
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
             }
@@ -711,6 +827,21 @@ impl Service<Request> for Mempool {
                         "removed expired transactions from the mempool",
                     );
 
+                    let mempool_transactions = storage.transaction_count();
+                    let mempool_bytes = storage.total_serialized_size();
+                    for tx_id in &expired_transactions {
+                        self.tracer.trace_tx(
+                            *tx_id,
+                            "expired_removed",
+                            "expiry",
+                            Some("expired"),
+                            None,
+                            None,
+                            best_tip_height,
+                            mempool_transactions,
+                            mempool_bytes,
+                        );
+                    }
                     invalidated_ids.extend(expired_transactions);
                 }
             }
@@ -765,6 +896,7 @@ impl Service<Request> for Mempool {
                 storage,
                 tx_downloads,
                 last_seen_tip_hash,
+                last_seen_tip_height: _,
             } => match req {
                 // Queries
                 Request::TransactionIds => {
@@ -1032,5 +1164,15 @@ impl Service<Request> for Mempool {
 impl Drop for Mempool {
     fn drop(&mut self) {
         self.disable_metrics();
+    }
+}
+
+fn classify_download_error(error: &TransactionDownloadVerifyError) -> &'static str {
+    match error {
+        TransactionDownloadVerifyError::Invalid { .. } => "invalid",
+        TransactionDownloadVerifyError::InState => "in_state",
+        TransactionDownloadVerifyError::StateError(_) => "state_error",
+        TransactionDownloadVerifyError::DownloadFailed(_) => "download_failed",
+        TransactionDownloadVerifyError::Cancelled => "cancelled",
     }
 }

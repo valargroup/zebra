@@ -90,6 +90,8 @@ fn new_test_connection<A>() -> (
         Vec::new(),
         #[cfg(feature = "p2p-tracing")]
         crate::p2p_tracing::P2pTracer::noop(),
+        #[cfg(feature = "p2p-tracing")]
+        crate::send_timing::SendTimingTracer::noop(),
     );
 
     (

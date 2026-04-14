@@ -16,31 +16,20 @@ use zebra_chain::{
     BoundedVec,
 };
 
-/// The median block span for time median calculations.
+/// The default median block span for time median calculations.
 ///
-/// `PoWMedianBlockSpan` in the Zcash specification.
+/// `PoWMedianBlockSpan` in the Zcash specification. Acts as the upper bound for the
+/// per-network configurable median block span; configured testnets may pick a smaller value.
 pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 
 /// The overall block span used for adjusting Zcash block difficulty.
 ///
 /// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
+///
+/// Acts as the compile-time upper bound for the [`AdjustedDifficulty`] context vectors;
+/// configured testnets may use smaller runtime values via `Network` accessors.
 pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
-
-/// The damping factor for median timespan variance.
-///
-/// `PoWDampingFactor` in the Zcash specification.
-pub const POW_DAMPING_FACTOR: i32 = 4;
-
-/// The maximum upward adjustment percentage for median timespan variance.
-///
-/// `PoWMaxAdjustUp * 100` in the Zcash specification.
-pub const POW_MAX_ADJUST_UP_PERCENT: i32 = 16;
-
-/// The maximum downward adjustment percentage for median timespan variance.
-///
-/// `PoWMaxAdjustDown * 100` in the Zcash specification.
-pub const POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
 
 /// The maximum number of seconds between the `median-time-past` of a block,
 /// and the block's `time` field.
@@ -224,19 +213,20 @@ impl AdjustedDifficulty {
     }
 
     /// Calculate the arithmetic mean of the averaging window thresholds: the
-    /// expanded `difficulty_threshold`s from the previous `PoWAveragingWindow` (17)
+    /// expanded `difficulty_threshold`s from the previous `PoWAveragingWindow`
     /// blocks in the relevant chain.
     ///
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
         // In Zebra, contextual validation starts after Canopy activation, so we
-        // can assume that the relevant chain contains at least 17 blocks.
-        // Therefore, the `PoWLimit` case of `MeanTarget()` from the Zcash
+        // can assume that the relevant chain contains at least `pow_averaging_window`
+        // blocks. Therefore, the `PoWLimit` case of `MeanTarget()` from the Zcash
         // specification is unreachable.
 
+        let averaging_window = self.network.pow_averaging_window();
         let averaging_window_thresholds =
-            if self.relevant_difficulty_thresholds.len() >= POW_AVERAGING_WINDOW {
-                &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW]
+            if self.relevant_difficulty_thresholds.len() >= averaging_window {
+                &self.relevant_difficulty_thresholds.as_slice()[0..averaging_window]
             } else {
                 return self.network.target_difficulty_limit();
             };
@@ -254,7 +244,7 @@ impl AdjustedDifficulty {
             })
             .sum();
 
-        let divisor: U256 = POW_AVERAGING_WINDOW.into();
+        let divisor: U256 = averaging_window.into();
         total / divisor
     }
 
@@ -279,8 +269,8 @@ impl AdjustedDifficulty {
             self.candidate_height,
         );
         // This value is exact, but we need to truncate its nanoseconds component
-        let damped_variance =
-            (self.median_timespan() - averaging_window_timespan) / POW_DAMPING_FACTOR;
+        let damped_variance = (self.median_timespan() - averaging_window_timespan)
+            / self.network.pow_damping_factor();
         // num_seconds truncates negative values towards zero, matching the Zcash specification
         let damped_variance = Duration::seconds(damped_variance.num_seconds());
 
@@ -289,9 +279,9 @@ impl AdjustedDifficulty {
 
         // `MinActualTimespan` and `MaxActualTimespan` in the Zcash spec
         let min_median_timespan =
-            averaging_window_timespan * (100 - POW_MAX_ADJUST_UP_PERCENT) / 100;
+            averaging_window_timespan * (100 - self.network.pow_max_adjust_up_percent()) / 100;
         let max_median_timespan =
-            averaging_window_timespan * (100 + POW_MAX_ADJUST_DOWN_PERCENT) / 100;
+            averaging_window_timespan * (100 + self.network.pow_max_adjust_down_percent()) / 100;
 
         // `ActualTimespanBounded` in the Zcash specification
         max(
@@ -309,15 +299,17 @@ impl AdjustedDifficulty {
     /// See [`Self::median_timespan_bounded`] for details.
     fn median_timespan(&self) -> Duration {
         let newer_median = self.median_time_past();
+        let averaging_window = self.network.pow_averaging_window();
+        let median_block_span = self.network.pow_median_block_span();
 
         // MedianTime(height : N) := median([ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to max(0, height − 1) ])
-        let older_median = if self.relevant_times.len() > POW_AVERAGING_WINDOW {
+        let older_median = if self.relevant_times.len() > averaging_window {
             let older_times: Vec<_> = self
                 .relevant_times
                 .iter()
-                .skip(POW_AVERAGING_WINDOW)
+                .skip(averaging_window)
                 .cloned()
-                .take(POW_MEDIAN_BLOCK_SPAN)
+                .take(median_block_span)
                 .collect();
 
             AdjustedDifficulty::median_time(older_times)
@@ -339,7 +331,7 @@ impl AdjustedDifficulty {
         let median_times: Vec<DateTime<Utc>> = self
             .relevant_times
             .iter()
-            .take(POW_MEDIAN_BLOCK_SPAN)
+            .take(self.network.pow_median_block_span())
             .cloned()
             .collect();
 

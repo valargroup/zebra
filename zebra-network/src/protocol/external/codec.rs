@@ -55,6 +55,9 @@ pub struct Builder {
     max_len: usize,
     /// An optional address label, to use for reporting metrics.
     metrics_addr_label: Option<String>,
+    /// Send-path timing tracer for measuring encode duration.
+    #[cfg(feature = "p2p-tracing")]
+    send_timing_tracer: Option<crate::send_timing::SendTimingTracer>,
 }
 
 impl Codec {
@@ -65,6 +68,8 @@ impl Codec {
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_PROTOCOL_MESSAGE_LEN,
             metrics_addr_label: None,
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer: None,
         }
     }
 
@@ -108,6 +113,13 @@ impl Builder {
         self.metrics_addr_label = Some(metrics_addr_label);
         self
     }
+
+    /// Configure the codec with a send-timing tracer for encode-phase timing.
+    #[cfg(feature = "p2p-tracing")]
+    pub fn with_send_timing_tracer(mut self, tracer: crate::send_timing::SendTimingTracer) -> Self {
+        self.send_timing_tracer = Some(tracer);
+        self
+    }
 }
 
 // ======== Encoding =========
@@ -117,6 +129,9 @@ impl Encoder<Message> for Codec {
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         use Error::Parse;
+
+        #[cfg(feature = "p2p-tracing")]
+        let encode_start = std::time::Instant::now();
 
         let body_length = self.body_length(&item);
 
@@ -129,6 +144,9 @@ impl Encoder<Message> for Codec {
                               "addr" => addr_label)
             .increment((body_length + HEADER_LEN) as u64);
         }
+
+        #[cfg(feature = "p2p-tracing")]
+        let command_str = item.command();
 
         use Message::*;
         // Note: because all match arms must have
@@ -175,6 +193,23 @@ impl Encoder<Message> for Codec {
         }
         let checksum = sha256d::Checksum::from(&dst[start_len + HEADER_LEN..]);
         dst[start_len + 20..][..4].copy_from_slice(&checksum.0);
+
+        #[cfg(feature = "p2p-tracing")]
+        if let Some(tracer) = &self.builder.send_timing_tracer {
+            let peer = self
+                .builder
+                .metrics_addr_label
+                .as_deref()
+                .unwrap_or("unknown");
+            tracer.record(
+                "encode",
+                command_str,
+                peer,
+                0,
+                encode_start.elapsed(),
+                Some(body_length),
+            );
+        }
 
         Ok(())
     }

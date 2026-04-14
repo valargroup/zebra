@@ -272,7 +272,9 @@ fn build_block(
         time,
         difficulty_threshold: difficulty,
         nonce: HexDebug([0; 32]),
-        solution: crate::work::equihash::Solution::for_proposal(),
+        solution: crate::work::equihash::Solution::for_proposal(
+            &crate::parameters::Network::Mainnet,
+        ),
     };
 
     let header = if disable_pow {
@@ -297,7 +299,8 @@ fn solve_header(header: Header) -> Result<Header, crate::BoxError> {
     {
         let cancel_fn = || Ok(());
         let solved_headers =
-            Solution::solve(header, cancel_fn).map_err(|_| "Equihash solver was cancelled")?;
+            Solution::solve(header, &crate::parameters::Network::Mainnet, cancel_fn)
+                .map_err(|_| "Equihash solver was cancelled")?;
         solved_headers
             .into_iter()
             .next()

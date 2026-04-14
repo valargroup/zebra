@@ -626,6 +626,10 @@ where
     /// Per-connection sequence counter for message ID generation.
     #[cfg(feature = "p2p-tracing")]
     trace_seq: std::sync::atomic::AtomicU64,
+
+    /// Send-path timing tracer.
+    #[cfg(feature = "p2p-tracing")]
+    send_timing_tracer: crate::send_timing::SendTimingTracer,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -662,6 +666,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         initial_cached_addrs: Vec<MetaAddr>,
         #[cfg(feature = "p2p-tracing")] p2p_tracer: crate::p2p_tracing::P2pTracer,
+        #[cfg(feature = "p2p-tracing")] send_timing_tracer: crate::send_timing::SendTimingTracer,
     ) -> Self {
         let metrics_label = connection_info.connected_addr.get_transient_addr_label();
         #[cfg(feature = "p2p-tracing")]
@@ -669,6 +674,16 @@ where
             .connected_addr
             .get_transient_addr_label_for_tracing()
             .into();
+
+        #[cfg(feature = "p2p-tracing")]
+        let peer_tx = PeerTx::new(
+            peer_tx,
+            send_timing_tracer.clone(),
+            p2p_peer_label.clone(),
+            connection_info.connection_id,
+        );
+        #[cfg(not(feature = "p2p-tracing"))]
+        let peer_tx: PeerTx<Tx> = peer_tx.into();
 
         Connection {
             connection_info,
@@ -678,7 +693,7 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             error_slot,
-            peer_tx: peer_tx.into(),
+            peer_tx,
             connection_tracker,
             metrics_label,
             last_metrics_state: None,
@@ -689,6 +704,8 @@ where
             p2p_peer_label,
             #[cfg(feature = "p2p-tracing")]
             trace_seq: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer,
         }
     }
 }
@@ -701,7 +718,24 @@ where
         #[cfg(feature = "p2p-tracing")]
         self.trace_msg("send", &msg);
 
-        self.peer_tx.send(msg).await
+        #[cfg(feature = "p2p-tracing")]
+        let command = msg.command();
+        #[cfg(feature = "p2p-tracing")]
+        let start = std::time::Instant::now();
+
+        let result = self.peer_tx.send(msg).await;
+
+        #[cfg(feature = "p2p-tracing")]
+        self.send_timing_tracer.record(
+            "send_message",
+            command,
+            &self.metrics_label,
+            self.connection_info.connection_id,
+            start.elapsed(),
+            None,
+        );
+
+        result
     }
 
     /// Trace a P2P message send or receive. No-op when the p2p-tracing feature is off.

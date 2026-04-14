@@ -9,7 +9,11 @@ use crate::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
-        network_upgrade::TESTNET_ACTIVATION_HEIGHTS,
+        network_upgrade::{
+            POST_BLOSSOM_POW_TARGET_SPACING, POW_AVERAGING_WINDOW, PRE_BLOSSOM_POW_TARGET_SPACING,
+            TESTNET_ACTIVATION_HEIGHTS, TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER,
+            TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT,
+        },
         subsidy::{
             constants::mainnet,
             constants::testnet,
@@ -25,6 +29,37 @@ use crate::{
     transparent,
     work::difficulty::{ExpandedDifficulty, U256},
 };
+
+/// Defaults for the difficulty-adjustment damping/cap constants. These match the mainnet/testnet
+/// values; configured testnets can override them via [`ParametersBuilder`].
+const DEFAULT_POW_MEDIAN_BLOCK_SPAN: usize = 11;
+const DEFAULT_POW_DAMPING_FACTOR: i32 = 4;
+const DEFAULT_POW_MAX_ADJUST_UP_PERCENT: i32 = 16;
+const DEFAULT_POW_MAX_ADJUST_DOWN_PERCENT: i32 = 32;
+
+/// The (N, K) Equihash parameter pair to use for a network.
+///
+/// Only paired variants are supported, because the upstream `equihash` crate exposes a
+/// hard-coded solver per pair. Verification accepts arbitrary `(N, K)` but solving does not.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EquihashParams {
+    /// Mainnet/Testnet pair: `N = 200`, `K = 9`. 1344-byte solutions.
+    Common,
+    /// Regtest pair: `N = 48`, `K = 5`. 36-byte solutions. Verifies but does not solve;
+    /// the upstream `equihash` crate only ships `solve_200_9`.
+    Regtest,
+}
+
+impl EquihashParams {
+    /// Returns the `(N, K)` pair for this Equihash variant.
+    pub fn n_k(&self) -> (u32, u32) {
+        match self {
+            EquihashParams::Common => (200, 9),
+            EquihashParams::Regtest => (48, 5),
+        }
+    }
+}
 
 use super::magic::Magic;
 
@@ -477,6 +512,27 @@ pub struct ParametersBuilder {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// Checkpointed block hashes and heights for this network.
     checkpoints: Arc<CheckpointList>,
+    /// The averaging window for difficulty-threshold mean calculations.
+    pow_averaging_window: usize,
+    /// The median block span for time median calculations.
+    pow_median_block_span: usize,
+    /// The target block spacing before Blossom, in seconds.
+    pre_blossom_pow_target_spacing: i64,
+    /// The target block spacing after Blossom activation, in seconds.
+    post_blossom_pow_target_spacing: u32,
+    /// The damping factor for median timespan variance.
+    pow_damping_factor: i32,
+    /// The maximum upward adjustment percentage for median timespan variance.
+    pow_max_adjust_up_percent: i32,
+    /// The maximum downward adjustment percentage for median timespan variance.
+    pow_max_adjust_down_percent: i32,
+    /// The start height for the testnet minimum-difficulty rule. Set to `Height(0)` to apply
+    /// the rule from genesis.
+    testnet_min_difficulty_start_height: block::Height,
+    /// The multiplier used to derive the testnet minimum-difficulty block time gap threshold.
+    testnet_min_difficulty_gap_multiplier: i32,
+    /// The Equihash `(N, K)` parameter pair to use for solving and verifying block headers.
+    equihash_params: EquihashParams,
 }
 
 impl Default for ParametersBuilder {
@@ -513,6 +569,16 @@ impl Default for ParametersBuilder {
                 .map(|(addr, amount)| (addr.to_string(), *amount))
                 .collect(),
             checkpoints: TESTNET_CHECKPOINT_LIST.clone(),
+            pow_averaging_window: POW_AVERAGING_WINDOW,
+            pow_median_block_span: DEFAULT_POW_MEDIAN_BLOCK_SPAN,
+            pre_blossom_pow_target_spacing: PRE_BLOSSOM_POW_TARGET_SPACING,
+            post_blossom_pow_target_spacing: POST_BLOSSOM_POW_TARGET_SPACING,
+            pow_damping_factor: DEFAULT_POW_DAMPING_FACTOR,
+            pow_max_adjust_up_percent: DEFAULT_POW_MAX_ADJUST_UP_PERCENT,
+            pow_max_adjust_down_percent: DEFAULT_POW_MAX_ADJUST_DOWN_PERCENT,
+            testnet_min_difficulty_start_height: TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT,
+            testnet_min_difficulty_gap_multiplier: TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER,
+            equihash_params: EquihashParams::Common,
         }
     }
 }
@@ -757,6 +823,78 @@ impl ParametersBuilder {
         Ok(self)
     }
 
+    /// Sets the difficulty-adjustment averaging window for this network.
+    pub fn with_pow_averaging_window(mut self, pow_averaging_window: usize) -> Self {
+        self.pow_averaging_window = pow_averaging_window;
+        self
+    }
+
+    /// Sets the median-block-span used by the difficulty adjustment for this network.
+    pub fn with_pow_median_block_span(mut self, pow_median_block_span: usize) -> Self {
+        self.pow_median_block_span = pow_median_block_span;
+        self
+    }
+
+    /// Sets the pre-Blossom target block spacing (seconds) for this network.
+    pub fn with_pre_blossom_pow_target_spacing(
+        mut self,
+        pre_blossom_pow_target_spacing: i64,
+    ) -> Self {
+        self.pre_blossom_pow_target_spacing = pre_blossom_pow_target_spacing;
+        self
+    }
+
+    /// Sets the post-Blossom target block spacing (seconds) for this network.
+    pub fn with_post_blossom_pow_target_spacing(
+        mut self,
+        post_blossom_pow_target_spacing: u32,
+    ) -> Self {
+        self.post_blossom_pow_target_spacing = post_blossom_pow_target_spacing;
+        self
+    }
+
+    /// Sets the difficulty-adjustment damping factor for this network.
+    pub fn with_pow_damping_factor(mut self, pow_damping_factor: i32) -> Self {
+        self.pow_damping_factor = pow_damping_factor;
+        self
+    }
+
+    /// Sets the maximum upward difficulty-adjustment percentage for this network.
+    pub fn with_pow_max_adjust_up_percent(mut self, pow_max_adjust_up_percent: i32) -> Self {
+        self.pow_max_adjust_up_percent = pow_max_adjust_up_percent;
+        self
+    }
+
+    /// Sets the maximum downward difficulty-adjustment percentage for this network.
+    pub fn with_pow_max_adjust_down_percent(mut self, pow_max_adjust_down_percent: i32) -> Self {
+        self.pow_max_adjust_down_percent = pow_max_adjust_down_percent;
+        self
+    }
+
+    /// Sets the start height for the testnet minimum-difficulty-after-gap rule.
+    pub fn with_testnet_min_difficulty_start_height(
+        mut self,
+        testnet_min_difficulty_start_height: block::Height,
+    ) -> Self {
+        self.testnet_min_difficulty_start_height = testnet_min_difficulty_start_height;
+        self
+    }
+
+    /// Sets the gap multiplier for the testnet minimum-difficulty-after-gap rule.
+    pub fn with_testnet_min_difficulty_gap_multiplier(
+        mut self,
+        testnet_min_difficulty_gap_multiplier: i32,
+    ) -> Self {
+        self.testnet_min_difficulty_gap_multiplier = testnet_min_difficulty_gap_multiplier;
+        self
+    }
+
+    /// Sets the Equihash `(N, K)` parameter pair for this network.
+    pub fn with_equihash_params(mut self, equihash_params: EquihashParams) -> Self {
+        self.equihash_params = equihash_params;
+        self
+    }
+
     /// Sets the expected one-time lockbox disbursement outputs for this network
     pub fn with_lockbox_disbursements(
         mut self,
@@ -827,6 +965,16 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            pow_averaging_window,
+            pow_median_block_span,
+            pre_blossom_pow_target_spacing,
+            post_blossom_pow_target_spacing,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
+            testnet_min_difficulty_start_height,
+            testnet_min_difficulty_gap_multiplier,
+            equihash_params,
         } = self;
         Parameters {
             network_name,
@@ -843,6 +991,16 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            pow_averaging_window,
+            pow_median_block_span,
+            pre_blossom_pow_target_spacing,
+            post_blossom_pow_target_spacing,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
+            testnet_min_difficulty_start_height,
+            testnet_min_difficulty_gap_multiplier,
+            equihash_params,
         }
     }
 
@@ -889,6 +1047,16 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints: _,
+            pow_averaging_window,
+            pow_median_block_span,
+            pre_blossom_pow_target_spacing,
+            post_blossom_pow_target_spacing,
+            pow_damping_factor,
+            pow_max_adjust_up_percent,
+            pow_max_adjust_down_percent,
+            testnet_min_difficulty_start_height,
+            testnet_min_difficulty_gap_multiplier,
+            equihash_params,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -903,6 +1071,16 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.pow_averaging_window == pow_averaging_window
+            && self.pow_median_block_span == pow_median_block_span
+            && self.pre_blossom_pow_target_spacing == pre_blossom_pow_target_spacing
+            && self.post_blossom_pow_target_spacing == post_blossom_pow_target_spacing
+            && self.pow_damping_factor == pow_damping_factor
+            && self.pow_max_adjust_up_percent == pow_max_adjust_up_percent
+            && self.pow_max_adjust_down_percent == pow_max_adjust_down_percent
+            && self.testnet_min_difficulty_start_height == testnet_min_difficulty_start_height
+            && self.testnet_min_difficulty_gap_multiplier == testnet_min_difficulty_gap_multiplier
+            && self.equihash_params == equihash_params
     }
 }
 
@@ -962,6 +1140,26 @@ pub struct Parameters {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// List of checkpointed block heights and hashes
     checkpoints: Arc<CheckpointList>,
+    /// The averaging window for difficulty-threshold mean calculations.
+    pow_averaging_window: usize,
+    /// The median block span for time median calculations.
+    pow_median_block_span: usize,
+    /// The target block spacing before Blossom, in seconds.
+    pre_blossom_pow_target_spacing: i64,
+    /// The target block spacing after Blossom activation, in seconds.
+    post_blossom_pow_target_spacing: u32,
+    /// The damping factor for median timespan variance.
+    pow_damping_factor: i32,
+    /// The maximum upward adjustment percentage for median timespan variance.
+    pow_max_adjust_up_percent: i32,
+    /// The maximum downward adjustment percentage for median timespan variance.
+    pow_max_adjust_down_percent: i32,
+    /// The start height for the testnet minimum-difficulty rule.
+    testnet_min_difficulty_start_height: block::Height,
+    /// The multiplier used to derive the testnet minimum-difficulty block time gap threshold.
+    testnet_min_difficulty_gap_multiplier: i32,
+    /// The Equihash `(N, K)` parameter pair to use for solving and verifying block headers.
+    equihash_params: EquihashParams,
 }
 
 impl Default for Parameters {
@@ -1046,6 +1244,18 @@ impl Parameters {
             post_blossom_halving_interval,
             lockbox_disbursements: _,
             checkpoints: _,
+            // PoW knobs are configurable per-testnet; not load-bearing for the regtest
+            // identity check, since regtest also disables PoW by default.
+            pow_averaging_window: _,
+            pow_median_block_span: _,
+            pre_blossom_pow_target_spacing: _,
+            post_blossom_pow_target_spacing: _,
+            pow_damping_factor: _,
+            pow_max_adjust_up_percent: _,
+            pow_max_adjust_down_percent: _,
+            testnet_min_difficulty_start_height: _,
+            testnet_min_difficulty_gap_multiplier: _,
+            equihash_params: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1147,6 +1357,56 @@ impl Parameters {
     pub fn checkpoints(&self) -> Arc<CheckpointList> {
         self.checkpoints.clone()
     }
+
+    /// Returns the difficulty-adjustment averaging window for this network.
+    pub fn pow_averaging_window(&self) -> usize {
+        self.pow_averaging_window
+    }
+
+    /// Returns the median-block-span used by the difficulty adjustment for this network.
+    pub fn pow_median_block_span(&self) -> usize {
+        self.pow_median_block_span
+    }
+
+    /// Returns the pre-Blossom target block spacing (seconds) for this network.
+    pub fn pre_blossom_pow_target_spacing(&self) -> i64 {
+        self.pre_blossom_pow_target_spacing
+    }
+
+    /// Returns the post-Blossom target block spacing (seconds) for this network.
+    pub fn post_blossom_pow_target_spacing(&self) -> u32 {
+        self.post_blossom_pow_target_spacing
+    }
+
+    /// Returns the difficulty-adjustment damping factor for this network.
+    pub fn pow_damping_factor(&self) -> i32 {
+        self.pow_damping_factor
+    }
+
+    /// Returns the maximum upward difficulty-adjustment percentage for this network.
+    pub fn pow_max_adjust_up_percent(&self) -> i32 {
+        self.pow_max_adjust_up_percent
+    }
+
+    /// Returns the maximum downward difficulty-adjustment percentage for this network.
+    pub fn pow_max_adjust_down_percent(&self) -> i32 {
+        self.pow_max_adjust_down_percent
+    }
+
+    /// Returns the start height for the testnet minimum-difficulty-after-gap rule.
+    pub fn testnet_min_difficulty_start_height(&self) -> block::Height {
+        self.testnet_min_difficulty_start_height
+    }
+
+    /// Returns the gap multiplier for the testnet minimum-difficulty-after-gap rule.
+    pub fn testnet_min_difficulty_gap_multiplier(&self) -> i32 {
+        self.testnet_min_difficulty_gap_multiplier
+    }
+
+    /// Returns the Equihash `(N, K)` parameter pair for this network.
+    pub fn equihash_params(&self) -> EquihashParams {
+        self.equihash_params
+    }
 }
 
 impl Network {
@@ -1217,6 +1477,89 @@ impl Network {
         match self {
             Network::Mainnet => &mainnet::FOUNDER_ADDRESS_LIST,
             Network::Testnet(_) => &testnet::FOUNDER_ADDRESS_LIST,
+        }
+    }
+
+    /// Returns the difficulty-adjustment averaging window for this network.
+    pub fn pow_averaging_window(&self) -> usize {
+        match self {
+            Network::Testnet(params) => params.pow_averaging_window(),
+            Network::Mainnet => POW_AVERAGING_WINDOW,
+        }
+    }
+
+    /// Returns the median-block-span used by the difficulty adjustment for this network.
+    pub fn pow_median_block_span(&self) -> usize {
+        match self {
+            Network::Testnet(params) => params.pow_median_block_span(),
+            Network::Mainnet => DEFAULT_POW_MEDIAN_BLOCK_SPAN,
+        }
+    }
+
+    /// Returns the pre-Blossom target block spacing (seconds) for this network.
+    pub fn pre_blossom_pow_target_spacing(&self) -> i64 {
+        match self {
+            Network::Testnet(params) => params.pre_blossom_pow_target_spacing(),
+            Network::Mainnet => PRE_BLOSSOM_POW_TARGET_SPACING,
+        }
+    }
+
+    /// Returns the post-Blossom target block spacing (seconds) for this network.
+    pub fn post_blossom_pow_target_spacing(&self) -> u32 {
+        match self {
+            Network::Testnet(params) => params.post_blossom_pow_target_spacing(),
+            Network::Mainnet => POST_BLOSSOM_POW_TARGET_SPACING,
+        }
+    }
+
+    /// Returns the difficulty-adjustment damping factor for this network.
+    pub fn pow_damping_factor(&self) -> i32 {
+        match self {
+            Network::Testnet(params) => params.pow_damping_factor(),
+            Network::Mainnet => DEFAULT_POW_DAMPING_FACTOR,
+        }
+    }
+
+    /// Returns the maximum upward difficulty-adjustment percentage for this network.
+    pub fn pow_max_adjust_up_percent(&self) -> i32 {
+        match self {
+            Network::Testnet(params) => params.pow_max_adjust_up_percent(),
+            Network::Mainnet => DEFAULT_POW_MAX_ADJUST_UP_PERCENT,
+        }
+    }
+
+    /// Returns the maximum downward difficulty-adjustment percentage for this network.
+    pub fn pow_max_adjust_down_percent(&self) -> i32 {
+        match self {
+            Network::Testnet(params) => params.pow_max_adjust_down_percent(),
+            Network::Mainnet => DEFAULT_POW_MAX_ADJUST_DOWN_PERCENT,
+        }
+    }
+
+    /// Returns the start height for the testnet minimum-difficulty-after-gap rule.
+    ///
+    /// Returns the configured value for testnets, or the historical Mainnet default. The rule
+    /// itself does not apply on Mainnet, so the value is informational there.
+    pub fn testnet_min_difficulty_start_height(&self) -> block::Height {
+        match self {
+            Network::Testnet(params) => params.testnet_min_difficulty_start_height(),
+            Network::Mainnet => TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT,
+        }
+    }
+
+    /// Returns the gap multiplier for the testnet minimum-difficulty-after-gap rule.
+    pub fn testnet_min_difficulty_gap_multiplier(&self) -> i32 {
+        match self {
+            Network::Testnet(params) => params.testnet_min_difficulty_gap_multiplier(),
+            Network::Mainnet => TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER,
+        }
+    }
+
+    /// Returns the Equihash `(N, K)` parameter pair for this network.
+    pub fn equihash_params(&self) -> EquihashParams {
+        match self {
+            Network::Testnet(params) => params.equihash_params(),
+            Network::Mainnet => EquihashParams::Common,
         }
     }
 }

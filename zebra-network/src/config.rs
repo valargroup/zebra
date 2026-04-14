@@ -20,7 +20,7 @@ use zebra_chain::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
         },
-        Magic, Network, NetworkKind,
+        EquihashParams, Magic, Network, NetworkKind,
     },
     work::difficulty::U256,
 };
@@ -607,6 +607,19 @@ struct DTestnetParameters {
     /// If `true`, automatically repeats configured funding stream addresses to fill
     /// all required periods.
     extend_funding_stream_addresses_as_required: Option<bool>,
+
+    // Configurable PoW parameters for ephemeral testnets. All optional; unset values fall back
+    // to mainnet/testnet constants.
+    pow_averaging_window: Option<usize>,
+    pow_median_block_span: Option<usize>,
+    pre_blossom_pow_target_spacing: Option<i64>,
+    post_blossom_pow_target_spacing: Option<u32>,
+    pow_damping_factor: Option<i32>,
+    pow_max_adjust_up_percent: Option<i32>,
+    pow_max_adjust_down_percent: Option<i32>,
+    testnet_min_difficulty_start_height: Option<u32>,
+    testnet_min_difficulty_gap_multiplier: Option<i32>,
+    equihash_params: Option<EquihashParams>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -675,6 +688,20 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                 params.checkpoints().into()
             },
             extend_funding_stream_addresses_as_required: None,
+            pow_averaging_window: Some(params.pow_averaging_window()),
+            pow_median_block_span: Some(params.pow_median_block_span()),
+            pre_blossom_pow_target_spacing: Some(params.pre_blossom_pow_target_spacing()),
+            post_blossom_pow_target_spacing: Some(params.post_blossom_pow_target_spacing()),
+            pow_damping_factor: Some(params.pow_damping_factor()),
+            pow_max_adjust_up_percent: Some(params.pow_max_adjust_up_percent()),
+            pow_max_adjust_down_percent: Some(params.pow_max_adjust_down_percent()),
+            testnet_min_difficulty_start_height: Some(
+                params.testnet_min_difficulty_start_height().0,
+            ),
+            testnet_min_difficulty_gap_multiplier: Some(
+                params.testnet_min_difficulty_gap_multiplier(),
+            ),
+            equihash_params: Some(params.equihash_params()),
         }
     }
 }
@@ -802,6 +829,16 @@ impl<'de> Deserialize<'de> for Config {
                     lockbox_disbursements,
                     checkpoints,
                     extend_funding_stream_addresses_as_required,
+                    pow_averaging_window,
+                    pow_median_block_span,
+                    pre_blossom_pow_target_spacing,
+                    post_blossom_pow_target_spacing,
+                    pow_damping_factor,
+                    pow_max_adjust_up_percent,
+                    pow_max_adjust_down_percent,
+                    testnet_min_difficulty_start_height,
+                    testnet_min_difficulty_gap_multiplier,
+                    equihash_params,
                 }),
             ) => {
                 let mut params_builder = testnet::Parameters::build();
@@ -855,6 +892,50 @@ impl<'de> Deserialize<'de> for Config {
                     params_builder = params_builder
                         .with_halving_interval(halving_interval.into())
                         .map_err(de::Error::custom)?
+                }
+
+                // Configurable PoW knobs: each one falls back to the default if unset.
+                if let Some(value) = pow_averaging_window {
+                    params_builder = params_builder.with_pow_averaging_window(value);
+                }
+
+                if let Some(value) = pow_median_block_span {
+                    params_builder = params_builder.with_pow_median_block_span(value);
+                }
+
+                if let Some(value) = pre_blossom_pow_target_spacing {
+                    params_builder = params_builder.with_pre_blossom_pow_target_spacing(value);
+                }
+
+                if let Some(value) = post_blossom_pow_target_spacing {
+                    params_builder = params_builder.with_post_blossom_pow_target_spacing(value);
+                }
+
+                if let Some(value) = pow_damping_factor {
+                    params_builder = params_builder.with_pow_damping_factor(value);
+                }
+
+                if let Some(value) = pow_max_adjust_up_percent {
+                    params_builder = params_builder.with_pow_max_adjust_up_percent(value);
+                }
+
+                if let Some(value) = pow_max_adjust_down_percent {
+                    params_builder = params_builder.with_pow_max_adjust_down_percent(value);
+                }
+
+                if let Some(value) = testnet_min_difficulty_start_height {
+                    params_builder = params_builder.with_testnet_min_difficulty_start_height(
+                        zebra_chain::block::Height(value),
+                    );
+                }
+
+                if let Some(value) = testnet_min_difficulty_gap_multiplier {
+                    params_builder =
+                        params_builder.with_testnet_min_difficulty_gap_multiplier(value);
+                }
+
+                if let Some(value) = equihash_params {
+                    params_builder = params_builder.with_equihash_params(value);
                 }
 
                 // Set configured funding streams after setting any parameters that affect the funding stream address period.

@@ -20,6 +20,7 @@ use zebra_chain::{
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     diagnostic::task::WaitForPanics,
+    parameters::Network,
     serialization::{AtLeastOne, ZcashSerialize},
     shutdown::is_shutting_down,
     work::equihash::{Solution, SolverCancelled},
@@ -457,7 +458,8 @@ where
         };
 
         // Mine at least one block using the equihash solver.
-        let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
+        let Ok(blocks) = mine_a_block(solver_id, template, rpc.network().clone(), cancel_fn).await
+        else {
             // If the solver was cancelled, we're either shutting down, or we have a new template.
             if solver_id == 0 {
                 info!(
@@ -551,6 +553,7 @@ where
 pub async fn mine_a_block<F>(
     solver_id: u8,
     template: Arc<Block>,
+    network: Network,
     cancel_fn: F,
 ) -> Result<AtLeastOne<Block>, SolverCancelled>
 where
@@ -575,7 +578,7 @@ where
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }
 
-                Solution::solve(header, cancel_fn)
+                Solution::solve(header, &network, cancel_fn)
             }).expect("unable to spawn miner thread");
 
             miner_thread_handle.wait_for_panics()

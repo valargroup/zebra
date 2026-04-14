@@ -159,6 +159,7 @@ zebra-network = { path = "../zebra-network", version = "5.0.0" }
 zebra-node-services = { path = "../zebra-node-services", version = "4.0.0", features = ["rpc-client"] }
 zebra-rpc = { path = "../zebra-rpc", version = "6.0.1" }
 zebra-state = { path = "../zebra-state", version = "5.0.0" }
+zebra-jsonl-trace = { path = "../zebra-jsonl-trace", version = "0.1.0" }
 # zebra-script is not used directly, but we list it here to enable the
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
@@ -254,6 +255,7 @@ proptest-derive = { workspace = true, optional = true }
 console-subscriber = { workspace = true, optional = true }
 
 derive-new.workspace = true
+serde_json = { workspace = true }
 
 [build-dependencies]
 vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }

@@ -20,7 +20,7 @@ use futures::{
     Future, TryFutureExt,
 };
 use indexmap::IndexMap;
-use rand::{Rng, seq::SliceRandom};
+use rand::{seq::SliceRandom, Rng};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
@@ -184,6 +184,8 @@ where
 
         #[cfg(feature = "p2p-tracing")]
         let p2p_tracer = crate::p2p_tracing::init_tracing();
+        #[cfg(feature = "p2p-tracing")]
+        let send_timing_tracer = crate::send_timing::init_send_timing();
 
         let hs = peer::Handshake::builder()
             .with_config(config.clone())
@@ -196,7 +198,9 @@ where
             .want_transactions(true);
 
         #[cfg(feature = "p2p-tracing")]
-        let hs = hs.with_p2p_tracer(p2p_tracer);
+        let hs = hs
+            .with_p2p_tracer(p2p_tracer)
+            .with_send_timing_tracer(send_timing_tracer);
 
         let hs = hs.finish().expect("configured all required parameters");
         (
@@ -351,7 +355,10 @@ where
     // the other's inbound (per-IP limit), killing both TCP streams and leaving
     // zero surviving connections with a long reconnection blackout.
     let jitter = rand::thread_rng().gen_range(Duration::ZERO..Duration::from_secs(3));
-    info!(?jitter, "delaying initial peer connections to avoid simultaneous-open races");
+    info!(
+        ?jitter,
+        "delaying initial peer connections to avoid simultaneous-open races"
+    );
     sleep(jitter).await;
 
     let mut handshake_success_total: usize = 0;

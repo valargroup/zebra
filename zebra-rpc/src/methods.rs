@@ -37,7 +37,7 @@ use std::{
     fmt,
     ops::RangeInclusive,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -107,10 +107,12 @@ use crate::{
 };
 
 pub(crate) mod hex_data;
+mod template_tracing;
 pub(crate) mod trees;
 pub(crate) mod types;
 
 use hex_data::HexData;
+use template_tracing::{TemplateSelectionTrace, TemplateTracer};
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
     get_block_template::{
@@ -820,6 +822,9 @@ where
 
     /// Handler for the `getblocktemplate` RPC.
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+
+    /// Structured tracer for block template selection.
+    template_tracer: TemplateTracer,
 }
 
 /// A type alias for the last event logged by the server.
@@ -915,6 +920,7 @@ where
             address_book,
             last_warn_error_log_rx,
             gbt,
+            template_tracer: TemplateTracer::from_env(&network),
         };
 
         // run the process queue
@@ -2231,6 +2237,7 @@ where
         //
         // Set up the loop.
         let mut max_time_reached = false;
+        let long_poll_started_at = Instant::now();
 
         // The loop returns the server long poll ID,
         // which should be different to the client long poll ID.
@@ -2475,6 +2482,13 @@ where
             "selecting transactions for the template from the mempool"
         );
 
+        let selection_started_at = Instant::now();
+        let selection_input = mempool_txs.clone();
+
+        // Clone deps before selection consumes them, so the tracer can record them.
+        #[cfg(not(test))]
+        let mempool_tx_deps_for_trace = mempool_tx_deps.clone();
+
         // Randomly select some mempool transactions.
         let mempool_txs = select_mempool_transactions(
             &network,
@@ -2486,6 +2500,10 @@ where
             #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
             None,
         );
+        let selection_ms = selection_started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
@@ -2494,6 +2512,24 @@ where
                 .collect::<Vec<_>>(),
             "selected transactions for the template from the mempool"
         );
+
+        #[cfg(not(test))]
+        self.template_tracer.trace_template(TemplateSelectionTrace {
+            tip_height: chain_tip_and_local_time.tip_height.0,
+            tip_hash: chain_tip_and_local_time.tip_hash,
+            template_prev_hash: chain_tip_and_local_time.tip_hash,
+            client_long_poll_id: client_long_poll_id.map(|id| id.to_string()),
+            server_long_poll_id: server_long_poll_id.to_string(),
+            submit_old,
+            mempool_transactions: selection_input,
+            selected_transactions: mempool_txs.clone(),
+            transaction_dependencies: mempool_tx_deps_for_trace,
+            long_poll_wait_ms: long_poll_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            selection_ms,
+        });
 
         // - After this point, the template only depends on the previously fetched data.
 
@@ -4052,7 +4088,7 @@ impl Default for BlockHeaderObject {
             sapling_tree_size: Default::default(),
             time: 0,
             nonce: [0; 32],
-            solution: Solution::for_proposal(),
+            solution: Solution::for_proposal(&Network::Mainnet),
             bits: difficulty.to_compact(),
             difficulty: 1.0,
             previous_block_hash: block::Hash([0; 32]),

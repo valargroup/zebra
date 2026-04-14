@@ -1,5 +1,6 @@
 use crate::{
     block::{Block, MAX_BLOCK_BYTES},
+    parameters::Network,
     serialization::{CompactSizeMessage, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     work::equihash::{Solution, SOLUTION_SIZE},
 };
@@ -41,7 +42,10 @@ fn equihash_solution_test_vectors_are_valid() -> color_eyre::eyre::Result<()> {
         let block =
             Block::zcash_deserialize(&block[..]).expect("block test vector should deserialize");
 
-        block.header.solution.check(&block.header)?;
+        block
+            .header
+            .solution
+            .check(&block.header, &Network::Mainnet)?;
     }
 
     Ok(())

@@ -233,27 +233,35 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (ZFuture, ConsensusBranchId(0xffffffff)),
 ];
 
-/// The target block spacing before Blossom.
-const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
+/// The default target block spacing before Blossom.
+///
+/// Configured testnets may override this via `testnet::Parameters`.
+pub const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 
-/// The target block spacing after Blossom activation.
+/// The default target block spacing after Blossom activation.
+///
+/// Configured testnets may override this via `testnet::Parameters`.
 pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 
-/// The averaging window for difficulty threshold arithmetic mean calculations.
+/// The default averaging window for difficulty threshold arithmetic mean calculations.
 ///
-/// `PoWAveragingWindow` in the Zcash specification.
+/// `PoWAveragingWindow` in the Zcash specification. Acts as the upper bound for the
+/// per-network configurable averaging window; configured testnets may pick a smaller value.
 pub const POW_AVERAGING_WINDOW: usize = 17;
 
-/// The multiplier used to derive the testnet minimum difficulty block time gap
+/// The default multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.
 ///
-/// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+/// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>.
+/// Configured testnets may override this via `testnet::Parameters`.
+pub const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
 
-/// The start height for the testnet minimum difficulty consensus rule.
+/// The default start height for the testnet minimum difficulty consensus rule.
 ///
-/// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
+/// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>.
+/// Configured testnets may override this via `testnet::Parameters` (e.g. set to 0 to
+/// activate the rule from genesis).
+pub const TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT: block::Height = block::Height(299_188);
 
 /// The activation height for the block maximum time rule on Testnet.
 ///
@@ -388,10 +396,13 @@ impl NetworkUpgrade {
         NetworkUpgrade::branch_id_list().get(self).cloned()
     }
 
-    /// Returns the target block spacing for the network upgrade.
+    /// Returns the target block spacing for the network upgrade using the default
+    /// mainnet/testnet spacings.
     ///
     /// Based on [`PRE_BLOSSOM_POW_TARGET_SPACING`] and
-    /// [`POST_BLOSSOM_POW_TARGET_SPACING`] from the Zcash specification.
+    /// [`POST_BLOSSOM_POW_TARGET_SPACING`] from the Zcash specification. Configured testnets
+    /// may use different spacings; prefer [`NetworkUpgrade::target_spacing_with_network`]
+    /// when a `&Network` is available.
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
@@ -406,11 +417,29 @@ impl NetworkUpgrade {
         Duration::seconds(spacing_seconds)
     }
 
+    /// Returns the target block spacing for the network upgrade using `network`'s
+    /// configured pre-/post-Blossom spacings.
+    pub fn target_spacing_with_network(&self, network: &Network) -> Duration {
+        let spacing_seconds = match self {
+            Genesis | BeforeOverwinter | Overwinter | Sapling => {
+                network.pre_blossom_pow_target_spacing()
+            }
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu7 => {
+                network.post_blossom_pow_target_spacing().into()
+            }
+
+            #[cfg(zcash_unstable = "zfuture")]
+            ZFuture => network.post_blossom_pow_target_spacing().into(),
+        };
+
+        Duration::seconds(spacing_seconds)
+    }
+
     /// Returns the target block spacing for `network` and `height`.
     ///
     /// See [`NetworkUpgrade::target_spacing`] for details.
     pub fn target_spacing_for_height(network: &Network, height: block::Height) -> Duration {
-        NetworkUpgrade::current(network, height).target_spacing()
+        NetworkUpgrade::current(network, height).target_spacing_with_network(network)
     }
 
     /// Returns all the target block spacings for `network` and the heights where they start.
@@ -418,10 +447,13 @@ impl NetworkUpgrade {
         network: &Network,
     ) -> impl Iterator<Item = (block::Height, Duration)> + '_ {
         [
-            (NetworkUpgrade::Genesis, PRE_BLOSSOM_POW_TARGET_SPACING),
+            (
+                NetworkUpgrade::Genesis,
+                network.pre_blossom_pow_target_spacing(),
+            ),
             (
                 NetworkUpgrade::Blossom,
-                POST_BLOSSOM_POW_TARGET_SPACING.into(),
+                network.post_blossom_pow_target_spacing().into(),
             ),
         ]
         .into_iter()
@@ -441,16 +473,18 @@ impl NetworkUpgrade {
         height: block::Height,
     ) -> Option<Duration> {
         match (network, height) {
-            // TODO: Move `TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT` to a field on testnet::Parameters (#8364)
-            (Network::Testnet(_params), height)
-                if height < TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT =>
+            (Network::Mainnet, _) => None,
+            (Network::Testnet(_), height)
+                if height < network.testnet_min_difficulty_start_height() =>
             {
                 None
             }
-            (Network::Mainnet, _) => None,
-            (Network::Testnet(_params), _) => {
+            (Network::Testnet(_), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
+                Some(
+                    network_upgrade.target_spacing_with_network(network)
+                        * network.testnet_min_difficulty_gap_multiplier(),
+                )
             }
         }
     }
@@ -486,11 +520,25 @@ impl NetworkUpgrade {
         }
     }
 
-    /// Returns the averaging window timespan for the network upgrade.
+    /// Returns the averaging window timespan for the network upgrade using the default
+    /// mainnet/testnet averaging window.
     ///
-    /// `AveragingWindowTimespan` from the Zcash specification.
+    /// `AveragingWindowTimespan` from the Zcash specification. Configured testnets may use
+    /// a different averaging window; prefer
+    /// [`NetworkUpgrade::averaging_window_timespan_with_network`] when a `&Network` is
+    /// available.
     pub fn averaging_window_timespan(&self) -> Duration {
         self.target_spacing() * POW_AVERAGING_WINDOW.try_into().expect("fits in i32")
+    }
+
+    /// Returns the averaging window timespan for the network upgrade using `network`'s
+    /// configured averaging window and target spacing.
+    pub fn averaging_window_timespan_with_network(&self, network: &Network) -> Duration {
+        let window: i32 = network
+            .pow_averaging_window()
+            .try_into()
+            .expect("averaging window fits in i32");
+        self.target_spacing_with_network(network) * window
     }
 
     /// Returns the averaging window timespan for `network` and `height`.
@@ -500,7 +548,7 @@ impl NetworkUpgrade {
         network: &Network,
         height: block::Height,
     ) -> Duration {
-        NetworkUpgrade::current(network, height).averaging_window_timespan()
+        NetworkUpgrade::current(network, height).averaging_window_timespan_with_network(network)
     }
 
     /// Returns an iterator over [`NetworkUpgrade`] variants.

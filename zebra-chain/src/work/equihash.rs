@@ -7,6 +7,7 @@ use serde_big_array::BigArray;
 
 use crate::{
     block::Header,
+    parameters::{testnet::EquihashParams, Network},
     serialization::{
         zcash_serialize_bytes, SerializationError, ZcashDeserialize, ZcashDeserializeInto,
         ZcashSerialize,
@@ -67,14 +68,11 @@ impl Solution {
         }
     }
 
-    /// Returns `Ok(())` if `EquihashSolution` is valid for `header`
+    /// Returns `Ok(())` if `EquihashSolution` is valid for `header` under `network`'s
+    /// configured Equihash parameters.
     #[allow(clippy::unwrap_in_result)]
-    pub fn check(&self, header: &Header) -> Result<(), Error> {
-        // TODO:
-        // - Add Equihash parameters field to `testnet::Parameters`
-        // - Update `Solution::Regtest` variant to hold a `Vec` to support arbitrary parameters - rename to `Other`
-        let n = 200;
-        let k = 9;
+    pub fn check(&self, header: &Header, network: &Network) -> Result<(), Error> {
+        let (n, k) = network.equihash_params().n_k();
         let nonce = &header.nonce;
 
         let mut input = Vec::new();
@@ -112,10 +110,13 @@ impl Solution {
         }
     }
 
-    /// Returns a [`Solution`] of `[0; SOLUTION_SIZE]` to be used in block proposals.
-    pub fn for_proposal() -> Self {
-        // TODO: Accept network as an argument, and if it's Regtest, return the shorter null solution.
-        Self::Common([0; SOLUTION_SIZE])
+    /// Returns a [`Solution`] of all-zero bytes sized for `network`'s Equihash variant,
+    /// to be used in block proposals.
+    pub fn for_proposal(network: &Network) -> Self {
+        match network.equihash_params() {
+            EquihashParams::Common => Self::Common([0; SOLUTION_SIZE]),
+            EquihashParams::Regtest => Self::Regtest([0; REGTEST_SOLUTION_SIZE]),
+        }
     }
 
     /// Mines and returns one or more [`Solution`]s based on a template `header`.
@@ -133,12 +134,21 @@ impl Solution {
     #[allow(clippy::unwrap_in_result)]
     pub fn solve<F>(
         mut header: Header,
+        network: &Network,
         mut cancel_fn: F,
     ) -> Result<AtLeastOne<Header>, SolverCancelled>
     where
         F: FnMut() -> Result<(), SolverCancelled>,
     {
         use crate::shutdown::is_shutting_down;
+
+        // The upstream `equihash` crate only ships `solve_200_9`. Configured testnets that
+        // pick the Regtest pair can verify, but cannot use Zebra's internal miner.
+        assert!(
+            matches!(network.equihash_params(), EquihashParams::Common),
+            "internal miner only supports Equihash (200, 9); upstream equihash crate has no \
+             solver for other parameter pairs",
+        );
 
         let mut input = Vec::new();
         header
@@ -170,7 +180,7 @@ impl Solution {
                     .expect("unexpected invalid solution: incorrect length");
 
                 // TODO: work out why we sometimes get invalid solutions here
-                if let Err(error) = header.solution.check(&header) {
+                if let Err(error) = header.solution.check(&header, network) {
                     info!(?error, "found invalid solution for header");
                     continue;
                 }

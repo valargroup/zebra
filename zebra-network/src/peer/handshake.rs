@@ -80,6 +80,9 @@ where
     #[cfg(feature = "p2p-tracing")]
     p2p_tracer: crate::p2p_tracing::P2pTracer,
 
+    #[cfg(feature = "p2p-tracing")]
+    send_timing_tracer: crate::send_timing::SendTimingTracer,
+
     parent_span: Span,
 }
 
@@ -121,6 +124,8 @@ where
             nonces: self.nonces.clone(),
             #[cfg(feature = "p2p-tracing")]
             p2p_tracer: self.p2p_tracer.clone(),
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer: self.send_timing_tracer.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -430,6 +435,9 @@ where
 
     #[cfg(feature = "p2p-tracing")]
     p2p_tracer: Option<crate::p2p_tracing::P2pTracer>,
+
+    #[cfg(feature = "p2p-tracing")]
+    send_timing_tracer: Option<crate::send_timing::SendTimingTracer>,
 }
 
 impl<S, C> Builder<S, C>
@@ -513,6 +521,8 @@ where
             inv_collector: self.inv_collector,
             #[cfg(feature = "p2p-tracing")]
             p2p_tracer: self.p2p_tracer,
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer: self.send_timing_tracer,
         }
     }
 
@@ -528,6 +538,13 @@ where
     #[cfg(feature = "p2p-tracing")]
     pub fn with_p2p_tracer(mut self, tracer: crate::p2p_tracing::P2pTracer) -> Self {
         self.p2p_tracer = Some(tracer);
+        self
+    }
+
+    /// Provide a send-path timing tracer. Optional.
+    #[cfg(feature = "p2p-tracing")]
+    pub fn with_send_timing_tracer(mut self, tracer: crate::send_timing::SendTimingTracer) -> Self {
+        self.send_timing_tracer = Some(tracer);
         self
     }
 
@@ -570,6 +587,10 @@ where
             p2p_tracer: self
                 .p2p_tracer
                 .unwrap_or_else(crate::p2p_tracing::P2pTracer::noop),
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer: self
+                .send_timing_tracer
+                .unwrap_or_else(crate::send_timing::SendTimingTracer::noop),
             parent_span: Span::current(),
         })
     }
@@ -596,6 +617,8 @@ where
             latest_chain_tip: NoChainTip,
             #[cfg(feature = "p2p-tracing")]
             p2p_tracer: None,
+            #[cfg(feature = "p2p-tracing")]
+            send_timing_tracer: None,
         }
     }
 }
@@ -1044,6 +1067,8 @@ where
         let minimum_peer_version = self.minimum_peer_version.clone();
         #[cfg(feature = "p2p-tracing")]
         let p2p_tracer = self.p2p_tracer.clone();
+        #[cfg(feature = "p2p-tracing")]
+        let send_timing_tracer = self.send_timing_tracer.clone();
 
         // # Security
         //
@@ -1058,13 +1083,12 @@ where
             // Start timing the handshake for metrics
             let handshake_start = Instant::now();
 
-            let mut peer_conn = Framed::new(
-                data_stream,
-                Codec::builder()
-                    .for_network(&config.network)
-                    .with_metrics_addr_label(connected_addr.get_transient_addr_label())
-                    .finish(),
-            );
+            let codec_builder = Codec::builder()
+                .for_network(&config.network)
+                .with_metrics_addr_label(connected_addr.get_transient_addr_label());
+            #[cfg(feature = "p2p-tracing")]
+            let codec_builder = codec_builder.with_send_timing_tracer(send_timing_tracer.clone());
+            let mut peer_conn = Framed::new(data_stream, codec_builder.finish());
 
             let connection_info = match negotiate_version(
                 &mut peer_conn,
@@ -1147,12 +1171,7 @@ where
             // These channels communicate between the inbound and outbound halves of the connection,
             // and between the different connection tasks. We create separate tasks and channels
             // for each new connection.
-            // Allow a small amount of per-peer request queueing so brief connection
-            // stalls don't immediately turn into dropped relay opportunities.
-            const CLIENT_REQUEST_CHANNEL_SIZE: usize = 10;
-
-            let (server_tx, server_rx) =
-                futures::channel::mpsc::channel(CLIENT_REQUEST_CHANNEL_SIZE);
+            let (server_tx, server_rx) = futures::channel::mpsc::channel(0);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let error_slot = ErrorSlot::default();
 
@@ -1283,6 +1302,8 @@ where
                 alternate_addrs.collect(),
                 #[cfg(feature = "p2p-tracing")]
                 p2p_tracer.clone(),
+                #[cfg(feature = "p2p-tracing")]
+                send_timing_tracer.clone(),
             );
 
             let connection_task = tokio::spawn(
