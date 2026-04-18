@@ -206,7 +206,10 @@ where
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            if request.is_proposal() || network.disable_pow() {
+            if request.is_proposal()
+                || network.disable_pow()
+                || network.should_skip_pow_at_height(height)
+            {
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for

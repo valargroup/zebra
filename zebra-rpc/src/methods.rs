@@ -112,7 +112,9 @@ pub(crate) mod trees;
 pub(crate) mod types;
 
 use hex_data::HexData;
-use template_tracing::{TemplateSelectionTrace, TemplateTracer};
+use template_tracing::{
+    LongPollIterationTrace, LongPollWakeReason, TemplateSelectionTrace, TemplateTracer,
+};
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
     get_block_template::{
@@ -2238,6 +2240,11 @@ where
         // Set up the loop.
         let mut max_time_reached = false;
         let long_poll_started_at = Instant::now();
+        let mut loop_iteration: u32 = 0;
+        let mut wake_reason = LongPollWakeReason::Initial;
+        // Track the final-iteration fetch times to pass to the template trace.
+        let mut final_state_fetch_ms: u64 = 0;
+        let mut final_mempool_fetch_ms: u64 = 0;
 
         // The loop returns the server long poll ID,
         // which should be different to the client long poll ID.
@@ -2248,6 +2255,8 @@ where
             mempool_tx_deps,
             submit_old,
         ) = loop {
+            let iteration_started_at = Instant::now();
+
             // Check if we are synced to the tip.
             // The result of this check can change during long polling.
             //
@@ -2269,13 +2278,16 @@ where
             //
             // We always return after 90 minutes on mainnet, even if we have the same response,
             // because the max time has been reached.
+            let state_fetch_started_at = Instant::now();
             let chain_tip_and_local_time @ zebra_state::GetBlockTemplateChainInfo {
                 tip_hash,
                 tip_height,
+                expected_difficulty,
                 max_time,
                 cur_time,
                 ..
             } = fetch_state_tip_and_local_time(read_state.clone()).await?;
+            let state_fetch_ms = state_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
             // Fetch the mempool data for the block template:
             // - if the mempool transactions change, we might return from long polling.
@@ -2287,6 +2299,7 @@ where
             //
             // Optional TODO:
             // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
+            let mempool_fetch_started_at = Instant::now();
             let Some((mempool_txs, mempool_tx_deps)) =
                 fetch_mempool_transactions(mempool.clone(), tip_hash)
                     .await?
@@ -2295,8 +2308,25 @@ where
                     // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
                     .or_else(|| client_long_poll_id.is_none().then(Default::default))
             else {
+                let mempool_fetch_ms = mempool_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+                #[cfg(not(test))]
+                self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
+                    iteration: loop_iteration,
+                    wake_reason: wake_reason.clone(),
+                    tip_height: tip_height.0,
+                    tip_hash,
+                    difficulty: expected_difficulty,
+                    state_fetch_ms,
+                    mempool_fetch_ms,
+                    produced_template: false,
+                    iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                });
+                loop_iteration += 1;
+                wake_reason = LongPollWakeReason::MempoolTimer;
                 continue;
             };
+            let mempool_fetch_ms = mempool_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
             // - Long poll ID calculation
             let server_long_poll_id = LongPollInput::new(
@@ -2324,6 +2354,21 @@ where
                     submit_old = Some(false);
                 }
 
+                #[cfg(not(test))]
+                self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
+                    iteration: loop_iteration,
+                    wake_reason: wake_reason.clone(),
+                    tip_height: tip_height.0,
+                    tip_hash,
+                    difficulty: expected_difficulty,
+                    state_fetch_ms,
+                    mempool_fetch_ms,
+                    produced_template: true,
+                    iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                });
+                final_state_fetch_ms = state_fetch_ms;
+                final_mempool_fetch_ms = mempool_fetch_ms;
+
                 break (
                     server_long_poll_id,
                     chain_tip_and_local_time,
@@ -2332,6 +2377,21 @@ where
                     submit_old,
                 );
             }
+
+            // Emit a trace for this non-producing iteration before we wait.
+            #[cfg(not(test))]
+            self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
+                iteration: loop_iteration,
+                wake_reason: wake_reason.clone(),
+                tip_height: tip_height.0,
+                tip_hash,
+                difficulty: expected_difficulty,
+                state_fetch_ms,
+                mempool_fetch_ms,
+                produced_template: false,
+                iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+            loop_iteration += 1;
 
             // - Polling wait conditions
             //
@@ -2390,6 +2450,7 @@ where
                         MEMPOOL_LONG_POLL_INTERVAL,
                         "checking for a new mempool change after waiting a few seconds"
                     );
+                    wake_reason = LongPollWakeReason::MempoolTimer;
                 }
 
                 // The state changes after around a target block interval (75s)
@@ -2413,6 +2474,8 @@ where
                                     "ignoring spurious state change notification"
                                 );
 
+                                wake_reason = LongPollWakeReason::TipSpurious;
+
                                 // Wait for the mempool interval, then check for any changes.
                                 tokio::time::sleep(Duration::from_secs(
                                     MEMPOOL_LONG_POLL_INTERVAL,
@@ -2428,6 +2491,7 @@ where
                                 ?client_long_poll_id,
                                 "returning from long poll because state has changed"
                             );
+                            wake_reason = LongPollWakeReason::TipChanged;
                         }
 
                         Err(recv_error) => {
@@ -2460,6 +2524,7 @@ where
                     );
 
                     max_time_reached = true;
+                    wake_reason = LongPollWakeReason::MaxTime;
                 }
             }
         };
@@ -2518,6 +2583,7 @@ where
             tip_height: chain_tip_and_local_time.tip_height.0,
             tip_hash: chain_tip_and_local_time.tip_hash,
             template_prev_hash: chain_tip_and_local_time.tip_hash,
+            difficulty: chain_tip_and_local_time.expected_difficulty,
             client_long_poll_id: client_long_poll_id.map(|id| id.to_string()),
             server_long_poll_id: server_long_poll_id.to_string(),
             submit_old,
@@ -2529,6 +2595,9 @@ where
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64,
             selection_ms,
+            state_fetch_ms: final_state_fetch_ms,
+            mempool_fetch_ms: final_mempool_fetch_ms,
+            loop_iterations: loop_iteration + 1,
         });
 
         // - After this point, the template only depends on the previously fetched data.

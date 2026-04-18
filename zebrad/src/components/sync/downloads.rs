@@ -393,9 +393,10 @@ where
                 } else {
                     unreachable!("wrong response to block request");
                 };
+                let download_duration = download_start.elapsed();
                 metrics::counter!("sync.downloaded.block.count").increment(1);
                 metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
-                    .record(download_start.elapsed().as_secs_f64());
+                    .record(download_duration.as_secs_f64());
 
                 // Security & Performance: reject blocks that are too far ahead of our tip.
                 // Avoids denial of service attacks, and reduces wasted work on high blocks
@@ -551,17 +552,39 @@ where
                     verification = rsp => verification,
                 };
 
+                let verify_duration = verify_start.elapsed();
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
-                    .record(verify_start.elapsed().as_secs_f64());
+                    .record(verify_duration.as_secs_f64());
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);
                 }
 
                 verification
-                    .map(|hash| (block_height, hash))
+                    .map(|hash| {
+                        crate::components::block_verify_tracing::record_block_verify(
+                            crate::components::block_verify_tracing::BlockSource::Sync,
+                            Some(block_height),
+                            hash,
+                            download_duration,
+                            verify_duration,
+                            crate::components::block_verify_tracing::VerifyResult::Success,
+                            None,
+                        );
+                        (block_height, hash)
+                    })
                     .map_err(|err| {
+                        let error_class = format!("{err}");
+                        crate::components::block_verify_tracing::record_block_verify(
+                            crate::components::block_verify_tracing::BlockSource::Sync,
+                            Some(block_height),
+                            hash,
+                            download_duration,
+                            verify_duration,
+                            crate::components::block_verify_tracing::VerifyResult::Failure,
+                            Some(error_class),
+                        );
                         match err.downcast::<zebra_consensus::router::RouterError>() {
                             Ok(error) => BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser_addr },
                             Err(error) => BlockDownloadVerifyError::ValidationRequestError { error, height: block_height, hash },

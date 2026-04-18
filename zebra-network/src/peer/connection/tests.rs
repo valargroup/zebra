@@ -92,6 +92,10 @@ fn new_test_connection<A>() -> (
         crate::p2p_tracing::P2pTracer::noop(),
         #[cfg(feature = "p2p-tracing")]
         crate::send_timing::SendTimingTracer::noop(),
+        #[cfg(feature = "p2p-tracing")]
+        crate::peer_session::SessionTracer::noop(),
+        #[cfg(feature = "p2p-tracing")]
+        crate::heartbeat::HeartbeatTracer::noop(),
     );
 
     (

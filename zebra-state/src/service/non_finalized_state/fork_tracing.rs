@@ -72,6 +72,7 @@ struct ForkChainRecord {
 struct ForkSnapshotRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     trigger: &'static str,
@@ -87,6 +88,7 @@ struct ForkSnapshotRecord {
 struct ForkCreatedRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     trigger: &'static str,
@@ -109,6 +111,7 @@ struct ForkCreatedRecord {
 struct ForkPrunedRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     trigger: &'static str,
@@ -133,6 +136,7 @@ struct ForkPrunedRecord {
 struct BestChainSwitchedRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     trigger: &'static str,
@@ -147,6 +151,7 @@ struct BestChainSwitchedRecord {
 struct ManualForkRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     trigger: &'static str,
@@ -249,6 +254,7 @@ impl ForkTracer {
         let record = ManualForkRecord {
             schema: SCHEMA_VERSION,
             ts: timestamp.to_owned(),
+            node_id: zebra_jsonl_trace::node_id(),
             network: self.network.to_string(),
             event,
             trigger: cause.trigger(),
@@ -294,6 +300,7 @@ impl ForkTracer {
         let record = ForkCreatedRecord {
             schema: SCHEMA_VERSION,
             ts: timestamp.to_owned(),
+            node_id: zebra_jsonl_trace::node_id(),
             network: self.network.to_string(),
             event: "fork_created",
             trigger: cause.trigger(),
@@ -338,6 +345,7 @@ impl ForkTracer {
             let record = ForkPrunedRecord {
                 schema: SCHEMA_VERSION,
                 ts: timestamp.to_owned(),
+                node_id: zebra_jsonl_trace::node_id(),
                 network: self.network.to_string(),
                 event: "fork_pruned",
                 trigger: cause.trigger(),
@@ -392,6 +400,7 @@ impl ForkTracer {
         let record = BestChainSwitchedRecord {
             schema: SCHEMA_VERSION,
             ts: timestamp.to_owned(),
+            node_id: zebra_jsonl_trace::node_id(),
             network: self.network.to_string(),
             event: "best_chain_switched",
             trigger: cause.trigger(),
@@ -409,6 +418,7 @@ impl ForkTracer {
         let record = ForkSnapshotRecord {
             schema: SCHEMA_VERSION,
             ts: timestamp.to_owned(),
+            node_id: zebra_jsonl_trace::node_id(),
             network: self.network.to_string(),
             event: "fork_snapshot",
             trigger: cause.trigger(),

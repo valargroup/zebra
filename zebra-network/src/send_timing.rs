@@ -25,6 +25,8 @@ const FILE_NAME: &str = "send_timing.jsonl";
 struct SendTimingRecord {
     /// ISO8601 wall-clock timestamp.
     ts: String,
+    /// Process-wide node identifier (resolved from `ZEBRA_NODE_ID`).
+    node_id: &'static str,
     /// Pipeline phase: "encode", "sink_send", or "send_message".
     phase: &'static str,
     /// Wire command name (e.g. "block", "tx", "inv").
@@ -76,6 +78,7 @@ impl SendTimingTracer {
 
         let record = SendTimingRecord {
             ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            node_id: zebra_jsonl_trace::node_id(),
             phase,
             command,
             peer: peer.to_string(),

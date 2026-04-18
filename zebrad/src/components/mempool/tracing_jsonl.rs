@@ -26,6 +26,7 @@ pub(crate) struct MempoolTracer {
 struct MempoolTxLifecycleRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     component: String,
     txid: String,
     event: &'static str,
@@ -46,6 +47,7 @@ struct MempoolTxLifecycleRecord {
 struct ChainChurnRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     component: String,
     event: &'static str,
     old_tip_hash: String,
@@ -93,6 +95,7 @@ impl MempoolTracer {
         let record = MempoolTxLifecycleRecord {
             schema: TRACE_SCHEMA,
             ts: timestamp(),
+            node_id: zebra_jsonl_trace::node_id(),
             component: self.component.to_string(),
             txid: txid.to_string(),
             event,
@@ -138,6 +141,7 @@ impl MempoolTracer {
         let record = ChainChurnRecord {
             schema: TRACE_SCHEMA,
             ts: timestamp(),
+            node_id: zebra_jsonl_trace::node_id(),
             component: self.component.to_string(),
             event,
             old_tip_hash: old_tip_hash.to_string(),

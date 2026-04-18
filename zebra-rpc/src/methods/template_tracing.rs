@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use zebra_chain::{block, parameters::Network, transaction::VerifiedUnminedTx};
+use zebra_chain::{block, parameters::Network, transaction::VerifiedUnminedTx, work::difficulty::CompactDifficulty};
 use zebra_jsonl_trace::{JsonlTraceSendError, JsonlTracer, JsonlWriteEvent};
 use zebra_node_services::mempool::TransactionDependencies;
 
@@ -21,7 +21,22 @@ const TEMPLATE_DIFF_TABLE: &str = "template_diff";
 const TEMPLATE_DIFF_FILE: &str = "template_diff.jsonl";
 const TEMPLATE_TX_DECISION_TABLE: &str = "template_tx_decision";
 const TEMPLATE_TX_DECISION_FILE: &str = "template_tx_decision.jsonl";
+const LONG_POLL_ITERATION_TABLE: &str = "long_poll_iteration";
+const LONG_POLL_ITERATION_FILE: &str = "long_poll_iteration.jsonl";
 const MAX_DECISION_RECORDS_PER_TEMPLATE: usize = 256;
+
+/// Derive the target (expanded difficulty hex) and work (expected hashes) from compact difficulty.
+fn difficulty_fields(difficulty: CompactDifficulty) -> (String, String) {
+    let target = difficulty
+        .to_expanded()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    let work = difficulty
+        .to_work()
+        .map(|w| w.as_u128().to_string())
+        .unwrap_or_default();
+    (target, work)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct TemplateTracer {
@@ -45,6 +60,7 @@ pub(crate) struct TemplateSelectionTrace {
     pub tip_height: u32,
     pub tip_hash: block::Hash,
     pub template_prev_hash: block::Hash,
+    pub difficulty: CompactDifficulty,
     pub client_long_poll_id: Option<String>,
     pub server_long_poll_id: String,
     pub submit_old: Option<bool>,
@@ -53,17 +69,55 @@ pub(crate) struct TemplateSelectionTrace {
     pub transaction_dependencies: TransactionDependencies,
     pub long_poll_wait_ms: u64,
     pub selection_ms: u64,
+    pub state_fetch_ms: u64,
+    pub mempool_fetch_ms: u64,
+    pub loop_iterations: u32,
+}
+
+/// What caused the long-poll loop to wake up and run an iteration.
+#[derive(Clone, Debug)]
+pub(crate) enum LongPollWakeReason {
+    /// First iteration (no long poll ID from client, or first pass).
+    Initial,
+    /// Woke because the mempool poll timer elapsed.
+    MempoolTimer,
+    /// Woke because the best chain tip changed.
+    TipChanged,
+    /// Woke because the best chain tip notification fired but the hash was the same (spurious).
+    TipSpurious,
+    /// Woke because max time was reached.
+    MaxTime,
+}
+
+/// Trace record for each iteration of the long-poll loop.
+#[derive(Clone, Debug)]
+pub(crate) struct LongPollIterationTrace {
+    pub iteration: u32,
+    pub wake_reason: LongPollWakeReason,
+    pub tip_height: u32,
+    pub tip_hash: block::Hash,
+    pub difficulty: CompactDifficulty,
+    pub state_fetch_ms: u64,
+    pub mempool_fetch_ms: u64,
+    /// Whether this iteration broke out of the loop (produced a template).
+    pub produced_template: bool,
+    /// Total time for this iteration from wake to decision.
+    pub iteration_ms: u64,
 }
 
 #[derive(Serialize)]
 struct TemplateEventRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     tip_height: u32,
     tip_hash: String,
     template_prev_hash: String,
+    difficulty: String,
+    target: String,
+    work: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_long_poll_id: Option<String>,
     server_long_poll_id: String,
@@ -79,12 +133,36 @@ struct TemplateEventRecord {
     low_fee_count: usize,
     long_poll_wait_ms: u64,
     selection_ms: u64,
+    state_fetch_ms: u64,
+    mempool_fetch_ms: u64,
+    loop_iterations: u32,
+}
+
+#[derive(Serialize)]
+struct LongPollIterationRecord {
+    schema: &'static str,
+    ts: String,
+    node_id: &'static str,
+    network: String,
+    event: &'static str,
+    iteration: u32,
+    wake_reason: String,
+    tip_height: u32,
+    tip_hash: String,
+    difficulty: String,
+    target: String,
+    work: String,
+    state_fetch_ms: u64,
+    mempool_fetch_ms: u64,
+    produced_template: bool,
+    iteration_ms: u64,
 }
 
 #[derive(Serialize)]
 struct TemplateDiffRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     event: &'static str,
     previous_tip_height: u32,
@@ -106,6 +184,7 @@ struct TemplateDiffRecord {
 struct TemplateTxDecisionRecord {
     schema: &'static str,
     ts: String,
+    node_id: &'static str,
     network: String,
     tip_height: u32,
     tip_hash: String,
@@ -179,14 +258,20 @@ impl TemplateTracer {
             }
         }
 
+        let (target, work) = difficulty_fields(trace.difficulty);
+
         let event = TemplateEventRecord {
             schema: TRACE_SCHEMA,
             ts: ts.clone(),
+            node_id: zebra_jsonl_trace::node_id(),
             network: self.network.to_string(),
             event: "template_built",
             tip_height: trace.tip_height,
             tip_hash: trace.tip_hash.to_string(),
             template_prev_hash: trace.template_prev_hash.to_string(),
+            difficulty: trace.difficulty.to_string(),
+            target,
+            work,
             client_long_poll_id: trace.client_long_poll_id.clone(),
             server_long_poll_id: trace.server_long_poll_id.clone(),
             submit_old: trace.submit_old,
@@ -200,6 +285,9 @@ impl TemplateTracer {
             low_fee_count,
             long_poll_wait_ms: trace.long_poll_wait_ms,
             selection_ms: trace.selection_ms,
+            state_fetch_ms: trace.state_fetch_ms,
+            mempool_fetch_ms: trace.mempool_fetch_ms,
+            loop_iterations: trace.loop_iterations,
         };
         self.emit(TEMPLATE_EVENT_TABLE, TEMPLATE_EVENT_FILE, &event);
 
@@ -213,6 +301,38 @@ impl TemplateTracer {
             selected_bytes,
         );
         self.trace_decisions(&ts, &trace, &selected_ids);
+    }
+
+    pub(crate) fn trace_long_poll_iteration(&self, trace: LongPollIterationTrace) {
+        if !self.tracer.is_enabled() {
+            return;
+        }
+
+        let (target, work) = difficulty_fields(trace.difficulty);
+
+        let record = LongPollIterationRecord {
+            schema: TRACE_SCHEMA,
+            ts: timestamp(),
+            node_id: zebra_jsonl_trace::node_id(),
+            network: self.network.to_string(),
+            event: "long_poll_iteration",
+            iteration: trace.iteration,
+            wake_reason: wake_reason_str(&trace.wake_reason).to_owned(),
+            tip_height: trace.tip_height,
+            tip_hash: trace.tip_hash.to_string(),
+            difficulty: trace.difficulty.to_string(),
+            target,
+            work,
+            state_fetch_ms: trace.state_fetch_ms,
+            mempool_fetch_ms: trace.mempool_fetch_ms,
+            produced_template: trace.produced_template,
+            iteration_ms: trace.iteration_ms,
+        };
+        self.emit(
+            LONG_POLL_ITERATION_TABLE,
+            LONG_POLL_ITERATION_FILE,
+            &record,
+        );
     }
 
     fn trace_diff(
@@ -237,6 +357,7 @@ impl TemplateTracer {
                 let record = TemplateDiffRecord {
                     schema: TRACE_SCHEMA,
                     ts: ts.to_owned(),
+                    node_id: zebra_jsonl_trace::node_id(),
                     network: self.network.to_string(),
                     event: "template_changed",
                     previous_tip_height: prev.tip_height,
@@ -296,6 +417,7 @@ impl TemplateTracer {
             let record = TemplateTxDecisionRecord {
                 schema: TRACE_SCHEMA,
                 ts: ts.to_owned(),
+                node_id: zebra_jsonl_trace::node_id(),
                 network: self.network.to_string(),
                 tip_height: trace.tip_height,
                 tip_hash: trace.tip_hash.to_string(),
@@ -351,6 +473,16 @@ fn classify_diff_reason(
         (true, false) => "tip_changed",
         (false, true) => "mempool_changed",
         (false, false) => "unknown",
+    }
+}
+
+fn wake_reason_str(reason: &LongPollWakeReason) -> &'static str {
+    match reason {
+        LongPollWakeReason::Initial => "initial",
+        LongPollWakeReason::MempoolTimer => "mempool_timer",
+        LongPollWakeReason::TipChanged => "tip_changed",
+        LongPollWakeReason::TipSpurious => "tip_spurious",
+        LongPollWakeReason::MaxTime => "max_time",
     }
 }
 

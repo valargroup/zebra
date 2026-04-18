@@ -10,6 +10,7 @@ use zebra_jsonl_trace::JsonlTracer;
 fn trace_record_serializes_to_json() {
     let record = P2pTraceRecord {
         ts: "2026-03-29T12:00:00.000Z".to_string(),
+        node_id: "test-node",
         dir: "send",
         msg: "inv",
         peer: "192.168.1.50:8233".to_string(),
@@ -20,6 +21,7 @@ fn trace_record_serializes_to_json() {
             hashes: vec!["abc123".to_string(), "def456".to_string()],
             height: None,
             nonce: None,
+            body_bytes: None,
         }),
     };
 
@@ -34,6 +36,7 @@ fn trace_record_serializes_to_json() {
 fn trace_record_skips_none_summary() {
     let record = P2pTraceRecord {
         ts: "2026-03-29T12:00:00.000Z".to_string(),
+        node_id: "test-node",
         dir: "recv",
         msg: "verack",
         peer: "10.0.0.1:8233".to_string(),
@@ -50,6 +53,7 @@ fn trace_record_skips_none_summary() {
 fn dropped_record_skips_zero_fields() {
     let record = TraceDroppedRecord {
         ts: "2026-03-29T12:00:00.000Z".to_string(),
+        node_id: "test-node",
         table: "peer_message",
         queue_full_dropped: 0,
         sampled_dropped: 4,
@@ -67,6 +71,7 @@ fn payload_summary_skips_empty_fields() {
         hashes: Vec::new(),
         height: None,
         nonce: None,
+        body_bytes: None,
     };
 
     let json = serde_json::to_string(&summary).expect("should serialize");
@@ -226,6 +231,7 @@ async fn writer_task_produces_per_table_jsonl() {
                 count: None,
                 hashes: Vec::new(),
                 height: None,
+                body_bytes: None,
             }),
         }));
     }

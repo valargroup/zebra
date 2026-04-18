@@ -14,7 +14,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use zebra_chain::{block, transaction};
+use zebra_chain::{block, serialization::ZcashSerialize, transaction};
 use zebra_jsonl_trace::{
     JsonlTraceConfig, JsonlTraceReserveError, JsonlTraceSendError, JsonlTracer, JsonlWriteEvent,
 };
@@ -272,6 +272,8 @@ impl std::fmt::Debug for P2pTracer {
 pub(crate) struct P2pTraceRecord {
     /// ISO8601 wall-clock timestamp.
     pub ts: String,
+    /// Process-wide node identifier (resolved from `ZEBRA_NODE_ID`).
+    pub node_id: &'static str,
     /// "send" or "recv"
     pub dir: &'static str,
     /// Wire message type (e.g. "inv", "block", "tx").
@@ -295,6 +297,8 @@ pub(crate) struct P2pTraceRecord {
 pub(crate) struct TraceDroppedRecord {
     /// ISO8601 wall-clock timestamp.
     pub ts: String,
+    /// Process-wide node identifier (resolved from `ZEBRA_NODE_ID`).
+    pub node_id: &'static str,
     /// The table that dropped events.
     pub table: &'static str,
     /// Events dropped because the channel was full.
@@ -316,6 +320,9 @@ pub(crate) struct PayloadSummary {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<u64>,
+    /// Serialized body size in bytes (set for `block` and `tx` messages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<usize>,
 }
 
 struct CompactPayloadSummary {
@@ -323,6 +330,7 @@ struct CompactPayloadSummary {
     hashes: Vec<TraceHash>,
     height: Option<u32>,
     nonce: Option<u64>,
+    body_bytes: Option<usize>,
 }
 
 enum TraceHash {
@@ -373,6 +381,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 nonce: Some(v.nonce.0),
                 count: None,
                 hashes: Vec::new(),
+                body_bytes: None,
             }),
         ),
         Message::Verack => ("verack", None),
@@ -383,6 +392,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 count: None,
                 hashes: Vec::new(),
                 height: None,
+                body_bytes: None,
             }),
         ),
         Message::Pong(Nonce(n)) => (
@@ -392,6 +402,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 count: None,
                 hashes: Vec::new(),
                 height: None,
+                body_bytes: None,
             }),
         ),
         Message::Reject { message, ccode, .. } => (
@@ -403,6 +414,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 )],
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::GetAddr => ("getaddr", None),
@@ -413,6 +425,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: Vec::new(),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::GetBlocks {
@@ -425,6 +438,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: first_n_block_hashes(known_blocks, MAX_SUMMARY_HASHES),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::Inv(items) => (
@@ -434,6 +448,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: first_n_inv_hashes(items, MAX_SUMMARY_HASHES),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::GetHeaders { known_blocks, .. } => (
@@ -443,6 +458,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: first_n_block_hashes(known_blocks, MAX_SUMMARY_HASHES),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::Headers(headers) => (
@@ -456,6 +472,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                     .collect(),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::GetData(items) => (
@@ -465,6 +482,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: first_n_inv_hashes(items, MAX_SUMMARY_HASHES),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::Block(block) => (
@@ -474,6 +492,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: vec![TraceHash::Block(block.hash())],
                 height: block.coinbase_height().map(|h| h.0),
                 nonce: None,
+                body_bytes: Some(block.zcash_serialized_size()),
             }),
         ),
         Message::Tx(tx) => (
@@ -483,6 +502,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: vec![TraceHash::Tx(tx.id.mined_id())],
                 height: None,
                 nonce: None,
+                body_bytes: Some(tx.size),
             }),
         ),
         Message::NotFound(items) => (
@@ -492,6 +512,7 @@ fn summarize_message(msg: &Message) -> (&'static str, Option<CompactPayloadSumma
                 hashes: first_n_inv_hashes(items, MAX_SUMMARY_HASHES),
                 height: None,
                 nonce: None,
+                body_bytes: None,
             }),
         ),
         Message::Mempool => ("mempool", None),
@@ -624,6 +645,7 @@ fn render_summary(summary: CompactPayloadSummary) -> PayloadSummary {
         hashes: summary.hashes.into_iter().map(render_trace_hash).collect(),
         height: summary.height,
         nonce: summary.nonce,
+        body_bytes: summary.body_bytes,
     }
 }
 
@@ -636,6 +658,7 @@ fn format_trace_timestamp(ts_unix_ms: i64) -> String {
 fn render_peer_message_record(event: PeerMessageEvent) -> P2pTraceRecord {
     P2pTraceRecord {
         ts: format_trace_timestamp(event.ts_unix_ms),
+        node_id: zebra_jsonl_trace::node_id(),
         dir: event.dir,
         msg: event.msg,
         peer: event.peer.to_string(),
@@ -648,6 +671,7 @@ fn render_peer_message_record(event: PeerMessageEvent) -> P2pTraceRecord {
 fn render_trace_dropped_record(event: TraceDroppedEvent) -> TraceDroppedRecord {
     TraceDroppedRecord {
         ts: format_trace_timestamp(event.ts_unix_ms),
+        node_id: zebra_jsonl_trace::node_id(),
         table: event.table.name(),
         queue_full_dropped: event.queue_full_dropped,
         sampled_dropped: event.sampled_dropped,

@@ -55,6 +55,10 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     InvaildDifficultyLimits,
 
+    #[error("target difficulty limit is too large for the fixed averaging window")]
+    #[non_exhaustive]
+    TargetDifficultyLimitOverflowRisk,
+
     #[error("halving interval on ParametersBuilder must not be set after setting funding streams")]
     #[non_exhaustive]
     HalvingIntervalAfterFundingStreams,

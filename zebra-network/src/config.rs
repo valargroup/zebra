@@ -620,6 +620,9 @@ struct DTestnetParameters {
     testnet_min_difficulty_start_height: Option<u32>,
     testnet_min_difficulty_gap_multiplier: Option<i32>,
     equihash_params: Option<EquihashParams>,
+    /// The height at which PoW validation begins. Blocks below this height skip
+    /// Equihash and difficulty checks. Omit to enforce PoW from genesis.
+    pow_start_height: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -702,6 +705,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                 params.testnet_min_difficulty_gap_multiplier(),
             ),
             equihash_params: Some(params.equihash_params()),
+            pow_start_height: params.pow_start_height().map(|h| h.0),
         }
     }
 }
@@ -839,6 +843,7 @@ impl<'de> Deserialize<'de> for Config {
                     testnet_min_difficulty_start_height,
                     testnet_min_difficulty_gap_multiplier,
                     equihash_params,
+                    pow_start_height,
                 }),
             ) => {
                 let mut params_builder = testnet::Parameters::build();
@@ -936,6 +941,11 @@ impl<'de> Deserialize<'de> for Config {
 
                 if let Some(value) = equihash_params {
                     params_builder = params_builder.with_equihash_params(value);
+                }
+
+                if let Some(value) = pow_start_height {
+                    params_builder =
+                        params_builder.with_pow_start_height(zebra_chain::block::Height(value));
                 }
 
                 // Set configured funding streams after setting any parameters that affect the funding stream address period.

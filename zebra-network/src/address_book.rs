@@ -3,7 +3,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Instant,
@@ -83,6 +83,10 @@ pub struct AddressBook {
 
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: Arc<IndexMap<IpAddr, Instant>>,
+
+    /// Peer listener addresses that were proven to point back at this local
+    /// node because an outbound dial failed with a self-connection nonce reuse.
+    self_addrs: HashSet<PeerSocketAddr>,
 
     /// The local listener address.
     local_listener: SocketAddr,
@@ -167,6 +171,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
+            self_addrs: HashSet::new(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -423,6 +428,33 @@ impl AddressBook {
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
+            return None;
+        }
+
+        if matches!(change, MetaAddrChange::UpdateSelfConnection { .. }) {
+            let _guard = self.span.enter();
+            let instant_now = Instant::now();
+            let chrono_now = Utc::now();
+            let self_addr = change.addr();
+
+            self.self_addrs.insert(self_addr);
+            self.by_addr.remove(&self_addr);
+
+            if self.should_remove_most_recent_by_ip(self_addr) {
+                if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
+                    most_recent_by_ip.remove(&self_addr.ip());
+                }
+            }
+
+            std::mem::drop(_guard);
+            self.update_metrics(instant_now, chrono_now);
+
+            info!(addr = ?self_addr, "suppressing proven self-address from address book");
+            return None;
+        }
+
+        if self.self_addrs.contains(&change.addr()) {
+            trace!(?change, "ignoring proven self-address update");
             return None;
         }
 
@@ -883,6 +915,7 @@ impl Clone for AddressBook {
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),
+            self_addrs: self.self_addrs.clone(),
         }
     }
 }

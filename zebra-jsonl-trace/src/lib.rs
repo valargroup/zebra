@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -28,6 +29,27 @@ pub const DEFAULT_BUFFER_FLUSH_BYTES: usize = 256 * 1024;
 
 /// Default interval between forced file flushes and syncs.
 pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(17);
+
+/// Env var used to label every JSONL trace record with a stable node identifier.
+pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
+
+/// Returns the process-wide node identifier used to tag JSONL trace records.
+///
+/// Resolution order: `ZEBRA_NODE_ID`, then `HOSTNAME`, then `"unknown"`. The
+/// value is resolved once on first call and cached for the lifetime of the
+/// process so every trace record from this node reports the same id.
+pub fn node_id() -> &'static str {
+    static NODE_ID: OnceLock<String> = OnceLock::new();
+    NODE_ID
+        .get_or_init(|| {
+            std::env::var(NODE_ID_ENV)
+                .ok()
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .as_str()
+}
 
 /// A pre-serialized JSONL record to be written to a per-table file.
 #[derive(Clone, Debug, Eq, PartialEq)]

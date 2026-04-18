@@ -14,7 +14,7 @@ use crate::{
     constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK},
     meta_addr::MetaAddr,
     protocol::external::types::PeerServices,
-    AddressBook,
+    AddressBook, PeerSocketAddr,
 };
 
 /// Make sure an empty address book is actually empty.
@@ -181,4 +181,58 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// Check that proven self addresses are removed and ignored on future updates.
+#[test]
+fn self_connection_addr_is_removed_and_ignored() {
+    let self_addr: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:8233".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+
+    let inserted = address_book.update(
+        MetaAddr::new_gossiped_meta_addr(self_addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("gossiped peer change has services"),
+    );
+    assert!(
+        inserted.is_some(),
+        "expected self candidate to be inserted before suppression"
+    );
+    assert_eq!(
+        address_book
+            .get(self_addr)
+            .map(|meta_addr| meta_addr.addr()),
+        Some(self_addr)
+    );
+
+    let suppressed = address_book.update(MetaAddr::new_self_connection(self_addr));
+    assert_eq!(
+        suppressed, None,
+        "self suppression should not return an updated peer"
+    );
+    assert_eq!(
+        address_book.get(self_addr),
+        None,
+        "self address should be removed"
+    );
+
+    let reinserted = address_book.update(
+        MetaAddr::new_gossiped_meta_addr(self_addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("gossiped peer change has services"),
+    );
+    assert_eq!(
+        reinserted, None,
+        "suppressed self address should stay ignored"
+    );
+    assert_eq!(
+        address_book.get(self_addr),
+        None,
+        "self address should stay absent"
+    );
 }

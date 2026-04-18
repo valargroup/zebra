@@ -245,6 +245,8 @@ where
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
 
         let fut = async move {
+            let download_start = std::time::Instant::now();
+
             // Check if the block is already in the state.
             match state.oneshot(zs::Request::KnownBlock(hash)).await {
                 Ok(zs::Response::KnownBlock(None)) => Ok(()),
@@ -275,6 +277,7 @@ where
             } else {
                 unreachable!("wrong response to block request");
             };
+            let download_duration = download_start.elapsed();
             metrics::counter!("gossip.downloaded.block.count").increment(1);
 
             // # Security & Performance
@@ -351,11 +354,36 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
+            let verify_start = std::time::Instant::now();
             verifier
                 .oneshot(zebra_consensus::Request::Commit(block))
                 .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map(|hash| {
+                    let verify_duration = verify_start.elapsed();
+                    crate::components::block_verify_tracing::record_block_verify(
+                        crate::components::block_verify_tracing::BlockSource::Gossip,
+                        Some(block_height),
+                        hash,
+                        download_duration,
+                        verify_duration,
+                        crate::components::block_verify_tracing::VerifyResult::Success,
+                        None,
+                    );
+                    (hash, block_height)
+                })
+                .map_err(|e| {
+                    let verify_duration = verify_start.elapsed();
+                    crate::components::block_verify_tracing::record_block_verify(
+                        crate::components::block_verify_tracing::BlockSource::Gossip,
+                        Some(block_height),
+                        hash,
+                        download_duration,
+                        verify_duration,
+                        crate::components::block_verify_tracing::VerifyResult::Failure,
+                        Some(format!("{e}")),
+                    );
+                    (e, advertiser_addr)
+                })
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");

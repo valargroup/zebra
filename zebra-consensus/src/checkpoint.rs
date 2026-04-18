@@ -598,7 +598,7 @@ where
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
-        if self.network.disable_pow() {
+        if self.network.disable_pow() || self.network.should_skip_pow_at_height(height) {
             crate::block::check::difficulty_threshold_is_valid(
                 &block.header,
                 &self.network,

@@ -155,12 +155,16 @@ pub mod constants;
 
 mod address_book;
 mod address_book_updater;
+#[cfg(feature = "p2p-tracing")]
+pub(crate) mod heartbeat;
 mod isolated;
 mod meta_addr;
 #[cfg(feature = "p2p-tracing")]
 pub(crate) mod p2p_tracing;
 mod peer;
 mod peer_cache_updater;
+#[cfg(feature = "p2p-tracing")]
+pub(crate) mod peer_session;
 mod peer_set;
 mod policies;
 mod protocol;

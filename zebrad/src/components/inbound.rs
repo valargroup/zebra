@@ -42,6 +42,7 @@ use InventoryResponse::*;
 
 mod cached_peer_addr_response;
 pub(crate) mod downloads;
+mod serving_tracing;
 
 use cached_peer_addr_response::CachedPeerAddrResponse;
 
@@ -422,6 +423,8 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
+                    let start = std::time::Instant::now();
+                    let requested = hashes.len();
                     let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
 
@@ -457,6 +460,16 @@ impl Service<zn::Request> for Inbound {
 
                     }
 
+                    let served = blocks.iter().filter(|r| matches!(r, Available(_))).count();
+                    let not_found = blocks.len() - served;
+                    serving_tracing::record_served_blocks(
+                        requested,
+                        served,
+                        not_found,
+                        total_size,
+                        start.elapsed(),
+                    );
+
                     // The network layer handles splitting this response into multiple `block`
                     // messages, and a `notfound` message if needed.
                     Ok(zn::Response::Blocks(blocks))
@@ -469,6 +482,8 @@ impl Service<zn::Request> for Inbound {
                     return async { Ok(zn::Response::Nil) }.boxed();
                 }
 
+                let start = std::time::Instant::now();
+                let requested = req_tx_ids.len();
                 let request = mempool::Request::TransactionsById(req_tx_ids.clone());
                 mempool.clone().oneshot(request).map_ok(move |resp| {
                     let mut total_size = 0;
@@ -483,12 +498,12 @@ impl Service<zn::Request> for Inbound {
                     // We don't need to limit the size of the missing transaction IDs list,
                     // because it is already limited to the size of the getdata request
                     // sent by the peer. (Their content and encodings are the same.)
-                    let missing = req_tx_ids.into_iter().filter(|tx_id| !available_tx_ids.contains(tx_id)).map(Missing);
+                    let missing: Vec<_> = req_tx_ids.into_iter().filter(|tx_id| !available_tx_ids.contains(tx_id)).map(Missing).collect();
 
                     // If we skip sending some transactions because the limit has been reached,
                     // they aren't reported as missing. This matches `zcashd`'s behaviour:
                     // <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/main.cpp#L6410-L6412>
-                    let available = transactions.into_iter().take_while(|tx| {
+                    let available: Vec<_> = transactions.into_iter().take_while(|tx| {
                         // We check the limit after including the transaction,
                         // so that we can send transactions greater than 1 MB
                         // (but only one at a time)
@@ -497,11 +512,21 @@ impl Service<zn::Request> for Inbound {
                         total_size += tx.size;
 
                         within_limit
-                    }).map(|tx| Available((tx, None)));
+                    }).map(|tx| Available((tx, None))).collect();
+
+                    let served = available.len();
+                    let not_found = missing.len();
+                    serving_tracing::record_served_txs(
+                        requested,
+                        served,
+                        not_found,
+                        total_size,
+                        start.elapsed(),
+                    );
 
                     // The network layer handles splitting this response into multiple `tx`
                     // messages, and a `notfound` message if needed.
-                    zn::Response::Transactions(available.chain(missing).collect())
+                    zn::Response::Transactions(available.into_iter().chain(missing).collect())
                 }).boxed()
             }
             // Find* responses are already size-limited by the state.

@@ -533,6 +533,9 @@ pub struct ParametersBuilder {
     testnet_min_difficulty_gap_multiplier: i32,
     /// The Equihash `(N, K)` parameter pair to use for solving and verifying block headers.
     equihash_params: EquihashParams,
+    /// The height at which PoW validation begins. Blocks below this height skip Equihash
+    /// and difficulty checks. `None` means PoW is enforced from genesis (the default).
+    pow_start_height: Option<block::Height>,
 }
 
 impl Default for ParametersBuilder {
@@ -579,6 +582,7 @@ impl Default for ParametersBuilder {
             testnet_min_difficulty_start_height: TESTNET_MINIMUM_DIFFICULTY_START_HEIGHT,
             testnet_min_difficulty_gap_multiplier: TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER,
             equihash_params: EquihashParams::Common,
+            pow_start_height: None,
         }
     }
 }
@@ -785,11 +789,19 @@ impl ParametersBuilder {
         mut self,
         target_difficulty_limit: impl Into<ExpandedDifficulty>,
     ) -> Result<Self, ParametersBuilderError> {
-        self.target_difficulty_limit = target_difficulty_limit
+        let target_difficulty_limit = target_difficulty_limit
             .into()
             .to_compact()
             .to_expanded()
             .ok_or(ParametersBuilderError::InvaildDifficultyLimits)?;
+
+        let max_safe_target_difficulty_limit =
+            ExpandedDifficulty::from(U256::MAX / U256::from(POW_AVERAGING_WINDOW));
+        if target_difficulty_limit > max_safe_target_difficulty_limit {
+            return Err(ParametersBuilderError::TargetDifficultyLimitOverflowRisk);
+        }
+
+        self.target_difficulty_limit = target_difficulty_limit;
         Ok(self)
     }
 
@@ -895,6 +907,17 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which PoW validation begins. Blocks below this height
+    /// skip Equihash and difficulty checks entirely. `None` (the default) means
+    /// PoW is enforced from genesis.
+    pub fn with_pow_start_height(
+        mut self,
+        pow_start_height: impl Into<Option<block::Height>>,
+    ) -> Self {
+        self.pow_start_height = pow_start_height.into();
+        self
+    }
+
     /// Sets the expected one-time lockbox disbursement outputs for this network
     pub fn with_lockbox_disbursements(
         mut self,
@@ -975,6 +998,7 @@ impl ParametersBuilder {
             testnet_min_difficulty_start_height,
             testnet_min_difficulty_gap_multiplier,
             equihash_params,
+            pow_start_height,
         } = self;
         Parameters {
             network_name,
@@ -1001,6 +1025,7 @@ impl ParametersBuilder {
             testnet_min_difficulty_start_height,
             testnet_min_difficulty_gap_multiplier,
             equihash_params,
+            pow_start_height,
         }
     }
 
@@ -1057,6 +1082,7 @@ impl ParametersBuilder {
             testnet_min_difficulty_start_height,
             testnet_min_difficulty_gap_multiplier,
             equihash_params,
+            pow_start_height,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1081,6 +1107,7 @@ impl ParametersBuilder {
             && self.testnet_min_difficulty_start_height == testnet_min_difficulty_start_height
             && self.testnet_min_difficulty_gap_multiplier == testnet_min_difficulty_gap_multiplier
             && self.equihash_params == equihash_params
+            && self.pow_start_height == pow_start_height
     }
 }
 
@@ -1160,6 +1187,9 @@ pub struct Parameters {
     testnet_min_difficulty_gap_multiplier: i32,
     /// The Equihash `(N, K)` parameter pair to use for solving and verifying block headers.
     equihash_params: EquihashParams,
+    /// The height at which PoW validation begins. Blocks below this height skip Equihash
+    /// and difficulty checks. `None` means PoW is enforced from genesis.
+    pow_start_height: Option<block::Height>,
 }
 
 impl Default for Parameters {
@@ -1256,6 +1286,7 @@ impl Parameters {
             testnet_min_difficulty_start_height: _,
             testnet_min_difficulty_gap_multiplier: _,
             equihash_params: _,
+            pow_start_height: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1313,6 +1344,12 @@ impl Parameters {
     /// Returns true if proof-of-work validation should be disabled for this network
     pub fn disable_pow(&self) -> bool {
         self.disable_pow
+    }
+
+    /// Returns the height at which PoW validation begins, or `None` if PoW is
+    /// enforced from genesis.
+    pub fn pow_start_height(&self) -> Option<block::Height> {
+        self.pow_start_height
     }
 
     /// Returns true if this network should allow transactions with transparent outputs
@@ -1426,6 +1463,22 @@ impl Network {
         } else {
             false
         }
+    }
+
+    /// Returns the height at which PoW validation begins, or `None` if PoW is
+    /// enforced from genesis. Mainnet always returns `None`.
+    pub fn pow_start_height(&self) -> Option<Height> {
+        if let Self::Testnet(params) = self {
+            params.pow_start_height()
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if PoW should be skipped for the given height on this network.
+    /// This is true when `pow_start_height` is set and `height` is below it.
+    pub fn should_skip_pow_at_height(&self, height: Height) -> bool {
+        self.pow_start_height().is_some_and(|start| height < start)
     }
 
     /// Returns slow start interval for this network

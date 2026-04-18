@@ -304,6 +304,28 @@ fn check_network_name() {
 }
 
 #[test]
+fn rejects_target_difficulty_limits_that_can_overflow_mean_target_sum() {
+    use crate::{parameters::POW_AVERAGING_WINDOW, work::difficulty::U256};
+
+    let err = testnet::Parameters::build()
+        .with_target_difficulty_limit(U256::one() << 253)
+        .expect_err("unsafe target difficulty limit should be rejected");
+
+    assert!(
+        matches!(
+            err,
+            ParametersBuilderError::TargetDifficultyLimitOverflowRisk
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    let max_safe_target_difficulty_limit = U256::MAX / U256::from(POW_AVERAGING_WINDOW as u64);
+    testnet::Parameters::build()
+        .with_target_difficulty_limit(max_safe_target_difficulty_limit)
+        .expect("maximum safe target difficulty limit should be accepted");
+}
+
+#[test]
 fn check_full_activation_list() {
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
