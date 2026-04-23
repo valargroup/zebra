@@ -1140,6 +1140,13 @@ where
             let codec_builder = codec_builder.with_send_timing_tracer(send_timing_tracer.clone());
             let mut peer_conn = Framed::new(data_stream, codec_builder.finish());
 
+            let direction = if connected_addr.is_inbound() {
+                "inbound"
+            } else {
+                "outbound"
+            };
+            let peer_label = connected_addr.get_transient_addr_label();
+
             let connection_info = match negotiate_version(
                 &mut peer_conn,
                 &connected_addr,
@@ -1162,6 +1169,11 @@ where
                         "result" => "success"
                     )
                     .record(duration);
+                    crate::peer_lifecycle::handshake_ok(
+                        &peer_label,
+                        direction,
+                        info.negotiated_version.0,
+                    );
                     info
                 }
                 Err(err) => {
@@ -1187,6 +1199,7 @@ where
                         "reason" => reason
                     )
                     .increment(1);
+                    crate::peer_lifecycle::handshake_failed(&peer_label, direction, &err);
                     return Err(err);
                 }
             };

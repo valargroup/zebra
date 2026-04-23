@@ -2287,7 +2287,10 @@ where
                 cur_time,
                 ..
             } = fetch_state_tip_and_local_time(read_state.clone()).await?;
-            let state_fetch_ms = state_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let state_fetch_ms = state_fetch_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
 
             // Fetch the mempool data for the block template:
             // - if the mempool transactions change, we might return from long polling.
@@ -2308,25 +2311,35 @@ where
                     // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
                     .or_else(|| client_long_poll_id.is_none().then(Default::default))
             else {
-                let mempool_fetch_ms = mempool_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let mempool_fetch_ms = mempool_fetch_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
 
                 #[cfg(not(test))]
-                self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
-                    iteration: loop_iteration,
-                    wake_reason: wake_reason.clone(),
-                    tip_height: tip_height.0,
-                    tip_hash,
-                    difficulty: expected_difficulty,
-                    state_fetch_ms,
-                    mempool_fetch_ms,
-                    produced_template: false,
-                    iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                });
+                self.template_tracer
+                    .trace_long_poll_iteration(LongPollIterationTrace {
+                        iteration: loop_iteration,
+                        wake_reason: wake_reason.clone(),
+                        tip_height: tip_height.0,
+                        tip_hash,
+                        difficulty: expected_difficulty,
+                        state_fetch_ms,
+                        mempool_fetch_ms,
+                        produced_template: false,
+                        iteration_ms: iteration_started_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    });
                 loop_iteration += 1;
                 wake_reason = LongPollWakeReason::MempoolTimer;
                 continue;
             };
-            let mempool_fetch_ms = mempool_fetch_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let mempool_fetch_ms = mempool_fetch_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
 
             // - Long poll ID calculation
             let server_long_poll_id = LongPollInput::new(
@@ -2355,17 +2368,21 @@ where
                 }
 
                 #[cfg(not(test))]
-                self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
-                    iteration: loop_iteration,
-                    wake_reason: wake_reason.clone(),
-                    tip_height: tip_height.0,
-                    tip_hash,
-                    difficulty: expected_difficulty,
-                    state_fetch_ms,
-                    mempool_fetch_ms,
-                    produced_template: true,
-                    iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                });
+                self.template_tracer
+                    .trace_long_poll_iteration(LongPollIterationTrace {
+                        iteration: loop_iteration,
+                        wake_reason: wake_reason.clone(),
+                        tip_height: tip_height.0,
+                        tip_hash,
+                        difficulty: expected_difficulty,
+                        state_fetch_ms,
+                        mempool_fetch_ms,
+                        produced_template: true,
+                        iteration_ms: iteration_started_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    });
                 final_state_fetch_ms = state_fetch_ms;
                 final_mempool_fetch_ms = mempool_fetch_ms;
 
@@ -2380,17 +2397,21 @@ where
 
             // Emit a trace for this non-producing iteration before we wait.
             #[cfg(not(test))]
-            self.template_tracer.trace_long_poll_iteration(LongPollIterationTrace {
-                iteration: loop_iteration,
-                wake_reason: wake_reason.clone(),
-                tip_height: tip_height.0,
-                tip_hash,
-                difficulty: expected_difficulty,
-                state_fetch_ms,
-                mempool_fetch_ms,
-                produced_template: false,
-                iteration_ms: iteration_started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            });
+            self.template_tracer
+                .trace_long_poll_iteration(LongPollIterationTrace {
+                    iteration: loop_iteration,
+                    wake_reason: wake_reason.clone(),
+                    tip_height: tip_height.0,
+                    tip_hash,
+                    difficulty: expected_difficulty,
+                    state_fetch_ms,
+                    mempool_fetch_ms,
+                    produced_template: false,
+                    iteration_ms: iteration_started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                });
             loop_iteration += 1;
 
             // - Polling wait conditions

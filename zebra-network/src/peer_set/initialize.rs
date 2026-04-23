@@ -182,6 +182,8 @@ where
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
         use crate::protocol::external::types::PeerServices;
 
+        crate::peer_lifecycle::init();
+
         #[cfg(feature = "p2p-tracing")]
         let p2p_tracer = crate::p2p_tracing::init_tracing();
         #[cfg(feature = "p2p-tracing")]
@@ -760,6 +762,7 @@ where
     let connected_addr = peer::ConnectedAddr::new_inbound_direct(addr);
 
     debug!("got incoming connection");
+    crate::peer_lifecycle::inbound_accept(addr);
 
     // # Correctness
     //
@@ -782,11 +785,15 @@ where
         async move {
             let handshake_result = handshake.await;
 
-            if let Ok(client) = handshake_result {
-                // The connection limit makes sure this send doesn't block
-                let _ = peerset_tx.send((addr, client)).await;
-            } else {
-                debug!(?handshake_result, "error handshaking with inbound peer");
+            match handshake_result {
+                Ok(client) => {
+                    // The connection limit makes sure this send doesn't block
+                    let _ = peerset_tx.send((addr, client)).await;
+                }
+                Err(ref error) => {
+                    crate::peer_lifecycle::inbound_failed(addr, error);
+                    debug!(?handshake_result, "error handshaking with inbound peer");
+                }
             }
         }
         .in_current_span(),
@@ -1149,6 +1156,7 @@ where
     // - functions that have a reasonable timeout
 
     debug!(?candidate.addr, "attempting outbound connection in response to demand");
+    crate::peer_lifecycle::dial_attempt(candidate.addr);
 
     // the connector is always ready, so this can't hang
     let outbound_connector = outbound_connector.ready().await?;
@@ -1164,12 +1172,14 @@ where
     match handshake_result {
         Ok((address, client)) => {
             debug!(?candidate.addr, "successfully dialed new peer");
+            crate::peer_lifecycle::dial_ok(address);
 
             // The connection limit makes sure this send doesn't block.
             peerset_tx.send((address, client)).await?;
         }
         // The connection was never opened, or it failed the handshake and was dropped.
         Err(error) => {
+            crate::peer_lifecycle::dial_failed(candidate.addr, &error);
             // Silence verbose info logs in production, but keep logs if the number of connections is low.
             // Also silence them completely in tests.
             if outbound_connections <= MAX_CONNECTIONS_FOR_INFO_LOG && !cfg!(test) {

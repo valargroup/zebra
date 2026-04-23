@@ -3,10 +3,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use zebra_chain::{
     block::{self, Height},
     parameters::Network,
+    work::difficulty::PartialCumulativeWork,
 };
 use zebra_jsonl_trace::{JsonlTraceSendError, JsonlTracer, JsonlWriteEvent};
 
@@ -42,6 +43,7 @@ pub(super) struct ForkChainSnapshot {
     pub recent_fork_height: Option<Height>,
     pub recent_fork_length: Option<u32>,
     pub block_count: usize,
+    pub chain_work: PartialCumulativeWork,
     pub is_best: bool,
 }
 
@@ -65,6 +67,8 @@ struct ForkChainRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     fork_length: Option<u32>,
     block_count: usize,
+    #[serde(serialize_with = "serialize_chain_work")]
+    chain_work: PartialCumulativeWork,
     is_best: bool,
 }
 
@@ -104,6 +108,8 @@ struct ForkCreatedRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     fork_length: Option<u32>,
     block_count: usize,
+    #[serde(serialize_with = "serialize_chain_work")]
+    chain_work: PartialCumulativeWork,
     is_best: bool,
 }
 
@@ -130,6 +136,8 @@ struct ForkPrunedRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     fork_length: Option<u32>,
     orphaned_block_count: usize,
+    #[serde(serialize_with = "serialize_chain_work")]
+    chain_work: PartialCumulativeWork,
 }
 
 #[derive(Serialize)]
@@ -176,6 +184,7 @@ impl ForkTraceSnapshot {
                 recent_fork_height: chain.recent_fork_height(),
                 recent_fork_length: chain.recent_fork_length(),
                 block_count: chain.len(),
+                chain_work: chain.partial_cumulative_work,
                 is_best: index == 0,
             })
             .collect();
@@ -314,6 +323,7 @@ impl ForkTracer {
             fork_height: created_chain.recent_fork_height.map(|height| height.0),
             fork_length: created_chain.recent_fork_length,
             block_count: created_chain.block_count,
+            chain_work: created_chain.chain_work,
             is_best: created_chain.is_best,
         };
 
@@ -363,6 +373,7 @@ impl ForkTracer {
                 fork_height: removed_chain.recent_fork_height.map(|height| height.0),
                 fork_length: removed_chain.recent_fork_length,
                 orphaned_block_count: removed_chain.block_count,
+                chain_work: removed_chain.chain_work,
             };
 
             self.emit_event(&record);
@@ -439,6 +450,7 @@ impl ForkTracer {
                     fork_height: chain.recent_fork_height.map(|height| height.0),
                     fork_length: chain.recent_fork_length,
                     block_count: chain.block_count,
+                    chain_work: chain.chain_work,
                     is_best: chain.is_best,
                 })
                 .collect(),
@@ -536,4 +548,14 @@ fn env_flag_enabled(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn serialize_chain_work<S>(
+    chain_work: &PartialCumulativeWork,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&format!("{:064x}", chain_work.as_u128()))
 }

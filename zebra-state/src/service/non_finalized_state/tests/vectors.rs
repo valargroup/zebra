@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use serde_json::Value;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
@@ -95,13 +96,71 @@ async fn fork_tracing_writes_fork_events_and_snapshots() -> Result<()> {
     let snapshot_contents =
         tokio::fs::read_to_string(trace_path.join("fork_snapshot.jsonl")).await?;
 
-    assert!(event_contents.contains("\"event\":\"fork_created\""));
-    assert!(event_contents.contains("\"event\":\"fork_pruned\""));
-    assert!(event_contents.contains("\"reason\":\"finalized_root_mismatch\""));
-    assert!(snapshot_contents.contains("\"chain_count\":2"));
-    assert!(snapshot_contents.contains("\"chain_count\":0"));
+    let event_records: Vec<Value> = event_contents
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let snapshot_records: Vec<Value> = snapshot_contents
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+
+    let created_record = event_records
+        .iter()
+        .find(|record| record["event"].as_str() == Some("fork_created"))
+        .expect("test should emit a fork_created event");
+    assert_valid_chain_work(chain_work(created_record));
+
+    let pruned_record = event_records
+        .iter()
+        .find(|record| record["event"].as_str() == Some("fork_pruned"))
+        .expect("test should emit a fork_pruned event");
+    assert_eq!(
+        pruned_record["reason"].as_str(),
+        Some("finalized_root_mismatch")
+    );
+    assert_valid_chain_work(chain_work(pruned_record));
+
+    let two_chain_snapshot = snapshot_records
+        .iter()
+        .find(|record| record["chain_count"].as_u64() == Some(2))
+        .expect("test should emit a two-chain snapshot");
+    let chains = two_chain_snapshot["chains"]
+        .as_array()
+        .expect("fork snapshot chains should be serialized as an array");
+    let best_chain_work = chains
+        .iter()
+        .find(|chain| chain["is_best"].as_bool() == Some(true))
+        .map(chain_work)
+        .expect("two-chain snapshot should include a best chain");
+
+    for chain in chains {
+        let chain_work = chain_work(chain);
+        assert_valid_chain_work(chain_work);
+        assert!(
+            best_chain_work >= chain_work,
+            "best chain work should be >= every other chain in the same snapshot"
+        );
+    }
+
+    assert!(snapshot_records
+        .iter()
+        .any(|record| record["chain_count"].as_u64() == Some(0)));
 
     Ok(())
+}
+
+fn chain_work(record: &Value) -> &str {
+    record["chain_work"]
+        .as_str()
+        .expect("fork trace records should include chain_work")
+}
+
+fn assert_valid_chain_work(chain_work: &str) {
+    assert_eq!(chain_work.len(), 64);
+    assert!(chain_work
+        .chars()
+        .all(|digit| digit.is_ascii_digit() || ('a'..='f').contains(&digit)));
 }
 
 #[test]

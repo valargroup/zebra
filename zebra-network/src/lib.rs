@@ -163,6 +163,7 @@ mod meta_addr;
 pub(crate) mod p2p_tracing;
 mod peer;
 mod peer_cache_updater;
+pub(crate) mod peer_lifecycle;
 #[cfg(feature = "p2p-tracing")]
 pub(crate) mod peer_session;
 mod peer_set;
