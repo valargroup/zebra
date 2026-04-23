@@ -601,6 +601,10 @@ where
                 // Unready -> Errored
                 Some(Err((key, UnreadyError::Inner(error)))) => {
                     debug!(%error, "service failed while unready, dropping service");
+                    crate::peer_lifecycle::disconnect(
+                        key,
+                        format_args!("service failed while unready: {error}"),
+                    );
 
                     let cancel = self.cancel_handles.remove(&key);
                     assert!(cancel.is_some(), "missing cancel handle");
@@ -644,6 +648,7 @@ where
                 Ok(()) => {
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
                         debug!(?key, "service ip is banned, dropping service");
+                        crate::peer_lifecycle::disconnect(key, "ip is banned");
                         std::mem::drop(svc);
                         continue;
                     }
@@ -654,6 +659,10 @@ where
                 // Ready -> Errored
                 Err(error) => {
                     debug!(%error, "service failed while ready, dropping service");
+                    crate::peer_lifecycle::disconnect(
+                        key,
+                        format_args!("service failed while ready: {error}"),
+                    );
 
                     // Ready services can just be dropped, they don't need any cleanup.
                     std::mem::drop(svc);
@@ -719,6 +728,7 @@ where
             match change {
                 Change::Remove(key) => {
                     trace!(?key, "got Change::Remove from Discover");
+                    crate::peer_lifecycle::disconnect(key, "connection task exited");
                     self.remove(&key);
                 }
                 Change::Insert(key, svc) => {
@@ -732,6 +742,7 @@ where
                     // Drop the new peer if we are already connected to it.
                     // Preferring old connections avoids connection thrashing.
                     if self.has_peer_with_addr(key) {
+                        crate::peer_lifecycle::disconnect(key, "duplicate address on insert");
                         std::mem::drop(svc);
                         continue;
                     }
@@ -741,6 +752,7 @@ where
                     // drop the new peer if there are already `max_conns_per_ip` peers with
                     // the same IP address in the peer set.
                     if self.num_peers_with_ip(key.ip()) >= self.max_conns_per_ip {
+                        crate::peer_lifecycle::disconnect(key, "per-ip cap exceeded on insert");
                         std::mem::drop(svc);
                         continue;
                     }
@@ -757,8 +769,13 @@ where
     fn disconnect_from_outdated_peers(&mut self) {
         if let Some(minimum_version) = self.minimum_peer_version.changed() {
             // It is ok to drop ready services, they don't need anything cancelled.
-            self.ready_services
-                .retain(|_address, peer| peer.remote_version() >= minimum_version);
+            self.ready_services.retain(|address, peer| {
+                let keep = peer.remote_version() >= minimum_version;
+                if !keep {
+                    crate::peer_lifecycle::disconnect(address, "outdated peer version");
+                }
+                keep
+            });
         }
     }
 
@@ -830,6 +847,7 @@ where
         if svc.remote_version() >= self.minimum_peer_version.current() {
             self.ready_services.insert(key, svc);
         } else {
+            crate::peer_lifecycle::disconnect(key, "outdated peer version (push_ready)");
             std::mem::drop(svc);
         }
     }
@@ -855,6 +873,7 @@ where
         } else {
             // Cancel any request made to the service because it is using an outdated protocol
             // version.
+            crate::peer_lifecycle::disconnect(key, "outdated peer version (push_unready)");
             let _ = tx.send(CancelClientWork);
         }
     }

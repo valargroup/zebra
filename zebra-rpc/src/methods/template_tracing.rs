@@ -8,7 +8,9 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use zebra_chain::{block, parameters::Network, transaction::VerifiedUnminedTx, work::difficulty::CompactDifficulty};
+use zebra_chain::{
+    block, parameters::Network, transaction::VerifiedUnminedTx, work::difficulty::CompactDifficulty,
+};
 use zebra_jsonl_trace::{JsonlTraceSendError, JsonlTracer, JsonlWriteEvent};
 use zebra_node_services::mempool::TransactionDependencies;
 
@@ -328,11 +330,7 @@ impl TemplateTracer {
             produced_template: trace.produced_template,
             iteration_ms: trace.iteration_ms,
         };
-        self.emit(
-            LONG_POLL_ITERATION_TABLE,
-            LONG_POLL_ITERATION_FILE,
-            &record,
-        );
+        self.emit(LONG_POLL_ITERATION_TABLE, LONG_POLL_ITERATION_FILE, &record);
     }
 
     fn trace_diff(
