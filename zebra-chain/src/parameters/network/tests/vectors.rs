@@ -309,6 +309,8 @@ fn rejects_target_difficulty_limits_that_can_overflow_mean_target_sum() {
 
     let err = testnet::Parameters::build()
         .with_target_difficulty_limit(U256::one() << 253)
+        .expect("difficulty limit should parse")
+        .to_network()
         .expect_err("unsafe target difficulty limit should be rejected");
 
     assert!(
@@ -322,7 +324,30 @@ fn rejects_target_difficulty_limits_that_can_overflow_mean_target_sum() {
     let max_safe_target_difficulty_limit = U256::MAX / U256::from(POW_AVERAGING_WINDOW as u64);
     testnet::Parameters::build()
         .with_target_difficulty_limit(max_safe_target_difficulty_limit)
+        .expect("maximum safe target difficulty limit should parse")
+        .to_network()
         .expect("maximum safe target difficulty limit should be accepted");
+}
+
+#[test]
+fn target_difficulty_limit_overflow_check_uses_configured_averaging_window() {
+    use crate::work::difficulty::U256;
+
+    let safe_for_default_window_only = U256::MAX / U256::from(17u64);
+    let err = testnet::Parameters::build()
+        .with_target_difficulty_limit(safe_for_default_window_only)
+        .expect("difficulty limit should parse")
+        .with_pow_averaging_window(51)
+        .to_network()
+        .expect_err("difficulty limit should be unsafe for a larger averaging window");
+
+    assert!(
+        matches!(
+            err,
+            ParametersBuilderError::TargetDifficultyLimitOverflowRisk
+        ),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]

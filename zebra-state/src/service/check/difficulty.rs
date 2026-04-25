@@ -11,31 +11,24 @@ use chrono::{DateTime, Duration, Utc};
 
 use zebra_chain::{
     block::{self, Block},
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{Network, NetworkUpgrade},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
-    BoundedVec,
 };
-
-/// The default median block span for time median calculations.
-///
-/// `PoWMedianBlockSpan` in the Zcash specification. Acts as the upper bound for the
-/// per-network configurable median block span; configured testnets may pick a smaller value.
-pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
-
-/// The overall block span used for adjusting Zcash block difficulty.
-///
-/// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
-/// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
-///
-/// Acts as the compile-time upper bound for the [`AdjustedDifficulty`] context vectors;
-/// configured testnets may use smaller runtime values via `Network` accessors.
-pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
 
 /// The maximum number of seconds between the `median-time-past` of a block,
 /// and the block's `time` field.
 ///
 /// Part of the block header consensus rules in the Zcash specification.
 pub const BLOCK_MAX_TIME_SINCE_MEDIAN: u32 = 90 * 60;
+
+/// Returns the overall block span used for adjusting Zcash block difficulty.
+///
+/// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification.
+pub(crate) fn pow_adjustment_block_span(network: &Network) -> usize {
+    network
+        .pow_averaging_window()
+        .saturating_add(network.pow_median_block_span())
+}
 
 /// Contains the context needed to calculate the adjusted difficulty for a block.
 pub(crate) struct AdjustedDifficulty {
@@ -49,16 +42,13 @@ pub(crate) struct AdjustedDifficulty {
     /// The configured network
     network: Network,
     /// The `header.difficulty_threshold`s from the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` blocks, in reverse height
     /// order.
-    relevant_difficulty_thresholds: BoundedVec<CompactDifficulty, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_difficulty_thresholds: Vec<CompactDifficulty>,
     /// The `header.time`s from the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` blocks, in reverse height
     /// order.
-    ///
-    /// Only the first and last `PoWMedianBlockSpan` times are used. Times
-    /// `11..=16` are ignored.
-    relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_times: Vec<DateTime<Utc>>,
 }
 
 impl AdjustedDifficulty {
@@ -66,7 +56,7 @@ impl AdjustedDifficulty {
     /// `network`, and a `context`.
     ///
     /// The `context` contains the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) `difficulty_threshold`s and
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` `difficulty_threshold`s and
     /// `time`s from the relevant chain for `candidate_block`, in reverse height
     /// order, starting with the previous block.
     ///
@@ -113,8 +103,6 @@ impl AdjustedDifficulty {
     ///
     /// This function may panic in the following cases:
     /// - The next block height is invalid.
-    /// - The `context` iterator is empty, because at least one difficulty threshold
-    ///   and block time are required to construct the `Bounded` vectors.
     /// - The context iterator is empty, because at least one difficulty threshold and block time are required.
     pub fn new_from_header_time<C>(
         candidate_header_time: DateTime<Utc>,
@@ -126,22 +114,17 @@ impl AdjustedDifficulty {
         C: IntoIterator<Item = (CompactDifficulty, DateTime<Utc>)>,
     {
         let candidate_height = (previous_block_height + 1).expect("next block height is valid");
+        let adjustment_block_span = pow_adjustment_block_span(network);
 
-        let (thresholds, times) = context
+        let (relevant_difficulty_thresholds, relevant_times) = context
             .into_iter()
-            .take(POW_ADJUSTMENT_BLOCK_SPAN)
+            .take(adjustment_block_span)
             .unzip::<_, _, Vec<_>, Vec<_>>();
 
-        let relevant_difficulty_thresholds: BoundedVec<
-            CompactDifficulty,
-            1,
-            POW_ADJUSTMENT_BLOCK_SPAN,
-        > = thresholds
-            .try_into()
-            .expect("context must provide a bounded number of difficulty thresholds");
-        let relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN> = times
-            .try_into()
-            .expect("context must provide a bounded number of block times");
+        assert!(
+            !relevant_difficulty_thresholds.is_empty() && !relevant_times.is_empty(),
+            "context must provide at least one difficulty threshold and block time"
+        );
 
         AdjustedDifficulty {
             candidate_time: candidate_header_time,
@@ -170,7 +153,7 @@ impl AdjustedDifficulty {
     /// Calculate the expected `difficulty_threshold` for a candidate block, based
     /// on the `candidate_time`, `candidate_height`, `network`, and the
     /// `difficulty_threshold`s and `time`s from the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the relevant chain.
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` blocks in the relevant chain.
     ///
     /// Implements `ThresholdBits` from the Zcash specification, and the Testnet
     /// minimum difficulty adjustment from ZIPs 205 and 208.
@@ -179,7 +162,10 @@ impl AdjustedDifficulty {
             &self.network,
             self.candidate_height,
             self.candidate_time,
-            *self.relevant_times.first(),
+            *self
+                .relevant_times
+                .first()
+                .expect("context must provide at least one block time"),
         ) {
             assert!(
                 self.network.is_a_test_network(),
@@ -231,10 +217,8 @@ impl AdjustedDifficulty {
                 return self.network.target_difficulty_limit();
             };
 
-        // Since the PoWLimits are `2^251 − 1` for Testnet, and `2^243 − 1` for
-        // Mainnet, the sum of 17 `ExpandedDifficulty` will be less than or equal
-        // to: `(2^251 − 1) * 17 = 2^255 + 2^251 - 17`. Therefore, the sum can
-        // not overflow a u256 value.
+        // Configured testnet parameters reject `PoWLimit` values that could overflow
+        // this sum for their configured averaging window.
         let total: ExpandedDifficulty = averaging_window_thresholds
             .iter()
             .map(|compact| {
@@ -250,7 +234,7 @@ impl AdjustedDifficulty {
 
     /// Calculate the bounded median timespan. The median timespan is the
     /// difference of medians of the timespan times, which are the `time`s from
-    /// the previous `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the
+    /// the previous `PoWAveragingWindow + PoWMedianBlockSpan` blocks in the
     /// relevant chain.
     ///
     /// Uses the candidate block's `height' and `network` to calculate the
@@ -261,7 +245,7 @@ impl AdjustedDifficulty {
     ///
     /// Implements `ActualTimespanBounded` from the Zcash specification.
     ///
-    /// Note: This calculation only uses `PoWMedianBlockSpan` (11) times at the
+    /// Note: This calculation only uses `PoWMedianBlockSpan` times at the
     /// start and end of the timespan times. timespan times `[11..=16]` are ignored.
     fn median_timespan_bounded(&self) -> Duration {
         let averaging_window_timespan = NetworkUpgrade::averaging_window_timespan_for_height(
@@ -292,7 +276,7 @@ impl AdjustedDifficulty {
 
     /// Calculate the median timespan. The median timespan is the difference of
     /// medians of the timespan times, which are the `time`s from the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks in the relevant chain.
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` blocks in the relevant chain.
     ///
     /// Implements `ActualTimespan` from the Zcash specification.
     ///
@@ -314,7 +298,10 @@ impl AdjustedDifficulty {
 
             AdjustedDifficulty::median_time(older_times)
         } else {
-            *self.relevant_times.last()
+            *self
+                .relevant_times
+                .last()
+                .expect("context must provide at least one block time")
         };
 
         // `ActualTimespan` in the Zcash specification
@@ -322,7 +309,7 @@ impl AdjustedDifficulty {
     }
 
     /// Calculate the median of the `time`s from the previous
-    /// `PoWMedianBlockSpan` (11) blocks in the relevant chain.
+    /// `PoWMedianBlockSpan` blocks in the relevant chain.
     ///
     /// Implements `median-time-past` and `MedianTime(candidate_height)` from the
     /// Zcash specification. (These functions are identical, but they are
@@ -339,7 +326,7 @@ impl AdjustedDifficulty {
     }
 
     /// Calculate the median of the `median_block_span_times`: the `time`s from a
-    /// Vec of `PoWMedianBlockSpan` (11) or fewer blocks in the relevant chain.
+    /// Vec of `PoWMedianBlockSpan` or fewer blocks in the relevant chain.
     ///
     /// Implements `MedianTime` from the Zcash specification.
     ///
@@ -353,5 +340,49 @@ impl AdjustedDifficulty {
         // <https://zips.z.cash/protocol/protocol.pdf>, section 7.7.3, Difficulty Adjustment (p. 132)
         let median_idx = median_block_span_times.len() / 2;
         median_block_span_times[median_idx]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::{
+        parameters::testnet,
+        work::difficulty::{CompactDifficulty, U256},
+    };
+
+    #[test]
+    fn configured_testnet_uses_larger_difficulty_context() {
+        let network = testnet::Parameters::build()
+            .with_network_name("LargeDaaContext")
+            .expect("network name is valid")
+            .with_target_difficulty_limit(U256::MAX / U256::from(52u64))
+            .expect("difficulty limit is valid")
+            .with_pow_averaging_window(51)
+            .with_pow_median_block_span(33)
+            .to_network()
+            .expect("configured testnet parameters are valid");
+
+        let context = (0..100).map(|seconds| {
+            (
+                CompactDifficulty::default(),
+                DateTime::from_timestamp(seconds, 0).expect("timestamp is valid"),
+            )
+        });
+
+        let adjusted = AdjustedDifficulty::new_from_header_time(
+            DateTime::from_timestamp(200, 0).expect("timestamp is valid"),
+            block::Height(100),
+            &network,
+            context,
+        );
+
+        assert_eq!(pow_adjustment_block_span(&network), 84);
+        assert_eq!(adjusted.relevant_times.len(), 84);
+        assert_eq!(
+            adjusted.median_time_past(),
+            DateTime::from_timestamp(16, 0).expect("timestamp is valid")
+        );
     }
 }

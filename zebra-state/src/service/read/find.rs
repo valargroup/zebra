@@ -29,7 +29,7 @@ use crate::{
     constants,
     service::{
         block_iter::any_ancestor_blocks,
-        check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
+        check::AdjustedDifficulty,
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
         read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
@@ -635,7 +635,10 @@ pub fn next_median_time_past(
         best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
     }
 
-    Ok(calculate_median_time_past(best_relevant_chain_result?))
+    Ok(calculate_median_time_past(
+        &non_finalized_state.network,
+        best_relevant_chain_result?,
+    ))
 }
 
 /// Do a consistency check by checking the finalized tip before and after all other database queries.
@@ -658,7 +661,7 @@ fn best_relevant_chain(
         any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
-        .take(POW_MEDIAN_BLOCK_SPAN)
+        .take(non_finalized_state.network.pow_median_block_span())
         .collect();
 
     if best_relevant_chain.is_empty() {
@@ -682,9 +685,13 @@ fn best_relevant_chain(
 /// The `relevant_chain` has blocks in reverse height order.
 ///
 /// See [`next_median_time_past()`] for details.
-pub(crate) fn calculate_median_time_past(relevant_chain: Vec<Arc<Block>>) -> DateTime32 {
+pub(crate) fn calculate_median_time_past(
+    network: &zebra_chain::parameters::Network,
+    relevant_chain: Vec<Arc<Block>>,
+) -> DateTime32 {
     let relevant_data: Vec<DateTime<Utc>> = relevant_chain
         .iter()
+        .take(network.pow_median_block_span())
         .map(|block| block.header.time)
         .collect();
 

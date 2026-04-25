@@ -794,12 +794,6 @@ impl ParametersBuilder {
             .to_expanded()
             .ok_or(ParametersBuilderError::InvaildDifficultyLimits)?;
 
-        let max_safe_target_difficulty_limit =
-            ExpandedDifficulty::from(U256::MAX / U256::from(POW_AVERAGING_WINDOW));
-        if target_difficulty_limit > max_safe_target_difficulty_limit {
-            return Err(ParametersBuilderError::TargetDifficultyLimitOverflowRisk);
-        }
-
         self.target_difficulty_limit = target_difficulty_limit;
         Ok(self)
     }
@@ -1035,6 +1029,8 @@ impl ParametersBuilder {
 
     /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
+        self.validate_target_difficulty_limit()?;
+
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
@@ -1052,6 +1048,21 @@ impl ParametersBuilder {
         }
 
         Ok(network)
+    }
+
+    fn validate_target_difficulty_limit(&self) -> Result<(), ParametersBuilderError> {
+        if self.pow_averaging_window == 0 {
+            return Err(ParametersBuilderError::InvalidPowAveragingWindow);
+        }
+
+        let max_safe_target_difficulty_limit =
+            ExpandedDifficulty::from(U256::MAX / U256::from(self.pow_averaging_window));
+
+        if self.target_difficulty_limit > max_safe_target_difficulty_limit {
+            return Err(ParametersBuilderError::TargetDifficultyLimitOverflowRisk);
+        }
+
+        Ok(())
     }
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.

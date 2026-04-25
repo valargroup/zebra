@@ -109,6 +109,34 @@ fn configured_testnet_can_use_regtest_equihash_params() {
 }
 
 #[test]
+fn configured_testnet_parses_larger_daa_windows() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+        initial_testnet_peers = []
+
+        [testnet_parameters]
+        network_name = 'LocalDaaTestnet'
+        checkpoints = true
+        target_difficulty_limit = '0x0400000000000000000000000000000000000000000000000000000000000000'
+        pow_averaging_window = 51
+        pow_median_block_span = 33
+        post_blossom_pow_target_spacing = 25
+        pow_damping_factor = 4
+        pow_max_adjust_up_percent = 16
+        pow_max_adjust_down_percent = 32
+        "#,
+    )
+    .unwrap();
+
+    assert_eq!(config.network.pow_averaging_window(), 51);
+    assert_eq!(config.network.pow_median_block_span(), 33);
+    assert_eq!(config.network.post_blossom_pow_target_spacing(), 25);
+}
+
+#[test]
 fn default_config_uses_ipv6() {
     let _init_guard = zebra_test::init();
     let config = Config::default();
