@@ -126,7 +126,7 @@ impl<C: Constraint> FromStr for Zec<C> {
 impl<C: Constraint> std::fmt::Debug for Zec<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(&format!("Zec<{}>", std::any::type_name::<C>()))
-            .field("ZEC", &self.to_string())
+            .field("TAZ7", &self.to_string())
             .field("zat", &self.0)
             .finish()
     }

@@ -26,6 +26,18 @@ pub mod magics {
     pub const TESTNET: Magic = Magic([0xfa, 0x1a, 0xf9, 0xbf]);
     /// The regtest, see <https://github.com/zcash/zcash/blob/master/src/chainparams.cpp#L716-L719>
     pub const REGTEST: Magic = Magic([0xaa, 0xe8, 0x3f, 0x5f]);
+    /// The NU7 testnet. ASCII bytes for `NU7T`.
+    pub const NU7_TESTNET: Magic = Magic([0x4e, 0x55, 0x37, 0x54]);
+}
+
+/// Default P2P listen ports for each known Zcash network.
+pub mod default_ports {
+    /// Default mainnet P2P port.
+    pub const MAINNET: u16 = 8233;
+    /// Default public testnet P2P port.
+    pub const TESTNET: u16 = 18233;
+    /// Default NU7 testnet P2P port.
+    pub const NU7_TESTNET: u16 = 28233;
 }
 
 /// The block heights at which network upgrades activate.
