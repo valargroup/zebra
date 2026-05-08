@@ -236,16 +236,16 @@ pub fn generate_local_testnet_with_funded_keys(
     let mut magic_bytes = [0u8; 4];
     rng.fill_bytes(&mut magic_bytes);
 
-    let network = build_network(
-        &options.network_name,
+    let network = build_network(BuildNetworkOptions {
+        network_name: &options.network_name,
         genesis_hash,
-        options.latest_network_upgrade,
+        latest_network_upgrade: options.latest_network_upgrade,
         activation_height,
-        options.disable_pow,
-        &checkpoints,
+        disable_pow: options.disable_pow,
+        checkpoints: &checkpoints,
         magic_bytes,
         target_difficulty,
-    )?;
+    })?;
 
     Ok(GeneratedLocalTestnet {
         network,
@@ -342,8 +342,7 @@ fn solve_header(header: Header) -> Result<Header, crate::BoxError> {
     {
         let cancel_fn = || Ok(());
         let solved_headers =
-            Solution::solve(header, &crate::parameters::Network::Mainnet, cancel_fn)
-                .map_err(|_| "Equihash solver was cancelled")?;
+            Solution::solve(header, cancel_fn).map_err(|_| "Equihash solver was cancelled")?;
         solved_headers
             .into_iter()
             .next()
@@ -355,17 +354,30 @@ fn solve_header(header: Header) -> Result<Header, crate::BoxError> {
     }
 }
 
-/// Build a zebra-chain [`Network`] from the generated parameters.
-fn build_network(
-    network_name: &str,
+struct BuildNetworkOptions<'a> {
+    network_name: &'a str,
     genesis_hash: block::Hash,
     latest_network_upgrade: NetworkUpgrade,
     activation_height: u32,
     disable_pow: bool,
-    checkpoints: &[(Height, block::Hash)],
+    checkpoints: &'a [(Height, block::Hash)],
     magic_bytes: [u8; 4],
     target_difficulty: ExpandedDifficulty,
-) -> Result<Network, crate::BoxError> {
+}
+
+/// Build a zebra-chain [`Network`] from the generated parameters.
+fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::BoxError> {
+    let BuildNetworkOptions {
+        network_name,
+        genesis_hash,
+        latest_network_upgrade,
+        activation_height,
+        disable_pow,
+        checkpoints,
+        magic_bytes,
+        target_difficulty,
+    } = options;
+
     let activation_heights =
         configured_activation_heights(latest_network_upgrade, activation_height)?;
 
@@ -409,7 +421,11 @@ fn configured_activation_heights(
         canopy: (latest_network_upgrade >= Canopy).then_some(activation_height),
         nu5: (latest_network_upgrade >= Nu5).then_some(activation_height),
         nu6: (latest_network_upgrade >= Nu6).then_some(activation_height),
-        nu6_1: (latest_network_upgrade >= Nu6_1).then_some(activation_height),
+        // Nu6.1 is the one-time ZIP-271 lockbox disbursement event from mainnet; activating it on
+        // a local testnet would require synthesising disbursement outputs in the activation-block
+        // coinbase, which the local genesis builder does not produce. Skipping it lets NU7 activate
+        // directly without tripping the lockbox-disbursements consensus rule.
+        nu6_1: None,
         nu7: (latest_network_upgrade >= Nu7).then_some(activation_height),
     })
 }
@@ -419,7 +435,7 @@ fn hash160(data: &[u8]) -> [u8; 20] {
     use ripemd::Digest as _;
 
     let sha_hash = sha2::Sha256::digest(data);
-    let ripemd_hash = ripemd::Ripemd160::digest(&sha_hash);
+    let ripemd_hash = ripemd::Ripemd160::digest(sha_hash);
     let mut result = [0u8; 20];
     result.copy_from_slice(&ripemd_hash);
     result

@@ -16,8 +16,8 @@ use zebra_chain::{
     at_least_one,
     block::Height,
     parameters::{
-        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
-        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        testnet::ConfiguredActivationHeights, Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET,
+        ORCHARD_BLOCK_ACTION_LIMIT, SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     sapling,
     transaction::{self, LockTime, Transaction, UnminedTx, VerifiedUnminedTx},
@@ -25,7 +25,33 @@ use zebra_chain::{
 };
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::{select_mempool_transactions, BlockTemplateLimits};
+use super::{fake_coinbase_transaction, select_mempool_transactions, BlockTemplateLimits};
+
+#[test]
+fn fake_coinbase_before_branch_id_does_not_panic() -> Result<(), Box<dyn std::error::Error>> {
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            overwinter: Some(5),
+            nu7: Some(5),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let miner_address = Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]));
+
+    let fake_coinbase = fake_coinbase_transaction(
+        &network,
+        Height(4),
+        &miner_address,
+        Vec::new(),
+        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        None,
+    );
+
+    assert!(!fake_coinbase.data.as_ref().is_empty());
+
+    Ok(())
+}
 
 #[test]
 fn excludes_tx_with_unselected_dependencies() {

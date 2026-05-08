@@ -114,6 +114,7 @@ use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
     get_block_template::{
+        check_block_template_supported,
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
             ZCASHD_FUNDING_STREAM_ORDER,
@@ -2495,11 +2496,13 @@ where
         //
         // Apart from random weighted transaction selection,
         // the template only depends on the previously fetched data.
-        // This processing never fails.
+        // This processing can only fail if block template generation is unsupported
+        // at the candidate height.
 
         // Calculate the next block height.
         let next_block_height =
             (chain_tip_and_local_time.tip_height + 1).expect("tip is far below Height::MAX");
+        check_block_template_supported(&network, next_block_height)?;
 
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs

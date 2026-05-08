@@ -6,12 +6,38 @@ use zcash_transparent::address::TransparentAddress;
 use zebra_chain::{
     amount::Amount,
     block::Height,
-    parameters::testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
+    parameters::{
+        testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
+        Network,
+    },
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,
 };
 
-use super::standard_coinbase_outputs;
+use super::{check_block_template_supported, standard_coinbase_outputs};
+
+#[test]
+fn block_template_before_canopy_returns_error() -> Result<(), Box<dyn std::error::Error>> {
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            overwinter: Some(5),
+            nu7: Some(5),
+            ..Default::default()
+        }
+        .into(),
+    );
+
+    let error = check_block_template_supported(&network, Height(4))
+        .expect_err("pre-Canopy getblocktemplate should be rejected");
+
+    assert!(
+        error.message().contains("from Canopy activation onward"),
+        "unexpected error message: {error:?}"
+    );
+    assert!(check_block_template_supported(&network, Height(5)).is_ok());
+
+    Ok(())
+}
 
 /// Tests that a minimal coinbase transaction can be generated.
 #[test]

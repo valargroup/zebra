@@ -723,6 +723,31 @@ where
     Ok(())
 }
 
+/// Returns an error if Zebra can't build a block template at `height`.
+pub fn check_block_template_supported(network: &Network, height: Height) -> RpcResult<()> {
+    let current_nu = NetworkUpgrade::current(network, height);
+
+    if current_nu < NetworkUpgrade::Canopy {
+        tracing::info!(
+            ?height,
+            ?current_nu,
+            "getblocktemplate is unavailable before Canopy activation"
+        );
+
+        return Err(ErrorObject::owned(
+            ErrorCode::ServerError(-1).code(),
+            format!(
+                "getblocktemplate is unavailable at height {height:?}: \
+                 Zebra only supports generating block templates from Canopy activation onward \
+                 (current network upgrade: {current_nu:?})"
+            ),
+            None::<()>,
+        ));
+    }
+
+    Ok(())
+}
+
 // - State and mempool data fetches
 
 /// Returns the state data for the block template.
