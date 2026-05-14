@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Once},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -44,26 +44,45 @@ const SHIELDED_POOLS: [ShieldedPool; SHIELDED_POOL_COUNT] = [
     ShieldedPool::Sprout,
 ];
 const MAINNET_BLOCK_HEADER_BYTES: usize = 1_487;
-const WORKLOAD_SELECTION_STRATEGY: &str = "exact_action_mix_max_actions_under_max_block_bytes";
+const CRITERION_SAMPLE_SIZE: usize = 10;
+const ZIP1271_GLOBAL_SHIELDED_BUDGET: usize = 330;
+const ZIP1271_ORCHARD_ACTION_LIMIT: usize = 330;
+const ZIP1271_SAPLING_IO_LIMIT: usize = 300;
 
 const BENCHMARK_CASES: &[BenchmarkCase] = &[
     BenchmarkCase {
-        name: "available_orchard_heavy",
+        name: "full_orchard_limit",
         rayon_threads: 4,
         tokio_worker_threads: 4,
-        action_mix: ShieldedActionMix::new(0, 100, 0),
+        target: BenchmarkTarget::ActionLimits {
+            action_limits: ActionLimits::zip1271(0, ZIP1271_ORCHARD_ACTION_LIMIT, 0),
+        },
     },
     BenchmarkCase {
-        name: "available_sapling_heavy",
+        name: "full_sapling_limit",
         rayon_threads: 4,
         tokio_worker_threads: 4,
-        action_mix: ShieldedActionMix::new(100, 0, 0),
+        target: BenchmarkTarget::ActionLimits {
+            action_limits: ActionLimits::zip1271(ZIP1271_SAPLING_IO_LIMIT, 0, 0),
+        },
     },
     BenchmarkCase {
-        name: "available_sapling_orchard_even",
+        name: "current_light_wallet_worst_case",
         rayon_threads: 4,
         tokio_worker_threads: 4,
-        action_mix: ShieldedActionMix::new(50, 50, 0),
+        target: BenchmarkTarget::MaxSaplingOutputs,
+    },
+    BenchmarkCase {
+        name: "current_light_wallet_trial_decrypt_worst_case",
+        rayon_threads: 4,
+        tokio_worker_threads: 4,
+        target: BenchmarkTarget::MaxSaplingOutputs,
+    },
+    BenchmarkCase {
+        name: "current_full_node_worst_case",
+        rayon_threads: 4,
+        tokio_worker_threads: 4,
+        target: BenchmarkTarget::MaxSaplingSpends,
     },
 ];
 
@@ -72,7 +91,14 @@ struct BenchmarkCase {
     name: &'static str,
     rayon_threads: usize,
     tokio_worker_threads: usize,
-    action_mix: ShieldedActionMix,
+    target: BenchmarkTarget,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BenchmarkTarget {
+    MaxSaplingOutputs,
+    MaxSaplingSpends,
+    ActionLimits { action_limits: ActionLimits },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,11 +106,6 @@ enum ShieldedPool {
     Sapling,
     Orchard,
     Sprout,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ShieldedActionMix {
-    percents: [u8; SHIELDED_POOL_COUNT],
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +121,8 @@ struct CandidateTx {
 struct Workload {
     requests: Vec<Request>,
     target_action_counts: ShieldedActionCounts,
+    target_global_shielded_budget: Option<usize>,
+    selection_strategy: &'static str,
     stats: WorkloadStats,
 }
 
@@ -113,9 +136,10 @@ struct WorkloadStats {
     verifier_checks: VerifierCheckCounts,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ActionCounts {
     transparent_inputs: usize,
+    transparent_outputs: usize,
     sapling_spends: usize,
     sapling_outputs: usize,
     orchard_actions: usize,
@@ -125,6 +149,12 @@ struct ActionCounts {
 #[derive(Clone, Copy, Debug, Default)]
 struct ShieldedActionCounts {
     counts: [usize; SHIELDED_POOL_COUNT],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActionLimits {
+    pool_limits: ShieldedActionCounts,
+    global_shielded_budget: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -140,6 +170,13 @@ struct CandidateLoadStats {
     skipped_coinbase: usize,
     skipped_unsupported_version: usize,
     skipped_transparent_prevouts: usize,
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkSummary {
+    case_name: &'static str,
+    stats: WorkloadStats,
+    sample_seconds: Vec<f64>,
 }
 
 type BenchmarkMempool =
@@ -200,6 +237,8 @@ fn worst_case_tx_verification(c: &mut Criterion) {
         .build()
         .expect("tokio runtime should build for the benchmark");
 
+    let mut benchmark_summaries = Vec::new();
+
     for case in BENCHMARK_CASES {
         let Some(workload) = build_workload(case, &candidates) else {
             println!(
@@ -211,20 +250,42 @@ fn worst_case_tx_verification(c: &mut Criterion) {
 
         print_workload_metadata(case, &workload);
 
+        let mut sample_seconds = Vec::new();
+
         c.bench_with_input(
             BenchmarkId::new("tx_verifier_repeated_workload", case.name),
             &workload.requests,
             |b, requests| {
-                b.iter(|| {
-                    let verified = runtime.block_on(async {
-                        let verifier = make_transaction_verifier(requests.len().saturating_add(1));
-                        verify_requests(verifier, requests).await
-                    });
-                    black_box(verified);
+                b.iter_custom(|iterations| {
+                    let start = Instant::now();
+
+                    for _ in 0..iterations {
+                        let verified = runtime.block_on(async {
+                            let verifier =
+                                make_transaction_verifier(requests.len().saturating_add(1));
+                            verify_requests(verifier, requests).await
+                        });
+                        black_box(verified);
+                    }
+
+                    let elapsed = start.elapsed();
+                    let iterations =
+                        u32::try_from(iterations).expect("benchmark iterations fit in u32");
+                    sample_seconds.push(elapsed.as_secs_f64() / f64::from(iterations));
+
+                    elapsed
                 });
             },
         );
+
+        benchmark_summaries.push(BenchmarkSummary {
+            case_name: case.name,
+            stats: workload.stats,
+            sample_seconds,
+        });
     }
+
+    print_benchmark_summaries(&benchmark_summaries);
 }
 
 fn validate_benchmark_cases() -> &'static BenchmarkCase {
@@ -240,13 +301,6 @@ fn validate_benchmark_cases() -> &'static BenchmarkCase {
         assert_eq!(
             case.tokio_worker_threads, first_case.tokio_worker_threads,
             "global proof verifier workers are tied to the Tokio runtime; use one tokio_worker_threads value per benchmark run"
-        );
-
-        assert_eq!(
-            case.action_mix.total_percent(),
-            100,
-            "case {} must allocate exactly 100 percent of shielded pool actions",
-            case.name,
         );
     }
 
@@ -316,7 +370,45 @@ fn load_mainnet_candidates() -> (Vec<CandidateTx>, CandidateLoadStats) {
 }
 
 fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Workload> {
-    let (target_action_counts, selected) = select_best_block_workload(case, candidates)?;
+    let (target_action_counts, target_global_shielded_budget, selected, selection_strategy) =
+        match case.target {
+            BenchmarkTarget::MaxSaplingOutputs => {
+                let selected = select_sapling_output_heavy_workload(candidates)?;
+
+                (
+                    action_counts_for_selection(&selected, candidates).shielded_pool_actions(),
+                    None,
+                    selected,
+                    "max_sapling_outputs_under_max_block_bytes",
+                )
+            }
+            BenchmarkTarget::MaxSaplingSpends => {
+                let selected = select_sapling_spend_heavy_workload(candidates)?;
+
+                (
+                    action_counts_for_selection(&selected, candidates).shielded_pool_actions(),
+                    None,
+                    selected,
+                    "max_sapling_spends_under_max_block_bytes",
+                )
+            }
+            BenchmarkTarget::ActionLimits { action_limits } => {
+                let selected = select_candidates_for_limits(action_limits, candidates)?;
+                let tx_bytes = selected_tx_bytes(&selected, candidates);
+                let block_bytes = modeled_block_bytes(tx_bytes, selected.len());
+
+                if block_bytes > max_block_bytes() {
+                    return None;
+                }
+
+                (
+                    action_limits.pool_limits,
+                    Some(action_limits.global_shielded_budget),
+                    selected,
+                    "max_available_actions_under_zip1271_pool_and_global_limits_and_max_block_bytes",
+                )
+            }
+        };
 
     let mut stats = WorkloadStats::default();
     let known_outpoint_hashes = Arc::new(HashSet::new());
@@ -346,11 +438,31 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
     stats.repeated_transactions = selected.len();
     stats.modeled_block_bytes = modeled_block_bytes(stats.serialized_bytes, selected.len());
 
-    assert_eq!(
-        stats.action_counts.shielded_pool_actions().counts,
-        target_action_counts.counts,
-        "selected workload must exactly match the requested shielded pool action mix",
-    );
+    match case.target {
+        BenchmarkTarget::ActionLimits { .. } => {
+            let actual_counts = stats.action_counts.shielded_pool_actions();
+
+            for pool in SHIELDED_POOLS {
+                assert!(
+                    actual_counts.action_count(pool) <= target_action_counts.action_count(pool),
+                    "selected workload must not exceed the requested shielded pool action limits",
+                );
+            }
+            assert!(
+                stats.action_counts.global_shielded_budget()
+                    <= target_global_shielded_budget
+                        .expect("ZIP 1271 action-limit workloads have a global budget"),
+                "selected workload must not exceed the requested global shielded budget",
+            );
+        }
+        BenchmarkTarget::MaxSaplingOutputs | BenchmarkTarget::MaxSaplingSpends => {
+            assert_eq!(
+                stats.action_counts.shielded_pool_actions().counts,
+                target_action_counts.counts,
+                "selected workload must exactly match the requested shielded pool action mix",
+            );
+        }
+    }
     assert!(
         stats.modeled_block_bytes <= max_block_bytes(),
         "selected workload must fit under the max block size",
@@ -359,49 +471,115 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
     Some(Workload {
         requests,
         target_action_counts,
+        target_global_shielded_budget,
+        selection_strategy,
         stats,
     })
 }
 
-fn select_best_block_workload(
-    case: &BenchmarkCase,
-    candidates: &[CandidateTx],
-) -> Option<(ShieldedActionCounts, Vec<usize>)> {
+fn select_sapling_output_heavy_workload(candidates: &[CandidateTx]) -> Option<Vec<usize>> {
     let mut best = None;
 
-    for total_actions in 1..=max_total_actions(case.action_mix, candidates)? {
-        let target_counts = case.action_mix.target_counts(total_actions);
-        let Some(selected) = select_candidates_for_counts(target_counts, candidates) else {
-            continue;
-        };
-        let tx_bytes = selected_tx_bytes(&selected, candidates);
-        let block_bytes = modeled_block_bytes(tx_bytes, selected.len());
-
-        if block_bytes <= max_block_bytes()
-            && best
-                .as_ref()
-                .is_none_or(|(best_actions, best_bytes, _, _)| {
-                    total_actions > *best_actions
-                        || (total_actions == *best_actions && block_bytes > *best_bytes)
-                })
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.has_only_pool_actions(ShieldedPool::Sapling)
+            || candidate.counts.sapling_outputs == 0
         {
-            best = Some((total_actions, block_bytes, target_counts, selected));
+            continue;
+        }
+
+        let max_repeats = max_block_bytes() / candidate.serialized_len;
+
+        for repeats in 1..=max_repeats {
+            let tx_bytes = candidate.serialized_len * repeats;
+            let block_bytes = modeled_block_bytes(tx_bytes, repeats);
+
+            if block_bytes > max_block_bytes() {
+                break;
+            }
+
+            let output_count = candidate.counts.sapling_outputs * repeats;
+            let action_count = candidate.counts.action_count(ShieldedPool::Sapling) * repeats;
+
+            if best
+                .as_ref()
+                .is_none_or(|(best_outputs, best_actions, best_bytes, _, _)| {
+                    output_count > *best_outputs
+                        || (output_count == *best_outputs && action_count > *best_actions)
+                        || (output_count == *best_outputs
+                            && action_count == *best_actions
+                            && block_bytes > *best_bytes)
+                })
+            {
+                best = Some((output_count, action_count, block_bytes, index, repeats));
+            }
         }
     }
 
-    best.map(|(_, _, target_counts, selected)| (target_counts, selected))
+    let (_, _, _, index, repeats) = best?;
+
+    Some(vec![index; repeats])
 }
 
-fn select_candidates_for_counts(
-    target_counts: ShieldedActionCounts,
+fn select_sapling_spend_heavy_workload(candidates: &[CandidateTx]) -> Option<Vec<usize>> {
+    let mut best = None;
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.has_only_pool_actions(ShieldedPool::Sapling)
+            || candidate.counts.sapling_spends == 0
+        {
+            continue;
+        }
+
+        let max_repeats = max_block_bytes() / candidate.serialized_len;
+
+        for repeats in 1..=max_repeats {
+            let tx_bytes = candidate.serialized_len * repeats;
+            let block_bytes = modeled_block_bytes(tx_bytes, repeats);
+
+            if block_bytes > max_block_bytes() {
+                break;
+            }
+
+            let spend_count = candidate.counts.sapling_spends * repeats;
+            let action_count = candidate.counts.action_count(ShieldedPool::Sapling) * repeats;
+
+            if best
+                .as_ref()
+                .is_none_or(|(best_spends, best_actions, best_bytes, _, _)| {
+                    spend_count > *best_spends
+                        || (spend_count == *best_spends && action_count > *best_actions)
+                        || (spend_count == *best_spends
+                            && action_count == *best_actions
+                            && block_bytes > *best_bytes)
+                })
+            {
+                best = Some((spend_count, action_count, block_bytes, index, repeats));
+            }
+        }
+    }
+
+    let (_, _, _, index, repeats) = best?;
+
+    Some(vec![index; repeats])
+}
+
+fn select_candidates_for_limits(
+    action_limits: ActionLimits,
     candidates: &[CandidateTx],
 ) -> Option<Vec<usize>> {
     let mut selected = Vec::new();
+    let mut selected_counts = ActionCounts::default();
 
     for pool in SHIELDED_POOLS {
-        let target_actions = target_counts.action_count(pool);
+        let remaining_global_budget = action_limits
+            .global_shielded_budget
+            .saturating_sub(selected_counts.global_shielded_budget());
+        let action_limit = action_limits
+            .pool_limits
+            .action_count(pool)
+            .min(remaining_global_budget / pool.global_budget_per_action());
 
-        if target_actions == 0 {
+        if action_limit == 0 {
             continue;
         }
 
@@ -413,41 +591,49 @@ fn select_candidates_for_counts(
             .collect();
 
         matching_indices.sort_by_key(|index| Reverse(candidates[*index].pool_score(pool)));
-        selected.extend(select_pool_candidates(
-            pool,
-            target_actions,
-            &matching_indices,
-            candidates,
-        )?);
+
+        let pool_selected = (1..=action_limit).rev().find_map(|target_actions| {
+            select_pool_candidates_for_limits(pool, target_actions, &matching_indices, candidates)
+        })?;
+
+        for index in &pool_selected {
+            selected_counts += candidates[*index].counts;
+        }
+
+        selected.extend(pool_selected);
     }
 
     Some(selected)
 }
 
-fn select_pool_candidates(
+fn select_pool_candidates_for_limits(
     pool: ShieldedPool,
     target_actions: usize,
     matching_indices: &[usize],
     candidates: &[CandidateTx],
 ) -> Option<Vec<usize>> {
     let mut previous_selection = vec![None; target_actions.saturating_add(1)];
-    previous_selection[0] = Some((0, 0, usize::MAX));
+    previous_selection[0] = Some((0, 0, 0, usize::MAX));
 
     for selected_actions in 0..=target_actions {
-        let Some((selected_bytes, _, _)) = previous_selection[selected_actions] else {
+        let Some((selected_score, selected_bytes, _, _)) = previous_selection[selected_actions]
+        else {
             continue;
         };
 
         for &index in matching_indices {
             let candidate = &candidates[index];
             let next_actions = selected_actions.saturating_add(candidate.counts.action_count(pool));
+            let next_score = selected_score + candidate.limit_score(pool);
             let next_bytes = selected_bytes + candidate.serialized_len;
 
             if next_actions <= target_actions
-                && previous_selection[next_actions]
-                    .is_none_or(|(best_bytes, _, _)| next_bytes < best_bytes)
+                && previous_selection[next_actions].is_none_or(|(best_score, best_bytes, _, _)| {
+                    next_score > best_score || (next_score == best_score && next_bytes < best_bytes)
+                })
             {
-                previous_selection[next_actions] = Some((next_bytes, selected_actions, index));
+                previous_selection[next_actions] =
+                    Some((next_score, next_bytes, selected_actions, index));
             }
         }
     }
@@ -458,7 +644,7 @@ fn select_pool_candidates(
     let mut remaining_actions = target_actions;
 
     while remaining_actions > 0 {
-        let (_, previous_actions, index) = previous_selection[remaining_actions]?;
+        let (_, _, previous_actions, index) = previous_selection[remaining_actions]?;
 
         selected.push(index);
         remaining_actions = previous_actions;
@@ -467,34 +653,21 @@ fn select_pool_candidates(
     Some(selected)
 }
 
-fn max_total_actions(mix: ShieldedActionMix, candidates: &[CandidateTx]) -> Option<usize> {
-    SHIELDED_POOLS
-        .iter()
-        .copied()
-        .filter(|pool| mix.percent(*pool) > 0)
-        .map(|pool| {
-            let percent = usize::from(mix.percent(pool));
-
-            candidates
-                .iter()
-                .filter(|candidate| candidate.has_only_pool_actions(pool))
-                .map(|candidate| {
-                    let action_count = candidate.counts.action_count(pool);
-                    let max_repeats = max_block_bytes() / candidate.serialized_len;
-
-                    max_repeats * action_count * 100 / percent + SHIELDED_POOL_COUNT
-                })
-                .max()
-        })
-        .min()
-        .flatten()
-}
-
 fn selected_tx_bytes(selected: &[usize], candidates: &[CandidateTx]) -> usize {
     selected
         .iter()
         .map(|&index| candidates[index].serialized_len)
         .sum()
+}
+
+fn action_counts_for_selection(selected: &[usize], candidates: &[CandidateTx]) -> ActionCounts {
+    let mut action_counts = ActionCounts::default();
+
+    for &index in selected {
+        action_counts += candidates[index].counts;
+    }
+
+    action_counts
 }
 
 fn modeled_block_bytes(tx_bytes: usize, tx_count: usize) -> usize {
@@ -514,10 +687,11 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
     let requested_actions = workload.target_action_counts;
     let actual_actions = workload.stats.action_counts.shielded_pool_actions();
     let actual_total_actions = actual_actions.total();
+    let actual_global_shielded_budget = workload.stats.action_counts.global_shielded_budget();
     let stats = &workload.stats;
 
     println!(
-        "worst_case_tx_verification: case={} mode=tx verifier repeated workload target_block_bytes={} actual_block_bytes={} actual_tx_bytes={} block_fill_percent={:.2} block_bytes_remaining={} actual_shielded_pool_actions={} unique_txs={} repeated_txs={} rayon_threads={} tokio_worker_threads={} transparent_prevouts_allowed={}",
+        "worst_case_tx_verification: case={} mode=tx verifier repeated workload target_block_bytes={} actual_block_bytes={} actual_tx_bytes={} block_fill_percent={:.2} block_bytes_remaining={} actual_shielded_pool_actions={} actual_global_shielded_budget={} unique_txs={} repeated_txs={} rayon_threads={} tokio_worker_threads={} transparent_prevouts_allowed={}",
         case.name,
         max_block_bytes(),
         stats.modeled_block_bytes,
@@ -525,6 +699,7 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
         percent(stats.modeled_block_bytes, max_block_bytes()),
         max_block_bytes() - stats.modeled_block_bytes,
         actual_total_actions,
+        actual_global_shielded_budget,
         stats.unique_transactions,
         stats.repeated_transactions,
         case.rayon_threads,
@@ -534,23 +709,44 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
     println!(
         "worst_case_tx_verification: case={} workload_source=mainnet_test_vectors workload_validity=repeated_txs_not_consensus_block selection_strategy={}",
         case.name,
-        WORKLOAD_SELECTION_STRATEGY,
+        workload.selection_strategy,
     );
     println!(
-        "worst_case_tx_verification: case={} requested_pool_actions {} requested_pool_percent {}",
+        "worst_case_tx_verification: case={} requested_pool_actions {}",
         case.name,
         pool_action_fields(requested_actions),
-        pool_mix_fields(case.action_mix),
     );
+    if let Some(requested_global_shielded_budget) = workload.target_global_shielded_budget {
+        println!(
+            "worst_case_tx_verification: case={} requested_global_shielded_budget={}",
+            case.name, requested_global_shielded_budget,
+        );
+    }
+    match case.target {
+        BenchmarkTarget::MaxSaplingOutputs => {
+            println!(
+                "worst_case_tx_verification: case={} requested_workload_goal sapling_outputs=max",
+                case.name,
+            );
+        }
+        BenchmarkTarget::MaxSaplingSpends => {
+            println!(
+                "worst_case_tx_verification: case={} requested_workload_goal sapling_spends=max",
+                case.name,
+            );
+        }
+        BenchmarkTarget::ActionLimits { .. } => {}
+    }
     println!(
         "worst_case_tx_verification: case={} actual_pool_actions {}",
         case.name,
         pool_action_percent_fields(actual_actions, actual_total_actions),
     );
     println!(
-        "worst_case_tx_verification: case={} raw_actions transparent_inputs={} sapling_spends={} sapling_outputs={} orchard_actions={} sprout_joinsplits={}",
+        "worst_case_tx_verification: case={} raw_actions transparent_inputs={} transparent_outputs={} sapling_spends={} sapling_outputs={} orchard_actions={} sprout_joinsplits={}",
         case.name,
         stats.action_counts.transparent_inputs,
+        stats.action_counts.transparent_outputs,
         stats.action_counts.sapling_spends,
         stats.action_counts.sapling_outputs,
         stats.action_counts.orchard_actions,
@@ -566,12 +762,106 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
     );
 }
 
-fn pool_action_fields(counts: ShieldedActionCounts) -> String {
-    pool_fields(|pool| format!("{}={}", pool.name(), counts.action_count(pool)))
+fn print_benchmark_summaries(summaries: &[BenchmarkSummary]) {
+    println!("worst_case_tx_verification_summary_csv:");
+    println!(
+        "case,total_bytes,tx_bytes,block_fill_percent,repeated_txs,unique_txs,transparent_inputs,transparent_outputs,sapling_spends,sapling_outputs,sapling_actions,orchard_actions,sprout_joinsplits,total_shielded_actions,global_shielded_budget,sapling_bundles,orchard_bundles,sprout_joinsplit_proofs,sprout_signatures,mean_ms,stddev_ms,time_ms"
+    );
+
+    for summary in summaries {
+        let Some((mean_seconds, stddev_seconds)) = mean_and_stddev(summary_samples(summary)) else {
+            println!(
+                "{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},not_run,not_run,not_run",
+                summary.case_name,
+                summary.stats.modeled_block_bytes,
+                summary.stats.serialized_bytes,
+                percent(summary.stats.modeled_block_bytes, max_block_bytes()),
+                summary.stats.repeated_transactions,
+                summary.stats.unique_transactions,
+                summary.stats.action_counts.transparent_inputs,
+                summary.stats.action_counts.transparent_outputs,
+                summary.stats.action_counts.sapling_spends,
+                summary.stats.action_counts.sapling_outputs,
+                summary
+                    .stats
+                    .action_counts
+                    .action_count(ShieldedPool::Sapling),
+                summary.stats.action_counts.orchard_actions,
+                summary.stats.action_counts.sprout_joinsplits,
+                summary.stats.action_counts.shielded_pool_actions().total(),
+                summary.stats.action_counts.global_shielded_budget(),
+                summary.stats.verifier_checks.sapling_bundles,
+                summary.stats.verifier_checks.orchard_bundles,
+                summary.stats.verifier_checks.sprout_joinsplit_proofs,
+                summary.stats.verifier_checks.sprout_signatures,
+            );
+            continue;
+        };
+
+        let mean_ms = mean_seconds * 1_000.0;
+        let stddev_ms = stddev_seconds * 1_000.0;
+
+        println!(
+            "{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3} +/- {:.3} ms",
+            summary.case_name,
+            summary.stats.modeled_block_bytes,
+            summary.stats.serialized_bytes,
+            percent(summary.stats.modeled_block_bytes, max_block_bytes()),
+            summary.stats.repeated_transactions,
+            summary.stats.unique_transactions,
+            summary.stats.action_counts.transparent_inputs,
+            summary.stats.action_counts.transparent_outputs,
+            summary.stats.action_counts.sapling_spends,
+            summary.stats.action_counts.sapling_outputs,
+            summary.stats.action_counts.action_count(ShieldedPool::Sapling),
+            summary.stats.action_counts.orchard_actions,
+            summary.stats.action_counts.sprout_joinsplits,
+            summary.stats.action_counts.shielded_pool_actions().total(),
+            summary.stats.action_counts.global_shielded_budget(),
+            summary.stats.verifier_checks.sapling_bundles,
+            summary.stats.verifier_checks.orchard_bundles,
+            summary.stats.verifier_checks.sprout_joinsplit_proofs,
+            summary.stats.verifier_checks.sprout_signatures,
+            mean_ms,
+            stddev_ms,
+            mean_ms,
+            stddev_ms,
+        );
+    }
 }
 
-fn pool_mix_fields(mix: ShieldedActionMix) -> String {
-    pool_fields(|pool| format!("{}={}", pool.name(), mix.percent(pool)))
+fn summary_samples(summary: &BenchmarkSummary) -> &[f64] {
+    let sample_count = summary.sample_seconds.len();
+    let start = sample_count.saturating_sub(CRITERION_SAMPLE_SIZE);
+
+    &summary.sample_seconds[start..]
+}
+
+fn mean_and_stddev(samples: &[f64]) -> Option<(f64, f64)> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let sample_count = u32::try_from(samples.len()).expect("benchmark sample count fits in u32");
+    let mean = samples.iter().sum::<f64>() / f64::from(sample_count);
+    let variance = if samples.len() > 1 {
+        samples
+            .iter()
+            .map(|sample| {
+                let difference = sample - mean;
+                difference * difference
+            })
+            .sum::<f64>()
+            / f64::from(sample_count - 1)
+    } else {
+        0.0
+    };
+
+    Some((mean, variance.sqrt()))
+}
+
+fn pool_action_fields(counts: ShieldedActionCounts) -> String {
+    pool_fields(|pool| format!("{}={}", pool.name(), counts.action_count(pool)))
 }
 
 fn pool_action_percent_fields(counts: ShieldedActionCounts, total: usize) -> String {
@@ -666,6 +956,13 @@ impl CandidateTx {
             self.counts.sapling_outputs,
         )
     }
+
+    fn limit_score(&self, pool: ShieldedPool) -> usize {
+        match pool {
+            ShieldedPool::Sapling => self.counts.sapling_spends,
+            ShieldedPool::Orchard | ShieldedPool::Sprout => self.counts.action_count(pool),
+        }
+    }
 }
 
 impl ShieldedPool {
@@ -684,6 +981,13 @@ impl ShieldedPool {
             ShieldedPool::Sprout => "sprout",
         }
     }
+
+    const fn global_budget_per_action(self) -> usize {
+        match self {
+            ShieldedPool::Sapling | ShieldedPool::Orchard => 1,
+            ShieldedPool::Sprout => 2,
+        }
+    }
 }
 
 impl ActionCounts {
@@ -694,6 +998,7 @@ impl ActionCounts {
                 .iter()
                 .filter(|input| matches!(input, transparent::Input::PrevOut { .. }))
                 .count(),
+            transparent_outputs: transaction.outputs().len(),
             sapling_spends: transaction.sapling_spends_per_anchor().count(),
             sapling_outputs: transaction.sapling_outputs().count(),
             orchard_actions: transaction.orchard_actions().count(),
@@ -715,6 +1020,13 @@ impl ActionCounts {
         }
     }
 
+    fn global_shielded_budget(&self) -> usize {
+        self.sapling_spends
+            + self.sapling_outputs
+            + self.orchard_actions
+            + self.sprout_joinsplits * ShieldedPool::Sprout.global_budget_per_action()
+    }
+
     fn verifier_check_counts(&self) -> VerifierCheckCounts {
         VerifierCheckCounts {
             sapling_bundles: usize::from(self.sapling_spends + self.sapling_outputs > 0),
@@ -725,49 +1037,13 @@ impl ActionCounts {
     }
 }
 
-impl ShieldedActionMix {
-    const fn new(sapling_percent: u8, orchard_percent: u8, sprout_percent: u8) -> Self {
-        Self {
-            percents: [sapling_percent, orchard_percent, sprout_percent],
-        }
-    }
-
-    fn total_percent(&self) -> u16 {
-        self.percents
-            .iter()
-            .map(|percent| u16::from(*percent))
-            .sum()
-    }
-
-    fn percent(&self, pool: ShieldedPool) -> u8 {
-        self.percents[pool.index()]
-    }
-
-    fn target_counts(&self, total_actions: usize) -> ShieldedActionCounts {
-        let mut targets = self
-            .percents
-            .map(|percent| total_actions * usize::from(percent) / 100);
-        let mut remainders = self
-            .percents
-            .map(|percent| total_actions * usize::from(percent) % 100);
-        let assigned_actions: usize = targets.iter().sum();
-
-        for _ in assigned_actions..total_actions {
-            let (index, _) = remainders
-                .iter()
-                .enumerate()
-                .max_by_key(|(index, remainder)| (**remainder, self.percents[*index]))
-                .expect("shielded pool action percentages should not be empty");
-
-            targets[index] += 1;
-            remainders[index] = 0;
-        }
-
-        ShieldedActionCounts { counts: targets }
-    }
-}
-
 impl ShieldedActionCounts {
+    const fn new(sapling: usize, orchard: usize, sprout: usize) -> Self {
+        Self {
+            counts: [sapling, orchard, sprout],
+        }
+    }
+
     fn total(&self) -> usize {
         self.counts.iter().sum()
     }
@@ -777,9 +1053,19 @@ impl ShieldedActionCounts {
     }
 }
 
+impl ActionLimits {
+    const fn zip1271(sapling: usize, orchard: usize, sprout: usize) -> Self {
+        Self {
+            pool_limits: ShieldedActionCounts::new(sapling, orchard, sprout),
+            global_shielded_budget: ZIP1271_GLOBAL_SHIELDED_BUDGET,
+        }
+    }
+}
+
 impl std::ops::AddAssign for ActionCounts {
     fn add_assign(&mut self, rhs: Self) {
         self.transparent_inputs += rhs.transparent_inputs;
+        self.transparent_outputs += rhs.transparent_outputs;
         self.sapling_spends += rhs.sapling_spends;
         self.sapling_outputs += rhs.sapling_outputs;
         self.orchard_actions += rhs.orchard_actions;
@@ -800,7 +1086,7 @@ criterion_group!(
     name = benches;
     config = Criterion::default()
         .noise_threshold(0.05)
-        .sample_size(10)
+        .sample_size(CRITERION_SAMPLE_SIZE)
         .measurement_time(Duration::from_secs(30));
     targets = worst_case_tx_verification
 );
