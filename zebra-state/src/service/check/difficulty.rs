@@ -794,7 +794,16 @@ mod tests {
                 })
                 .collect();
 
-        let mut elapsed_since_shock_seconds = 0.0;
+        // The last pre-shock block is anchored at `shock_time -
+        // target_spacing_seconds` (see the chain construction above:
+        // `blocks_before_shock == 1` => `shock_time - target_spacing`).
+        // Post-shock block times are `shock_time + elapsed_since_shock_seconds`.
+        // Starting the accumulator at 0 would place the first post-shock block
+        // a full `target_spacing` too late, injecting one extra target-spacing
+        // of slowness into the first difficulty-averaging window (the boundary
+        // "seam"). Seed it one target-spacing back so the first post-shock
+        // interval is exactly one (hash-rate-adjusted) spacing, not two.
+        let mut elapsed_since_shock_seconds = -(scenario.target_spacing_seconds as f64);
         let mut recovery = None;
 
         for height in SHOCK_HEIGHT..SHOCK_HEIGHT + scenario.blocks_after_shock {
