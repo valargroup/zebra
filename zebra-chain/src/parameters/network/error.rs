@@ -51,6 +51,10 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     OutOfOrderUpgrades,
 
+    #[error("V4 deprecation height must be after NU7 activation height")]
+    #[non_exhaustive]
+    InvalidV4DeprecationHeight,
+
     #[error("difficulty limits are valid expanded values")]
     #[non_exhaustive]
     InvaildDifficultyLimits,

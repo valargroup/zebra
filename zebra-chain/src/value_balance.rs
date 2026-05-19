@@ -26,6 +26,10 @@ pub struct ValueBalance<C> {
     sapling: Amount<C>,
     orchard: Amount<C>,
     deferred: Amount<C>,
+    /// Long-Term Support (NSM/ZIP-234) chain value pool balance.
+    /// Always zero pre-NU7. Without the `cfg(zcash_unstable = "nsm")` build
+    /// cfg, no inflow or outflow is ever recorded, so this stays at zero.
+    lts: Amount<C>,
 }
 
 impl<C> ValueBalance<C>
@@ -126,6 +130,17 @@ where
         self
     }
 
+    /// Returns the LTS pool amount.
+    pub fn lts_amount(&self) -> Amount<C> {
+        self.lts
+    }
+
+    /// Sets the LTS pool amount without affecting other amounts.
+    pub fn set_lts_amount(&mut self, lts_amount: Amount<C>) -> &Self {
+        self.lts = lts_amount;
+        self
+    }
+
     /// Creates a [`ValueBalance`] where all the pools are zero.
     pub fn zero() -> Self {
         let zero = Amount::zero();
@@ -135,6 +150,7 @@ where
             sapling: zero,
             orchard: zero,
             deferred: zero,
+            lts: zero,
         }
     }
 
@@ -150,6 +166,7 @@ where
             sapling: self.sapling.constrain().map_err(Sapling)?,
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
+            lts: self.lts.constrain().map_err(Lts)?,
         })
     }
 }
@@ -319,20 +336,21 @@ impl ValueBalance<NonNegative> {
     }
 
     /// To byte array
-    pub fn to_bytes(self) -> [u8; 40] {
+    pub fn to_bytes(self) -> [u8; 48] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
             self.sapling.to_bytes(),
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
+            self.lts.to_bytes(),
         ]
         .concat()
         .try_into()
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "five [u8; 8] should always concat with no error into a single [u8; 40]"
+                "six [u8; 8] should always concat with no error into a single [u8; 48]"
             ),
         }
     }
@@ -344,47 +362,36 @@ impl ValueBalance<NonNegative> {
 
         // Return an error early if bytes don't have the right length instead of panicking later.
         match bytes_length {
-            32 | 40 => {}
+            32 | 40 | 48 => {}
             _ => return Err(Unparsable),
         };
 
-        let transparent = Amount::from_bytes(
-            bytes[0..8]
-                .try_into()
-                .expect("transparent amount should be parsable"),
-        )
-        .map_err(Transparent)?;
-
-        let sprout = Amount::from_bytes(
-            bytes[8..16]
-                .try_into()
-                .expect("sprout amount should be parsable"),
-        )
-        .map_err(Sprout)?;
-
-        let sapling = Amount::from_bytes(
-            bytes[16..24]
-                .try_into()
-                .expect("sapling amount should be parsable"),
-        )
-        .map_err(Sapling)?;
-
-        let orchard = Amount::from_bytes(
-            bytes[24..32]
-                .try_into()
-                .expect("orchard amount should be parsable"),
-        )
-        .map_err(Orchard)?;
-
-        let deferred = match bytes_length {
-            32 => Amount::zero(),
-            40 => Amount::from_bytes(
-                bytes[32..40]
+        // Each pool is a little-endian i64 at a fixed 8-byte offset. Pools
+        // past the end of the input default to zero, so legacy 32- and
+        // 40-byte records still parse.
+        let amount = |range: std::ops::Range<usize>,
+                      map_err: fn(amount::Error) -> ValueBalanceError| {
+            Amount::from_bytes(
+                bytes[range]
                     .try_into()
-                    .expect("deferred amount should be parsable"),
+                    .expect("an 8-byte slice always parses into an Amount"),
             )
-            .map_err(Deferred)?,
-            _ => return Err(Unparsable),
+            .map_err(map_err)
+        };
+
+        let transparent = amount(0..8, Transparent)?;
+        let sprout = amount(8..16, Sprout)?;
+        let sapling = amount(16..24, Sapling)?;
+        let orchard = amount(24..32, Orchard)?;
+        let deferred = if bytes_length >= 40 {
+            amount(32..40, Deferred)?
+        } else {
+            Amount::zero()
+        };
+        let lts = if bytes_length >= 48 {
+            amount(40..48, Lts)?
+        } else {
+            Amount::zero()
         };
 
         Ok(ValueBalance {
@@ -393,6 +400,7 @@ impl ValueBalance<NonNegative> {
             sapling,
             orchard,
             deferred,
+            lts,
         })
     }
 }
@@ -415,6 +423,9 @@ pub enum ValueBalanceError {
     /// deferred amount error {0}
     Deferred(amount::Error),
 
+    /// LTS amount error {0}
+    Lts(amount::Error),
+
     /// ValueBalance is unparsable
     Unparsable,
 }
@@ -427,6 +438,7 @@ impl fmt::Display for ValueBalanceError {
             Sapling(e) => format!("sapling amount err: {e}"),
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
+            Lts(e) => format!("lts amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
     }
@@ -444,6 +456,7 @@ where
             sapling: (self.sapling + rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
+            lts: (self.lts + rhs.lts).map_err(Lts)?,
         })
     }
 }
@@ -493,6 +506,7 @@ where
             sapling: (self.sapling - rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
+            lts: (self.lts - rhs.lts).map_err(Lts)?,
         })
     }
 }
@@ -562,6 +576,7 @@ where
             sapling: self.sapling.neg(),
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
+            lts: self.lts.neg(),
         }
     }
 }

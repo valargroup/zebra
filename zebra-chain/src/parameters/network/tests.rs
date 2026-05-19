@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_in_result)]
 
+#[cfg(zcash_unstable = "nsm")]
+mod lts;
 mod prop;
 mod vectors;
 

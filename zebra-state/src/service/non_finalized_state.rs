@@ -588,8 +588,23 @@ impl NonFinalizedState {
             &prepared,
         );
 
+        // ZIP-234/235 Long-Term Support pool payout check. Re-derives the
+        // miner's implied claim from the block bytes (mirroring the semantic
+        // verifier's value-balance equation) and confirms it matches the
+        // per-era payout rate derived from the chain's LTS pool history.
+        #[cfg(zcash_unstable = "nsm")]
+        check::lts::check_claimed_lts_payout(
+            &self.network,
+            &new_chain,
+            finalized_state,
+            prepared.height,
+            &prepared.block,
+            &transparent::utxos_from_ordered_utxos(spent_utxos.clone()),
+        )?;
+
         // Quick check that doesn't read from disk
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        #[cfg_attr(not(zcash_unstable = "nsm"), allow(unused_mut))]
+        let mut contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             prepared.clone(),
             spent_utxos.clone(),
         )
@@ -602,6 +617,31 @@ impl NonFinalizedState {
                 spent_utxo_count: spent_utxos.len(),
             }
         })?;
+
+        // Set the LTS pool delta from chain history. Done *after*
+        // `check_claimed_lts_payout` has confirmed the miner's implied claim
+        // equals the expected payout, so we can use the same expected value
+        // here without re-deriving it from the block.
+        #[cfg(zcash_unstable = "nsm")]
+        {
+            let parent_lts_pool = new_chain.chain_value_pools.lts_amount();
+            let lts_delta = check::lts::block_lts_pool_delta(
+                &prepared.block,
+                &self.network,
+                prepared.height,
+                parent_lts_pool,
+            )
+            .map_err(|value_balance_error| {
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error,
+                    height: prepared.height,
+                    block_hash: prepared.hash,
+                    transaction_count: prepared.block.transactions.len(),
+                    spent_utxo_count: spent_utxos.len(),
+                }
+            })?;
+            contextual.chain_value_pool_change.set_lts_amount(lts_delta);
+        }
 
         Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)
     }

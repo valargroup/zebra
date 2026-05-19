@@ -29,7 +29,7 @@ use zebra_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[cfg(any(all(zcash_unstable = "nu7", feature = "tx_v6"), zcash_unstable = "nsm"))]
 use crate::methods::Amount;
 
 #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
@@ -41,6 +41,8 @@ mod tests;
 #[cfg(test)]
 use crate::methods::types::get_block_template::InBlockTxDependenciesDepth;
 
+#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+use super::resolve_coinbase_zip233_amount;
 use super::standard_coinbase_outputs;
 
 /// Used in the return type of [`select_mempool_transactions()`] for test compilations.
@@ -253,9 +255,23 @@ pub fn fake_coinbase_transaction(
     // so one zat has the same size as the real amount:
     // https://developer.bitcoin.org/reference/transactions.html#txout-a-transaction-output
     let miner_fee = 1.try_into().expect("amount is valid and non-negative");
-    let outputs = standard_coinbase_outputs(net, height, miner_address, miner_fee);
-
     let network_upgrade = NetworkUpgrade::current(net, height);
+    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+    let zip233_amount = resolve_coinbase_zip233_amount(network_upgrade, zip233_amount, miner_fee);
+    // The LTS payout and ZIP-233 transparent-output adjustment only affect the
+    // i64 amount in the miner's transparent output, not its serialized size or
+    // sigop count, so the fake coinbase used for transaction selection
+    // budgeting can ignore them.
+    let outputs = standard_coinbase_outputs(
+        net,
+        height,
+        miner_address,
+        miner_fee,
+        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        Amount::zero(),
+        #[cfg(zcash_unstable = "nsm")]
+        Amount::zero(),
+    );
 
     #[cfg(not(all(zcash_unstable = "nu7", feature = "tx_v6")))]
     let coinbase = if network_upgrade.branch_id().is_none() {
@@ -275,7 +291,7 @@ pub fn fake_coinbase_transaction(
             height,
             outputs,
             extra_coinbase_data,
-            zip233_amount,
+            Some(zip233_amount),
             #[cfg(zcash_unstable = "zip235")]
             miner_fee,
         )

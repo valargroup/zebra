@@ -13,11 +13,12 @@ const DEFAULT_RUST_VERSION: &str = "1.91";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
 const OUTPUT_BINARY_NAME: &str = "zebra";
 
-// Enable the NU7 + NSM (ZIP-235) consensus paths gated behind the `zcash_unstable`
+// Enable the NU7 + ZIP-235 + NSM consensus paths gated behind the `zcash_unstable`
 // custom cfg. Multiple `--cfg key="value"` flags compose: `cfg(zcash_unstable = "X")`
-// passes if any of the supplied values matches.
+// passes if any of the supplied values matches. `nsm` implies that `zip235` is
+// also set (the NSM payout sits on top of the ZIP-235 LTS pool plumbing).
 const DEFAULT_RUSTFLAGS: &str =
-    "--cfg zcash_unstable=\"nu7\" --cfg zcash_unstable=\"zip235\"";
+    "--cfg zcash_unstable=\"nu7\" --cfg zcash_unstable=\"zip235\" --cfg zcash_unstable=\"nsm\"";
 
 type BoxError = Box<dyn Error>;
 

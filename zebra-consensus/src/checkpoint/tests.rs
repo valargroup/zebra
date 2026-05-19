@@ -814,3 +814,103 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     Ok(())
 }
+
+/// Constructing a `CheckpointVerifier` whose final checkpoint is at or above
+/// `lts_disbursement_start(network)` must panic, because the checkpoint
+/// verifier finalises blocks without running the contextual LTS payout check.
+#[cfg(zcash_unstable = "nsm")]
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "lts_disbursement_start")]
+async fn checkpoint_at_lts_disbursement_start_panics() {
+    use zebra_chain::parameters::{
+        subsidy::lts_disbursement_start,
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    // Regtest-style network with NU7 active so `lts_disbursement_start`
+    // returns Some. A small halving interval keeps the resulting height
+    // small. The actual value doesn't matter — we read it back at runtime.
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(block::Height::MIN)
+        .with_halving_interval(144)
+        .expect("halving interval is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu7: Some(10),
+        })
+        .expect("activation heights are monotonic")
+        .extend_funding_streams()
+        .to_network()
+        .expect("network builds");
+
+    let disbursement_start = lts_disbursement_start(&network)
+        .expect("NU7 + Blossom configured, so lts_disbursement_start is Some");
+
+    // Smallest violating list: genesis + a checkpoint exactly at disbursement_start.
+    let checkpoints = vec![
+        (block::Height(0), block::Hash([0xaa; 32])),
+        (disbursement_start, block::Hash([0xbb; 32])),
+    ];
+
+    let state_service = zebra_state::init_test(&network).await;
+    let _ = CheckpointVerifier::from_list(checkpoints, &network, None, state_service);
+}
+
+/// A `CheckpointVerifier` whose final checkpoint sits one block below
+/// `lts_disbursement_start(network)` must construct successfully — that's the
+/// largest valid range.
+#[cfg(zcash_unstable = "nsm")]
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_just_below_lts_disbursement_start_succeeds() {
+    use zebra_chain::parameters::{
+        subsidy::lts_disbursement_start,
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(block::Height::MIN)
+        .with_halving_interval(144)
+        .expect("halving interval is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu7: Some(10),
+        })
+        .expect("activation heights are monotonic")
+        .extend_funding_streams()
+        .to_network()
+        .expect("network builds");
+
+    let disbursement_start = lts_disbursement_start(&network)
+        .expect("NU7 + Blossom configured, so lts_disbursement_start is Some");
+    let last_valid = block::Height(disbursement_start.0 - 1);
+
+    let checkpoints = vec![
+        (block::Height(0), block::Hash([0xcc; 32])),
+        (last_valid, block::Hash([0xdd; 32])),
+    ];
+
+    let state_service = zebra_state::init_test(&network).await;
+    // Must not panic.
+    let _ = CheckpointVerifier::from_list(checkpoints, &network, None, state_service)
+        .expect("checkpoint list one below disbursement_start is accepted");
+}

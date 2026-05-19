@@ -294,6 +294,14 @@ impl Network {
             .expect("Sapling activation height needs to be set")
     }
 
+    /// Returns the height where V4 transactions stop being accepted.
+    pub fn v4_deprecation_height(&self) -> Option<Height> {
+        match self {
+            Self::Mainnet => None,
+            Self::Testnet(params) => params.v4_deprecation_height(),
+        }
+    }
+
     /// Returns the expected total value of the sum of all NU6.1 one-time lockbox disbursement output values for this network at
     /// the provided height.
     pub fn lockbox_disbursement_total_amount(&self, height: Height) -> Amount<NonNegative> {

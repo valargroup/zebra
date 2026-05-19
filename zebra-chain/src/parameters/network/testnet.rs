@@ -455,6 +455,8 @@ pub struct ParametersBuilder {
     genesis_hash: block::Hash,
     /// The network upgrade activation heights for this network, see [`Parameters::activation_heights`] for more details.
     activation_heights: BTreeMap<Height, NetworkUpgrade>,
+    /// The height at which V4 transactions are no longer accepted.
+    v4_deprecation_height: Option<Height>,
     /// Slow start interval for this network
     slow_start_interval: Height,
     /// Funding streams for this network
@@ -492,6 +494,7 @@ impl Default for ParametersBuilder {
             //
             // `Genesis` network upgrade activation height must always be 0
             activation_heights: TESTNET_ACTIVATION_HEIGHTS.iter().cloned().collect(),
+            v4_deprecation_height: None,
             genesis_hash: TESTNET_GENESIS_HASH
                 .parse()
                 .expect("hard-coded hash parses"),
@@ -673,6 +676,17 @@ impl ParametersBuilder {
         Ok(self)
     }
 
+    /// Sets the height where V4 transactions stop being accepted.
+    pub fn with_v4_deprecation_height(mut self, height: Height) -> Self {
+        self.v4_deprecation_height = Some(height);
+        self
+    }
+
+    fn with_optional_v4_deprecation_height(mut self, height: Option<Height>) -> Self {
+        self.v4_deprecation_height = height;
+        self
+    }
+
     /// Sets the slow start interval to be used in the [`Parameters`] being built.
     pub fn with_slow_start_interval(mut self, slow_start_interval: Height) -> Self {
         self.slow_start_interval = slow_start_interval;
@@ -827,6 +841,7 @@ impl ParametersBuilder {
             network_magic,
             genesis_hash,
             activation_heights,
+            v4_deprecation_height,
             slow_start_interval,
             funding_streams,
             should_lock_funding_stream_address_period: _,
@@ -844,6 +859,7 @@ impl ParametersBuilder {
             network_magic,
             genesis_hash,
             activation_heights,
+            v4_deprecation_height,
             slow_start_interval,
             slow_start_shift: Height(slow_start_interval.0 / 2),
             funding_streams,
@@ -863,9 +879,28 @@ impl ParametersBuilder {
         Network::new_configured_testnet(self.clone().finish())
     }
 
+    fn validate_v4_deprecation_height(&self) -> Result<(), ParametersBuilderError> {
+        let Some(v4_deprecation_height) = self.v4_deprecation_height else {
+            return Ok(());
+        };
+
+        let network = self.to_network_unchecked();
+        let Some(nu7_activation_height) = NetworkUpgrade::Nu7.activation_height(&network) else {
+            return Err(ParametersBuilderError::InvalidV4DeprecationHeight);
+        };
+
+        if v4_deprecation_height <= nu7_activation_height {
+            return Err(ParametersBuilderError::InvalidV4DeprecationHeight);
+        }
+
+        Ok(())
+    }
+
     /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
+
+        self.validate_v4_deprecation_height()?;
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         for fs in &self.funding_streams {
@@ -891,6 +926,7 @@ impl ParametersBuilder {
             network_magic,
             genesis_hash,
             activation_heights,
+            v4_deprecation_height,
             slow_start_interval,
             funding_streams,
             should_lock_funding_stream_address_period: _,
@@ -905,6 +941,7 @@ impl ParametersBuilder {
         } = Self::default();
 
         self.activation_heights == activation_heights
+            && self.v4_deprecation_height == v4_deprecation_height
             && self.network_magic == network_magic
             && self.genesis_hash == genesis_hash
             && self.slow_start_interval == slow_start_interval
@@ -924,6 +961,8 @@ impl ParametersBuilder {
 pub struct RegtestParameters {
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,
+    /// The height at which V4 transactions are no longer accepted on Regtest.
+    pub v4_deprecation_height: Option<Height>,
     /// Configured funding streams
     pub funding_streams: Option<Vec<ConfiguredFundingStreams>>,
     /// Expected one-time lockbox disbursement outputs in NU6.1 activation block coinbase for Regtest
@@ -954,6 +993,8 @@ pub struct Parameters {
     genesis_hash: block::Hash,
     /// The network upgrade activation heights for this network.
     activation_heights: BTreeMap<Height, NetworkUpgrade>,
+    /// The height at which V4 transactions are no longer accepted.
+    v4_deprecation_height: Option<Height>,
     /// Slow start interval for this network
     slow_start_interval: Height,
     /// Slow start shift for this network, always half the slow start interval
@@ -1015,6 +1056,7 @@ impl Parameters {
     pub fn new_regtest(
         RegtestParameters {
             activation_heights,
+            v4_deprecation_height,
             funding_streams,
             lockbox_disbursements,
             checkpoints,
@@ -1031,10 +1073,13 @@ impl Parameters {
             // Removes default Testnet activation heights if not configured,
             // most network upgrades are disabled by default for Regtest in zcashd
             .with_activation_heights(activation_heights.for_regtest())?
+            .with_optional_v4_deprecation_height(v4_deprecation_height)
             .with_halving_interval(PRE_BLOSSOM_REGTEST_HALVING_INTERVAL)?
             .with_funding_streams(funding_streams.unwrap_or_default())
             .with_lockbox_disbursements(lockbox_disbursements.unwrap_or_default())
             .with_checkpoints(checkpoints.unwrap_or_default())?;
+
+        parameters.validate_v4_deprecation_height()?;
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
@@ -1065,6 +1110,7 @@ impl Parameters {
             genesis_hash,
             // Activation heights are configurable on Regtest
             activation_heights: _,
+            v4_deprecation_height: _,
             slow_start_interval,
             slow_start_shift,
             funding_streams: _,
@@ -1108,6 +1154,11 @@ impl Parameters {
     /// Returns the network upgrade activation heights
     pub fn activation_heights(&self) -> &BTreeMap<Height, NetworkUpgrade> {
         &self.activation_heights
+    }
+
+    /// Returns the height where V4 transactions stop being accepted.
+    pub fn v4_deprecation_height(&self) -> Option<Height> {
+        self.v4_deprecation_height
     }
 
     /// Returns slow start interval for this network

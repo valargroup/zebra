@@ -2534,6 +2534,18 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
+        // Compute the LTS (NSM / ZIP-234) payout the coinbase is allowed to
+        // claim at `next_block_height`, so the generated coinbase passes the
+        // contextual verifier when the resulting block is submitted. Zero
+        // outside the disbursement window.
+        #[cfg(zcash_unstable = "nsm")]
+        let lts_payout = types::get_block_template::expected_lts_payout(
+            &network,
+            next_block_height,
+            read_state.clone(),
+        )
+        .await?;
+
         let response = BlockTemplateResponse::new_internal(
             &network,
             &miner_address,
@@ -2544,6 +2556,8 @@ where
             extra_coinbase_data,
             #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
             None,
+            #[cfg(zcash_unstable = "nsm")]
+            lts_payout,
         );
 
         Ok(response.into())

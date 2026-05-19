@@ -262,6 +262,25 @@ where
     ) -> Self {
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
+
+        // The checkpoint verifier finalises blocks without running the
+        // contextual LTS payout check, so the checkpoint range must end
+        // strictly below `lts_disbursement_start`. Lifting this requires
+        // teaching the checkpoint path to validate per-block LTS payouts
+        // (see `flup_dispersment.md`).
+        #[cfg(zcash_unstable = "nsm")]
+        if let Some(disbursement_start) =
+            zebra_chain::parameters::subsidy::lts_disbursement_start(network)
+        {
+            let max_height = checkpoint_list.max_height();
+            assert!(
+                max_height < disbursement_start,
+                "final checkpoint at {max_height:?} must be below \
+                 lts_disbursement_start {disbursement_start:?} on {network:?}: \
+                 the checkpoint verifier does not validate LTS payouts"
+            );
+        }
+
         let (initial_tip_hash, verifier_progress) =
             progress_from_tip(&checkpoint_list, initial_tip);
 

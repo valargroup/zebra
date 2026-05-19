@@ -374,15 +374,16 @@ mod tests {
 
     use zebra_chain::{
         block,
-        parameters::{testnet, ParameterDifficulty},
+        parameters::testnet,
         serialization::Duration32,
+        work::difficulty::ParameterDifficulty,
     };
 
     #[test]
     fn get_block_template_testnet_min_difficulty_uses_candidate_height_spacing() {
         let previous_block_height = Height(2_999_999);
         let candidate_block_height = (previous_block_height + 1).unwrap();
-        let previous_block_time = DateTime32::from_seconds(1_000);
+        let previous_block_time = DateTime32::from(1_000u32);
 
         let network = testnet::Parameters::build()
             .with_activation_heights(testnet::ConfiguredActivationHeights {

@@ -225,22 +225,34 @@ impl Block {
     /// UTXOs, which are ignored.
     ///
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
+    ///
+    /// The Long-Term Support (NSM / ZIP-234) pool delta is **not** set here.
+    /// The `lts` leg of the returned [`ValueBalance`] is left at zero;
+    /// callers that track the LTS pool must compute
+    /// `+coinbase.zip233_amount − expected_lts_payout` themselves and call
+    /// [`set_lts_amount`] on the result. This keeps `chain_value_pool_change`
+    /// purely a function of the block bytes and spent UTXOs, with no
+    /// dependency on contextual chain history.
+    ///
+    /// [`set_lts_amount`]: crate::value_balance::ValueBalance::set_lts_amount
     pub fn chain_value_pool_change(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        Ok(*self
+        let mut value_balance = self
             .transactions
             .iter()
             .flat_map(|t| t.value_balance(utxos))
             .sum::<Result<ValueBalance<NegativeAllowed>, _>>()?
-            .neg()
-            .set_deferred_amount(
-                deferred_pool_balance_change
-                    .map(DeferredPoolBalanceChange::value)
-                    .unwrap_or_default(),
-            ))
+            .neg();
+        value_balance.set_deferred_amount(
+            deferred_pool_balance_change
+                .map(DeferredPoolBalanceChange::value)
+                .unwrap_or_default(),
+        );
+
+        Ok(value_balance)
     }
 
     /// Compute the root of the authorizing data Merkle tree,

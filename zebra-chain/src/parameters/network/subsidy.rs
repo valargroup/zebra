@@ -540,6 +540,92 @@ pub fn founders_reward_address(net: &Network, height: Height) -> Option<transpar
         .and_then(|a| a.parse().ok())
 }
 
+/// First block at which Long-Term Support (LTS / NSM) payouts begin: two
+/// halvenings after NU7 activation. Returns `None` on networks where NU7
+/// isn't configured, or where the resulting halving index can't be mapped to
+/// a height (e.g. far-future overflow).
+///
+/// `lts_disbursement_start = height_for_halving(halving(NU7) + 2, network)`
+///
+/// Before this height the LTS pool only accumulates (via the ZIP-235 60% fee
+/// floor); from this height onward, each block's coinbase may claim an extra
+/// `lts_payout` amount on top of `block_subsidy + miner_fees`.
+///
+/// Build-cfg note: every NSM site is gated by `cfg(zcash_unstable = "nsm")`.
+/// NSM sits on top of the ZIP-235 LTS pool plumbing, so `zcash_unstable =
+/// "nsm"` implies `zcash_unstable = "zip235"` is also set — the build script
+/// / xtask sets both. The two cfgs are kept separate so a future build can
+/// enable ZIP-235 without NSM, but never the other way around.
+#[cfg(zcash_unstable = "nsm")]
+pub fn lts_disbursement_start(network: &Network) -> Option<Height> {
+    let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
+    let target_halving = halving(nu7, network).checked_add(2)?;
+    height_for_halving(target_halving, network)
+}
+
+/// Numerator of the per-block LTS payout fraction (ZIP-234 smooth issuance).
+#[cfg(zcash_unstable = "nsm")]
+const LTS_PAYOUT_FRACTION_NUMERATOR: u64 = 4_126;
+
+/// Denominator of the per-block LTS payout fraction (ZIP-234 smooth issuance).
+#[cfg(zcash_unstable = "nsm")]
+const LTS_PAYOUT_FRACTION_DENOMINATOR: u64 = 10_000_000_000;
+
+/// Per-block LTS payout for `height`, given the LTS pool snapshot at the
+/// parent block.
+///
+/// Returns `Amount::zero()` before [`lts_disbursement_start`], when NU7 is
+/// unconfigured, or when `parent_pool` is empty.
+///
+/// Inside the disbursement window the payout is recomputed every block as a
+/// ZIP-234 smooth-issuance ceiling fraction of the parent LTS pool:
+///
+/// ```text
+/// payout = ceil(parent_pool * LTS_PAYOUT_FRACTION_NUMERATOR
+///                            / LTS_PAYOUT_FRACTION_DENOMINATOR)
+/// payout = min(payout, parent_pool)
+/// ```
+///
+/// The current block's own LTS contributions don't affect the current block's
+/// payout — they enter the pool in this block and only affect the next
+/// block. This parent-pool rule avoids a circular dependency between the
+/// coinbase output, the coinbase `zip233_amount`, transaction fees, and the
+/// state transition for the same block. Halving boundaries have no special
+/// effect on the LTS payout rate after disbursement begins.
+///
+/// Ceiling division mirrors ZIP-234 and drains a one-zatoshi pool in one
+/// block, so no separate dust rule is needed.
+#[cfg(zcash_unstable = "nsm")]
+pub fn lts_payout(
+    height: Height,
+    network: &Network,
+    parent_pool: Amount<NonNegative>,
+) -> Amount<NonNegative> {
+    let Some(start) = lts_disbursement_start(network) else {
+        return Amount::zero();
+    };
+
+    if height < start {
+        return Amount::zero();
+    }
+
+    let parent_pool_u = u64::from(parent_pool);
+    if parent_pool_u == 0 {
+        return Amount::zero();
+    }
+
+    // u128 keeps the consensus math obvious: parent_pool fits in u64, and the
+    // numerator multiplication can't overflow u128 for any plausible pool.
+    let numerator = u128::from(parent_pool_u) * u128::from(LTS_PAYOUT_FRACTION_NUMERATOR);
+    let payout = numerator.div_ceil(u128::from(LTS_PAYOUT_FRACTION_DENOMINATOR));
+    let capped = payout.min(u128::from(parent_pool_u));
+
+    // capped ≤ parent_pool ≤ u64::MAX, so the conversion through u64 and into
+    // Amount<NonNegative> can't fail.
+    Amount::try_from(u64::try_from(capped).expect("capped ≤ parent_pool ≤ u64::MAX"))
+        .expect("capped LTS payout fits in Amount because it is at most parent_pool")
+}
+
 /// `FoundersReward(height)` as described in [§7.8].
 ///
 /// [§7.8]: <https://zips.z.cash/protocol/protocol.pdf#subsidies>
