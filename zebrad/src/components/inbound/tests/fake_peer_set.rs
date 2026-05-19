@@ -830,6 +830,7 @@ async fn caches_getaddr_response() {
             state: state_service.clone(),
             latest_chain_tip,
             misbehavior_sender,
+            network: network.clone(),
         };
         let r = setup_tx.send(setup_data);
         // We can't expect or unwrap because the returned Result does not implement Debug
@@ -1030,7 +1031,10 @@ async fn setup(
     // Add transactions to the mempool, skipping verification and broadcast
     let mut added_transactions = Vec::new();
     if add_transactions {
-        added_transactions.extend(add_some_stuff_to_mempool(&mut mempool_service, network));
+        added_transactions.extend(add_some_stuff_to_mempool(
+            &mut mempool_service,
+            network.clone(),
+        ));
     }
 
     let mempool_service = BoxService::new(mempool_service);
@@ -1053,6 +1057,7 @@ async fn setup(
         state: state_service.clone(),
         latest_chain_tip,
         misbehavior_sender,
+        network: network.clone(),
     };
     let r = setup_tx.send(setup_data);
     // We can't expect or unwrap because the returned Result does not implement Debug

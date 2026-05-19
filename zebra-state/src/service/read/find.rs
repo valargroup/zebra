@@ -21,15 +21,16 @@ use chrono::{DateTime, Utc};
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
+    parameters::Network,
     serialization::DateTime32,
     value_balance::ValueBalance,
 };
 
 use crate::{
-    constants,
+    constants::max_block_reorg_height,
     service::{
         block_iter::any_ancestor_blocks,
-        check::{difficulty::POW_MEDIAN_BLOCK_SPAN, AdjustedDifficulty},
+        check::AdjustedDifficulty,
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
         read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
@@ -238,7 +239,11 @@ where
 /// A block locator is used to efficiently find an intersection of two node's chains.
 /// It contains a list of block hashes at decreasing heights, skipping some blocks,
 /// so that any intersection can be located, no matter how long or different the chains are.
-pub fn block_locator<C>(chain: Option<C>, db: &ZebraDb) -> Option<Vec<block::Hash>>
+pub fn block_locator<C>(
+    network: &Network,
+    chain: Option<C>,
+    db: &ZebraDb,
+) -> Option<Vec<block::Hash>>
 where
     C: AsRef<Chain>,
 {
@@ -259,7 +264,7 @@ where
     // via the transaction merkle tree commitments.
     let tip_height = tip_height(chain, db)?;
 
-    let heights = block_locator_heights(tip_height);
+    let heights = block_locator_heights(network, tip_height);
     let mut hashes = Vec::with_capacity(heights.len());
 
     for height in heights {
@@ -275,17 +280,18 @@ where
 ///
 /// Zebra uses a decreasing list of block heights, starting at the tip, and skipping some heights.
 /// See [`block_locator()`] for details.
-pub fn block_locator_heights(tip_height: block::Height) -> Vec<block::Height> {
-    // The initial height in the returned `vec` is the tip height,
-    // and the final height is `MAX_BLOCK_REORG_HEIGHT` below the tip.
+pub fn block_locator_heights(network: &Network, tip_height: block::Height) -> Vec<block::Height> {
+    // The initial height in the returned `vec` is the tip height, and the final
+    // height is at most the active reorg limit below the tip (99 pre-NU7, 300
+    // from NU7 onward).
     //
     // The initial distance between heights is 1, and it doubles between each subsequent height.
-    // So the number of returned heights is approximately `log_2(MAX_BLOCK_REORG_HEIGHT)`.
+    // So the number of returned heights is approximately log_2 of the reorg limit.
 
-    // Limit the maximum locator depth.
+    // Limit the maximum locator depth to the active reorg limit at the tip.
     let min_locator_height = tip_height
         .0
-        .saturating_sub(constants::MAX_BLOCK_REORG_HEIGHT);
+        .saturating_sub(max_block_reorg_height(network, tip_height));
 
     // Create an exponentially decreasing set of heights.
     let exponential_locators = iter::successors(Some(1u32), |h| h.checked_mul(2))
@@ -619,10 +625,11 @@ where
 ///
 /// - If we don't have enough blocks in the state.
 pub fn next_median_time_past(
+    network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZebraDb,
 ) -> Result<DateTime32, BoxError> {
-    let mut best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
+    let mut best_relevant_chain_result = best_relevant_chain(network, non_finalized_state, db);
 
     // Retry the finalized state query if it was interrupted by a finalizing block.
     //
@@ -632,7 +639,7 @@ pub fn next_median_time_past(
             break;
         }
 
-        best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
+        best_relevant_chain_result = best_relevant_chain(network, non_finalized_state, db);
     }
 
     Ok(calculate_median_time_past(best_relevant_chain_result?))
@@ -647,6 +654,7 @@ pub fn next_median_time_past(
 ///
 /// - If we don't have enough blocks in the state.
 fn best_relevant_chain(
+    network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZebraDb,
 ) -> Result<Vec<Arc<Block>>, BoxError> {
@@ -654,11 +662,17 @@ fn best_relevant_chain(
         BoxError::from("Zebra's state is empty, wait until it syncs to the chain tip")
     })?;
 
+    let next_block_height = (state_tip_before_queries.0 + 1).expect("next block height is valid");
+    let median_block_span = crate::service::check::difficulty::pow_median_block_span_for_height(
+        network,
+        next_block_height,
+    );
+
     let best_relevant_chain =
         any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
-        .take(POW_MEDIAN_BLOCK_SPAN)
+        .take(median_block_span)
         .collect();
 
     if best_relevant_chain.is_empty() {

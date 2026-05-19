@@ -1,10 +1,16 @@
 //! Fixed test vectors for "find" read requests.
 
-use zebra_chain::block::Height;
+use zebra_chain::{block::Height, parameters::Network};
 
-use crate::{constants, service::read::find::block_locator_heights};
+use crate::{
+    constants::{self, max_block_reorg_height},
+    service::read::find::block_locator_heights,
+};
 
-/// Block heights, and the expected minimum block locator height
+/// Block heights, and the expected minimum block locator height.
+///
+/// Cases are computed against `PRE_NU7_MAX_BLOCK_REORG_HEIGHT` (= 99) because
+/// the tested heights are below NU7 activation on Mainnet.
 static BLOCK_LOCATOR_CASES: &[(u32, u32)] = &[
     (0, 0),
     (1, 0),
@@ -22,8 +28,10 @@ static BLOCK_LOCATOR_CASES: &[(u32, u32)] = &[
 fn test_block_locator_heights() {
     let _init_guard = zebra_test::init();
 
+    let network = Network::Mainnet;
+
     for (height, min_height) in BLOCK_LOCATOR_CASES.iter().cloned() {
-        let locator = block_locator_heights(Height(height));
+        let locator = block_locator_heights(&network, Height(height));
 
         assert!(!locator.is_empty(), "locators must not be empty");
         if (height - min_height) > 1 {
@@ -52,14 +60,19 @@ fn test_block_locator_heights() {
             Height(min_height),
             "locators must end with the specified final height"
         );
+        let reorg_limit = max_block_reorg_height(&network, Height(height));
         assert!(
-            height - final_height.0 <= constants::MAX_BLOCK_REORG_HEIGHT,
-            "locator for {} must not be more than the maximum reorg height {} below the tip, \
+            height - final_height.0 <= reorg_limit,
+            "locator for {} must not be more than the active reorg height {} below the tip, \
              but {} is {} blocks below the tip",
             height,
-            constants::MAX_BLOCK_REORG_HEIGHT,
+            reorg_limit,
             final_height.0,
             height - final_height.0
+        );
+        assert!(
+            reorg_limit <= constants::MAX_BLOCK_REORG_HEIGHT,
+            "active reorg limit must never exceed the upper-bound MAX_BLOCK_REORG_HEIGHT"
         );
     }
 }

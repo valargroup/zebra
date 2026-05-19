@@ -3039,7 +3039,9 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
     let client = RpcRequestClient::new(rpc_address);
 
     // Mine enough blocks to push the first few blocks into the finalized state.
-    // Block at height 2 is finalized once tip > 2 + MAX_BLOCK_REORG_HEIGHT = 101.
+    // The active reorg limit depends on the network upgrade at the tip, but
+    // MAX_BLOCK_REORG_HEIGHT is the across-regime upper bound, so mining this
+    // many blocks always finalizes block 2.
     let blocks_to_mine = MAX_BLOCK_REORG_HEIGHT + 10;
     client.generate(blocks_to_mine).await?;
 

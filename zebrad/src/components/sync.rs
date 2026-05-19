@@ -504,6 +504,7 @@ where
             block_network,
             verifier,
             latest_chain_tip.clone(),
+            config.network.network.clone(),
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,

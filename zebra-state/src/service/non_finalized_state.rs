@@ -711,7 +711,8 @@ impl NonFinalizedState {
     /// or `None` if the best chain has no blocks.
     pub fn best_chain_len(&self) -> Option<u32> {
         // This `as` can't overflow because the number of blocks in the chain is limited to i32::MAX,
-        // and the non-finalized chain is further limited by the fork length (slightly over 100 blocks).
+        // and the non-finalized chain is further limited by the fork length (slightly over the
+        // active reorg limit — 99 pre-NU7, 1200 from NU7 onward).
         Some(self.best_chain()?.blocks.len() as u32)
     }
 

@@ -17,7 +17,7 @@ use zebra_chain::{
     fmt::humantime_seconds,
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
-use zebra_state::MAX_BLOCK_REORG_HEIGHT;
+use zebra_state::POST_NU7_MAX_BLOCK_REORG_HEIGHT;
 
 use crate::components::{health::ChainTipMetrics, sync::SyncStatus};
 
@@ -76,8 +76,12 @@ pub async fn show_block_chain_progress(
     // - the non-finalized state limit, and
     // - the minimum number of extra blocks mined between a checkpoint update,
     //   and the automated tests for that update.
+    //
+    // Uses the post-NU7 (upper-bound) reorg limit so that the threshold is
+    // conservative for any height; the difference is small relative to
+    // checkpoint-update intervals.
     let min_after_checkpoint_blocks =
-        MAX_BLOCK_REORG_HEIGHT + MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE;
+        POST_NU7_MAX_BLOCK_REORG_HEIGHT + MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE;
     let min_after_checkpoint_blocks: HeightDiff = min_after_checkpoint_blocks.into();
 
     // The minimum height of the valid best chain, based on:

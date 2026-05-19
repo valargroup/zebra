@@ -1,5 +1,6 @@
 ---
 source: zebra-rpc/src/methods/tests/snapshot.rs
+assertion_line: 720
 expression: info
 ---
 {
@@ -46,12 +47,6 @@ expression: info
     },
     {
       "id": "lockbox",
-      "chainValue": 0.0,
-      "chainValueZat": 0,
-      "monitored": false
-    },
-    {
-      "id": "lts_funds",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false

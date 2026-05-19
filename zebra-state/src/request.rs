@@ -825,6 +825,14 @@ pub enum Request {
     /// > when switching from one best valid block chain to another that is not a descendent.
     /// > For `zcashd` and `zebra` this limit is 100 blocks.
     ///
+    /// The quoted 100-block value is the historical rollback limit. Zebra's
+    /// active rollback limit is 99 blocks before NU7 (preserving the
+    /// coinbase-maturity-aligned invariant) and
+    /// [`crate::POST_NU7_MAX_BLOCK_REORG_HEIGHT`] blocks from NU7 onward.
+    /// [`crate::MAX_BLOCK_REORG_HEIGHT`] is the across-regime upper bound used
+    /// for static memory sizing; finalization decisions use
+    /// [`crate::max_block_reorg_height`].
+    ///
     /// <https://zips.z.cash/protocol/protocol.pdf#blockchain>
     ///
     /// # Correctness

@@ -18,7 +18,8 @@ use crate::{
         block_iter::any_chain_ancestor_iter,
         check::{
             difficulty::{
-                BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
+                pow_median_block_span_for_height, BLOCK_MAX_TIME_SINCE_MEDIAN,
+                POW_ADJUSTMENT_BLOCK_SPAN,
             },
             AdjustedDifficulty,
         },
@@ -216,10 +217,12 @@ fn difficulty_time_and_history_tree(
     // > For each block other than the genesis block , nTime MUST be strictly greater than
     // > the median-time-past of that block.
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
+    let next_block_height = (tip_height + 1).expect("next block height is valid");
+    let median_block_span = pow_median_block_span_for_height(network, next_block_height);
     let median_time_past = calculate_median_time_past(
         relevant_chain
             .iter()
-            .take(POW_MEDIAN_BLOCK_SPAN)
+            .take(median_block_span)
             .cloned()
             .collect(),
     );
@@ -373,9 +376,7 @@ mod tests {
     use super::*;
 
     use zebra_chain::{
-        block,
-        parameters::testnet,
-        serialization::Duration32,
+        block, parameters::testnet, serialization::Duration32,
         work::difficulty::ParameterDifficulty,
     };
 

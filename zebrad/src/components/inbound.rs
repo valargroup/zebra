@@ -110,6 +110,10 @@ pub struct InboundSetupData {
 
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+
+    /// The configured Zcash network. Used to select the active reorg limit
+    /// when filtering gossiped blocks.
+    pub network: zebra_chain::parameters::Network,
 }
 
 /// Tracks the internal state of the [`Inbound`] service during setup.
@@ -268,6 +272,7 @@ impl Service<zn::Request> for Inbound {
                         state,
                         latest_chain_tip,
                         misbehavior_sender,
+                        network,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
@@ -278,6 +283,7 @@ impl Service<zn::Request> for Inbound {
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),
                         latest_chain_tip,
+                        network,
                     ));
 
                     result = Ok(());

@@ -85,8 +85,8 @@ fn minimal_coinbase() -> Result<(), Box<dyn std::error::Error>> {
 /// from the pool snapshot.
 #[cfg(zcash_unstable = "nsm")]
 #[test]
-fn standard_coinbase_outputs_route_lts_payout_into_miner_reward() -> Result<(), Box<dyn std::error::Error>>
-{
+fn standard_coinbase_outputs_route_lts_payout_into_miner_reward(
+) -> Result<(), Box<dyn std::error::Error>> {
     let regtest = testnet::Parameters::build()
         .with_slow_start_interval(Height::MIN)
         .with_activation_heights(ConfiguredActivationHeights {
