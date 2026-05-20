@@ -309,14 +309,11 @@ pub fn subsidy_is_valid(
 ///
 /// - Pre-NU6: `total_output ≤ total_input`.
 /// - NU6: `total_output = total_input`.
-/// - NU7 onward (with `nsm`): the miner may claim extra value from the LTS
-///   (Long-Term Support / NSM / ZIP-234) pool on top of `subsidy + fees`, so
-///   we relax the strict equality and require only that the *implied claim*
-///   `total_output − total_input` is non-negative (i.e. the miner is
-///   *claiming* extra value from the LTS pool, not silently overpaying
-///   themselves). The contextual verifier independently re-derives the
-///   implied claim from the block bytes and checks that it matches what the
-///   chain's pool history actually permits.
+/// - NU7 onward (with `nsm`): the LTS (Long-Term Support / NSM /
+///   ZIP-234/235) pool is represented by the signed coinbase under-claim or
+///   over-claim, so the semantic verifier only checks arithmetic here. The
+///   contextual verifier independently re-derives the signed implied claim
+///   from the block bytes and validates it against the parent pool.
 ///
 /// On builds where NSM isn't enabled (no `cfg(zcash_unstable = "nsm")`, or
 /// pre-NU7), the strict equality / inequality is enforced directly here.
@@ -341,27 +338,6 @@ pub fn miner_fees_are_valid(
     let sapling_value_balance = coinbase_tx.sapling_value_balance().sapling_amount();
     let orchard_value_balance = coinbase_tx.orchard_value_balance().orchard_amount();
 
-    // Coinbase transaction can still have a NSM deposit
-    #[cfg(zcash_unstable = "zip235")]
-    let zip233_amount: Amount<NegativeAllowed> = coinbase_tx
-        .zip233_amount()
-        .constrain()
-        .map_err(|_| SubsidyError::InvalidZip233Amount)?;
-
-    #[cfg(not(zcash_unstable = "zip235"))]
-    let zip233_amount = Amount::zero();
-
-    #[cfg(zcash_unstable = "zip235")]
-    if let Some(nsm_activation_height) = NetworkUpgrade::Nu7.activation_height(network) {
-        if height >= nsm_activation_height {
-            let minimum_zip233_amount =
-                transaction::builder::zip235_minimum_zip233_amount(block_miner_fees);
-            if zip233_amount < minimum_zip233_amount {
-                Err(SubsidyError::InvalidZip233Amount)?
-            }
-        }
-    }
-
     // # Consensus
     //
     // > - define the total output value of its coinbase transaction to be the total value in zatoshi of its transparent
@@ -375,17 +351,17 @@ pub fn miner_fees_are_valid(
     // from the block subsidy value plus the transaction fees paid by transactions in this block.
     let total_output_value =
         (transparent_value_balance - sapling_value_balance - orchard_value_balance
-            + expected_deferred_pool_balance_change.value()
-            + zip233_amount)
-            .map_err(|_| SubsidyError::Overflow)?;
+            + expected_deferred_pool_balance_change.value())
+        .map_err(|_| SubsidyError::Overflow)?;
 
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 
-    // With NSM enabled at NU7+, the miner may claim an extra `lts_payout` on
-    // top of `subsidy + fees`, so we relax the equality and require only
-    // that the implied claim is non-negative. The contextual verifier then
-    // checks that the claim matches the expected payout for this height.
+    // With NSM enabled at NU7+, the miner may under-claim to deposit into the
+    // LTS pool or over-claim by the scheduled LTS payout net of the required
+    // deposit. The contextual verifier checks the signed implied claim
+    // against chain history, so the semantic check only ensures the value
+    // equation above is arithmetically well-formed.
     //
     // Without NSM (compile-time-off, or pre-NU7), we keep the historical
     // strict checks: pre-NU6 `output ≤ input`, NU6 `output = input`.
@@ -397,17 +373,6 @@ pub fn miner_fees_are_valid(
     let nsm_active = false;
 
     if nsm_active {
-        let total_input_value: Amount<NegativeAllowed> = total_input_value
-            .constrain()
-            .map_err(|_| SubsidyError::Overflow)?;
-        // Enforce non-negativity of the implied claim — the miner may not
-        // silently overpay themselves. The actual *value* is recomputed by
-        // the contextual layer (which checks it against the expected payout
-        // derived from chain history), so we discard it here.
-        let _: Amount<NonNegative> = (total_output_value - total_input_value)
-            .map_err(|_| SubsidyError::Overflow)?
-            .constrain::<NonNegative>()
-            .map_err(|_| SubsidyError::InvalidMinerFees)?;
         return Ok(());
     }
 

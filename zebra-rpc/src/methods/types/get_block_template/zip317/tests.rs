@@ -39,14 +39,7 @@ fn fake_coinbase_before_branch_id_does_not_panic() -> Result<(), Box<dyn std::er
     );
     let miner_address = Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]));
 
-    let fake_coinbase = fake_coinbase_transaction(
-        &network,
-        Height(4),
-        &miner_address,
-        Vec::new(),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-        None,
-    );
+    let fake_coinbase = fake_coinbase_transaction(&network, Height(4), &miner_address, Vec::new());
 
     assert!(!fake_coinbase.data.as_ref().is_empty());
 
@@ -79,8 +72,6 @@ fn excludes_tx_with_unselected_dependencies() {
             vec![unmined_tx],
             mempool_tx_deps,
             extra_coinbase_data,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            None,
         ),
         vec![],
         "should not select any transactions when dependencies are unavailable"
@@ -209,8 +200,6 @@ fn includes_tx_with_selected_dependencies() {
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
         extra_coinbase_data,
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-        None,
     );
 
     assert_eq!(

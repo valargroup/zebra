@@ -342,21 +342,21 @@ pub enum ValidateContextError {
     },
 
     #[cfg(zcash_unstable = "nsm")]
-    #[error(
-        "invalid LTS (NSM) payout claimed at {height:?}: \
-         expected {expected:?}, actual {actual:?}"
-    )]
-    #[non_exhaustive]
-    InvalidLtsPayout {
-        height: block::Height,
-        expected: Amount<NonNegative>,
-        actual: Amount<NonNegative>,
-    },
-
-    #[cfg(zcash_unstable = "nsm")]
     #[error("missing BlockInfo for LTS (NSM) ancestor height {height:?}")]
     #[non_exhaustive]
     MissingLtsBlockInfo { height: block::Height },
+
+    #[cfg(zcash_unstable = "nsm")]
+    #[error(
+        "invalid LTS (NSM) deposit at {height:?}: \
+         expected at least {expected_minimum:?}, actual {actual:?}"
+    )]
+    #[non_exhaustive]
+    InvalidLtsDeposit {
+        height: block::Height,
+        expected_minimum: Amount<NonNegative>,
+        actual: Amount<NegativeAllowed>,
+    },
 
     #[error("error updating a note commitment tree: {0}")]
     NoteCommitmentTreeError(#[from] zebra_chain::parallel::tree::NoteCommitmentTreeError),

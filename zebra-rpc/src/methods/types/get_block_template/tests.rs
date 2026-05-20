@@ -4,10 +4,9 @@ use zcash_keys::address::Address;
 use zcash_transparent::address::TransparentAddress;
 
 use zebra_chain::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::Amount,
     block::Height,
     parameters::{
-        subsidy::block_subsidy,
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network,
     },
@@ -16,6 +15,15 @@ use zebra_chain::{
 };
 
 use super::{check_block_template_supported, standard_coinbase_outputs};
+
+#[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235"))]
+use zebra_chain::{
+    amount::{NegativeAllowed, NonNegative},
+    block,
+    parameters::subsidy::block_subsidy,
+};
+#[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235"))]
+use super::generate_coinbase_and_roots;
 
 #[test]
 fn block_template_before_canopy_returns_error() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,8 +67,6 @@ fn minimal_coinbase() -> Result<(), Box<dyn std::error::Error>> {
         &regtest,
         Height(1),
         &Address::from(TransparentAddress::PublicKeyHash([0x42; 20])),
-        Amount::zero(),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         Amount::zero(),
         #[cfg(zcash_unstable = "nsm")]
         Amount::zero(),
@@ -110,17 +116,10 @@ fn standard_coinbase_outputs_route_lts_payout_into_miner_reward(
         &miner_address,
         miner_fee,
         Amount::zero(),
-        Amount::zero(),
     );
     // With a non-zero LTS payout.
-    let with_lts = standard_coinbase_outputs(
-        &regtest,
-        Height(1),
-        &miner_address,
-        miner_fee,
-        Amount::zero(),
-        lts_payout,
-    );
+    let with_lts =
+        standard_coinbase_outputs(&regtest, Height(1), &miner_address, miner_fee, lts_payout);
 
     assert_eq!(
         baseline.len(),
@@ -150,10 +149,10 @@ fn standard_coinbase_outputs_route_lts_payout_into_miner_reward(
 
 /// Fee-bearing generated coinbases must round-trip through the same
 /// value-balance equation used by the semantic and contextual verifiers.
-#[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235", feature = "tx_v6"))]
+#[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235"))]
 #[test]
-fn generated_coinbase_implies_only_lts_payout_with_zip233() -> Result<(), Box<dyn std::error::Error>>
-{
+fn generated_coinbase_implies_lts_payout_net_zip235_deposit(
+) -> Result<(), Box<dyn std::error::Error>> {
     let regtest = testnet::Parameters::build()
         .with_slow_start_interval(Height::MIN)
         .with_activation_heights(ConfiguredActivationHeights {
@@ -166,23 +165,11 @@ fn generated_coinbase_implies_only_lts_payout_with_zip233() -> Result<(), Box<dy
     let miner_address = Address::from(TransparentAddress::PublicKeyHash([0x42; 20]));
     let miner_fee = Amount::try_from(10_000_u64)?;
     let lts_payout = Amount::try_from(123_u64)?;
-    let zip233_amount = zebra_chain::transaction::builder::zip235_minimum_zip233_amount(miner_fee);
-    let outputs = standard_coinbase_outputs(
-        &regtest,
-        height,
-        &miner_address,
-        miner_fee,
-        zip233_amount,
-        lts_payout,
-    );
-    let coinbase_tx = Transaction::new_v6_coinbase(
-        &regtest,
-        height,
-        outputs,
-        Vec::new(),
-        Some(zip233_amount),
-        miner_fee,
-    );
+    let minimum_deposit =
+        zebra_chain::transaction::builder::zip235_minimum_zip233_amount(miner_fee);
+    let outputs =
+        standard_coinbase_outputs(&regtest, height, &miner_address, miner_fee, lts_payout);
+    let coinbase_tx = Transaction::new_v5_coinbase(&regtest, height, outputs, Vec::new());
     let coinbase_tx = coinbase_tx
         .zcash_serialize_to_vec()?
         .zcash_deserialize_into::<Transaction>()?;
@@ -193,25 +180,58 @@ fn generated_coinbase_implies_only_lts_payout_with_zip233() -> Result<(), Box<dy
         .map(|output| output.value())
         .sum::<Result<Amount<NonNegative>, _>>()?
         .constrain()?;
-    let zip233_amount: Amount<NegativeAllowed> = coinbase_tx.zip233_amount().constrain()?;
-    let total_output_value = (transparent_value + zip233_amount)?;
+    let total_output_value = transparent_value;
 
     let expected_block_subsidy: Amount<NegativeAllowed> =
         block_subsidy(height, &regtest)?.constrain()?;
     let miner_fee: Amount<NegativeAllowed> = miner_fee.constrain()?;
     let total_input_value = (expected_block_subsidy + miner_fee)?;
 
-    let implied_lts_claim = (total_output_value - total_input_value)?.constrain::<NonNegative>()?;
+    let implied_lts_claim = (total_output_value - total_input_value)?;
+    let lts_payout: Amount<NegativeAllowed> = lts_payout.constrain()?;
+    let minimum_deposit_signed: Amount<NegativeAllowed> = minimum_deposit.constrain()?;
+    let implied_deposit = (lts_payout - implied_lts_claim)?;
 
     assert_eq!(
-        coinbase_tx.zip233_amount(),
-        zip233_amount,
-        "generated coinbase must set the default ZIP-235 minimum"
+        minimum_deposit, implied_deposit,
+        "generated coinbase must under-claim by the ZIP-235 minimum"
     );
     assert_eq!(
-        lts_payout, implied_lts_claim,
-        "coinbase output plus ZIP-233 must imply exactly the LTS payout"
+        (lts_payout - minimum_deposit_signed)?,
+        implied_lts_claim,
+        "v5 coinbase output must imply the LTS payout net of the ZIP-235 deposit"
     );
+
+    Ok(())
+}
+
+/// The full template coinbase path must stay on v5 at NU7, so computing the
+/// coinbase template ID must not enter the removed V6 txid/auth-digest path.
+#[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235"))]
+#[test]
+#[allow(clippy::unwrap_in_result)]
+fn nu7_generate_coinbase_and_roots_uses_v5_template_path() -> Result<(), Box<dyn std::error::Error>>
+{
+    let regtest = testnet::Parameters::build()
+        .with_slow_start_interval(Height::MIN)
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })?
+        .to_network()?;
+
+    let (coinbase_txn, _default_roots) = generate_coinbase_and_roots(
+        &regtest,
+        Height(2),
+        &Address::from(TransparentAddress::PublicKeyHash([0x42; 20])),
+        &[],
+        Some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()),
+        Vec::new(),
+        Amount::zero(),
+    )
+    .expect("NU7 v5 coinbase template should be generated without V6 txid support");
+
+    assert!(!coinbase_txn.data.as_ref().is_empty());
 
     Ok(())
 }

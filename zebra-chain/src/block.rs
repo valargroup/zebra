@@ -228,11 +228,8 @@ impl Block {
     ///
     /// The Long-Term Support (NSM / ZIP-234) pool delta is **not** set here.
     /// The `lts` leg of the returned [`ValueBalance`] is left at zero;
-    /// callers that track the LTS pool must compute
-    /// `+coinbase.zip233_amount − expected_lts_payout` themselves and call
-    /// [`set_lts_amount`] on the result. This keeps `chain_value_pool_change`
-    /// purely a function of the block bytes and spent UTXOs, with no
-    /// dependency on contextual chain history.
+    /// callers that track the LTS pool must derive the signed implicit
+    /// coinbase claim and call [`set_lts_amount`] on the result.
     ///
     /// [`set_lts_amount`]: crate::value_balance::ValueBalance::set_lts_amount
     pub fn chain_value_pool_change(

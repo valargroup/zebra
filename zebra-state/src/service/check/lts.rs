@@ -1,10 +1,11 @@
 //! Contextual check for ZIP-234/235 (NSM) Long-Term Support pool payouts.
 //!
-//! The semantic verifier (`miner_fees_are_valid`) only enforces non-negativity
-//! of the implied claim. This module re-derives the same implied claim from
-//! the block bytes and checks it against the expected per-block payout
-//! computed from the parent block's LTS pool snapshot (ZIP-234
-//! smooth-issuance ceiling rule).
+//! The semantic verifier (`miner_fees_are_valid`) only checks that the
+//! coinbase value equation is arithmetically well-formed. This module
+//! re-derives the signed implied claim from the block bytes and checks it
+//! against the expected per-block payout computed from the parent block's LTS
+//! pool snapshot (ZIP-234 smooth-issuance ceiling rule) and the ZIP-235
+//! minimum deposit.
 
 use std::collections::HashMap;
 
@@ -38,9 +39,12 @@ use crate::{
 /// block); those are used to compute the per-block miner fees needed to
 /// re-derive the implied claim.
 ///
-/// Returns `Ok(())` outside of the disbursement window (where the expected
-/// payout is zero) when the implied claim is also zero. Returns
-/// `InvalidLtsPayout` on mismatch in either direction.
+/// On success returns the LTS pool delta this block contributes (the signed
+/// coinbase under-/over-claim, i.e. `-implied_claim`), which the caller sets
+/// on the block's `chain_value_pool_change`. This avoids re-deriving the
+/// value balance in [`block_lts_pool_delta`] on the non-finalized path.
+/// Returns `InvalidLtsDeposit` if the miner over-claims relative to the
+/// scheduled payout and required deposit.
 #[allow(clippy::unwrap_in_result)]
 pub(crate) fn check_claimed_lts_payout(
     network: &Network,
@@ -49,20 +53,23 @@ pub(crate) fn check_claimed_lts_payout(
     height: Height,
     block: &Block,
     spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
-) -> Result<(), ValidateContextError> {
+) -> Result<Amount<NegativeAllowed>, ValidateContextError> {
     // The LTS contextual check only applies once NSM activates at NU7. Before
     // NU7, the semantic verifier already enforces strict transparent
     // conservation (NU6 onward) or the historical pre-NU6 inequality, so the
     // implied-claim derivation against pre-NSM blocks would fight that math.
     let Some(nsm_activation_height) = NetworkUpgrade::Nu7.activation_height(network) else {
-        return Ok(());
+        return Ok(Amount::zero());
     };
     if height < nsm_activation_height {
-        return Ok(());
+        return Ok(Amount::zero());
     }
 
     let expected = expected_lts_payout(network, parent_chain, finalized_state, height)?;
-    let implied_claim = derive_implied_lts_claim(block, network, height, spent_utxos).map_err(
+    let LtsValueBalance {
+        implied_claim,
+        block_miner_fees,
+    } = derive_lts_value_balance(block, network, height, spent_utxos).map_err(
         |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
             value_balance_error,
             height,
@@ -72,42 +79,66 @@ pub(crate) fn check_claimed_lts_payout(
         },
     )?;
 
-    if implied_claim != expected {
-        return Err(ValidateContextError::InvalidLtsPayout {
+    let expected_claim: Amount<NegativeAllowed> =
+        expected.constrain().map_err(|value_balance_error| {
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error: ValueBalanceError::Lts(value_balance_error),
+                height,
+                block_hash: block.hash(),
+                transaction_count: block.transactions.len(),
+                spent_utxo_count: spent_utxos.len(),
+            }
+        })?;
+    let implied_deposit = (expected_claim - implied_claim).map_err(|value_balance_error| {
+        ValidateContextError::CalculateBlockChainValueChange {
+            value_balance_error: ValueBalanceError::Lts(value_balance_error),
             height,
-            expected,
-            actual: implied_claim,
+            block_hash: block.hash(),
+            transaction_count: block.transactions.len(),
+            spent_utxo_count: spent_utxos.len(),
+        }
+    })?;
+
+    let minimum_deposit =
+        zebra_chain::transaction::builder::zip235_minimum_zip233_amount(block_miner_fees);
+
+    if implied_deposit < minimum_deposit {
+        return Err(ValidateContextError::InvalidLtsDeposit {
+            height,
+            expected_minimum: minimum_deposit,
+            actual: implied_deposit,
         });
     }
 
-    Ok(())
+    Ok(-implied_claim)
 }
 
-/// Returns the LTS pool delta this block contributes to the chain pool:
-/// `+coinbase.zip233_amount − expected_lts_payout(height, network, parent_pool)`.
+/// Returns the LTS pool delta this block contributes to the chain pool.
 ///
-/// Used by callers (contextual + finalized commit) that need to set the
-/// `lts_amount` leg of the per-block `chain_value_pool_change` after the
-/// LTS check has confirmed the miner's claim equals the expected payout.
+/// In the no-v6 NSM model, the LTS pool delta is the negative signed implied
+/// coinbase claim. A coinbase under-claim increases the pool; an over-claim
+/// decreases it.
 ///
-/// `parent_lts_pool` is the LTS pool snapshot *before* this block (i.e.
-/// after the parent block).
+/// Used by the finalized commit path to set the `lts_amount` leg of the
+/// per-block `chain_value_pool_change`. The non-finalized path reuses the
+/// delta returned by [`check_claimed_lts_payout`] instead of calling this.
 pub(crate) fn block_lts_pool_delta(
     block: &Block,
     network: &Network,
     height: Height,
-    parent_lts_pool: Amount<NonNegative>,
+    spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
 ) -> Result<Amount<NegativeAllowed>, ValueBalanceError> {
-    let expected = lts_payout(height, network, parent_lts_pool);
-    let inflow: Amount<NegativeAllowed> = block
-        .transactions
-        .first()
-        .map(|tx| tx.zip233_amount())
-        .unwrap_or_else(Amount::zero)
-        .constrain()
-        .map_err(ValueBalanceError::Lts)?;
-    let outflow: Amount<NegativeAllowed> = expected.constrain().map_err(ValueBalanceError::Lts)?;
-    (inflow - outflow).map_err(ValueBalanceError::Lts)
+    let Some(nsm_activation_height) = NetworkUpgrade::Nu7.activation_height(network) else {
+        return Ok(Amount::zero());
+    };
+    if height < nsm_activation_height {
+        return Ok(Amount::zero());
+    }
+
+    let implied_claim =
+        derive_lts_value_balance(block, network, height, spent_utxos)?.implied_claim;
+
+    Ok(-implied_claim)
 }
 
 /// Computes the expected LTS payout for `height` from chain history.
@@ -117,6 +148,7 @@ pub(crate) fn block_lts_pool_delta(
 /// directly). The parent-block LTS pool snapshot is resolved by looking at
 /// `parent_chain` first, then falling back to `finalized_state` — so each
 /// fork's expected payout reflects its own pool history.
+#[allow(clippy::unwrap_in_result)]
 pub(crate) fn expected_lts_payout(
     network: &Network,
     parent_chain: &Chain,
@@ -141,23 +173,27 @@ pub(crate) fn expected_lts_payout(
     Ok(lts_payout(height, network, parent_pool))
 }
 
-/// Re-derive the implied LTS claim from the coinbase value-balance equation.
+struct LtsValueBalance {
+    implied_claim: Amount<NegativeAllowed>,
+    block_miner_fees: Amount<NonNegative>,
+}
+
+/// Re-derive the LTS value-balance terms from the coinbase value-balance equation.
 /// Mirrors the formula in `miner_fees_are_valid` in `zebra-consensus`,
 /// without that crate's tower-service plumbing.
 ///
 /// `implied_claim = total_coinbase_output − (expected_subsidy + block_miner_fees)`
 ///
 /// where `total_coinbase_output` is the coinbase's transparent + shielded +
-/// deferred + zip233 contribution to the chain value pool, and
-/// `block_miner_fees` is the sum of per-tx miner fees over non-coinbase
-/// transactions (`vb.remaining_transaction_value() − tx.zip233_amount()`).
+/// deferred contribution to the chain value pool, and `block_miner_fees` is
+/// the sum of per-tx miner fees over non-coinbase transactions.
 #[allow(clippy::unwrap_in_result)]
-fn derive_implied_lts_claim(
+fn derive_lts_value_balance(
     block: &Block,
     network: &Network,
     height: Height,
     spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
-) -> Result<Amount<NonNegative>, ValueBalanceError> {
+) -> Result<LtsValueBalance, ValueBalanceError> {
     use zebra_chain::amount::Error as AmountError;
     use zebra_chain::parameters::subsidy::FundingStreamReceiver;
 
@@ -166,7 +202,7 @@ fn derive_implied_lts_claim(
         .first()
         .expect("verified block has a coinbase transaction");
 
-    // Coinbase total output (transparent − sapling − orchard + deferred + zip233).
+    // Coinbase total output (transparent − sapling − orchard + deferred).
     let transparent_value_balance: Amount<NegativeAllowed> = coinbase_tx
         .outputs()
         .iter()
@@ -177,10 +213,6 @@ fn derive_implied_lts_claim(
         .map_err(ValueBalanceError::Transparent)?;
     let sapling_value_balance = coinbase_tx.sapling_value_balance().sapling_amount();
     let orchard_value_balance = coinbase_tx.orchard_value_balance().orchard_amount();
-    let zip233_amount: Amount<NegativeAllowed> = coinbase_tx
-        .zip233_amount()
-        .constrain()
-        .map_err(ValueBalanceError::Lts)?;
 
     // Expected block subsidy and deferred-pool contribution for this height.
     // Both are pure functions of `(height, network)`; they only fail on
@@ -200,21 +232,18 @@ fn derive_implied_lts_claim(
 
     let total_output_value =
         (transparent_value_balance - sapling_value_balance - orchard_value_balance
-            + deferred_pool_balance_change
-            + zip233_amount)
+            + deferred_pool_balance_change)
             .map_err(ValueBalanceError::Transparent)?;
 
-    // Block miner fees: per-tx miner_fee = `vb.remaining_transaction_value() − tx.zip233_amount()`,
-    // matching the formula in `zebra-consensus`'s transaction verifier
-    // (`Response::miner_fee()`). Coinbase contributes nothing to fees.
+    // Block miner fees match the formula in `zebra-consensus`'s transaction
+    // verifier (`Response::miner_fee()`). Coinbase contributes nothing to fees.
     let mut block_miner_fees: Amount<NonNegative> = Amount::zero();
     for tx in block.transactions.iter().skip(1) {
         let vb = tx.value_balance(spent_utxos)?;
         let rtv = vb
             .remaining_transaction_value()
             .map_err(ValueBalanceError::Transparent)?;
-        let fee = (rtv - tx.zip233_amount()).map_err(ValueBalanceError::Transparent)?;
-        block_miner_fees = (block_miner_fees + fee).map_err(ValueBalanceError::Transparent)?;
+        block_miner_fees = (block_miner_fees + rtv).map_err(ValueBalanceError::Transparent)?;
     }
 
     let total_input_value: Amount<NegativeAllowed> = (expected_block_subsidy + block_miner_fees)
@@ -222,10 +251,13 @@ fn derive_implied_lts_claim(
         .constrain()
         .map_err(ValueBalanceError::Transparent)?;
 
-    (total_output_value - total_input_value)
-        .map_err(ValueBalanceError::Transparent)?
-        .constrain::<NonNegative>()
-        .map_err(ValueBalanceError::Transparent)
+    let implied_claim =
+        (total_output_value - total_input_value).map_err(ValueBalanceError::Transparent)?;
+
+    Ok(LtsValueBalance {
+        implied_claim,
+        block_miner_fees,
+    })
 }
 
 /// Resolve the LTS pool balance *after* the block at `height` by consulting

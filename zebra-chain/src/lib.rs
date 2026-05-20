@@ -11,9 +11,11 @@
 
 #[cfg(all(
     zcash_unstable = "nsm",
-    not(all(zcash_unstable = "nu7", zcash_unstable = "zip235", feature = "tx_v6"))
+    not(all(zcash_unstable = "nu7", zcash_unstable = "zip235"))
 ))]
-compile_error!("zcash_unstable=\"nsm\" requires zcash_unstable=\"nu7\", zcash_unstable=\"zip235\", and the tx_v6 feature");
+compile_error!(
+    "zcash_unstable=\"nsm\" requires zcash_unstable=\"nu7\" and zcash_unstable=\"zip235\""
+);
 
 #[macro_use]
 extern crate bitflags;

@@ -589,7 +589,7 @@ const LTS_PAYOUT_FRACTION_DENOMINATOR: u64 = 10_000_000_000;
 /// The current block's own LTS contributions don't affect the current block's
 /// payout — they enter the pool in this block and only affect the next
 /// block. This parent-pool rule avoids a circular dependency between the
-/// coinbase output, the coinbase `zip233_amount`, transaction fees, and the
+/// coinbase output, implicit ZIP-235 deposits, transaction fees, and the
 /// state transition for the same block. Halving boundaries have no special
 /// effect on the LTS payout rate after disbursement begins.
 ///

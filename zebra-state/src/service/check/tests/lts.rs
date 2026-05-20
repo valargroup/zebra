@@ -10,9 +10,9 @@
 //! and is out of scope here.
 //!
 //! The block-bytes side of the contextual check (the implied-claim
-//! derivation in [`super::super::lts::check_claimed_lts_payout`]) is
-//! exercised by full-block validation tests; here we focus on the
-//! chain-history side, which is the whole point of the contextual layer.
+//! derivation and ZIP-235 deposit floor in
+//! [`super::super::lts::check_claimed_lts_payout`]) is exercised both by the
+//! deposit/over-claim tests below and by full-block validation tests.
 //!
 //! Under the continuous-payout rule, the only state lookup is the parent
 //! block's LTS pool snapshot — there is no era-start lookup.
@@ -22,16 +22,19 @@ use std::{collections::HashMap, sync::Arc};
 use chrono::DateTime;
 
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{merkle, Block, Hash, Header, Height},
     block_info::BlockInfo,
     fmt::HexDebug,
     parameters::{
-        subsidy::{block_subsidy, lts_disbursement_start, lts_payout},
+        subsidy::{
+            block_subsidy, funding_stream_values, lts_disbursement_start, lts_payout,
+            FundingStreamReceiver,
+        },
         testnet::ConfiguredActivationHeights,
         Network, NetworkUpgrade,
     },
-    transaction::{LockTime, Transaction},
+    transaction::{self, LockTime, Transaction},
     transparent,
     value_balance::ValueBalance,
     work::{difficulty::ParameterDifficulty, equihash::Solution},
@@ -129,6 +132,113 @@ fn block_with_coinbase_output(
     }
 }
 
+/// The ZIP-234 deferred (lockbox) funding-stream contribution to the chain
+/// value pool at `height`. The contextual derivation adds this to the coinbase
+/// total output, so the deposit-targeting helper must account for it.
+fn deferred_pool_change(network: &Network, height: Height) -> Amount<NonNegative> {
+    let subsidy = block_subsidy(height, network).unwrap();
+    funding_stream_values(height, network, subsidy)
+        .unwrap()
+        .remove(&FundingStreamReceiver::Deferred)
+        .unwrap_or_else(Amount::zero)
+}
+
+/// Builds a block whose coinbase has a single transparent output of
+/// `coinbase_output_value`, plus — when `fee > 0` — one transparent
+/// fee-paying transaction whose `remaining_transaction_value` equals `fee`.
+/// Returns the block and the `spent_utxos` map covering the fee tx's input.
+fn block_with_coinbase_and_fee(
+    network: &Network,
+    height: Height,
+    coinbase_output_value: Amount<NonNegative>,
+    fee: Amount<NonNegative>,
+) -> (Block, HashMap<transparent::OutPoint, transparent::Utxo>) {
+    let coinbase = Arc::new(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![transparent::Input::new_coinbase(height, Vec::new(), None)],
+        outputs: vec![transparent::Output::new(
+            coinbase_output_value,
+            transparent::Script::new(&[]),
+        )],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+
+    let mut transactions = vec![coinbase];
+    let mut spent_utxos = HashMap::new();
+
+    if fee > Amount::<NonNegative>::zero() {
+        // input − output == fee, so the tx's remaining value (the miner fee) is `fee`.
+        let output_value = Amount::<NonNegative>::try_from(1_000).unwrap();
+        let input_value = (output_value + fee).unwrap();
+        let outpoint = transparent::OutPoint::from_usize(transaction::Hash([7; 32]), 0);
+        spent_utxos.insert(
+            outpoint,
+            transparent::Utxo::new(
+                transparent::Output::new(input_value, transparent::Script::new(&[])),
+                Height(1),
+                false,
+            ),
+        );
+        transactions.push(Arc::new(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu7,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![transparent::Input::PrevOut {
+                outpoint,
+                unlock_script: transparent::Script::new(&[]),
+                sequence: 0,
+            }],
+            outputs: vec![transparent::Output::new(
+                output_value,
+                transparent::Script::new(&[]),
+            )],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        }));
+    }
+
+    let merkle_root: merkle::Root = transactions.iter().cloned().collect();
+    let block = Block {
+        header: Arc::new(Header {
+            version: 4,
+            previous_block_hash: Hash([0; 32]),
+            merkle_root,
+            commitment_bytes: HexDebug([0; 32]),
+            time: DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("hard-coded timestamp is valid"),
+            difficulty_threshold: network.target_difficulty_limit().to_compact(),
+            nonce: HexDebug([0; 32]),
+            solution: Solution::for_proposal(),
+        }),
+        transactions,
+    };
+
+    (block, spent_utxos)
+}
+
+/// Coinbase output value that makes the contextual implied claim equal
+/// `target_claim` for a block at `height` carrying `fee` in miner fees.
+///
+/// The contextual derivation is
+/// `implied_claim = output + deferred − subsidy − fee`, so
+/// `output = target_claim + subsidy + fee − deferred`.
+fn coinbase_output_for_claim(
+    network: &Network,
+    height: Height,
+    fee: Amount<NonNegative>,
+    target_claim: i64,
+) -> Amount<NonNegative> {
+    let subsidy = i64::from(block_subsidy(height, network).unwrap());
+    let deferred = i64::from(deferred_pool_change(network, height));
+    let fee = i64::from(fee);
+
+    Amount::<NonNegative>::try_from(target_claim + subsidy + fee - deferred)
+        .expect("test coinbase output is a valid non-negative amount")
+}
+
 /// Before `lts_disbursement_start`, the expected payout is zero — there is
 /// no LTS pool snapshot to consult yet.
 #[test]
@@ -180,9 +290,9 @@ fn claimed_payout_rejects_positive_claim_before_disbursement_start() {
     )
     .expect_err("positive pre-disbursement LTS claim must be rejected");
 
-    let ValidateContextError::InvalidLtsPayout {
+    let ValidateContextError::InvalidLtsDeposit {
         height,
-        expected,
+        expected_minimum,
         actual,
     } = err
     else {
@@ -190,8 +300,151 @@ fn claimed_payout_rejects_positive_claim_before_disbursement_start() {
     };
 
     assert_eq!(pre_height, height);
-    assert_eq!(Amount::<NonNegative>::zero(), expected);
-    assert!(actual > Amount::<NonNegative>::zero());
+    assert_eq!(Amount::<NonNegative>::zero(), expected_minimum);
+    assert!(actual < Amount::<NonNegative>::zero());
+}
+
+/// Before the disbursement window, a coinbase that under-claims (deposits into
+/// the LTS pool) by at least the ZIP-235 minimum is accepted, and the returned
+/// pool delta equals the deposited amount.
+#[test]
+fn claimed_payout_accepts_under_claim_before_disbursement_start() {
+    let network = regtest_nu7_at_1();
+    let chain = empty_chain(&network);
+    let finalized = ephemeral_finalized_state(&network);
+    let pre_height = lts_disbursement_start(&network)
+        .unwrap()
+        .previous()
+        .unwrap();
+
+    // No fees → the minimum deposit is zero; deposit 500 zatoshi (claim = −500).
+    let deposit = 500i64;
+    let output = coinbase_output_for_claim(&network, pre_height, Amount::zero(), -deposit);
+    let (block, spent_utxos) =
+        block_with_coinbase_and_fee(&network, pre_height, output, Amount::zero());
+
+    let delta = check_claimed_lts_payout(
+        &network,
+        &chain,
+        &finalized.db,
+        pre_height,
+        &block,
+        &spent_utxos,
+    )
+    .expect("under-claim that meets the zero minimum deposit is valid");
+
+    // pool delta = −implied_claim = +deposit
+    assert_eq!(Amount::<NegativeAllowed>::try_from(deposit).unwrap(), delta);
+}
+
+/// Inside the disbursement window, claiming more than the scheduled payout
+/// (net of the minimum deposit) is rejected as an over-claim.
+#[test]
+fn claimed_payout_rejects_over_claim_in_disbursement_window() {
+    let network = regtest_nu7_at_1();
+    let start = lts_disbursement_start(&network).unwrap();
+    let parent_height = start.previous().unwrap();
+
+    let parent_pool = 10_000_000_000u64; // expected payout = 4126
+    let mut chain = empty_chain(&network);
+    plant_lts_pool(&mut chain, parent_height, parent_pool);
+    let finalized = ephemeral_finalized_state(&network);
+
+    let expected = i64::from(lts_payout(
+        start,
+        &network,
+        Amount::<NonNegative>::try_from(parent_pool).unwrap(),
+    ));
+    assert!(expected > 0, "test needs a positive scheduled payout");
+
+    // Claim one zatoshi more than the scheduled payout (zero fees → zero minimum).
+    let output = coinbase_output_for_claim(&network, start, Amount::zero(), expected + 1);
+    let (block, spent_utxos) =
+        block_with_coinbase_and_fee(&network, start, output, Amount::zero());
+
+    let err = check_claimed_lts_payout(
+        &network,
+        &chain,
+        &finalized.db,
+        start,
+        &block,
+        &spent_utxos,
+    )
+    .expect_err("over-claiming the scheduled payout must be rejected");
+
+    let ValidateContextError::InvalidLtsDeposit {
+        height,
+        expected_minimum,
+        actual,
+    } = err
+    else {
+        panic!("unexpected error: {err:?}");
+    };
+
+    assert_eq!(start, height);
+    assert_eq!(Amount::<NonNegative>::zero(), expected_minimum);
+    assert_eq!(Amount::<NegativeAllowed>::try_from(-1).unwrap(), actual);
+}
+
+/// With non-zero miner fees, the contextual check enforces the ZIP-235 60%
+/// floor: depositing exactly the minimum is accepted; one zatoshi short is
+/// rejected.
+#[test]
+fn claimed_payout_enforces_zip235_minimum_with_fees() {
+    let network = regtest_nu7_at_1();
+    let chain = empty_chain(&network);
+    let finalized = ephemeral_finalized_state(&network);
+    let pre_height = lts_disbursement_start(&network)
+        .unwrap()
+        .previous()
+        .unwrap();
+
+    let fee = Amount::<NonNegative>::try_from(1_000).unwrap();
+    let minimum = 600i64; // 60% of 1000
+
+    // Deposit exactly the minimum: claim = −minimum, so deposit == floor → accepted.
+    let output = coinbase_output_for_claim(&network, pre_height, fee, -minimum);
+    let (block, spent_utxos) = block_with_coinbase_and_fee(&network, pre_height, output, fee);
+
+    let delta = check_claimed_lts_payout(
+        &network,
+        &chain,
+        &finalized.db,
+        pre_height,
+        &block,
+        &spent_utxos,
+    )
+    .expect("depositing exactly the ZIP-235 minimum is valid");
+    assert_eq!(Amount::<NegativeAllowed>::try_from(minimum).unwrap(), delta);
+
+    // Deposit one zatoshi short of the minimum → rejected.
+    let output = coinbase_output_for_claim(&network, pre_height, fee, -(minimum - 1));
+    let (block, spent_utxos) = block_with_coinbase_and_fee(&network, pre_height, output, fee);
+
+    let err = check_claimed_lts_payout(
+        &network,
+        &chain,
+        &finalized.db,
+        pre_height,
+        &block,
+        &spent_utxos,
+    )
+    .expect_err("depositing below the ZIP-235 minimum must be rejected");
+
+    let ValidateContextError::InvalidLtsDeposit {
+        expected_minimum,
+        actual,
+        ..
+    } = err
+    else {
+        panic!("unexpected error: {err:?}");
+    };
+
+    assert_eq!(Amount::<NonNegative>::try_from(minimum).unwrap(), expected_minimum);
+    assert_eq!(
+        Amount::<NegativeAllowed>::try_from(minimum - 1).unwrap(),
+        actual
+    );
 }
 
 /// At `lts_disbursement_start`, the expected payout is

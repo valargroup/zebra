@@ -270,19 +270,17 @@ impl DiskWriteBatch {
                 }
             })?;
 
-        // Set the LTS pool delta from chain history. The block has been
-        // contextually validated by the time it reaches the finalized commit
-        // path, so the miner's implied claim equals the expected payout
-        // derived from chain history; we recompute the leg here from the
-        // parent pool snapshot in `value_pool` (the chain-wide value pool
-        // *before* this block) rather than threading it through.
+        // Set the LTS pool delta (the signed coinbase under-/over-claim). The
+        // block has been contextually validated by the time it reaches the
+        // finalized commit path, so we re-derive the leg from the block bytes
+        // here rather than threading it through.
         #[cfg(zcash_unstable = "nsm")]
         {
             let lts_delta = crate::service::check::lts::block_lts_pool_delta(
                 &finalized.block,
                 &db.network(),
                 finalized.height,
-                value_pool.lts_amount(),
+                &utxos_spent_by_block,
             )
             .map_err(|value_balance_error| {
                 ValidateContextError::CalculateBlockChainValueChange {
