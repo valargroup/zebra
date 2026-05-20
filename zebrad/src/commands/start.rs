@@ -236,7 +236,6 @@ impl StartCmd {
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
             misbehavior_sender,
-            network: config.network.network.clone(),
         };
         setup_tx
             .send(setup_data)

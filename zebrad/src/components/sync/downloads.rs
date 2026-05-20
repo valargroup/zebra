@@ -26,7 +26,6 @@ use tracing_futures::Instrument;
 use zebra_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
-    parameters::Network,
 };
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_state as zs;
@@ -196,9 +195,6 @@ where
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
 
-    /// The configured Zcash network. Used to select the active reorg limit.
-    zcash_network: Network,
-
     // Configuration
     //
     /// The configured lookahead limit, after applying the minimum limit.
@@ -302,7 +298,6 @@ where
         network: ZN,
         verifier: ZV,
         latest_chain_tip: ZSTip,
-        zcash_network: Network,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         max_checkpoint_height: Height,
@@ -314,7 +309,6 @@ where
             network,
             verifier,
             latest_chain_tip,
-            zcash_network,
             lookahead_limit,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
@@ -360,7 +354,6 @@ where
 
         let mut verifier = self.verifier.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
-        let zcash_network = self.zcash_network.clone();
 
         let lookahead_limit = self.lookahead_limit;
         let max_checkpoint_height = self.max_checkpoint_height;
@@ -440,11 +433,10 @@ where
                 // the finalized tip anyway.
                 //
                 // TODO: get the actual finalized tip height
-                let behind_tip_limit = tip_height
-                    .map(|tip_height| zs::max_block_reorg_height(&zcash_network, tip_height))
-                    .unwrap_or(zs::MAX_BLOCK_REORG_HEIGHT);
                 let min_accepted_height = tip_height
-                    .map(|tip_height| block::Height(tip_height.0.saturating_sub(behind_tip_limit)))
+                    .map(|tip_height| {
+                        block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
+                    })
                     .unwrap_or(block::Height(0));
 
                 let block_height = if let Some(block_height) = block.coinbase_height() {
@@ -512,7 +504,6 @@ where
                         ?block_height,
                         ?tip_height,
                         ?min_accepted_height,
-                        ?behind_tip_limit,
                         "synced block height behind the finalized tip: dropped downloaded block"
                     );
                     metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);

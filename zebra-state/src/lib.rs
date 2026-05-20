@@ -39,10 +39,7 @@ pub use config::{
     check_and_delete_old_databases, check_and_delete_old_state_databases,
     database_format_version_on_disk, state_database_format_version_on_disk, Config,
 };
-pub use constants::{
-    max_block_reorg_height, state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
-    POST_NU7_MAX_BLOCK_REORG_HEIGHT, PRE_NU7_MAX_BLOCK_REORG_HEIGHT,
-};
+pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitSemanticallyVerifiedError,
     DuplicateNullifierError, ValidateContextError,

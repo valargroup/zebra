@@ -18,7 +18,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants::{max_block_reorg_height, MAX_BLOCK_REORG_HEIGHT},
+    constants::MAX_BLOCK_REORG_HEIGHT,
     service::{
         check,
         finalized_state::{FinalizedState, ZebraDb},
@@ -436,17 +436,10 @@ impl WriteBlockWorkerTask {
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
-            // The active reorg limit depends on whether the non-finalized tip
-            // is before or after the NU7 activation height.
-            let reorg_limit = non_finalized_state
-                .best_tip()
-                .map(|(height, _)| max_block_reorg_height(&non_finalized_state.network, height))
-                .unwrap_or(MAX_BLOCK_REORG_HEIGHT);
-
             while non_finalized_state
                 .best_chain_len()
                 .expect("just successfully inserted a non-finalized block above")
-                > reorg_limit
+                > MAX_BLOCK_REORG_HEIGHT
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();

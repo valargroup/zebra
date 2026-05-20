@@ -292,9 +292,9 @@ pub const PRE_NU7_POW_AVERAGING_WINDOW: usize = 17;
 /// The averaging window for difficulty threshold arithmetic mean calculations from NU7 onward.
 ///
 /// Scaled so that the wall-clock timespan of the averaging window matches a
-/// reference of 17 blocks at 300 s per block (5100 s), which at the post-NU7
-/// 25 s target spacing equals `17 * (300 / 25) = 204` blocks.
-pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 204;
+/// reference of 17 blocks at 150 s per block (2550 s), which at the post-NU7
+/// 25 s target spacing equals `17 * (150 / 25) = 102` blocks.
+pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 102;
 
 /// The multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.

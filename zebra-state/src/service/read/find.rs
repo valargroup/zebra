@@ -27,7 +27,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants::max_block_reorg_height,
+    constants::MAX_BLOCK_REORG_HEIGHT,
     service::{
         block_iter::any_ancestor_blocks,
         check::AdjustedDifficulty,
@@ -239,11 +239,7 @@ where
 /// A block locator is used to efficiently find an intersection of two node's chains.
 /// It contains a list of block hashes at decreasing heights, skipping some blocks,
 /// so that any intersection can be located, no matter how long or different the chains are.
-pub fn block_locator<C>(
-    network: &Network,
-    chain: Option<C>,
-    db: &ZebraDb,
-) -> Option<Vec<block::Hash>>
+pub fn block_locator<C>(chain: Option<C>, db: &ZebraDb) -> Option<Vec<block::Hash>>
 where
     C: AsRef<Chain>,
 {
@@ -264,7 +260,7 @@ where
     // via the transaction merkle tree commitments.
     let tip_height = tip_height(chain, db)?;
 
-    let heights = block_locator_heights(network, tip_height);
+    let heights = block_locator_heights(tip_height);
     let mut hashes = Vec::with_capacity(heights.len());
 
     for height in heights {
@@ -280,24 +276,21 @@ where
 ///
 /// Zebra uses a decreasing list of block heights, starting at the tip, and skipping some heights.
 /// See [`block_locator()`] for details.
-pub fn block_locator_heights(network: &Network, tip_height: block::Height) -> Vec<block::Height> {
+pub fn block_locator_heights(tip_height: block::Height) -> Vec<block::Height> {
     // The initial height in the returned `vec` is the tip height, and the final
-    // height is at most the active reorg limit below the tip (99 pre-NU7, 300
-    // from NU7 onward).
+    // height is at most [`MAX_BLOCK_REORG_HEIGHT`] below the tip.
     //
     // The initial distance between heights is 1, and it doubles between each subsequent height.
     // So the number of returned heights is approximately log_2 of the reorg limit.
 
-    // Limit the maximum locator depth to the active reorg limit at the tip.
-    let min_locator_height = tip_height
-        .0
-        .saturating_sub(max_block_reorg_height(network, tip_height));
+    // Limit the maximum locator depth to the reorg limit below the tip.
+    let min_locator_height = tip_height.0.saturating_sub(MAX_BLOCK_REORG_HEIGHT);
 
     // Create an exponentially decreasing set of heights.
     let exponential_locators = iter::successors(Some(1u32), |h| h.checked_mul(2))
         .flat_map(move |step| tip_height.0.checked_sub(step));
 
-    // Start at the tip, add decreasing heights, and end MAX_BLOCK_REORG_HEIGHT below the tip.
+    // Start at the tip, add decreasing heights, and end at the active reorg limit below the tip.
     let locators = iter::once(tip_height.0)
         .chain(exponential_locators)
         .take_while(move |&height| height > min_locator_height)

@@ -21,7 +21,7 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zebra_node_services::rpc_client::RpcRequestClient;
-use zebra_state::{ChainTipChange, LatestChainTip, POST_NU7_MAX_BLOCK_REORG_HEIGHT};
+use zebra_state::{ChainTipChange, LatestChainTip, MAX_BLOCK_REORG_HEIGHT};
 use zebra_test::command::TestChild;
 
 use crate::common::{
@@ -229,7 +229,7 @@ pub async fn raw_future_blocks(
 ) -> Result<Vec<String>> {
     assert!(max_num_blocks > 0);
 
-    let max_num_blocks = max_num_blocks.min(POST_NU7_MAX_BLOCK_REORG_HEIGHT);
+    let max_num_blocks = max_num_blocks.min(MAX_BLOCK_REORG_HEIGHT);
     let mut raw_blocks = Vec::with_capacity(max_num_blocks as usize);
 
     assert!(
@@ -266,7 +266,7 @@ pub async fn raw_future_blocks(
         .try_into()
         .expect("unexpected block height: doesn't fit in u32");
 
-    let estimated_finalized_tip_height = tip_height - POST_NU7_MAX_BLOCK_REORG_HEIGHT;
+    let estimated_finalized_tip_height = tip_height - MAX_BLOCK_REORG_HEIGHT;
 
     tracing::info!(
         ?tip_height,

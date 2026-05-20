@@ -26,9 +26,9 @@ pub const PRE_NU7_POW_MEDIAN_BLOCK_SPAN: usize = 11;
 /// The median block span for time median calculations from NU7 onward.
 ///
 /// Scaled so that the wall-clock timespan of the median window matches a
-/// reference of 11 blocks at 300 s per block (3300 s), which at the post-NU7
-/// 25 s target spacing equals `11 * (300 / 25) = 132` blocks.
-pub const POST_NU7_POW_MEDIAN_BLOCK_SPAN: usize = 132;
+/// reference of 11 blocks at 150 s per block (1650 s), which at the post-NU7
+/// 25 s target spacing equals `11 * (150 / 25) = 66` blocks.
+pub const POST_NU7_POW_MEDIAN_BLOCK_SPAN: usize = 66;
 
 /// The maximum overall block span used for adjusting Zcash block difficulty.
 ///

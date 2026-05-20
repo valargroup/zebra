@@ -1470,8 +1470,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             // Used by the StateService.
             ReadRequest::BlockLocator => Ok(ReadResponse::BlockLocator(
-                read::block_locator(&state.network, state.latest_best_chain(), &state.db)
-                    .unwrap_or_default(),
+                read::block_locator(state.latest_best_chain(), &state.db).unwrap_or_default(),
             )),
 
             // Used by the StateService.
