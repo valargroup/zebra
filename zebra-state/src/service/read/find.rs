@@ -21,7 +21,6 @@ use chrono::{DateTime, Utc};
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
-    parameters::Network,
     serialization::DateTime32,
     value_balance::ValueBalance,
 };
@@ -618,11 +617,10 @@ where
 ///
 /// - If we don't have enough blocks in the state.
 pub fn next_median_time_past(
-    network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZebraDb,
 ) -> Result<DateTime32, BoxError> {
-    let mut best_relevant_chain_result = best_relevant_chain(network, non_finalized_state, db);
+    let mut best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
 
     // Retry the finalized state query if it was interrupted by a finalizing block.
     //
@@ -632,7 +630,7 @@ pub fn next_median_time_past(
             break;
         }
 
-        best_relevant_chain_result = best_relevant_chain(network, non_finalized_state, db);
+        best_relevant_chain_result = best_relevant_chain(non_finalized_state, db);
     }
 
     Ok(calculate_median_time_past(best_relevant_chain_result?))
@@ -647,7 +645,6 @@ pub fn next_median_time_past(
 ///
 /// - If we don't have enough blocks in the state.
 fn best_relevant_chain(
-    network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZebraDb,
 ) -> Result<Vec<Arc<Block>>, BoxError> {
@@ -655,17 +652,11 @@ fn best_relevant_chain(
         BoxError::from("Zebra's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let next_block_height = (state_tip_before_queries.0 + 1).expect("next block height is valid");
-    let median_block_span = crate::service::check::difficulty::pow_median_block_span_for_height(
-        network,
-        next_block_height,
-    );
-
     let best_relevant_chain =
         any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
     let best_relevant_chain: Vec<_> = best_relevant_chain
         .into_iter()
-        .take(median_block_span)
+        .take(crate::service::check::difficulty::POW_MEDIAN_BLOCK_SPAN)
         .collect();
 
     if best_relevant_chain.is_empty() {

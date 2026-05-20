@@ -1363,13 +1363,11 @@ impl Service<ReadRequest> for ReadStateService {
             ))),
 
             // Used by the StateService.
-            ReadRequest::BestChainNextMedianTimePast => Ok(
-                ReadResponse::BestChainNextMedianTimePast(read::next_median_time_past(
-                    &state.network,
-                    &state.latest_non_finalized_state(),
-                    &state.db,
-                )?),
-            ),
+            ReadRequest::BestChainNextMedianTimePast => {
+                Ok(ReadResponse::BestChainNextMedianTimePast(
+                    read::next_median_time_past(&state.latest_non_finalized_state(), &state.db)?,
+                ))
+            }
 
             // Used by the get_block (raw) RPC and the StateService.
             ReadRequest::Block(hash_or_height) => Ok(ReadResponse::Block(read::block(

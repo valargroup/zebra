@@ -16,29 +16,20 @@ use zebra_chain::{
     BoundedVec,
 };
 
-/// The median block span for time median calculations before NU7.
+/// The median block span for time median calculations.
 ///
-/// `PoWMedianBlockSpan` in the Zcash specification.
-///
-/// Use [`pow_median_block_span_for_height`] for the active network value.
-pub const PRE_NU7_POW_MEDIAN_BLOCK_SPAN: usize = 11;
-
-/// The median block span for time median calculations from NU7 onward.
-///
-/// Scaled so that the wall-clock timespan of the median window matches a
-/// reference of 11 blocks at 150 s per block (1650 s), which at the post-NU7
-/// 25 s target spacing equals `11 * (150 / 25) = 66` blocks.
-pub const POST_NU7_POW_MEDIAN_BLOCK_SPAN: usize = 66;
+/// `PoWMedianBlockSpan` in the Zcash specification. Per ZIP, this value is a
+/// number of blocks and does not change at network upgrade activations.
+pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 
 /// The maximum overall block span used for adjusting Zcash block difficulty.
 ///
 /// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
 ///
-/// Sized for the largest active values across all regimes so that the
-/// [`BoundedVec`] capacities accommodate any height.
-pub const POW_ADJUSTMENT_BLOCK_SPAN: usize =
-    POST_NU7_POW_AVERAGING_WINDOW + POST_NU7_POW_MEDIAN_BLOCK_SPAN;
+/// Sized for the largest active averaging window so that the [`BoundedVec`]
+/// capacities accommodate any height.
+pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POST_NU7_POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
 
 /// The damping factor for median timespan variance.
 ///
@@ -330,8 +321,6 @@ impl AdjustedDifficulty {
         let newer_median = self.median_time_past();
         let averaging_window =
             NetworkUpgrade::averaging_window_for_height(&self.network, self.candidate_height);
-        let median_block_span =
-            pow_median_block_span_for_height(&self.network, self.candidate_height);
 
         // MedianTime(height : N) := median([ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to max(0, height − 1) ])
         let older_median = if self.relevant_times.len() > averaging_window {
@@ -340,7 +329,7 @@ impl AdjustedDifficulty {
                 .iter()
                 .skip(averaging_window)
                 .cloned()
-                .take(median_block_span)
+                .take(POW_MEDIAN_BLOCK_SPAN)
                 .collect();
 
             AdjustedDifficulty::median_time(older_times)
@@ -359,12 +348,10 @@ impl AdjustedDifficulty {
     /// Zcash specification. (These functions are identical, but they are
     /// specified in slightly different ways.)
     pub fn median_time_past(&self) -> DateTime<Utc> {
-        let median_block_span =
-            pow_median_block_span_for_height(&self.network, self.candidate_height);
         let median_times: Vec<DateTime<Utc>> = self
             .relevant_times
             .iter()
-            .take(median_block_span)
+            .take(POW_MEDIAN_BLOCK_SPAN)
             .cloned()
             .collect();
 
@@ -391,20 +378,7 @@ impl AdjustedDifficulty {
 
 /// Returns the difficulty adjustment block span for `network` and `height`.
 pub fn pow_adjustment_block_span_for_height(network: &Network, height: block::Height) -> usize {
-    NetworkUpgrade::averaging_window_for_height(network, height)
-        + pow_median_block_span_for_height(network, height)
-}
-
-/// Returns the median block span for `network` and `height`.
-///
-/// Selects [`PRE_NU7_POW_MEDIAN_BLOCK_SPAN`] for heights below NU7 activation,
-/// and [`POST_NU7_POW_MEDIAN_BLOCK_SPAN`] from NU7 onward.
-pub fn pow_median_block_span_for_height(network: &Network, height: block::Height) -> usize {
-    if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu7 {
-        PRE_NU7_POW_MEDIAN_BLOCK_SPAN
-    } else {
-        POST_NU7_POW_MEDIAN_BLOCK_SPAN
-    }
+    NetworkUpgrade::averaging_window_for_height(network, height) + POW_MEDIAN_BLOCK_SPAN
 }
 
 #[cfg(test)]
