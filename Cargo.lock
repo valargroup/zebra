@@ -7750,6 +7750,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zebra-jsonl-trace"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "zebra-network"
 version = "6.0.0"
 dependencies = [
