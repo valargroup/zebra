@@ -38,6 +38,7 @@
   - [Doing Mass Renames](dev/mass-renames.md)
   - [Updating the ECC dependencies](dev/ecc-updates.md)
   - [Running a Private Testnet Test](dev/private-testnet.md)
+  - [Joining the NU7 Testnet](dev/nu7-testnet-join.md)
   - [Zebra crates](dev/crate-owners.md)
   - [Zebra RFCs](dev/rfcs.md)
     - [Pipelinable Block Lookup](dev/rfcs/0001-pipelinable-block-lookup.md)

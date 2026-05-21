@@ -134,6 +134,8 @@ FROM deps AS release
 ARG SHORT_SHA
 ARG FEATURES
 ENV FEATURES=${FEATURES}
+ARG RUSTFLAGS
+ENV RUSTFLAGS=${RUSTFLAGS}
 
 # Set the working directory for the build.
 ARG HOME
