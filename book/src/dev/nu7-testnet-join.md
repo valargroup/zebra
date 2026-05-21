@@ -1,20 +1,24 @@
 # Join the NU7 Testnet
 
-Use this page on a fresh Ubuntu machine to download the NU7 join bundle and run
-the join script in observer or mining mode.
+Use this page on a fresh x86_64 Ubuntu machine to download the NU7 join bundle
+and run the join script in observer or mining mode. The join script downloads
+the prebuilt `zebrad` and `kresko` binaries from their GitHub releases and
+verifies their checksums — nothing is compiled on the host.
 
-The bundle URL defaults to `nu7-testnet/nu7-join-bundle.tar.gz` next to this
-page. Add `?bundle_url=...` to the page URL to prefill a different bundle. If
-the script and bundle are already on the machine, pass the local bundle path
-instead.
+The join script ships as an asset on every
+[Kresko release](https://github.com/valargroup/kresko/releases). The bundle URL
+defaults to `nu7-testnet/nu7-join-bundle.tar.gz` next to this page. Add
+`?bundle_url=...` to the page URL to prefill a different bundle. If the bundle is
+already on the machine, pass the local bundle path instead.
 
-Observer mode with local files:
+Observer mode:
 
 ```sh
+curl -fsSLO https://github.com/valargroup/kresko/releases/download/v0.1.0/join-nu7-testnet.sh
 bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz
 ```
 
-Mining mode with local files:
+Mining mode:
 
 ```sh
 bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz --mine
@@ -38,15 +42,12 @@ bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz --mine --miner-ad
     </div>
     <div class="nu7-action-row">
       <a id="download-bundle" class="nu7-button" href="nu7-testnet/nu7-join-bundle.tar.gz" download>Download bundle</a>
-      <a id="download-script" class="nu7-button" href="nu7-testnet/join-nu7-testnet.sh" download>Download script</a>
+      <a id="download-script" class="nu7-button" href="https://github.com/valargroup/kresko/releases/download/v0.1.0/join-nu7-testnet.sh">Download script</a>
       <button id="copy-command" type="button">Copy command</button>
-      <button id="copy-script" type="button" disabled>Copy script</button>
     </div>
   </section>
   <h2>Run Command</h2>
   <pre><code id="join-command"></code></pre>
-  <h2>Join Script</h2>
-  <pre><code id="join-script"></code></pre>
 </div>
 
 <style>
@@ -115,17 +116,16 @@ bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz --mine --miner-ad
 
 <script>
 (function () {
+  const kreskoReleaseTag = "v0.1.0";
+  const scriptUrl = "https://github.com/valargroup/kresko/releases/download/" + kreskoReleaseTag + "/join-nu7-testnet.sh";
   const defaultBundleUrl = new URL("nu7-testnet/nu7-join-bundle.tar.gz", window.location.href).href;
-  const scriptUrl = new URL("nu7-testnet/join-nu7-testnet.sh", window.location.href).href;
   const params = new URLSearchParams(window.location.search);
 
   const bundleInput = document.getElementById("bundle-url");
   const minerAddressInput = document.getElementById("miner-address");
   const commandOutput = document.getElementById("join-command");
-  const scriptOutput = document.getElementById("join-script");
   const downloadBundle = document.getElementById("download-bundle");
   const copyCommand = document.getElementById("copy-command");
-  const copyScript = document.getElementById("copy-script");
 
   bundleInput.value = params.get("bundle_url") || params.get("bundle") || defaultBundleUrl;
   minerAddressInput.value = params.get("miner_address") || "";
@@ -185,23 +185,6 @@ bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz --mine --miner-ad
     setCopied(button);
   }
 
-  fetch(scriptUrl)
-    .then(function (response) {
-      if (!response.ok) {
-        throw new Error("script fetch failed");
-      }
-
-      return response.text();
-    })
-    .then(function (script) {
-      scriptOutput.textContent = script;
-      copyScript.disabled = false;
-    })
-    .catch(function () {
-      scriptOutput.textContent = "Unable to load " + scriptUrl;
-      copyScript.disabled = true;
-    });
-
   bundleInput.addEventListener("input", updateCommand);
   minerAddressInput.addEventListener("input", updateCommand);
   document.querySelectorAll("input[name='join-mode']").forEach(function (input) {
@@ -210,10 +193,6 @@ bash join-nu7-testnet.sh --bundle-url ./nu7-join-bundle.tar.gz --mine --miner-ad
 
   copyCommand.addEventListener("click", function () {
     copyText(copyCommand, commandOutput.textContent);
-  });
-
-  copyScript.addEventListener("click", function () {
-    copyText(copyScript, scriptOutput.textContent);
   });
 
   updateCommand();
