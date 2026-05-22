@@ -38,6 +38,7 @@ jobs:
           private-key: ${{ secrets.Z3_APP_PRIVATE_KEY }}
           owner: zcash
           repositories: integration-tests
+          permission-contents: write
 
       - name: Get requested test branch, if any
         if: github.event_name == 'pull_request'
