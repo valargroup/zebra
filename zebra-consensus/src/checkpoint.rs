@@ -262,6 +262,26 @@ where
     ) -> Self {
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
+
+        // The checkpoint verifier finalises blocks without running the
+        // contextual LTS payout/deposit check, so the checkpoint range must
+        // end strictly below NU7 activation. In the no-v6 NSM model, implicit
+        // ZIP-235 deposits start at NU7 even though LTS payouts begin later.
+        // Lifting this requires teaching the checkpoint path to validate
+        // per-block LTS value movement (see `flup_dispersment.md`).
+        #[cfg(zcash_unstable = "nsm")]
+        if let Some(nu7_activation_height) =
+            zebra_chain::parameters::NetworkUpgrade::Nu7.activation_height(network)
+        {
+            let max_height = checkpoint_list.max_height();
+            assert!(
+                max_height < nu7_activation_height,
+                "final checkpoint at {max_height:?} must be below \
+                 NU7 activation height {nu7_activation_height:?} on {network:?}: \
+                 the checkpoint verifier does not validate LTS deposits or payouts"
+            );
+        }
+
         let (initial_tip_hash, verifier_progress) =
             progress_from_tip(&checkpoint_list, initial_tip);
 

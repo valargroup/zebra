@@ -28,6 +28,8 @@ use crate::service::non_finalized_state::Chain;
 
 pub(crate) mod anchors;
 pub(crate) mod difficulty;
+#[cfg(zcash_unstable = "nsm")]
+pub(crate) mod lts;
 pub(crate) mod nullifier;
 pub(crate) mod utxo;
 

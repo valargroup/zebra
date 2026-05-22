@@ -29,11 +29,8 @@ use zebra_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[cfg(zcash_unstable = "nsm")]
 use crate::methods::Amount;
-
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-use zebra_chain::amount::NonNegative;
 
 #[cfg(test)]
 mod tests;
@@ -69,9 +66,6 @@ pub fn select_mempool_transactions(
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
     extra_coinbase_data: Vec<u8>,
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))] zip233_amount: Option<
-        Amount<NonNegative>,
-    >,
 ) -> Vec<SelectedMempoolTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
@@ -80,8 +74,6 @@ pub fn select_mempool_transactions(
         next_block_height,
         miner_address,
         extra_coinbase_data,
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-        zip233_amount,
     );
 
     let tx_dependencies = mempool_tx_deps.dependencies();
@@ -239,9 +231,6 @@ pub fn fake_coinbase_transaction(
     height: Height,
     miner_address: &Address,
     extra_coinbase_data: Vec<u8>,
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))] zip233_amount: Option<
-        Amount<NonNegative>,
-    >,
 ) -> TransactionTemplate<NegativeOrZero> {
     // Block heights are encoded as variable-length (script) and `u32` (lock time, expiry height).
     // They can also change the `u32` consensus branch id.
@@ -253,33 +242,24 @@ pub fn fake_coinbase_transaction(
     // so one zat has the same size as the real amount:
     // https://developer.bitcoin.org/reference/transactions.html#txout-a-transaction-output
     let miner_fee = 1.try_into().expect("amount is valid and non-negative");
-    let outputs = standard_coinbase_outputs(net, height, miner_address, miner_fee);
-
     let network_upgrade = NetworkUpgrade::current(net, height);
+    // The LTS payout and ZIP-233 transparent-output adjustment only affect the
+    // i64 amount in the miner's transparent output, not its serialized size or
+    // sigop count, so the fake coinbase used for transaction selection
+    // budgeting can ignore them.
+    let outputs = standard_coinbase_outputs(
+        net,
+        height,
+        miner_address,
+        miner_fee,
+        #[cfg(zcash_unstable = "nsm")]
+        Amount::zero(),
+    );
 
-    #[cfg(not(all(zcash_unstable = "nu7", feature = "tx_v6")))]
     let coinbase = if network_upgrade.branch_id().is_none() {
         Transaction::new_v4_coinbase(height, outputs, extra_coinbase_data).into()
     } else {
         Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into()
-    };
-
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-    let coinbase = if network_upgrade.branch_id().is_none() {
-        Transaction::new_v4_coinbase(height, outputs, extra_coinbase_data).into()
-    } else if network_upgrade < NetworkUpgrade::Nu7 {
-        Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into()
-    } else {
-        Transaction::new_v6_coinbase(
-            net,
-            height,
-            outputs,
-            extra_coinbase_data,
-            zip233_amount,
-            #[cfg(zcash_unstable = "zip235")]
-            miner_fee,
-        )
-        .into()
     };
 
     TransactionTemplate::from_coinbase(&coinbase, miner_fee)

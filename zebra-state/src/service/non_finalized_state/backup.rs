@@ -162,6 +162,8 @@ impl From<&ContextuallyVerifiedBlock> for NonFinalizedBlockBackup {
 
 impl NonFinalizedBlockBackup {
     /// Encodes a [`NonFinalizedBlockBackup`] as a vector of bytes.
+    ///
+    /// Layout: `[deferred_pool_balance_change(8) | block_bytes...]`.
     fn as_bytes(&self) -> Vec<u8> {
         let block_bytes = self
             .block
@@ -177,9 +179,9 @@ impl NonFinalizedBlockBackup {
     /// Constructs a new [`NonFinalizedBlockBackup`] from a vector of bytes.
     #[allow(clippy::unwrap_in_result)]
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, io::Error> {
-        let (deferred_pool_balance_change_bytes, block_bytes) = bytes
-            .split_at_checked(size_of::<Amount>())
-            .ok_or(io::Error::new(
+        let prefix_len = size_of::<Amount>();
+        let (deferred_pool_balance_change_bytes, block_bytes) =
+            bytes.split_at_checked(prefix_len).ok_or(io::Error::new(
                 ErrorKind::InvalidInput,
                 "input is too short",
             ))?;
@@ -344,4 +346,50 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
     };
 
     Some((block_hash, entry.path()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_test::vectors::MAINNET_BLOCKS;
+
+    fn sample_block() -> Arc<Block> {
+        let bytes = MAINNET_BLOCKS
+            .iter()
+            .next()
+            .expect("at least one mainnet test block")
+            .1;
+        Arc::new(bytes.zcash_deserialize_into().expect("valid block"))
+    }
+
+    fn assert_round_trip(deferred: i64) {
+        let original = NonFinalizedBlockBackup {
+            block: sample_block(),
+            deferred_pool_balance_change: Amount::try_from(deferred)
+                .expect("test deferred amount in range"),
+        };
+        let bytes = original.as_bytes();
+        let decoded =
+            NonFinalizedBlockBackup::from_bytes(bytes).expect("round-trip parse succeeds");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn backup_round_trips_with_zero_deferred() {
+        assert_round_trip(0);
+    }
+
+    #[test]
+    fn backup_round_trips_with_non_zero_deferred() {
+        assert_round_trip(12_345);
+    }
+
+    #[test]
+    fn backup_from_bytes_rejects_short_prefix() {
+        let too_short = vec![0u8; size_of::<Amount>() - 1];
+        let err = NonFinalizedBlockBackup::from_bytes(too_short)
+            .expect_err("input shorter than the prefix must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
 }

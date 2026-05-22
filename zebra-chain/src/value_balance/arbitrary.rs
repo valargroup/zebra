@@ -1,6 +1,16 @@
 use crate::{amount::*, value_balance::*};
 use proptest::prelude::*;
 
+#[cfg(zcash_unstable = "nsm")]
+fn active_lts<C>(lts: Amount<C>) -> Amount<C> {
+    lts
+}
+
+#[cfg(not(zcash_unstable = "nsm"))]
+fn active_lts<C: Constraint>(_lts: Amount<C>) -> Amount<C> {
+    Amount::zero()
+}
+
 impl Arbitrary for ValueBalance<NegativeAllowed> {
     type Parameters = ();
 
@@ -11,14 +21,18 @@ impl Arbitrary for ValueBalance<NegativeAllowed> {
             any::<Amount<NegativeAllowed>>(),
             any::<Amount<NegativeAllowed>>(),
             any::<Amount<NegativeAllowed>>(),
+            any::<Amount<NegativeAllowed>>(),
         )
-            .prop_map(|(transparent, sprout, sapling, orchard, deferred)| Self {
-                transparent,
-                sprout,
-                sapling,
-                orchard,
-                deferred,
-            })
+            .prop_map(
+                |(transparent, sprout, sapling, orchard, deferred, lts)| Self {
+                    transparent,
+                    sprout,
+                    sapling,
+                    orchard,
+                    deferred,
+                    lts: active_lts(lts),
+                },
+            )
             .boxed()
     }
 
@@ -35,14 +49,18 @@ impl Arbitrary for ValueBalance<NonNegative> {
             any::<Amount<NonNegative>>(),
             any::<Amount<NonNegative>>(),
             any::<Amount<NonNegative>>(),
+            any::<Amount<NonNegative>>(),
         )
-            .prop_map(|(transparent, sprout, sapling, orchard, deferred)| Self {
-                transparent,
-                sprout,
-                sapling,
-                orchard,
-                deferred,
-            })
+            .prop_map(
+                |(transparent, sprout, sapling, orchard, deferred, lts)| Self {
+                    transparent,
+                    sprout,
+                    sapling,
+                    orchard,
+                    deferred,
+                    lts: active_lts(lts),
+                },
+            )
             .boxed()
     }
 

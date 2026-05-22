@@ -198,6 +198,9 @@ impl DiskFormatUpgrade for Upgrade {
             };
 
             // Add this block's value pool changes to the total value pool.
+            // The LTS leg is left at zero — this database upgrade replays
+            // historical pre-NSM blocks, where neither implicit deposits nor
+            // any LTS payout is ever non-zero.
             value_pool = value_pool
                 .add_chain_value_pool_change(
                     block

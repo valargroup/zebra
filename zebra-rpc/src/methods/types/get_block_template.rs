@@ -280,9 +280,7 @@ impl BlockTemplateResponse {
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
         extra_coinbase_data: Vec<u8>,
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))] zip233_amount: Option<
-            Amount<NonNegative>,
-        >,
+        #[cfg(zcash_unstable = "nsm")] lts_payout: Amount<NonNegative>,
     ) -> Self {
         // Calculate the next block height.
         let next_block_height =
@@ -334,8 +332,8 @@ impl BlockTemplateResponse {
             &mempool_txs,
             chain_tip_and_local_time.chain_history_root,
             extra_coinbase_data,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            zip233_amount,
+            #[cfg(zcash_unstable = "nsm")]
+            lts_payout,
         )
         .expect("coinbase should be valid under the given parameters");
 
@@ -781,6 +779,90 @@ where
     Ok(chain_info)
 }
 
+/// Computes the LTS (Long-Term Support / NSM / ZIP-234) payout that the
+/// coinbase at `next_height` is allowed to claim, by looking up the parent
+/// block's LTS pool snapshot via the read-state service and applying the
+/// same ZIP-234 smooth-issuance ceiling formula as the contextual verifier.
+///
+/// Returns `Amount::zero()` outside the disbursement window (including when
+/// NU7 is unconfigured).
+#[cfg(zcash_unstable = "nsm")]
+pub async fn expected_lts_payout<State>(
+    network: &Network,
+    next_height: Height,
+    state: State,
+) -> RpcResult<Amount<NonNegative>>
+where
+    State: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    use zebra_chain::parameters::subsidy::{lts_disbursement_start, lts_payout};
+
+    let Some(start) = lts_disbursement_start(network) else {
+        return Ok(Amount::zero());
+    };
+
+    if next_height < start {
+        return Ok(Amount::zero());
+    }
+
+    // parent_height = next_height - 1 is always available because
+    // next_height ≥ disbursement_start ≥ NU7 activation > 0.
+    let parent_height = next_height
+        .previous()
+        .expect("next_height ≥ disbursement_start > 0, parent height exists");
+
+    let parent_pool = read_lts_pool_at(state, parent_height).await?;
+
+    Ok(lts_payout(next_height, network, parent_pool))
+}
+
+/// Read the LTS pool balance recorded *after* the block at `height` from the
+/// best chain via [`zebra_state::ReadRequest::BlockInfo`].
+#[cfg(zcash_unstable = "nsm")]
+async fn read_lts_pool_at<State>(state: State, height: Height) -> RpcResult<Amount<NonNegative>>
+where
+    State: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    use zebra_state::{HashOrHeight, ReadRequest, ReadResponse};
+
+    let response = state
+        .oneshot(ReadRequest::BlockInfo(HashOrHeight::Height(height)))
+        .await
+        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+
+    let block_info = match response {
+        ReadResponse::BlockInfo(info) => info,
+        _ => unreachable!("incorrect response to ReadRequest::BlockInfo"),
+    };
+
+    let block_info = block_info.ok_or_else(|| {
+        ErrorObject::owned(
+            0,
+            format!(
+                "no block info available at ancestor height {height:?} \
+                 needed for LTS payout computation"
+            ),
+            None::<()>,
+        )
+    })?;
+
+    Ok(block_info.value_pools().lts_amount())
+}
+
 /// Returns the transactions that are currently in `mempool`, or None if the
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
@@ -829,31 +911,24 @@ pub fn generate_coinbase_and_roots(
     mempool_txs: &[VerifiedUnminedTx],
     chain_history_root: Option<ChainHistoryMmrRootHash>,
     miner_data: Vec<u8>,
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))] zip233_amount: Option<
-        Amount<NonNegative>,
-    >,
+    #[cfg(zcash_unstable = "nsm")] lts_payout: Amount<NonNegative>,
 ) -> Result<(TransactionTemplate<NegativeOrZero>, DefaultRoots), &'static str> {
     let miner_fee = calculate_miner_fee(mempool_txs);
-    let outputs = standard_coinbase_outputs(network, height, miner_address, miner_fee);
     let current_nu = NetworkUpgrade::current(network, height);
+    let outputs = standard_coinbase_outputs(
+        network,
+        height,
+        miner_address,
+        miner_fee,
+        #[cfg(zcash_unstable = "nsm")]
+        lts_payout,
+    );
 
     let tx = match current_nu {
         NetworkUpgrade::Canopy => Transaction::new_v4_coinbase(height, outputs, miner_data),
-        NetworkUpgrade::Nu5 | NetworkUpgrade::Nu6 | NetworkUpgrade::Nu6_1 => {
+        NetworkUpgrade::Nu5 | NetworkUpgrade::Nu6 | NetworkUpgrade::Nu6_1 | NetworkUpgrade::Nu7 => {
             Transaction::new_v5_coinbase(network, height, outputs, miner_data)
         }
-        #[cfg(not(all(zcash_unstable = "nu7", feature = "tx_v6")))]
-        NetworkUpgrade::Nu7 => Transaction::new_v5_coinbase(network, height, outputs, miner_data),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-        NetworkUpgrade::Nu7 => Transaction::new_v6_coinbase(
-            network,
-            height,
-            outputs,
-            miner_data,
-            zip233_amount,
-            #[cfg(zcash_unstable = "zip235")]
-            miner_fee,
-        ),
         _ => Err("Zebra does not support generating pre-Canopy coinbase transactions")?,
     }
     .into();
@@ -894,6 +969,7 @@ pub fn standard_coinbase_outputs(
     height: Height,
     miner_address: &Address,
     miner_fee: Amount<NonNegative>,
+    #[cfg(zcash_unstable = "nsm")] lts_payout: Amount<NonNegative>,
 ) -> Vec<(Amount<NonNegative>, transparent::Script)> {
     let expected_block_subsidy = block_subsidy(height, network).expect("valid block subsidy");
     let funding_streams = funding_stream_values(height, network, expected_block_subsidy)
@@ -904,6 +980,23 @@ pub fn standard_coinbase_outputs(
         + miner_fee;
     let miner_reward =
         miner_reward.expect("reward calculations are valid for reasonable chain heights");
+    // The LTS payout is funded from the on-chain LTS pool (accumulated burn),
+    // and routed into the miner's primary transparent output. The contextual
+    // verifier checks that the claimed amount matches the per-block rate
+    // derived from the chain's pool history.
+    #[cfg(zcash_unstable = "nsm")]
+    let miner_reward =
+        (miner_reward + lts_payout).expect("miner reward + lts payout is bounded by MAX_MONEY");
+    #[cfg(all(zcash_unstable = "nsm", zcash_unstable = "zip235"))]
+    let miner_reward = if NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7 {
+        let minimum_zip233_amount =
+            zebra_chain::transaction::builder::zip235_minimum_zip233_amount(miner_fee);
+
+        (miner_reward - minimum_zip233_amount)
+            .expect("coinbase ZIP-233 minimum is funded by the miner fee")
+    } else {
+        miner_reward
+    };
 
     // Optional TODO: move this into a zebra_consensus function?
     let funding_streams: HashMap<

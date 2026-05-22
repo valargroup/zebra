@@ -717,7 +717,12 @@ fn snapshot_rpc_getblockchaininfo(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}"), info, {
+        #[cfg(zcash_unstable = "nsm")]
+        let nsm_suffix = "_nsm";
+        #[cfg(not(zcash_unstable = "nsm"))]
+        let nsm_suffix = "";
+
+        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}{nsm_suffix}"), info, {
             ".estimatedheight" => dynamic_redaction(|value, _path| {
                 // assert that the value looks like a valid height here
                 assert!(u32::try_from(value.as_u64().unwrap()).unwrap() < Height::MAX_AS_U32);
@@ -772,7 +777,14 @@ fn snapshot_rpc_getblock_verbose(
     block: GetBlockResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block));
+    settings.bind(|| {
+        #[cfg(zcash_unstable = "nsm")]
+        let nsm_suffix = "_nsm";
+        #[cfg(not(zcash_unstable = "nsm"))]
+        let nsm_suffix = "";
+
+        insta::assert_json_snapshot!(format!("get_block_verbose_{variant}{nsm_suffix}"), block)
+    });
 }
 
 /// Check valid `getblockheader` response using `cargo insta`.

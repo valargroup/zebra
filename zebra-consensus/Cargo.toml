@@ -98,6 +98,9 @@ zebra-chain = { path = "../zebra-chain", version = "7.0.0", features = ["proptes
 zebra-test = { path = "../zebra-test/", version = "3.0.0" }
 
 criterion = { workspace = true, features = ["html_reports"] }
+rand_core = { workspace = true }
+zcash_primitives = { workspace = true, features = ["transparent-inputs", "zip-233"] }
+zcash_transparent = { workspace = true, features = ["transparent-inputs"] }
 
 [[bench]]
 name = "groth16"

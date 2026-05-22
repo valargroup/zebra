@@ -588,8 +588,24 @@ impl NonFinalizedState {
             &prepared,
         );
 
+        // ZIP-234/235 Long-Term Support pool check. Re-derives the miner's
+        // signed implied claim from the block bytes (mirroring the semantic
+        // verifier's value-balance equation), validates it against the chain's
+        // LTS pool history and the ZIP-235 deposit floor, and returns the pool
+        // delta (the signed under-/over-claim) to apply below.
+        #[cfg(zcash_unstable = "nsm")]
+        let lts_delta = check::lts::check_claimed_lts_payout(
+            &self.network,
+            &new_chain,
+            finalized_state,
+            prepared.height,
+            &prepared.block,
+            &transparent::utxos_from_ordered_utxos(spent_utxos.clone()),
+        )?;
+
         // Quick check that doesn't read from disk
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        #[cfg_attr(not(zcash_unstable = "nsm"), allow(unused_mut))]
+        let mut contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             prepared.clone(),
             spent_utxos.clone(),
         )
@@ -602,6 +618,10 @@ impl NonFinalizedState {
                 spent_utxo_count: spent_utxos.len(),
             }
         })?;
+
+        // Apply the LTS pool delta confirmed by `check_claimed_lts_payout`.
+        #[cfg(zcash_unstable = "nsm")]
+        contextual.chain_value_pool_change.set_lts_amount(lts_delta);
 
         Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)
     }
