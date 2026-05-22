@@ -33,6 +33,7 @@ use zebra_chain::{
     serialization::{DateTime32, ZcashDeserializeInto},
     subtree::NoteCommitmentSubtreeData,
     transaction::Transaction,
+    value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
 use zebra_consensus::Request;
@@ -1171,6 +1172,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                     min_time: fake_min_time,
                     max_time: fake_max_time,
                     chain_history_root: fake_history_tree(network).hash(),
+                    value_balance: ValueBalance::zero(),
                 }));
         }
     };

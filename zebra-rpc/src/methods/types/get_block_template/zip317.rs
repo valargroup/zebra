@@ -255,26 +255,31 @@ pub fn fake_coinbase_transaction(
     let miner_fee = 1.try_into().expect("amount is valid and non-negative");
     let outputs = standard_coinbase_outputs(net, height, miner_address, miner_fee);
 
+    let network_upgrade = NetworkUpgrade::current(net, height);
+
     #[cfg(not(all(zcash_unstable = "nu7", feature = "tx_v6")))]
-    let coinbase = Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into();
+    let coinbase = if network_upgrade.branch_id().is_none() {
+        Transaction::new_v4_coinbase(height, outputs, extra_coinbase_data).into()
+    } else {
+        Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into()
+    };
 
     #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-    let coinbase = {
-        let network_upgrade = NetworkUpgrade::current(net, height);
-        if network_upgrade < NetworkUpgrade::Nu7 {
-            Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into()
-        } else {
-            Transaction::new_v6_coinbase(
-                net,
-                height,
-                outputs,
-                extra_coinbase_data,
-                zip233_amount,
-                #[cfg(zcash_unstable = "zip235")]
-                miner_fee,
-            )
-            .into()
-        }
+    let coinbase = if network_upgrade.branch_id().is_none() {
+        Transaction::new_v4_coinbase(height, outputs, extra_coinbase_data).into()
+    } else if network_upgrade < NetworkUpgrade::Nu7 {
+        Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into()
+    } else {
+        Transaction::new_v6_coinbase(
+            net,
+            height,
+            outputs,
+            extra_coinbase_data,
+            zip233_amount,
+            #[cfg(zcash_unstable = "zip235")]
+            miner_fee,
+        )
+        .into()
     };
 
     TransactionTemplate::from_coinbase(&coinbase, miner_fee)

@@ -477,6 +477,9 @@ pub struct ParametersBuilder {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// Checkpointed block hashes and heights for this network.
     checkpoints: Arc<CheckpointList>,
+    /// Optional default P2P listen port for this network. When `None`, callers
+    /// fall back to the public testnet default port.
+    default_port: Option<u16>,
 }
 
 impl Default for ParametersBuilder {
@@ -513,6 +516,7 @@ impl Default for ParametersBuilder {
                 .map(|(addr, amount)| (addr.to_string(), *amount))
                 .collect(),
             checkpoints: TESTNET_CHECKPOINT_LIST.clone(),
+            default_port: None,
         }
     }
 }
@@ -565,6 +569,12 @@ impl ParametersBuilder {
         self.network_magic = network_magic;
 
         Ok(self)
+    }
+
+    /// Sets the default P2P port to be used in the [`Parameters`] being built.
+    pub fn with_default_port(mut self, default_port: u16) -> Self {
+        self.default_port = Some(default_port);
+        self
     }
 
     /// Parses the hex-encoded block hash and sets it as the genesis hash in the [`Parameters`] being built.
@@ -832,6 +842,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            default_port,
         } = self;
         Parameters {
             network_name,
@@ -848,6 +859,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            default_port,
         }
     }
 
@@ -894,6 +906,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints: _,
+            default_port: _,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -967,6 +980,9 @@ pub struct Parameters {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// List of checkpointed block heights and hashes
     checkpoints: Arc<CheckpointList>,
+    /// Optional default P2P listen port for this network. When `None`, callers
+    /// fall back to the public testnet default port.
+    default_port: Option<u16>,
 }
 
 impl Default for Parameters {
@@ -983,6 +999,19 @@ impl Parameters {
     /// Creates a new [`ParametersBuilder`].
     pub fn build() -> ParametersBuilder {
         ParametersBuilder::default()
+    }
+
+    /// Creates a new [`ParametersBuilder`] pre-configured with the NU7 testnet
+    /// name, magic, and default P2P port. The caller is responsible for
+    /// supplying the genesis hash, activation heights, and other parameters
+    /// that vary per NU7 testnet instance.
+    pub fn build_nu7_testnet() -> ParametersBuilder {
+        Self::build()
+            .with_network_name("Nu7Testnet")
+            .expect("Nu7Testnet is a valid network name")
+            .with_network_magic(magics::NU7_TESTNET)
+            .expect("NU7_TESTNET magic is not reserved")
+            .with_default_port(crate::parameters::constants::default_ports::NU7_TESTNET)
     }
 
     /// Accepts a [`ConfiguredActivationHeights`].
@@ -1051,6 +1080,7 @@ impl Parameters {
             post_blossom_halving_interval,
             lockbox_disbursements: _,
             checkpoints: _,
+            default_port: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1151,6 +1181,16 @@ impl Parameters {
     /// Returns the checkpoints for this network.
     pub fn checkpoints(&self) -> Arc<CheckpointList> {
         self.checkpoints.clone()
+    }
+
+    /// Returns the configured default P2P port for this network, if any.
+    pub fn default_port(&self) -> Option<u16> {
+        self.default_port
+    }
+
+    /// Returns true if these [`Parameters`] represent the NU7 testnet.
+    pub fn is_nu7_testnet(&self) -> bool {
+        self.network_magic == magics::NU7_TESTNET && self.network_name == "Nu7Testnet"
     }
 }
 
