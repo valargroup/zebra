@@ -393,7 +393,6 @@ mod tests {
             testnet, POST_NU7_POW_AVERAGING_WINDOW, POST_NU7_POW_TARGET_SPACING,
             PRE_NU7_POW_AVERAGING_WINDOW,
         },
-        work::difficulty::ParameterDifficulty,
     };
 
     #[test]
