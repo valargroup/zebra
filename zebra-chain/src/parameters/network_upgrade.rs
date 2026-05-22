@@ -239,10 +239,63 @@ const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 /// The target block spacing after Blossom activation.
 pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 
-/// The averaging window for difficulty threshold arithmetic mean calculations.
+/// The target block spacing after NU7 activation, in seconds.
+///
+/// Defined by the draft "Shorter Block Target Spacing" ZIP, which lowers the
+/// block target spacing from 75 to 25 seconds at NU7.
+pub const POST_NU7_POW_TARGET_SPACING: u32 = 25;
+
+/// The ratio between the post-Blossom and post-NU7 block target spacings.
+///
+/// `PostBlossomPoWTargetSpacing / PostNU7PoWTargetSpacing = 75 / 25 = 3`.
+pub const NU7_POW_TARGET_SPACING_RATIO: u32 =
+    POST_BLOSSOM_POW_TARGET_SPACING / POST_NU7_POW_TARGET_SPACING;
+
+/// Per-block limit on the total number of Orchard actions, applied from NU7
+/// activation onwards.
+///
+/// `OrchardBlockActionLimit` in the draft "Shorter Block Target Spacing" ZIP.
+pub const ORCHARD_BLOCK_ACTION_LIMIT: u32 = 306;
+
+/// Per-block limit on the total number of Sapling spends + outputs, applied
+/// from NU7 activation onwards.
+///
+/// `SaplingBlockIOLimit` in the draft "Shorter Block Target Spacing" ZIP.
+pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
+
+/// Per-block limit on the total number of Sprout JoinSplits, applied from NU7
+/// activation onwards.
+///
+/// `SproutBlockJoinSplitLimit` in the draft "Shorter Block Target Spacing" ZIP.
+// TODO: Remove this when disallowing
+pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 25;
+
+/// Per-block global shielded budget, applied from NU7 activation onwards.
+///
+/// Bounds the worst-case shielded sync bandwidth per block independently of
+/// which combination of pools is used. Sprout JoinSplits are weighted by 2
+/// because each JoinSplit produces 2 shielded outputs.
+///
+/// `GlobalShieldedBudget` in the draft "Shorter Block Target Spacing" ZIP.
+pub const GLOBAL_SHIELDED_BUDGET: u32 = 306;
+
+/// The averaging window for difficulty threshold arithmetic mean calculations before NU7.
 ///
 /// `PoWAveragingWindow` in the Zcash specification.
-pub const POW_AVERAGING_WINDOW: usize = 17;
+///
+/// Use [`NetworkUpgrade::averaging_window`] or
+/// [`NetworkUpgrade::averaging_window_for_height`] for the active network value.
+pub const POW_AVERAGING_WINDOW: usize = PRE_NU7_POW_AVERAGING_WINDOW;
+
+/// The averaging window for difficulty threshold arithmetic mean calculations before NU7.
+pub const PRE_NU7_POW_AVERAGING_WINDOW: usize = 17;
+
+/// The averaging window for difficulty threshold arithmetic mean calculations from NU7 onward.
+///
+/// Scaled so that the wall-clock timespan of the averaging window matches a
+/// reference of 17 blocks at 150 s per block (2550 s), which at the post-NU7
+/// 25 s target spacing equals `17 * (150 / 25) = 102` blocks.
+pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 102;
 
 /// The multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.
@@ -395,12 +448,13 @@ impl NetworkUpgrade {
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
-            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu7 => {
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
+            Nu7 => POST_NU7_POW_TARGET_SPACING.into(),
 
             #[cfg(zcash_unstable = "zfuture")]
-            ZFuture => POST_BLOSSOM_POW_TARGET_SPACING.into(),
+            ZFuture => POST_NU7_POW_TARGET_SPACING.into(),
         };
 
         Duration::seconds(spacing_seconds)
@@ -423,6 +477,7 @@ impl NetworkUpgrade {
                 NetworkUpgrade::Blossom,
                 POST_BLOSSOM_POW_TARGET_SPACING.into(),
             ),
+            (NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),
         ]
         .into_iter()
         .filter_map(move |(upgrade, spacing_seconds)| {
@@ -490,7 +545,21 @@ impl NetworkUpgrade {
     ///
     /// `AveragingWindowTimespan` from the Zcash specification.
     pub fn averaging_window_timespan(&self) -> Duration {
-        self.target_spacing() * POW_AVERAGING_WINDOW.try_into().expect("fits in i32")
+        self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
+    }
+
+    /// Returns the averaging window for difficulty threshold arithmetic mean calculations.
+    ///
+    /// `PoWAveragingWindow` from the Zcash specification.
+    pub fn averaging_window(&self) -> usize {
+        match self {
+            Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy
+            | Nu5 | Nu6 | Nu6_1 => PRE_NU7_POW_AVERAGING_WINDOW,
+            Nu7 => POST_NU7_POW_AVERAGING_WINDOW,
+
+            #[cfg(zcash_unstable = "zfuture")]
+            ZFuture => POST_NU7_POW_AVERAGING_WINDOW,
+        }
     }
 
     /// Returns the averaging window timespan for `network` and `height`.
@@ -501,6 +570,13 @@ impl NetworkUpgrade {
         height: block::Height,
     ) -> Duration {
         NetworkUpgrade::current(network, height).averaging_window_timespan()
+    }
+
+    /// Returns the averaging window for `network` and `height`.
+    ///
+    /// See [`NetworkUpgrade::averaging_window`] for details.
+    pub fn averaging_window_for_height(network: &Network, height: block::Height) -> usize {
+        NetworkUpgrade::current(network, height).averaging_window()
     }
 
     /// Returns an iterator over [`NetworkUpgrade`] variants.

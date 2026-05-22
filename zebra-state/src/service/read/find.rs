@@ -291,7 +291,7 @@ pub fn block_locator_heights(tip_height: block::Height) -> Vec<block::Height> {
     let exponential_locators = iter::successors(Some(1u32), |h| h.checked_mul(2))
         .flat_map(move |step| tip_height.0.checked_sub(step));
 
-    // Start at the tip, add decreasing heights, and end MAX_BLOCK_REORG_HEIGHT below the tip.
+    // Start at the tip, add decreasing heights, and end at the active reorg limit below the tip.
     let locators = iter::once(tip_height.0)
         .chain(exponential_locators)
         .take_while(move |&height| height > min_locator_height)

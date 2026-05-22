@@ -2,27 +2,40 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+use std::sync::Arc;
+
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
+use proptest::{
+    arbitrary::any,
+    strategy::{Strategy, ValueTree},
+    test_runner::TestRunner,
+};
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, MAX_MONEY},
+    at_least_one,
     block::{
         tests::generate::{
             large_multi_transaction_block, large_single_transaction_block_many_inputs,
         },
         Block, Height,
     },
-    parameters::{subsidy::block_subsidy, NetworkUpgrade},
+    parameters::{
+        subsidy::block_subsidy, testnet, Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET,
+        ORCHARD_BLOCK_ACTION_LIMIT, SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+    },
+    primitives::Groth16Proof,
+    sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
+    transaction::{arbitrary::transaction_to_fake_v5, JoinSplitData, LockTime, Transaction},
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
 use zebra_script::Sigops;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
 
-use crate::{block::check::subsidy_is_valid, transaction};
+use crate::{block::check::subsidy_is_valid, error::TransactionError, transaction};
 
 use super::*;
 
@@ -760,6 +773,231 @@ fn miner_fees_validation_fails_when_zip233_amount_is_incorrect() -> Result<(), R
     );
 
     Ok(())
+}
+
+/// Smoke test for the per-block shielded action limits introduced by the draft
+/// "Shorter Block Target Spacing" ZIP. The limits only apply at and after NU7
+/// activation; pre-NU7 the check is a no-op, so historical block test vectors
+/// must all pass, and a (very small) historical block treated as if it were at
+/// NU7 activation must still pass because its shielded counts are all zero or
+/// well below the limits.
+#[test]
+fn shielded_action_limits_smoke() -> Result<(), Report> {
+    use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zebra_test::init();
+
+    // Pre-NU7: function is a no-op, every historical block must pass.
+    for network in Network::iter() {
+        for block in zebra_test::vectors::BLOCKS.iter() {
+            let block = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid");
+            check::shielded_action_limits_are_valid(
+                &block.transactions,
+                block.coinbase_height().unwrap(),
+                &network,
+            )
+            .expect("historical pre-NU7 block must satisfy the shielded action limits");
+        }
+    }
+
+    // Post-NU7: a configured testnet with NU7 active at height 1, evaluating the
+    // mainnet genesis block "as if" it were at NU7 activation. The genesis block
+    // has no shielded data, so the action counts are all zero and the check passes.
+    let nu7_testnet = testnet::Parameters::build()
+        .with_slow_start_interval(Height(0))
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let block = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("mainnet genesis deserializes");
+
+    check::shielded_action_limits_are_valid(&block.transactions, Height(1), &nu7_testnet)
+        .expect("a block with no shielded data must satisfy the post-NU7 limits");
+
+    Ok(())
+}
+
+#[test]
+fn shielded_action_limits_reject_orchard_over_limit() {
+    let count = limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT);
+    let err = check::shielded_action_limits_are_valid(
+        [fake_v5_with_orchard_actions(count)].iter(),
+        Height(1),
+        &nu7_active_testnet(),
+    )
+    .expect_err("Orchard actions above the NU7 per-block limit must fail");
+
+    assert_eq!(
+        err,
+        TransactionError::OrchardActionsExceedBlockLimit {
+            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+            limit: ORCHARD_BLOCK_ACTION_LIMIT,
+        }
+    );
+}
+
+#[test]
+fn shielded_action_limits_reject_sapling_over_limit() {
+    let count = limit_plus_one(SAPLING_BLOCK_IO_LIMIT);
+    let err = check::shielded_action_limits_are_valid(
+        [fake_v5_with_sapling_outputs(count)].iter(),
+        Height(1),
+        &nu7_active_testnet(),
+    )
+    .expect_err("Sapling spends and outputs above the NU7 per-block limit must fail");
+
+    assert_eq!(
+        err,
+        TransactionError::SaplingIOsExceedBlockLimit {
+            ios: SAPLING_BLOCK_IO_LIMIT + 1,
+            limit: SAPLING_BLOCK_IO_LIMIT,
+        }
+    );
+}
+
+#[test]
+fn shielded_action_limits_reject_sprout_over_limit() {
+    let count = limit_plus_one(SPROUT_BLOCK_JOINSPLIT_LIMIT);
+    let err = check::shielded_action_limits_are_valid(
+        [fake_v4_with_sprout_joinsplits(count)].iter(),
+        Height(1),
+        &nu7_active_testnet(),
+    )
+    .expect_err("Sprout JoinSplits above the NU7 per-block limit must fail");
+
+    assert_eq!(
+        err,
+        TransactionError::SproutJoinSplitsExceedBlockLimit {
+            joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT + 1,
+            limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        }
+    );
+}
+
+#[test]
+fn shielded_action_limits_reject_global_budget_over_limit() {
+    let err = check::shielded_action_limits_are_valid(
+        [
+            fake_v5_with_orchard_actions(
+                usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("limit fits in usize"),
+            ),
+            fake_v5_with_sapling_outputs(1),
+        ]
+        .iter(),
+        Height(1),
+        &nu7_active_testnet(),
+    )
+    .expect_err("combined shielded cost above the NU7 global budget must fail");
+
+    assert_eq!(
+        err,
+        TransactionError::ShieldedCostExceedsBlockBudget {
+            cost: GLOBAL_SHIELDED_BUDGET + 1,
+            limit: GLOBAL_SHIELDED_BUDGET,
+        }
+    );
+}
+
+fn nu7_active_testnet() -> Network {
+    testnet::Parameters::build()
+        .with_slow_start_interval(Height(0))
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid")
+}
+
+fn limit_plus_one(limit: u32) -> usize {
+    limit
+        .checked_add(1)
+        .expect("test limit plus one fits in u32")
+        .try_into()
+        .expect("test limit fits in usize")
+}
+
+fn fake_v5_with_orchard_actions(count: usize) -> Arc<Transaction> {
+    let mut tx = empty_v5_transaction();
+    let shielded_data =
+        zebra_chain::transaction::arbitrary::insert_fake_orchard_shielded_data(&mut tx);
+    let action = shielded_data
+        .actions
+        .iter()
+        .next()
+        .expect("fake shielded data has an action")
+        .clone();
+    shielded_data.actions = at_least_one![action; count];
+    Arc::new(tx)
+}
+
+fn fake_v5_with_sapling_outputs(count: usize) -> Arc<Transaction> {
+    let mut runner = TestRunner::default();
+    let mut shielded_data = any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+        .new_tree(&mut runner)
+        .expect("sapling shielded data strategy is valid")
+        .current();
+    let output = any::<sapling::Output>()
+        .new_tree(&mut runner)
+        .expect("sapling output strategy is valid")
+        .current();
+
+    shielded_data.transfers = sapling::TransferData::JustOutputs {
+        outputs: at_least_one![output; count],
+    };
+
+    let mut tx = empty_v5_transaction();
+    match &mut tx {
+        Transaction::V5 {
+            sapling_shielded_data,
+            ..
+        } => *sapling_shielded_data = Some(shielded_data),
+        _ => unreachable!("empty_v5_transaction returns V5"),
+    }
+    Arc::new(tx)
+}
+
+fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
+    let mut runner = TestRunner::default();
+    let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
+        .new_tree(&mut runner)
+        .expect("sprout JoinSplit data strategy is valid")
+        .current();
+    let rest_len = count
+        .checked_sub(1)
+        .expect("sprout JoinSplit test count is at least one");
+    joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+
+    Arc::new(Transaction::V4 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(100),
+        joinsplit_data: Some(joinsplit_data),
+        sapling_shielded_data: None,
+    })
+}
+
+fn empty_v5_transaction() -> Transaction {
+    Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(100),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    }
 }
 
 #[test]
