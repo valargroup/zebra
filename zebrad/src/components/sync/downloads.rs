@@ -27,7 +27,7 @@ use zebra_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
-use zebra_network::{self as zn, PeerSocketAddr};
+use zebra_network::{self as zn, InventoryResponse, PeerSocketAddr};
 use zebra_state as zs;
 
 use crate::components::sync::{
@@ -166,6 +166,28 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
     fn from(_value: tokio::time::error::Elapsed) -> Self {
         BlockDownloadVerifyError::Timeout
     }
+}
+
+/// The result of a batched block download, shared between the verification tasks
+/// for each block in the batch.
+///
+/// A single [`zn::Request::BlocksByHash`] request can fetch many blocks from one
+/// peer, which streams them back-to-back in response to a single `getdata`
+/// message. Batching lets a small peer set fill the bandwidth-delay product,
+/// instead of paying a full network round-trip per block.
+///
+/// The result is wrapped in an [`Arc`] so each block's verification task can
+/// cheaply clone it and pick out its own block.
+#[derive(Debug)]
+enum SharedDownloadResult {
+    /// The request succeeded. Maps each downloaded block's hash to the block and
+    /// the address of the peer that provided it. Blocks the peer reported as
+    /// missing are absent from the map.
+    Blocks(HashMap<block::Hash, (Arc<block::Block>, Option<PeerSocketAddr>)>),
+
+    /// The whole request failed (for example, a network error or timeout). The
+    /// formatted error is shared by every block in the batch.
+    Failed(String),
 }
 
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
@@ -320,19 +342,52 @@ where
         }
     }
 
-    /// Queue a block for download and verification.
+    /// Queue a single block for download and verification.
     ///
-    /// This method waits for the network to become ready, and returns an error
-    /// only if the network service fails. It returns immediately after queuing
-    /// the request.
-    #[instrument(level = "debug", skip(self), fields(%hash))]
+    /// This is a thin wrapper around [`Self::download_and_verify_batch`] for
+    /// callers that only have one block hash, such as the genesis block. A single
+    /// hash keeps the network's inventory-aware peer routing (which only applies
+    /// to single-item requests).
     pub async fn download_and_verify(
         &mut self,
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
-        if self.cancel_handles.contains_key(&hash) {
-            metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
-            return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
+        self.download_and_verify_batch(vec![hash]).await
+    }
+
+    /// Queue a batch of blocks for download and verification.
+    ///
+    /// All the blocks in `hashes` are fetched from a single peer using one
+    /// [`zn::Request::BlocksByHash`] request, which the peer answers by streaming
+    /// the blocks back-to-back. This lets a small peer set stay busy instead of
+    /// paying a network round-trip per block, which is the main bottleneck when
+    /// syncing from only a few peers.
+    ///
+    /// Each block is still verified independently, with its own cancellation
+    /// handle and entry in the pending task stream, so the syncer's accounting
+    /// (lookahead limits and in-flight counts) keeps working in units of blocks.
+    ///
+    /// Hashes that are already queued for download are skipped. This method waits
+    /// for the network to become ready, and returns an error only if the network
+    /// service fails. It returns immediately after queuing the requests.
+    #[instrument(level = "debug", skip(self, hashes), fields(batch_size = hashes.len()))]
+    pub async fn download_and_verify_batch(
+        &mut self,
+        hashes: Vec<block::Hash>,
+    ) -> Result<(), BlockDownloadVerifyError> {
+        // Skip hashes that are already queued for download, so a duplicate within
+        // the batch doesn't fail the whole request.
+        let mut new_hashes = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if self.cancel_handles.contains_key(&hash) {
+                metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
+            } else {
+                new_hashes.push(hash);
+            }
+        }
+
+        if new_hashes.is_empty() {
+            return Ok(());
         }
 
         // We construct the block requests sequentially, waiting for the peer
@@ -342,31 +397,69 @@ where
         // if we waited for readiness and did the service call in the spawned
         // tasks, all of the spawned tasks would race each other waiting for the
         // network to become ready.
+        //
+        // A single request fetches the whole batch from one peer, which streams
+        // the blocks back-to-back, instead of paying a round-trip per block.
         let block_req = self
             .network
             .ready()
             .await
             .map_err(|error| BlockDownloadVerifyError::NetworkServiceError { error })?
-            .call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+            .call(zn::Request::BlocksByHash(
+                new_hashes.iter().copied().collect(),
+            ));
 
-        // This oneshot is used to signal cancellation to the download task.
-        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        // Turn the download into a cheaply-cloneable shared future, so each
+        // block's verification task can await it and pick out its own block.
+        //
+        // `Shared` requires a `Clone` output and `BoxError` is not `Clone`, so we
+        // map the response into an `Arc`ed result keyed by block hash first.
+        let shared_download = block_req
+            // The explicit type pins the `BoxError` lifetime to `'static`, which
+            // `Shared` and `tokio::spawn` require. Without it, inference picks a
+            // higher-ranked lifetime and the closure is "not general enough".
+            .map(|rsp: Result<zn::Response, BoxError>| {
+                Arc::new(match rsp {
+                    Ok(zn::Response::Blocks(blocks)) => SharedDownloadResult::Blocks(
+                        blocks
+                            .into_iter()
+                            .filter_map(|block| match block {
+                                InventoryResponse::Available((block, advertiser_addr)) => {
+                                    Some((block.hash(), (block, advertiser_addr)))
+                                }
+                                // Blocks the peer doesn't have are reported as missing,
+                                // and surface as a `NotFound` error in the task below.
+                                InventoryResponse::Missing(_) => None,
+                            })
+                            .collect(),
+                    ),
+                    Ok(_) => unreachable!("wrong response to block request"),
+                    Err(error) => SharedDownloadResult::Failed(format!("{error:?}")),
+                })
+            })
+            .boxed()
+            .shared();
 
-        let mut verifier = self.verifier.clone();
-        let latest_chain_tip = self.latest_chain_tip.clone();
+        for hash in new_hashes {
+            // This oneshot is used to signal cancellation to the verify task.
+            let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-        let lookahead_limit = self.lookahead_limit;
-        let max_checkpoint_height = self.max_checkpoint_height;
+            let block_download = shared_download.clone();
+            let mut verifier = self.verifier.clone();
+            let latest_chain_tip = self.latest_chain_tip.clone();
 
-        let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
-        let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
+            let lookahead_limit = self.lookahead_limit;
+            let max_checkpoint_height = self.max_checkpoint_height;
 
-        let task = tokio::spawn(
+            let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
+            let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
+
+            let task = tokio::spawn(
             async move {
-                // Download the block.
+                // Wait for the batch download, then pick out this block.
                 // Prefer the cancel handle if both are ready.
                 let download_start = std::time::Instant::now();
-                let rsp = tokio::select! {
+                let downloaded = tokio::select! {
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to download completion");
@@ -375,23 +468,26 @@ where
                             .record(download_start.elapsed().as_secs_f64());
                         return Err(BlockDownloadVerifyError::CancelledDuringDownload { hash })
                     }
-                    rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
+                    downloaded = block_download => downloaded,
                 };
 
-                let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
-                    assert_eq!(
-                        blocks.len(),
-                        1,
-                        "wrong number of blocks in response to a single hash"
-                    );
-
-                    blocks
-                        .first()
-                        .expect("just checked length")
-                        .available()
-                        .expect("unexpected missing block status: single block failures should be errors")
-                } else {
-                    unreachable!("wrong response to block request");
+                let (block, advertiser_addr) = match downloaded.as_ref() {
+                    SharedDownloadResult::Blocks(blocks) => match blocks.get(&hash) {
+                        Some((block, advertiser_addr)) => (block.clone(), *advertiser_addr),
+                        // The peer didn't return this block. The "NotFound" text keeps this
+                        // consistent with `should_restart_sync`, so a single missing block
+                        // doesn't restart the whole sync.
+                        None => return Err(BlockDownloadVerifyError::DownloadFailed {
+                            error: "block was NotFound in the batch download response".into(),
+                            hash,
+                        }),
+                    },
+                    SharedDownloadResult::Failed(error) => {
+                        return Err(BlockDownloadVerifyError::DownloadFailed {
+                            error: error.clone().into(),
+                            hash,
+                        })
+                    }
                 };
                 metrics::counter!("sync.downloaded.block.count").increment(1);
                 metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
@@ -573,14 +669,16 @@ where
             .map_err(move |e| (e, hash)),
         );
 
-        // Try to start the spawned task before queueing the next block request
-        tokio::task::yield_now().await;
+            self.pending.push(task);
+            assert!(
+                self.cancel_handles.insert(hash, cancel_tx).is_none(),
+                "blocks are only queued once"
+            );
+        }
 
-        self.pending.push(task);
-        assert!(
-            self.cancel_handles.insert(hash, cancel_tx).is_none(),
-            "blocks are only queued once"
-        );
+        // Try to start the spawned tasks before returning, so they begin polling
+        // (and therefore driving) the shared batch download.
+        tokio::task::yield_now().await;
 
         Ok(())
     }

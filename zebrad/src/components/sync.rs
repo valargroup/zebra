@@ -91,6 +91,14 @@ pub const DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT: usize = MAX_TIPS_RESPONSE_HASH_C
 /// If the concurrency limit is 0, Zebra can't download or verify any blocks.
 pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 
+/// The default number of block hashes requested from a single peer in one
+/// batched block download.
+///
+/// Peers answer a multi-hash block request by streaming the blocks back-to-back,
+/// so batching keeps a small peer set busy instead of paying a network
+/// round-trip per block. See [`Config::block_download_batch_size`].
+pub const DEFAULT_BLOCK_DOWNLOAD_BATCH_SIZE: usize = 100;
+
 /// The expected maximum number of hashes in an ObtainTips or ExtendTips response.
 ///
 /// This is used to allow block heights that are slightly beyond the lookahead limit,
@@ -265,6 +273,20 @@ pub struct Config {
     /// Increasing this value may improve performance on machines with many cores.
     pub full_verify_concurrency_limit: usize,
 
+    /// The number of block hashes requested from a single peer in one batched
+    /// block download.
+    ///
+    /// A peer answers a multi-hash block request by streaming the blocks
+    /// back-to-back, so larger batches keep a small peer set busy and speed up
+    /// syncing when only a few peers are connected. The tradeoff is coarser
+    /// load-balancing, hedging, and retries: a failed or timed-out batch retries
+    /// as a unit, and the [`BLOCK_DOWNLOAD_TIMEOUT`] applies to the whole batch,
+    /// so very large batches combined with large blocks and slow links may time
+    /// out.
+    ///
+    /// Set to 1 to download one block per request (the historical behavior).
+    pub block_download_batch_size: usize,
+
     /// The number of threads used to verify signatures, proofs, and other CPU-intensive code.
     ///
     /// If the number of threads is not configured or zero, Zebra uses the number of logical cores.
@@ -293,6 +315,10 @@ impl Default for Config {
             // - move more disk work to blocking tokio threads,
             //   and CPU work to the rayon thread pool inside blocking tokio threads
             full_verify_concurrency_limit: 20,
+
+            // Batch block downloads so a small peer set can stream many blocks
+            // per request, instead of paying a round-trip per block.
+            block_download_batch_size: DEFAULT_BLOCK_DOWNLOAD_BATCH_SIZE,
 
             // Use one thread per CPU.
             //
@@ -346,6 +372,10 @@ where
 
     /// The configured full verification concurrency limit, after applying the minimum limit.
     full_verify_concurrency_limit: usize,
+
+    /// The number of block hashes requested from a single peer in one batched
+    /// block download, after applying the minimum limit.
+    block_download_batch_size: usize,
 
     /// Whether the node is running on regtest. Used to apply a shorter sync restart delay.
     is_regtest: bool,
@@ -469,6 +499,17 @@ where
             full_verify_concurrency_limit = MIN_CONCURRENCY_LIMIT;
         }
 
+        let mut block_download_batch_size = config.sync.block_download_batch_size;
+
+        if block_download_batch_size < MIN_CONCURRENCY_LIMIT {
+            warn!(
+                "configured block download batch size {} too low, increasing to {}",
+                config.sync.block_download_batch_size, MIN_CONCURRENCY_LIMIT,
+            );
+
+            block_download_batch_size = MIN_CONCURRENCY_LIMIT;
+        }
+
         let tip_network = Timeout::new(peers.clone(), TIPS_RESPONSE_TIMEOUT);
 
         // The Hedge middleware is the outermost layer, hedging requests
@@ -517,6 +558,7 @@ where
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
+            block_download_batch_size,
             is_regtest: config.network.network.is_regtest(),
             tip_network,
             downloads,
@@ -1087,8 +1129,14 @@ where
             IndexSet::new()
         };
 
-        for hash in hashes.into_iter() {
-            self.downloads.download_and_verify(hash).await?;
+        // Download the blocks in batches, so each request fetches several blocks
+        // from a single peer in one round-trip. This keeps a small peer set busy
+        // during sync. Hashes keep their order, so batches stay contiguous.
+        let hashes: Vec<block::Hash> = hashes.into_iter().collect();
+        for batch in hashes.chunks(self.block_download_batch_size) {
+            self.downloads
+                .download_and_verify_batch(batch.to_vec())
+                .await?;
         }
 
         Ok(extra_hashes)
