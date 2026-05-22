@@ -1148,7 +1148,7 @@ where
             } else {
                 debug!(?error, ?candidate.addr, "failed to make outbound connection to peer");
             }
-            report_failed(address_book_updater.clone(), candidate).await;
+            report_failed(address_book_updater.clone(), candidate, &error).await;
 
             // The demand signal that was taken out of the queue to attempt to connect to the
             // failed candidate never turned into a connection, so add it back.
@@ -1173,9 +1173,19 @@ where
 async fn report_failed(
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     addr: MetaAddr,
+    error: &BoxError,
 ) {
-    // The connection info is the same as what's already in the address book.
-    let addr = MetaAddr::new_errored(addr.addr, None);
+    // Remote nonce reuse proves that this address points back at this local
+    // node, so suppress it rather than repeatedly retrying and re-caching it.
+    let addr = if matches!(
+        error.downcast_ref::<peer::HandshakeError>(),
+        Some(peer::HandshakeError::RemoteNonceReuse)
+    ) {
+        MetaAddr::new_self_connection(addr.addr)
+    } else {
+        // The connection info is the same as what's already in the address book.
+        MetaAddr::new_errored(addr.addr, None)
+    };
 
     // Ignore send errors on Zebra shutdown.
     let _ = address_book_updater.send(addr).await;

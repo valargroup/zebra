@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Added
 
 - Startup warning on Linux when `net.ipv4.tcp_slow_start_after_idle` is enabled (which resets TCP congestion windows between block requests and significantly reduces single-peer block-propagation throughput on long-haul links), with a "Linux TCP tuning for block propagation" troubleshooting section ([#10513](https://github.com/ZcashFoundation/zebra/pull/10513))
+- New `[sync] block_download_batch_size` config option (default 100). The syncer now fetches blocks in batches from a single peer, which stream back-to-back in response to one request. This speeds up block sync when only a few peers are connected, since each peer is no longer limited to one block per network round-trip. Set to 1 to restore the previous one-block-per-request behavior.
 
 ## [Zebra 4.4.1](https://github.com/ZcashFoundation/zebra/releases/tag/v4.4.1) - 2026-05-04
 
