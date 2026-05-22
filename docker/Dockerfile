@@ -134,6 +134,8 @@ FROM deps AS release
 ARG SHORT_SHA
 ARG FEATURES
 ENV FEATURES=${FEATURES}
+ARG RUSTFLAGS
+ENV RUSTFLAGS=${RUSTFLAGS}
 
 # Set the working directory for the build.
 ARG HOME
@@ -153,7 +155,9 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=bind,source=zebra-state,target=zebra-state \
     --mount=type=bind,source=zebra-test,target=zebra-test \
     --mount=type=bind,source=zebra-utils,target=zebra-utils \
+    --mount=type=bind,source=zebra-jsonl-trace,target=zebra-jsonl-trace \
     --mount=type=bind,source=zebrad,target=zebrad \
+    --mount=type=bind,source=xtask,target=xtask \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \

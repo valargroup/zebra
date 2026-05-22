@@ -16,7 +16,7 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-  FEATURES: default-release-binaries tx_v6
+  FEATURES: default-release-binaries
   RUSTFLAGS: --cfg zcash_unstable="nu7" --cfg zcash_unstable="zip235" --cfg zcash_unstable="nsm"
 
 jobs:
