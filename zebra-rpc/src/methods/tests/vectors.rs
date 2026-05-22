@@ -24,7 +24,6 @@ use zebra_chain::{
     },
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{zip317, UnminedTxId, VerifiedUnminedTx},
-    value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
 use zebra_consensus::MAX_BLOCK_SIGOPS;
@@ -89,7 +88,6 @@ async fn rpc_getinfo() {
             tip_hash: Mainnet.genesis_hash(),
             tip_height: Height::MIN,
             chain_history_root: HistoryTree::default().hash(),
-            value_balance: ValueBalance::zero(),
             expected_difficulty: Default::default(),
             cur_time: zebra_chain::serialization::DateTime32::now(),
             min_time: zebra_chain::serialization::DateTime32::now(),
@@ -2133,7 +2131,6 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
                     min_time: fake_min_time,
                     max_time: fake_max_time,
                     chain_history_root: fake_history_tree(&Mainnet).hash(),
-                    value_balance: ValueBalance::zero(),
                 }));
         }
     };
@@ -2327,8 +2324,6 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     let verified_unmined_tx = VerifiedUnminedTx {
         transaction: unmined_tx,
         miner_fee: 0.try_into().unwrap(),
-        conventional_fee_paid: 0.try_into().unwrap(),
-        lts_contribution: 0.try_into().unwrap(),
         legacy_sigop_count: 0,
         p2sh_sigop_count: 0,
         conventional_actions,
@@ -2827,7 +2822,6 @@ async fn rpc_getdifficulty() {
                 min_time: fake_min_time,
                 max_time: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
-                value_balance: ValueBalance::zero(),
             }));
     };
 
@@ -2854,7 +2848,6 @@ async fn rpc_getdifficulty() {
                 min_time: fake_min_time,
                 max_time: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
-                value_balance: ValueBalance::zero(),
             }));
     };
 
@@ -2878,7 +2871,6 @@ async fn rpc_getdifficulty() {
                 min_time: fake_min_time,
                 max_time: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
-                value_balance: ValueBalance::zero(),
             }));
     };
 
@@ -2902,7 +2894,6 @@ async fn rpc_getdifficulty() {
                 min_time: fake_min_time,
                 max_time: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
-                value_balance: ValueBalance::zero(),
             }));
     };
 
