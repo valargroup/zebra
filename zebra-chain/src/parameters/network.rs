@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     amount::{Amount, NonNegative},
     block::{self, Height},
-    parameters::NetworkUpgrade,
+    parameters::{constants::default_ports, NetworkUpgrade},
     transparent,
 };
 
@@ -195,6 +195,15 @@ impl Network {
         }
     }
 
+    /// Returns true if the network is the NU7 testnet, or false otherwise.
+    pub fn is_nu7_testnet(&self) -> bool {
+        if let Self::Testnet(params) = self {
+            params.is_nu7_testnet()
+        } else {
+            false
+        }
+    }
+
     /// Returns the [`NetworkKind`] for this network.
     pub fn kind(&self) -> NetworkKind {
         match self {
@@ -238,9 +247,8 @@ impl Network {
     /// Get the default port associated to this network.
     pub fn default_port(&self) -> u16 {
         match self {
-            Network::Mainnet => 8233,
-            // TODO: Add a `default_port` field to `testnet::Parameters` to return here. (zcashd uses 18344 for Regtest)
-            Network::Testnet(_params) => 18233,
+            Network::Mainnet => default_ports::MAINNET,
+            Network::Testnet(params) => params.default_port().unwrap_or(default_ports::TESTNET),
         }
     }
 
