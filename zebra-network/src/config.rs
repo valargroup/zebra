@@ -14,6 +14,7 @@ use tokio::fs;
 
 use tracing::Span;
 use zebra_chain::{
+    block::Height,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -597,6 +598,7 @@ struct DTestnetParameters {
     disable_pow: Option<bool>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
+    v4_deprecation_height: Option<u32>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     post_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
@@ -677,6 +679,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             disable_pow: Some(params.disable_pow()),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
+            v4_deprecation_height: params.v4_deprecation_height().map(|height| height.0),
             pre_nu6_funding_streams: None,
             post_nu6_funding_streams: None,
             funding_streams: Some(params.funding_streams().iter().map(Into::into).collect()),
@@ -776,7 +779,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+                build_configured_regtest::<D>(*params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -786,7 +789,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -880,6 +883,7 @@ where
         disable_pow,
         genesis_hash,
         activation_heights,
+        v4_deprecation_height,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -933,6 +937,10 @@ where
         params_builder = params_builder
             .with_activation_heights(activation_heights)
             .map_err(de::Error::custom)?
+    }
+
+    if let Some(v4_deprecation_height) = v4_deprecation_height {
+        params_builder = params_builder.with_v4_deprecation_height(Height(v4_deprecation_height));
     }
 
     if let Some(halving_interval) = pre_blossom_halving_interval {
@@ -989,6 +997,7 @@ where
 fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
     let DTestnetParameters {
         activation_heights,
+        v4_deprecation_height,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1010,9 +1019,19 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
 
     RegtestParameters {
         activation_heights: activation_heights.unwrap_or_default(),
+        v4_deprecation_height: v4_deprecation_height.map(Height),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
         extend_funding_stream_addresses_as_required,
     }
+}
+
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    testnet::Parameters::new_regtest(build_regtest_params(params))
+        .map(Network::new_configured_testnet)
+        .map_err(de::Error::custom)
 }

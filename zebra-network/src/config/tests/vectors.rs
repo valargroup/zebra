@@ -77,6 +77,25 @@ fn testnet_params_serialization_roundtrip() {
 }
 
 #[test]
+fn invalid_regtest_v4_deprecation_height_returns_config_error() {
+    let _init_guard = zebra_test::init();
+
+    let err = toml::from_str::<Config>(
+        r#"
+        network = "Regtest"
+
+        [testnet_parameters]
+        v4_deprecation_height = 5
+        "#,
+    )
+    .expect_err("invalid regtest parameters should return a config error");
+
+    assert!(err
+        .to_string()
+        .contains("V4 deprecation height must be after NU7 activation height"));
+}
+
+#[test]
 fn default_config_uses_ipv6() {
     let _init_guard = zebra_test::init();
     let config = Config::default();

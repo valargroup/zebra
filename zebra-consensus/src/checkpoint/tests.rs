@@ -814,3 +814,97 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     Ok(())
 }
+
+/// Constructing a `CheckpointVerifier` whose final checkpoint is at or above
+/// NU7 activation must panic, because the checkpoint verifier finalises blocks
+/// without running the contextual LTS payout/deposit check.
+#[cfg(zcash_unstable = "nsm")]
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "NU7 activation height")]
+async fn checkpoint_at_nu7_activation_panics() {
+    use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zebra_test::init();
+
+    // Regtest-style network with NU7 active. The actual value doesn't matter,
+    // we read it back at runtime.
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(block::Height::MIN)
+        .with_halving_interval(144)
+        .expect("halving interval is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu7: Some(10),
+        })
+        .expect("activation heights are monotonic")
+        .extend_funding_streams()
+        .to_network()
+        .expect("network builds");
+
+    let nu7_activation_height = zebra_chain::parameters::NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("NU7 activation height is configured");
+
+    // Smallest violating list: genesis + a checkpoint exactly at NU7 activation.
+    let checkpoints = vec![
+        (block::Height(0), block::Hash([0xaa; 32])),
+        (nu7_activation_height, block::Hash([0xbb; 32])),
+    ];
+
+    let state_service = zebra_state::init_test(&network).await;
+    let _ = CheckpointVerifier::from_list(checkpoints, &network, None, state_service);
+}
+
+/// A `CheckpointVerifier` whose final checkpoint sits one block below NU7
+/// activation must construct successfully. That's the largest valid range.
+#[cfg(zcash_unstable = "nsm")]
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_just_below_nu7_activation_succeeds() {
+    use zebra_chain::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zebra_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(block::Height::MIN)
+        .with_halving_interval(144)
+        .expect("halving interval is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu7: Some(10),
+        })
+        .expect("activation heights are monotonic")
+        .extend_funding_streams()
+        .to_network()
+        .expect("network builds");
+
+    let nu7_activation_height = zebra_chain::parameters::NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("NU7 activation height is configured");
+    let last_valid = block::Height(nu7_activation_height.0 - 1);
+
+    let checkpoints = vec![
+        (block::Height(0), block::Hash([0xcc; 32])),
+        (last_valid, block::Hash([0xdd; 32])),
+    ];
+
+    let state_service = zebra_state::init_test(&network).await;
+    // Must not panic.
+    let _ = CheckpointVerifier::from_list(checkpoints, &network, None, state_service)
+        .expect("checkpoint list one below NU7 activation is accepted");
+}

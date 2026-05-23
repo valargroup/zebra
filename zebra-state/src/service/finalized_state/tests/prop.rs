@@ -73,7 +73,12 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             nu5: Some(35),
             nu6: Some(40),
             nu6_1: Some(45),
+            // NSM adds contextual LTS payout validation. The arbitrary fake
+            // blocks in this commitment-focused test do not fund that pool.
+            #[cfg(all(zcash_unstable = "nu7", not(zcash_unstable = "nsm")))]
             nu7: Some(50),
+            #[cfg(any(not(zcash_unstable = "nu7"), zcash_unstable = "nsm"))]
+            nu7: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()

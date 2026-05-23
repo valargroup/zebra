@@ -38,7 +38,7 @@ pub struct GetBlockchainInfoBalance {
 
 impl GetBlockchainInfoBalance {
     /// Returns a list of [`GetBlockchainInfoBalance`]s converted from the default [`ValueBalance`].
-    pub fn zero_pools() -> [Self; 5] {
+    pub fn zero_pools() -> crate::methods::BlockchainValuePoolBalances {
         Self::value_pools(Default::default(), None)
     }
 
@@ -87,11 +87,17 @@ impl GetBlockchainInfoBalance {
         Self::new_internal("lockbox", amount, delta)
     }
 
+    /// Creates a [`GetBlockchainInfoBalance`] for the LTS (NSM) pool.
+    #[cfg(zcash_unstable = "nsm")]
+    pub fn lts(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
+        Self::new_internal("lts", amount, delta)
+    }
+
     /// Converts a [`ValueBalance`] to a list of [`GetBlockchainInfoBalance`]s.
     pub fn value_pools(
         value_balance: ValueBalance<NonNegative>,
         delta_balance: Option<ValueBalance<NegativeAllowed>>,
-    ) -> [Self; 5] {
+    ) -> crate::methods::BlockchainValuePoolBalances {
         [
             Self::transparent(
                 value_balance.transparent_amount(),
@@ -112,6 +118,11 @@ impl GetBlockchainInfoBalance {
             Self::deferred(
                 value_balance.deferred_amount(),
                 delta_balance.map(|b| b.deferred_amount()),
+            ),
+            #[cfg(zcash_unstable = "nsm")]
+            Self::lts(
+                value_balance.lts_amount(),
+                delta_balance.map(|b| b.lts_amount()),
             ),
         ]
     }

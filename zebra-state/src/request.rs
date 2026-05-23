@@ -360,7 +360,10 @@ impl Treestate {
 ///
 /// Zebra's state service passes this `enum` over to the finalized state
 /// when committing a block.
-#[allow(missing_docs)]
+// This value is constructed and consumed once per block commit (never stored
+// in a collection), so the variant size difference doesn't justify boxing the
+// large field and paying a heap allocation on the commit path.
+#[allow(missing_docs, clippy::large_enum_variant)]
 pub enum FinalizableBlock {
     Checkpoint {
         checkpoint_verified: CheckpointVerifiedBlock,

@@ -93,7 +93,13 @@ fn format_upgrades(
     let min_version = move || min_version.clone().unwrap_or(Version::new(0, 0, 0));
 
     // Note: Disk format upgrades must be run in order of database version.
-    ([
+    //
+    // The 27.1.0 LTS value-pool entry only exists in `nsm` builds, where the
+    // running database version is also 27.1.0. In default builds the running
+    // version stays at 27.0.0, so this entry must be omitted: otherwise an
+    // upgrade from an older database would reach it and `mark_as_upgraded_to`
+    // would assert (it forbids marking a version newer than the running one).
+    let upgrades: Vec<Box<dyn DiskFormatUpgrade>> = vec![
         Box::new(prune_trees::PruneTrees),
         Box::new(add_subtrees::AddSubtrees),
         Box::new(tree_keys_and_caches_upgrade::FixTreeKeyTypeAndCacheGenesisRoots),
@@ -102,7 +108,14 @@ fn format_upgrades(
             Version::new(26, 0, 0),
         )),
         Box::new(block_info_and_address_received::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 5])
+        #[cfg(zcash_unstable = "nsm")]
+        Box::new(no_migration::NoMigration::new(
+            "add LTS value pool compatibility",
+            Version::new(27, 1, 0),
+        )),
+    ];
+
+    upgrades
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

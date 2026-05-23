@@ -8,6 +8,15 @@ use crate::{
     transparent,
 };
 
+/// Returns the ZIP-235 minimum ZIP-233 amount for `miner_fee`.
+#[cfg(zcash_unstable = "zip235")]
+pub fn zip235_minimum_zip233_amount(miner_fee: Amount<NonNegative>) -> Amount<NonNegative> {
+    let minimum = u64::from(miner_fee) * 6 / 10;
+
+    Amount::try_from(minimum)
+        .expect("60% of a valid non-negative amount is also a valid non-negative amount")
+}
+
 impl Transaction {
     /// Returns a new version 6 coinbase transaction for `network` and `height`,
     /// which contains the specified `outputs`.
@@ -89,8 +98,7 @@ impl Transaction {
 
             // > The NSM zip233_amount field [ZIP-233] must be set at minimum to 60% of miner fees [ZIP-235].
             #[cfg(zcash_unstable = "zip235")]
-            zip233_amount: zip233_amount
-                .unwrap_or_else(|| ((miner_fee * 6).unwrap() / 10).unwrap()),
+            zip233_amount: zip233_amount.unwrap_or_else(|| zip235_minimum_zip233_amount(miner_fee)),
             #[cfg(not(zcash_unstable = "zip235"))]
             zip233_amount: zip233_amount.unwrap_or(Amount::zero()),
 

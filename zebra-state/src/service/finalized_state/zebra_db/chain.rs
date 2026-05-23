@@ -253,7 +253,8 @@ impl DiskWriteBatch {
         utxos_spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo>,
         value_pool: ValueBalance<NonNegative>,
     ) -> Result<(), ValidateContextError> {
-        let block_value_pool_change = finalized
+        #[cfg_attr(not(zcash_unstable = "nsm"), allow(unused_mut))]
+        let mut block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
                 &utxos_spent_by_block,
@@ -268,6 +269,30 @@ impl DiskWriteBatch {
                     spent_utxo_count: utxos_spent_by_block.len(),
                 }
             })?;
+
+        // Set the LTS pool delta (the signed coinbase under-/over-claim). The
+        // block has been contextually validated by the time it reaches the
+        // finalized commit path, so we re-derive the leg from the block bytes
+        // here rather than threading it through.
+        #[cfg(zcash_unstable = "nsm")]
+        {
+            let lts_delta = crate::service::check::lts::block_lts_pool_delta(
+                &finalized.block,
+                &db.network(),
+                finalized.height,
+                &utxos_spent_by_block,
+            )
+            .map_err(|value_balance_error| {
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error,
+                    height: finalized.height,
+                    block_hash: finalized.hash,
+                    transaction_count: finalized.transaction_hashes.len(),
+                    spent_utxo_count: utxos_spent_by_block.len(),
+                }
+            })?;
+            block_value_pool_change.set_lts_amount(lts_delta);
+        }
 
         let new_value_pool = value_pool
             .add_chain_value_pool_change(block_value_pool_change)

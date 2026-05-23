@@ -140,10 +140,19 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
             // distinguish column family names from empty column families
             empty_column_families.push(format!("{cf_name}: no entries"));
         } else {
+            let snapshot_name = format!("{cf_name}_raw_data");
+            #[cfg(zcash_unstable = "nsm")]
+            let snapshot_name = if matches!(cf_name.as_str(), "block_info" | "tip_chain_value_pool")
+            {
+                format!("{snapshot_name}_nsm")
+            } else {
+                snapshot_name
+            };
+
             // The note commitment tree snapshots will change if the trees do not have cached roots.
             // But we expect them to always have cached roots,
             // because those roots are used to populate the anchor column families.
-            insta::assert_ron_snapshot!(format!("{cf_name}_raw_data"), cf_data);
+            insta::assert_ron_snapshot!(snapshot_name, cf_data);
         }
     }
 

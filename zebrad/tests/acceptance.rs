@@ -3606,6 +3606,8 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         vec![],
         #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         None,
+        #[cfg(zcash_unstable = "nsm")]
+        zebra_chain::amount::Amount::zero(),
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -3667,6 +3669,8 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         vec![],
         #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         None,
+        #[cfg(zcash_unstable = "nsm")]
+        zebra_chain::amount::Amount::zero(),
     )
     .expect("coinbase transaction should be valid under the given parameters");
 

@@ -22,7 +22,10 @@ use zebra_chain::{
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
 
 impl IntoDisk for ValueBalance<NonNegative> {
+    #[cfg(not(zcash_unstable = "nsm"))]
     type Bytes = [u8; 40];
+    #[cfg(zcash_unstable = "nsm")]
+    type Bytes = [u8; 48];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -110,10 +113,21 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // We want to be forward-compatible, so this must work even if the
-        // size of the buffer is larger than expected.
+        // The on-disk record has grown over time:
+        //   44 bytes — pre-NSM: 40 ValueBalance + 4 size
+        //   52 bytes — post-NSM: 48 ValueBalance + 4 size
+        // We accept anything ≥ 52 bytes (forward-compat) for the new layout,
+        // and 44..52 for the legacy layout. Older layouts default the LTS pool
+        // to zero on parse (handled inside ValueBalance::from_bytes).
         match bytes.as_ref().len() {
-            44.. => {
+            52.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..48])
+                    .expect("must work for 48 bytes");
+                let size =
+                    u32::from_le_bytes(bytes.as_ref()[48..52].try_into().expect("must be 4 bytes"));
+                BlockInfo::new(value_pools, size)
+            }
+            44..52 => {
                 let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..40])
                     .expect("must work for 40 bytes");
                 let size =

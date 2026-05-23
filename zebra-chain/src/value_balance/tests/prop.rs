@@ -17,16 +17,18 @@ proptest! {
         let sapling = value_balance1.sapling + value_balance2.sapling;
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
+        let lts = value_balance1.lts + value_balance2.lts;
 
-        match (transparent, sprout, sapling, orchard, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, lts) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(lts)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    deferred
+                    deferred,
+                    lts,
                 })
             ),
             _ => prop_assert!(
@@ -36,7 +38,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Lts(_))
                 )
             ),
         }
@@ -53,16 +56,18 @@ proptest! {
         let sapling = value_balance1.sapling - value_balance2.sapling;
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let deferred = value_balance1.deferred - value_balance2.deferred;
+        let lts = value_balance1.lts - value_balance2.lts;
 
-        match (transparent, sprout, sapling, orchard, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, lts) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(lts)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    deferred
+                    deferred,
+                    lts,
                 })
             ),
             _ => prop_assert!(matches!(
@@ -71,7 +76,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Lts(_))
                 )),
         }
     }
@@ -90,16 +96,18 @@ proptest! {
         let sapling = value_balance1.sapling + value_balance2.sapling;
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
+        let lts = value_balance1.lts + value_balance2.lts;
 
-        match (transparent, sprout, sapling, orchard, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, lts) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(lts)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    deferred
+                    deferred,
+                    lts,
                 })
             ),
             _ => prop_assert!(matches!(
@@ -108,7 +116,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Lts(_))
                  ))
         }
     }
@@ -122,6 +131,7 @@ proptest! {
         prop_assert_eq!(value_balance, serialized_value_balance);
     }
 
+    #[cfg(not(zcash_unstable = "nsm"))]
     #[test]
     fn value_balance_deserialization(bytes in any::<[u8; 40]>()) {
         let _init_guard = zebra_test::init();
@@ -131,17 +141,49 @@ proptest! {
         }
     }
 
-    /// The legacy version of [`ValueBalance`] had 32 bytes compared to the current 40 bytes,
-    /// but it's possible to correctly instantiate the current version of [`ValueBalance`] from
-    /// the legacy format, so we test if Zebra can still deserialiaze the legacy format.
+    #[cfg(zcash_unstable = "nsm")]
     #[test]
-    fn legacy_value_balance_deserialization(bytes in any::<[u8; 32]>()) {
+    fn value_balance_deserialization_nsm(bytes in any::<[u8; 48]>()) {
+        let _init_guard = zebra_test::init();
+
+        if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
+            prop_assert_eq!(bytes, deserialized.to_bytes());
+        }
+    }
+
+    /// The legacy 32-byte format predates the deferred (ZIP-1015) and LTS (NSM)
+    /// pools. Both default to zero on parse; round-tripping back through
+    /// [`ValueBalance::to_bytes`] produces the active layout with the legacy
+    /// bytes intact in the first 32.
+    #[test]
+    fn legacy_value_balance_deserialization_32(bytes in any::<[u8; 32]>()) {
         let _init_guard = zebra_test::init();
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
+            #[cfg(not(zcash_unstable = "nsm"))]
             let mut extended_bytes = [0u8; 40];
+            #[cfg(zcash_unstable = "nsm")]
+            let mut extended_bytes = [0u8; 48];
             extended_bytes[..32].copy_from_slice(&bytes);
+            prop_assert_eq!(extended_bytes, deserialized);
+        }
+    }
+
+    /// The 40-byte format predates the LTS (NSM) pool. The lts field defaults
+    /// to zero on parse; round-tripping back produces the active layout with
+    /// the legacy bytes intact in the first 40.
+    #[test]
+    fn legacy_value_balance_deserialization_40(bytes in any::<[u8; 40]>()) {
+        let _init_guard = zebra_test::init();
+
+        if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
+            let deserialized = deserialized.to_bytes();
+            #[cfg(not(zcash_unstable = "nsm"))]
+            let mut extended_bytes = [0u8; 40];
+            #[cfg(zcash_unstable = "nsm")]
+            let mut extended_bytes = [0u8; 48];
+            extended_bytes[..40].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
     }

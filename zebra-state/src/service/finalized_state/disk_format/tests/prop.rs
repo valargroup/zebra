@@ -488,3 +488,45 @@ fn roundtrip_value_balance() {
 
     proptest!(|(val in any::<ValueBalance::<NonNegative>>())| assert_value_properties(val));
 }
+
+/// Round-trip [`BlockInfo`] through its on-disk format, exercising both the
+/// post-NSM 52-byte layout (48-byte ValueBalance + 4-byte size) and the
+/// legacy 44-byte layout (40-byte ValueBalance + 4-byte size). The legacy
+/// layout is parsed with `lts = 0`, so a hand-built 44-byte record
+/// round-trips through `FromDisk + IntoDisk` to the new 52-byte layout —
+/// not back to 44 bytes.
+#[cfg(zcash_unstable = "nsm")]
+#[test]
+fn roundtrip_block_info_layouts() {
+    use zebra_chain::block_info::BlockInfo;
+
+    use crate::service::finalized_state::disk_format::FromDisk;
+
+    let _init_guard = zebra_test::init();
+
+    // Post-NSM (52-byte) layout: full round-trip via IntoDisk + FromDisk.
+    let mut value_pools = ValueBalance::<NonNegative>::zero();
+    value_pools.set_lts_amount(Amount::<NonNegative>::try_from(1234).unwrap());
+    let info = BlockInfo::new(value_pools, 4096);
+    let bytes = info.as_bytes();
+    assert_eq!(52, bytes.len(), "post-NSM record is 48 + 4 bytes");
+    let parsed = BlockInfo::from_bytes(&bytes);
+    assert_eq!(info, parsed);
+
+    // Legacy 44-byte layout: 40-byte ValueBalance (lts implicitly zero) +
+    // 4-byte size. Hand-build the bytes and confirm the parse plumbs a
+    // zero LTS pool.
+    let mut legacy = [0u8; 44];
+    // Stash a recognisable size so we can assert it survives the parse.
+    legacy[40..44].copy_from_slice(&7777u32.to_le_bytes());
+    let parsed_legacy = BlockInfo::from_bytes(&legacy[..]);
+    assert_eq!(7777, parsed_legacy.size());
+    assert_eq!(
+        Amount::<NonNegative>::zero(),
+        parsed_legacy.value_pools().lts_amount(),
+        "legacy 44-byte records default the LTS pool to zero"
+    );
+
+    // A new write of the legacy-parsed record uses the 52-byte layout.
+    assert_eq!(52, parsed_legacy.as_bytes().len());
+}

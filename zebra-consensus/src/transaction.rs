@@ -484,8 +484,11 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let ffi_nu = Self::ffi_network_upgrade(tx.as_ref(), &network, req.height(), nu)?;
+            let cached_ffi_transaction = Arc::new(
+                CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), ffi_nu)
+                    .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?,
+            );
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
@@ -499,7 +502,6 @@ where
                     ..
                 } => Self::verify_v4_transaction(
                     &req,
-                    &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     joinsplit_data,
@@ -550,22 +552,13 @@ where
             // Get the `value_balance` to calculate the transaction fee.
             let value_balance = tx.value_balance(&spent_utxos);
 
-            let zip233_amount = match *tx {
-            	#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-                Transaction::V6{ .. } => tx.zip233_amount(),
-                _ => Amount::zero()
-            };
-
             // Calculate the fee only for non-coinbase transactions.
             let mut miner_fee = None;
             if !tx.is_coinbase() {
                 // TODO: deduplicate this code with remaining_transaction_value()?
                 miner_fee = match value_balance {
                     Ok(vb) => match vb.remaining_transaction_value() {
-                        Ok(tx_rtv) => match tx_rtv - zip233_amount {
-                            Ok(fee) => Some(fee),
-                            Err(_) => return Err(TransactionError::IncorrectFee),
-                        }
+                        Ok(tx_rtv) => Some(tx_rtv),
                         Err(_) => return Err(TransactionError::IncorrectFee),
                     },
                     Err(_) => return Err(TransactionError::IncorrectFee),
@@ -826,16 +819,10 @@ where
     #[allow(clippy::unwrap_in_result)]
     fn verify_v4_transaction(
         request: &Request,
-        network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
         joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
     ) -> Result<AsyncChecks, TransactionError> {
-        let tx = request.transaction();
-        let nu = request.upgrade(network);
-
-        Self::verify_v4_transaction_network_upgrade(&tx, nu)?;
-
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
 
         let sighash = cached_ffi_transaction
@@ -854,8 +841,17 @@ where
     /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
     fn verify_v4_transaction_network_upgrade(
         transaction: &Transaction,
+        network: &Network,
+        height: block::Height,
         network_upgrade: NetworkUpgrade,
     ) -> Result<(), TransactionError> {
+        // From NU7 onward, V4 transactions remain valid only until the
+        // optional V4 deprecation height (testnet-only); after it they are
+        // rejected. Networks with no configured height never deprecate V4.
+        let v4_allowed_after_nu7 = network
+            .v4_deprecation_height()
+            .is_none_or(|deprecation_height| height < deprecation_height);
+
         match network_upgrade {
             // Supports V4 transactions
             //
@@ -881,9 +877,17 @@ where
             | NetworkUpgrade::Nu6_1 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => Ok(()),
+            NetworkUpgrade::ZFuture if v4_allowed_after_nu7 => Ok(()),
+
+            NetworkUpgrade::Nu7 if v4_allowed_after_nu7 => Ok(()),
 
             // Does not support V4 transactions
+            #[cfg(zcash_unstable = "zfuture")]
+            NetworkUpgrade::ZFuture => Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            )),
+
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
@@ -892,6 +896,25 @@ where
                 network_upgrade,
             )),
         }
+    }
+
+    /// Returns the network upgrade used for FFI sighash construction.
+    fn ffi_network_upgrade(
+        transaction: &Transaction,
+        network: &Network,
+        height: block::Height,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<NetworkUpgrade, TransactionError> {
+        if matches!(transaction, Transaction::V4 { .. }) {
+            Self::verify_v4_transaction_network_upgrade(
+                transaction,
+                network,
+                height,
+                network_upgrade,
+            )?;
+        }
+
+        Ok(network_upgrade)
     }
 
     /// Verify a V5 transaction.

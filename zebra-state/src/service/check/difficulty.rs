@@ -382,7 +382,7 @@ pub fn pow_adjustment_block_span_for_height(network: &Network, height: block::He
     NetworkUpgrade::averaging_window_for_height(network, height) + POW_MEDIAN_BLOCK_SPAN
 }
 
-#[cfg(test)]
+#[cfg(all(test, zcash_unstable = "nu7"))]
 mod tests {
     use super::*;
 

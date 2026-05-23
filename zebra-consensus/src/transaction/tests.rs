@@ -17,6 +17,8 @@ use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, ServiceExt};
 
+#[cfg(zcash_unstable = "nu7")]
+use zebra_chain::parameters::testnet::RegtestParameters;
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
@@ -57,6 +59,32 @@ fn test_timeout() -> std::time::Duration {
     } else {
         std::time::Duration::from_secs(30)
     }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn ffi_network_upgrade_for_test<ZS, Mempool>(
+    _verifier: &Verifier<ZS, Mempool>,
+    transaction: &Transaction,
+    network: &Network,
+    height: block::Height,
+    network_upgrade: NetworkUpgrade,
+) -> Result<NetworkUpgrade, TransactionError>
+where
+    ZS: tower::Service<
+            zebra_state::Request,
+            Response = zebra_state::Response,
+            Error = crate::BoxError,
+        > + Send
+        + Clone
+        + 'static,
+    ZS::Future: Send + 'static,
+    Mempool: tower::Service<mempool::Request, Response = mempool::Response, Error = crate::BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    Verifier::<ZS, Mempool>::ffi_network_upgrade(transaction, network, height, network_upgrade)
 }
 
 #[test]
@@ -1297,6 +1325,119 @@ async fn v5_transaction_is_accepted_after_nu5_activation() {
     }
 }
 
+#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[tokio::test]
+async fn v6_transaction_with_sapling_shielded_data_is_accepted_after_nu7_activation() {
+    use std::convert::Infallible;
+
+    use zcash_primitives::transaction::{
+        builder::{BuildConfig, Builder},
+        fees::zip317,
+    };
+    use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+    use zcash_transparent::builder::TransparentSigningSet;
+
+    let _init_guard = zebra_test::init();
+
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu5: Some(1),
+            nu6: Some(2),
+            nu6_1: Some(3),
+            nu7: Some(4),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let height = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("NU7 activation height is configured");
+
+    let extsk = sapling_crypto::zip32::ExtendedSpendingKey::master(&[]);
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let to = dfvk.default_address().1;
+    let note_value = Zatoshis::const_from_u64(50_000);
+    let note = to.create_note(
+        sapling_crypto::value::NoteValue::from_raw(note_value.into()),
+        sapling_crypto::Rseed::BeforeZip212(jubjub::Fr::from(1)),
+    );
+
+    let mut tree = sapling_crypto::CommitmentTree::empty();
+    tree.append(sapling_crypto::Node::from_cmu(&note.cmu()))
+        .expect("note commitment should append to empty Sapling tree");
+    let witness = sapling_crypto::IncrementalWitness::from_tree(tree)
+        .expect("Sapling tree with one note should produce a witness");
+
+    let build_config = BuildConfig::Standard {
+        sapling_anchor: Some(witness.root().into()),
+        orchard_anchor: None,
+    };
+    let mut builder = Builder::new(network.clone(), height.into(), build_config);
+    builder
+        .add_sapling_spend::<Infallible>(dfvk.fvk().clone(), note, witness.path().unwrap())
+        .expect("Sapling spend should be added to builder");
+
+    let fee = builder
+        .get_fee(&zip317::FeeRule::standard())
+        .expect("ZIP-317 fee should be computable");
+    let output_value = (note_value - fee).expect("note should cover fee and Sapling output");
+    builder
+        .add_sapling_output::<Infallible>(
+            Some(dfvk.fvk().ovk),
+            to,
+            output_value,
+            MemoBytes::empty(),
+        )
+        .expect("Sapling output should be added to builder");
+
+    let prover = zcash_proofs::prover::LocalTxProver::bundled();
+    let built_transaction = builder
+        .build(
+            &TransparentSigningSet::new(),
+            &[extsk],
+            &[],
+            rand_core::OsRng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        )
+        .expect("valid v6 Sapling transaction should build")
+        .transaction()
+        .clone();
+
+    let mut transaction_bytes = Vec::new();
+    built_transaction
+        .write(&mut transaction_bytes)
+        .expect("valid v6 Sapling transaction should serialize");
+    let transaction = transaction_bytes
+        .zcash_deserialize_into::<Transaction>()
+        .expect("valid v6 Sapling transaction should deserialize into Zebra");
+
+    assert!(transaction.version() > 4);
+    assert!(transaction.has_sapling_shielded_data());
+    assert_eq!(
+        NetworkUpgrade::current(&network, height),
+        NetworkUpgrade::Nu7
+    );
+
+    let expected = transaction.unmined_id();
+    let result = Verifier::new_for_tests(
+        &network,
+        service_fn(|_| async { unreachable!("Service should not be called") }),
+    )
+    .oneshot(Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction: Arc::new(transaction),
+        known_utxos: Arc::new(HashMap::new()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        height,
+        time: DateTime::<Utc>::MAX_UTC,
+    })
+    .await;
+
+    assert_eq!(result.expect("success").tx_id(), expected);
+}
+
 /// Test if V4 transaction with transparent funds is accepted.
 #[tokio::test]
 async fn v4_transaction_with_transparent_transfer_is_accepted() {
@@ -2477,6 +2618,122 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
             expected_hash
         );
     })
+}
+
+/// Test if a signed V4 transaction with a [`sprout::JoinSplit`] is rejected at
+/// its configured deprecation height.
+#[cfg(zcash_unstable = "nu7")]
+#[tokio::test]
+async fn v4_with_signed_sprout_transfer_is_rejected_at_deprecation_height() {
+    let _init_guard = zebra_test::init();
+
+    let (_, transaction) = test_transactions(&Network::Mainnet)
+        .rev()
+        .filter(|(_, transaction)| !transaction.is_coinbase() && transaction.inputs().is_empty())
+        .find(|(_, transaction)| transaction.sprout_groth16_joinsplits().next().is_some())
+        .expect("No transaction found with Groth16 JoinSplits");
+
+    assert_eq!(transaction.version(), 4);
+    assert!(transaction.has_sprout_joinsplit_data());
+
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            nu6: Some(2),
+            nu6_1: Some(3),
+            nu7: Some(4),
+            ..Default::default()
+        },
+        v4_deprecation_height: Some(Height(5)),
+        ..Default::default()
+    });
+    let nu7_height = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("NU7 activation height is configured");
+
+    assert_eq!(
+        NetworkUpgrade::current(&network, nu7_height),
+        NetworkUpgrade::Nu7
+    );
+    let verifier = Verifier::new_for_tests(
+        &network,
+        service_fn(|_: zebra_state::Request| async {
+            unreachable!("State service should not be called")
+        }),
+    );
+    assert_eq!(
+        ffi_network_upgrade_for_test(
+            &verifier,
+            &transaction,
+            &network,
+            nu7_height,
+            NetworkUpgrade::Nu7,
+        )
+        .expect("v4 transaction is supported before its deprecation height"),
+        NetworkUpgrade::Nu7,
+    );
+
+    let result = Verifier::new_for_tests(
+        &network,
+        service_fn(|_| async { unreachable!("State service should not be called") }),
+    )
+    .oneshot(Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction: transaction.clone(),
+        known_utxos: Arc::new(HashMap::new()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        height: nu7_height,
+        time: DateTime::<Utc>::MAX_UTC,
+    })
+    .await;
+
+    #[cfg(zcash_unstable = "nu7")]
+    assert!(
+        !matches!(
+            result,
+            Err(TransactionError::UnsupportedByNetworkUpgrade(
+                4,
+                NetworkUpgrade::Nu7
+            ))
+        ),
+        "v4 transactions are not rejected by the version gate before the configured deprecation height"
+    );
+
+    #[cfg(not(zcash_unstable = "nu7"))]
+    assert_eq!(
+        result,
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            4,
+            NetworkUpgrade::Nu7
+        )),
+        "without the NU7 librustzcash cfg, the active NU7 branch id is unavailable to the FFI verifier"
+    );
+
+    let deprecation_height = network
+        .v4_deprecation_height()
+        .expect("v4 deprecation height is configured");
+
+    let result = Verifier::new_for_tests(
+        &network,
+        service_fn(|_| async { unreachable!("State service should not be called") }),
+    )
+    .oneshot(Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction,
+        known_utxos: Arc::new(HashMap::new()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        height: deprecation_height,
+        time: DateTime::<Utc>::MAX_UTC,
+    })
+    .await;
+
+    assert_eq!(
+        result,
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            4,
+            NetworkUpgrade::Nu7
+        ))
+    );
 }
 
 /// Test if an V4 transaction with a modified [`sprout::JoinSplit`] is rejected.
