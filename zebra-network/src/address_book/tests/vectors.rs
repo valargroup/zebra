@@ -14,7 +14,7 @@ use crate::{
     constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK},
     meta_addr::MetaAddr,
     protocol::external::types::PeerServices,
-    AddressBook,
+    AddressBook, PeerSocketAddr,
 };
 
 /// Make sure an empty address book is actually empty.
@@ -181,4 +181,114 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// Check that inbound ephemeral addresses are not saved to the peer cache.
+#[test]
+fn cacheable_skips_inbound_addrs() {
+    let now = Utc::now();
+    let inbound_addr = "127.0.0.2:12345".parse().unwrap();
+    let inbound = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(
+            Instant::now(),
+            now.try_into().expect("will succeed until 2038"),
+        );
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:8233".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [inbound],
+    );
+
+    assert_eq!(
+        address_book.cacheable(now),
+        Vec::new(),
+        "inbound ephemeral addresses must not be cached"
+    );
+}
+
+/// Check that inbound ephemeral addresses are not selected for outbound dials.
+#[test]
+fn reconnection_peers_skips_inbound_addrs() {
+    let inbound_addr = "127.0.0.2:12345".parse().unwrap();
+    let mut inbound = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(
+            Instant::now(),
+            Utc::now().try_into().expect("will succeed until 2038"),
+        );
+    inbound.set_last_response(DateTime32::MIN);
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:8233".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        [inbound],
+    );
+
+    assert_eq!(
+        address_book
+            .reconnection_peers(Instant::now(), Utc::now())
+            .next(),
+        None,
+        "inbound ephemeral addresses must not be selected for outbound dials"
+    );
+}
+
+/// Check that proven self addresses are removed and ignored on future updates.
+#[test]
+fn self_connection_addr_is_removed_and_ignored() {
+    let self_addr: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:8233".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+
+    let inserted = address_book.update(
+        MetaAddr::new_gossiped_meta_addr(self_addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("gossiped peer change has services"),
+    );
+    assert!(
+        inserted.is_some(),
+        "expected self candidate to be inserted before suppression"
+    );
+    assert_eq!(
+        address_book
+            .get(self_addr)
+            .map(|meta_addr| meta_addr.addr()),
+        Some(self_addr)
+    );
+
+    let suppressed = address_book.update(MetaAddr::new_self_connection(self_addr));
+    assert_eq!(
+        suppressed, None,
+        "self suppression should not return an updated peer"
+    );
+    assert_eq!(
+        address_book.get(self_addr),
+        None,
+        "self address should be removed"
+    );
+
+    let reinserted = address_book.update(
+        MetaAddr::new_gossiped_meta_addr(self_addr, PeerServices::NODE_NETWORK, DateTime32::now())
+            .new_gossiped_change()
+            .expect("gossiped peer change has services"),
+    );
+    assert_eq!(
+        reinserted, None,
+        "suppressed self address should stay ignored"
+    );
+    assert_eq!(
+        address_book.get(self_addr),
+        None,
+        "self address should stay absent"
+    );
 }
