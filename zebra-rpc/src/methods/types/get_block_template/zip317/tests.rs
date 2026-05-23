@@ -2,13 +2,30 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+use std::sync::Arc;
+
+use proptest::{
+    arbitrary::any,
+    strategy::{Strategy, ValueTree},
+    test_runner::TestRunner,
+};
 use zcash_keys::address::Address;
 
 use zcash_transparent::address::TransparentAddress;
-use zebra_chain::{block::Height, parameters::Network, transaction, transparent::OutPoint};
+use zebra_chain::{
+    at_least_one,
+    block::Height,
+    parameters::{
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+    },
+    sapling,
+    transaction::{self, LockTime, Transaction, UnminedTx, VerifiedUnminedTx},
+    transparent::OutPoint,
+};
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::select_mempool_transactions;
+use super::{select_mempool_transactions, BlockTemplateLimits};
 
 #[test]
 fn excludes_tx_with_unselected_dependencies() {
@@ -42,6 +59,90 @@ fn excludes_tx_with_unselected_dependencies() {
         vec![],
         "should not select any transactions when dependencies are unavailable"
     );
+}
+
+#[test]
+fn template_limits_selection_to_global_shielded_budget_after_nu7() {
+    let mut limits = nu7_block_template_limits();
+    let orchard_tx = verified_unmined_tx(fake_v5_with_orchard_actions(
+        usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("limit fits in usize"),
+    ));
+    let sapling_tx = verified_unmined_tx(fake_v5_with_sapling_outputs(1));
+
+    assert!(limits.try_add(&orchard_tx));
+    assert!(!limits.try_add(&sapling_tx));
+}
+
+fn nu7_block_template_limits() -> BlockTemplateLimits {
+    BlockTemplateLimits {
+        remaining_bytes: usize::MAX,
+        remaining_sigops: u32::MAX,
+        remaining_unpaid_actions: u32::MAX,
+        remaining_orchard_actions: ORCHARD_BLOCK_ACTION_LIMIT,
+        remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,
+        remaining_sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        remaining_shielded_cost: GLOBAL_SHIELDED_BUDGET,
+    }
+}
+
+fn verified_unmined_tx(transaction: Arc<Transaction>) -> VerifiedUnminedTx {
+    let unmined_tx = UnminedTx::from(transaction);
+    let miner_fee = unmined_tx.conventional_fee;
+
+    VerifiedUnminedTx::new(unmined_tx, miner_fee, 0, 0, Arc::new(Vec::new()))
+        .expect("fake transaction pays the conventional fee")
+}
+
+fn fake_v5_with_orchard_actions(count: usize) -> Arc<Transaction> {
+    let mut tx = empty_v5_transaction();
+    let shielded_data =
+        zebra_chain::transaction::arbitrary::insert_fake_orchard_shielded_data(&mut tx);
+    let action = shielded_data
+        .actions
+        .iter()
+        .next()
+        .expect("fake shielded data has an action")
+        .clone();
+    shielded_data.actions = at_least_one![action; count];
+    Arc::new(tx)
+}
+
+fn fake_v5_with_sapling_outputs(count: usize) -> Arc<Transaction> {
+    let mut runner = TestRunner::default();
+    let mut shielded_data = any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+        .new_tree(&mut runner)
+        .expect("sapling shielded data strategy is valid")
+        .current();
+    let output = any::<sapling::Output>()
+        .new_tree(&mut runner)
+        .expect("sapling output strategy is valid")
+        .current();
+
+    shielded_data.transfers = sapling::TransferData::JustOutputs {
+        outputs: at_least_one![output; count],
+    };
+
+    let mut tx = empty_v5_transaction();
+    match &mut tx {
+        Transaction::V5 {
+            sapling_shielded_data,
+            ..
+        } => *sapling_shielded_data = Some(shielded_data),
+        _ => unreachable!("empty_v5_transaction returns V5"),
+    }
+    Arc::new(tx)
+}
+
+fn empty_v5_transaction() -> Transaction {
+    Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(100),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    }
 }
 
 #[test]

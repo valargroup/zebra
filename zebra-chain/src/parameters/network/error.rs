@@ -51,6 +51,10 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     OutOfOrderUpgrades,
 
+    #[error("configured NU7 activation requires building with `--cfg zcash_unstable=\"nu7\"`")]
+    #[non_exhaustive]
+    Nu7RequiresUnstableCfg,
+
     #[error("difficulty limits are valid expanded values")]
     #[non_exhaustive]
     InvaildDifficultyLimits,

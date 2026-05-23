@@ -604,6 +604,11 @@ impl ParametersBuilder {
             return Err(ParametersBuilderError::LockFundingStreams);
         }
 
+        #[cfg(not(any(test, zcash_unstable = "nu7")))]
+        if nu7.is_some() {
+            return Err(ParametersBuilderError::Nu7RequiresUnstableCfg);
+        }
+
         // # Correctness
         //
         // These must be in order so that later network upgrades overwrite prior ones
