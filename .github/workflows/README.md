@@ -44,36 +44,29 @@ graph TB
     Security[zizmor.yml]
   end
 
-  %% Integration tests on GCP
-  subgraph GCP Integration
-    IT[zfnd-ci-integration-tests-gcp.yml]
-    FindDisks[zfnd-find-cached-disks.yml]
-    Deploy[zfnd-deploy-integration-tests-gcp.yml]
-    DeployNodes[zfnd-deploy-nodes-gcp.yml]
-    Cleanup[zfnd-delete-gcp-resources.yml]
+  %% Release
+  subgraph Release
+    RelBin[release-binaries.yml]
   end
 
   %% Trigger wiring
-  PR --> Unit & Lint & DockerCfg & CrateBuild & IT & Security
+  PR --> Unit & Lint & DockerCfg & CrateBuild & Security
   Push --> Unit & Lint & Coverage & Docs & Security
-  Schedule --> IT
-  Manual --> IT & DeployNodes & Cleanup
-
-  %% Build dependency
-  BuildDocker --> IT
-  IT --> FindDisks --> Deploy
+  Release_Event[Release] --> RelBin
+  RelBin --> BuildDocker
 
   %% Styling
   classDef primary fill:#2374ab,stroke:#2374ab,color:white
   classDef secondary fill:#48a9a6,stroke:#48a9a6,color:white
   classDef trigger fill:#95a5a6,stroke:#95a5a6,color:white
   class BuildDocker primary
-  class Unit,Lint,Coverage,DockerCfg,CrateBuild,Docs,Security secondary
-  class IT,FindDisks,Deploy,DeployNodes,Cleanup secondary
-  class PR,Push,Schedule,Manual trigger
+  class Unit,Lint,Coverage,DockerCfg,CrateBuild,Docs,Security,RelBin secondary
+  class PR,Push,Schedule,Manual,Release_Event trigger
 ```
 
-_The diagram above illustrates the parallel execution patterns in our CI/CD system. All triggers can initiate the pipeline concurrently, unit tests run in parallel after the Docker image build, and integration tests follow a mix of parallel and sequential steps. The infrastructure components support their respective workflow parts concurrently._
+_The diagram above illustrates the parallel execution patterns in this fork's CI: all PR/push triggers run concurrently, and the reusable Docker image build is invoked by the release pipeline._
+
+> **Fork note:** This fork does **not** run the upstream ZcashFoundation GCP stateful-test suite. The `zfnd-ci-integration-tests-gcp`, `zfnd-deploy-integration-tests-gcp`, `zfnd-deploy-nodes-gcp`, `zfnd-find-cached-disks`, `zfnd-delete-gcp-resources`, and `trigger-integration-tests` workflows (plus `scripts/gcp-*.sh`) were removed because they require GCP Workload Identity Federation, service accounts, and pre-seeded cached state disks that the fork does not have. Network-sync coverage is instead provided by local multi-node simulations; PR-level correctness is covered by the unit, lint, crate-build, and Docker-config workflows below. The GCP-oriented narrative later in this document is retained for upstream reference.
 
 ## Core Infrastructure
 
@@ -150,16 +143,11 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Security Analysis** (`zizmor.yml`): GitHub Actions security lint (SARIF)
 - **Release Binaries** (`release-binaries.yml`): Build and publish release artifacts
 - **Release Drafter** (`release-drafter.yml`): Automates release notes
-- **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, cached disks, lwd flows
+- **Fork Release Artifacts** (`fork-release-artifacts.yml`): Builds and attaches this fork's release binaries
 
 ### Supporting/Re-usable Workflows
 
-- **Build docker image** (`zfnd-build-docker-image.yml`): Reusable image build with caching and tagging
-- **Find cached disks** (`zfnd-find-cached-disks.yml`): Discovers GCP disks for stateful tests
-- **Deploy integration tests** (`zfnd-deploy-integration-tests-gcp.yml`): Orchestrates GCP VMs and test runs
-- **Deploy nodes** (`zfnd-deploy-nodes-gcp.yml`): Provision long-lived nodes
-- **Delete GCP resources** (`zfnd-delete-gcp-resources.yml`): Cleanup utilities
-- Helper scripts in `.github/workflows/scripts/` used by the above
+- **Build docker image** (`zfnd-build-docker-image.yml`): Reusable image build with caching and tagging (invoked by `release-binaries.yml`)
 
 ## Test Execution Strategy
 
