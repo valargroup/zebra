@@ -19,7 +19,9 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants::{MAX_INVALIDATED_BLOCKS, MAX_NON_FINALIZED_CHAIN_FORKS},
+    constants::{
+        MAX_INVALIDATED_BLOCKS, MAX_INVALIDATED_BLOCK_RECORDS, MAX_NON_FINALIZED_CHAIN_FORKS,
+    },
     error::ReconsiderError,
     request::{ContextuallyVerifiedBlock, FinalizableBlock},
     service::{check, finalized_state::ZebraDb, InvalidateError},
@@ -404,7 +406,9 @@ impl NonFinalizedState {
             Arc::new(invalidated_blocks),
         );
 
-        while self.invalidated_blocks.len() > MAX_INVALIDATED_BLOCKS {
+        while self.invalidated_blocks.len() > MAX_INVALIDATED_BLOCKS
+            || self.invalidated_block_records() > MAX_INVALIDATED_BLOCK_RECORDS
+        {
             self.invalidated_blocks.shift_remove_index(0);
         }
 
@@ -849,6 +853,14 @@ impl NonFinalizedState {
     /// Return the invalidated blocks.
     pub fn invalidated_blocks(&self) -> IndexMap<Height, Arc<Vec<ContextuallyVerifiedBlock>>> {
         self.invalidated_blocks.clone()
+    }
+
+    /// Return the total number of cached invalidated blocks.
+    fn invalidated_block_records(&self) -> usize {
+        self.invalidated_blocks
+            .values()
+            .map(|blocks| blocks.len())
+            .sum()
     }
 
     /// Return the chain whose tip block hash is `parent_hash`.

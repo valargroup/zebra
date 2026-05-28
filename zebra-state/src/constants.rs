@@ -15,20 +15,18 @@ pub use zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 
 /// The maximum chain reorganisation height.
 ///
-/// This threshold determines the maximum length of the best non-finalized chain.
-/// Larger reorganisations would allow double-spends of coinbase transactions.
+/// This threshold determines the maximum length of the best non-finalized
+/// chain. Larger reorganisations are outside Zebra's rollback window because
+/// older blocks have already been finalized.
 ///
-/// This threshold uses the relevant chain for the block being verified by the
-/// non-finalized state.
+/// This is a local-only node policy; it is not part of consensus.
 ///
-/// For the best chain, coinbase spends are only allowed from blocks at or below
-/// the finalized tip. For other chains, coinbase spends can use outputs from
-/// early non-finalized blocks, or finalized blocks. But if that chain becomes
-/// the best chain, all non-finalized blocks past the [`MAX_BLOCK_REORG_HEIGHT`]
-/// will be finalized. This includes all mature coinbase outputs.
+/// This larger rollback window intentionally takes effect immediately rather
+/// than at NU7 activation. It keeps node-local rollback capacity at roughly the
+/// same wall-clock duration after NU7 reduces the target spacing to 25 seconds.
 //
 // TODO: change to HeightDiff
-pub const MAX_BLOCK_REORG_HEIGHT: u32 = MIN_TRANSPARENT_COINBASE_MATURITY - 1;
+pub const MAX_BLOCK_REORG_HEIGHT: u32 = 600;
 
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
@@ -99,8 +97,8 @@ pub const MAX_LEGACY_CHAIN_BLOCKS: usize = 100_000;
 /// 100 blocks. (1 fork per 20 blocks.) When block propagation is efficient, there is around
 /// 1 fork per 300 blocks.
 ///
-/// This limits non-finalized chain memory to around:
-/// `10 forks * 100 blocks * 2 MB per block = 2 GB`
+/// This limits non-finalized chain memory, in the worst case, to around:
+/// `10 forks * 600 blocks * 2 MB per block = 12 GB`
 pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
 
 /// The maximum number of block hashes allowed in `getblocks` responses in the Zcash network protocol.
@@ -111,9 +109,15 @@ pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
 
 /// The maximum number of invalidated block records.
 ///
-/// This limits the memory use to around:
-/// `100 entries * up to 99 blocks * 2 MB per block = 20 GB`
+/// This limits the number of separate blocks that can be invalidated and later
+/// reconsidered.
 pub const MAX_INVALIDATED_BLOCKS: usize = 100;
+
+/// The maximum total number of cached blocks in invalidated block records.
+///
+/// This limits the memory use, in the worst case, to around:
+/// `9,900 blocks * 2 MB per block = 20 GB`
+pub const MAX_INVALIDATED_BLOCK_RECORDS: usize = 9_900;
 
 lazy_static! {
     /// Regex that matches the RocksDB error when its lock file is already open.
