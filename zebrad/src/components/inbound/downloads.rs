@@ -366,6 +366,7 @@ where
                     BoxError::from("gossiped block with no height")
                 })
                 .map_err(|e| (e, None))?;
+            let block_time = block.header.time;
 
             if block_height > max_lookahead_height {
                 debug!(
@@ -404,6 +405,7 @@ where
                         crate::components::block_verify_tracing::BlockSource::Gossip,
                         Some(block_height),
                         hash,
+                        block_time,
                         download_duration,
                         verify_duration,
                         crate::components::block_verify_tracing::VerifyResult::Success,
@@ -417,6 +419,7 @@ where
                         crate::components::block_verify_tracing::BlockSource::Gossip,
                         Some(block_height),
                         hash,
+                        block_time,
                         download_duration,
                         verify_duration,
                         crate::components::block_verify_tracing::VerifyResult::Failure,

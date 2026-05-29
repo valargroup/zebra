@@ -455,6 +455,7 @@ where
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
+                let block_time = block.header.time;
 
                 if block_height > lookahead_drop_height {
                     Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
@@ -571,6 +572,7 @@ where
                             crate::components::block_verify_tracing::BlockSource::Sync,
                             Some(block_height),
                             hash,
+                            block_time,
                             download_duration,
                             verify_duration,
                             crate::components::block_verify_tracing::VerifyResult::Success,
@@ -584,6 +586,7 @@ where
                             crate::components::block_verify_tracing::BlockSource::Sync,
                             Some(block_height),
                             hash,
+                            block_time,
                             download_duration,
                             verify_duration,
                             crate::components::block_verify_tracing::VerifyResult::Failure,
