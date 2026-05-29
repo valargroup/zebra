@@ -3,6 +3,7 @@ members = [
         "zebrad",
         "zebra-chain",
         "zebra-network",
+        "zebra-jsonl-trace",
         "zebra-state",
         "zebra-script",
         "zebra-consensus",

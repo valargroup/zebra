@@ -1,4 +1,4 @@
-/! Randomised test case generation for amounts.
+//! Randomised test case generation for amounts.
 
 use proptest::prelude::*;
 

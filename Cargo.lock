@@ -7561,6 +7561,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zebra-jsonl-trace"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "zebra-network"
 version = "7.0.0"
 dependencies = [
@@ -7600,6 +7609,7 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "zebra-chain",
+ "zebra-jsonl-trace",
  "zebra-test",
 ]
 
@@ -7745,6 +7755,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zebra-chain",
+ "zebra-jsonl-trace",
  "zebra-node-services",
  "zebra-test",
 ]
@@ -7871,6 +7882,7 @@ dependencies = [
  "zcash_script",
  "zebra-chain",
  "zebra-consensus",
+ "zebra-jsonl-trace",
  "zebra-network",
  "zebra-node-services",
  "zebra-rpc",

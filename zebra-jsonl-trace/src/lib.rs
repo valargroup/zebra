@@ -33,6 +33,24 @@ pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Env var used to label every JSONL trace record with a stable node identifier.
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
+/// Env var used to configure which JSONL trace tables are written.
+///
+/// Use `all` to write every table, `none` to disable all tables, or a
+/// comma-separated list of table names like `node_heartbeat,peer_lifecycle`.
+pub const TRACE_TABLES_ENV: &str = "ZEBRA_JSONL_TRACE_TABLES";
+
+/// Default lower-volume trace tables for mainnet debugging.
+pub const DEFAULT_ENABLED_TABLES: &[&str] = &[
+    "block_verify_event",
+    "fork_event",
+    "fork_snapshot",
+    "node_heartbeat",
+    "peer_lifecycle",
+    "peer_session",
+    "send_timing",
+    "serving_event",
+];
+
 /// Returns the process-wide node identifier used to tag JSONL trace records.
 ///
 /// Resolution order: `ZEBRA_NODE_ID`, then `HOSTNAME`, then `"unknown"`. The
@@ -75,6 +93,8 @@ pub struct JsonlTraceConfig {
     pub buffer_flush_bytes: usize,
     /// Maximum time between forced file flushes.
     pub file_flush_interval: Duration,
+    /// Tables that should be written. `None` enables all tables.
+    pub enabled_tables: Option<HashSet<String>>,
 }
 
 impl Default for JsonlTraceConfig {
@@ -85,8 +105,60 @@ impl Default for JsonlTraceConfig {
             batch_linger: DEFAULT_BATCH_LINGER,
             buffer_flush_bytes: DEFAULT_BUFFER_FLUSH_BYTES,
             file_flush_interval: DEFAULT_FILE_FLUSH_INTERVAL,
+            enabled_tables: enabled_tables_from_env(),
         }
     }
+}
+
+impl JsonlTraceConfig {
+    /// Return a config that writes every JSONL table.
+    pub fn all_tables() -> Self {
+        Self {
+            enabled_tables: None,
+            ..Default::default()
+        }
+    }
+
+    /// Return true if `table` should be written.
+    fn table_enabled(&self, table: &str) -> bool {
+        self.enabled_tables
+            .as_ref()
+            .is_none_or(|enabled_tables| enabled_tables.contains(table))
+    }
+}
+
+fn enabled_tables_from_env() -> Option<HashSet<String>> {
+    let Some(value) = std::env::var_os(TRACE_TABLES_ENV) else {
+        return Some(
+            DEFAULT_ENABLED_TABLES
+                .iter()
+                .map(|table| (*table).to_string())
+                .collect(),
+        );
+    };
+
+    let value = value.to_string_lossy();
+    let value = value.trim();
+
+    if value.eq_ignore_ascii_case("all") || value == "*" {
+        return None;
+    }
+
+    if value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("disabled")
+    {
+        return Some(HashSet::new());
+    }
+
+    Some(
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|table| !table.is_empty())
+            .map(|table| table.strip_suffix(".jsonl").unwrap_or(table).to_string())
+            .collect(),
+    )
 }
 
 #[derive(Clone)]
@@ -294,6 +366,10 @@ impl TraceWriter {
 
     async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
         for event in batch {
+            if !self.config.table_enabled(event.table) {
+                continue;
+            }
+
             if self.disabled_tables.contains(event.table) {
                 continue;
             }
@@ -474,7 +550,7 @@ mod tests {
         let trace_dir = dir.path().join("traces");
 
         let (tx, rx) = mpsc::channel(16);
-        let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::default());
+        let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::all_tables());
         let handle = tokio::spawn(run_trace_writer(rx, writer));
 
         tx.send(JsonlWriteEvent {

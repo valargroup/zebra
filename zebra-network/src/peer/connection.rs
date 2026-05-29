@@ -742,7 +742,24 @@ where
         #[cfg(feature = "p2p-tracing")]
         self.heartbeat_tracer.record_sent(&msg);
 
-        self.peer_tx.send(msg).await
+        #[cfg(feature = "p2p-tracing")]
+        let command = msg.command();
+        #[cfg(feature = "p2p-tracing")]
+        let start = std::time::Instant::now();
+
+        let result = self.peer_tx.send(msg).await;
+
+        #[cfg(feature = "p2p-tracing")]
+        self.send_timing_tracer.record(
+            "send_message",
+            command,
+            &self.metrics_label,
+            self.connection_info.connection_id,
+            start.elapsed(),
+            None,
+        );
+
+        result
     }
 
     /// Trace a P2P message send or receive. No-op when the p2p-tracing feature is off.

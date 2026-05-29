@@ -169,6 +169,8 @@ pub(crate) mod peer_session;
 mod peer_set;
 mod policies;
 mod protocol;
+#[cfg(feature = "p2p-tracing")]
+pub(crate) mod send_timing;
 
 #[allow(unused)]
 pub(crate) use peer_set::PeerSet;
