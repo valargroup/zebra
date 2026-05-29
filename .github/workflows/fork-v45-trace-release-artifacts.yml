@@ -1,0 +1,61 @@
+name: Fork v4.5 trace release artifacts
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach artifacts to
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  FEATURES: default-release-binaries p2p-tracing
+  CXXFLAGS: -include cstdint
+
+jobs:
+  linux-x86_64-binary:
+    name: Build Linux x86_64 binary
+    if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'v4.5.0-jsonl-traces') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
+
+      - name: Build Ubuntu-compatible binary
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f #v7.1.0
+        with:
+          context: .
+          file: docker/ubuntu-package.Dockerfile
+          target: artifact
+          platforms: linux/amd64
+          outputs: type=local,dest=dist
+          build-args: |
+            FEATURES=${{ env.FEATURES }}
+            CXXFLAGS=${{ env.CXXFLAGS }}
+
+      - name: Package binary
+        env:
+          ARCHIVE: zebra-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-gnu.tar.gz
+        run: |
+          install -D -m 0755 dist/zebra package/zebra
+          tar -C package -czf "${ARCHIVE}" zebra
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: zebra-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-gnu.tar.gz
+        run: |
+          gh release upload "${RELEASE_TAG}" "${ARCHIVE}" "${ARCHIVE}.sha256" --clobber
