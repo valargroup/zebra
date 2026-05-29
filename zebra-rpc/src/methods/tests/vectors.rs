@@ -2073,6 +2073,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     let mining_conf = crate::config::mining::Config {
         miner_address: Some(addr.clone()),
         extra_coinbase_data: None,
+        miner_memo: None,
         internal_miner: true,
     };
 
@@ -2404,7 +2405,7 @@ async fn rpc_submitblock_errors() {
     );
 
     // Try to submit pre-populated blocks and assert that it responds with duplicate.
-    for (_height, &block_bytes) in zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS.iter() {
+    for &block_bytes in zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS.values() {
         let submit_block_response = rpc.submit_block(HexData(block_bytes.into()), None).await;
 
         assert_eq!(
@@ -2767,6 +2768,7 @@ async fn rpc_getdifficulty() {
     let mining_conf = mining::Config {
         miner_address: None,
         extra_coinbase_data: None,
+        miner_memo: None,
         internal_miner: true,
     };
 

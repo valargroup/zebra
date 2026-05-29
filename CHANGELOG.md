@@ -7,9 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Security
+
+- Cap the upfront `Vec::with_capacity` reservation in
+  `zcash_deserialize_external_count` so a peer-supplied `CompactSize`
+  cannot force a large allocation before any element bytes are read. The
+  `Vec` grows naturally via `push()` as real data arrives. Complements
+  the per-type `max_allocation()` caps from PR #10494
+  ([GHSA-xr93-pcq3-pxf8](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-xr93-pcq3-pxf8)).
+  CWE-770.
+- Cap `block::Hash::max_allocation` at `MAX_BLOCK_LOCATOR_LENGTH = 101`
+  (matching Bitcoin Core's `MAX_LOCATOR_SZ` in `net_processing.cpp`) and
+  `CountedHeader::max_allocation` at the existing
+  `MAX_HEADERS_PER_MESSAGE = 160` constant (already enforced on the
+  sending side and at the codec level for `read_headers`). The previous
+  values were derived from `MAX_PROTOCOL_MESSAGE_LEN` and returned 65,535
+  and ~1,409 respectively, allowing a post-handshake peer to force ~2 MiB
+  of upfront `Vec` preallocation per `getblocks`/`getheaders` message
+  before any payload bytes were read. Same fix shape as
+  GHSA-xr93-pcq3-pxf8 for `AddrV1`/`AddrV2` (PR #10494). CWE-770.
+
 ### Added
 
 - Startup warning on Linux when `net.ipv4.tcp_slow_start_after_idle` is enabled (which resets TCP congestion windows between block requests and significantly reduces single-peer block-propagation throughput on long-haul links), with a "Linux TCP tuning for block propagation" troubleshooting section ([#10513](https://github.com/ZcashFoundation/zebra/pull/10513))
+- Support ZIP-213
+
+### Changed
+
+- Increased Zebra's local rollback window to 600 blocks. This local node policy
+  takes effect immediately to keep the rollback window large enough for NU7's
+  shorter block spacing, and is not gated by NU7 activation.
+
+### Fixed
+
+- Avoid panicking in the address-book ban path when `network.max_connections_per_ip > 1`. Guard the optional `most_recent_by_ip` cache instead of unwrapping it, so a ban-threshold misbehavior update no longer crashes the address-book updater and poisons the shared mutex ([#10580](https://github.com/ZcashFoundation/zebra/issues/10580))
+- Propagate transaction-level value-balance errors from `Block::chain_value_pool_change()` instead of silently dropping them. The previous `flat_map(Result)` aggregation relied on `Result<T, E>: IntoIterator` and yielded zero items on `Err`, so a failing transaction was omitted from the block sum rather than surfacing as a `ValueBalanceError` ([#10585](https://github.com/ZcashFoundation/zebra/issues/10585))
 
 ## [Zebra 4.4.1](https://github.com/ZcashFoundation/zebra/releases/tag/v4.4.1) - 2026-05-04
 
@@ -71,6 +103,10 @@ operators update to 4.4.0.
 - Refreshed the Sentry/OpenTelemetry observability stack ([#10490](https://github.com/ZcashFoundation/zebra/pull/10490)): Sentry SDK upgraded to `0.47` (transport switched from `reqwest` to `ureq`); Sentry events now carry `SENTRY_ENVIRONMENT`, `git.ref`, `git.sha`, and CI context (`CI_PR_NUMBER`, `CI_TEST_ID`, `GITHUB_*`) when present; `opentelemetry` is now part of the `default-release-binaries` feature set, with export still gated on `OTEL_EXPORTER_OTLP_ENDPOINT` (or the tracing config); and `zebrad::sentry` is now crate-private.
 - Upgraded the librustzcash crate cohort (`equihash` 0.3, `orchard` 0.13, `sapling-crypto` 0.7, `zcash_address` 0.11, `zcash_encoding` 0.4, `zcash_keys` 0.13, `zcash_primitives` 0.27, `zcash_proofs` 0.27, `zcash_protocol` 0.8, `zcash_transparent` 0.7) to the 2026-04 release wave, which migrates off the yanked `core2` crate to `corez 0.1.1` and clears RUSTSEC-2026-0105 ([#10522](https://github.com/ZcashFoundation/zebra/pull/10522)).
 - Bumped workspace MSRV from 1.85.0 to 1.85.1, required by the new librustzcash releases. Also bumped `zebrad` MSRV from 1.89 to 1.91, required by `cargo-platform 0.3.3` (transitively via `vergen-git2`).
+- Upgraded `ed25519-zebra` from 4.0 to 4.2
+- Upgraded `console-subscriber` from 0.4 to 0.5
+- Upgraded `toml` from 0.9 to 1.0
+- Upgraded `opentelemetry` from 0.28 to 0.31, `opentelemetry_sdk` from 0.28 to 0.31, `opentelemetry-otlp` from 0.28 to 0.31, `tracing-opentelemetry` from 0.29 to 0.32
 
 ### Fixed
 
