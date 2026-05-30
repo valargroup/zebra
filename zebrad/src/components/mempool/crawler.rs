@@ -74,14 +74,25 @@ mod tests;
 /// The number of peers to request transactions from per crawl event.
 const FANOUT: usize = 3;
 
-/// The delay between crawl events.
+/// Periodic fallback interval between crawl events.
 ///
-/// This should be less than the target block interval,
-/// so that we crawl peer mempools at least once per block.
+/// The crawler primarily wakes on chain-tip changes so mempool freshness
+/// tracks the chain rather than wall-clock. This constant is the backstop
+/// that bounds staleness when no tip change occurs (e.g. a long inter-block
+/// gap or a momentary loss of the tip-change subscription).
 ///
-/// Using a prime number makes sure that mempool crawler fanouts
-/// don't synchronise with other crawls.
+/// Deliberately not coupled to `POST_*_POW_TARGET_SPACING`: under any future
+/// network upgrade that changes block spacing, the tip-change path adapts
+/// automatically and this backstop stays meaningful.
 pub const RATE_LIMIT_DELAY: Duration = Duration::from_secs(17);
+
+/// Minimum gap between successive crawl events.
+///
+/// Acts as a rate-limit floor against tip-change storms (rapid reorgs,
+/// duplicate notifications) that would otherwise trigger back-to-back
+/// crawls. Also doubles as jitter, so all nodes don't fan out simultaneously
+/// the moment a new block arrives.
+pub const MIN_CRAWL_GAP: Duration = Duration::from_secs(2);
 
 /// The time to wait for a peer response.
 ///
@@ -182,7 +193,12 @@ where
         result
     }
 
-    /// Periodically crawl peers for transactions to include in the mempool.
+    /// Crawl peers for transactions to include in the mempool.
+    ///
+    /// Wakes on chain-tip changes, with a periodic [`RATE_LIMIT_DELAY`]
+    /// backstop in case tip changes stop arriving. A [`MIN_CRAWL_GAP`] floor
+    /// between crawls rate-limits tip-change storms and adds jitter so
+    /// fanouts don't synchronise across nodes on block arrival.
     ///
     /// Runs until the [`SyncStatus`] loses its connection to the chain syncer, which happens when
     /// Zebra is shutting down.
@@ -195,6 +211,7 @@ where
 
         loop {
             self.wait_until_enabled().await?;
+
             // Avoid hangs when the peer service is not ready, or due to bugs in async code.
             timeout(RATE_LIMIT_DELAY, self.crawl_transactions())
                 .await
@@ -203,7 +220,22 @@ where
                     info!("mempool crawl timed out: {timeout:?}");
                     Ok(())
                 })?;
-            sleep(RATE_LIMIT_DELAY).await;
+
+            // Rate-limit floor + jitter: never crawl more than once per
+            // MIN_CRAWL_GAP, regardless of tip-change storms.
+            sleep(MIN_CRAWL_GAP).await;
+
+            // Wake on the next tip change or the periodic backstop,
+            // whichever fires first. The backstop interval is reduced by
+            // MIN_CRAWL_GAP so the overall maximum gap between crawls is
+            // still RATE_LIMIT_DELAY.
+            let backstop = RATE_LIMIT_DELAY.saturating_sub(MIN_CRAWL_GAP);
+            tokio::select! {
+                tip_result = self.chain_tip_change.wait_for_tip_change() => {
+                    tip_result?;
+                }
+                () = sleep(backstop) => {}
+            }
         }
     }
 
