@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [8.0.0] - 2026-05-28
+
+### Removed
+
+- `block::Height::coinbase_zcash_serialized_size()`
+- `transaction`:
+  - `builder` module
+  - `Transaction::new_v4_coinbase()` and `new_v5_coinbase()`
+- `transparent`:
+  - `Input::new_coinbase()` and `extra_coinbase_data()`
+  - `CoinbaseData` struct and its impls
+  - `EXTRA_ZEBRA_COINBASE_DATA`, `GENESIS_COINBASE_DATA`, `MAX_COINBASE_DATA_LEN`,
+    `MAX_COINBASE_HEIGHT_DATA_LEN` constants
+
+### Changed
+
+- `transparent::Input::Coinbase`:
+  - `data` field type changed from `CoinbaseData` to `Vec<u8>`
+  - `data` now stores only miner data (without height encoding)
+- `block::Hash::max_allocation()` now returns `MAX_BLOCK_LOCATOR_LENGTH` (`101`,
+  matching Bitcoin Core's `MAX_LOCATOR_SZ`); previously derived from
+  `MAX_PROTOCOL_MESSAGE_LEN` (~65,535).
+- `block::CountedHeader::max_allocation()` now returns `MAX_HEADERS_PER_MESSAGE`
+  (`160`); previously ~1,409. Mitigates upfront preallocation by a
+  post-handshake peer on `getblocks`/`getheaders` (CWE-770; same fix shape as
+  [GHSA-xr93-pcq3-pxf8](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-xr93-pcq3-pxf8)).
+- `serialization::zcash_deserialize_external_count` now caps the initial
+  `Vec::with_capacity` reservation at `MAX_INITIAL_ALLOCATION = 1024` so a
+  peer-supplied `CompactSize` cannot force a large allocation before any
+  element bytes are read; the `Vec` grows naturally via `push()`. Complements
+  the per-type `max_allocation()` caps (CWE-770).
+
+### Added
+
+- `block::MAX_BLOCK_LOCATOR_LENGTH: u64 = 101`.
+- `block::Height`:
+  - `impl From<block::Height> for i64`
+  - `impl From<&block::Height> for i64`
+  - `impl TryFrom<i64> for block::Height`
+- `transparent`:
+  - `Input::miner_data()`
+  - `Input::coinbase_script()`
+  - `impl TryFrom<transparent::Address> for zcash_transparent::address::TransparentAddress`
+  - `derive(Copy)` on `transparent::Address`
+- `transaction`:
+  - `impl TryFrom<&[u8]> for AuthDigest`
+  - `impl AsRef<[u8; 32]> for Hash`
+  - `impl From<&[u8; 32]> for Hash`
+- `serialization`:
+  - `SerializationError::{Num, Opcode, Script}` variants
+  - `impl ZcashSerialize for u8`
+
+### Fixed
+
+- `Block::chain_value_pool_change()` now propagates per-transaction
+  `ValueBalanceError`s instead of silently dropping them via `flat_map(Result)`
+  ([#10585](https://github.com/ZcashFoundation/zebra/issues/10585)).
+
 ## [7.0.0] - 2026-05-01
 
 ### Added
