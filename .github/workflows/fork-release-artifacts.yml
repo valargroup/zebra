@@ -29,19 +29,21 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
 
-      - name: Build Ubuntu-compatible binary
+      - name: Build Linux binaries
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f #v7.1.0
         with:
           context: .
-          file: docker/ubuntu-package.Dockerfile
-          target: artifact
+          file: docker/Dockerfile
+          target: release
           platforms: linux/amd64
           outputs: type=local,dest=dist
           build-args: |
+            SHORT_SHA=
             FEATURES=${{ env.FEATURES }}
             RUSTFLAGS=${{ env.RUSTFLAGS }}
 
@@ -49,8 +51,15 @@ jobs:
         env:
           ARCHIVE: zebra-${{ env.RELEASE_TAG }}-x86_64-unknown-linux-gnu.tar.gz
         run: |
-          install -D -m 0755 dist/zebra package/zebra
-          tar -C package -czf "${ARCHIVE}" zebra
+          install -D -m 0755 dist/usr/local/bin/zebrad package/zebra
+          if [ -f dist/usr/local/bin/zebra-rollback-state ]; then
+            install -D -m 0755 dist/usr/local/bin/zebra-rollback-state package/zebra-rollback-state
+          fi
+          archive_entries="zebra"
+          if [ -f package/zebra-rollback-state ]; then
+            archive_entries="${archive_entries} zebra-rollback-state"
+          fi
+          tar -C package -czf "${ARCHIVE}" ${archive_entries}
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload binary to release
@@ -69,6 +78,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set lowercase image name
         id: image
