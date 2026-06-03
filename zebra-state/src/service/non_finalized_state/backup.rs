@@ -11,13 +11,12 @@ use hex::ToHex;
 use zebra_chain::{
     amount::{Amount, DeferredPoolBalanceChange},
     block::{self, Block, Height},
-    parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
 
 use crate::{
-    ContextuallyVerifiedBlock, IntoDisk, NonFinalizedState, SemanticallyVerifiedBlock,
-    WatchReceiver, ZebraDb,
+    constants::MAX_BLOCK_REORG_HEIGHT, ContextuallyVerifiedBlock, IntoDisk, NonFinalizedState,
+    SemanticallyVerifiedBlock, WatchReceiver, ZebraDb,
 };
 
 #[cfg(not(test))]
@@ -26,8 +25,9 @@ use crate::service::write::validate_and_commit_non_finalized;
 /// The minimum duration that Zebra will wait between updates to the non-finalized state backup cache.
 pub(crate) const MIN_DURATION_BETWEEN_BACKUP_UPDATES: Duration = Duration::from_secs(5);
 
-/// The file name for cached consensus parameters used to validate backup blocks.
-const BACKUP_ACTIVATION_HEIGHTS_FILE_NAME: &str = "activation-heights";
+/// The file name for the latest known activation height used to validate backup
+/// blocks.
+const BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME: &str = "max-known-activation-height";
 
 /// Accepts an optional path to the non-finalized state backup directory and a handle to the database.
 ///
@@ -102,7 +102,7 @@ pub(super) fn update_non_finalized_state_backup(
     non_finalized_state: &NonFinalizedState,
     mut backup_blocks: HashMap<block::Hash, PathBuf>,
 ) {
-    write_backup_activation_heights(backup_dir_path, &non_finalized_state.network);
+    write_backup_max_known_activation_height(backup_dir_path, &non_finalized_state.network);
 
     for block in non_finalized_state
         .chain_iter()
@@ -233,20 +233,14 @@ fn write_backup_block(backup_dir_path: &Path, block: &ContextuallyVerifiedBlock)
     }
 }
 
-/// Returns the first height where backup blocks might have been validated using
-/// a different activation schedule from the current [`Network`].
+/// Returns the first height where backup blocks might have been validated
+/// without knowing about a network upgrade.
 fn backup_rewind_height_for_changed_activation(
     backup_dir_path: &Path,
     finalized_state: &ZebraDb,
     backup_blocks: &BTreeMap<Height, Vec<SemanticallyVerifiedBlock>>,
 ) -> Option<Height> {
     let network = finalized_state.network();
-
-    if read_backup_activation_heights(backup_dir_path).as_deref()
-        == Some(serialized_activation_heights(&network).as_str())
-    {
-        return None;
-    }
 
     let Some(first_backup_height) = backup_blocks.keys().next().copied() else {
         return None;
@@ -255,81 +249,103 @@ fn backup_rewind_height_for_changed_activation(
         return None;
     };
 
+    let current_max_activation_height = max_known_activation_height(&network)?;
+
+    match read_backup_max_known_activation_height(backup_dir_path) {
+        Some(backup_max_activation_height)
+            if backup_max_activation_height >= current_max_activation_height =>
+        {
+            None
+        }
+        Some(backup_max_activation_height) => network.full_activation_list().into_iter().find_map(
+            |(activation_height, _network_upgrade)| {
+                (backup_max_activation_height < activation_height
+                    && first_backup_height <= activation_height
+                    && activation_height <= last_backup_height)
+                    .then_some(activation_height)
+            },
+        ),
+        None => backup_range_is_near_activation(
+            first_backup_height,
+            last_backup_height,
+            current_max_activation_height,
+        )
+        .then_some(current_max_activation_height),
+    }
+}
+
+/// Returns true if `first_backup_height..=last_backup_height` overlaps the
+/// non-finalized reorg window around `activation_height`.
+fn backup_range_is_near_activation(
+    first_backup_height: Height,
+    last_backup_height: Height,
+    activation_height: Height,
+) -> bool {
+    let reorg_limit = MAX_BLOCK_REORG_HEIGHT;
+    let lower_bound = Height(activation_height.0.saturating_sub(reorg_limit));
+    let upper_bound = activation_height + i64::from(reorg_limit);
+    let upper_bound = upper_bound.unwrap_or(Height::MAX);
+
+    first_backup_height <= upper_bound && lower_bound <= last_backup_height
+}
+
+/// Returns the latest activation height known to `network`.
+fn max_known_activation_height(network: &zebra_chain::parameters::Network) -> Option<Height> {
     network
         .full_activation_list()
         .into_iter()
-        .find_map(|(activation_height, _network_upgrade)| {
-            (first_backup_height <= activation_height && activation_height <= last_backup_height)
-                .then_some(activation_height)
-        })
+        .map(|(activation_height, _network_upgrade)| activation_height)
+        .max()
 }
 
-/// Writes the activation schedule used to validate backup blocks.
-fn write_backup_activation_heights(backup_dir_path: &Path, network: &Network) {
-    let activation_heights_file_path = backup_dir_path.join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME);
+/// Writes the latest activation height known when backup blocks were validated.
+fn write_backup_max_known_activation_height(
+    backup_dir_path: &Path,
+    network: &zebra_chain::parameters::Network,
+) {
+    let max_known_activation_height_file_path =
+        backup_dir_path.join(BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME);
+    let max_known_activation_height = max_known_activation_height(network)
+        .expect("every network has at least a genesis activation height");
 
     if let Err(err) = std::fs::write(
-        activation_heights_file_path,
-        serialized_activation_heights(network),
+        max_known_activation_height_file_path,
+        max_known_activation_height.0.to_string(),
     ) {
         tracing::warn!(
             ?err,
-            "failed to write non-finalized state backup activation heights"
+            "failed to write non-finalized state backup max known activation height"
         );
     }
 }
 
-/// Reads the activation schedule that was used to validate backup blocks.
-fn read_backup_activation_heights(backup_dir_path: &Path) -> Option<String> {
-    let activation_heights_file_path = backup_dir_path.join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME);
+/// Reads the latest activation height known when backup blocks were validated.
+fn read_backup_max_known_activation_height(backup_dir_path: &Path) -> Option<Height> {
+    let max_known_activation_height_file_path =
+        backup_dir_path.join(BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME);
 
-    match std::fs::read_to_string(activation_heights_file_path) {
-        Ok(activation_heights) => Some(activation_heights),
+    match std::fs::read_to_string(max_known_activation_height_file_path) {
+        Ok(max_known_activation_height) => max_known_activation_height
+            .trim()
+            .parse::<u32>()
+            .map(Height)
+            .map_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    "failed to parse non-finalized state backup max known \
+                     activation height"
+                );
+            })
+            .ok(),
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => {
             tracing::warn!(
                 ?err,
-                "failed to read non-finalized state backup activation heights"
+                "failed to read non-finalized state backup max known activation height"
             );
 
             None
         }
-    }
-}
-
-/// Serializes activation heights in a stable text format.
-fn serialized_activation_heights(network: &Network) -> String {
-    network
-        .full_activation_list()
-        .into_iter()
-        .map(|(height, network_upgrade)| {
-            format!(
-                "{}:{}\n",
-                height.0,
-                serialized_network_upgrade(network_upgrade)
-            )
-        })
-        .collect()
-}
-
-/// Returns a stable text name for a [`NetworkUpgrade`].
-fn serialized_network_upgrade(network_upgrade: NetworkUpgrade) -> &'static str {
-    match network_upgrade {
-        NetworkUpgrade::Genesis => "Genesis",
-        NetworkUpgrade::BeforeOverwinter => "BeforeOverwinter",
-        NetworkUpgrade::Overwinter => "Overwinter",
-        NetworkUpgrade::Sapling => "Sapling",
-        NetworkUpgrade::Blossom => "Blossom",
-        NetworkUpgrade::Heartwood => "Heartwood",
-        NetworkUpgrade::Canopy => "Canopy",
-        NetworkUpgrade::Nu5 => "Nu5",
-        NetworkUpgrade::Nu6 => "Nu6",
-        NetworkUpgrade::Nu6_1 => "Nu6_1",
-        NetworkUpgrade::Nu6_2 => "Nu6_2",
-        NetworkUpgrade::Nu7 => "Nu7",
-
-        #[cfg(zcash_unstable = "zfuture")]
-        NetworkUpgrade::ZFuture => "ZFuture",
     }
 }
 
@@ -449,7 +465,7 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
         }
     };
 
-    if block_file_name == BACKUP_ACTIVATION_HEIGHTS_FILE_NAME {
+    if block_file_name == BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME {
         return None;
     }
 
@@ -473,14 +489,32 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
 mod tests {
     use super::*;
 
-    use crate::{
-        arbitrary::Prepare, service::finalized_state::FinalizedState, tests::FakeChainHelper,
-        Config,
+    use zebra_chain::parameters::{
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+        Network, NetworkUpgrade,
     };
+
+    use crate::{service::finalized_state::FinalizedState, tests::FakeChainHelper, Config};
 
     #[test]
     fn restore_backup_rewinds_stale_cache_at_activation_height() {
-        let network = Network::Mainnet;
+        let mainnet = Network::Mainnet;
+        let heartwood_activation = NetworkUpgrade::Heartwood
+            .activation_height(&mainnet)
+            .expect("Heartwood activates on mainnet");
+        let before_heartwood = (heartwood_activation - 1).expect("activation is above genesis");
+
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                before_overwinter: Some(1),
+                overwinter: Some(2),
+                sapling: Some(3),
+                blossom: Some(4),
+                heartwood: Some(heartwood_activation.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let finalized_state = FinalizedState::new(
             &Config::ephemeral(),
             &network,
@@ -489,12 +523,7 @@ mod tests {
         );
         let backup_dir = tempfile::tempdir().expect("temporary directory is created");
 
-        let heartwood_activation = NetworkUpgrade::Heartwood
-            .activation_height(&network)
-            .expect("Heartwood activates on mainnet");
-        let before_heartwood = (heartwood_activation - 1).expect("activation is above genesis");
-
-        let blocks = network.block_map();
+        let blocks = mainnet.block_map();
         let prev_block = Arc::new(
             blocks
                 .get(&before_heartwood.0)
@@ -506,22 +535,18 @@ mod tests {
         let stale_block_1 = stale_activation_block.make_fake_child();
         let stale_block_2 = stale_block_1.make_fake_child();
 
-        let mut stale_non_finalized_state = NonFinalizedState::new(&network);
-        stale_non_finalized_state
-            .commit_new_chain(prev_block.clone().prepare(), &finalized_state.db)
-            .expect("pre-activation block should commit to the test state");
-
-        update_non_finalized_state_backup(
-            backup_dir.path(),
-            &stale_non_finalized_state,
-            HashMap::new(),
-        );
+        write_stale_backup_block(backup_dir.path(), prev_block.clone());
         write_stale_backup_block(backup_dir.path(), stale_activation_block);
         write_stale_backup_block(backup_dir.path(), stale_block_1);
         write_stale_backup_block(backup_dir.path(), stale_block_2);
 
-        std::fs::remove_file(backup_dir.path().join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME))
-            .expect("simulating an old backup cache should remove activation metadata");
+        assert!(
+            !backup_dir
+                .path()
+                .join(BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME)
+                .exists(),
+            "legacy backup cache should not have activation metadata"
+        );
 
         let restored_non_finalized_state = restore_backup(
             NonFinalizedState::new(&network),
@@ -554,7 +579,94 @@ mod tests {
     }
 
     #[test]
-    fn backup_activation_metadata_rewinds_crossed_activation() {
+    fn backup_activation_metadata_rewinds_newer_activation() {
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
+
+        let heartwood_activation = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("Heartwood activates on mainnet");
+        let before_heartwood = (heartwood_activation - 1).expect("activation is above genesis");
+        let after_heartwood = (heartwood_activation + 1).expect("activation is below max height");
+
+        let mut backup_blocks = BTreeMap::new();
+        backup_blocks.insert(before_heartwood, Vec::new());
+        backup_blocks.insert(after_heartwood, Vec::new());
+
+        std::fs::write(
+            backup_dir
+                .path()
+                .join(BACKUP_MAX_KNOWN_ACTIVATION_HEIGHT_FILE_NAME),
+            before_heartwood.0.to_string(),
+        )
+        .expect("simulating an old backup cache should write old activation metadata");
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            Some(heartwood_activation),
+            "old activation metadata should reject backup blocks that cross \
+             a newer activation height"
+        );
+
+        write_backup_max_known_activation_height(backup_dir.path(), &network);
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            None,
+            "matching metadata should allow backup blocks that cross an activation height"
+        );
+    }
+
+    #[test]
+    fn missing_activation_metadata_rewinds_near_latest_activation() {
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
+
+        let latest_activation =
+            max_known_activation_height(&network).expect("mainnet has activation heights");
+        let before_latest_activation =
+            (latest_activation - 1).expect("activation is above genesis");
+        let after_latest_activation =
+            (latest_activation + 1).expect("activation is below max height");
+
+        let mut backup_blocks = BTreeMap::new();
+        backup_blocks.insert(before_latest_activation, Vec::new());
+        backup_blocks.insert(after_latest_activation, Vec::new());
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            Some(latest_activation),
+            "missing metadata should rewind backup blocks near the latest \
+             activation height"
+        );
+    }
+
+    #[test]
+    fn missing_activation_metadata_allows_range_far_from_latest_activation() {
         let network = Network::Mainnet;
         let finalized_state = FinalizedState::new(
             &Config::ephemeral(),
@@ -580,53 +692,9 @@ mod tests {
                 &finalized_state.db,
                 &backup_blocks
             ),
-            Some(heartwood_activation),
-            "missing metadata should reject backup blocks that cross an activation height"
-        );
-
-        write_backup_activation_heights(backup_dir.path(), &network);
-
-        assert_eq!(
-            backup_rewind_height_for_changed_activation(
-                backup_dir.path(),
-                &finalized_state.db,
-                &backup_blocks
-            ),
             None,
-            "matching metadata should allow backup blocks that cross an activation height"
-        );
-    }
-
-    #[test]
-    fn backup_activation_metadata_allows_single_upgrade_range() {
-        let network = Network::Mainnet;
-        let finalized_state = FinalizedState::new(
-            &Config::ephemeral(),
-            &network,
-            #[cfg(feature = "elasticsearch")]
-            false,
-        );
-        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
-
-        let heartwood_activation = NetworkUpgrade::Heartwood
-            .activation_height(&network)
-            .expect("Heartwood activates on mainnet");
-        let before_heartwood = (heartwood_activation - 2).expect("activation is above genesis");
-        let last_before_heartwood =
-            (heartwood_activation - 1).expect("activation is above genesis");
-
-        let mut backup_blocks = BTreeMap::new();
-        backup_blocks.insert(before_heartwood, Vec::new());
-        backup_blocks.insert(last_before_heartwood, Vec::new());
-
-        assert_eq!(
-            backup_rewind_height_for_changed_activation(
-                backup_dir.path(),
-                &finalized_state.db,
-                &backup_blocks
-            ),
-            None,
-            "missing metadata should allow backup blocks that do not cross an activation height"
+            "missing metadata should not rewind historical backup blocks far \
+             from the latest activation height"
         );
     }
 }
