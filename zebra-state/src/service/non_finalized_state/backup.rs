@@ -11,6 +11,7 @@ use hex::ToHex;
 use zebra_chain::{
     amount::{Amount, DeferredPoolBalanceChange},
     block::{self, Block, Height},
+    parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
 
@@ -24,6 +25,9 @@ use crate::service::write::validate_and_commit_non_finalized;
 
 /// The minimum duration that Zebra will wait between updates to the non-finalized state backup cache.
 pub(crate) const MIN_DURATION_BETWEEN_BACKUP_UPDATES: Duration = Duration::from_secs(5);
+
+/// The file name for cached consensus parameters used to validate backup blocks.
+const BACKUP_ACTIVATION_HEIGHTS_FILE_NAME: &str = "activation-heights";
 
 /// Accepts an optional path to the non-finalized state backup directory and a handle to the database.
 ///
@@ -40,6 +44,19 @@ pub(super) fn restore_backup(
 
     for block in read_non_finalized_blocks_from_backup(backup_dir_path, finalized_state) {
         store.entry(block.height).or_default().push(block);
+    }
+
+    if let Some(rewind_height) =
+        backup_rewind_height_for_changed_activation(backup_dir_path, finalized_state, &store)
+    {
+        tracing::warn!(
+            ?backup_dir_path,
+            ?rewind_height,
+            "rewinding non-finalized backup cache because it reaches a network \
+             upgrade activation height with unknown or changed activation parameters"
+        );
+
+        store.retain(|height, _blocks| *height < rewind_height);
     }
 
     for (height, blocks) in store {
@@ -85,6 +102,8 @@ pub(super) fn update_non_finalized_state_backup(
     non_finalized_state: &NonFinalizedState,
     mut backup_blocks: HashMap<block::Hash, PathBuf>,
 ) {
+    write_backup_activation_heights(backup_dir_path, &non_finalized_state.network);
+
     for block in non_finalized_state
         .chain_iter()
         .flat_map(|chain| chain.blocks.values())
@@ -214,6 +233,106 @@ fn write_backup_block(backup_dir_path: &Path, block: &ContextuallyVerifiedBlock)
     }
 }
 
+/// Returns the first height where backup blocks might have been validated using
+/// a different activation schedule from the current [`Network`].
+fn backup_rewind_height_for_changed_activation(
+    backup_dir_path: &Path,
+    finalized_state: &ZebraDb,
+    backup_blocks: &BTreeMap<Height, Vec<SemanticallyVerifiedBlock>>,
+) -> Option<Height> {
+    let network = finalized_state.network();
+
+    if read_backup_activation_heights(backup_dir_path).as_deref()
+        == Some(serialized_activation_heights(&network).as_str())
+    {
+        return None;
+    }
+
+    let Some(first_backup_height) = backup_blocks.keys().next().copied() else {
+        return None;
+    };
+    let Some(last_backup_height) = backup_blocks.keys().next_back().copied() else {
+        return None;
+    };
+
+    network
+        .full_activation_list()
+        .into_iter()
+        .find_map(|(activation_height, _network_upgrade)| {
+            (first_backup_height <= activation_height && activation_height <= last_backup_height)
+                .then_some(activation_height)
+        })
+}
+
+/// Writes the activation schedule used to validate backup blocks.
+fn write_backup_activation_heights(backup_dir_path: &Path, network: &Network) {
+    let activation_heights_file_path = backup_dir_path.join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME);
+
+    if let Err(err) = std::fs::write(
+        activation_heights_file_path,
+        serialized_activation_heights(network),
+    ) {
+        tracing::warn!(
+            ?err,
+            "failed to write non-finalized state backup activation heights"
+        );
+    }
+}
+
+/// Reads the activation schedule that was used to validate backup blocks.
+fn read_backup_activation_heights(backup_dir_path: &Path) -> Option<String> {
+    let activation_heights_file_path = backup_dir_path.join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME);
+
+    match std::fs::read_to_string(activation_heights_file_path) {
+        Ok(activation_heights) => Some(activation_heights),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "failed to read non-finalized state backup activation heights"
+            );
+
+            None
+        }
+    }
+}
+
+/// Serializes activation heights in a stable text format.
+fn serialized_activation_heights(network: &Network) -> String {
+    network
+        .full_activation_list()
+        .into_iter()
+        .map(|(height, network_upgrade)| {
+            format!(
+                "{}:{}\n",
+                height.0,
+                serialized_network_upgrade(network_upgrade)
+            )
+        })
+        .collect()
+}
+
+/// Returns a stable text name for a [`NetworkUpgrade`].
+fn serialized_network_upgrade(network_upgrade: NetworkUpgrade) -> &'static str {
+    match network_upgrade {
+        NetworkUpgrade::Genesis => "Genesis",
+        NetworkUpgrade::BeforeOverwinter => "BeforeOverwinter",
+        NetworkUpgrade::Overwinter => "Overwinter",
+        NetworkUpgrade::Sapling => "Sapling",
+        NetworkUpgrade::Blossom => "Blossom",
+        NetworkUpgrade::Heartwood => "Heartwood",
+        NetworkUpgrade::Canopy => "Canopy",
+        NetworkUpgrade::Nu5 => "Nu5",
+        NetworkUpgrade::Nu6 => "Nu6",
+        NetworkUpgrade::Nu6_1 => "Nu6_1",
+        NetworkUpgrade::Nu6_2 => "Nu6_2",
+        NetworkUpgrade::Nu7 => "Nu7",
+
+        #[cfg(zcash_unstable = "zfuture")]
+        NetworkUpgrade::ZFuture => "ZFuture",
+    }
+}
+
 /// Reads blocks from the provided non-finalized state backup directory path.
 ///
 /// Returns any blocks that are valid and not present in the finalized state.
@@ -330,6 +449,10 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
         }
     };
 
+    if block_file_name == BACKUP_ACTIVATION_HEIGHTS_FILE_NAME {
+        return None;
+    }
+
     let block_hash: block::Hash = match block_file_name.parse() {
         Ok(block_hash) => block_hash,
         Err(err) => {
@@ -344,4 +467,166 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
     };
 
     Some((block_hash, entry.path()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        arbitrary::Prepare, service::finalized_state::FinalizedState, tests::FakeChainHelper,
+        Config,
+    };
+
+    #[test]
+    fn restore_backup_rewinds_stale_cache_at_activation_height() {
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
+
+        let heartwood_activation = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("Heartwood activates on mainnet");
+        let before_heartwood = (heartwood_activation - 1).expect("activation is above genesis");
+
+        let blocks = network.block_map();
+        let prev_block = Arc::new(
+            blocks
+                .get(&before_heartwood.0)
+                .expect("test vector exists")
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid"),
+        );
+        let stale_activation_block = prev_block.make_fake_child();
+        let stale_block_1 = stale_activation_block.make_fake_child();
+        let stale_block_2 = stale_block_1.make_fake_child();
+
+        let mut stale_non_finalized_state = NonFinalizedState::new(&network);
+        stale_non_finalized_state
+            .commit_new_chain(prev_block.clone().prepare(), &finalized_state.db)
+            .expect("pre-activation block should commit to the test state");
+
+        update_non_finalized_state_backup(
+            backup_dir.path(),
+            &stale_non_finalized_state,
+            HashMap::new(),
+        );
+        write_stale_backup_block(backup_dir.path(), stale_activation_block);
+        write_stale_backup_block(backup_dir.path(), stale_block_1);
+        write_stale_backup_block(backup_dir.path(), stale_block_2);
+
+        std::fs::remove_file(backup_dir.path().join(BACKUP_ACTIVATION_HEIGHTS_FILE_NAME))
+            .expect("simulating an old backup cache should remove activation metadata");
+
+        let restored_non_finalized_state = restore_backup(
+            NonFinalizedState::new(&network),
+            backup_dir.path(),
+            &finalized_state.db,
+        );
+
+        assert_eq!(
+            restored_non_finalized_state.best_chain_len(),
+            Some(1),
+            "restore should keep only pre-activation backup blocks"
+        );
+        assert_eq!(
+            restored_non_finalized_state.best_tip(),
+            Some((before_heartwood, prev_block.hash())),
+            "restore should rewind the non-finalized backup to before activation"
+        );
+    }
+
+    fn write_stale_backup_block(backup_dir_path: &Path, block: Arc<Block>) {
+        let backup_block_file_name: String = block.hash().encode_hex();
+        let backup_block_file_path = backup_dir_path.join(backup_block_file_name);
+        let backup_block = NonFinalizedBlockBackup {
+            block,
+            deferred_pool_balance_change: Amount::zero(),
+        };
+
+        std::fs::write(backup_block_file_path, backup_block.as_bytes())
+            .expect("test should write stale backup block");
+    }
+
+    #[test]
+    fn backup_activation_metadata_rewinds_crossed_activation() {
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
+
+        let heartwood_activation = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("Heartwood activates on mainnet");
+        let before_heartwood = (heartwood_activation - 1).expect("activation is above genesis");
+        let after_heartwood = (heartwood_activation + 1).expect("activation is below max height");
+
+        let mut backup_blocks = BTreeMap::new();
+        backup_blocks.insert(before_heartwood, Vec::new());
+        backup_blocks.insert(after_heartwood, Vec::new());
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            Some(heartwood_activation),
+            "missing metadata should reject backup blocks that cross an activation height"
+        );
+
+        write_backup_activation_heights(backup_dir.path(), &network);
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            None,
+            "matching metadata should allow backup blocks that cross an activation height"
+        );
+    }
+
+    #[test]
+    fn backup_activation_metadata_allows_single_upgrade_range() {
+        let network = Network::Mainnet;
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        let backup_dir = tempfile::tempdir().expect("temporary directory is created");
+
+        let heartwood_activation = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("Heartwood activates on mainnet");
+        let before_heartwood = (heartwood_activation - 2).expect("activation is above genesis");
+        let last_before_heartwood =
+            (heartwood_activation - 1).expect("activation is above genesis");
+
+        let mut backup_blocks = BTreeMap::new();
+        backup_blocks.insert(before_heartwood, Vec::new());
+        backup_blocks.insert(last_before_heartwood, Vec::new());
+
+        assert_eq!(
+            backup_rewind_height_for_changed_activation(
+                backup_dir.path(),
+                &finalized_state.db,
+                &backup_blocks
+            ),
+            None,
+            "missing metadata should allow backup blocks that do not cross an activation height"
+        );
+    }
 }
