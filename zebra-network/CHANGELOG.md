@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added `zebra_network::zakura`, a default-off iroh scaffold that exposes a
+  relay/discovery-off endpoint builder and reserves the persistent Zakura iroh
+  node secret-key path and config field.
+- Added `PeerServices::NODE_P2P_V2`, the default-on `v2_p2p` and `legacy_p2p`
+  network configs, and a neutral legacy-handshake upgrade hook for mutually
+  capable Zakura peers.
+- Added bounded Zakura P2P v2 upgrade prelude and control-handshake wire types,
+  including transcript binding, native-vs-upgraded control validation, and
+  duplicate-peer handling scaffolding.
+- Added the default-off Zakura iroh protocol handler, explicit QUIC transport
+  limits, native bootstrap peer config, and bounded admission/stream/message
+  limit enforcement.
+- Added the `zakura-testkit` feature with deterministic loopback Iroh endpoint
+  tooling, in-process Zakura node/cluster harnesses, a bounded inbound recorder,
+  and raw hostile-peer helpers for protocol tests.
+
 ## [8.0.0] - 2026-06-02
 
 ### Changed

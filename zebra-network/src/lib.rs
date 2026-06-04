@@ -162,6 +162,7 @@ mod peer_cache_updater;
 mod peer_set;
 mod policies;
 mod protocol;
+pub mod zakura;
 
 #[allow(unused)]
 pub(crate) use peer_set::PeerSet;

@@ -46,6 +46,8 @@ use crate::{
         internal::{Request, Response},
     },
     types::MetaAddr,
+    zakura::{ZakuraControlRole, ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraUpgradeRequest},
+    zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
     BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
@@ -76,6 +78,7 @@ where
     inv_collector: broadcast::Sender<InventoryChange>,
     minimum_peer_version: MinimumPeerVersion<C>,
     nonces: Arc<futures::lock::Mutex<IndexSet<Nonce>>>,
+    zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
 
     parent_span: Span,
 }
@@ -94,6 +97,10 @@ where
             .field("our_services", &self.our_services)
             .field("relay", &self.relay)
             .field("minimum_peer_version", &self.minimum_peer_version)
+            .field(
+                "zakura_handshake_connector",
+                &self.zakura_handshake_connector,
+            )
             .field("parent_span", &self.parent_span)
             .finish()
     }
@@ -116,6 +123,7 @@ where
             inv_collector: self.inv_collector.clone(),
             minimum_peer_version: self.minimum_peer_version.clone(),
             nonces: self.nonces.clone(),
+            zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -133,6 +141,9 @@ pub struct ConnectionInfo {
 
     /// The network protocol [`VersionMessage`] sent by the remote peer.
     pub remote: VersionMessage,
+
+    /// The network protocol [`VersionMessage`] sent by this node.
+    pub local: VersionMessage,
 
     /// The network protocol version negotiated with the remote peer.
     ///
@@ -406,6 +417,7 @@ where
     inbound_service: Option<S>,
     address_book_updater: Option<tokio::sync::mpsc::Sender<MetaAddrChange>>,
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
+    zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
     latest_chain_tip: C,
 }
 
@@ -488,7 +500,17 @@ where
             user_agent: self.user_agent,
             relay: self.relay,
             inv_collector: self.inv_collector,
+            zakura_handshake_connector: self.zakura_handshake_connector,
         }
+    }
+
+    /// Provide a handle for routing mutually capable peers to Zakura P2P v2.
+    pub fn with_zakura_handshake_connector(
+        mut self,
+        zakura_handshake_connector: ZakuraHandshakeConnector,
+    ) -> Self {
+        self.zakura_handshake_connector = Some(zakura_handshake_connector);
+        self
     }
 
     /// Whether to request that peers relay transactions to our node.  Optional.
@@ -518,8 +540,11 @@ where
             tx
         });
         let nonces = Arc::new(futures::lock::Mutex::new(IndexSet::new()));
-        let user_agent = self.user_agent.unwrap_or_default();
-        let our_services = self.our_services.unwrap_or_else(PeerServices::empty);
+        let user_agent = configured_user_agent(&config, self.user_agent.unwrap_or_default());
+        let our_services = configured_advertised_services(
+            &config,
+            self.our_services.unwrap_or_else(PeerServices::empty),
+        );
         let relay = self.relay.unwrap_or(false);
         let network = config.network.clone();
         let minimum_peer_version = MinimumPeerVersion::new(self.latest_chain_tip, &network);
@@ -534,6 +559,7 @@ where
             inv_collector,
             minimum_peer_version,
             nonces,
+            zakura_handshake_connector: self.zakura_handshake_connector,
             parent_span: Span::current(),
         })
     }
@@ -557,9 +583,46 @@ where
             inbound_service: None,
             address_book_updater: None,
             inv_collector: None,
+            zakura_handshake_connector: None,
             latest_chain_tip: NoChainTip,
         }
     }
+}
+
+/// Return the services Zebra should advertise for this handshake.
+fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
+    services.remove(PeerServices::NODE_P2P_V2);
+
+    if config.v2_p2p {
+        services |= PeerServices::NODE_P2P_V2;
+    }
+
+    services
+}
+
+/// Return the user-agent Zebra should advertise for this handshake.
+fn configured_user_agent(config: &Config, user_agent: String) -> String {
+    if !config.v2_p2p {
+        return user_agent;
+    }
+
+    let zakura_token = format!("Zakura:{}", env!("CARGO_PKG_VERSION"));
+    let trimmed_user_agent = user_agent.trim_matches('/');
+
+    if trimmed_user_agent.is_empty() {
+        format!("/{zakura_token}/")
+    } else {
+        format!("/{zakura_token}/{trimmed_user_agent}/")
+    }
+}
+
+/// Returns true when the legacy handshake should try to route this peer to Zakura P2P v2.
+fn should_attempt_zakura_upgrade(config: &Config, connection_info: &ConnectionInfo) -> bool {
+    config.v2_p2p
+        && connection_info
+            .remote
+            .services
+            .contains(PeerServices::NODE_P2P_V2)
 }
 
 /// Negotiate the Zcash network protocol version with the remote peer at `connected_addr`, using
@@ -685,11 +748,13 @@ where
         user_agent: user_agent.clone(),
         start_height: minimum_peer_version.chain_tip_height(),
         relay,
-    }
-    .into();
+    };
 
     debug!(?our_version, "sending initial version message");
-    peer_conn.send(our_version).await?;
+    if our_services.contains(PeerServices::NODE_P2P_V2) {
+        metrics::counter!("zakura.p2p.handshake.service_bit.advertised").increment(1);
+    }
+    peer_conn.send(our_version.clone().into()).await?;
 
     let mut remote_msg = peer_conn
         .next()
@@ -721,6 +786,9 @@ where
             ?remote.user_agent,
             "peer with inconsistent version services and version address services",
         );
+    }
+    if remote.services.contains(PeerServices::NODE_P2P_V2) {
+        metrics::counter!("zakura.p2p.handshake.service_bit.remote").increment(1);
     }
 
     // Check for nonce reuse, indicating self-connection
@@ -783,6 +851,7 @@ where
     let connection_info = Arc::new(ConnectionInfo {
         connected_addr: *connected_addr,
         remote,
+        local: our_version,
         negotiated_version,
     });
 
@@ -840,6 +909,80 @@ where
     Ok(connection_info)
 }
 
+/// Route a mutually P2P-v2-capable peer into the Zakura handshake path.
+async fn upgrade_to_zakura_handshake(
+    connection_info: &ConnectionInfo,
+    connected_addr: ConnectedAddr,
+    network: &Network,
+    zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+) -> Result<ZakuraUpgradeOutcome, HandshakeError> {
+    let Some(zakura_handshake_connector) = zakura_handshake_connector else {
+        metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
+        return Err(HandshakeError::ZakuraUpgrade(
+            crate::zakura::ZakuraUpgradeError::Unavailable,
+        ));
+    };
+
+    let role = if connected_addr.is_inbound() {
+        ZakuraControlRole::Responder
+    } else {
+        ZakuraControlRole::Initiator
+    };
+    let request = ZakuraUpgradeRequest {
+        local_config: ZakuraHandshakeConfig::for_network(network),
+        local_version: connection_info.local.clone(),
+        remote_version: connection_info.remote.clone(),
+        nonces: ZakuraLegacyNonces {
+            local_zebra_nonce: connection_info.local.nonce,
+            remote_zebra_nonce: connection_info.remote.nonce,
+        },
+        role,
+    };
+
+    match zakura_handshake_connector.upgrade_outcome(request).await {
+        Ok(ZakuraUpgradeOutcome::Upgraded { peer_id }) => {
+            info!(
+                ?connected_addr,
+                ?peer_id,
+                remote_services = ?connection_info.remote.services,
+                "upgraded mutually P2P-v2-capable peer to Zakura",
+            );
+            metrics::counter!("zakura.p2p.handshake.upgraded").increment(1);
+
+            Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
+        }
+        Ok(ZakuraUpgradeOutcome::Duplicate { peer_id }) => {
+            info!(
+                ?connected_addr,
+                ?peer_id,
+                remote_services = ?connection_info.remote.services,
+                "closing duplicate Zakura peer neutrally",
+            );
+            metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
+            Ok(ZakuraUpgradeOutcome::Duplicate { peer_id })
+        }
+        Ok(ZakuraUpgradeOutcome::Rejected { reason }) => {
+            info!(
+                ?connected_addr,
+                ?reason,
+                remote_services = ?connection_info.remote.services,
+                "Zakura upgrade rejected neutrally",
+            );
+            metrics::counter!(
+                "zakura.p2p.upgrade.prelude.rejected",
+                "reason" => format!("{reason:?}"),
+                "network" => ZakuraHandshakeConfig::for_network(network).network_label(),
+            )
+            .increment(1);
+            Ok(ZakuraUpgradeOutcome::Rejected { reason })
+        }
+        Err(error) => {
+            metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
+            Err(error.into())
+        }
+    }
+}
+
 /// A handshake request.
 /// Contains the information needed to handshake with the peer.
 pub struct HandshakeRequest<PeerTransport>
@@ -880,7 +1023,7 @@ where
         let HandshakeRequest {
             data_stream,
             connected_addr,
-            mut connection_tracker,
+            connection_tracker,
         } = req;
 
         let negotiator_span = debug_span!("negotiator", peer = ?connected_addr);
@@ -900,6 +1043,7 @@ where
         let our_services = self.our_services;
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
+        let zakura_handshake_connector = self.zakura_handshake_connector.clone();
 
         // # Security
         //
@@ -921,11 +1065,12 @@ where
                     .with_metrics_addr_label(connected_addr.get_transient_addr_label())
                     .finish(),
             );
+            let mut connection_tracker = connection_tracker;
 
             let connection_info = match negotiate_version(
                 &mut peer_conn,
                 &connected_addr,
-                config,
+                config.clone(),
                 nonces,
                 user_agent,
                 our_services,
@@ -956,6 +1101,10 @@ where
                         HandshakeError::Serialization(_) => "serialization",
                         HandshakeError::ObsoleteVersion(_) => "obsolete_version",
                         HandshakeError::Timeout => "timeout",
+                        HandshakeError::ZakuraUpgradeSelected
+                        | HandshakeError::ZakuraUpgrade(_) => {
+                            unreachable!("negotiate_version returns before Zakura upgrade routing")
+                        }
                     };
                     metrics::histogram!(
                         "zcash.net.peer.handshake.duration_seconds",
@@ -972,6 +1121,40 @@ where
             };
 
             let remote_services = connection_info.remote.services;
+
+            if should_attempt_zakura_upgrade(&config, &connection_info) {
+                match upgrade_to_zakura_handshake(
+                    &connection_info,
+                    connected_addr,
+                    &config.network,
+                    zakura_handshake_connector,
+                )
+                .await
+                {
+                    Ok(
+                        ZakuraUpgradeOutcome::Upgraded { .. }
+                        | ZakuraUpgradeOutcome::Duplicate { .. },
+                    ) => {
+                        // Returning here drops the legacy stream and connection tracker, cleanly
+                        // closing the Zebra path and releasing the connection limit exactly once.
+                        return Err(HandshakeError::ZakuraUpgradeSelected);
+                    }
+                    Ok(ZakuraUpgradeOutcome::Rejected {
+                        reason: ZakuraRejectReason::TemporaryUnavailable,
+                    }) => {
+                        debug!(
+                            ?connected_addr,
+                            "Zakura upgrade is temporarily unavailable; continuing legacy handshake"
+                        );
+                    }
+                    Ok(ZakuraUpgradeOutcome::Rejected { .. }) => {
+                        // Returning here drops the legacy stream and connection tracker, cleanly
+                        // closing the Zebra path and releasing the connection limit exactly once.
+                        return Err(HandshakeError::ZakuraUpgradeSelected);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
             // The handshake succeeded: update the peer status from AttemptPending to Responded,
             // send initial connection info, and update the active connection counter.

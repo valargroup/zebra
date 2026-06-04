@@ -1218,6 +1218,10 @@ where
                 debug!(%msg, "got reject message unsolicited or from canceled request");
                 Unused
             }
+            Message::P2pV2Upgrade(_) => {
+                debug!(%msg, "got Zakura upgrade prelude outside the handshake");
+                Consumed
+            }
             Message::NotFound { .. } => {
                 debug!(%msg, "got notfound message unsolicited or from canceled request");
                 Unused
