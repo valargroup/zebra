@@ -1,7 +1,7 @@
 //! Raw peer harness for adversarial Zakura tests.
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use iroh::endpoint::{Connection, Endpoint, SendStream, VarInt};
+use iroh::endpoint::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
@@ -95,6 +95,68 @@ impl HostilePeer {
         Ok(())
     }
 
+    /// Open one stream whose prelude has a request id, then send a frame.
+    pub async fn send_frame_with_request_id(
+        &self,
+        stream_kind: u16,
+        request_id: u64,
+        frame: Frame,
+    ) -> Result<(), BoxError> {
+        let (mut send, _recv) = self.connection.open_bi().await?;
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind,
+            stream_version: 1,
+            request_id: Some(request_id),
+            max_frame_bytes: self.limits.max_frame_bytes,
+        };
+        send.write_all(&prelude.encode()?).await?;
+        send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+            .await?;
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// Accept the next bidi stream opened by the victim and respond with raw frames.
+    pub async fn respond_to_next_request(&self, frames: Vec<Frame>) -> Result<(), BoxError> {
+        let (mut send, _recv) = self.connection.accept_bi().await?;
+        for frame in frames {
+            send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+                .await?;
+        }
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// Accept the next request stream and build a response from its request id.
+    pub async fn respond_to_next_request_with(
+        &self,
+        build_frames: impl FnOnce(u64) -> Vec<Frame>,
+    ) -> Result<(), BoxError> {
+        let (mut send, mut recv) = self.connection.accept_bi().await?;
+        let prelude = Self::read_prelude(&mut recv).await?;
+        let request_id = prelude
+            .request_id
+            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        for frame in build_frames(request_id) {
+            send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+                .await?;
+        }
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// Accept the next request stream and keep the response side open.
+    pub async fn accept_next_request_without_response(&mut self) -> Result<(), BoxError> {
+        let (send, mut recv) = self.connection.accept_bi().await?;
+        let prelude = Self::read_prelude(&mut recv).await?;
+        prelude
+            .request_id
+            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        self.held_streams.push(send);
+        Ok(())
+    }
+
     /// Open one stream of `stream_kind` and send `count` valid frames on it.
     ///
     /// Unlike [`send_frame`](Self::send_frame), every frame travels on the SAME
@@ -174,5 +236,23 @@ impl HostilePeer {
         };
         send.write_all(&prelude.encode()?).await?;
         Ok(())
+    }
+
+    async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {
+        let mut bytes = vec![0; 4 + 2 + 2 + 1];
+        recv.read_exact(&mut bytes).await?;
+        match bytes[8] {
+            0 => {}
+            1 => {
+                let mut request_id = [0; 8];
+                recv.read_exact(&mut request_id).await?;
+                bytes.extend_from_slice(&request_id);
+            }
+            flag => return Err(format!("invalid request id flag: {flag}").into()),
+        }
+        let mut cap = [0; 4];
+        recv.read_exact(&mut cap).await?;
+        bytes.extend_from_slice(&cap);
+        Ok(StreamPrelude::decode(&bytes)?)
     }
 }

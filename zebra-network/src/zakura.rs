@@ -3,17 +3,27 @@
 //! This module reserves the iroh dependency, privacy-preserving endpoint posture,
 //! persistent identity storage surface, and bounded Zakura handshake wire types.
 
-use iroh::{endpoint, Endpoint, RelayMode, SecretKey};
+use std::time::Duration;
+
+use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
 use thiserror::Error;
+use tokio::sync::watch;
+
+use crate::{
+    meta_addr::{MetaAddr, MetaAddrChange},
+    PeerSocketAddr,
+};
 
 mod handler;
 mod handshake;
+mod legacy_gossip;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
 mod trace;
 
 pub use handler::*;
 pub use handshake::*;
+pub use legacy_gossip::*;
 pub use trace::{
     peer_label as zakura_trace_peer_label, reject_reason_label as zakura_trace_reject_reason_label,
     ZakuraTrace, ZakuraTraceEvent, CONN_TABLE, HANDSHAKE_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
@@ -30,6 +40,22 @@ use std::sync::{
 
 /// The pinned iroh version the Zakura P2P plan was verified against.
 pub const IROH_VERSION: &str = "0.92.0";
+
+/// How long the legacy->Zakura liveness keeper waits for the upgraded QUIC
+/// connection to register with the supervisor before giving up.
+///
+/// The native dial spawned by the upgrade is asynchronous, so the peer only
+/// appears in the supervisor's registered set a little later. If it never
+/// registers (the dial failed), the keeper exits without marking the peer live,
+/// so the outbound crawler reconnects to it normally.
+const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the keeper refreshes an upgraded peer's legacy address-book entry.
+///
+/// Must stay below [`constants::MIN_PEER_RECONNECTION_DELAY`](crate::constants::MIN_PEER_RECONNECTION_DELAY)
+/// so the `Responded` liveness never ages into a reconnection candidate while
+/// the Zakura connection is alive.
+const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 
 /// Returns an iroh endpoint builder with relays and external address lookup disabled.
 ///
@@ -72,139 +98,213 @@ pub enum ZakuraUpgradeError {
     Unavailable,
 }
 
-/// Legacy handshake context passed to the Zakura upgrade connector.
-#[derive(Clone, Debug)]
-pub struct ZakuraUpgradeRequest {
-    /// The local network and resource policy.
-    pub local_config: ZakuraHandshakeConfig,
-    /// The local legacy Zebra `version` message.
-    pub local_version: crate::VersionMessage,
-    /// The remote legacy Zebra `version` message.
-    pub remote_version: crate::VersionMessage,
-    /// The local/remote legacy nonce pair as observed locally.
-    pub nonces: ZakuraLegacyNonces,
-    /// Whether this side initiated or responded to the legacy TCP connection.
-    pub role: ZakuraControlRole,
-}
-
 /// Handle used by the legacy handshake to enter the Zakura P2P upgrade path.
+///
+/// After a mutually P2P-v2-capable legacy `version`/`verack` exchange, the legacy
+/// handshake swaps a bounded upgrade prelude over the TCP stream to learn the
+/// peer's Zakura node address, then uses this connector to dial it over QUIC.
 #[derive(Clone, Debug, Default)]
 pub struct ZakuraHandshakeConnector {
-    supervisor: Option<ZakuraSupervisorHandle>,
-    trace: ZakuraTrace,
+    /// The live Zakura endpoint, used to read our own dial hints and to dial a
+    /// peer over QUIC once the legacy upgrade prelude exchange reveals its
+    /// Zakura node address.
+    endpoint: Option<ZakuraEndpoint>,
     #[cfg(test)]
     test_outcome: Option<(Arc<AtomicUsize>, ZakuraUpgradeOutcome)>,
 }
 
 impl ZakuraHandshakeConnector {
-    /// Create a placeholder connector for a node that can advertise P2P v2, but does not yet have
-    /// a Zakura supervisor capable of accepting a handoff.
+    /// Create a placeholder connector for a node that can advertise P2P v2, but
+    /// has no live Zakura endpoint, so it cannot complete a handoff.
     pub fn unavailable() -> Self {
         Self {
-            supervisor: None,
-            trace: ZakuraTrace::noop(),
+            endpoint: None,
             #[cfg(test)]
             test_outcome: None,
         }
     }
 
-    /// Create a connector backed by the active Zakura supervisor.
-    pub fn new(supervisor: ZakuraSupervisorHandle) -> Self {
+    /// Create a connector backed by the live Zakura endpoint, so the legacy
+    /// handshake can exchange dial hints and connect to the peer over QUIC.
+    pub(crate) fn new_with_endpoint(endpoint: ZakuraEndpoint) -> Self {
         Self {
-            supervisor: Some(supervisor),
-            trace: ZakuraTrace::noop(),
+            endpoint: Some(endpoint),
             #[cfg(test)]
             test_outcome: None,
         }
     }
 
-    /// Create a connector backed by the active Zakura supervisor and trace emitter.
-    pub(crate) fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
-        Self {
-            supervisor: Some(supervisor),
-            trace,
-            #[cfg(test)]
-            test_outcome: None,
-        }
+    /// Returns our local Zakura dial hints (iroh node id, and direct addresses
+    /// each encoded as a `SocketAddr` string) for the legacy upgrade prelude, or
+    /// `None` if this node has no live Zakura endpoint.
+    pub(crate) async fn local_iroh_hints(&self) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+        let endpoint = self.endpoint.as_ref()?;
+        Some(endpoint.local_upgrade_hints().await)
     }
 
-    /// Resolve the upgrade outcome for the current legacy handshake.
-    pub(crate) async fn upgrade_outcome(
+    /// Dial a peer over Zakura QUIC using the node id and direct-address hints it
+    /// advertised in the legacy upgrade prelude. Returns `false` when there is no
+    /// live endpoint or the hints cannot be parsed into a dial address.
+    pub(crate) fn spawn_zakura_dial_to_hints(
         &self,
-        request: ZakuraUpgradeRequest,
-    ) -> Result<ZakuraUpgradeOutcome, ZakuraUpgradeError> {
-        self.trace.emit(
-            HANDSHAKE_TABLE,
-            ZakuraTraceEvent::new("prelude.accepted")
-                .role(control_role_label(request.role))
-                .phase("legacy_upgrade")
-                .network(request.local_config.network_label()),
-        );
-
-        #[cfg(test)]
-        if let Some((calls, outcome)) = &self.test_outcome {
-            calls.fetch_add(1, Ordering::SeqCst);
-            self.emit_upgrade_outcome(&request, outcome);
-            return Ok(outcome.clone());
-        }
-
-        let Some(supervisor) = &self.supervisor else {
-            self.trace.emit(
-                HANDSHAKE_TABLE,
-                ZakuraTraceEvent::new("rejected")
-                    .role(control_role_label(request.role))
-                    .phase("legacy_upgrade")
-                    .reason(zakura_trace_reject_reason_label(
-                        ZakuraRejectReason::TemporaryUnavailable,
-                    ))
-                    .network(request.local_config.network_label()),
-            );
-            return Err(ZakuraUpgradeError::Unavailable);
+        node_id: &[u8],
+        direct_addresses: &[Vec<u8>],
+    ) -> bool {
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return false;
         };
-
-        let outcome = supervisor
-            .register_legacy_upgrade_placeholder(request.clone())
-            .await;
-        self.emit_upgrade_outcome(&request, &outcome);
-        Ok(outcome)
+        let Some(node_addr) = node_addr_from_hints(node_id, direct_addresses) else {
+            return false;
+        };
+        endpoint.spawn_native_dial(node_addr);
+        true
     }
 
-    fn emit_upgrade_outcome(&self, request: &ZakuraUpgradeRequest, outcome: &ZakuraUpgradeOutcome) {
-        let event = match outcome {
-            ZakuraUpgradeOutcome::Upgraded { .. } => {
-                ZakuraTraceEvent::new("upgraded").selected_protocol(ZAKURA_PROTOCOL_VERSION_1)
-            }
-            ZakuraUpgradeOutcome::Duplicate { .. } => ZakuraTraceEvent::new("duplicate"),
-            ZakuraUpgradeOutcome::Rejected { reason } => {
-                ZakuraTraceEvent::new("rejected").reason(zakura_trace_reject_reason_label(*reason))
-            }
+    /// Keep an upgraded peer's legacy address-book entry live for the lifetime
+    /// of its Zakura connection, so the outbound crawler does not re-dial it.
+    ///
+    /// After a legacy->Zakura upgrade the legacy TCP connection is dropped, so
+    /// nothing else refreshes the peer's `Responded` liveness. Without this, the
+    /// crawler re-dials the peer once its entry ages past
+    /// [`constants::MIN_PEER_RECONNECTION_DELAY`](crate::constants::MIN_PEER_RECONNECTION_DELAY),
+    /// re-running the upgrade and churning the QUIC connection. While the peer
+    /// is registered with the supervisor the keeper marks it `Responded`; once
+    /// it deregisters the keeper stops, so a genuinely gone peer becomes a
+    /// reconnection candidate again.
+    ///
+    /// Only meaningful for outbound connections, where `book_addr` is the
+    /// dialable remote address the crawler would otherwise reconnect to. Does
+    /// nothing without a live endpoint.
+    pub(crate) fn spawn_legacy_liveness_keeper(
+        &self,
+        peer_id: ZakuraPeerId,
+        book_addr: PeerSocketAddr,
+        address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    ) {
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return;
         };
+        let registered = endpoint.supervisor().subscribe();
+        tokio::spawn(run_legacy_liveness_keeper(
+            registered,
+            peer_id,
+            book_addr,
+            address_book_updater,
+            ZAKURA_LIVENESS_APPEAR_TIMEOUT,
+            ZAKURA_LIVENESS_REFRESH_INTERVAL,
+        ));
+    }
 
-        self.trace.emit(
-            HANDSHAKE_TABLE,
-            event
-                .role(control_role_label(request.role))
-                .phase("legacy_upgrade")
-                .network(request.local_config.network_label()),
-        );
+    /// Returns the deterministic upgrade outcome injected for handshake routing
+    /// tests (incrementing the call counter), if one was configured.
+    #[cfg(test)]
+    pub(crate) fn consume_test_outcome(&self) -> Option<ZakuraUpgradeOutcome> {
+        let (calls, outcome) = self.test_outcome.as_ref()?;
+        calls.fetch_add(1, Ordering::SeqCst);
+        Some(outcome.clone())
     }
 
     /// Create a deterministic connector for handshake routing tests.
     #[cfg(test)]
     pub(crate) fn for_test(calls: Arc<AtomicUsize>, outcome: ZakuraUpgradeOutcome) -> Self {
         Self {
-            supervisor: None,
-            trace: ZakuraTrace::noop(),
+            endpoint: None,
             test_outcome: Some((calls, outcome)),
         }
     }
 }
 
-fn control_role_label(role: ZakuraControlRole) -> &'static str {
-    match role {
-        ZakuraControlRole::Initiator => "initiator",
-        ZakuraControlRole::Responder => "responder",
+/// Builds an iroh dial address from the node id and direct-address hints a peer
+/// advertised in a legacy upgrade prelude.
+///
+/// Direct addresses are carried as `SocketAddr` strings (the same encoding used
+/// by configured bootstrap peers), so each entry is parsed back into a
+/// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
+/// parses, since a peer with no reachable address cannot be dialed.
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+    let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
+    let node_id = NodeId::from_bytes(&node_id_bytes).ok()?;
+
+    let direct: Vec<std::net::SocketAddr> = direct_addresses
+        .iter()
+        .filter_map(|address| std::str::from_utf8(address).ok()?.parse().ok())
+        .collect();
+
+    if direct.is_empty() {
+        return None;
     }
+
+    Some(NodeAddr::new(node_id).with_direct_addresses(direct))
+}
+
+/// Refresh an upgraded peer's legacy `Responded` liveness while it stays
+/// registered with the Zakura supervisor.
+///
+/// See [`ZakuraHandshakeConnector::spawn_legacy_liveness_keeper`]. Exits when
+/// the peer never registers within `appear_timeout`, when it deregisters, or
+/// when the address book updater closes (node shutdown).
+async fn run_legacy_liveness_keeper(
+    mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
+    peer_id: ZakuraPeerId,
+    book_addr: PeerSocketAddr,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    appear_timeout: Duration,
+    refresh_interval: Duration,
+) {
+    if !wait_for_zakura_peer(&mut registered, &peer_id, appear_timeout).await {
+        return;
+    }
+
+    loop {
+        // Refresh the peer's `Responded` liveness so the crawler treats it as a
+        // live (Zakura) peer instead of re-dialing it over legacy TCP.
+        if address_book_updater
+            .send(MetaAddr::new_responded(book_addr, None))
+            .await
+            .is_err()
+        {
+            // The address book updater is gone: the node is shutting down.
+            break;
+        }
+
+        // Wait for the next refresh, but wake early if the peer set changes so
+        // we react to deregistration promptly.
+        tokio::select! {
+            changed = registered.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(refresh_interval) => {}
+        }
+
+        if !registered.borrow().iter().any(|id| id == &peer_id) {
+            // The Zakura connection deregistered: stop refreshing so the entry
+            // ages out and the peer can be reconnected over legacy.
+            break;
+        }
+    }
+}
+
+/// Wait until `peer_id` appears in the supervisor's registered set, or
+/// `appear_timeout` elapses. Returns whether the peer is registered.
+async fn wait_for_zakura_peer(
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
+    peer_id: &ZakuraPeerId,
+    appear_timeout: Duration,
+) -> bool {
+    tokio::time::timeout(appear_timeout, async {
+        loop {
+            if registered.borrow().iter().any(|id| id == peer_id) {
+                return true;
+            }
+            if registered.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -268,6 +368,82 @@ mod tests {
                 .zakura_node_secret_key_file_path(&Network::Mainnet)
                 .expect("custom cache path should be enabled"),
             PathBuf::from("/tmp/zebra-cache/network/mainnet.zakura-iroh-secret-key")
+        );
+    }
+
+    fn test_peer_id() -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![7u8; 32]).expect("32-byte node id is within bounds")
+    }
+
+    fn test_book_addr() -> PeerSocketAddr {
+        "127.0.0.1:18233"
+            .parse::<std::net::SocketAddr>()
+            .expect("valid socket addr")
+            .into()
+    }
+
+    /// While the peer stays registered, the keeper repeatedly refreshes its
+    /// `Responded` liveness; once it deregisters, the keeper stops.
+    #[tokio::test]
+    async fn legacy_liveness_keeper_refreshes_until_deregistered() {
+        let peer_id = test_peer_id();
+        let (registered_tx, registered_rx) = watch::channel(vec![peer_id.clone()]);
+        let (updater_tx, mut updater_rx) = tokio::sync::mpsc::channel(16);
+
+        let keeper = tokio::spawn(run_legacy_liveness_keeper(
+            registered_rx,
+            peer_id.clone(),
+            test_book_addr(),
+            updater_tx,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        ));
+
+        // The keeper should keep marking the peer `Responded` while it is registered.
+        for _ in 0..2 {
+            let change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
+                .await
+                .expect("keeper refreshes liveness on a registered peer")
+                .expect("the keeper holds the sender open");
+            assert!(
+                matches!(change, MetaAddrChange::UpdateResponded { addr, .. } if addr == test_book_addr()),
+                "keeper should refresh the upgraded peer's responded liveness, got {change:?}",
+            );
+        }
+
+        // Deregister the peer: the keeper must observe the change and exit.
+        registered_tx.send(Vec::new()).expect("receiver is alive");
+        tokio::time::timeout(Duration::from_secs(2), keeper)
+            .await
+            .expect("keeper exits after the peer deregisters")
+            .expect("keeper task does not panic");
+    }
+
+    /// If the upgraded connection never registers, the keeper gives up without
+    /// marking the peer live, so the crawler can reconnect normally.
+    #[tokio::test]
+    async fn legacy_liveness_keeper_exits_when_peer_never_registers() {
+        let peer_id = test_peer_id();
+        let (_registered_tx, registered_rx) = watch::channel(Vec::new());
+        let (updater_tx, mut updater_rx) = tokio::sync::mpsc::channel(16);
+
+        let keeper = tokio::spawn(run_legacy_liveness_keeper(
+            registered_rx,
+            peer_id,
+            test_book_addr(),
+            updater_tx,
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), keeper)
+            .await
+            .expect("keeper exits after the appear timeout")
+            .expect("keeper task does not panic");
+
+        assert!(
+            updater_rx.try_recv().is_err(),
+            "keeper must not refresh liveness for a peer that never registered",
         );
     }
 }

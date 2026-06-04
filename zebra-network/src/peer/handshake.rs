@@ -15,6 +15,7 @@ use std::{
 use chrono::{TimeZone, Utc};
 use futures::{channel::oneshot, future, pin_mut, FutureExt, SinkExt, StreamExt};
 use indexmap::IndexSet;
+use rand::{rngs::OsRng, RngCore};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -46,7 +47,10 @@ use crate::{
         internal::{Request, Response},
     },
     types::MetaAddr,
-    zakura::{ZakuraControlRole, ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraUpgradeRequest},
+    zakura::{
+        P2pV2Upgrade, P2pV2UpgradeAccept, P2pV2UpgradeInit, P2pV2UpgradeReject,
+        ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, PRELUDE_MAGIC,
+    },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
     BoxError, Config, PeerSocketAddr, VersionMessage,
 };
@@ -910,77 +914,311 @@ where
 }
 
 /// Route a mutually P2P-v2-capable peer into the Zakura handshake path.
-async fn upgrade_to_zakura_handshake(
+///
+/// After the legacy `version`/`verack` exchange, two mutually capable peers swap
+/// a bounded [`P2pV2Upgrade`] prelude over the legacy TCP stream to learn each
+/// other's Zakura (iroh) node address. The TCP initiator then dials the
+/// responder over QUIC; the responder's iroh router accepts that dial and
+/// registers the peer. On success the caller drops the legacy stream and the
+/// peers continue over Zakura. Any neutral problem (no local endpoint, malformed
+/// or rejected prelude) returns [`ZakuraUpgradeOutcome::Rejected`] with
+/// [`ZakuraRejectReason::TemporaryUnavailable`], so the caller keeps the legacy
+/// connection instead.
+async fn upgrade_to_zakura_handshake<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
     connection_info: &ConnectionInfo,
     connected_addr: ConnectedAddr,
     network: &Network,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
-) -> Result<ZakuraUpgradeOutcome, HandshakeError> {
-    let Some(zakura_handshake_connector) = zakura_handshake_connector else {
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) -> Result<ZakuraUpgradeOutcome, HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(connector) = zakura_handshake_connector else {
         metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
         return Err(HandshakeError::ZakuraUpgrade(
             crate::zakura::ZakuraUpgradeError::Unavailable,
         ));
     };
 
-    let role = if connected_addr.is_inbound() {
-        ZakuraControlRole::Responder
-    } else {
-        ZakuraControlRole::Initiator
-    };
-    let request = ZakuraUpgradeRequest {
-        local_config: ZakuraHandshakeConfig::for_network(network),
-        local_version: connection_info.local.clone(),
-        remote_version: connection_info.remote.clone(),
-        nonces: ZakuraLegacyNonces {
-            local_zebra_nonce: connection_info.local.nonce,
-            remote_zebra_nonce: connection_info.remote.nonce,
-        },
-        role,
+    // Handshake routing tests inject a deterministic outcome instead of running
+    // the real prelude exchange over a live Zakura endpoint.
+    #[cfg(test)]
+    if let Some(outcome) = connector.consume_test_outcome() {
+        return Ok(outcome);
+    }
+
+    // Our own iroh dial hints. Without a live Zakura endpoint we cannot upgrade,
+    // so we stay on the legacy connection.
+    let Some((local_node_id, local_direct_addresses)) = connector.local_iroh_hints().await else {
+        return Ok(neutral_upgrade_fallback());
     };
 
-    match zakura_handshake_connector.upgrade_outcome(request).await {
-        Ok(ZakuraUpgradeOutcome::Upgraded { peer_id }) => {
+    let config = ZakuraHandshakeConfig::for_network(network);
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: connection_info.local.nonce,
+        remote_zebra_nonce: connection_info.remote.nonce,
+    };
+
+    // The side that opened the legacy TCP connection initiates the prelude and
+    // dials over QUIC; the accepting side responds and is dialed.
+    let outcome = if connected_addr.is_inbound() {
+        run_responder_upgrade(
+            peer_conn,
+            &config,
+            nonces,
+            local_node_id,
+            local_direct_addresses,
+        )
+        .await?
+    } else {
+        run_initiator_upgrade(
+            peer_conn,
+            &connector,
+            &config,
+            nonces,
+            local_node_id,
+            local_direct_addresses,
+        )
+        .await?
+    };
+
+    match &outcome {
+        ZakuraUpgradeOutcome::Upgraded { peer_id } => {
+            // The success metric `zakura.p2p.handshake.upgraded` is incremented by
+            // the supervisor when the dialed/accepted QUIC connection registers.
             info!(
                 ?connected_addr,
                 ?peer_id,
                 remote_services = ?connection_info.remote.services,
                 "upgraded mutually P2P-v2-capable peer to Zakura",
             );
-            metrics::counter!("zakura.p2p.handshake.upgraded").increment(1);
-
-            Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
         }
-        Ok(ZakuraUpgradeOutcome::Duplicate { peer_id }) => {
+        ZakuraUpgradeOutcome::Duplicate { peer_id } => {
             info!(
                 ?connected_addr,
                 ?peer_id,
-                remote_services = ?connection_info.remote.services,
-                "closing duplicate Zakura peer neutrally",
+                "closing duplicate Zakura peer neutrally"
             );
             metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
-            Ok(ZakuraUpgradeOutcome::Duplicate { peer_id })
         }
-        Ok(ZakuraUpgradeOutcome::Rejected { reason }) => {
-            info!(
+        ZakuraUpgradeOutcome::Rejected { reason } => {
+            debug!(
                 ?connected_addr,
                 ?reason,
-                remote_services = ?connection_info.remote.services,
-                "Zakura upgrade rejected neutrally",
+                "Zakura upgrade not completed; continuing on the legacy connection",
             );
             metrics::counter!(
                 "zakura.p2p.upgrade.prelude.rejected",
                 "reason" => format!("{reason:?}"),
-                "network" => ZakuraHandshakeConfig::for_network(network).network_label(),
+                "network" => config.network_label(),
             )
             .increment(1);
-            Ok(ZakuraUpgradeOutcome::Rejected { reason })
-        }
-        Err(error) => {
-            metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
-            Err(error.into())
         }
     }
+
+    // Keep the upgraded peer's legacy address-book entry live for as long as the
+    // Zakura connection is registered, so the outbound crawler treats it as
+    // connected and does not re-dial it (which would re-run this upgrade and
+    // churn the QUIC connection). Only the outbound side reconnects, and only
+    // when we have a dialable address book entry for the peer.
+    if let ZakuraUpgradeOutcome::Upgraded { peer_id }
+    | ZakuraUpgradeOutcome::Duplicate { peer_id } = &outcome
+    {
+        if !connected_addr.is_inbound() {
+            if let Some(book_addr) = connected_addr.get_address_book_addr() {
+                connector.spawn_legacy_liveness_keeper(
+                    peer_id.clone(),
+                    book_addr,
+                    address_book_updater.clone(),
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// The neutral upgrade fallback outcome: keep the legacy connection.
+fn neutral_upgrade_fallback() -> ZakuraUpgradeOutcome {
+    ZakuraUpgradeOutcome::Rejected {
+        reason: ZakuraRejectReason::TemporaryUnavailable,
+    }
+}
+
+/// The TCP initiator side of the legacy Zakura upgrade prelude exchange.
+///
+/// Sends our [`P2pV2UpgradeInit`], reads the responder's [`P2pV2UpgradeAccept`],
+/// and dials the responder's advertised Zakura node address over QUIC.
+async fn run_initiator_upgrade<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+    connector: &ZakuraHandshakeConnector,
+    config: &ZakuraHandshakeConfig,
+    nonces: ZakuraLegacyNonces,
+    local_node_id: Vec<u8>,
+    local_direct_addresses: Vec<Vec<u8>>,
+) -> Result<ZakuraUpgradeOutcome, HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut upgrade_nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut upgrade_nonce);
+
+    let init = P2pV2UpgradeInit {
+        magic: PRELUDE_MAGIC,
+        prelude_version: config.prelude_version,
+        zakura_protocol_min: config.zakura_protocol_min,
+        zakura_protocol_max: config.zakura_protocol_max,
+        network_id: config.network_id,
+        chain_id: config.chain_id,
+        capabilities: config.supported_capabilities,
+        local_zebra_nonce: nonces.local_zebra_nonce,
+        remote_zebra_nonce: nonces.remote_zebra_nonce,
+        upgrade_nonce,
+        iroh_node_id: local_node_id,
+        iroh_direct_addresses: local_direct_addresses,
+        iroh_relay_hint: None,
+        max_control_frame_bytes: config.max_control_frame_bytes,
+        max_open_streams: config.max_open_streams,
+    };
+
+    let Ok(init_bytes) = P2pV2Upgrade::Init(init.clone()).encode() else {
+        return Ok(neutral_upgrade_fallback());
+    };
+    peer_conn.send(Message::P2pV2Upgrade(init_bytes)).await?;
+
+    let Some(P2pV2Upgrade::Accept(accept)) = read_upgrade_prelude(peer_conn).await? else {
+        // A reject, an unexpected variant, a malformed payload, or a closed
+        // upgrade window: keep the legacy connection.
+        return Ok(neutral_upgrade_fallback());
+    };
+
+    if accept.validate(config, nonces, &init).is_err() {
+        return Ok(neutral_upgrade_fallback());
+    }
+
+    let Ok(peer_id) = ZakuraPeerId::new(accept.iroh_node_id.clone()) else {
+        return Ok(neutral_upgrade_fallback());
+    };
+
+    // Dial the responder's Zakura endpoint over QUIC. The dial and connection
+    // service run in the background; the supervisor registers the peer on
+    // success and increments `zakura.p2p.handshake.upgraded`.
+    if !connector.spawn_zakura_dial_to_hints(&accept.iroh_node_id, &accept.iroh_direct_addresses) {
+        return Ok(neutral_upgrade_fallback());
+    }
+
+    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
+}
+
+/// The TCP responder side of the legacy Zakura upgrade prelude exchange.
+///
+/// Reads the initiator's [`P2pV2UpgradeInit`] and replies with our
+/// [`P2pV2UpgradeAccept`], advertising our Zakura node address so the initiator
+/// can dial us. Our iroh router accepts that inbound dial separately.
+async fn run_responder_upgrade<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+    config: &ZakuraHandshakeConfig,
+    nonces: ZakuraLegacyNonces,
+    local_node_id: Vec<u8>,
+    local_direct_addresses: Vec<Vec<u8>>,
+) -> Result<ZakuraUpgradeOutcome, HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(P2pV2Upgrade::Init(init)) = read_upgrade_prelude(peer_conn).await? else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
+
+    let selected_zakura_protocol = match init.validate(config, nonces) {
+        Ok(selected) => selected,
+        Err(_) => {
+            send_upgrade_reject(peer_conn, config).await?;
+            return Ok(neutral_upgrade_fallback());
+        }
+    };
+
+    let mut responder_upgrade_nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut responder_upgrade_nonce);
+
+    let accept = P2pV2UpgradeAccept {
+        magic: PRELUDE_MAGIC,
+        prelude_version: config.prelude_version,
+        selected_zakura_protocol,
+        network_id: config.network_id,
+        chain_id: config.chain_id,
+        capabilities: config.supported_capabilities,
+        initiator_upgrade_nonce: init.upgrade_nonce,
+        responder_upgrade_nonce,
+        local_zebra_nonce: nonces.local_zebra_nonce,
+        remote_zebra_nonce: nonces.remote_zebra_nonce,
+        iroh_node_id: local_node_id,
+        iroh_direct_addresses: local_direct_addresses,
+        iroh_relay_hint: None,
+        max_control_frame_bytes: config.max_control_frame_bytes,
+        max_open_streams: config.max_open_streams,
+    };
+
+    let Ok(accept_bytes) = P2pV2Upgrade::Accept(accept).encode() else {
+        return Ok(neutral_upgrade_fallback());
+    };
+    peer_conn.send(Message::P2pV2Upgrade(accept_bytes)).await?;
+
+    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
+        return Ok(neutral_upgrade_fallback());
+    };
+
+    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
+}
+
+/// Sends a neutral [`P2pV2UpgradeReject`] so the peer stops waiting for an accept
+/// and falls back to the legacy connection.
+async fn send_upgrade_reject<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+    config: &ZakuraHandshakeConfig,
+) -> Result<(), HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let reject = P2pV2UpgradeReject {
+        magic: PRELUDE_MAGIC,
+        prelude_version: config.prelude_version,
+        reason: ZakuraRejectReason::TemporaryUnavailable,
+    };
+    if let Ok(reject_bytes) = P2pV2Upgrade::Reject(reject).encode() {
+        peer_conn.send(Message::P2pV2Upgrade(reject_bytes)).await?;
+    }
+    Ok(())
+}
+
+/// Reads the next legacy [`P2pV2Upgrade`] prelude from the peer.
+///
+/// Skips a small bounded number of unrelated messages (the overall handshake
+/// timeout also applies), so a peer cannot stall the upgrade by streaming other
+/// messages. Returns `Ok(None)` if the prelude is malformed or no prelude
+/// arrives within the skip bound, so the caller falls back to legacy.
+async fn read_upgrade_prelude<PeerTransport>(
+    peer_conn: &mut Framed<PeerTransport, Codec>,
+) -> Result<Option<P2pV2Upgrade>, HandshakeError>
+where
+    PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Bound on unrelated messages tolerated before the prelude.
+    const MAX_SKIPPED_MESSAGES: usize = 4;
+
+    for _ in 0..MAX_SKIPPED_MESSAGES {
+        let message = peer_conn
+            .next()
+            .await
+            .ok_or(HandshakeError::ConnectionClosed)??;
+        if let Message::P2pV2Upgrade(payload) = message {
+            return Ok(P2pV2Upgrade::decode(&payload).ok());
+        }
+    }
+
+    Ok(None)
 }
 
 /// A handshake request.
@@ -1124,10 +1362,12 @@ where
 
             if should_attempt_zakura_upgrade(&config, &connection_info) {
                 match upgrade_to_zakura_handshake(
+                    &mut peer_conn,
                     &connection_info,
                     connected_addr,
                     &config.network,
                     zakura_handshake_connector,
+                    &address_book_updater,
                 )
                 .await
                 {

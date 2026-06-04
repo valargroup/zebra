@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 
 use super::{InboundRecorder, LocalEndpointFactory};
 use crate::{
-    zakura::{Frame, InboundSink},
+    zakura::{Frame, InboundSink, ZakuraPeerId},
     BoxError,
 };
 
@@ -66,7 +66,11 @@ impl GossipCore {
 
     /// Observe a frame in this node's bounded recorder.
     fn record(&self, frame: &Frame) {
-        let _ = self.recorder.deliver(GOSSIP_STREAM_KIND, frame.clone());
+        let _ = self.recorder.deliver(
+            ZakuraPeerId::new(vec![0; 32]).expect("test peer id is within bounds"),
+            GOSSIP_STREAM_KIND,
+            frame.clone(),
+        );
     }
 
     /// Forward `frame` to every connection this node holds.

@@ -116,9 +116,18 @@ where
         info!("legacy P2P disabled; not opening Zcash protocol listener");
         (None, config.listen_addr)
     };
-    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint(&config)
-        .await
-        .expect("Zakura endpoint should start when P2P v2 is enabled");
+    // Clone the inbound service for the Zakura legacy-gossip sink before the
+    // handshake builder consumes the original below. The factory only runs when
+    // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
+    let inbound_for_zakura_sink = inbound_service.clone();
+    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint(&config, move |supervisor| {
+        Arc::new(crate::zakura::LegacyGossipSink::spawn(
+            inbound_for_zakura_sink,
+            supervisor,
+        )) as Arc<dyn crate::zakura::InboundSink>
+    })
+    .await
+    .expect("Zakura endpoint should start when P2P v2 is enabled");
 
     let (
         address_book,
@@ -337,6 +346,12 @@ where
         ));
     }
 
+    // Capture the supervisor before the endpoint is moved into the keep-alive
+    // task, so we can back the dual-stack adapters with the same first-seen cache.
+    let zakura_supervisor = zakura_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.supervisor());
+
     if let Some(zakura_endpoint) = zakura_endpoint {
         task_handles.push(tokio::spawn(async move {
             let _zakura_endpoint = zakura_endpoint;
@@ -345,6 +360,19 @@ where
     }
 
     handle_tx.send(task_handles).unwrap();
+
+    // When the Zakura endpoint is active, wrap the legacy peer set so locally
+    // originated gossip and inventory fetches also flow over Zakura. The internal
+    // candidate set and crawler keep using the unwrapped legacy peer set above;
+    // only the service handed to the syncer/mempool/inbound becomes dual-stack.
+    let peer_set = match zakura_supervisor {
+        Some(supervisor) => {
+            let dual_stack =
+                crate::zakura::ZakuraDualStackService::new(peer_set, supervisor, config.legacy_p2p);
+            Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
+        }
+        None => peer_set,
+    };
 
     (peer_set, address_book, misbehavior_tx)
 }

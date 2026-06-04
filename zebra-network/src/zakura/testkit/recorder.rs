@@ -8,14 +8,13 @@ use std::{
     },
 };
 
-use crate::{
-    zakura::{Frame, InboundSink},
-    BoxError,
-};
+use crate::zakura::{Frame, InboundSink, InboundSinkReject, ZakuraPeerId};
 
 /// One frame delivered to an [`InboundRecorder`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedInbound {
+    /// Authenticated peer that sent the frame.
+    pub peer_id: ZakuraPeerId,
     /// Application stream kind.
     pub stream_kind: u16,
     /// Decoded stream frame.
@@ -84,16 +83,25 @@ impl InboundRecorder {
 }
 
 impl InboundSink for InboundRecorder {
-    fn deliver(&self, stream_kind: u16, frame: Frame) -> Result<(), BoxError> {
+    fn deliver(
+        &self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        frame: Frame,
+    ) -> Result<(), InboundSinkReject> {
         let mut messages = self
             .messages
             .lock()
-            .map_err(|_| -> BoxError { "recorder mutex should not be poisoned".into() })?;
+            .map_err(|_| InboundSinkReject::local("recorder mutex should not be poisoned"))?;
         if messages.len() == self.capacity {
             messages.pop_front();
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        messages.push_back(RecordedInbound { stream_kind, frame });
+        messages.push_back(RecordedInbound {
+            peer_id,
+            stream_kind,
+            frame,
+        });
         Ok(())
     }
 }
@@ -109,6 +117,7 @@ mod tests {
         for payload in [1, 2, 3] {
             recorder
                 .deliver(
+                    ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds"),
                     1,
                     Frame {
                         message_type: 0,

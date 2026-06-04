@@ -13,7 +13,7 @@ use std::{
 use super::*;
 use crate::{
     peer_set::ActiveConnectionCounter,
-    zakura::{ZakuraPeerId, ZakuraUpgradeOutcome},
+    zakura::{Frame, InboundSink, InboundSinkReject, ZakuraPeerId, ZakuraUpgradeOutcome},
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
@@ -154,6 +154,125 @@ fn test_handshake_without_zakura_connector(
         .want_transactions(true)
         .finish()
         .unwrap()
+}
+
+fn test_handshake_with_connector(
+    config: Config,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    connector: crate::zakura::ZakuraHandshakeConnector,
+) -> Handshake<MockService<Request, Response, PanicAssertion>> {
+    let inbound_service: MockService<Request, Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+
+    Handshake::builder()
+        .with_config(config)
+        .with_inbound_service(inbound_service)
+        .with_address_book_updater(address_book_updater)
+        .with_advertised_services(PeerServices::NODE_NETWORK)
+        .with_user_agent("/Zebra:handshake-test/".to_string())
+        .with_zakura_handshake_connector(connector)
+        .want_transactions(true)
+        .finish()
+        .unwrap()
+}
+
+/// An inbound sink that drops every delivered frame, used to start a real Zakura
+/// endpoint in tests without wiring an application service.
+#[derive(Debug)]
+struct DropSink;
+
+impl InboundSink for DropSink {
+    fn deliver(
+        &self,
+        _peer_id: ZakuraPeerId,
+        _stream_kind: u16,
+        _frame: Frame,
+    ) -> Result<(), InboundSinkReject> {
+        Ok(())
+    }
+}
+
+/// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.
+async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
+    crate::zakura::spawn_zakura_endpoint(&test_config(true), |_supervisor| {
+        Arc::new(DropSink) as Arc<dyn InboundSink>
+    })
+    .await
+    .expect("Zakura endpoint starts")
+    .expect("v2_p2p is enabled in the test config")
+}
+
+/// Two mutually P2P-v2-capable nodes with live Zakura endpoints should exchange
+/// the legacy upgrade prelude over the TCP stream, drop the legacy connection,
+/// and establish a real Zakura QUIC connection that registers on both ends.
+#[tokio::test]
+async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
+    let _init_guard = zebra_test::init();
+
+    let local_endpoint = start_test_zakura_endpoint().await;
+    let remote_endpoint = start_test_zakura_endpoint().await;
+
+    let (local_stream, remote_stream) = duplex(16 * 1024);
+    let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
+
+    let mut local_counter = ActiveConnectionCounter::new_counter();
+    let mut remote_counter = ActiveConnectionCounter::new_counter();
+
+    let local_handshake = test_handshake_with_connector(
+        test_config(true),
+        address_book_tx.clone(),
+        local_endpoint.connector(),
+    );
+    let remote_handshake = test_handshake_with_connector(
+        test_config(true),
+        address_book_tx,
+        remote_endpoint.connector(),
+    );
+
+    let local_task = tokio::spawn(local_handshake.oneshot(HandshakeRequest {
+        data_stream: local_stream,
+        connected_addr: ConnectedAddr::new_outbound_direct(peer_addr(18233)),
+        connection_tracker: local_counter.track_connection(),
+    }));
+    let remote_task = tokio::spawn(remote_handshake.oneshot(HandshakeRequest {
+        data_stream: remote_stream,
+        connected_addr: ConnectedAddr::new_inbound_direct(peer_addr(28233)),
+        connection_tracker: remote_counter.track_connection(),
+    }));
+
+    let local_error = local_task.await.unwrap().unwrap_err();
+    let remote_error = remote_task.await.unwrap().unwrap_err();
+
+    // A completed upgrade drops the legacy connection on both sides.
+    assert!(local_error
+        .downcast_ref::<HandshakeError>()
+        .is_some_and(|error| matches!(error, HandshakeError::ZakuraUpgradeSelected)));
+    assert!(remote_error
+        .downcast_ref::<HandshakeError>()
+        .is_some_and(|error| matches!(error, HandshakeError::ZakuraUpgradeSelected)));
+
+    // The initiator dialed the responder's advertised Zakura address over QUIC;
+    // both supervisors should register the other peer once it completes.
+    let local_supervisor = local_endpoint.supervisor();
+    let remote_supervisor = remote_endpoint.supervisor();
+    let registered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if !local_supervisor.registered_ids().await.is_empty()
+                && !remote_supervisor.registered_ids().await.is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        registered.is_ok(),
+        "the legacy upgrade should establish a Zakura connection registered on both endpoints",
+    );
+
+    local_endpoint.shutdown().await;
+    remote_endpoint.shutdown().await;
 }
 
 #[tokio::test]

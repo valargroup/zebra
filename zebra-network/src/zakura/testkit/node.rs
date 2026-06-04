@@ -9,7 +9,7 @@ use zebra_jsonl_trace::JsonlTracer;
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
     zakura::{
-        ZakuraEndpoint, ZakuraHandlerError, ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId,
+        InboundSink, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId,
         ZakuraProtocolHandler, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
@@ -22,7 +22,7 @@ pub struct ZakuraTestNode {
     endpoint: ZakuraEndpoint,
     limits: ZakuraLocalLimits,
     recorder: InboundRecorder,
-    dial_tasks: Arc<Mutex<Vec<JoinHandle<Result<(), ZakuraHandlerError>>>>>,
+    dial_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     _tracer: JsonlTracer,
 }
 
@@ -75,9 +75,8 @@ impl ZakuraTestNode {
                     registered
                 }
                 joined = &mut handle => {
-                    let result = joined
+                    joined
                         .map_err(|error| -> BoxError { format!("native Zakura dial task failed: {error}").into() })?;
-                    result?;
                     Err("native Zakura dial task ended before serving the connection".into())
                 }
             }
@@ -139,6 +138,9 @@ pub struct ZakuraTestNodeBuilder {
     transport_config: Option<TransportConfig>,
     legacy_upgrade: bool,
     tracer: JsonlTracer,
+    inbound_sink: Option<Arc<dyn InboundSink>>,
+    inbound_sink_factory:
+        Option<Box<dyn FnOnce(ZakuraSupervisorHandle) -> Arc<dyn InboundSink> + Send>>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -149,6 +151,10 @@ impl fmt::Debug for ZakuraTestNodeBuilder {
             .field("transport_config", &self.transport_config.is_some())
             .field("legacy_upgrade", &self.legacy_upgrade)
             .field("tracer", &self.tracer)
+            .field(
+                "inbound_sink",
+                &(self.inbound_sink.is_some() || self.inbound_sink_factory.is_some()),
+            )
             .finish()
     }
 }
@@ -167,6 +173,8 @@ impl ZakuraTestNodeBuilder {
             transport_config: None,
             legacy_upgrade: false,
             tracer: JsonlTracer::noop(),
+            inbound_sink: None,
+            inbound_sink_factory: None,
         }
     }
 
@@ -196,6 +204,21 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Install a custom inbound sink instead of the default recorder.
+    pub fn inbound_sink(mut self, inbound_sink: Arc<dyn InboundSink>) -> Self {
+        self.inbound_sink = Some(inbound_sink);
+        self
+    }
+
+    /// Install a custom inbound sink that needs this node's supervisor.
+    pub fn inbound_sink_from_supervisor(
+        mut self,
+        factory: impl FnOnce(ZakuraSupervisorHandle) -> Arc<dyn InboundSink> + Send + 'static,
+    ) -> Self {
+        self.inbound_sink_factory = Some(Box::new(factory));
+        self
+    }
+
     /// Spawn the node.
     pub async fn spawn(self) -> Result<ZakuraTestNode, BoxError> {
         if self.legacy_upgrade {
@@ -213,11 +236,17 @@ impl ZakuraTestNodeBuilder {
             .await?;
         let supervisor = ZakuraSupervisorHandle::new(self.limits.max_connections);
         let recorder = InboundRecorder::new(usize::from(self.limits.max_inbound_queue_depth));
+        let inbound_sink = if let Some(factory) = self.inbound_sink_factory {
+            factory(supervisor.clone())
+        } else {
+            self.inbound_sink
+                .unwrap_or_else(|| Arc::new(recorder.clone()))
+        };
         let handler = ZakuraProtocolHandler::new_with_sink_and_trace(
             supervisor.clone(),
             ZakuraHandshakeConfig::for_network(&Config::default().network),
             self.limits.clone(),
-            Arc::new(recorder.clone()),
+            inbound_sink,
             ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
         );
         let router = Router::builder(endpoint)

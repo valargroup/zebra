@@ -88,6 +88,10 @@ pub(crate) const FRAME_HEADER_BYTES: usize = 2 + 2 + 4;
 
 /// A bounded authenticated Zakura peer identity.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(
+    any(test, feature = "proptest-impl"),
+    derive(proptest_derive::Arbitrary)
+)]
 pub struct ZakuraPeerId(Vec<u8>);
 
 impl ZakuraPeerId {
