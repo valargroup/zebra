@@ -325,6 +325,7 @@ impl Default for Config {
 struct CheckedTip {
     tip: block::Hash,
     expected_next: block::Hash,
+    expected_next_height: Option<Height>,
 }
 
 /// Block hashes waiting to be queued, with any peers that reported those hashes.
@@ -332,14 +333,20 @@ struct CheckedTip {
 struct PendingBlockHashes {
     hashes: IndexSet<block::Hash>,
     sources: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+    heights: HashMap<block::Hash, Height>,
 }
 
 impl PendingBlockHashes {
-    fn with_sources(
+    fn with_sources_and_heights(
         hashes: IndexSet<block::Hash>,
         sources: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+        heights: HashMap<block::Hash, Height>,
     ) -> Self {
-        Self { hashes, sources }
+        Self {
+            hashes,
+            sources,
+            heights,
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -350,19 +357,56 @@ impl PendingBlockHashes {
         self.hashes.len()
     }
 
-    fn insert(&mut self, hash: block::Hash, sources: HashSet<PeerSocketAddr>) {
+    fn insert(
+        &mut self,
+        hash: block::Hash,
+        sources: HashSet<PeerSocketAddr>,
+        height: Option<Height>,
+    ) {
         self.hashes.insert(hash);
 
         if !sources.is_empty() {
             self.sources.entry(hash).or_default().extend(sources);
+        }
+
+        if let Some(height) = height {
+            self.heights
+                .entry(hash)
+                .and_modify(|known_height| *known_height = (*known_height).min(height))
+                .or_insert(height);
         }
     }
 
     fn merge(&mut self, mut other: PendingBlockHashes) {
         for hash in other.hashes {
             let sources = other.sources.remove(&hash).unwrap_or_default();
-            self.insert(hash, sources);
+            let height = other.heights.remove(&hash);
+            self.insert(hash, sources, height);
         }
+    }
+}
+
+fn height_at(first_height: Option<Height>, index: usize) -> Option<Height> {
+    let first_height = first_height?;
+    let offset: HeightDiff = index.try_into().ok()?;
+
+    first_height + offset
+}
+
+fn record_hash_heights(
+    heights: &mut HashMap<block::Hash, Height>,
+    hashes: &[block::Hash],
+    first_height: Option<Height>,
+) {
+    for (index, hash) in hashes.iter().enumerate() {
+        let Some(height) = height_at(first_height, index) else {
+            break;
+        };
+
+        heights
+            .entry(*hash)
+            .and_modify(|known_height| *known_height = (*known_height).min(height))
+            .or_insert(height);
     }
 }
 
@@ -444,6 +488,9 @@ where
 
     /// Source peers for each currently queued block hash.
     block_source_peers: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+
+    /// Minimum fallback peer heights for each currently queued block hash.
+    block_min_peer_heights: HashMap<block::Hash, Height>,
 
     /// Source-routed block hashes that should be queued again after source peers become ready.
     deferred_block_hashes: PendingBlockHashes,
@@ -640,6 +687,7 @@ where
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
             block_source_peers: HashMap::new(),
+            block_min_peer_heights: HashMap::new(),
             deferred_block_hashes: PendingBlockHashes::default(),
             refresh_source_inventory: false,
             past_lookahead_limit_receiver,
@@ -694,6 +742,7 @@ where
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.block_source_peers.clear();
+        self.block_min_peer_heights.clear();
         self.deferred_block_hashes = PendingBlockHashes::default();
         self.refresh_source_inventory = false;
 
@@ -860,6 +909,7 @@ where
 
         let mut download_set = IndexSet::new();
         let mut download_sources: HashMap<block::Hash, HashSet<PeerSocketAddr>> = HashMap::new();
+        let mut download_heights: HashMap<block::Hash, Height> = HashMap::new();
         while let Some(res) = requests.next().await {
             let response = res
                 .unwrap_or_else(|e @ JoinError { .. }| {
@@ -947,11 +997,16 @@ where
                         };
 
                         trace!(?unknown_hashes);
+                        let first_unknown_height = self.fallback_min_peer_height();
 
                         let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
                             CheckedTip {
                                 tip: end[0],
                                 expected_next: end[1],
+                                expected_next_height: height_at(
+                                    first_unknown_height,
+                                    unknown_hashes.len().saturating_sub(1),
+                                ),
                             }
                         } else {
                             debug!("discarding response that extends only one block");
@@ -972,6 +1027,11 @@ where
                                 download_sources.entry(*hash).or_default().insert(peer);
                             }
                         }
+                        record_hash_heights(
+                            &mut download_heights,
+                            unknown_hashes,
+                            first_unknown_height,
+                        );
 
                         // Make sure we get the same tips, regardless of the
                         // order of peer responses
@@ -1034,9 +1094,10 @@ where
         self.recent_syncs.push_obtain_tips_length(new_downloads);
 
         let response = self
-            .request_blocks_from_peers(PendingBlockHashes::with_sources(
+            .request_blocks_from_peers(PendingBlockHashes::with_sources_and_heights(
                 download_set,
                 download_sources,
+                download_heights,
             ))
             .await;
 
@@ -1054,6 +1115,7 @@ where
 
         let mut download_set = IndexSet::new();
         let mut download_sources: HashMap<block::Hash, HashSet<PeerSocketAddr>> = HashMap::new();
+        let mut download_heights: HashMap<block::Hash, Height> = HashMap::new();
         debug!(tips = ?tips.len(), "trying to extend chain tips");
         for tip in tips {
             debug!(?tip, "asking peers to extend chain tip");
@@ -1155,12 +1217,19 @@ where
                                 }
                                 [rest @ .., _last] => rest,
                             };
+                            let first_unknown_height = tip
+                                .expected_next_height
+                                .and_then(|height| height.next().ok());
 
                             let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next()
                             {
                                 CheckedTip {
                                     tip: end[0],
                                     expected_next: end[1],
+                                    expected_next_height: height_at(
+                                        first_unknown_height,
+                                        unknown_hashes.len().saturating_sub(1),
+                                    ),
                                 }
                             } else {
                                 debug!("discarding response that extends only one block");
@@ -1183,6 +1252,11 @@ where
                                     download_sources.entry(*hash).or_default().insert(peer);
                                 }
                             }
+                            record_hash_heights(
+                                &mut download_heights,
+                                unknown_hashes,
+                                first_unknown_height,
+                            );
 
                             // Make sure we get the same tips, regardless of the
                             // order of peer responses
@@ -1236,9 +1310,10 @@ where
         self.recent_syncs.push_extend_tips_length(new_downloads);
 
         let response = self
-            .request_blocks_from_peers(PendingBlockHashes::with_sources(
+            .request_blocks_from_peers(PendingBlockHashes::with_sources_and_heights(
                 download_set,
                 download_sources,
+                download_heights,
             ))
             .await;
 
@@ -1315,10 +1390,12 @@ where
         mut pending_hashes: PendingBlockHashes,
     ) -> Result<PendingBlockHashes, BlockDownloadVerifyError> {
         let lookahead_limit = self.lookahead_limit(pending_hashes.hashes.len());
+        let fallback_min_peer_height = self.fallback_min_peer_height();
 
         debug!(
             hashes.len = pending_hashes.hashes.len(),
             ?lookahead_limit,
+            ?fallback_min_peer_height,
             "requesting blocks",
         );
 
@@ -1328,9 +1405,13 @@ where
             IndexSet::new()
         };
         let mut extra_sources = HashMap::new();
+        let mut extra_heights = HashMap::new();
         for hash in extra_hashes.iter() {
             if let Some(sources) = pending_hashes.sources.remove(hash) {
                 extra_sources.insert(*hash, sources);
+            }
+            if let Some(height) = pending_hashes.heights.remove(hash) {
+                extra_heights.insert(*hash, height);
             }
         }
 
@@ -1360,9 +1441,25 @@ where
                 .unwrap_or_default();
 
             if preferred_peers.is_empty() {
+                let min_peer_height = pending_hashes
+                    .heights
+                    .get(&hash)
+                    .copied()
+                    .or_else(|| height_at(fallback_min_peer_height, index));
+
                 self.block_source_peers.remove(&hash);
+                if let Some(height) = min_peer_height {
+                    self.block_min_peer_heights.insert(hash, height);
+                } else {
+                    self.block_min_peer_heights.remove(&hash);
+                }
+
                 self.downloads
-                    .download_and_verify_from_peers(hash, HashSet::new())
+                    .download_and_verify_from_peers_at_or_above(
+                        hash,
+                        HashSet::new(),
+                        min_peer_height,
+                    )
                     .await?;
 
                 index += 1;
@@ -1401,6 +1498,9 @@ where
                 if let Some(sources) = pending_hashes.sources.get(batch_hash).cloned() {
                     self.block_source_peers.insert(*batch_hash, sources);
                 }
+                if let Some(height) = pending_hashes.heights.get(batch_hash).copied() {
+                    self.block_min_peer_heights.insert(*batch_hash, height);
+                }
             }
 
             self.downloads
@@ -1410,10 +1510,17 @@ where
             index = next_index;
         }
 
-        Ok(PendingBlockHashes::with_sources(
+        Ok(PendingBlockHashes::with_sources_and_heights(
             extra_hashes,
             extra_sources,
+            extra_heights,
         ))
+    }
+
+    fn fallback_min_peer_height(&self) -> Option<Height> {
+        self.latest_chain_tip
+            .best_tip_height()
+            .and_then(|height| height.next().ok())
     }
 
     /// Cancel queued downloads and immediately obtain fresh source peers from the current state tip.
@@ -1429,6 +1536,7 @@ where
         self.prospective_tips.clear();
         self.missing_block_retry_counts.clear();
         self.block_source_peers.clear();
+        self.block_min_peer_heights.clear();
         self.deferred_block_hashes = PendingBlockHashes::default();
 
         self.obtain_tips().await
@@ -1523,6 +1631,7 @@ where
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
             self.block_source_peers.remove(hash);
+            self.block_min_peer_heights.remove(hash);
         }
 
         if let Some(hash) = response
@@ -1543,7 +1652,8 @@ where
                 "source peers busy, deferring block download"
             );
             metrics::counter!("sync.source.peer.busy.deferred.count").increment(1);
-            self.deferred_block_hashes.insert(hash, sources);
+            let min_height = self.block_min_peer_heights.get(&hash).copied();
+            self.deferred_block_hashes.insert(hash, sources, min_height);
 
             return Ok(());
         }
@@ -1561,6 +1671,22 @@ where
                 source_peer_count, "source peers unavailable, refreshing source inventory"
             );
             metrics::counter!("sync.source.peer.unavailable.refresh.count").increment(1);
+            self.refresh_source_inventory = true;
+
+            return Ok(());
+        }
+
+        if let Some(hash) = response
+            .as_ref()
+            .err()
+            .and_then(BlockDownloadVerifyError::peers_below_min_height_download_hash)
+        {
+            info!(
+                ?hash,
+                min_peer_height = ?self.fallback_min_peer_height(),
+                "fallback peers are below requested block height, refreshing source inventory"
+            );
+            metrics::counter!("sync.fallback.peer.height.refresh.count").increment(1);
             self.refresh_source_inventory = true;
 
             return Ok(());
@@ -1590,9 +1716,23 @@ where
                 );
                 metrics::counter!("sync.missing.block.requeued.count").increment(1);
 
+                let min_peer_height = preferred_peers
+                    .is_empty()
+                    .then(|| {
+                        self.block_min_peer_heights
+                            .get(&hash)
+                            .copied()
+                            .or_else(|| self.fallback_min_peer_height())
+                    })
+                    .flatten();
+
                 match self
                     .downloads
-                    .download_and_verify_from_peers(hash, preferred_peers)
+                    .download_and_verify_from_peers_at_or_above(
+                        hash,
+                        preferred_peers,
+                        min_peer_height,
+                    )
                     .await
                 {
                     Ok(()) => return Ok(()),
@@ -1604,6 +1744,7 @@ where
             } else {
                 self.missing_block_retry_counts.remove(&hash);
                 self.block_source_peers.remove(&hash);
+                self.block_min_peer_heights.remove(&hash);
 
                 warn!(
                     ?hash,

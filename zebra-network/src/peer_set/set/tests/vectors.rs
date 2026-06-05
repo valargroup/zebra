@@ -2,20 +2,22 @@
 
 use std::{cmp::max, collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
 
+use futures::{stream, StreamExt};
 use tokio::time::timeout;
-use tower::{Service, ServiceExt};
+use tower::{discover::Change, BoxError, Service, ServiceExt};
 
 use zebra_chain::{
     block,
     parameters::{Network, NetworkUpgrade},
+    serialization::ZcashDeserializeInto,
 };
 
 use crate::{
     constants::DEFAULT_MAX_CONNS_PER_IP,
-    peer::{ClientRequest, MinimumPeerVersion},
+    peer::{ClientRequest, ClientTestHarness, MinimumPeerVersion},
     peer_set::inventory_registry::InventoryStatus,
     protocol::external::{types::Version, InventoryHash},
-    PeerSocketAddr, Request, Response, SharedPeerError,
+    InventoryResponse, PeerSocketAddr, Request, Response, SharedPeerError,
 };
 use indexmap::IndexMap;
 use tokio::sync::watch;
@@ -806,6 +808,229 @@ fn peer_set_route_inv_missing_registry_order(missing_first: bool) {
     });
 }
 
+/// Check that height-aware fallback routing skips peers below the requested height.
+#[test]
+fn peer_set_route_inv_fallback_skips_peers_below_min_height() {
+    let test_hash = block::Hash([8; 32]);
+    let test_inv = InventoryHash::Block(test_hash);
+    let stale_peer: PeerSocketAddr = "127.0.0.1:1"
+        .parse()
+        .expect("unexpected invalid peer address");
+    let eligible_peer: PeerSocketAddr = "127.0.0.1:2"
+        .parse()
+        .expect("unexpected invalid peer address");
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let (stale_client, mut stale_handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_start_height(block::Height(100))
+        .finish();
+    let (eligible_client, mut eligible_handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_start_height(block::Height(200))
+        .finish();
+    let discovered_peers = stream::iter([
+        Ok::<_, BoxError>(Change::Insert(stale_peer, stale_client.into())),
+        Ok::<_, BoxError>(Change::Insert(eligible_peer, eligible_client.into())),
+    ])
+    .chain(stream::pending());
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        peer_set_guard
+            .inventory_sender()
+            .as_mut()
+            .expect("unexpected missing inv sender")
+            .send(InventoryStatus::new_available(test_inv, stale_peer))
+            .expect("unexpected dropped receiver");
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        assert_eq!(peer_ready.ready_services.len(), 2);
+
+        let sent_request = Request::BlocksByHashFromPeers {
+            hashes: iter::once(test_hash).collect(),
+            preferred_peers: HashSet::new(),
+            min_peer_height: Some(block::Height(150)),
+        };
+        let _fut = peer_ready.call(sent_request.clone());
+
+        assert!(
+            stale_handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "height-aware request routed to stale peer"
+        );
+
+        if let Some(ClientRequest { request, .. }) = eligible_handle
+            .try_to_receive_outbound_client_request()
+            .request()
+        {
+            assert_eq!(sent_request, request);
+        } else {
+            panic!("height-aware request was not routed to eligible peer");
+        }
+    });
+}
+
+/// Check that fallback routing uses the latest block height observed from a peer.
+#[test]
+fn peer_set_route_inv_fallback_uses_observed_peer_height() {
+    let block1: Arc<block::Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let block1_hash = block1.hash();
+    let later_hash = block::Hash([10; 32]);
+    let peer: PeerSocketAddr = "127.0.0.1:1"
+        .parse()
+        .expect("unexpected invalid peer address");
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let (client, mut handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_start_height(block::Height(0))
+        .finish();
+    let discovered_peers = stream::iter([Ok::<_, BoxError>(Change::Insert(peer, client.into()))])
+        .chain(stream::pending());
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        assert_eq!(peer_ready.ready_services.len(), 1);
+
+        let first_request = Request::BlocksByHash(iter::once(block1_hash).collect());
+        let response_fut = peer_ready.call(first_request.clone());
+        let ClientRequest { request, tx, .. } = handle
+            .try_to_receive_outbound_client_request()
+            .request()
+            .expect("block request should route to the only peer");
+        assert_eq!(first_request, request);
+        tx.send(Ok(Response::Blocks(vec![InventoryResponse::Available((
+            block1.clone(),
+            None,
+        ))])))
+        .expect("peer set should still be awaiting the block response");
+        response_fut
+            .await
+            .expect("block response from peer should succeed");
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        let height_aware_request = Request::BlocksByHashFromPeers {
+            hashes: iter::once(later_hash).collect(),
+            preferred_peers: HashSet::new(),
+            min_peer_height: Some(block::Height(1)),
+        };
+        let _fut = peer_ready.call(height_aware_request.clone());
+
+        if let Some(ClientRequest { request, .. }) =
+            handle.try_to_receive_outbound_client_request().request()
+        {
+            assert_eq!(height_aware_request, request);
+        } else {
+            panic!("height-aware request should use the observed peer height");
+        }
+    });
+}
+
+/// Check that stale height events from old request futures are ignored.
+#[test]
+fn peer_set_ignores_stale_peer_height_events() {
+    let test_hash = block::Hash([11; 32]);
+    let peer: PeerSocketAddr = "127.0.0.1:1"
+        .parse()
+        .expect("unexpected invalid peer address");
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let (client, mut handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_start_height(block::Height(0))
+        .finish();
+    let discovered_peers = stream::iter([Ok::<_, BoxError>(Change::Insert(peer, client.into()))])
+        .chain(stream::pending());
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .build();
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        assert_eq!(
+            peer_ready.observed_peer_heights.get(&peer),
+            Some(&block::Height(0))
+        );
+
+        peer_ready
+            .peer_height_event_tx
+            .send((peer, block::Height(1), Arc::new(())))
+            .expect("peer set height event receiver should be active");
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+        assert_eq!(
+            peer_ready.observed_peer_heights.get(&peer),
+            Some(&block::Height(0)),
+            "stale height event should not update observed height"
+        );
+
+        let height_aware_request = Request::BlocksByHashFromPeers {
+            hashes: iter::once(test_hash).collect(),
+            preferred_peers: HashSet::new(),
+            min_peer_height: Some(block::Height(1)),
+        };
+        let response = peer_ready.call(height_aware_request).await;
+        assert!(
+            response.is_err(),
+            "stale height event should not make the peer eligible"
+        );
+        assert!(
+            handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "height-aware request routed using a stale height event"
+        );
+    });
+}
+
 /// Check that a peer set fails inventory requests if all peers are missing that inventory.
 #[test]
 fn peer_set_route_inv_all_missing_fail() {
@@ -925,6 +1150,7 @@ fn peer_set_route_source_unavailable_fail_without_fallback(batch: bool) {
     let sent_request = Request::BlocksByHashFromPeers {
         hashes,
         preferred_peers,
+        min_peer_height: None,
     };
 
     // Use two ready peers which are not the requested source peer.
@@ -1002,6 +1228,7 @@ fn peer_set_route_source_single_busy_ignores_advertised_non_source() {
     let sent_request = Request::BlocksByHashFromPeers {
         hashes: iter::once(test_hash).collect(),
         preferred_peers: iter::once(source_peer).collect(),
+        min_peer_height: None,
     };
 
     let non_source_available = InventoryStatus::new_available(test_inv, advertised_peer);
@@ -1100,6 +1327,7 @@ fn peer_set_route_source_single_mixed_missing_disconnected_is_unavailable() {
     let sent_request = Request::BlocksByHashFromPeers {
         hashes: iter::once(test_hash).collect(),
         preferred_peers: [missing_source, disconnected_source].into_iter().collect(),
+        min_peer_height: None,
     };
 
     let source_missing = InventoryStatus::new_missing(test_inv, missing_source);
@@ -1199,6 +1427,7 @@ fn peer_set_route_source_batch_empty_sources_fail_without_fallback() {
     let sent_request = Request::BlocksByHashFromPeers {
         hashes: [block1_hash, block2_hash].into_iter().collect(),
         preferred_peers: HashSet::new(),
+        min_peer_height: None,
     };
 
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
@@ -1287,6 +1516,7 @@ fn peer_set_route_source_busy_fail_without_fallback(batch: bool) {
     let sent_request = Request::BlocksByHashFromPeers {
         hashes,
         preferred_peers: iter::once(source_peer).collect(),
+        min_peer_height: None,
     };
 
     let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);

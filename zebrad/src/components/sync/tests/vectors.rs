@@ -2,7 +2,12 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{collections::HashMap, iter, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    iter,
+    sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::Report;
 use futures::{Future, FutureExt};
@@ -166,6 +171,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .expect_request(zn::Request::BlocksByHashFromPeers {
             hashes: [block1_hash, block2_hash].into_iter().collect(),
             preferred_peers: iter::once(source_peer).collect(),
+            min_peer_height: None,
         })
         .await
         .respond(zn::Response::Blocks(vec![
@@ -1201,6 +1207,7 @@ async fn not_found_download_retries_missing_block_from_sources() -> Result<(), c
         .expect_request(zn::Request::BlocksByHashFromPeers {
             hashes: iter::once(block1_hash).collect(),
             preferred_peers: iter::once(source_peer).collect(),
+            min_peer_height: None,
         })
         .await
         .respond(Err(not_found_block_error(block1_hash)));
@@ -1253,6 +1260,81 @@ async fn no_ready_source_peers_refreshes_sources_without_retrying() {
             .missing_block_retry_counts
             .contains_key(&block_hash),
         "unavailable source peers should not consume missing-block retries"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Tests that unsourced block downloads use the pending hash height for
+/// fallback peer selection.
+#[tokio::test]
+async fn unsourced_block_download_uses_pending_min_peer_height() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAE; 32]);
+    let min_peer_height = Height(42);
+    let mut pending_hashes = sync::PendingBlockHashes::default();
+    pending_hashes.insert(block_hash, HashSet::new(), Some(min_peer_height));
+
+    let queue_download =
+        tokio::spawn(async move { chain_sync.request_blocks_from_peers(pending_hashes).await });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHashFromPeers {
+            hashes: iter::once(block_hash).collect(),
+            preferred_peers: HashSet::new(),
+            min_peer_height: Some(min_peer_height),
+        })
+        .await
+        .respond(Err(no_ready_peers_error()));
+
+    let extra_hashes = queue_download
+        .await
+        .expect("queue task should not panic")
+        .expect("unsourced block download should be queued");
+    assert!(extra_hashes.is_empty());
+}
+
+/// Tests that fallback peers below the requested height trigger a source
+/// refresh instead of a missing-block retry or sync restart.
+#[tokio::test]
+async fn peers_below_min_height_refreshes_sources_without_retrying() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAD; 32]);
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: peers_below_min_height_error(Height(42), 3),
+        hash: block_hash,
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("fallback peers below the requested height should request source refresh");
+
+    assert!(
+        chain_sync.refresh_source_inventory,
+        "fallback peers below the requested height should request source refresh"
+    );
+    assert!(
+        !chain_sync
+            .missing_block_retry_counts
+            .contains_key(&block_hash),
+        "fallback peers below the requested height should not consume missing-block retries"
     );
 
     peer_set.expect_no_requests().await;
@@ -1471,6 +1553,14 @@ fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
 
 fn no_ready_peers_error() -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NoReadyPeers).into()
+}
+
+fn peers_below_min_height_error(min_height: Height, peer_count: usize) -> crate::BoxError {
+    zn::SharedPeerError::from(zn::PeerError::PeersBelowMinHeight {
+        min_height,
+        peer_count,
+    })
+    .into()
 }
 
 fn preferred_peers_busy_error() -> crate::BoxError {

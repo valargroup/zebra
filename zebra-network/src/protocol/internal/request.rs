@@ -85,8 +85,16 @@ pub enum Request {
         /// Block hashes to request.
         hashes: HashSet<block::Hash>,
         /// Source peers to try without falling back to normal inventory-aware
-        /// routing.
+        /// routing. If this set is non-empty and no preferred peer is ready,
+        /// the request fails with [`PeerError::NoReadyPeers`][crate::PeerError::NoReadyPeers]
+        /// or [`PeerError::PreferredPeersBusy`][crate::PeerError::PreferredPeersBusy].
         preferred_peers: HashSet<PeerSocketAddr>,
+        /// Minimum peer chain height for fallback routing.
+        ///
+        /// This is only used for single-block fallback requests with an empty
+        /// `preferred_peers` set, when the peer set chooses advertised or maybe
+        /// peers that might have the block.
+        min_peer_height: Option<block::Height>,
     },
 
     /// Request transactions by their unmined transaction ID.
@@ -264,11 +272,13 @@ impl fmt::Display for Request {
             Request::BlocksByHashFromPeers {
                 hashes,
                 preferred_peers,
+                min_peer_height,
             } => {
                 format!(
-                    "BlocksByHashFromPeers({}, peers: {})",
+                    "BlocksByHashFromPeers({}, peers: {}, min height: {:?})",
                     hashes.len(),
-                    preferred_peers.len()
+                    preferred_peers.len(),
+                    min_peer_height
                 )
             }
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),

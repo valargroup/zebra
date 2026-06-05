@@ -214,6 +214,20 @@ impl BlockDownloadVerifyError {
             _ => None,
         }
     }
+
+    /// Returns the block hash for download failures caused by peers below the requested height.
+    pub(super) fn peers_below_min_height_download_hash(&self) -> Option<block::Hash> {
+        match self {
+            BlockDownloadVerifyError::DownloadFailed { error, hash }
+                if error
+                    .downcast_ref::<zn::SharedPeerError>()
+                    .is_some_and(shared_peer_error_is_peers_below_min_height) =>
+            {
+                Some(*hash)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn shared_peer_error_is_not_found(error: &zn::SharedPeerError) -> bool {
@@ -230,6 +244,10 @@ fn shared_peer_error_is_preferred_peers_busy(error: &zn::SharedPeerError) -> boo
     error.inner_debug().contains("PreferredPeersBusy")
 }
 
+fn shared_peer_error_is_peers_below_min_height(error: &zn::SharedPeerError) -> bool {
+    error.inner_debug().contains("PeersBelowMinHeight")
+}
+
 fn classify_download_error(error: &BoxError) -> &'static str {
     if let Some(error) = error.downcast_ref::<zn::SharedPeerError>() {
         let inner = error.inner_debug();
@@ -242,6 +260,8 @@ fn classify_download_error(error: &BoxError) -> &'static str {
             "no_ready_peers"
         } else if inner.contains("PreferredPeersBusy") {
             "preferred_peers_busy"
+        } else if inner.contains("PeersBelowMinHeight") {
+            "peers_below_min_height"
         } else if inner.contains("Timeout") {
             "timeout"
         } else {
@@ -688,6 +708,19 @@ where
         hash: block::Hash,
         preferred_peers: HashSet<PeerSocketAddr>,
     ) -> Result<(), BlockDownloadVerifyError> {
+        self.download_and_verify_from_peers_at_or_above(hash, preferred_peers, None)
+            .await
+    }
+
+    /// Queue a block for download and verification, preferring known source
+    /// peers and requiring fallback peers to be at least `min_peer_height`.
+    #[instrument(level = "debug", skip(self, preferred_peers), fields(%hash, preferred_peers = preferred_peers.len(), ?min_peer_height))]
+    pub async fn download_and_verify_from_peers_at_or_above(
+        &mut self,
+        hash: block::Hash,
+        preferred_peers: HashSet<PeerSocketAddr>,
+        min_peer_height: Option<Height>,
+    ) -> Result<(), BlockDownloadVerifyError> {
         if self.cancel_handles.contains_key(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
@@ -695,12 +728,13 @@ where
 
         let preferred_peer_count = preferred_peers.len();
         let hashes = std::iter::once(hash).collect();
-        let request = if preferred_peers.is_empty() {
+        let request = if preferred_peers.is_empty() && min_peer_height.is_none() {
             zn::Request::BlocksByHash(hashes)
         } else {
             zn::Request::BlocksByHashFromPeers {
                 hashes,
                 preferred_peers,
+                min_peer_height,
             }
         };
 
@@ -856,6 +890,7 @@ where
             zn::Request::BlocksByHashFromPeers {
                 hashes: request_hashes.clone(),
                 preferred_peers,
+                min_peer_height: None,
             }
         };
 

@@ -14,11 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Response::BlockHashesBySource`.
 - Added `PeerError::PreferredPeersBusy` for source-routed requests whose
   preferred peers are connected but not currently ready.
+- Added a `min_peer_height` field to `Request::BlocksByHashFromPeers` and
+  `PeerError::PeersBelowMinHeight` for height-aware fallback routing.
 
 ### Breaking Changes
 
 - Public `Request`, `Response`, and `PeerError` enum matches must handle the new
-  source-aware block sync variants above.
+  source-aware block sync variants and height-aware routing fields above.
 
 ## [8.0.0] - 2026-06-02
 

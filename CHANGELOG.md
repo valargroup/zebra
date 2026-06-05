@@ -23,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Breaking Changes
 
 - `zebra-network` library consumers must handle the new source-aware block sync
-  `Request`, `Response`, and `PeerError` enum variants.
+  `Request`, `Response`, and `PeerError` enum variants, the
+  `BlocksByHashFromPeers::min_peer_height` field, and
+  `PeerError::PeersBelowMinHeight`.
 
 ### Fixed
 
@@ -36,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   stalls when a peer reports `notfound` for a required block hash.
 - Batch source-routed sync block downloads and refresh source inventory when
   source peers are unavailable, avoiding restart-prone stale inventory requests.
+- Avoid fallback block requests to peers whose observed chain height is below
+  the requested sync range.
 
 ## [Zebra 5.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v5.0.0) - 2026-06-02
 

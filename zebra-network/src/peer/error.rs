@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc};
 use thiserror::Error;
 
 use tracing_error::TracedError;
-use zebra_chain::serialization::SerializationError;
+use zebra_chain::{block, serialization::SerializationError};
 
 use crate::protocol::external::InventoryHash;
 
@@ -90,6 +90,15 @@ pub enum PeerError {
     #[error("Preferred peers are connected but busy")]
     PreferredPeersBusy,
 
+    /// Ready peers exist, but their reported chain tip is below the requested height.
+    #[error("Ready peers are below requested block height {min_height:?}: {peer_count}")]
+    PeersBelowMinHeight {
+        /// The minimum height needed to request this block.
+        min_height: block::Height,
+        /// The number of otherwise eligible ready peers below `min_height`.
+        peer_count: usize,
+    },
+
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
     #[error("Internal services timed out")]
@@ -157,6 +166,7 @@ impl PeerError {
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
             PeerError::PreferredPeersBusy => "PreferredPeersBusy".into(),
+            PeerError::PeersBelowMinHeight { .. } => "PeersBelowMinHeight".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),
