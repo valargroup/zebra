@@ -125,7 +125,7 @@ use tower::{
     Service,
 };
 
-use zebra_chain::{chain_tip::ChainTip, parameters::Network};
+use zebra_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     address_book::AddressMetrics,
@@ -138,7 +138,7 @@ use crate::{
     },
     protocol::{
         external::InventoryHash,
-        internal::{Request, Response},
+        internal::{InventoryResponse, Request, Response},
     },
     BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
 };
@@ -183,6 +183,20 @@ fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcom
     }
 }
 
+fn max_block_height(response: &Response) -> Option<block::Height> {
+    let Response::Blocks(blocks) = response else {
+        return None;
+    };
+
+    blocks
+        .iter()
+        .filter_map(|status| match status {
+            InventoryResponse::Available((block, _)) => block.coinbase_height(),
+            InventoryResponse::Missing(_) => None,
+        })
+        .max()
+}
+
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
 ///
 /// # Security
@@ -223,6 +237,18 @@ where
 
     /// Producer clones handed to each tracked request's response wrapper.
     stall_event_tx: tokio_mpsc::UnboundedSender<(PeerSocketAddr, StallOutcome)>,
+
+    /// Best chain height observed for each connected peer.
+    observed_peer_heights: HashMap<PeerSocketAddr, block::Height>,
+
+    /// Per-connection tokens used to ignore stale height updates from old request futures.
+    peer_connection_tokens: HashMap<PeerSocketAddr, Arc<()>>,
+
+    /// Height updates from completed block response futures.
+    peer_height_event_rx: tokio_mpsc::UnboundedReceiver<(PeerSocketAddr, block::Height, Arc<()>)>,
+
+    /// Producer clones handed to each block response wrapper.
+    peer_height_event_tx: tokio_mpsc::UnboundedSender<(PeerSocketAddr, block::Height, Arc<()>)>,
 
     // Peer Tracking: Ready Peers
     //
@@ -349,6 +375,8 @@ where
         max_conns_per_ip: Option<usize>,
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
+        let (peer_height_event_tx, peer_height_event_rx) = tokio_mpsc::unbounded_channel();
+
         Self {
             // New peers
             discover,
@@ -360,6 +388,10 @@ where
             find_response_stalls: FindResponseStallTracker::new(),
             stall_event_rx,
             stall_event_tx,
+            observed_peer_heights: HashMap::new(),
+            peer_connection_tokens: HashMap::new(),
+            peer_height_event_rx,
+            peer_height_event_tx,
 
             // Ready peers
             ready_services: HashMap::new(),
@@ -468,6 +500,8 @@ where
     fn shut_down_tasks_and_channels(&mut self, cx: &mut Context<'_>) {
         // Drop services and cancel their background tasks.
         self.ready_services = HashMap::new();
+        self.observed_peer_heights.clear();
+        self.peer_connection_tokens.clear();
 
         for (_peer_key, handle) in self.cancel_handles.drain() {
             let _ = handle.send(CancelClientWork);
@@ -569,6 +603,8 @@ where
                             cancel.is_some(),
                             "missing cancel handle for banned unready peer"
                         );
+                        self.observed_peer_heights.remove(&key);
+                        self.peer_connection_tokens.remove(&key);
                         continue;
                     }
 
@@ -604,6 +640,8 @@ where
 
                     let cancel = self.cancel_handles.remove(&key);
                     assert!(cancel.is_some(), "missing cancel handle");
+                    self.observed_peer_heights.remove(&key);
+                    self.peer_connection_tokens.remove(&key);
                 }
             }
         }
@@ -645,6 +683,8 @@ where
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
                         debug!(?key, "service ip is banned, dropping service");
                         std::mem::drop(svc);
+                        self.observed_peer_heights.remove(&key);
+                        self.peer_connection_tokens.remove(&key);
                         continue;
                     }
 
@@ -657,6 +697,8 @@ where
 
                     // Ready services can just be dropped, they don't need any cleanup.
                     std::mem::drop(svc);
+                    self.observed_peer_heights.remove(&key);
+                    self.peer_connection_tokens.remove(&key);
                 }
             }
         }
@@ -759,6 +801,18 @@ where
             // It is ok to drop ready services, they don't need anything cancelled.
             self.ready_services
                 .retain(|_address, peer| peer.remote_version() >= minimum_version);
+
+            let connected_peers: HashSet<_> = self
+                .ready_services
+                .keys()
+                .chain(self.cancel_handles.keys())
+                .copied()
+                .collect();
+
+            self.observed_peer_heights
+                .retain(|address, _height| connected_peers.contains(address));
+            self.peer_connection_tokens
+                .retain(|address, _token| connected_peers.contains(address));
         }
     }
 
@@ -797,12 +851,28 @@ where
         }
     }
 
+    /// Drains peer height updates from completed block responses.
+    fn drain_peer_height_events(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some((addr, height, token))) = self.peer_height_event_rx.poll_recv(cx)
+        {
+            let Some(current_token) = self.peer_connection_tokens.get(&addr) else {
+                continue;
+            };
+
+            if Arc::ptr_eq(current_token, &token) {
+                self.record_peer_height(addr, height);
+            }
+        }
+    }
+
     /// Remove the service corresponding to `key` from the peer set.
     ///
     /// Drops the service, cancelling any pending request or response to that peer.
     /// If the peer does not exist, does nothing.
     fn remove(&mut self, key: &D::Key) {
         self.find_response_stalls.clear(*key);
+        self.observed_peer_heights.remove(key);
+        self.peer_connection_tokens.remove(key);
 
         if let Some(ready_service) = self.take_ready_service(key) {
             // A ready service has no work to cancel, so just drop it.
@@ -828,8 +898,12 @@ where
         );
 
         if svc.remote_version() >= self.minimum_peer_version.current() {
+            self.ensure_peer_connection_token(key);
+            self.record_peer_height(key, svc.remote_start_height());
             self.ready_services.insert(key, svc);
         } else {
+            self.observed_peer_heights.remove(&key);
+            self.peer_connection_tokens.remove(&key);
             std::mem::drop(svc);
         }
     }
@@ -841,6 +915,7 @@ where
     /// service is dropped.
     fn push_unready(&mut self, key: D::Key, svc: D::Service) {
         let peer_version = svc.remote_version();
+        let peer_start_height = svc.remote_start_height();
         let (tx, rx) = oneshot::channel();
 
         self.unready_services.push(UnreadyService {
@@ -851,12 +926,47 @@ where
         });
 
         if peer_version >= self.minimum_peer_version.current() {
+            self.ensure_peer_connection_token(key);
+            self.record_peer_height(key, peer_start_height);
             self.cancel_handles.insert(key, tx);
         } else {
+            self.observed_peer_heights.remove(&key);
+            self.peer_connection_tokens.remove(&key);
             // Cancel any request made to the service because it is using an outdated protocol
             // version.
             let _ = tx.send(CancelClientWork);
         }
+    }
+
+    /// Returns the current connection token for `peer`, creating one if needed.
+    fn ensure_peer_connection_token(&mut self, peer: PeerSocketAddr) -> Arc<()> {
+        self.peer_connection_tokens
+            .entry(peer)
+            .or_insert_with(|| Arc::new(()))
+            .clone()
+    }
+
+    /// Records the highest chain height observed for `peer`.
+    fn record_peer_height(&mut self, peer: PeerSocketAddr, height: block::Height) {
+        self.observed_peer_heights
+            .entry(peer)
+            .and_modify(|observed_height| *observed_height = (*observed_height).max(height))
+            .or_insert(height);
+    }
+
+    /// Returns true if `peer` has shown enough chain height for this request.
+    fn peer_observed_at_or_above(
+        &self,
+        peer: PeerSocketAddr,
+        min_height: Option<block::Height>,
+    ) -> bool {
+        let Some(min_height) = min_height else {
+            return true;
+        };
+
+        self.observed_peer_heights
+            .get(&peer)
+            .is_some_and(|observed_height| *observed_height >= min_height)
     }
 
     /// Performs P2C on `self.ready_services` to randomly select a less-loaded ready service.
@@ -934,36 +1044,49 @@ where
         svc.map(|svc| svc.load())
     }
 
+    /// Calls a ready peer, moves it to the unready list, and tracks response metadata.
+    fn call_peer(&mut self, peer: D::Key, mut svc: D::Service, req: Request) -> ResponseFuture {
+        let track_stalls = matches!(
+            &req,
+            Request::FindBlocks { .. } | Request::FindHeaders { .. }
+        );
+        let stall_tx = self.stall_event_tx.clone();
+        let height_tx = self.peer_height_event_tx.clone();
+        let token = self.ensure_peer_connection_token(peer);
+
+        let fut = svc.call(req);
+        self.push_unready(peer, svc);
+
+        async move {
+            let result = fut.await;
+
+            if let Ok(response) = &result {
+                if let Some(height) = max_block_height(response) {
+                    let _ = height_tx.send((peer, height, token));
+                }
+            }
+
+            if track_stalls {
+                if let Some(outcome) = classify_find_response(&result) {
+                    let _ = stall_tx.send((peer, outcome));
+                }
+            }
+
+            result.map_err(Into::into)
+        }
+        .boxed()
+    }
+
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
             tracing::trace!(?p2c_key, "routing based on p2c");
 
-            let mut svc = self
+            let svc = self
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
-            let track_stalls = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
-
-            let fut = svc.call(req);
-            self.push_unready(p2c_key, svc);
-
-            if track_stalls {
-                let stall_tx = self.stall_event_tx.clone();
-                return async move {
-                    let result = fut.await;
-                    if let Some(outcome) = classify_find_response(&result) {
-                        let _ = stall_tx.send((p2c_key, outcome));
-                    }
-                    result.map_err(Into::into)
-                }
-                .boxed();
-            }
-
-            return fut.map_err(Into::into).boxed();
+            return self.call_peer(p2c_key, svc, req);
         }
 
         async move {
@@ -992,8 +1115,9 @@ where
         &mut self,
         req: Request,
         hash: InventoryHash,
+        min_peer_height: Option<block::Height>,
     ) -> <Self as tower::Service<Request>>::Future {
-        let advertising_peer_list = self
+        let advertising_peer_list: HashSet<_> = self
             .inventory_registry
             .advertising_peers(hash)
             .filter(|&addr| self.ready_services.contains_key(addr))
@@ -1010,12 +1134,10 @@ where
         // so that a peer can't provide all our inventory responses.
         let peer = self.select_p2c_peer_from_list(&advertising_peer_list);
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(?hash, ?peer, "routing to a peer which advertised inventory");
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
-            return fut.map_err(Into::into).boxed();
+            return self.call_peer(peer, svc, req);
         }
 
         let missing_peer_list: HashSet<PeerSocketAddr> = self
@@ -1023,22 +1145,54 @@ where
             .missing_peers(hash)
             .copied()
             .collect();
-        let maybe_peer_list = self
+
+        let maybe_peer_candidates: HashSet<_> = self
             .ready_services
             .keys()
             .filter(|addr| !missing_peer_list.contains(addr))
             .copied()
             .collect();
 
+        let maybe_peer_list = maybe_peer_candidates
+            .iter()
+            .filter(|addr| self.peer_observed_at_or_above(**addr, min_peer_height))
+            .copied()
+            .collect();
+
         // Security: choose a random, less-loaded peer that might have the inventory.
         let peer = self.select_p2c_peer_from_list(&maybe_peer_list);
 
-        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+        if let Some(svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
             tracing::trace!(?hash, ?peer, "routing to a peer that might have inventory");
-            let fut = svc.call(req);
-            self.push_unready(peer, svc);
-            return fut.map_err(Into::into).boxed();
+            return self.call_peer(peer, svc, req);
+        }
+
+        if let Some(min_height) = min_peer_height {
+            let below_min_peer_count = maybe_peer_candidates
+                .iter()
+                .filter(|peer| !self.peer_observed_at_or_above(**peer, Some(min_height)))
+                .count();
+
+            if below_min_peer_count > 0 {
+                tracing::debug!(
+                    ?hash,
+                    ?min_height,
+                    below_min_peer_count,
+                    "all fallback peers are below the requested block height"
+                );
+
+                return async move {
+                    tokio::task::yield_now().await;
+
+                    Err(SharedPeerError::from(PeerError::PeersBelowMinHeight {
+                        min_height,
+                        peer_count: below_min_peer_count,
+                    }))
+                }
+                .map_err(Into::into)
+                .boxed();
+            }
         }
 
         tracing::debug!(
@@ -1351,6 +1505,7 @@ where
         // Drain stall events first, so disconnects free up slots that
         // `poll_discover` can fill in the same poll cycle.
         self.drain_stall_events(cx);
+        self.drain_peer_height_events(cx);
 
         // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
         // can be infrequent if our connection slots are full, or we're connected to all
@@ -1405,11 +1560,18 @@ where
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
+            }
+            Request::BlocksByHashAtHeight {
+                ref hashes,
+                min_peer_height,
+            } if hashes.len() == 1 => {
+                let hash = InventoryHash::from(*hashes.iter().next().unwrap());
+                self.route_inv(req, hash, Some(min_peer_height))
             }
             Request::TransactionsById(ref hashes) if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
-                self.route_inv(req, hash)
+                self.route_inv(req, hash, None)
             }
 
             // Broadcast advertisements to lots of peers

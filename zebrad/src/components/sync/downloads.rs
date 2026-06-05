@@ -180,12 +180,30 @@ impl BlockDownloadVerifyError {
             _ => None,
         }
     }
+
+    /// Returns the block hash for downloads delayed because ready peers are below the needed height.
+    pub(super) fn peers_below_min_height_download_hash(&self) -> Option<block::Hash> {
+        match self {
+            BlockDownloadVerifyError::DownloadFailed { error, hash }
+                if error
+                    .downcast_ref::<zn::SharedPeerError>()
+                    .is_some_and(shared_peer_error_is_peers_below_min_height) =>
+            {
+                Some(*hash)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn shared_peer_error_is_not_found(error: &zn::SharedPeerError) -> bool {
     let inner = error.inner_debug();
 
     inner.contains("NotFoundResponse") || inner.contains("NotFoundRegistry")
+}
+
+fn shared_peer_error_is_peers_below_min_height(error: &zn::SharedPeerError) -> bool {
+    error.inner_debug().contains("PeersBelowMinHeight")
 }
 
 impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
@@ -356,6 +374,31 @@ where
         &mut self,
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
+        let request = zn::Request::BlocksByHash(std::iter::once(hash).collect());
+        self.download_and_verify_with_request(hash, request).await
+    }
+
+    /// Queue a block for download and verification, only using fallback peers
+    /// that have shown evidence at or above `min_peer_height`.
+    #[instrument(level = "debug", skip(self), fields(%hash, ?min_peer_height))]
+    pub async fn download_and_verify_at_or_above(
+        &mut self,
+        hash: block::Hash,
+        min_peer_height: block::Height,
+    ) -> Result<(), BlockDownloadVerifyError> {
+        let request = zn::Request::BlocksByHashAtHeight {
+            hashes: std::iter::once(hash).collect(),
+            min_peer_height,
+        };
+
+        self.download_and_verify_with_request(hash, request).await
+    }
+
+    async fn download_and_verify_with_request(
+        &mut self,
+        hash: block::Hash,
+        request: zn::Request,
+    ) -> Result<(), BlockDownloadVerifyError> {
         if self.cancel_handles.contains_key(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
@@ -373,7 +416,7 @@ where
             .ready()
             .await
             .map_err(|error| BlockDownloadVerifyError::NetworkServiceError { error })?
-            .call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+            .call(request);
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();

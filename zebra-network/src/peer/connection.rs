@@ -1057,7 +1057,7 @@ where
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
-            (AwaitingRequest, BlocksByHash(hashes)) => {
+            (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashAtHeight { hashes, .. }) => {
                 self
                     .peer_tx
                     .send(Message::GetData(

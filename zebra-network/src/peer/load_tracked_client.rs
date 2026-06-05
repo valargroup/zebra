@@ -10,6 +10,7 @@ use tower::{
     load::{Load, PeakEwma},
     Service,
 };
+use zebra_chain::block::Height;
 
 use crate::{
     constants::{EWMA_DECAY_TIME_NANOS, EWMA_DEFAULT_RTT},
@@ -52,6 +53,11 @@ impl LoadTrackedClient {
     /// Retrieve the peer's reported protocol version.
     pub fn remote_version(&self) -> Version {
         self.connection_info.remote.version
+    }
+
+    /// Retrieve the peer's reported chain height from its handshake.
+    pub fn remote_start_height(&self) -> Height {
+        self.connection_info.remote.start_height
     }
 }
 

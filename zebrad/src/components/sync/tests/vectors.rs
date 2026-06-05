@@ -8,7 +8,7 @@ use color_eyre::Report;
 use futures::{Future, FutureExt};
 
 use zebra_chain::{
-    block::{self, Block, Height},
+    block::{self, Block, Height, HeightDiff},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
     serialization::ZcashDeserializeInto,
 };
@@ -44,6 +44,13 @@ type TestChainSync = ChainSync<
 ///
 /// Increasing this value causes the tests to take longer to complete, so it can't be too large.
 const MAX_SERVICE_REQUEST_DELAY: Duration = Duration::from_millis(1000);
+
+fn blocks_by_hash_at_height(hash: block::Hash, min_peer_height: Height) -> zn::Request {
+    zn::Request::BlocksByHashAtHeight {
+        hashes: iter::once(hash).collect(),
+        min_peer_height,
+    }
+}
 
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
@@ -170,14 +177,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block1_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block1.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block2_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block2.clone(),
@@ -240,14 +247,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     // Blocks 3 & 4 are fetched in order, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block3_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block3.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block4_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block4.clone(),
@@ -414,14 +421,14 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block1_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block1.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block2_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block2.clone(),
@@ -486,14 +493,14 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     // Blocks 3 & 4 are fetched in order, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block3_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block3.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block4_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block4.clone(),
@@ -718,23 +725,21 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
     // Blocks 982k, 1, 2 are fetched in order, then verified concurrently,
     // but block 982k verification is skipped because it is too high.
     peer_set
-        .expect_request(zn::Request::BlocksByHash(
-            iter::once(block982k_hash).collect(),
-        ))
+        .expect_request(blocks_by_hash_at_height(block982k_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block982k.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block1_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block1.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block2_hash, Height(2)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block2.clone(),
@@ -885,14 +890,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
 
     // Blocks 1 & 2 are fetched in order, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block1_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block1.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block2_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block2.clone(),
@@ -957,23 +962,21 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
     // Blocks 3, 4, 982k are fetched in order, then verified concurrently,
     // but block 982k verification is skipped because it is too high.
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block3_hash, Height(0)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block3.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block4_hash, Height(1)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block4.clone(),
             None,
         ))]));
     peer_set
-        .expect_request(zn::Request::BlocksByHash(
-            iter::once(block982k_hash).collect(),
-        ))
+        .expect_request(blocks_by_hash_at_height(block982k_hash, Height(2)))
         .await
         .respond(zn::Response::Blocks(vec![Available((
             block982k.clone(),
@@ -1176,13 +1179,133 @@ async fn not_found_download_requeues_missing_block() -> Result<(), crate::BoxErr
     });
 
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(blocks_by_hash_at_height(block1_hash, Height(0)))
         .await
         .respond(Err(not_found_block_error(block1_hash)));
 
     requeue
         .await
         .expect("missing block retry task should not panic")?;
+
+    block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// Tests that sync block downloads pass conservative peer-height lower bounds to the network.
+#[tokio::test]
+async fn request_blocks_uses_min_peer_height_from_chain_tip() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let hashes: Vec<_> = (1..=21).map(|byte| block::Hash::from([byte; 32])).collect();
+    let queued_hashes = hashes.clone();
+
+    mock_chain_tip_sender.send_best_tip_height(Height(40));
+    let lookahead_limit = chain_sync.lookahead_limit(hashes.len());
+    assert!(
+        hashes.len() > lookahead_limit,
+        "test must exercise the split extra_hashes path"
+    );
+
+    let request_blocks = tokio::spawn(async move {
+        let extra_hashes = chain_sync
+            .request_blocks(hashes.into_iter().collect())
+            .await?;
+
+        Ok::<_, BlockDownloadVerifyError>((chain_sync, extra_hashes))
+    });
+
+    let expected_requests: HashMap<_, _> = queued_hashes
+        .iter()
+        .take(lookahead_limit)
+        .copied()
+        .enumerate()
+        .map(|(offset, hash)| {
+            let offset = HeightDiff::try_from(offset).expect("test offset fits in HeightDiff");
+            let min_peer_height = (Height(41) + offset).expect("test height is in range");
+            (hash, min_peer_height)
+        })
+        .collect();
+
+    let mut seen_requests = HashMap::new();
+    let mut responses = Vec::new();
+    for _ in 0..expected_requests.len() {
+        let response = peer_set
+            .expect_request_that(|request| match request {
+                zn::Request::BlocksByHashAtHeight {
+                    hashes,
+                    min_peer_height,
+                } if hashes.len() == 1 => expected_requests
+                    .get(hashes.iter().next().expect("just checked length"))
+                    .is_some_and(|expected_height| expected_height == min_peer_height),
+                _ => false,
+            })
+            .await;
+
+        if let zn::Request::BlocksByHashAtHeight {
+            hashes,
+            min_peer_height,
+        } = response.request()
+        {
+            let hash = *hashes.iter().next().expect("just checked length");
+            seen_requests.insert(hash, *min_peer_height);
+        }
+
+        responses.push(response);
+    }
+
+    for response in responses {
+        response.respond(Err(not_found_block_error(block::Hash::from([0; 32]))));
+    }
+
+    let (chain_sync, extra_hashes) = request_blocks
+        .await
+        .expect("request_blocks task should not panic")
+        .expect("request_blocks should queue the first window");
+
+    for (offset, hash) in queued_hashes.iter().copied().enumerate() {
+        let offset = HeightDiff::try_from(offset).expect("test offset fits in HeightDiff");
+        let min_peer_height = (Height(41) + offset).expect("test height is in range");
+
+        assert_eq!(
+            chain_sync.block_min_peer_heights.get(&hash),
+            Some(&min_peer_height),
+            "queued hashes should keep their position-based minimum height"
+        );
+    }
+    assert_eq!(seen_requests, expected_requests);
+
+    let expected_extra_hashes: Vec<_> = queued_hashes
+        .iter()
+        .skip(lookahead_limit)
+        .copied()
+        .collect();
+
+    assert_eq!(
+        extra_hashes.len(),
+        expected_extra_hashes.len(),
+        "all hashes beyond the lookahead window should be returned"
+    );
+    for extra_hash in expected_extra_hashes {
+        assert!(
+            extra_hashes.contains(&extra_hash),
+            "extra hashes should contain every hash beyond the lookahead window"
+        );
+    }
+    assert_eq!(
+        chain_sync
+            .block_min_peer_heights
+            .get(queued_hashes.last().expect("test has at least one hash")),
+        Some(&Height(61)),
+        "extra hashes should keep their original position-based minimum height"
+    );
 
     block_verifier_router.expect_no_requests().await;
 
@@ -1223,6 +1346,40 @@ async fn not_found_download_restarts_after_queue_retry_limit() {
     peer_set.expect_no_requests().await;
 }
 
+/// Tests that height-limited block download retries are bounded.
+#[tokio::test]
+async fn peers_below_min_height_restarts_after_queue_retry_limit() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xBC; 32]);
+    chain_sync
+        .height_limited_block_retry_counts
+        .insert(block_hash, sync::MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT);
+
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: peers_below_min_height_error(),
+        hash: block_hash,
+    };
+
+    let result = chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "height-limited downloads should restart sync after queue retry limit"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
 /// Tests that a `notfound` block download triggers sync restart once the
 /// queue-level retry handler has exhausted its retries.
 #[tokio::test]
@@ -1237,6 +1394,22 @@ async fn not_found_download_restarts_sync() {
     assert!(
         restart,
         "notfound block downloads should restart sync after queue retries"
+    );
+}
+
+/// Tests that fallback height filtering is treated as a temporary availability issue.
+#[tokio::test]
+async fn peers_below_min_height_does_not_restart_sync() {
+    let block_hash = block::Hash::from([0xEF; 32]);
+    let err = BlockDownloadVerifyError::DownloadFailed {
+        error: peers_below_min_height_error(),
+        hash: block_hash,
+    };
+
+    let restart = TestChainSync::should_restart_sync(&err);
+    assert!(
+        !restart,
+        "peers below the requested block height should not directly restart sync"
     );
 }
 
@@ -1295,6 +1468,7 @@ fn setup_chain_sync() -> (
     // So machines under heavy load need a longer delay.
     // (For example, CI machines with limited cores.)
     let peer_set = MockService::build()
+        .with_proxy_channel_size(64)
         .with_max_request_delay(MAX_SERVICE_REQUEST_DELAY)
         .for_unit_tests();
 
@@ -1331,4 +1505,12 @@ fn setup_chain_sync() -> (
 
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(Vec::new())).into()
+}
+
+fn peers_below_min_height_error() -> crate::BoxError {
+    zn::SharedPeerError::from(zn::PeerError::PeersBelowMinHeight {
+        min_height: Height(42),
+        peer_count: 3,
+    })
+    .into()
 }

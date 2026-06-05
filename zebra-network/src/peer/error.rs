@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc};
 use thiserror::Error;
 
 use tracing_error::TracedError;
-use zebra_chain::serialization::SerializationError;
+use zebra_chain::{block, serialization::SerializationError};
 
 use crate::protocol::external::InventoryHash;
 
@@ -133,6 +133,18 @@ pub enum PeerError {
     /// [1]: crate::protocol::internal::InventoryResponse::Missing
     #[error("All ready peers are registered as recently missing these items: {0:?}")]
     NotFoundRegistry(Vec<InventoryHash>),
+
+    /// We requested a block from fallback peers, but every candidate peer had
+    /// only shown evidence below the requested block height.
+    #[error(
+        "All fallback peers are below the requested block height {min_height:?}: {peer_count}"
+    )]
+    PeersBelowMinHeight {
+        /// Minimum height required by the request.
+        min_height: block::Height,
+        /// Number of otherwise-eligible peers that were below `min_height`.
+        peer_count: usize,
+    },
 }
 
 impl PeerError {
@@ -156,6 +168,7 @@ impl PeerError {
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),
             PeerError::NotFoundRegistry(_) => "NotFoundRegistry".into(),
+            PeerError::PeersBelowMinHeight { .. } => "PeersBelowMinHeight".into(),
         }
     }
 }

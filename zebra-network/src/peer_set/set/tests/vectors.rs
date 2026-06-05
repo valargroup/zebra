@@ -496,6 +496,143 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
     });
 }
 
+/// Check that an exact inventory advertisement is enough evidence for height-aware block requests.
+#[test]
+fn peer_set_route_inv_uses_advertised_peer_below_min_height() {
+    let test_hash = block::Hash([0; 32]);
+    let test_inv = InventoryHash::Block(test_hash);
+
+    let low_peer = "127.0.0.1:1"
+        .parse()
+        .expect("unexpected invalid peer address");
+    let test_change = InventoryStatus::new_available(test_inv, low_peer);
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    tokio::time::pause();
+
+    let (discovered_peers, mut handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        peer_set_guard
+            .inventory_sender()
+            .as_mut()
+            .expect("unexpected missing inv sender")
+            .send(test_change)
+            .expect("unexpected dropped receiver");
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+
+        peer_ready.record_peer_height(low_peer, block::Height(9));
+
+        let sent_request = Request::BlocksByHashAtHeight {
+            hashes: iter::once(test_hash).collect(),
+            min_peer_height: block::Height(10),
+        };
+        let _fut = peer_ready.call(sent_request.clone());
+
+        if let Some(ClientRequest { request, .. }) = handles[0]
+            .try_to_receive_outbound_client_request()
+            .request()
+        {
+            assert_eq!(sent_request, request);
+        } else {
+            panic!("height-aware inv request was not routed to the advertised peer");
+        }
+
+        assert!(
+            handles[1]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "request routed to fallback peer instead of advertised peer",
+        );
+    });
+}
+
+/// Check that height-aware block requests skip fallback peers below the requested height.
+#[test]
+fn peer_set_route_inv_fallback_skips_peer_below_min_height() {
+    let test_hash = block::Hash([0; 32]);
+
+    let low_peer = "127.0.0.1:1"
+        .parse()
+        .expect("unexpected invalid peer address");
+    let high_peer = "127.0.0.1:2"
+        .parse()
+        .expect("unexpected invalid peer address");
+
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    tokio::time::pause();
+
+    let (discovered_peers, mut handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+
+        peer_ready.record_peer_height(low_peer, block::Height(9));
+        peer_ready.record_peer_height(high_peer, block::Height(10));
+
+        let sent_request = Request::BlocksByHashAtHeight {
+            hashes: iter::once(test_hash).collect(),
+            min_peer_height: block::Height(10),
+        };
+        let _fut = peer_ready.call(sent_request.clone());
+
+        assert!(
+            handles[0]
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none(),
+            "request routed to fallback peer below the minimum height",
+        );
+
+        if let Some(ClientRequest { request, .. }) = handles[1]
+            .try_to_receive_outbound_client_request()
+            .request()
+        {
+            assert_eq!(sent_request, request);
+        } else {
+            panic!("height-aware inv request was not routed to the high fallback peer");
+        }
+    });
+}
+
 /// Check that a peer set routes inventory requests to peers that are not missing that inventory.
 #[test]
 fn peer_set_route_inv_missing_registry() {

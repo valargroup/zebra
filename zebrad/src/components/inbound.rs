@@ -412,7 +412,7 @@ impl Service<zn::Request> for Inbound {
                     Ok(response)
                 }.boxed()
             }
-            zn::Request::BlocksByHash(hashes) => {
+            zn::Request::BlocksByHash(hashes) | zn::Request::BlocksByHashAtHeight { hashes, .. } => {
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
                 if hashes.is_empty() {

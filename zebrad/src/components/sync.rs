@@ -394,6 +394,12 @@ where
     /// Queue-level retry counts for block hashes whose download failed with `notfound`.
     missing_block_retry_counts: HashMap<block::Hash, usize>,
 
+    /// Queue-level retry counts for block hashes deferred because ready peers are too low.
+    height_limited_block_retry_counts: HashMap<block::Hash, usize>,
+
+    /// Minimum peer height to use for each queued sync block hash.
+    block_min_peer_heights: HashMap<block::Hash, Height>,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -535,6 +541,8 @@ where
             prospective_tips: HashSet::new(),
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
+            height_limited_block_retry_counts: HashMap::new(),
+            block_min_peer_heights: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
         };
@@ -586,6 +594,8 @@ where
     async fn try_to_sync(&mut self) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
+        self.height_limited_block_retry_counts.clear();
+        self.block_min_peer_heights.clear();
 
         info!(
             state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -1094,6 +1104,18 @@ where
             "requesting blocks",
         );
 
+        let fallback_min_peer_height = self.fallback_min_peer_height();
+        for (offset, hash) in hashes.iter().copied().enumerate() {
+            let offset = HeightDiff::try_from(offset).expect("hash list length fits in HeightDiff");
+            let min_peer_height = (fallback_min_peer_height + offset)
+                .expect("chain height plus lookahead is below Height::MAX");
+
+            self.block_min_peer_heights
+                .entry(hash)
+                .and_modify(|height| *height = (*height).max(min_peer_height))
+                .or_insert(min_peer_height);
+        }
+
         let extra_hashes = if hashes.len() > lookahead_limit {
             hashes.split_off(lookahead_limit)
         } else {
@@ -1101,10 +1123,26 @@ where
         };
 
         for hash in hashes.into_iter() {
-            self.downloads.download_and_verify(hash).await?;
+            let min_peer_height = self
+                .block_min_peer_heights
+                .get(&hash)
+                .copied()
+                .unwrap_or(fallback_min_peer_height);
+
+            self.downloads
+                .download_and_verify_at_or_above(hash, min_peer_height)
+                .await?;
         }
 
         Ok(extra_hashes)
+    }
+
+    /// Returns a conservative lower bound for the next queued sync block height.
+    fn fallback_min_peer_height(&self) -> Height {
+        self.latest_chain_tip
+            .best_tip_height()
+            .and_then(|height| height + 1)
+            .unwrap_or(Height(0))
     }
 
     /// The configured lookahead limit, based on the currently verified height,
@@ -1183,11 +1221,12 @@ where
         Self::handle_response(response)
     }
 
-    /// Handles a downloaded block response, requeueing required missing block hashes.
+    /// Handles a downloaded block response, requeueing required blocks after temporary routing failures.
     ///
-    /// The block download service already retries each `BlocksByHash` request and
-    /// may hedge it to another peer. If all those attempts fail with `notfound`,
-    /// the syncer gives the required hash a small number of urgent queue-level
+    /// The block download service already retries each block request and may
+    /// hedge it to another peer. If all those attempts fail with `notfound`, or
+    /// because no ready peers are high enough for the requested block, the
+    /// syncer gives the required hash a small number of urgent queue-level
     /// retries before restarting the sync round.
     async fn handle_block_response_with_missing_retry(
         &mut self,
@@ -1195,13 +1234,20 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
+            self.height_limited_block_retry_counts.remove(hash);
+            self.block_min_peer_heights.remove(hash);
         }
 
-        if let Some(hash) = response
+        let not_found_hash = response
             .as_ref()
             .err()
-            .and_then(BlockDownloadVerifyError::not_found_download_hash)
-        {
+            .and_then(BlockDownloadVerifyError::not_found_download_hash);
+        let below_min_height_hash = response
+            .as_ref()
+            .err()
+            .and_then(BlockDownloadVerifyError::peers_below_min_height_download_hash);
+
+        if let Some(hash) = not_found_hash {
             let retry_count = self.missing_block_retry_counts.entry(hash).or_default();
 
             if *retry_count < MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT {
@@ -1215,7 +1261,17 @@ where
                 );
                 metrics::counter!("sync.missing.block.requeued.count").increment(1);
 
-                match self.downloads.download_and_verify(hash).await {
+                let min_peer_height = self
+                    .block_min_peer_heights
+                    .get(&hash)
+                    .copied()
+                    .unwrap_or_else(|| self.fallback_min_peer_height());
+
+                match self
+                    .downloads
+                    .download_and_verify_at_or_above(hash, min_peer_height)
+                    .await
+                {
                     Ok(()) => return Ok(()),
                     Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
                         return Ok(());
@@ -1224,6 +1280,7 @@ where
                 }
             } else {
                 self.missing_block_retry_counts.remove(&hash);
+                self.block_min_peer_heights.remove(&hash);
 
                 warn!(
                     ?hash,
@@ -1232,6 +1289,59 @@ where
                     "missing sync block retry limit exhausted, restarting sync"
                 );
                 metrics::counter!("sync.missing.block.retry.limit.count").increment(1);
+            }
+        }
+
+        if let Some(hash) = below_min_height_hash {
+            let retry_count = self
+                .height_limited_block_retry_counts
+                .entry(hash)
+                .or_default();
+
+            if *retry_count < MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT {
+                *retry_count += 1;
+
+                info!(
+                    ?hash,
+                    retry_attempt = *retry_count,
+                    retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                    "no ready peers are high enough for sync block, retrying required block"
+                );
+                metrics::counter!("sync.height_limited.block.requeued.count").increment(1);
+
+                let min_peer_height = self
+                    .block_min_peer_heights
+                    .get(&hash)
+                    .copied()
+                    .unwrap_or_else(|| self.fallback_min_peer_height());
+
+                match self
+                    .downloads
+                    .download_and_verify_at_or_above(hash, min_peer_height)
+                    .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                        return Ok(());
+                    }
+                    Err(error) => self.handle_block_response(Err(error))?,
+                }
+            } else {
+                self.height_limited_block_retry_counts.remove(&hash);
+                self.block_min_peer_heights.remove(&hash);
+
+                warn!(
+                    ?hash,
+                    retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                    error = ?response.as_ref().expect_err("checked for below-height error"),
+                    "sync block height-limited retry limit exhausted, restarting sync"
+                );
+                metrics::counter!("sync.height_limited.block.retry.limit.count").increment(1);
+
+                return Err(eyre!(
+                    "sync block height-limited retry limit exhausted: {:#}",
+                    response.expect_err("checked for below-height error")
+                ));
             }
         }
 
@@ -1355,6 +1465,16 @@ where
                     "required sync block was not found after retries, restarting sync"
                 );
                 true
+            }
+
+            BlockDownloadVerifyError::DownloadFailed { .. }
+                if e.peers_below_min_height_download_hash().is_some() =>
+            {
+                info!(
+                    error = ?e,
+                    "no ready peers are high enough for a required sync block, continuing"
+                );
+                false
             }
 
             _ => {

@@ -71,6 +71,23 @@ pub enum Request {
     /// Returns [`Response::Blocks`](super::Response::Blocks).
     BlocksByHash(HashSet<block::Hash>),
 
+    /// Request block data by block hashes, requiring fallback peers to have
+    /// shown evidence that they are at least `min_peer_height`.
+    ///
+    /// This is sent on the wire exactly like [`Request::BlocksByHash`]. The
+    /// minimum height is only used by the peer set when choosing a fallback
+    /// peer for single-block requests.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    BlocksByHashAtHeight {
+        /// Block hashes to request.
+        hashes: HashSet<block::Hash>,
+        /// Minimum peer chain height for fallback routing.
+        min_peer_height: block::Height,
+    },
+
     /// Request transactions by their unmined transaction ID.
     ///
     /// v4 transactions use a legacy transaction ID, and
@@ -222,6 +239,16 @@ impl fmt::Display for Request {
             Request::BlocksByHash(hashes) => {
                 format!("BlocksByHash({})", hashes.len())
             }
+            Request::BlocksByHashAtHeight {
+                hashes,
+                min_peer_height,
+            } => {
+                format!(
+                    "BlocksByHashAtHeight({}, min height: {:?})",
+                    hashes.len(),
+                    min_peer_height,
+                )
+            }
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
 
             Request::FindBlocks { known_blocks, stop } => format!(
@@ -255,6 +282,7 @@ impl Request {
             Request::Ping(_) => "Ping",
 
             Request::BlocksByHash(_) => "BlocksByHash",
+            Request::BlocksByHashAtHeight { .. } => "BlocksByHashAtHeight",
             Request::TransactionsById(_) => "TransactionsById",
 
             Request::FindBlocks { .. } => "FindBlocks",
@@ -272,16 +300,18 @@ impl Request {
     pub fn is_inventory_download(&self) -> bool {
         matches!(
             self,
-            Request::BlocksByHash(_) | Request::TransactionsById(_)
+            Request::BlocksByHash(_)
+                | Request::BlocksByHashAtHeight { .. }
+                | Request::TransactionsById(_)
         )
     }
 
     /// Returns the block hash inventory downloads from the request, if any.
     pub fn block_hash_inventory(&self) -> HashSet<block::Hash> {
-        if let Request::BlocksByHash(block_hashes) = self {
-            block_hashes.clone()
-        } else {
-            HashSet::new()
+        match self {
+            Request::BlocksByHash(block_hashes) => block_hashes.clone(),
+            Request::BlocksByHashAtHeight { hashes, .. } => hashes.clone(),
+            _ => HashSet::new(),
         }
     }
 

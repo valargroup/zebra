@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   correctly.
 - Retry missing block downloads inside the active sync round, avoiding long
   stalls when a peer reports `notfound` for a required block hash.
+- Avoid fallback block download requests to peers that have only shown a lower
+  chain height than the requested sync block.
 
 ## [Zebra 5.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v5.0.0) - 2026-06-02
 

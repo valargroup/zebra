@@ -126,7 +126,8 @@ fn request_genesis_is_rate_limited() {
     // panic in any other type of request.
     let peer_service = tower::service_fn(move |request| {
         match request {
-            zebra_network::Request::BlocksByHash(_) => {
+            zebra_network::Request::BlocksByHash(_)
+            | zebra_network::Request::BlocksByHashAtHeight { .. } => {
                 // Track the call
                 peer_requests_counter_in_service.fetch_add(1, Ordering::SeqCst);
                 // Respond with `Error`
