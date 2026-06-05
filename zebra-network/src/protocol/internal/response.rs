@@ -47,6 +47,9 @@ pub enum Response {
     // TODO: make this into an IndexMap - an ordered unique list of hashes (#2244)
     BlockHashes(Vec<block::Hash>),
 
+    /// Block hash lists returned by multiple peers.
+    BlockHashesBySource(Vec<(PeerSocketAddr, Vec<block::Hash>)>),
+
     /// An ordered list of block headers.
     ///
     /// The list contains zero or more block headers.
@@ -93,6 +96,9 @@ impl fmt::Display for Response {
             Response::Pong(duration) => format!("Pong {{ latency: {duration:?} }}"),
 
             Response::BlockHashes(hashes) => format!("BlockHashes {{ hashes: {} }}", hashes.len()),
+            Response::BlockHashesBySource(responses) => {
+                format!("BlockHashesBySource {{ responses: {} }}", responses.len())
+            }
             Response::BlockHeaders(headers) => {
                 format!("BlockHeaders {{ headers: {} }}", headers.len())
             }
@@ -139,6 +145,7 @@ impl Response {
             Response::Pong(_) => "Pong",
 
             Response::BlockHashes(_) => "BlockHashes",
+            Response::BlockHashesBySource(_) => "BlockHashesBySource",
             Response::BlockHeaders(_) => "BlockHeaders",
             Response::TransactionIds(_) => "TransactionIds",
 

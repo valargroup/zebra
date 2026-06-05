@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added source-aware block sync request and response variants:
+  `Request::BlocksByHashFromPeers`, `Request::FindBlocksWithSources`, and
+  `Response::BlockHashesBySource`.
+- Added `PeerError::PreferredPeersBusy` for source-routed requests whose
+  preferred peers are connected but not currently ready.
+
+### Breaking Changes
+
+- Public `Request`, `Response`, and `PeerError` enum matches must handle the new
+  source-aware block sync variants above.
+
 ## [8.0.0] - 2026-06-02
 
 ### Changed

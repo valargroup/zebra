@@ -1057,7 +1057,10 @@ where
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
-            (AwaitingRequest, BlocksByHash(hashes)) => {
+            (
+                AwaitingRequest,
+                BlocksByHash(hashes) | BlocksByHashFromPeers { hashes, .. },
+            ) => {
                 self
                     .peer_tx
                     .send(Message::GetData(
@@ -1085,7 +1088,13 @@ where
                          })
             }
 
-            (AwaitingRequest, FindBlocks { known_blocks, stop }) => {
+            (
+                AwaitingRequest,
+                FindBlocks { known_blocks, stop }
+                | FindBlocksWithSources {
+                    known_blocks, stop, ..
+                },
+            ) => {
                 self
                     .peer_tx
                     .send(Message::GetBlocks { known_blocks, stop })
@@ -1530,6 +1539,17 @@ where
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
                     .await
                 {
+                    self.fail_with(e).await
+                }
+            }
+            Response::BlockHashesBySource(responses) => {
+                let hashes = responses
+                    .into_iter()
+                    .flat_map(|(_peer, hashes)| hashes)
+                    .map(Into::into)
+                    .collect();
+
+                if let Err(e) = self.peer_tx.send(Message::Inv(hashes)).await {
                     self.fail_with(e).await
                 }
             }

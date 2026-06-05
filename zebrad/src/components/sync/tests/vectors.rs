@@ -12,7 +12,7 @@ use zebra_chain::{
     chain_tip::mock::{MockChainTip, MockChainTipSender},
     serialization::ZcashDeserializeInto,
 };
-use zebra_consensus::{Config as ConsensusConfig, RouterError, VerifyBlockError};
+use zebra_consensus::{BlockError, Config as ConsensusConfig, RouterError, VerifyBlockError};
 use zebra_network::{InventoryResponse, PeerSocketAddr};
 use zebra_state::Config as StateConfig;
 use zebra_test::mock_service::{MockService, PanicAssertion};
@@ -79,6 +79,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     let block5: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
     let block5_hash = block5.hash();
+    let source_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
 
     // Start the syncer
     let chain_sync_task_handle = tokio::spawn(chain_sync_future);
@@ -126,34 +127,26 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     // Network is sent the block locator
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block0_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashesBySource(vec![(
+            source_peer,
+            vec![
+                block1_hash, // tip
+                block2_hash, // expected_next
+                block3_hash, // (discarded - last hash, possibly incorrect)
+            ],
+        )]));
 
     // State is checked for the first unknown block (block 1)
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
     // Check that nothing unexpected happened.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -168,21 +161,17 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         .await
         .respond(zs::Response::KnownBlock(None));
 
-    // Blocks 1 & 2 are fetched in order, then verified concurrently
+    // Blocks 1 & 2 are source-routed in one batch, then verified concurrently
     peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .expect_request(zn::Request::BlocksByHashFromPeers {
+            hashes: [block1_hash, block2_hash].into_iter().collect(),
+            preferred_peers: iter::once(source_peer).collect(),
+        })
         .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
-            None,
-        ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
-            None,
-        ))]));
+        .respond(zn::Response::Blocks(vec![
+            Available((block1.clone(), None)),
+            Available((block2.clone(), None)),
+        ]));
 
     // We can't guarantee the verification request order
     let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
@@ -211,9 +200,10 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 
     // Network is sent a block locator based on the tip
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block1_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -222,18 +212,6 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             block4_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block1_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
-    }
-
     // Check that nothing unexpected happened.
     block_verifier_router.expect_no_requests().await;
     state_service.expect_no_requests().await;
@@ -368,9 +346,10 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     // Network is sent the block locator
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block0_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -386,18 +365,6 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
         .expect_request(zs::Request::KnownBlock(block1_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
     // Check that nothing unexpected happened.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -455,9 +422,10 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
 
     // Network is sent a block locator based on the tip
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block1_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -468,18 +436,6 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
             block4_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block1_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
-    }
-
     // Check that nothing unexpected happened.
     block_verifier_router.expect_no_requests().await;
     state_service.expect_no_requests().await;
@@ -668,9 +624,10 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
 
     // Network is sent the block locator
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block0_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -685,18 +642,6 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         .expect_request(zs::Request::KnownBlock(block982k_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
     // Check that nothing unexpected happened.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -841,9 +786,10 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
 
     // Network is sent the block locator
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block0_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -857,18 +803,6 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         .expect_request(zs::Request::KnownBlock(block1_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
     // Check that nothing unexpected happened.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
@@ -926,9 +860,10 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
 
     // Network is sent a block locator based on the tip
     peer_set
-        .expect_request(zn::Request::FindBlocks {
+        .expect_request(zn::Request::FindBlocksWithSources {
             known_blocks: vec![block1_hash],
             stop: None,
+            max_peers: sync::FANOUT,
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
@@ -938,18 +873,6 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             block982k_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block1_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
-    }
-
     // Check that nothing unexpected happened.
     block_verifier_router.expect_no_requests().await;
     state_service.expect_no_requests().await;
@@ -1003,7 +926,7 @@ async fn should_restart_sync_returns_false() {
         location: zebra_state::KnownBlock::BestChain,
     };
 
-    let verify_block_error = VerifyBlockError::Commit(commit_error);
+    let verify_block_error = VerifyBlockError::Commit(commit_error.clone());
     let router_error = RouterError::Block {
         source: Box::new(verify_block_error),
     };
@@ -1024,6 +947,58 @@ async fn should_restart_sync_returns_false() {
     assert!(
         !restart,
         "duplicate commit block errors should NOT trigger sync restart"
+    );
+
+    let verify_block_error = VerifyBlockError::StateService {
+        source: Box::new(zs::CommitSemanticallyVerifiedError::from(commit_error)),
+        hash: block::Hash::from([0xAA; 32]),
+    };
+    let router_error = RouterError::Block {
+        source: Box::new(verify_block_error),
+    };
+
+    let err = BlockDownloadVerifyError::Invalid {
+        error: router_error,
+        height: block::Height(42),
+        hash: block::Hash::from([0xAA; 32]),
+        advertiser_addr: None,
+    };
+
+    let restart = ChainSync::<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zs::Request, zs::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >::should_restart_sync(&err);
+    assert!(
+        !restart,
+        "duplicate state service commit block errors should NOT trigger sync restart"
+    );
+}
+
+/// Tests that invalid blocks with peer attribution and a misbehavior score do
+/// not trigger a sync restart after the peer has been scored.
+#[tokio::test]
+async fn peer_scored_invalid_block_does_not_restart_sync() {
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let verify_block_error = VerifyBlockError::Block {
+        source: BlockError::WrongTransactionConsensusBranchId,
+    };
+    let router_error = RouterError::Block {
+        source: Box::new(verify_block_error),
+    };
+
+    let err = BlockDownloadVerifyError::Invalid {
+        error: router_error,
+        height: block::Height(42),
+        hash: block::Hash::from([0xAC; 32]),
+        advertiser_addr: Some(addr),
+    };
+
+    let restart = TestChainSync::should_restart_sync(&err);
+    assert!(
+        !restart,
+        "peer-scored invalid blocks should be dropped without restarting sync"
     );
 }
 
@@ -1189,9 +1164,60 @@ async fn not_found_download_requeues_missing_block() -> Result<(), crate::BoxErr
     Ok(())
 }
 
-/// Tests that queue-level `notfound` retries are bounded.
+/// Tests that a `notfound` block download retries the missing block using its
+/// known source peers.
 #[tokio::test]
-async fn not_found_download_restarts_after_queue_retry_limit() {
+async fn not_found_download_retries_missing_block_from_sources() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+    let source_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let source_peers = iter::once(source_peer).collect();
+
+    chain_sync
+        .block_source_peers
+        .insert(block1_hash, source_peers);
+
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: not_found_block_error(block1_hash),
+        hash: block1_hash,
+    };
+
+    let requeue = tokio::spawn(async move {
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHashFromPeers {
+            hashes: iter::once(block1_hash).collect(),
+            preferred_peers: iter::once(source_peer).collect(),
+        })
+        .await
+        .respond(Err(not_found_block_error(block1_hash)));
+
+    requeue
+        .await
+        .expect("missing block retry task should not panic")?;
+
+    block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// Tests that unavailable source peers trigger a source refresh instead of a
+/// missing-block retry or sync restart.
+#[tokio::test]
+async fn no_ready_source_peers_refreshes_sources_without_retrying() {
     let (
         mut chain_sync,
         _sync_status,
@@ -1202,6 +1228,109 @@ async fn not_found_download_restarts_after_queue_retry_limit() {
     ) = setup_chain_sync();
 
     let block_hash = block::Hash::from([0xAB; 32]);
+    let source_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    chain_sync
+        .block_source_peers
+        .insert(block_hash, iter::once(source_peer).collect());
+
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: no_ready_peers_error(),
+        hash: block_hash,
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("unavailable source peers should be handled by source refresh");
+
+    assert!(
+        chain_sync.refresh_source_inventory,
+        "unavailable source peers should request source refresh"
+    );
+    assert!(
+        !chain_sync
+            .missing_block_retry_counts
+            .contains_key(&block_hash),
+        "unavailable source peers should not consume missing-block retries"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Tests that busy source peers defer the block instead of refreshing source
+/// inventory or using missing-block retries.
+#[tokio::test]
+async fn busy_source_peers_defer_without_refreshing_sources() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xBC; 32]);
+    let source_peer: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    chain_sync
+        .block_source_peers
+        .insert(block_hash, iter::once(source_peer).collect());
+
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: preferred_peers_busy_error(),
+        hash: block_hash,
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .expect("busy source peers should be handled by deferring");
+
+    assert!(
+        !chain_sync.refresh_source_inventory,
+        "busy source peers should not request source refresh"
+    );
+    assert!(
+        !chain_sync
+            .missing_block_retry_counts
+            .contains_key(&block_hash),
+        "busy source peers should not consume missing-block retries"
+    );
+    assert!(
+        chain_sync
+            .deferred_block_hashes
+            .hashes
+            .contains(&block_hash),
+        "busy source peer block should be deferred"
+    );
+    assert_eq!(
+        chain_sync
+            .deferred_block_hashes
+            .sources
+            .get(&block_hash)
+            .expect("deferred block should keep source peers"),
+        &iter::once(source_peer).collect()
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Tests that queue-level `notfound` retry exhaustion requests a source refresh
+/// instead of entering the outer restart delay.
+#[tokio::test]
+async fn not_found_download_refreshes_sources_after_queue_retry_limit() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAC; 32]);
     chain_sync
         .missing_block_retry_counts
         .insert(block_hash, sync::MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT);
@@ -1211,13 +1340,20 @@ async fn not_found_download_restarts_after_queue_retry_limit() {
         hash: block_hash,
     };
 
-    let result = chain_sync
+    chain_sync
         .handle_block_response_with_missing_retry(Err(error))
-        .await;
+        .await
+        .expect("exhausted notfound retries should request source refresh");
 
     assert!(
-        result.is_err(),
-        "notfound downloads should restart sync after queue retry limit"
+        chain_sync.refresh_source_inventory,
+        "exhausted notfound retries should request source refresh"
+    );
+    assert!(
+        !chain_sync
+            .missing_block_retry_counts
+            .contains_key(&block_hash),
+        "exhausted notfound retries should clear retry count"
     );
 
     peer_set.expect_no_requests().await;
@@ -1331,4 +1467,12 @@ fn setup_chain_sync() -> (
 
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(Vec::new())).into()
+}
+
+fn no_ready_peers_error() -> crate::BoxError {
+    zn::SharedPeerError::from(zn::PeerError::NoReadyPeers).into()
+}
+
+fn preferred_peers_busy_error() -> crate::BoxError {
+    zn::SharedPeerError::from(zn::PeerError::PreferredPeersBusy).into()
 }

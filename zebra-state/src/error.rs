@@ -82,6 +82,14 @@ impl CommitBlockError {
 #[error("could not commit semantically-verified block")]
 pub struct CommitSemanticallyVerifiedError(#[from] CommitBlockError);
 
+impl CommitSemanticallyVerifiedError {
+    /// Returns `true` if this is definitely a duplicate commit request.
+    /// Some duplicate requests might not be detected, and therefore return `false`.
+    pub fn is_duplicate_request(&self) -> bool {
+        self.0.is_duplicate_request()
+    }
+}
+
 impl From<ValidateContextError> for CommitSemanticallyVerifiedError {
     fn from(value: ValidateContextError) -> Self {
         Self(CommitBlockError::ValidateContextError(Box::new(value)))

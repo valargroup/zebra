@@ -71,6 +71,24 @@ pub enum Request {
     /// Returns [`Response::Blocks`](super::Response::Blocks).
     BlocksByHash(HashSet<block::Hash>),
 
+    /// Request block data by block hashes, preferring peers that are known to
+    /// have those hashes.
+    ///
+    /// This is sent on the wire exactly like [`Request::BlocksByHash`]. The
+    /// preferred peers are only used by the peer set when choosing which
+    /// connection should receive the request.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    BlocksByHashFromPeers {
+        /// Block hashes to request.
+        hashes: HashSet<block::Hash>,
+        /// Source peers to try without falling back to normal inventory-aware
+        /// routing.
+        preferred_peers: HashSet<PeerSocketAddr>,
+    },
+
     /// Request transactions by their unmined transaction ID.
     ///
     /// v4 transactions use a legacy transaction ID, and
@@ -118,6 +136,27 @@ pub enum Request {
         known_blocks: Vec<block::Hash>,
         /// Optionally, the last block hash to request.
         stop: Option<block::Hash>,
+    },
+
+    /// Request block hashes from multiple distinct peers, including the source
+    /// peer for each response.
+    ///
+    /// This is implemented by the peer set. Each selected peer receives the
+    /// same wire request as [`Request::FindBlocks`].
+    ///
+    /// # Returns
+    ///
+    /// Returns
+    /// [`Response::BlockHashesBySource`](super::Response::BlockHashesBySource).
+    FindBlocksWithSources {
+        /// Hashes of known blocks, ordered from highest height to lowest height.
+        //
+        // TODO: make this into an IndexMap - an ordered unique list of hashes (#2244)
+        known_blocks: Vec<block::Hash>,
+        /// Optionally, the last block hash to request.
+        stop: Option<block::Hash>,
+        /// Maximum number of distinct peers to query.
+        max_peers: usize,
     },
 
     /// Request headers of subsequent blocks in the chain, given hashes of
@@ -222,12 +261,32 @@ impl fmt::Display for Request {
             Request::BlocksByHash(hashes) => {
                 format!("BlocksByHash({})", hashes.len())
             }
+            Request::BlocksByHashFromPeers {
+                hashes,
+                preferred_peers,
+            } => {
+                format!(
+                    "BlocksByHashFromPeers({}, peers: {})",
+                    hashes.len(),
+                    preferred_peers.len()
+                )
+            }
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
 
             Request::FindBlocks { known_blocks, stop } => format!(
                 "FindBlocks {{ known_blocks: {}, stop: {} }}",
                 known_blocks.len(),
                 if stop.is_some() { "Some" } else { "None" },
+            ),
+            Request::FindBlocksWithSources {
+                known_blocks,
+                stop,
+                max_peers,
+            } => format!(
+                "FindBlocksWithSources {{ known_blocks: {}, stop: {}, max_peers: {} }}",
+                known_blocks.len(),
+                if stop.is_some() { "Some" } else { "None" },
+                max_peers,
             ),
             Request::FindHeaders { known_blocks, stop } => format!(
                 "FindHeaders {{ known_blocks: {}, stop: {} }}",
@@ -255,9 +314,11 @@ impl Request {
             Request::Ping(_) => "Ping",
 
             Request::BlocksByHash(_) => "BlocksByHash",
+            Request::BlocksByHashFromPeers { .. } => "BlocksByHashFromPeers",
             Request::TransactionsById(_) => "TransactionsById",
 
             Request::FindBlocks { .. } => "FindBlocks",
+            Request::FindBlocksWithSources { .. } => "FindBlocksWithSources",
             Request::FindHeaders { .. } => "FindHeaders",
 
             Request::PushTransaction(_) => "PushTransaction",
@@ -272,16 +333,21 @@ impl Request {
     pub fn is_inventory_download(&self) -> bool {
         matches!(
             self,
-            Request::BlocksByHash(_) | Request::TransactionsById(_)
+            Request::BlocksByHash(_)
+                | Request::BlocksByHashFromPeers { .. }
+                | Request::TransactionsById(_)
         )
     }
 
     /// Returns the block hash inventory downloads from the request, if any.
     pub fn block_hash_inventory(&self) -> HashSet<block::Hash> {
-        if let Request::BlocksByHash(block_hashes) = self {
-            block_hashes.clone()
-        } else {
-            HashSet::new()
+        match self {
+            Request::BlocksByHash(block_hashes)
+            | Request::BlocksByHashFromPeers {
+                hashes: block_hashes,
+                ..
+            } => block_hashes.clone(),
+            _ => HashSet::new(),
         }
     }
 

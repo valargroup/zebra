@@ -412,7 +412,8 @@ impl Service<zn::Request> for Inbound {
                     Ok(response)
                 }.boxed()
             }
-            zn::Request::BlocksByHash(hashes) => {
+            zn::Request::BlocksByHash(hashes)
+            | zn::Request::BlocksByHashFromPeers { hashes, .. } => {
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
                 if hashes.is_empty() {
@@ -505,7 +506,10 @@ impl Service<zn::Request> for Inbound {
                 }).boxed()
             }
             // Find* responses are already size-limited by the state.
-            zn::Request::FindBlocks { known_blocks, stop } => {
+            zn::Request::FindBlocks { known_blocks, stop }
+            | zn::Request::FindBlocksWithSources {
+                known_blocks, stop, ..
+            } => {
                 let request = zs::Request::FindBlockHashes { known_blocks, stop };
                 state.clone().oneshot(request).map_ok(|resp| match resp {
                     zs::Response::BlockHashes(hashes) if hashes.is_empty() => zn::Response::Nil,

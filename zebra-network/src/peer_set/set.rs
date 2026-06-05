@@ -102,7 +102,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -172,10 +172,22 @@ enum StallOutcome {
     Clear,
 }
 
+/// How long a multi-peer `FindBlocks` request waits for responses before
+/// returning the responses it already has.
+const FIND_BLOCKS_FANOUT_RESPONSE_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long source-routed block downloads wait before retrying when all known
+/// source peers are connected but busy.
+const SOURCE_PEER_BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcome> {
     match result {
         Ok(Response::BlockHashes(hashes)) if hashes.is_empty() => Some(StallOutcome::Stall),
         Ok(Response::BlockHashes(_)) => Some(StallOutcome::Clear),
+        Ok(Response::BlockHashesBySource(responses)) if responses.is_empty() => {
+            Some(StallOutcome::Stall)
+        }
+        Ok(Response::BlockHashesBySource(_)) => Some(StallOutcome::Clear),
         Ok(Response::BlockHeaders(headers)) if headers.is_empty() => Some(StallOutcome::Stall),
         Ok(Response::BlockHeaders(_)) => Some(StallOutcome::Clear),
         Ok(_) => None,
@@ -937,16 +949,15 @@ where
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
-            tracing::trace!(?p2c_key, "routing based on p2c");
+            let request_command = req.command();
+            tracing::trace!(?p2c_key, request = request_command, "routing based on p2c");
 
             let mut svc = self
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
-            let track_stalls = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
+            let track_find_blocks = matches!(&req, Request::FindBlocks { .. });
+            let track_stalls = track_find_blocks || matches!(&req, Request::FindHeaders { .. });
 
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
@@ -955,6 +966,44 @@ where
                 let stall_tx = self.stall_event_tx.clone();
                 return async move {
                     let result = fut.await;
+                    match &result {
+                        Ok(Response::BlockHashes(hashes)) => {
+                            metrics::counter!(
+                                "peer.findblocks.response.count",
+                                "request" => request_command,
+                                "result" => "hashes"
+                            )
+                            .increment(1);
+                            metrics::histogram!(
+                                "peer.findblocks.response.hash.count",
+                                "request" => request_command
+                            )
+                            .record(hashes.len() as f64);
+
+                            tracing::debug!(
+                                ?p2c_key,
+                                hash_count = hashes.len(),
+                                first_hash = ?hashes.first(),
+                                last_hash = ?hashes.last(),
+                                "findblocks response from peer"
+                            );
+                        }
+                        Err(error) => {
+                            metrics::counter!(
+                                "peer.findblocks.response.count",
+                                "request" => request_command,
+                                "result" => "error"
+                            )
+                            .increment(1);
+                            tracing::debug!(
+                                ?p2c_key,
+                                error = ?error.inner_debug(),
+                                "findblocks request to peer failed"
+                            );
+                        }
+                        _ => {}
+                    }
+
                     if let Some(outcome) = classify_find_response(&result) {
                         let _ = stall_tx.send((p2c_key, outcome));
                     }
@@ -981,6 +1030,122 @@ where
         .boxed()
     }
 
+    /// Sends a `FindBlocks` request to multiple distinct ready peers and keeps
+    /// the source peer for each response.
+    fn route_find_blocks_with_sources(
+        &mut self,
+        known_blocks: Vec<zebra_chain::block::Hash>,
+        stop: Option<zebra_chain::block::Hash>,
+        max_peers: usize,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let max_peers = max_peers.min(self.ready_services.len());
+
+        if max_peers == 0 {
+            return async move {
+                tokio::task::yield_now().await;
+
+                Err(SharedPeerError::from(PeerError::NoReadyPeers))
+            }
+            .map_err(Into::into)
+            .boxed();
+        }
+
+        let selected_peers = self.select_random_ready_peers(max_peers);
+        metrics::histogram!("peer.findblocks.fanout.peer.count")
+            .record(selected_peers.len() as f64);
+
+        let stall_tx = self.stall_event_tx.clone();
+        let mut pending_peers: HashSet<_> = selected_peers.iter().copied().collect();
+        let futs = FuturesUnordered::new();
+        for peer in selected_peers {
+            let mut svc = self
+                .take_ready_service(&peer)
+                .expect("selected peer must be ready");
+
+            let fut = svc.call(Request::FindBlocks {
+                known_blocks: known_blocks.clone(),
+                stop,
+            });
+            self.push_unready(peer, svc);
+
+            futs.push(async move {
+                let result = fut.await;
+                (peer, result)
+            });
+        }
+
+        async move {
+            let mut responses = Vec::new();
+            let mut futs = futs;
+            let response_window = tokio::time::sleep(FIND_BLOCKS_FANOUT_RESPONSE_WINDOW);
+            tokio::pin!(response_window);
+
+            loop {
+                tokio::select! {
+                    maybe_result = futs.next() => {
+                        let Some((peer, result)) = maybe_result else {
+                            break;
+                        };
+                        pending_peers.remove(&peer);
+
+                        match result {
+                            Ok(Response::BlockHashes(hashes)) => {
+                                metrics::counter!(
+                                    "peer.findblocks.fanout.response.count",
+                                    "result" => "hashes"
+                                )
+                                .increment(1);
+                                metrics::histogram!("peer.findblocks.fanout.response.hash.count")
+                                    .record(hashes.len() as f64);
+
+                                let outcome = if hashes.is_empty() {
+                                    StallOutcome::Stall
+                                } else {
+                                    StallOutcome::Clear
+                                };
+                                let _ = stall_tx.send((peer, outcome));
+
+                                responses.push((peer, hashes));
+                            }
+                            Ok(response) => {
+                                metrics::counter!(
+                                    "peer.findblocks.fanout.response.count",
+                                    "result" => "wrong_response"
+                                )
+                                .increment(1);
+                                let _ = stall_tx.send((peer, StallOutcome::Stall));
+                                tracing::debug!(?peer, ?response, "unexpected findblocks fanout response");
+                            }
+                            Err(error) => {
+                                metrics::counter!(
+                                    "peer.findblocks.fanout.response.count",
+                                    "result" => "error"
+                                )
+                                .increment(1);
+                                let _ = stall_tx.send((peer, StallOutcome::Stall));
+                                tracing::debug!(?peer, ?error, "findblocks fanout request failed");
+                            }
+                        }
+                    }
+                    _ = &mut response_window => {
+                        metrics::counter!("peer.findblocks.fanout.response.count", "result" => "window_elapsed")
+                            .increment(1);
+
+                        for peer in pending_peers.drain() {
+                            let _ = stall_tx.send((peer, StallOutcome::Stall));
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            Ok::<Response, BoxError>(Response::BlockHashesBySource(responses))
+        }
+        .map_err(Into::into)
+        .boxed()
+    }
+
     /// Tries to route a request to a ready peer that advertised that inventory,
     /// falling back to a ready peer that isn't missing the inventory.
     ///
@@ -993,12 +1158,210 @@ where
         req: Request,
         hash: InventoryHash,
     ) -> <Self as tower::Service<Request>>::Future {
-        let advertising_peer_list = self
+        self.route_inv_with_preferred(req, hash, HashSet::new(), true)
+    }
+
+    /// Routes a multi-inventory request to a preferred ready peer.
+    ///
+    /// If none of the preferred peers are ready, fails without falling back so
+    /// the syncer can refresh its source inventory.
+    fn route_preferred_batch(
+        &mut self,
+        req: Request,
+        preferred_peers: HashSet<PeerSocketAddr>,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let request_command = req.command();
+        let ready_peer_count = self.ready_services.len();
+        let preferred_peer_count = preferred_peers.len();
+        let preferred_connected_peer_count = preferred_peers
+            .iter()
+            .filter(|addr| self.has_peer_with_addr(**addr))
+            .count();
+        let preferred_peer_list: HashSet<PeerSocketAddr> = preferred_peers
+            .iter()
+            .filter(|addr| self.ready_services.contains_key(addr))
+            .copied()
+            .collect();
+        let preferred_ready_peer_count = preferred_peer_list.len();
+
+        let peer = self.select_p2c_peer_from_list(&preferred_peer_list);
+
+        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+            let peer = peer.expect("just checked peer is Some");
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "preferred_batch"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?peer,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_ready_peer_count,
+                route = "preferred_batch",
+                "routing inventory batch request"
+            );
+
+            let fut = svc.call(req);
+            self.push_unready(peer, svc);
+            return fut.map_err(Into::into).boxed();
+        }
+
+        metrics::counter!(
+            "peer.inventory.route.count",
+            "request" => request_command,
+            "route" => "preferred_batch_busy"
+        )
+        .increment(1);
+        tracing::debug!(
+            request = request_command,
+            ready_peer_count,
+            preferred_peer_count,
+            preferred_connected_peer_count,
+            preferred_ready_peer_count,
+            route = "preferred_batch_busy",
+            "preferred peers busy for inventory batch request"
+        );
+
+        async move {
+            tokio::time::sleep(SOURCE_PEER_BUSY_RETRY_DELAY).await;
+
+            if preferred_connected_peer_count > 0 {
+                Err(SharedPeerError::from(PeerError::PreferredPeersBusy))
+            } else {
+                Err(SharedPeerError::from(PeerError::NoReadyPeers))
+            }
+        }
+        .map_err(Into::into)
+        .boxed()
+    }
+
+    /// Tries to route a request to a preferred ready peer.
+    ///
+    /// If `allow_inventory_fallback` is true, falls back to peers that
+    /// advertised or might have the inventory.
+    fn route_inv_with_preferred(
+        &mut self,
+        req: Request,
+        hash: InventoryHash,
+        preferred_peers: HashSet<PeerSocketAddr>,
+        allow_inventory_fallback: bool,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let request_command = req.command();
+        let ready_peer_count = self.ready_services.len();
+        let advertising_peer_list: HashSet<PeerSocketAddr> = self
             .inventory_registry
             .advertising_peers(hash)
             .filter(|&addr| self.ready_services.contains_key(addr))
             .copied()
             .collect();
+        let advertising_peer_count = advertising_peer_list.len();
+
+        let missing_peer_list: HashSet<PeerSocketAddr> = self
+            .inventory_registry
+            .missing_peers(hash)
+            .copied()
+            .collect();
+        let ready_missing_peer_count = self
+            .ready_services
+            .keys()
+            .filter(|addr| missing_peer_list.contains(addr))
+            .count();
+        let maybe_peer_count = ready_peer_count.saturating_sub(ready_missing_peer_count);
+
+        let preferred_peer_count = preferred_peers.len();
+        let preferred_connected_peer_count = preferred_peers
+            .iter()
+            .filter(|addr| self.has_peer_with_addr(**addr))
+            .count();
+        let preferred_connected_not_missing_peer_count = preferred_peers
+            .iter()
+            .filter(|addr| self.has_peer_with_addr(**addr) && !missing_peer_list.contains(addr))
+            .count();
+        let preferred_missing_peer_count = preferred_peers
+            .iter()
+            .filter(|addr| missing_peer_list.contains(addr))
+            .count();
+        let preferred_peer_list: HashSet<PeerSocketAddr> = preferred_peers
+            .iter()
+            .filter(|addr| {
+                self.ready_services.contains_key(addr) && !missing_peer_list.contains(addr)
+            })
+            .copied()
+            .collect();
+        let preferred_ready_peer_count = preferred_peer_list.len();
+
+        // Prefer the peers that supplied the hashes, if they are ready and
+        // have not already told us they are missing this inventory.
+        let peer = self.select_p2c_peer_from_list(&preferred_peer_list);
+
+        if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
+            let peer = peer.expect("just checked peer is Some");
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "preferred"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?hash,
+                ?peer,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_connected_not_missing_peer_count,
+                preferred_ready_peer_count,
+                preferred_missing_peer_count,
+                advertising_peer_count,
+                missing_peer_count = ready_missing_peer_count,
+                maybe_peer_count,
+                route = "preferred",
+                "routing inventory request"
+            );
+            let fut = svc.call(req);
+            self.push_unready(peer, svc);
+            return fut.map_err(Into::into).boxed();
+        }
+
+        if !allow_inventory_fallback {
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "preferred_only_unavailable"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?hash,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_connected_not_missing_peer_count,
+                preferred_ready_peer_count,
+                preferred_missing_peer_count,
+                advertising_peer_count,
+                missing_peer_count = ready_missing_peer_count,
+                maybe_peer_count,
+                route = "preferred_only_unavailable",
+                "source-routed inventory request has no available preferred peer"
+            );
+
+            return async move {
+                tokio::time::sleep(SOURCE_PEER_BUSY_RETRY_DELAY).await;
+
+                if preferred_connected_not_missing_peer_count > 0 {
+                    Err(SharedPeerError::from(PeerError::PreferredPeersBusy))
+                } else {
+                    Err(SharedPeerError::from(PeerError::NoReadyPeers))
+                }
+            }
+            .map_err(Into::into)
+            .boxed();
+        }
 
         // # Security
         //
@@ -1012,18 +1375,70 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer which advertised inventory");
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "advertised"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?hash,
+                ?peer,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_connected_not_missing_peer_count,
+                preferred_ready_peer_count,
+                preferred_missing_peer_count,
+                advertising_peer_count,
+                missing_peer_count = ready_missing_peer_count,
+                maybe_peer_count,
+                route = "advertised",
+                "routing inventory request"
+            );
             let fut = svc.call(req);
             self.push_unready(peer, svc);
             return fut.map_err(Into::into).boxed();
         }
 
-        let missing_peer_list: HashSet<PeerSocketAddr> = self
-            .inventory_registry
-            .missing_peers(hash)
-            .copied()
-            .collect();
-        let maybe_peer_list = self
+        if preferred_peer_count > preferred_missing_peer_count {
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "preferred_busy"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?hash,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_connected_not_missing_peer_count,
+                preferred_ready_peer_count,
+                preferred_missing_peer_count,
+                advertising_peer_count,
+                missing_peer_count = ready_missing_peer_count,
+                maybe_peer_count,
+                route = "preferred_busy",
+                "preferred peers busy for inventory request"
+            );
+
+            return async move {
+                tokio::time::sleep(SOURCE_PEER_BUSY_RETRY_DELAY).await;
+
+                if preferred_connected_peer_count > 0 {
+                    Err(SharedPeerError::from(PeerError::PreferredPeersBusy))
+                } else {
+                    Err(SharedPeerError::from(PeerError::NoReadyPeers))
+                }
+            }
+            .map_err(Into::into)
+            .boxed();
+        }
+
+        let maybe_peer_list: HashSet<PeerSocketAddr> = self
             .ready_services
             .keys()
             .filter(|addr| !missing_peer_list.contains(addr))
@@ -1035,14 +1450,51 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer that might have inventory");
+            metrics::counter!(
+                "peer.inventory.route.count",
+                "request" => request_command,
+                "route" => "maybe"
+            )
+            .increment(1);
+            tracing::debug!(
+                ?hash,
+                ?peer,
+                request = request_command,
+                ready_peer_count,
+                preferred_peer_count,
+                preferred_connected_peer_count,
+                preferred_connected_not_missing_peer_count,
+                preferred_ready_peer_count,
+                preferred_missing_peer_count,
+                advertising_peer_count,
+                missing_peer_count = ready_missing_peer_count,
+                maybe_peer_count,
+                route = "maybe",
+                "routing inventory request"
+            );
             let fut = svc.call(req);
             self.push_unready(peer, svc);
             return fut.map_err(Into::into).boxed();
         }
 
+        metrics::counter!(
+            "peer.inventory.route.count",
+            "request" => request_command,
+            "route" => "all_missing"
+        )
+        .increment(1);
         tracing::debug!(
             ?hash,
+            request = request_command,
+            ready_peer_count,
+            preferred_peer_count,
+            preferred_connected_peer_count,
+            preferred_ready_peer_count,
+            preferred_missing_peer_count,
+            advertising_peer_count,
+            missing_peer_count = ready_missing_peer_count,
+            maybe_peer_count,
+            route = "all_missing",
             "all ready peers are missing inventory, failing request"
         );
 
@@ -1407,10 +1859,39 @@ where
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
+            Request::BlocksByHashFromPeers {
+                hashes,
+                preferred_peers,
+            } if hashes.len() == 1 => {
+                let hash = InventoryHash::from(*hashes.iter().next().unwrap());
+                let route_preferred_peers = preferred_peers.clone();
+                self.route_inv_with_preferred(
+                    Request::BlocksByHashFromPeers {
+                        hashes,
+                        preferred_peers,
+                    },
+                    hash,
+                    route_preferred_peers,
+                    false,
+                )
+            }
+            Request::BlocksByHashFromPeers {
+                ref preferred_peers,
+                ..
+            } => {
+                let route_preferred_peers = preferred_peers.clone();
+                self.route_preferred_batch(req, route_preferred_peers)
+            }
             Request::TransactionsById(ref hashes) if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
             }
+
+            Request::FindBlocksWithSources {
+                known_blocks,
+                stop,
+                max_peers,
+            } => self.route_find_blocks_with_sources(known_blocks, stop, max_peers),
 
             // Broadcast advertisements to lots of peers
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),

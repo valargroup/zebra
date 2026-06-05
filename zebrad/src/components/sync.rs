@@ -55,7 +55,16 @@ pub use recent_sync_lengths::RecentSyncLengths;
 pub use status::SyncStatus;
 
 /// Controls the number of peers used for each ObtainTips and ExtendTips request.
-const FANOUT: usize = 3;
+const FANOUT: usize = 16;
+/// Maximum number of source-routed blocks to request from one peer.
+///
+/// This matches the inbound `getdata` block response limit used by Zebra and
+/// zcashd. Larger requests can be silently truncated by peers and then wait
+/// until Zebra's connection receive timeout.
+const SOURCE_BLOCK_BATCH_SIZE: usize = super::inbound::GETDATA_MAX_BLOCK_COUNT;
+
+const SOURCE_STAGE_OBTAIN_TIPS: &str = "obtain_tips";
+const SOURCE_STAGE_EXTEND_TIPS: &str = "extend_tips";
 
 /// Controls how many times we will retry each block download.
 ///
@@ -318,6 +327,45 @@ struct CheckedTip {
     expected_next: block::Hash,
 }
 
+/// Block hashes waiting to be queued, with any peers that reported those hashes.
+#[derive(Debug, Default)]
+struct PendingBlockHashes {
+    hashes: IndexSet<block::Hash>,
+    sources: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+}
+
+impl PendingBlockHashes {
+    fn with_sources(
+        hashes: IndexSet<block::Hash>,
+        sources: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+    ) -> Self {
+        Self { hashes, sources }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    fn insert(&mut self, hash: block::Hash, sources: HashSet<PeerSocketAddr>) {
+        self.hashes.insert(hash);
+
+        if !sources.is_empty() {
+            self.sources.entry(hash).or_default().extend(sources);
+        }
+    }
+
+    fn merge(&mut self, mut other: PendingBlockHashes) {
+        for hash in other.hashes {
+            let sources = other.sources.remove(&hash).unwrap_or_default();
+            self.insert(hash, sources);
+        }
+    }
+}
+
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
@@ -394,6 +442,15 @@ where
     /// Queue-level retry counts for block hashes whose download failed with `notfound`.
     missing_block_retry_counts: HashMap<block::Hash, usize>,
 
+    /// Source peers for each currently queued block hash.
+    block_source_peers: HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+
+    /// Source-routed block hashes that should be queued again after source peers become ready.
+    deferred_block_hashes: PendingBlockHashes,
+
+    /// Whether the syncer should cancel queued downloads and refresh source peers.
+    refresh_source_inventory: bool,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -430,6 +487,53 @@ where
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
 {
+    fn record_source_counts(
+        stage: &'static str,
+        hashes: &IndexSet<block::Hash>,
+        sources: &HashMap<block::Hash, HashSet<PeerSocketAddr>>,
+    ) {
+        let mut sourced = 0;
+        let mut single_source = 0;
+
+        for hash in hashes {
+            let source_count = sources.get(hash).map_or(0, HashSet::len);
+
+            if source_count > 0 {
+                sourced += 1;
+            }
+
+            if source_count == 1 {
+                single_source += 1;
+            }
+
+            metrics::histogram!("sync.source.hash.source_count", "stage" => stage)
+                .record(source_count as f64);
+        }
+
+        metrics::gauge!("sync.source.hash.sourced.count", "stage" => stage).set(sourced as f64);
+        metrics::gauge!("sync.source.hash.single_source.count", "stage" => stage)
+            .set(single_source as f64);
+        metrics::gauge!("sync.source.hash.unsourced.count", "stage" => stage)
+            .set((hashes.len() - sourced) as f64);
+    }
+
+    fn record_source_branches(
+        stage: &'static str,
+        response_peer_count: usize,
+        accepted_response_count: usize,
+        discarded_response_count: usize,
+        unique_branches: usize,
+    ) {
+        metrics::histogram!("sync.source.response.peer_count", "stage" => stage)
+            .record(response_peer_count as f64);
+        metrics::histogram!("sync.source.response.accepted_count", "stage" => stage)
+            .record(accepted_response_count as f64);
+        metrics::histogram!("sync.source.response.discarded_count", "stage" => stage)
+            .record(discarded_response_count as f64);
+        metrics::histogram!("sync.source.response.unique_branch_count", "stage" => stage)
+            .record(unique_branches as f64);
+    }
+
     /// Returns a new syncer instance, using:
     ///  - chain: the zebra-chain `Network` to download (Mainnet or Testnet)
     ///  - peers: the zebra-network peers to contact for downloads
@@ -535,6 +639,9 @@ where
             prospective_tips: HashSet::new(),
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
+            block_source_peers: HashMap::new(),
+            deferred_block_hashes: PendingBlockHashes::default(),
+            refresh_source_inventory: false,
             past_lookahead_limit_receiver,
             misbehavior_sender,
         };
@@ -586,6 +693,9 @@ where
     async fn try_to_sync(&mut self) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
+        self.block_source_peers.clear();
+        self.deferred_block_hashes = PendingBlockHashes::default();
+        self.refresh_source_inventory = false;
 
         info!(
             state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -626,8 +736,8 @@ where
     #[instrument(skip(self, extra_hashes))]
     async fn try_to_sync_once(
         &mut self,
-        mut extra_hashes: IndexSet<block::Hash>,
-    ) -> Result<IndexSet<block::Hash>, Report> {
+        mut extra_hashes: PendingBlockHashes,
+    ) -> Result<PendingBlockHashes, Report> {
         // Check whether any block tasks are currently ready.
         while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
             // Some temporary errors are ignored, and syncing continues with other blocks.
@@ -635,6 +745,10 @@ where
             // the syncer will reset itself.
             self.handle_block_response_with_missing_retry(rsp).await?;
         }
+        if self.refresh_source_inventory {
+            return self.refresh_block_sources().await;
+        }
+        extra_hashes.merge(std::mem::take(&mut self.deferred_block_hashes));
         self.update_metrics();
 
         // Pause new downloads while the syncer or downloader are past their lookahead limits.
@@ -658,6 +772,10 @@ where
 
             self.handle_block_response_with_missing_retry(response)
                 .await?;
+            if self.refresh_source_inventory {
+                return self.refresh_block_sources().await;
+            }
+            extra_hashes.merge(std::mem::take(&mut self.deferred_block_hashes));
             self.update_metrics();
         }
 
@@ -672,7 +790,7 @@ where
                 "requesting more blocks",
             );
 
-            let response = self.request_blocks(extra_hashes).await;
+            let response = self.request_blocks_from_peers(extra_hashes).await;
             extra_hashes = Self::handle_hash_response(response)?;
         } else {
             info!(
@@ -697,7 +815,7 @@ where
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
-    async fn obtain_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+    async fn obtain_tips(&mut self) -> Result<PendingBlockHashes, Report> {
         let stage_start = std::time::Instant::now();
 
         let block_locator = self
@@ -722,7 +840,7 @@ where
         );
 
         let mut requests = FuturesUnordered::new();
-        for attempt in 0..FANOUT {
+        for attempt in 0..1 {
             if attempt > 0 {
                 // Let other tasks run, so we're more likely to choose a different peer.
                 //
@@ -732,16 +850,18 @@ where
 
             let ready_tip_network = self.tip_network.ready().await;
             requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                zn::Request::FindBlocks {
+                zn::Request::FindBlocksWithSources {
                     known_blocks: block_locator.clone(),
                     stop: None,
+                    max_peers: FANOUT,
                 },
             )));
         }
 
         let mut download_set = IndexSet::new();
+        let mut download_sources: HashMap<block::Hash, HashSet<PeerSocketAddr>> = HashMap::new();
         while let Some(res) = requests.next().await {
-            match res
+            let response = res
                 .unwrap_or_else(|e @ JoinError { .. }| {
                     if e.is_panic() {
                         panic!("panic in obtain tips task: {e:?}");
@@ -753,209 +873,80 @@ where
                         Err(e.into())
                     }
                 })
-                .map_err::<Report, _>(|e| eyre!(e))
-            {
-                Ok(zn::Response::BlockHashes(hashes)) => {
-                    trace!(?hashes);
+                .map_err::<Report, _>(|e| eyre!(e));
 
-                    // zcashd sometimes appends an unrelated hash at the start
-                    // or end of its response.
-                    //
-                    // We can't discard the first hash, because it might be a
-                    // block we want to download. So we just accept any
-                    // out-of-order first hashes.
-
-                    // We use the last hash for the tip, and we want to avoid bad
-                    // tips from zcashd's quirk of appending an unrelated hash.
-                    // So we discard the last hash on mainnet/testnet.
-                    // (We don't need to worry about missed downloads, because we
-                    // will pick them up again in ExtendTips.)
-                    //
-                    // In regtest we only connect to Zebra nodes, not zcashd,
-                    // so we trust all hashes in the response and keep them all.
-                    // This is necessary when there are only a small number of
-                    // blocks to sync (e.g. 2 new blocks), where stripping the
-                    // last hash leaves only 1 unknown hash and rchunks_exact(2)
-                    // would discard the entire response.
-                    let hashes = if self.is_regtest {
-                        hashes.as_slice()
-                    } else {
-                        match hashes.as_slice() {
-                            [] => continue,
-                            [rest @ .., _last] => rest,
-                        }
-                    };
-                    if hashes.is_empty() {
-                        continue;
-                    }
-
-                    let mut first_unknown = None;
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        if !self.state_contains(hash).await? {
-                            first_unknown = Some(i);
-                            break;
-                        }
-                    }
-
-                    debug!(hashes.len = ?hashes.len(), ?first_unknown);
-
-                    let unknown_hashes = if let Some(index) = first_unknown {
-                        &hashes[index..]
-                    } else {
-                        continue;
+            match response {
+                Ok(response) => {
+                    let sourced_hashes: Vec<_> = match response {
+                        zn::Response::BlockHashes(hashes) => vec![(None, hashes)],
+                        zn::Response::BlockHashesBySource(responses) => responses
+                            .into_iter()
+                            .map(|(peer, hashes)| (Some(peer), hashes))
+                            .collect(),
+                        _ => unreachable!("network returned wrong response"),
                     };
 
-                    trace!(?unknown_hashes);
+                    let response_peer_count = sourced_hashes.len();
+                    let mut accepted_response_count = 0;
+                    let mut discarded_response_count = 0;
+                    let mut unique_branches = HashSet::new();
 
-                    let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                        CheckedTip {
-                            tip: end[0],
-                            expected_next: end[1],
-                        }
-                    } else {
-                        debug!("discarding response that extends only one block");
-                        continue;
-                    };
-
-                    // Make sure we get the same tips, regardless of the
-                    // order of peer responses
-                    if !download_set.contains(&new_tip.expected_next) {
-                        debug!(?new_tip,
-                                        "adding new prospective tip, and removing existing tips in the new block hash list");
-                        self.prospective_tips
-                            .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                        self.prospective_tips.insert(new_tip);
-                    } else {
-                        debug!(
-                            ?new_tip,
-                            "discarding prospective tip: already in download set"
-                        );
-                    }
-
-                    // security: the first response determines our download order
-                    //
-                    // TODO: can we make the download order independent of response order?
-                    let prev_download_len = download_set.len();
-                    download_set.extend(unknown_hashes);
-                    let new_download_len = download_set.len();
-                    let new_hashes = new_download_len - prev_download_len;
-                    debug!(new_hashes, "added hashes to download set");
-                    metrics::histogram!("sync.obtain.response.hash.count")
-                        .record(new_hashes as f64);
-                }
-                Ok(_) => unreachable!("network returned wrong response"),
-                // We ignore this error because we made multiple fanout requests.
-                Err(e) => debug!(?e),
-            }
-        }
-
-        debug!(?self.prospective_tips);
-
-        // Check that the new tips we got are actually unknown.
-        for hash in &download_set {
-            debug!(?hash, "checking if state contains hash");
-            if self.state_contains(*hash).await? {
-                return Err(eyre!("queued download of hash behind our chain tip"));
-            }
-        }
-
-        let new_downloads = download_set.len();
-        debug!(new_downloads, "queueing new downloads");
-        metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
-
-        // security: use the actual number of new downloads from all peers,
-        // so the last peer to respond can't toggle our mempool
-        self.recent_syncs.push_obtain_tips_length(new_downloads);
-
-        let response = self.request_blocks(download_set).await;
-
-        metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
-            .record(stage_start.elapsed().as_secs_f64());
-
-        Self::handle_hash_response(response).map_err(Into::into)
-    }
-
-    #[instrument(skip(self))]
-    async fn extend_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
-        let stage_start = std::time::Instant::now();
-
-        let tips = std::mem::take(&mut self.prospective_tips);
-
-        let mut download_set = IndexSet::new();
-        debug!(tips = ?tips.len(), "trying to extend chain tips");
-        for tip in tips {
-            debug!(?tip, "asking peers to extend chain tip");
-            let mut responses = FuturesUnordered::new();
-            for attempt in 0..FANOUT {
-                if attempt > 0 {
-                    // Let other tasks run, so we're more likely to choose a different peer.
-                    //
-                    // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
-                    tokio::task::yield_now().await;
-                }
-
-                let ready_tip_network = self.tip_network.ready().await;
-                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                    zn::Request::FindBlocks {
-                        known_blocks: vec![tip.tip],
-                        stop: None,
-                    },
-                )));
-            }
-            while let Some(res) = responses.next().await {
-                match res
-                    .expect("panic in spawned extend tips request")
-                    .map_err::<Report, _>(|e| eyre!(e))
-                {
-                    Ok(zn::Response::BlockHashes(hashes)) => {
-                        debug!(first = ?hashes.first(), len = ?hashes.len());
+                    for (source_peer, hashes) in sourced_hashes {
                         trace!(?hashes);
 
-                        // zcashd sometimes appends an unrelated hash at the
-                        // start or end of its response. Check the first hash
-                        // against the previous response, and discard mismatches.
-                        let unknown_hashes = match hashes.as_slice() {
-                            [expected_hash, rest @ ..] if expected_hash == &tip.expected_next => {
-                                rest
+                        // zcashd sometimes appends an unrelated hash at the start
+                        // or end of its response.
+                        //
+                        // We can't discard the first hash, because it might be a
+                        // block we want to download. So we just accept any
+                        // out-of-order first hashes.
+
+                        // We use the last hash for the tip, and we want to avoid bad
+                        // tips from zcashd's quirk of appending an unrelated hash.
+                        // So we discard the last hash on mainnet/testnet.
+                        // (We don't need to worry about missed downloads, because we
+                        // will pick them up again in ExtendTips.)
+                        //
+                        // In regtest we only connect to Zebra nodes, not zcashd,
+                        // so we trust all hashes in the response and keep them all.
+                        // This is necessary when there are only a small number of
+                        // blocks to sync (e.g. 2 new blocks), where stripping the
+                        // last hash leaves only 1 unknown hash and rchunks_exact(2)
+                        // would discard the entire response.
+                        let hashes = if self.is_regtest {
+                            hashes.as_slice()
+                        } else {
+                            match hashes.as_slice() {
+                                [] => {
+                                    discarded_response_count += 1;
+                                    continue;
+                                }
+                                [rest @ .., _last] => rest,
                             }
-                            // If the first hash doesn't match, retry with the second.
-                            [first_hash, expected_hash, rest @ ..]
-                                if expected_hash == &tip.expected_next =>
-                            {
-                                debug!(?first_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "unexpected first hash, but the second matches: using the hashes after the match");
-                                rest
+                        };
+                        if hashes.is_empty() {
+                            discarded_response_count += 1;
+                            continue;
+                        }
+
+                        let mut first_unknown = None;
+                        for (i, &hash) in hashes.iter().enumerate() {
+                            if !self.state_contains(hash).await? {
+                                first_unknown = Some(i);
+                                break;
                             }
-                            // We ignore these responses
-                            [] => continue,
-                            [single_hash] => {
-                                debug!(?single_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response containing a single unexpected hash");
-                                continue;
-                            }
-                            [first_hash, second_hash, rest @ ..] => {
-                                debug!(?first_hash,
-                                                ?second_hash,
-                                                rest_len = ?rest.len(),
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response that starts with two unexpected hashes");
-                                continue;
-                            }
+                        }
+
+                        debug!(hashes.len = ?hashes.len(), ?first_unknown);
+
+                        let unknown_hashes = if let Some(index) = first_unknown {
+                            &hashes[index..]
+                        } else {
+                            discarded_response_count += 1;
+                            continue;
                         };
 
-                        // We use the last hash for the tip, and we want to avoid
-                        // bad tips. So we discard the last hash. (We don't need
-                        // to worry about missed downloads, because we will pick
-                        // them up again in the next ExtendTips.)
-                        let unknown_hashes = match unknown_hashes {
-                            [] => continue,
-                            [rest @ .., _last] => rest,
-                        };
+                        trace!(?unknown_hashes);
 
                         let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
                             CheckedTip {
@@ -964,16 +955,29 @@ where
                             }
                         } else {
                             debug!("discarding response that extends only one block");
+                            discarded_response_count += 1;
                             continue;
                         };
 
-                        trace!(?unknown_hashes);
+                        accepted_response_count += 1;
+                        metrics::histogram!(
+                            "sync.source.response.unknown_hash_count",
+                            "stage" => SOURCE_STAGE_OBTAIN_TIPS
+                        )
+                        .record(unknown_hashes.len() as f64);
+                        unique_branches.insert(unknown_hashes.to_vec());
+
+                        if let Some(peer) = source_peer {
+                            for hash in unknown_hashes {
+                                download_sources.entry(*hash).or_default().insert(peer);
+                            }
+                        }
 
                         // Make sure we get the same tips, regardless of the
                         // order of peer responses
                         if !download_set.contains(&new_tip.expected_next) {
                             debug!(?new_tip,
-                                            "adding new prospective tip, and removing any existing tips in the new block hash list");
+                                        "adding new prospective tip, and removing existing tips in the new block hash list");
                             self.prospective_tips
                                 .retain(|t| !unknown_hashes.contains(&t.expected_next));
                             self.prospective_tips.insert(new_tip);
@@ -992,15 +996,236 @@ where
                         let new_download_len = download_set.len();
                         let new_hashes = new_download_len - prev_download_len;
                         debug!(new_hashes, "added hashes to download set");
-                        metrics::histogram!("sync.extend.response.hash.count")
+                        metrics::histogram!("sync.obtain.response.hash.count")
                             .record(new_hashes as f64);
                     }
-                    Ok(_) => unreachable!("network returned wrong response"),
+
+                    Self::record_source_branches(
+                        SOURCE_STAGE_OBTAIN_TIPS,
+                        response_peer_count,
+                        accepted_response_count,
+                        discarded_response_count,
+                        unique_branches.len(),
+                    );
+                }
+                // We ignore this error because we made multiple fanout requests.
+                Err(e) => debug!(?e),
+            }
+        }
+
+        debug!(?self.prospective_tips);
+
+        // Check that the new tips we got are actually unknown.
+        for hash in &download_set {
+            debug!(?hash, "checking if state contains hash");
+            if self.state_contains(*hash).await? {
+                return Err(eyre!("queued download of hash behind our chain tip"));
+            }
+        }
+
+        Self::record_source_counts(SOURCE_STAGE_OBTAIN_TIPS, &download_set, &download_sources);
+
+        let new_downloads = download_set.len();
+        debug!(new_downloads, "queueing new downloads");
+        metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
+
+        // security: use the actual number of new downloads from all peers,
+        // so the last peer to respond can't toggle our mempool
+        self.recent_syncs.push_obtain_tips_length(new_downloads);
+
+        let response = self
+            .request_blocks_from_peers(PendingBlockHashes::with_sources(
+                download_set,
+                download_sources,
+            ))
+            .await;
+
+        metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
+            .record(stage_start.elapsed().as_secs_f64());
+
+        Self::handle_hash_response(response).map_err(Into::into)
+    }
+
+    #[instrument(skip(self))]
+    async fn extend_tips(&mut self) -> Result<PendingBlockHashes, Report> {
+        let stage_start = std::time::Instant::now();
+
+        let tips = std::mem::take(&mut self.prospective_tips);
+
+        let mut download_set = IndexSet::new();
+        let mut download_sources: HashMap<block::Hash, HashSet<PeerSocketAddr>> = HashMap::new();
+        debug!(tips = ?tips.len(), "trying to extend chain tips");
+        for tip in tips {
+            debug!(?tip, "asking peers to extend chain tip");
+            let mut responses = FuturesUnordered::new();
+            for attempt in 0..1 {
+                if attempt > 0 {
+                    // Let other tasks run, so we're more likely to choose a different peer.
+                    //
+                    // TODO: move fanouts into the PeerSet, so we always choose different peers (#2214)
+                    tokio::task::yield_now().await;
+                }
+
+                let ready_tip_network = self.tip_network.ready().await;
+                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+                    zn::Request::FindBlocksWithSources {
+                        known_blocks: vec![tip.tip],
+                        stop: None,
+                        max_peers: FANOUT,
+                    },
+                )));
+            }
+            while let Some(res) = responses.next().await {
+                let response = res
+                    .expect("panic in spawned extend tips request")
+                    .map_err::<Report, _>(|e| eyre!(e));
+
+                match response {
+                    Ok(response) => {
+                        let sourced_hashes: Vec<_> = match response {
+                            zn::Response::BlockHashes(hashes) => vec![(None, hashes)],
+                            zn::Response::BlockHashesBySource(responses) => responses
+                                .into_iter()
+                                .map(|(peer, hashes)| (Some(peer), hashes))
+                                .collect(),
+                            _ => unreachable!("network returned wrong response"),
+                        };
+
+                        let response_peer_count = sourced_hashes.len();
+                        let mut accepted_response_count = 0;
+                        let mut discarded_response_count = 0;
+                        let mut unique_branches = HashSet::new();
+
+                        for (source_peer, hashes) in sourced_hashes {
+                            debug!(first = ?hashes.first(), len = ?hashes.len());
+                            trace!(?hashes);
+
+                            // zcashd sometimes appends an unrelated hash at the
+                            // start or end of its response. Check the first hash
+                            // against the previous response, and discard mismatches.
+                            let unknown_hashes = match hashes.as_slice() {
+                                [expected_hash, rest @ ..]
+                                    if expected_hash == &tip.expected_next =>
+                                {
+                                    rest
+                                }
+                                // If the first hash doesn't match, retry with the second.
+                                [first_hash, expected_hash, rest @ ..]
+                                    if expected_hash == &tip.expected_next =>
+                                {
+                                    debug!(?first_hash,
+                                                ?tip.expected_next,
+                                                ?tip.tip,
+                                                "unexpected first hash, but the second matches: using the hashes after the match");
+                                    rest
+                                }
+                                // We ignore these responses
+                                [] => {
+                                    discarded_response_count += 1;
+                                    continue;
+                                }
+                                [single_hash] => {
+                                    debug!(?single_hash,
+                                                ?tip.expected_next,
+                                                ?tip.tip,
+                                                "discarding response containing a single unexpected hash");
+                                    discarded_response_count += 1;
+                                    continue;
+                                }
+                                [first_hash, second_hash, rest @ ..] => {
+                                    debug!(?first_hash,
+                                                ?second_hash,
+                                                rest_len = ?rest.len(),
+                                                ?tip.expected_next,
+                                                ?tip.tip,
+                                                "discarding response that starts with two unexpected hashes");
+                                    discarded_response_count += 1;
+                                    continue;
+                                }
+                            };
+
+                            // We use the last hash for the tip, and we want to avoid
+                            // bad tips. So we discard the last hash. (We don't need
+                            // to worry about missed downloads, because we will pick
+                            // them up again in the next ExtendTips.)
+                            let unknown_hashes = match unknown_hashes {
+                                [] => {
+                                    discarded_response_count += 1;
+                                    continue;
+                                }
+                                [rest @ .., _last] => rest,
+                            };
+
+                            let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next()
+                            {
+                                CheckedTip {
+                                    tip: end[0],
+                                    expected_next: end[1],
+                                }
+                            } else {
+                                debug!("discarding response that extends only one block");
+                                discarded_response_count += 1;
+                                continue;
+                            };
+
+                            trace!(?unknown_hashes);
+
+                            accepted_response_count += 1;
+                            metrics::histogram!(
+                                "sync.source.response.unknown_hash_count",
+                                "stage" => SOURCE_STAGE_EXTEND_TIPS
+                            )
+                            .record(unknown_hashes.len() as f64);
+                            unique_branches.insert(unknown_hashes.to_vec());
+
+                            if let Some(peer) = source_peer {
+                                for hash in unknown_hashes {
+                                    download_sources.entry(*hash).or_default().insert(peer);
+                                }
+                            }
+
+                            // Make sure we get the same tips, regardless of the
+                            // order of peer responses
+                            if !download_set.contains(&new_tip.expected_next) {
+                                debug!(?new_tip,
+                                            "adding new prospective tip, and removing any existing tips in the new block hash list");
+                                self.prospective_tips
+                                    .retain(|t| !unknown_hashes.contains(&t.expected_next));
+                                self.prospective_tips.insert(new_tip);
+                            } else {
+                                debug!(
+                                    ?new_tip,
+                                    "discarding prospective tip: already in download set"
+                                );
+                            }
+
+                            // security: the first response determines our download order
+                            //
+                            // TODO: can we make the download order independent of response order?
+                            let prev_download_len = download_set.len();
+                            download_set.extend(unknown_hashes);
+                            let new_download_len = download_set.len();
+                            let new_hashes = new_download_len - prev_download_len;
+                            debug!(new_hashes, "added hashes to download set");
+                            metrics::histogram!("sync.extend.response.hash.count")
+                                .record(new_hashes as f64);
+                        }
+
+                        Self::record_source_branches(
+                            SOURCE_STAGE_EXTEND_TIPS,
+                            response_peer_count,
+                            accepted_response_count,
+                            discarded_response_count,
+                            unique_branches.len(),
+                        );
+                    }
                     // We ignore this error because we made multiple fanout requests.
                     Err(e) => debug!(?e),
                 }
             }
         }
+
+        Self::record_source_counts(SOURCE_STAGE_EXTEND_TIPS, &download_set, &download_sources);
 
         let new_downloads = download_set.len();
         debug!(new_downloads, "queueing new downloads");
@@ -1010,7 +1235,12 @@ where
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_extend_tips_length(new_downloads);
 
-        let response = self.request_blocks(download_set).await;
+        let response = self
+            .request_blocks_from_peers(PendingBlockHashes::with_sources(
+                download_set,
+                download_sources,
+            ))
+            .await;
 
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
             .record(stage_start.elapsed().as_secs_f64());
@@ -1079,32 +1309,129 @@ where
         Ok(response)
     }
 
-    /// Queue download and verify tasks for each block that isn't currently known to our node.
-    ///
-    /// TODO: turn obtain and extend tips into a separate task, which sends hashes via a channel?
-    async fn request_blocks(
+    /// Queue download and verify tasks, preferring known source peers for each hash.
+    async fn request_blocks_from_peers(
         &mut self,
-        mut hashes: IndexSet<block::Hash>,
-    ) -> Result<IndexSet<block::Hash>, BlockDownloadVerifyError> {
-        let lookahead_limit = self.lookahead_limit(hashes.len());
+        mut pending_hashes: PendingBlockHashes,
+    ) -> Result<PendingBlockHashes, BlockDownloadVerifyError> {
+        let lookahead_limit = self.lookahead_limit(pending_hashes.hashes.len());
 
         debug!(
-            hashes.len = hashes.len(),
+            hashes.len = pending_hashes.hashes.len(),
             ?lookahead_limit,
             "requesting blocks",
         );
 
-        let extra_hashes = if hashes.len() > lookahead_limit {
-            hashes.split_off(lookahead_limit)
+        let extra_hashes = if pending_hashes.hashes.len() > lookahead_limit {
+            pending_hashes.hashes.split_off(lookahead_limit)
         } else {
             IndexSet::new()
         };
-
-        for hash in hashes.into_iter() {
-            self.downloads.download_and_verify(hash).await?;
+        let mut extra_sources = HashMap::new();
+        for hash in extra_hashes.iter() {
+            if let Some(sources) = pending_hashes.sources.remove(hash) {
+                extra_sources.insert(*hash, sources);
+            }
         }
 
-        Ok(extra_hashes)
+        let sourced_hashes = pending_hashes
+            .hashes
+            .iter()
+            .filter(|hash| {
+                pending_hashes
+                    .sources
+                    .get(hash)
+                    .is_some_and(|peers| !peers.is_empty())
+            })
+            .count();
+        metrics::gauge!("sync.queued.sourced.hash.count").set(sourced_hashes as f64);
+        metrics::gauge!("sync.queued.unsourced.hash.count")
+            .set((pending_hashes.hashes.len() - sourced_hashes) as f64);
+
+        let ordered_hashes: Vec<_> = pending_hashes.hashes.into_iter().collect();
+        let mut index = 0;
+
+        while index < ordered_hashes.len() {
+            let hash = ordered_hashes[index];
+            let mut preferred_peers = pending_hashes
+                .sources
+                .get(&hash)
+                .cloned()
+                .unwrap_or_default();
+
+            if preferred_peers.is_empty() {
+                self.block_source_peers.remove(&hash);
+                self.downloads
+                    .download_and_verify_from_peers(hash, HashSet::new())
+                    .await?;
+
+                index += 1;
+                continue;
+            }
+
+            let mut batch = Vec::with_capacity(SOURCE_BLOCK_BATCH_SIZE);
+            batch.push(hash);
+
+            let mut next_index = index + 1;
+            while batch.len() < SOURCE_BLOCK_BATCH_SIZE && next_index < ordered_hashes.len() {
+                let candidate_hash = ordered_hashes[next_index];
+                let Some(candidate_peers) = pending_hashes.sources.get(&candidate_hash) else {
+                    break;
+                };
+
+                let shared_peers = preferred_peers
+                    .intersection(candidate_peers)
+                    .copied()
+                    .collect::<HashSet<_>>();
+
+                if shared_peers.is_empty() {
+                    break;
+                }
+
+                batch.push(candidate_hash);
+                preferred_peers = shared_peers;
+                next_index += 1;
+            }
+
+            metrics::histogram!("sync.source.batch.queued.size").record(batch.len() as f64);
+            metrics::histogram!("sync.source.batch.shared.peer.count")
+                .record(preferred_peers.len() as f64);
+
+            for batch_hash in &batch {
+                if let Some(sources) = pending_hashes.sources.get(batch_hash).cloned() {
+                    self.block_source_peers.insert(*batch_hash, sources);
+                }
+            }
+
+            self.downloads
+                .download_and_verify_batch_from_peers(batch, preferred_peers)
+                .await?;
+
+            index = next_index;
+        }
+
+        Ok(PendingBlockHashes::with_sources(
+            extra_hashes,
+            extra_sources,
+        ))
+    }
+
+    /// Cancel queued downloads and immediately obtain fresh source peers from the current state tip.
+    async fn refresh_block_sources(&mut self) -> Result<PendingBlockHashes, Report> {
+        info!(
+            state_tip = ?self.latest_chain_tip.best_tip_height(),
+            "refreshing block source inventory"
+        );
+        metrics::counter!("sync.source.refresh.count").increment(1);
+
+        self.refresh_source_inventory = false;
+        self.downloads.cancel_all();
+        self.prospective_tips.clear();
+        self.missing_block_retry_counts.clear();
+        self.block_source_peers.clear();
+        self.deferred_block_hashes = PendingBlockHashes::default();
+
+        self.obtain_tips().await
     }
 
     /// The configured lookahead limit, based on the currently verified height,
@@ -1195,6 +1522,48 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
+            self.block_source_peers.remove(hash);
+        }
+
+        if let Some(hash) = response
+            .as_ref()
+            .err()
+            .and_then(BlockDownloadVerifyError::preferred_peers_busy_download_hash)
+            .filter(|hash| self.block_source_peers.contains_key(hash))
+        {
+            let sources = self
+                .block_source_peers
+                .get(&hash)
+                .cloned()
+                .unwrap_or_default();
+
+            info!(
+                ?hash,
+                source_peer_count = sources.len(),
+                "source peers busy, deferring block download"
+            );
+            metrics::counter!("sync.source.peer.busy.deferred.count").increment(1);
+            self.deferred_block_hashes.insert(hash, sources);
+
+            return Ok(());
+        }
+
+        if let Some(hash) = response
+            .as_ref()
+            .err()
+            .and_then(BlockDownloadVerifyError::no_ready_peers_download_hash)
+            .filter(|hash| self.block_source_peers.contains_key(hash))
+        {
+            let source_peer_count = self.block_source_peers.get(&hash).map_or(0, HashSet::len);
+
+            info!(
+                ?hash,
+                source_peer_count, "source peers unavailable, refreshing source inventory"
+            );
+            metrics::counter!("sync.source.peer.unavailable.refresh.count").increment(1);
+            self.refresh_source_inventory = true;
+
+            return Ok(());
         }
 
         if let Some(hash) = response
@@ -1203,6 +1572,11 @@ where
             .and_then(BlockDownloadVerifyError::not_found_download_hash)
         {
             let retry_count = self.missing_block_retry_counts.entry(hash).or_default();
+            let preferred_peers = self
+                .block_source_peers
+                .get(&hash)
+                .cloned()
+                .unwrap_or_default();
 
             if *retry_count < MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT {
                 *retry_count += 1;
@@ -1211,11 +1585,16 @@ where
                     ?hash,
                     retry_attempt = *retry_count,
                     retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                    source_peer_count = preferred_peers.len(),
                     "missing sync block download failed, retrying required block"
                 );
                 metrics::counter!("sync.missing.block.requeued.count").increment(1);
 
-                match self.downloads.download_and_verify(hash).await {
+                match self
+                    .downloads
+                    .download_and_verify_from_peers(hash, preferred_peers)
+                    .await
+                {
                     Ok(()) => return Ok(()),
                     Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
                         return Ok(());
@@ -1224,14 +1603,18 @@ where
                 }
             } else {
                 self.missing_block_retry_counts.remove(&hash);
+                self.block_source_peers.remove(&hash);
 
                 warn!(
                     ?hash,
                     retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
                     error = ?response.as_ref().expect_err("checked for notfound error"),
-                    "missing sync block retry limit exhausted, restarting sync"
+                    "missing sync block retry limit exhausted, refreshing source inventory"
                 );
                 metrics::counter!("sync.missing.block.retry.limit.count").increment(1);
+                self.refresh_source_inventory = true;
+
+                return Ok(());
             }
         }
 
@@ -1245,11 +1628,11 @@ where
     /// See [`Self::handle_response`] for more details.
     #[allow(unknown_lints)]
     fn handle_hash_response(
-        response: Result<IndexSet<block::Hash>, BlockDownloadVerifyError>,
-    ) -> Result<IndexSet<block::Hash>, BlockDownloadVerifyError> {
+        response: Result<PendingBlockHashes, BlockDownloadVerifyError>,
+    ) -> Result<PendingBlockHashes, BlockDownloadVerifyError> {
         match response {
             Ok(extra_hashes) => Ok(extra_hashes),
-            Err(_) => Self::handle_response(response).map(|()| IndexSet::new()),
+            Err(_) => Self::handle_response(response).map(|()| PendingBlockHashes::default()),
         }
     }
 
@@ -1305,6 +1688,17 @@ where
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
                 debug!(error = ?e, "block was already verified or committed, possibly from a previous sync run, continuing");
+                false
+            }
+            BlockDownloadVerifyError::Invalid {
+                error,
+                advertiser_addr: Some(_),
+                ..
+            } if error.misbehavior_score() != 0 => {
+                debug!(
+                    error = ?e,
+                    "downloaded invalid block from peer, dropping it and continuing sync"
+                );
                 false
             }
 

@@ -102,6 +102,9 @@ impl VerifyBlockError {
         match self {
             VerifyBlockError::Block { source, .. } => source.is_duplicate_request(),
             VerifyBlockError::Commit(commit_err) => commit_err.is_duplicate_request(),
+            VerifyBlockError::StateService { source, .. } => source
+                .downcast_ref::<zs::CommitSemanticallyVerifiedError>()
+                .is_some_and(zs::CommitSemanticallyVerifiedError::is_duplicate_request),
             _ => false,
         }
     }

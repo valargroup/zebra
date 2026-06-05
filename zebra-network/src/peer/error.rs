@@ -86,6 +86,10 @@ pub enum PeerError {
     #[error("No ready peers available")]
     NoReadyPeers,
 
+    /// The requested source peers are connected, but currently busy.
+    #[error("Preferred peers are connected but busy")]
+    PreferredPeersBusy,
+
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
     #[error("Internal services timed out")]
@@ -152,6 +156,7 @@ impl PeerError {
             PeerError::DuplicateHandshake => "DuplicateHandshake".into(),
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
+            PeerError::PreferredPeersBusy => "PreferredPeersBusy".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   download concurrency to 100, increase the default peer target size to 100, and
   cap inbound peers at the peer target size.
 
+### Breaking Changes
+
+- `zebra-network` library consumers must handle the new source-aware block sync
+  `Request`, `Response`, and `PeerError` enum variants.
+
 ### Fixed
 
 - Make `zebra-rollback-state` rollback existing v5 databases without replaying
@@ -29,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   correctly.
 - Retry missing block downloads inside the active sync round, avoiding long
   stalls when a peer reports `notfound` for a required block hash.
+- Batch source-routed sync block downloads and refresh source inventory when
+  source peers are unavailable, avoiding restart-prone stale inventory requests.
 
 ## [Zebra 5.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v5.0.0) - 2026-06-02
 
