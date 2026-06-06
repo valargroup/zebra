@@ -2,7 +2,8 @@
 
 `unity-node` is a Rust launcher that runs:
 - `zebrad` as the primary consensus process
-- `zcashd` as a wallet follower (`connect=127.0.0.1:<zebra_p2p>`)
+- `zallet` as the preferred wallet-service (optional in manifest)
+- `zcashd` as an optional fallback wallet provider (`connect=127.0.0.1:<zebra_p2p>`)
 
 ## Commands
 
@@ -16,8 +17,16 @@
 ## Behavior
 
 - Verifies pinned binary hashes from `manifest.toml` before launch.
-- Renders `zebra.toml` and `zcash.conf` under `<state-dir>/<network>/`.
-- Startup order: `zebrad` first, then `zcashd`.
+- Renders `zebra.toml`, `zcash.conf`, and `zallet.toml` under `<state-dir>/<network>/`.
+- Startup order: `zebrad`, then optional `zallet`, then optional `zcashd` fallback.
+- Writes `run/wallet-routing.json` with the current P0 wallet routing assignment.
+- `zcashd` startup is controlled by wallet routing fallback needs.
+- Fallback metadata includes all zcashd-supported wallet methods grouped by `P0`/`P1`/`P2`.
+- `zallet` bootstrap prerequisites are enforced before startup:
+  - schema-compatible `zallet.toml` in `<state-dir>/<network>/zallet/zallet.toml`,
+  - an age identity file at `<state-dir>/<network>/zallet/encryption-identity.txt`.
+- `unity-node` attempts to generate the identity file with `rage-keygen` / `age-keygen` when missing.
+- Readiness gates include zallet JSON-RPC (`getwalletinfo`) when zallet is enabled.
 - `--network mainnet-like` runs a private, height-0 profile on Zebra's Regtest engine with:
   - compressed mainnet-like activation sequence (`Overwinter` through `NU6.2` at low private heights),
   - `disable_pow = true`,
@@ -39,6 +48,7 @@
   - Re-checks canonical single-peer isolation during the window
 - Uses PID files for lifecycle:
   - `<state-dir>/<network>/run/zebrad.pid`
+  - `<state-dir>/<network>/run/zallet.pid`
   - `<state-dir>/<network>/run/zcashd.pid`
   - `<state-dir>/<network>/run/producer.pid`
 
@@ -67,3 +77,8 @@ Use this for a private height-0 network where `zebrad` is primary and `zcashd` f
 - Canonical divergence (`zcashd ahead of zebra`):
   - Check `/var/lib/unity-node/mainnet-like/logs/producer.log` and `zebrad.log` for `submitblock rejected`.
   - Restart with clean state directory and confirm peer isolation (`zcashd peers: 1`, addr `127.0.0.1:19235`).
+- Zallet fails with `Failed to fetch blockchain info`:
+  - Verify Zebra RPC is healthy and cookie auth is enabled.
+  - Confirm zallet config points indexer validator settings to Zebra (`127.0.0.1:9232` in mainnet-like) and the cookie path under `cookies/zebra/.cookie`.
+- Zallet fails with missing encryption identity:
+  - Ensure `rage-keygen` is installed or manually create `<state-dir>/<network>/zallet/encryption-identity.txt`.

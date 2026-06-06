@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -47,6 +48,22 @@ impl Network {
         }
     }
 
+    pub fn zallet_rpc_port(self) -> u16 {
+        match self {
+            Self::Regtest => 28233,
+            Self::Testnet => 38233,
+            Self::MainnetLike => 29233,
+        }
+    }
+
+    pub fn wallet_facade_rpc_port(self) -> u16 {
+        match self {
+            Self::Regtest => 8181,
+            Self::Testnet => 9181,
+            Self::MainnetLike => 10181,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Regtest => "regtest",
@@ -63,14 +80,25 @@ impl Network {
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
     pub zebra: BinarySpec,
-    pub zcashd: BinarySpec,
+    pub zcashd: Option<BinarySpec>,
+    pub zallet: Option<BinarySpec>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BinarySpec {
     pub path: PathBuf,
     pub version: String,
     pub sha256: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,13 +113,18 @@ pub struct Layout {
     pub logs_dir: PathBuf,
     pub zebra_dir: PathBuf,
     pub zcashd_dir: PathBuf,
+    pub zallet_dir: PathBuf,
     pub cookie_dir: PathBuf,
     pub zebra_conf: PathBuf,
     pub zcashd_conf: PathBuf,
+    pub zallet_conf: PathBuf,
     pub creds_file: PathBuf,
     pub zebra_pid: PathBuf,
     pub zcashd_pid: PathBuf,
+    pub zallet_pid: PathBuf,
+    pub facade_pid: PathBuf,
     pub producer_pid: PathBuf,
+    pub routing_metadata_file: PathBuf,
 }
 
 impl Layout {
@@ -101,13 +134,18 @@ impl Layout {
         let logs_dir = network_dir.join("logs");
         let zebra_dir = network_dir.join("zebra");
         let zcashd_dir = network_dir.join("zcashd");
+        let zallet_dir = network_dir.join("zallet");
         let cookie_dir = network_dir.join("cookies").join("zebra");
         let zebra_conf = network_dir.join("zebra.toml");
         let zcashd_conf = network_dir.join("zcash.conf");
+        let zallet_conf = zallet_dir.join("zallet.toml");
         let creds_file = network_dir.join("rpc-creds.toml");
         let zebra_pid = run_dir.join("zebrad.pid");
         let zcashd_pid = run_dir.join("zcashd.pid");
+        let zallet_pid = run_dir.join("zallet.pid");
+        let facade_pid = run_dir.join("wallet-facade.pid");
         let producer_pid = run_dir.join("producer.pid");
+        let routing_metadata_file = run_dir.join("wallet-routing.json");
 
         Self {
             network_dir,
@@ -115,13 +153,18 @@ impl Layout {
             logs_dir,
             zebra_dir,
             zcashd_dir,
+            zallet_dir,
             cookie_dir,
             zebra_conf,
             zcashd_conf,
+            zallet_conf,
             creds_file,
             zebra_pid,
             zcashd_pid,
+            zallet_pid,
+            facade_pid,
             producer_pid,
+            routing_metadata_file,
         }
     }
 
@@ -132,6 +175,7 @@ impl Layout {
             &self.logs_dir,
             &self.zebra_dir,
             &self.zcashd_dir,
+            &self.zallet_dir,
             &self.cookie_dir,
         ] {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -283,6 +327,68 @@ i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
     )
 }
 
+pub fn render_zallet_config(layout: &Layout, network: Network, creds: &RpcCredentials) -> String {
+    let zebra_rpc = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), network.zebra_rpc_port());
+    let zallet_rpc = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), network.zallet_rpc_port());
+    let zallet_network = match network {
+        Network::Regtest | Network::MainnetLike => "regtest",
+        Network::Testnet => "test",
+    };
+    format!(
+        r#"[builder]
+spend_zeroconf_change = true
+trusted_confirmations = 3
+tx_expiry_delta = 40
+untrusted_confirmations = 10
+
+[builder.limits]
+orchard_actions = 50
+
+[consensus]
+network = "{zallet_network}"
+
+[database]
+wallet = "wallet.db"
+
+[external]
+broadcast = true
+
+[features]
+as_of_version = "0.1.0-alpha.3"
+
+[features.deprecated]
+
+[features.experimental]
+
+[indexer]
+validator_address = "{zebra_rpc}"
+validator_cookie_path = "{cookie_path}"
+
+[keystore]
+encryption_identity = "encryption-identity.txt"
+require_backup = false
+
+[note_management]
+min_note_value = 1000000
+target_note_count = 4
+
+[rpc]
+bind = ["{zallet_rpc}"]
+timeout = 30
+
+[[rpc.auth]]
+user = "{rpc_user}"
+password = "{rpc_password}"
+"#,
+        zallet_network = zallet_network,
+        zebra_rpc = zebra_rpc,
+        cookie_path = layout.cookie_dir.join(".cookie").display(),
+        zallet_rpc = zallet_rpc,
+        rpc_user = creds.user,
+        rpc_password = creds.password
+    )
+}
+
 pub fn write_configs(
     layout: &Layout,
     network: Network,
@@ -297,6 +403,10 @@ pub fn write_configs(
     let zcashd_conf = render_zcashd_config(layout, network, creds);
     fs::write(&layout.zcashd_conf, zcashd_conf)
         .with_context(|| format!("writing {}", layout.zcashd_conf.display()))?;
+
+    let zallet_conf = render_zallet_config(layout, network, creds);
+    fs::write(&layout.zallet_conf, zallet_conf)
+        .with_context(|| format!("writing {}", layout.zallet_conf.display()))?;
 
     Ok(())
 }
@@ -337,10 +447,15 @@ mod tests {
         assert_eq!(Network::Testnet.zebra_rpc_port(), 18232);
         assert_eq!(Network::Regtest.zcashd_rpc_port(), 18233);
         assert_eq!(Network::Testnet.zcashd_rpc_port(), 18236);
+        assert_eq!(Network::Regtest.zallet_rpc_port(), 28233);
+        assert_eq!(Network::Testnet.zallet_rpc_port(), 38233);
+        assert_eq!(Network::Regtest.wallet_facade_rpc_port(), 8181);
         assert_eq!(Network::MainnetLike.zebra_network_name(), "Regtest");
         assert_eq!(Network::MainnetLike.zebra_p2p_port(), 19235);
         assert_eq!(Network::MainnetLike.zebra_rpc_port(), 9232);
         assert_eq!(Network::MainnetLike.zcashd_rpc_port(), 19233);
+        assert_eq!(Network::MainnetLike.zallet_rpc_port(), 29233);
+        assert_eq!(Network::MainnetLike.wallet_facade_rpc_port(), 10181);
         assert!(Network::MainnetLike.is_private_regtest_like());
         assert_eq!(Network::Regtest.as_str(), "regtest");
         assert_eq!(Network::Testnet.as_str(), "testnet");
@@ -362,6 +477,14 @@ mod tests {
         assert_eq!(
             testnet.zcashd_pid,
             root.join("testnet").join("run/zcashd.pid")
+        );
+        assert_eq!(
+            testnet.zallet_pid,
+            root.join("testnet").join("run/zallet.pid")
+        );
+        assert_eq!(
+            testnet.facade_pid,
+            root.join("testnet").join("run/wallet-facade.pid")
         );
     }
 
@@ -459,6 +582,27 @@ mod tests {
         assert!(zcashd.contains("rpcport=19233"));
         assert!(zcashd.contains("nuparams=e9ff75a6:1"));
         assert!(zcashd.contains("nuparams=5437f330:100000000"));
+    }
+
+    #[test]
+    fn zallet_config_uses_expected_endpoints() {
+        let layout = Layout::new(Path::new("/tmp/unity-node"), Network::Regtest);
+        let creds = RpcCredentials {
+            user: "u".to_string(),
+            password: "p".to_string(),
+        };
+
+        let zallet = render_zallet_config(&layout, Network::Regtest, &creds);
+        assert!(zallet.contains("network = \"regtest\""));
+        assert!(zallet.contains("validator_address = \"127.0.0.1:8232\""));
+        assert!(zallet
+            .contains("validator_cookie_path = \"/tmp/unity-node/regtest/cookies/zebra/.cookie\""));
+        assert!(zallet.contains("bind = [\"127.0.0.1:28233\"]"));
+        assert!(zallet.contains("encryption_identity = \"encryption-identity.txt\""));
+        assert!(zallet.contains("[features.deprecated]"));
+        assert!(zallet.contains("[features.experimental]"));
+        assert!(zallet.contains("user = \"u\""));
+        assert!(zallet.contains("password = \"p\""));
     }
 
     #[test]

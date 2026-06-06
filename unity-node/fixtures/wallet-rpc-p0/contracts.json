@@ -1,0 +1,139 @@
+{
+  "source": "zcashd wallet rpc contract fixtures",
+  "notes": [
+    "These fixtures lock JSON field-level compatibility for P0 migration methods.",
+    "Values are representative placeholders; parity tests must compare live zcashd outputs."
+  ],
+  "methods": {
+    "getnewaddress": {
+      "request": {"method": "getnewaddress", "params": []},
+      "success_shape": {"result": "tmExampleAddress"},
+      "error_shape": {"code": -4, "message": "Error: wallet locked"}
+    },
+    "z_getnewaddress": {
+      "request": {"method": "z_getnewaddress", "params": []},
+      "success_shape": {"result": "u1example"},
+      "error_shape": {"code": -5, "message": "Invalid address type"}
+    },
+    "z_getnewaccount": {
+      "request": {"method": "z_getnewaccount", "params": []},
+      "success_shape": {"result": "uacc1example"},
+      "error_shape": {"code": -4, "message": "Wallet error"}
+    },
+    "z_getaddressforaccount": {
+      "request": {"method": "z_getaddressforaccount", "params": ["uacc1example"]},
+      "success_shape": {"result": {"account": "uacc1example", "address": "u1example"}},
+      "error_shape": {"code": -5, "message": "Unknown account"}
+    },
+    "getbalance": {
+      "request": {"method": "getbalance", "params": []},
+      "success_shape": {"result": 1.23},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "z_gettotalbalance": {
+      "request": {"method": "z_gettotalbalance", "params": []},
+      "success_shape": {"result": {"transparent": "1.23", "private": "0.00", "total": "1.23"}},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "z_getbalanceforaccount": {
+      "request": {"method": "z_getbalanceforaccount", "params": ["uacc1example"]},
+      "success_shape": {"result": {"pools": {"orchard": "0.00", "sapling": "0.00", "transparent": "1.23"}, "minimum_confirmations": 1}},
+      "error_shape": {"code": -5, "message": "Unknown account"}
+    },
+    "z_getbalance": {
+      "request": {"method": "z_getbalance", "params": ["u1example"]},
+      "success_shape": {"result": "1.23"},
+      "error_shape": {"code": -5, "message": "Invalid address"}
+    },
+    "z_listreceivedbyaddress": {
+      "request": {"method": "z_listreceivedbyaddress", "params": ["u1example"]},
+      "success_shape": {"result": [{"txid": "hash", "amount": 1.23}]},
+      "error_shape": {"code": -5, "message": "Invalid address"}
+    },
+    "gettransaction": {
+      "request": {"method": "gettransaction", "params": ["hash"]},
+      "success_shape": {"result": {"amount": 0.0, "confirmations": 1, "txid": "hash", "details": []}},
+      "error_shape": {"code": -5, "message": "Invalid or non-wallet transaction id"}
+    },
+    "listtransactions": {
+      "request": {"method": "listtransactions", "params": []},
+      "success_shape": {"result": [{"category": "receive", "amount": 1.23}]},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "listsinceblock": {
+      "request": {"method": "listsinceblock", "params": []},
+      "success_shape": {"result": {"transactions": [], "lastblock": "hash"}},
+      "error_shape": {"code": -8, "message": "Block not found"}
+    },
+    "listunspent": {
+      "request": {"method": "listunspent", "params": []},
+      "success_shape": {"result": [{"txid": "hash", "vout": 0, "address": "tmExampleAddress", "amount": 1.23}]},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "z_listunspent": {
+      "request": {"method": "z_listunspent", "params": []},
+      "success_shape": {"result": [{"txid": "hash", "amount": 1.23, "address": "u1example"}]},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "sendtoaddress": {
+      "request": {"method": "sendtoaddress", "params": ["tmExampleAddress", 1.0]},
+      "success_shape": {"result": "hash"},
+      "error_shape": {"code": -6, "message": "Insufficient funds"}
+    },
+    "sendmany": {
+      "request": {"method": "sendmany", "params": ["", {"tmExampleAddress": 1.0}]},
+      "success_shape": {"result": "hash"},
+      "error_shape": {"code": -6, "message": "Insufficient funds"}
+    },
+    "z_sendmany": {
+      "request": {"method": "z_sendmany", "params": ["u1example", [{"address": "u1dest", "amount": 1.0}]]},
+      "success_shape": {"result": "opid-123"},
+      "error_shape": {"code": -6, "message": "Insufficient funds"}
+    },
+    "z_shieldcoinbase": {
+      "request": {"method": "z_shieldcoinbase", "params": ["*", "u1example"]},
+      "success_shape": {"result": {"remainingUTXOs": 0, "remainingValue": 0.0, "shieldingUTXOs": 1, "shieldingValue": 1.0, "opid": "opid-123"}},
+      "error_shape": {"code": -8, "message": "No coinbase funds available"}
+    },
+    "z_getoperationstatus": {
+      "request": {"method": "z_getoperationstatus", "params": [[]]},
+      "success_shape": {"result": [{"id": "opid-123", "status": "success"}]},
+      "error_shape": {"code": -8, "message": "Unknown operation id"}
+    },
+    "z_getoperationresult": {
+      "request": {"method": "z_getoperationresult", "params": [[]]},
+      "success_shape": {"result": [{"id": "opid-123", "status": "success"}]},
+      "error_shape": {"code": -8, "message": "Unknown operation id"}
+    },
+    "z_listoperationids": {
+      "request": {"method": "z_listoperationids", "params": []},
+      "success_shape": {"result": ["opid-123"]},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    },
+    "dumpprivkey": {
+      "request": {"method": "dumpprivkey", "params": ["tmExampleAddress"]},
+      "success_shape": {"result": "secret-extended-key"},
+      "error_shape": {"code": -5, "message": "Address not found in wallet"}
+    },
+    "importprivkey": {
+      "request": {"method": "importprivkey", "params": ["secret-extended-key"]},
+      "success_shape": {"result": null},
+      "error_shape": {"code": -5, "message": "Invalid private key encoding"}
+    },
+    "z_exportkey": {
+      "request": {"method": "z_exportkey", "params": ["u1example"]},
+      "success_shape": {"result": "secret-key"},
+      "error_shape": {"code": -5, "message": "Address not found in wallet"}
+    },
+    "z_importkey": {
+      "request": {"method": "z_importkey", "params": ["secret-key"]},
+      "success_shape": {"result": null},
+      "error_shape": {"code": -5, "message": "Invalid spending key"}
+    },
+    "getwalletinfo": {
+      "request": {"method": "getwalletinfo", "params": []},
+      "success_shape": {"result": {"walletversion": 1, "balance": 0.0, "txcount": 0}},
+      "error_shape": {"code": -4, "message": "Wallet unavailable"}
+    }
+  }
+}

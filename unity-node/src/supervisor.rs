@@ -13,8 +13,9 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{
     default_miner_address, load_manifest, load_or_create_credentials, validate_hex_sha256,
-    write_configs, Layout, Manifest, Network, RpcCredentials,
+    write_configs, BinarySpec, Layout, Manifest, Network, RpcCredentials,
 };
+use crate::wallet_rpc::{requires_zcashd_fallback, write_routing_metadata};
 
 const READINESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const READINESS_LOG_EVERY_POLLS: u32 = 5;
@@ -57,6 +58,12 @@ pub fn start_stack(
     if process_exists_from_pid_file(&layout.zcashd_pid)? {
         bail!("zcashd already running (pid file exists and process is alive)");
     }
+    if process_exists_from_pid_file(&layout.zallet_pid)? {
+        bail!("zallet already running (pid file exists and process is alive)");
+    }
+    if process_exists_from_pid_file(&layout.facade_pid)? {
+        bail!("wallet facade already running (pid file exists and process is alive)");
+    }
 
     let creds = load_or_create_credentials(&layout.creds_file)?;
     let enable_internal_miner =
@@ -68,11 +75,36 @@ pub fn start_stack(
         &creds,
         enable_internal_miner,
     )?;
+    write_routing_metadata(&layout.routing_metadata_file)?;
 
     println!("starting zebrad, then waiting for readiness");
     start_zebrad_with_backoff(&layout, &manifest, network, timeout_secs)?;
-    println!("starting zcashd, then waiting for single peer");
-    start_zcashd_with_backoff(&layout, &manifest, network, timeout_secs, &options)?;
+    ensure_zallet_bootstrap_prerequisites(&layout, &manifest)?;
+    println!("starting zallet wallet service");
+    start_optional_service(
+        manifest.zallet.as_ref(),
+        "zallet",
+        &layout.zallet_pid,
+        &layout.logs_dir.join("zallet.log"),
+        |spec| build_optional_service_command(spec, &layout.zallet_conf, &layout.network_dir),
+    )?;
+    if manifest
+        .zallet
+        .as_ref()
+        .map(|spec| spec.enabled)
+        .unwrap_or(false)
+    {
+        wait_for_zallet_ready(network, &layout, &creds, timeout_secs)?;
+    }
+
+    if requires_zcashd_fallback() {
+        println!("starting zcashd fallback, then waiting for single peer");
+        start_zcashd_with_backoff(&layout, &manifest, network, timeout_secs, &options)?;
+    } else {
+        println!("zcashd fallback not required by current routing table");
+    }
+    println!("starting wallet facade service");
+    start_facade_service(network, &layout)?;
 
     start_regtest_producer_if_needed(network, &layout, &options)?;
 
@@ -86,10 +118,12 @@ pub fn start_stack(
     }
 
     println!(
-        "unity-node started: network={}, zebrad_pid_file={}, zcashd_pid_file={}",
+        "unity-node started: network={}, zebrad_pid_file={}, zallet_pid_file={}, zcashd_pid_file={}, facade_pid_file={}",
         network.as_str(),
         layout.zebra_pid.display(),
-        layout.zcashd_pid.display()
+        layout.zallet_pid.display(),
+        layout.zcashd_pid.display(),
+        layout.facade_pid.display()
     );
     Ok(())
 }
@@ -101,14 +135,27 @@ pub fn status_stack(network: Network, state_dir: &Path, manifest_path: &Path) ->
 
     let zebra_pid = read_pid(&layout.zebra_pid).ok();
     let zcashd_pid = read_pid(&layout.zcashd_pid).ok();
+    let zallet_pid = read_pid(&layout.zallet_pid).ok();
+    let facade_pid = read_pid(&layout.facade_pid).ok();
     let producer_pid = read_pid(&layout.producer_pid).ok();
     let zebra_alive = zebra_pid.map(process_exists).unwrap_or(false);
     let zcashd_alive = zcashd_pid.map(process_exists).unwrap_or(false);
+    let zallet_alive = zallet_pid.map(process_exists).unwrap_or(false);
+    let facade_alive = facade_pid.map(process_exists).unwrap_or(false);
     let producer_alive = producer_pid.map(process_exists).unwrap_or(false);
 
     println!(
-        "processes: zebrad={} (pid={:?}), zcashd={} (pid={:?}), producer={} (pid={:?})",
-        zebra_alive, zebra_pid, zcashd_alive, zcashd_pid, producer_alive, producer_pid
+        "processes: zebrad={} (pid={:?}), zallet={} (pid={:?}), zcashd={} (pid={:?}), facade={} (pid={:?}), producer={} (pid={:?})",
+        zebra_alive,
+        zebra_pid,
+        zallet_alive,
+        zallet_pid,
+        zcashd_alive,
+        zcashd_pid,
+        facade_alive,
+        facade_pid,
+        producer_alive,
+        producer_pid
     );
 
     if zebra_alive {
@@ -140,6 +187,28 @@ pub fn status_stack(network: Network, state_dir: &Path, manifest_path: &Path) ->
         println!("zcashd rpc: skipped (process down)");
     }
 
+    if zallet_alive {
+        match zallet_get_walletinfo(network, &creds) {
+            Ok(_) => println!("zallet rpc: ok"),
+            Err(e) => println!("zallet rpc: error: {e}"),
+        }
+    } else {
+        println!("zallet rpc: skipped (process down)");
+    }
+
+    if facade_alive {
+        let creds = load_or_create_credentials(&layout.creds_file)?;
+        match facade_get_walletinfo(network, &creds) {
+            Ok(_) => println!(
+                "wallet facade rpc: ok, endpoint=http://127.0.0.1:{}",
+                network.wallet_facade_rpc_port()
+            ),
+            Err(e) => println!("wallet facade rpc: error: {e}"),
+        }
+    } else {
+        println!("wallet facade rpc: skipped (process down)");
+    }
+
     Ok(())
 }
 
@@ -151,8 +220,37 @@ pub fn stop_stack(network: Network, state_dir: &Path) -> Result<()> {
     );
     let layout = Layout::new(state_dir, network);
     stop_from_pid_file(&layout.producer_pid, "producer")?;
+    stop_from_pid_file(&layout.facade_pid, "wallet-facade")?;
     stop_from_pid_file(&layout.zcashd_pid, "zcashd")?;
+    stop_from_pid_file(&layout.zallet_pid, "zallet")?;
     stop_from_pid_file(&layout.zebra_pid, "zebrad")?;
+    Ok(())
+}
+
+fn start_facade_service(network: Network, layout: &Layout) -> Result<()> {
+    let log_path = layout.logs_dir.join("wallet-facade.log");
+    let state_dir = layout
+        .network_dir
+        .parent()
+        .ok_or_else(|| anyhow!("network directory has no parent state dir"))?;
+    let child =
+        Command::new(std::env::current_exe().context("getting unity-node executable path")?)
+            .arg("facade-harness")
+            .arg("--network")
+            .arg(network.as_str())
+            .arg("--state-dir")
+            .arg(state_dir.display().to_string())
+            .stdout(open_append(&log_path)?)
+            .stderr(open_append(&log_path)?)
+            .spawn()
+            .context("starting wallet facade harness")?;
+
+    write_pid(&layout.facade_pid, child.id())?;
+    println!(
+        "wallet facade: started pid={} log={}",
+        child.id(),
+        log_path.display()
+    );
     Ok(())
 }
 
@@ -163,15 +261,35 @@ fn verify_binary_specs(manifest: &Manifest) -> Result<()> {
             manifest.zebra.path.display()
         )
     })?;
-    verify_binary(&manifest.zcashd.path, &manifest.zcashd.sha256).with_context(|| {
-        format!(
-            "zcashd binary verification failed ({})",
-            manifest.zcashd.path.display()
-        )
-    })?;
+    if let Some(zcashd) = manifest.zcashd.as_ref().filter(|spec| spec.enabled) {
+        verify_binary(&zcashd.path, &zcashd.sha256).with_context(|| {
+            format!(
+                "zcashd binary verification failed ({})",
+                zcashd.path.display()
+            )
+        })?;
+    }
+    if let Some(zallet) = manifest.zallet.as_ref().filter(|spec| spec.enabled) {
+        verify_binary(&zallet.path, &zallet.sha256).with_context(|| {
+            format!(
+                "zallet binary verification failed ({})",
+                zallet.path.display()
+            )
+        })?;
+    }
     println!(
-        "binary pins: zebrad={} zcashd={}",
-        manifest.zebra.version, manifest.zcashd.version
+        "binary pins: zebrad={} zcashd={} zallet={}",
+        manifest.zebra.version,
+        manifest
+            .zcashd
+            .as_ref()
+            .map(|v| v.version.as_str())
+            .unwrap_or("disabled"),
+        manifest
+            .zallet
+            .as_ref()
+            .map(|v| v.version.as_str())
+            .unwrap_or("disabled"),
     );
     Ok(())
 }
@@ -246,6 +364,120 @@ fn verify_binary(path: &Path, expected_sha256_hex: &str) -> Result<()> {
     Ok(())
 }
 
+fn build_optional_service_command(
+    spec: &BinarySpec,
+    config_path: &Path,
+    network_dir: &Path,
+) -> Command {
+    let mut cmd = Command::new(&spec.path);
+    if spec.args.is_empty() {
+        cmd.arg(format!("--config={}", config_path.display()));
+    } else {
+        cmd.args(&spec.args);
+    }
+    cmd.env("UNITY_NODE_NETWORK_DIR", network_dir.display().to_string());
+    for (key, value) in &spec.env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+fn ensure_zallet_bootstrap_prerequisites(layout: &Layout, manifest: &Manifest) -> Result<()> {
+    let Some(zallet) = manifest.zallet.as_ref().filter(|spec| spec.enabled) else {
+        return Ok(());
+    };
+
+    if !layout.zallet_conf.exists() {
+        bail!(
+            "zallet config is missing at {} after config generation",
+            layout.zallet_conf.display()
+        );
+    }
+
+    let identity_file = layout.zallet_dir.join("encryption-identity.txt");
+    if identity_file.exists() {
+        return Ok(());
+    }
+
+    let keygen_candidates = ["rage-keygen", "age-keygen", "/root/.cargo/bin/rage-keygen"];
+    let keygen = keygen_candidates.iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+
+    let Some(keygen) = keygen else {
+        bail!(
+            "zallet requires encryption identity file at {} but no keygen utility was found. Install rage/age or create the file manually.",
+            identity_file.display()
+        );
+    };
+
+    let output = Command::new(keygen)
+        .arg("-o")
+        .arg(&identity_file)
+        .output()
+        .with_context(|| {
+            format!(
+                "generating zallet encryption identity with {} for {}",
+                keygen,
+                zallet.path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to generate zallet encryption identity at {} using {}: {}",
+            identity_file.display(),
+            keygen,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    println!(
+        "zallet bootstrap: generated encryption identity at {}",
+        identity_file.display()
+    );
+    Ok(())
+}
+
+fn start_optional_service<F>(
+    spec: Option<&BinarySpec>,
+    name: &str,
+    pid_path: &Path,
+    log_path: &Path,
+    command_builder: F,
+) -> Result<()>
+where
+    F: FnOnce(&BinarySpec) -> Command,
+{
+    let Some(spec) = spec else {
+        println!("{name}: disabled (not configured in manifest)");
+        return Ok(());
+    };
+    if !spec.enabled {
+        println!("{name}: disabled (enabled=false in manifest)");
+        return Ok(());
+    }
+
+    let mut command = command_builder(spec);
+    let child = command
+        .stdout(open_append(log_path)?)
+        .stderr(open_append(log_path)?)
+        .spawn()
+        .with_context(|| format!("starting {name} service"))?;
+
+    write_pid(pid_path, child.id())?;
+    println!(
+        "{name}: started pid={} log={}",
+        child.id(),
+        log_path.display()
+    );
+    Ok(())
+}
+
 fn start_zebrad_with_backoff(
     layout: &Layout,
     manifest: &Manifest,
@@ -296,6 +528,15 @@ fn start_zcashd_with_backoff(
     timeout_secs: u64,
     options: &StartOptions,
 ) -> Result<()> {
+    let zcashd = manifest
+        .zcashd
+        .as_ref()
+        .filter(|spec| spec.enabled)
+        .ok_or_else(|| {
+            anyhow!(
+                "zcashd fallback is required by routing but zcashd is missing or disabled in manifest"
+            )
+        })?;
     let log_path = layout.logs_dir.join("zcashd.log");
     let mut delay_secs = 1u64;
 
@@ -304,7 +545,7 @@ fn start_zcashd_with_backoff(
             "zcashd start attempt {attempt}/4 (log={})",
             log_path.display()
         );
-        let child = Command::new(&manifest.zcashd.path)
+        let child = Command::new(&zcashd.path)
             .arg(format!("-conf={}", layout.zcashd_conf.display()))
             .arg(format!("-datadir={}", layout.zcashd_dir.display()))
             .arg("-printtoconsole=1")
@@ -429,6 +670,58 @@ fn wait_for_zcashd_peer(
     bail!("timed out waiting for zcashd single peer")
 }
 
+fn wait_for_zallet_ready(
+    network: Network,
+    layout: &Layout,
+    creds: &RpcCredentials,
+    timeout_secs: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let start = Instant::now();
+    let mut polls = 0u32;
+    let mut last_error = None;
+    println!("waiting for zallet RPC readiness (timeout={timeout_secs}s)");
+
+    while Instant::now() < deadline {
+        polls = polls.saturating_add(1);
+
+        if !process_exists_from_pid_file(&layout.zallet_pid)? {
+            bail!(
+                "zallet process exited before becoming ready; inspect {}",
+                layout.logs_dir.join("zallet.log").display()
+            );
+        }
+
+        match zallet_get_walletinfo(network, creds) {
+            Ok(_) => {
+                println!(
+                    "zallet ready after {}s ({} polls)",
+                    start.elapsed().as_secs(),
+                    polls
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                if should_log_readiness_progress(polls) {
+                    println!(
+                        "zallet not ready yet after {}s (poll {}): {}",
+                        start.elapsed().as_secs(),
+                        polls,
+                        err
+                    );
+                }
+                last_error = Some(err);
+            }
+        }
+        thread::sleep(READINESS_POLL_INTERVAL);
+    }
+
+    if let Some(err) = last_error {
+        bail!("timed out waiting for zallet RPC: {err}");
+    }
+    bail!("timed out waiting for zallet RPC")
+}
+
 fn zebra_get_blockchaininfo(network: Network, layout: &Layout) -> Result<Value> {
     let cookie = fs::read_to_string(layout.cookie_dir.join(".cookie"))
         .context("reading zebra cookie file (.cookie)")?;
@@ -443,6 +736,17 @@ fn zcashd_get_blockchaininfo(network: Network, creds: &RpcCredentials) -> Result
     rpc_call_basic_auth(
         &url,
         "getblockchaininfo",
+        json!([]),
+        &creds.user,
+        &creds.password,
+    )
+}
+
+fn zallet_get_walletinfo(network: Network, creds: &RpcCredentials) -> Result<Value> {
+    let url = format!("http://127.0.0.1:{}", network.zallet_rpc_port());
+    rpc_call_basic_auth(
+        &url,
+        "getwalletinfo",
         json!([]),
         &creds.user,
         &creds.password,
@@ -469,6 +773,17 @@ fn zcashd_get_peer_addrs(network: Network, creds: &RpcCredentials) -> Result<Vec
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(entries)
+}
+
+fn facade_get_walletinfo(network: Network, creds: &RpcCredentials) -> Result<Value> {
+    let url = format!("http://127.0.0.1:{}", network.wallet_facade_rpc_port());
+    rpc_call_basic_auth(
+        &url,
+        "getwalletinfo",
+        json!([]),
+        &creds.user,
+        &creds.password,
+    )
 }
 
 fn rpc_call_basic_auth(
