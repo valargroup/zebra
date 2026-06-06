@@ -200,7 +200,7 @@ jobs:
           DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
         run: |
           set -euo pipefail
-          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
           for _ in {1..90}; do
             if ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" 'cloud-init status --wait >/dev/null 2>&1 || true; echo ready'; then
@@ -217,7 +217,7 @@ jobs:
           DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
         run: |
           set -euo pipefail
-          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
           tar \
             --exclude=.git \
@@ -237,7 +237,7 @@ jobs:
           DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
         run: |
           set -euo pipefail
-          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
           remote_env=$(printf 'TARGET_BLOCKS=%q BENCH_VARIANT=%q MAX_ELAPSED_SECONDS=%q MAX_STALL_SECONDS=%q ' \
             "$TARGET_BLOCKS" \
@@ -254,7 +254,7 @@ jobs:
           DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
         run: |
           set -euo pipefail
-          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
           mkdir -p bench-artifacts
 
           if ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" 'test -e /mnt/zebra/current-run'; then
