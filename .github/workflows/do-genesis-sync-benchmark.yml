@@ -1,0 +1,344 @@
+name: DigitalOcean Genesis Sync Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocks:
+        description: Number of mainnet blocks to sync from genesis
+        required: true
+        default: "50000"
+      droplet_size:
+        description: DigitalOcean size slug
+        required: true
+        default: s-4vcpu-16gb-amd
+      region:
+        description: DigitalOcean region
+        required: true
+        default: nyc1
+      image:
+        description: DigitalOcean image slug
+        required: true
+        default: ubuntu-24-04-x64
+      max_elapsed_seconds:
+        description: Stop the sync after this many seconds, or 0 to disable
+        required: true
+        default: "14400"
+      max_stall_seconds:
+        description: Stop if RPC height does not advance for this many seconds, or 0 to disable
+        required: true
+        default: "900"
+      extra_ssh_key_ids:
+        description: Optional comma-separated existing DO SSH key IDs or fingerprints
+        required: false
+        default: ""
+      keep_droplet:
+        description: Keep the droplet after the run for manual debugging
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  genesis-sync-benchmark:
+    name: Sync ${{ inputs.blocks }} blocks from genesis
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      TARGET_BLOCKS: ${{ inputs.blocks }}
+      DROPLET_SIZE: ${{ inputs.droplet_size }}
+      DROPLET_REGION: ${{ inputs.region }}
+      DROPLET_IMAGE: ${{ inputs.image }}
+      MAX_ELAPSED_SECONDS: ${{ inputs.max_elapsed_seconds }}
+      MAX_STALL_SECONDS: ${{ inputs.max_stall_seconds }}
+      EXTRA_SSH_KEY_IDS: ${{ inputs.extra_ssh_key_ids }}
+      KEEP_DROPLET: ${{ inputs.keep_droplet }}
+      DO_RESOURCE_FILE: /tmp/zebra-do-genesis-bench-resources.env
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          require_uint() {
+            local name=$1
+            local value=$2
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+              echo "$name must be an integer: $value" >&2
+              exit 1
+            fi
+          }
+
+          require_uint TARGET_BLOCKS "$TARGET_BLOCKS"
+          require_uint MAX_ELAPSED_SECONDS "$MAX_ELAPSED_SECONDS"
+          require_uint MAX_STALL_SECONDS "$MAX_STALL_SECONDS"
+
+          if (( TARGET_BLOCKS <= 0 )); then
+            echo "TARGET_BLOCKS must be greater than zero" >&2
+            exit 1
+          fi
+
+          if [[ -z "${DIGITALOCEAN_ACCESS_TOKEN:-}" ]]; then
+            echo "DIGITALOCEAN_ACCESS_TOKEN secret is required" >&2
+            exit 1
+          fi
+
+          if [[ "$KEEP_DROPLET" == "true" && -z "$EXTRA_SSH_KEY_IDS" ]]; then
+            echo "::warning::keep_droplet=true without extra_ssh_key_ids may leave a droplet that is hard to access after the runner deletes its private key"
+          fi
+
+          short_sha="${GITHUB_SHA:0:7}"
+          raw_variant="${GITHUB_REF_NAME}-${short_sha}"
+          variant=$(printf '%s' "$raw_variant" | tr -c 'A-Za-z0-9._-' '-')
+          echo "BENCH_VARIANT=$variant" >> "$GITHUB_ENV"
+
+      - name: Generate temporary SSH key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/zebra_do_genesis_bench
+          chmod 600 ~/.ssh/zebra_do_genesis_bench
+
+      - name: Create DigitalOcean droplet
+        id: create
+        run: |
+          set -euo pipefail
+
+          : > "$DO_RESOURCE_FILE"
+
+          ssh_key_name="zebra-genesis-bench-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh_key_payload=$(jq -n \
+            --arg name "$ssh_key_name" \
+            --arg public_key "$(cat ~/.ssh/zebra_do_genesis_bench.pub)" \
+            '{name: $name, public_key: $public_key}')
+
+          ssh_key_response=$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${DIGITALOCEAN_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$ssh_key_payload" \
+            "https://api.digitalocean.com/v2/account/keys")
+
+          ssh_key_id=$(jq -r '.ssh_key.id' <<<"$ssh_key_response")
+          echo "SSH_KEY_ID=$ssh_key_id" >> "$DO_RESOURCE_FILE"
+          echo "ssh_key_id=$ssh_key_id" >> "$GITHUB_OUTPUT"
+
+          ssh_keys_json=$(
+            {
+              echo "$ssh_key_id"
+              printf '%s' "$EXTRA_SSH_KEY_IDS" | tr ',' '\n'
+            } |
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+              jq -R 'select(length > 0) | if test("^[0-9]+$") then tonumber else . end' |
+              jq -s .
+          )
+
+          droplet_name="zebra-genesis-bench-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          droplet_payload=$(jq -n \
+            --arg name "$droplet_name" \
+            --arg region "$DROPLET_REGION" \
+            --arg size "$DROPLET_SIZE" \
+            --arg image "$DROPLET_IMAGE" \
+            --argjson ssh_keys "$ssh_keys_json" \
+            '{
+              name: $name,
+              region: $region,
+              size: $size,
+              image: $image,
+              ssh_keys: $ssh_keys,
+              monitoring: true,
+              tags: ["zebra-genesis-benchmark"]
+            }')
+
+          droplet_response=$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${DIGITALOCEAN_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$droplet_payload" \
+            "https://api.digitalocean.com/v2/droplets")
+
+          droplet_id=$(jq -r '.droplet.id' <<<"$droplet_response")
+          echo "DROPLET_ID=$droplet_id" >> "$DO_RESOURCE_FILE"
+          echo "DROPLET_NAME=$droplet_name" >> "$DO_RESOURCE_FILE"
+          echo "droplet_id=$droplet_id" >> "$GITHUB_OUTPUT"
+          echo "droplet_name=$droplet_name" >> "$GITHUB_OUTPUT"
+
+          echo "Waiting for droplet $droplet_id to become active..."
+          droplet_ip=""
+          for _ in {1..120}; do
+            droplet=$(curl -fsS \
+              -H "Authorization: Bearer ${DIGITALOCEAN_ACCESS_TOKEN}" \
+              "https://api.digitalocean.com/v2/droplets/${droplet_id}")
+
+            status=$(jq -r '.droplet.status' <<<"$droplet")
+            droplet_ip=$(jq -r '.droplet.networks.v4[]? | select(.type == "public") | .ip_address' <<<"$droplet" | head -1)
+            if [[ "$status" == "active" && -n "$droplet_ip" ]]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ -z "$droplet_ip" ]]; then
+            echo "Timed out waiting for droplet public IPv4" >&2
+            exit 1
+          fi
+
+          echo "DROPLET_IP=$droplet_ip" >> "$DO_RESOURCE_FILE"
+          echo "droplet_ip=$droplet_ip" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        env:
+          DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
+
+          for _ in {1..90}; do
+            if ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" 'cloud-init status --wait >/dev/null 2>&1 || true; echo ready'; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSH on ${DROPLET_IP}" >&2
+          exit 1
+
+      - name: Upload source
+        env:
+          DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
+
+          tar \
+            --exclude=.git \
+            --exclude=target \
+            --exclude=bench-artifacts \
+            -czf "$RUNNER_TEMP/zebra-src.tgz" .
+
+          scp -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" \
+            "$RUNNER_TEMP/zebra-src.tgz" \
+            "root@${DROPLET_IP}:/root/zebra-src.tgz"
+
+          ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" \
+            'rm -rf /mnt/zebra/src && mkdir -p /mnt/zebra/src /mnt/zebra/runs /mnt/zebra/network-cache && tar -xzf /root/zebra-src.tgz -C /mnt/zebra/src'
+
+      - name: Build and run genesis sync benchmark
+        env:
+          DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
+
+          remote_env=$(printf 'TARGET_BLOCKS=%q BENCH_VARIANT=%q MAX_ELAPSED_SECONDS=%q MAX_STALL_SECONDS=%q ' \
+            "$TARGET_BLOCKS" \
+            "$BENCH_VARIANT" \
+            "$MAX_ELAPSED_SECONDS" \
+            "$MAX_STALL_SECONDS")
+
+          ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" \
+            "${remote_env}bash /mnt/zebra/src/.github/workflows/scripts/do-genesis-sync-remote-runner.sh"
+
+      - name: Collect benchmark artifacts
+        if: always() && steps.create.outputs.droplet_ip != ''
+        env:
+          DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
+        run: |
+          set -euo pipefail
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
+          mkdir -p bench-artifacts
+
+          if ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" 'test -e /mnt/zebra/current-run'; then
+            ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" \
+              'run_dir=$(readlink -f /mnt/zebra/current-run) && tar -C "$run_dir" -czf /tmp/zebra-genesis-bench-results.tgz .'
+            scp -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" \
+              "root@${DROPLET_IP}:/tmp/zebra-genesis-bench-results.tgz" \
+              bench-artifacts/zebra-genesis-bench-results.tgz
+            tar -xzf bench-artifacts/zebra-genesis-bench-results.tgz -C bench-artifacts
+          else
+            echo "No current run found on droplet" > bench-artifacts/no-current-run.txt
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [[ -f bench-artifacts/summary.md ]]; then
+            cat bench-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Genesis Sync Benchmark"
+              echo
+              echo "No benchmark summary was collected."
+              echo
+              if [[ -f bench-artifacts/no-current-run.txt ]]; then
+                cat bench-artifacts/no-current-run.txt
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "## Workflow Run"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| SHA | \`${GITHUB_SHA}\` |"
+            echo "| Target blocks | ${TARGET_BLOCKS} |"
+            echo "| Droplet size | \`${DROPLET_SIZE}\` |"
+            echo "| Region | \`${DROPLET_REGION}\` |"
+            echo "| Image | \`${DROPLET_IMAGE}\` |"
+            echo "| Droplet | \`${{ steps.create.outputs.droplet_name || 'not-created' }}\` |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zebra-genesis-sync-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-artifacts
+          if-no-files-found: warn
+
+      - name: Delete DigitalOcean resources
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$DO_RESOURCE_FILE" ]]; then
+            echo "No DigitalOcean resource file found."
+            exit 0
+          fi
+
+          # shellcheck source=/dev/null
+          source "$DO_RESOURCE_FILE"
+
+          if [[ "$KEEP_DROPLET" == "true" ]]; then
+            echo "Keeping droplet ${DROPLET_ID:-unknown} and temporary SSH key ${SSH_KEY_ID:-unknown}."
+            exit 0
+          fi
+
+          if [[ -n "${DROPLET_ID:-}" ]]; then
+            curl -fsS \
+              -X DELETE \
+              -H "Authorization: Bearer ${DIGITALOCEAN_ACCESS_TOKEN}" \
+              "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}" || true
+          fi
+
+          if [[ -n "${SSH_KEY_ID:-}" ]]; then
+            curl -fsS \
+              -X DELETE \
+              -H "Authorization: Bearer ${DIGITALOCEAN_ACCESS_TOKEN}" \
+              "https://api.digitalocean.com/v2/account/keys/${SSH_KEY_ID}" || true
+          fi
