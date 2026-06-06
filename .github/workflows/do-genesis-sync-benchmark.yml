@@ -270,6 +270,8 @@ jobs:
 
       - name: Write job summary
         if: always()
+        env:
+          DROPLET_NAME: ${{ steps.create.outputs.droplet_name || 'not-created' }}
         run: |
           set -euo pipefail
 
@@ -299,7 +301,7 @@ jobs:
             echo "| Droplet size | \`${DROPLET_SIZE}\` |"
             echo "| Region | \`${DROPLET_REGION}\` |"
             echo "| Image | \`${DROPLET_IMAGE}\` |"
-            echo "| Droplet | \`${{ steps.create.outputs.droplet_name || 'not-created' }}\` |"
+            echo "| Droplet | \`${DROPLET_NAME}\` |"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
