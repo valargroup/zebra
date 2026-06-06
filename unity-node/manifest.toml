@@ -1,0 +1,11 @@
+[zebra]
+# Update path to the deployed zebrad binary on the host where unity-node runs.
+path = "/usr/local/bin/zebrad"
+version = "v5.0.0-rc.3"
+sha256 = "a346468f2136aa607aa3b78350912ba8513c45ee722ca9fa6ce5d1d0d5f4bd96"
+
+[zcashd]
+# Update path to the deployed zcashd binary on the host where unity-node runs.
+path = "/usr/local/bin/zcashd"
+version = "v6.20.0 (prebuilt-unmodified)"
+sha256 = "ce44170ad00548b0dfcf8ed9ba07b4083edd17f7037ffcfca010ae1a0ce16a67"

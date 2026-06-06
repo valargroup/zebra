@@ -312,12 +312,17 @@ fn difficulty_threshold_and_time_are_valid(
     // > For a block at block height `Height`, `nBits` MUST be equal to `ThresholdBits(Height)`.
     //
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
-    if difficulty_threshold != expected_difficulty {
-        Err(ValidateContextError::InvalidDifficultyThreshold {
-            difficulty_threshold,
-            expected_difficulty,
-        })?
+    // On Regtest, Zebra uses `disable_pow` and accepts blocks whose PoW fields
+    // don't follow contextual retargeting exactly. We still enforce these checks
+    // on all consensus networks that validate PoW.
+    if !network.disable_pow() {
+        let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
+        if difficulty_threshold != expected_difficulty {
+            Err(ValidateContextError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            })?
+        }
     }
 
     Ok(())
