@@ -8,7 +8,7 @@ on:
         required: true
         default: "50000"
       source_ref:
-        description: Zebra source ref to build and benchmark. Defaults to the selected workflow branch.
+        description: Zebra source branch, tag, or commit SHA to build. Defaults to the selected workflow branch.
         required: false
         default: ""
       droplet_size:

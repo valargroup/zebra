@@ -25,7 +25,7 @@ Optional environment:
   ZEBRAD_FILTERS                Default: info
   MAX_ELAPSED_SECONDS           Optional. Stop after this many seconds.
   MAX_STALL_SECONDS             Optional. Stop if RPC height does not advance.
-  SOURCE_REF                    Optional. Source ref that produced ZEBRAD_BIN.
+  SOURCE_REF                    Optional. Source branch, tag, or commit SHA that produced ZEBRAD_BIN.
   SOURCE_SHA                    Optional. Source commit that produced ZEBRAD_BIN.
   WORKFLOW_REF                  Optional. Workflow ref that provided this harness.
   WORKFLOW_SHA                  Optional. Workflow commit that provided this harness.
