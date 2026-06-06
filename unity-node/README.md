@@ -9,7 +9,8 @@
 - `unity-node start --network regtest --state-dir /var/lib/unity-node --manifest unity-node/manifest.toml`
 - `unity-node status --network regtest --state-dir /var/lib/unity-node --manifest unity-node/manifest.toml`
 - `unity-node stop --network regtest --state-dir /var/lib/unity-node`
-- `unity-node start --network regtest --regtest-producer external --canonical-regtest true`
+- `unity-node start --network regtest --regtest-producer external`
+- `unity-node start --network regtest --canonical-regtest true --follower-lag-tolerance 20`
 
 ## Behavior
 
@@ -23,11 +24,14 @@
   - `--regtest-producer internal`: enables Zebra internal miner.
 - Readiness gates:
   - Zebra RPC `getblockchaininfo` reachable via cookie auth
-  - zcashd `getpeerinfo` reports exactly one peer (and in canonical regtest mode, that peer must be Zebra loopback P2P)
-- Canonical regtest verification:
-  - Zebra height must increase.
-  - zcashd must not remain ahead of Zebra for sustained polling windows.
-  - zcashd lag behind Zebra must stay under `--follower-lag-tolerance`.
+  - zcashd `getpeerinfo` reports exactly one peer
+  - In canonical regtest mode (`--canonical-regtest true`), the single peer must be Zebra loopback P2P
+- Canonical regtest verification (enabled when `--canonical-regtest true`):
+  - Runs a 60-poll verification window (~120s) after startup
+  - Requires Zebra height growth during the window
+  - Fails if zcashd remains ahead of Zebra for sustained polls
+  - Enforces final follower lag <= `--follower-lag-tolerance`
+  - Re-checks canonical single-peer isolation during the window
 - Uses PID files for lifecycle:
   - `<state-dir>/<network>/run/zebrad.pid`
   - `<state-dir>/<network>/run/zcashd.pid`

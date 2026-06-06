@@ -36,12 +36,13 @@ pub fn start_stack(
     options: StartOptions,
 ) -> Result<()> {
     println!(
-        "starting unity-node stack: network={}, state_dir={}, manifest={}, canonical_regtest={}, follower_lag_tolerance={}",
+        "starting unity-node stack: network={}, state_dir={}, manifest={}, canonical_regtest={}, follower_lag_tolerance={}, regtest_producer_external={}",
         network.as_str(),
         state_dir.display(),
         manifest_path.display(),
         options.canonical_regtest,
-        options.follower_lag_tolerance
+        options.follower_lag_tolerance,
+        options.regtest_producer_external
     );
 
     let layout = Layout::new(state_dir, network);
@@ -310,7 +311,7 @@ fn start_zcashd_with_backoff(
         write_pid(&layout.zcashd_pid, child.id())?;
 
         let creds = load_or_create_credentials(&layout.creds_file)?;
-        match wait_for_zcashd_peer(network, layout, &creds, timeout_secs, options) {
+        match wait_for_zcashd_peer(network, &creds, timeout_secs, options) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 println!("zcashd not ready on attempt {attempt}: {err}");
@@ -369,7 +370,6 @@ fn wait_for_zebra_ready(network: Network, layout: &Layout, timeout_secs: u64) ->
 
 fn wait_for_zcashd_peer(
     network: Network,
-    _layout: &Layout,
     creds: &RpcCredentials,
     timeout_secs: u64,
     options: &StartOptions,
