@@ -25,6 +25,10 @@ Optional environment:
   ZEBRAD_FILTERS                Default: info
   MAX_ELAPSED_SECONDS           Optional. Stop after this many seconds.
   MAX_STALL_SECONDS             Optional. Stop if RPC height does not advance.
+  SOURCE_REF                    Optional. Source ref that produced ZEBRAD_BIN.
+  SOURCE_SHA                    Optional. Source commit that produced ZEBRAD_BIN.
+  WORKFLOW_REF                  Optional. Workflow ref that provided this harness.
+  WORKFLOW_SHA                  Optional. Workflow commit that provided this harness.
 USAGE
 }
 
@@ -63,6 +67,10 @@ POLL_INTERVAL=${POLL_INTERVAL:-5}
 ZEBRAD_FILTERS=${ZEBRAD_FILTERS:-info}
 MAX_ELAPSED_SECONDS=${MAX_ELAPSED_SECONDS:-0}
 MAX_STALL_SECONDS=${MAX_STALL_SECONDS:-0}
+SOURCE_REF=${SOURCE_REF:-}
+SOURCE_SHA=${SOURCE_SHA:-}
+WORKFLOW_REF=${WORKFLOW_REF:-}
+WORKFLOW_SHA=${WORKFLOW_SHA:-}
 
 VARIANT=$(printf '%s' "$VARIANT" | tr -c 'A-Za-z0-9._-' '-')
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${VARIANT}-genesis-to-${TARGET_HEIGHT}"
@@ -149,6 +157,10 @@ trap cleanup EXIT
 {
   echo "run_id=$RUN_ID"
   echo "variant=$VARIANT"
+  echo "source_ref=$SOURCE_REF"
+  echo "source_sha=$SOURCE_SHA"
+  echo "workflow_ref=$WORKFLOW_REF"
+  echo "workflow_sha=$WORKFLOW_SHA"
   echo "zebrad_bin=$ZEBRAD_BIN"
   echo "zebrad_version=$("$ZEBRAD_BIN" --version | tr -d '\r')"
   echo "network=$NETWORK"
@@ -383,6 +395,8 @@ fi
   echo "| Metric | Value |"
   echo "| --- | ---: |"
   echo "| Variant | \`$VARIANT\` |"
+  echo "| Source ref | \`$SOURCE_REF\` |"
+  echo "| Source SHA | \`$SOURCE_SHA\` |"
   echo "| Target height | $TARGET_HEIGHT |"
   echo "| End height | $END_HEIGHT |"
   echo "| Target reached | $TARGET_REACHED |"
