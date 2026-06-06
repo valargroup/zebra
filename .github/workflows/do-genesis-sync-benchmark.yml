@@ -273,8 +273,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -f bench-artifacts/summary.md ]]; then
+            cat bench-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Genesis Sync Benchmark"
+              echo
+              echo "No benchmark summary was collected."
+              echo
+              if [[ -f bench-artifacts/no-current-run.txt ]]; then
+                cat bench-artifacts/no-current-run.txt
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           {
-            echo "## DigitalOcean Genesis Sync Benchmark"
+            echo "## Workflow Run"
             echo
             echo "| Field | Value |"
             echo "| --- | --- |"
@@ -287,18 +302,6 @@ jobs:
             echo "| Droplet | \`${{ steps.create.outputs.droplet_name || 'not-created' }}\` |"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ -f bench-artifacts/summary.md ]]; then
-            cat bench-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "No benchmark summary was collected."
-              echo
-              if [[ -f bench-artifacts/no-current-run.txt ]]; then
-                cat bench-artifacts/no-current-run.txt
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Upload benchmark artifacts
         if: always()
