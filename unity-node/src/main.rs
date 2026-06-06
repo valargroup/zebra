@@ -14,6 +14,7 @@ use crate::supervisor::{start_stack, status_stack, stop_stack, StartOptions};
 enum NetworkArg {
     Regtest,
     Testnet,
+    MainnetLike,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -136,6 +137,7 @@ impl From<NetworkArg> for config::Network {
         match value {
             NetworkArg::Regtest => config::Network::Regtest,
             NetworkArg::Testnet => config::Network::Testnet,
+            NetworkArg::MainnetLike => config::Network::MainnetLike,
         }
     }
 }

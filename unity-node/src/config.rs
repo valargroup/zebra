@@ -12,12 +12,13 @@ use serde::{Deserialize, Serialize};
 pub enum Network {
     Regtest,
     Testnet,
+    MainnetLike,
 }
 
 impl Network {
     pub fn zebra_network_name(self) -> &'static str {
         match self {
-            Self::Regtest => "Regtest",
+            Self::Regtest | Self::MainnetLike => "Regtest",
             Self::Testnet => "Testnet",
         }
     }
@@ -26,6 +27,7 @@ impl Network {
         match self {
             Self::Regtest => 18235,
             Self::Testnet => 18234,
+            Self::MainnetLike => 19235,
         }
     }
 
@@ -33,6 +35,7 @@ impl Network {
         match self {
             Self::Regtest => 8232,
             Self::Testnet => 18232,
+            Self::MainnetLike => 9232,
         }
     }
 
@@ -40,6 +43,7 @@ impl Network {
         match self {
             Self::Regtest => 18233,
             Self::Testnet => 18236,
+            Self::MainnetLike => 19233,
         }
     }
 
@@ -47,7 +51,12 @@ impl Network {
         match self {
             Self::Regtest => "regtest",
             Self::Testnet => "testnet",
+            Self::MainnetLike => "mainnet-like",
         }
+    }
+
+    pub fn is_private_regtest_like(self) -> bool {
+        matches!(self, Self::Regtest | Self::MainnetLike)
     }
 }
 
@@ -164,13 +173,35 @@ pub fn render_zebra_config(
     let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), network.zebra_p2p_port());
     let rpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), network.zebra_rpc_port());
 
-    let internal_miner = if matches!(network, Network::Regtest) && enable_internal_miner {
+    let internal_miner = if network.is_private_regtest_like() && enable_internal_miner {
         "\ninternal_miner = true"
     } else {
         ""
     };
-    let debug_force_finished_sync = if matches!(network, Network::Regtest) {
+    let debug_force_finished_sync = if network.is_private_regtest_like() {
         "\ndebug_force_finished_sync = true"
+    } else {
+        ""
+    };
+    let mainnet_like_parameters = if matches!(network, Network::MainnetLike) {
+        r#"
+[network.testnet_parameters]
+disable_pow = true
+checkpoints = false
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 7
+NU6 = 8
+"NU6.1" = 100000000
+"NU6.2" = 100000000
+"#
     } else {
         ""
     };
@@ -179,6 +210,7 @@ pub fn render_zebra_config(
         r#"[network]
 network = "{network_name}"
 listen_addr = "{listen_addr}"
+{mainnet_like_parameters}
 
 [state]
 cache_dir = "{state_cache}"
@@ -195,6 +227,7 @@ miner_address = "{miner_address}"
 "#,
         network_name = network.zebra_network_name(),
         listen_addr = listen_addr,
+        mainnet_like_parameters = mainnet_like_parameters,
         state_cache = layout.zebra_dir.display(),
         rpc_addr = rpc_addr,
         cookie_dir = layout.cookie_dir.display(),
@@ -209,6 +242,8 @@ pub fn render_zcashd_config(layout: &Layout, network: Network, creds: &RpcCreden
     let rpc_bind = "127.0.0.1";
     let canonical_follower_settings = if matches!(network, Network::Regtest) {
         "maxconnections=1\ndiscover=0\ndnsseed=0\nnuparams=5ba81b19:1\nnuparams=76b809bb:1\nnuparams=2bb40e60:1\nnuparams=f5b9230b:1\nnuparams=e9ff75a6:1\nnuparams=c2d6d0b4:100000000\nnuparams=c8e71055:100000000\nnuparams=4dec4df0:100000000\nnuparams=5437f330:100000000\n"
+    } else if matches!(network, Network::MainnetLike) {
+        "maxconnections=1\ndiscover=0\ndnsseed=0\nnuparams=5ba81b19:1\nnuparams=76b809bb:1\nnuparams=2bb40e60:1\nnuparams=f5b9230b:1\nnuparams=e9ff75a6:1\nnuparams=c2d6d0b4:7\nnuparams=c8e71055:8\nnuparams=4dec4df0:100000000\nnuparams=5437f330:100000000\n"
     } else {
         "maxconnections=8\n"
     };
@@ -228,7 +263,7 @@ wallet=1
 allowdeprecated=getnewaddress
 i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
 "#,
-        regtest = if matches!(network, Network::Regtest) {
+        regtest = if network.is_private_regtest_like() {
             1
         } else {
             0
@@ -270,6 +305,7 @@ pub fn default_miner_address(network: Network) -> &'static str {
     match network {
         Network::Regtest => "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
         Network::Testnet => "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+        Network::MainnetLike => "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
     }
 }
 
@@ -301,8 +337,14 @@ mod tests {
         assert_eq!(Network::Testnet.zebra_rpc_port(), 18232);
         assert_eq!(Network::Regtest.zcashd_rpc_port(), 18233);
         assert_eq!(Network::Testnet.zcashd_rpc_port(), 18236);
+        assert_eq!(Network::MainnetLike.zebra_network_name(), "Regtest");
+        assert_eq!(Network::MainnetLike.zebra_p2p_port(), 19235);
+        assert_eq!(Network::MainnetLike.zebra_rpc_port(), 9232);
+        assert_eq!(Network::MainnetLike.zcashd_rpc_port(), 19233);
+        assert!(Network::MainnetLike.is_private_regtest_like());
         assert_eq!(Network::Regtest.as_str(), "regtest");
         assert_eq!(Network::Testnet.as_str(), "testnet");
+        assert_eq!(Network::MainnetLike.as_str(), "mainnet-like");
     }
 
     #[test]
@@ -389,6 +431,34 @@ mod tests {
         assert!(rendered.contains("discover=0"));
         assert!(rendered.contains("dnsseed=0"));
         assert!(rendered.contains("nuparams=c2d6d0b4:100000000"));
+    }
+
+    #[test]
+    fn mainnet_like_configs_use_private_regtest_profile() {
+        let layout = Layout::new(Path::new("/tmp/unity-node"), Network::MainnetLike);
+        let creds = RpcCredentials {
+            user: "u".to_string(),
+            password: "p".to_string(),
+        };
+
+        let zebra = render_zebra_config(
+            &layout,
+            Network::MainnetLike,
+            "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            false,
+        );
+        assert!(zebra.contains("network = \"Regtest\""));
+        assert!(zebra.contains("[network.testnet_parameters]"));
+        assert!(zebra.contains("disable_pow = true"));
+        assert!(zebra.contains("\"NU6.2\" = 100000000"));
+
+        let zcashd = render_zcashd_config(&layout, Network::MainnetLike, &creds);
+        assert!(zcashd.contains("regtest=1"));
+        assert!(zcashd.contains("testnet=0"));
+        assert!(zcashd.contains("connect=127.0.0.1:19235"));
+        assert!(zcashd.contains("rpcport=19233"));
+        assert!(zcashd.contains("nuparams=e9ff75a6:1"));
+        assert!(zcashd.contains("nuparams=5437f330:100000000"));
     }
 
     #[test]

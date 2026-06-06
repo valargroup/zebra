@@ -60,7 +60,7 @@ pub fn start_stack(
 
     let creds = load_or_create_credentials(&layout.creds_file)?;
     let enable_internal_miner =
-        matches!(network, Network::Regtest) && !options.regtest_producer_external;
+        network.is_private_regtest_like() && !options.regtest_producer_external;
     write_configs(
         &layout,
         network,
@@ -76,8 +76,13 @@ pub fn start_stack(
 
     start_regtest_producer_if_needed(network, &layout, &options)?;
 
-    if options.canonical_regtest && matches!(network, Network::Regtest) {
-        verify_canonical_regtest_behavior(&layout, &creds, options.follower_lag_tolerance)?;
+    if options.canonical_regtest && network.is_private_regtest_like() {
+        verify_canonical_private_behavior(
+            network,
+            &layout,
+            &creds,
+            options.follower_lag_tolerance,
+        )?;
     }
 
     println!(
@@ -176,7 +181,7 @@ fn start_regtest_producer_if_needed(
     layout: &Layout,
     options: &StartOptions,
 ) -> Result<()> {
-    if !matches!(network, Network::Regtest) || !options.regtest_producer_external {
+    if !network.is_private_regtest_like() || !options.regtest_producer_external {
         return Ok(());
     }
 
@@ -186,7 +191,7 @@ fn start_regtest_producer_if_needed(
 
     let log_path = layout.logs_dir.join("producer.log");
     println!(
-        "starting external regtest producer side process (log={})",
+        "starting external producer side process (log={})",
         log_path.display()
     );
 
@@ -216,7 +221,7 @@ fn start_regtest_producer_if_needed(
             .stdout(open_append(&log_path)?)
             .stderr(open_append(&log_path)?)
             .spawn()
-            .context("starting built-in regtest producer harness")?
+            .context("starting built-in producer harness")?
     };
 
     write_pid(&layout.producer_pid, child.id())?;
@@ -560,7 +565,7 @@ fn peers_are_ready(network: Network, peer_addrs: &[String], canonical_regtest: b
         return false;
     }
 
-    if canonical_regtest && matches!(network, Network::Regtest) {
+    if canonical_regtest && network.is_private_regtest_like() {
         return peer_addr_matches_expected_zebra(peer_addrs[0].as_str(), network.zebra_p2p_port());
     }
 
@@ -585,22 +590,26 @@ fn parse_cookie_auth(cookie_contents: &str) -> Result<(&str, &str)> {
         .ok_or_else(|| anyhow!("invalid zebra cookie format"))
 }
 
-fn verify_canonical_regtest_behavior(
+fn verify_canonical_private_behavior(
+    network: Network,
     layout: &Layout,
     creds: &RpcCredentials,
     follower_lag_tolerance: i64,
 ) -> Result<()> {
-    println!("verifying canonical regtest producer/follower behavior");
-    let mut zebra_prev = zebra_blocks(Network::Regtest, layout)?;
-    let mut zcashd_prev = zcashd_blocks(Network::Regtest, creds)?;
+    println!(
+        "verifying canonical private producer/follower behavior (network={})",
+        network.as_str()
+    );
+    let mut zebra_prev = zebra_blocks(network, layout)?;
+    let mut zcashd_prev = zcashd_blocks(network, creds)?;
     let mut zebra_increased = false;
     let mut zcashd_ahead_polls = 0u32;
 
     for poll in 1..=60 {
         thread::sleep(Duration::from_secs(2));
-        let zebra_now = zebra_blocks(Network::Regtest, layout)?;
-        let zcashd_now = zcashd_blocks(Network::Regtest, creds)?;
-        let peer_addrs = zcashd_get_peer_addrs(Network::Regtest, creds)?;
+        let zebra_now = zebra_blocks(network, layout)?;
+        let zcashd_now = zcashd_blocks(network, creds)?;
+        let peer_addrs = zcashd_get_peer_addrs(network, creds)?;
 
         if zcashd_now > zebra_now {
             zcashd_ahead_polls = zcashd_ahead_polls.saturating_add(1);
@@ -618,7 +627,7 @@ fn verify_canonical_regtest_behavior(
             zebra_increased = true;
         }
 
-        if !peers_are_ready(Network::Regtest, &peer_addrs, true) {
+        if !peers_are_ready(network, &peer_addrs, true) {
             bail!(
                 "follower isolation violated in canonical mode: expected one zebra loopback peer, got addrs={peer_addrs:?}"
             );
@@ -626,7 +635,7 @@ fn verify_canonical_regtest_behavior(
 
         if should_log_readiness_progress(poll) {
             println!(
-                "canonical regtest check poll {}: zebra_blocks={} zcashd_blocks={} lag={} peers={:?}",
+                "canonical private check poll {}: zebra_blocks={} zcashd_blocks={} lag={} peers={:?}",
                 poll,
                 zebra_now,
                 zcashd_now,
@@ -640,7 +649,10 @@ fn verify_canonical_regtest_behavior(
     }
 
     if !zebra_increased {
-        bail!("zebra internal miner did not produce new regtest blocks during canonical verification window");
+        bail!(
+            "zebra chain height did not increase during canonical verification window for network={}",
+            network.as_str()
+        );
     }
 
     let lag = zebra_prev.saturating_sub(zcashd_prev);
@@ -657,7 +669,8 @@ fn verify_canonical_regtest_behavior(
     }
 
     println!(
-        "canonical regtest behavior verified: zebra_blocks={zebra_prev}, zcashd_blocks={zcashd_prev}, lag={lag}"
+        "canonical private behavior verified: network={}, zebra_blocks={zebra_prev}, zcashd_blocks={zcashd_prev}, lag={lag}",
+        network.as_str()
     );
     Ok(())
 }
@@ -762,6 +775,12 @@ mod tests {
         assert!(peers_are_ready(Network::Regtest, &ok, true));
         assert!(!peers_are_ready(Network::Regtest, &wrong_target, true));
         assert!(!peers_are_ready(Network::Regtest, &too_many, true));
+        let mainnet_like_ok = vec!["127.0.0.1:19235".to_string()];
+        assert!(peers_are_ready(
+            Network::MainnetLike,
+            &mainnet_like_ok,
+            true
+        ));
         assert!(peers_are_ready(Network::Testnet, &ok, false));
     }
 
