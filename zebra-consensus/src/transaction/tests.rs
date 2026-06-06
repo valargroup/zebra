@@ -3357,6 +3357,61 @@ async fn v5_consensus_branch_ids() {
     }
 }
 
+#[test]
+fn configured_nu6_2_boundary_changes_v5_consensus_branch_id() {
+    let marker_height = Height(120);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_1: Some(marker_height.0 - 1),
+            nu6_2: Some(marker_height.0),
+            ..Default::default()
+        })
+        .expect("configured activation heights should be valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured network should build");
+
+    let tx_nu6_1 = Transaction::V5 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height::MAX_EXPIRY_HEIGHT,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        network_upgrade: NetworkUpgrade::Nu6_1,
+    };
+
+    let tx_nu6_2 = Transaction::V5 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height::MAX_EXPIRY_HEIGHT,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        network_upgrade: NetworkUpgrade::Nu6_2,
+    };
+
+    let before_marker = marker_height
+        .previous()
+        .expect("marker height is above genesis");
+
+    assert_eq!(
+        check::consensus_branch_id(&tx_nu6_1, before_marker, &network),
+        Ok(()),
+        "NU6.1 transaction should be valid before the private marker boundary",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&tx_nu6_1, marker_height, &network),
+        Err(TransactionError::WrongConsensusBranchId),
+        "NU6.1 transaction should be rejected at and after the marker boundary",
+    );
+    assert_eq!(
+        check::consensus_branch_id(&tx_nu6_2, marker_height, &network),
+        Ok(()),
+        "NU6.2 transaction should be valid at the private marker boundary",
+    );
+}
+
 // Utility functions
 
 /// Create a mock transparent transfer to be included in a transaction.

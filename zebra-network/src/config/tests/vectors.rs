@@ -5,7 +5,7 @@ use zebra_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredFundingStreams},
-        Network,
+        Network, NetworkUpgrade,
     },
 };
 
@@ -144,5 +144,130 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     assert_eq!(
         params.temporary_orchard_disabling_soft_fork_height(),
         Some(soft_fork_height),
+    );
+}
+
+#[test]
+fn private_nu6_3_marker_requires_explicit_network_magic() {
+    let _init_guard = zebra_test::init();
+
+    let config = r#"
+        initial_testnet_peers = ["192.0.2.10:18233"]
+
+        [network]
+        network_name = "UnityPrivate"
+        fork_height = 100
+        nu6_3_activation_height = 120
+        checkpoints = true
+    "#;
+
+    let error = toml::from_str::<Config>(config).expect_err("config should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("requires an explicit `network_magic` override"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn private_nu6_3_marker_requires_explicit_initial_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config = r#"
+        initial_testnet_peers = []
+
+        [network]
+        network_name = "UnityPrivate"
+        network_magic = [250, 191, 180, 45]
+        fork_height = 100
+        nu6_3_activation_height = 120
+        checkpoints = true
+        extend_funding_stream_addresses_as_required = true
+    "#;
+
+    let error = toml::from_str::<Config>(config).expect_err("config should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("requires explicit `initial_testnet_peers`"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn private_nu6_3_marker_requires_ordered_heights() {
+    let _init_guard = zebra_test::init();
+
+    let config = r#"
+        initial_testnet_peers = ["192.0.2.10:18233"]
+
+        [network]
+        network_name = "UnityPrivate"
+        network_magic = [250, 191, 180, 45]
+        fork_height = 200
+        nu6_3_activation_height = 120
+        checkpoints = true
+    "#;
+
+    let error = toml::from_str::<Config>(config).expect_err("config should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("requires `nu6_3_activation_height >= fork_height`"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn private_nu6_3_marker_requires_matching_configured_nu6_2() {
+    let _init_guard = zebra_test::init();
+
+    let config = r#"
+        initial_testnet_peers = ["192.0.2.10:18233"]
+
+        [network]
+        network_name = "UnityPrivate"
+        network_magic = [250, 191, 180, 45]
+        fork_height = 100
+        nu6_3_activation_height = 120
+        checkpoints = true
+
+        [network.activation_heights]
+        "NU6.2" = 121
+    "#;
+
+    let error = toml::from_str::<Config>(config).expect_err("config should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("requires `activation_heights.NU6.2` to match `nu6_3_activation_height`"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn private_nu6_3_marker_maps_to_nu6_2_activation() {
+    let _init_guard = zebra_test::init();
+
+    let config = r#"
+        initial_testnet_peers = ["192.0.2.10:18233"]
+
+        [network]
+        network_name = "UnityPrivate"
+        network_magic = [250, 191, 180, 45]
+        fork_height = 100
+        nu6_3_activation_height = 120
+        checkpoints = true
+        extend_funding_stream_addresses_as_required = true
+    "#;
+
+    let config: Config = toml::from_str(config).expect("config should parse");
+    let nu6_2_height = NetworkUpgrade::Nu6_2.activation_height(&config.network);
+
+    assert_eq!(
+        nu6_2_height,
+        Some(Height(120)),
+        "private NU6.3 marker must map to NU6.2 activation",
     );
 }

@@ -240,6 +240,42 @@ fn branch_id_consistent(network: Network) {
     }
 }
 
+#[test]
+fn branch_id_transition_for_configured_nu6_2_boundary() {
+    let _init_guard = zebra_test::init();
+
+    let marker_height = block::Height(120);
+    let network = crate::parameters::testnet::Parameters::build()
+        .with_activation_heights(crate::parameters::testnet::ConfiguredActivationHeights {
+            nu6_1: Some(marker_height.0 - 1),
+            nu6_2: Some(marker_height.0),
+            ..Default::default()
+        })
+        .expect("configured activation heights should be valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured network should build");
+
+    let before_marker = marker_height
+        .previous()
+        .expect("marker height is above genesis");
+
+    assert_eq!(
+        NetworkUpgrade::current(&network, before_marker),
+        NetworkUpgrade::Nu6_1
+    );
+    assert_eq!(
+        NetworkUpgrade::current(&network, marker_height),
+        NetworkUpgrade::Nu6_2
+    );
+
+    assert_ne!(
+        ConsensusBranchId::current(&network, before_marker),
+        ConsensusBranchId::current(&network, marker_height),
+        "consensus branch id must change at the configured marker boundary",
+    );
+}
+
 // TODO: split this file in unit.rs and prop.rs
 use hex::{FromHex, ToHex};
 use proptest::prelude::*;

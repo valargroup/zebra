@@ -592,6 +592,12 @@ impl Default for Config {
 struct DTestnetParameters {
     network_name: Option<String>,
     network_magic: Option<[u8; 4]>,
+    /// Fork anchor height for private testnet profiles that mirror mainnet history.
+    fork_height: Option<u32>,
+    /// Private `NU6.3` marker activation height.
+    ///
+    /// Zebra currently maps this marker to the configured `NU6.2` activation height.
+    nu6_3_activation_height: Option<u32>,
     slow_start_interval: Option<u32>,
     target_difficulty_limit: Option<String>,
     disable_pow: Option<bool>,
@@ -677,6 +683,8 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
         Self {
             network_name: Some(params.network_name().to_string()),
             network_magic: Some(params.network_magic().0),
+            fork_height: None,
+            nu6_3_activation_height: None,
             slow_start_interval: Some(params.slow_start_interval().0),
             target_difficulty_limit: Some(params.target_difficulty_limit().to_string()),
             disable_pow: Some(params.disable_pow()),
@@ -883,6 +891,8 @@ where
     let DTestnetParameters {
         network_name,
         network_magic,
+        fork_height,
+        nu6_3_activation_height,
         slow_start_interval,
         target_difficulty_limit,
         disable_pow,
@@ -897,6 +907,63 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
     } = params;
+
+    let uses_private_nu6_3_marker = fork_height.is_some() || nu6_3_activation_height.is_some();
+
+    if uses_private_nu6_3_marker {
+        let (Some(fork_height), Some(nu6_3_activation_height)) =
+            (fork_height, nu6_3_activation_height)
+        else {
+            return Err(de::Error::custom(
+                "private NU6.3 marker mode requires both `fork_height` and `nu6_3_activation_height`",
+            ));
+        };
+
+        if nu6_3_activation_height < fork_height {
+            return Err(de::Error::custom(
+                "private NU6.3 marker mode requires `nu6_3_activation_height >= fork_height`",
+            ));
+        }
+
+        if network_magic.is_none() {
+            return Err(de::Error::custom(
+                "private NU6.3 marker mode requires an explicit `network_magic` override",
+            ));
+        }
+
+        if initial_testnet_peers.is_empty() {
+            return Err(de::Error::custom(
+                "private NU6.3 marker mode requires explicit `initial_testnet_peers`",
+            ));
+        }
+
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "private NU6.3 marker mode forbids default Mainnet/Testnet seed peers",
+            ));
+        }
+    }
+
+    let activation_heights = match (activation_heights, nu6_3_activation_height) {
+        (Some(mut activation_heights), Some(nu6_3_activation_height)) => {
+            if let Some(nu6_2_activation_height) = activation_heights.nu6_2 {
+                if nu6_2_activation_height != nu6_3_activation_height {
+                    return Err(de::Error::custom(
+                        "private NU6.3 marker mode requires `activation_heights.NU6.2` to match `nu6_3_activation_height`",
+                    ));
+                }
+            }
+
+            // Private NU6.3 marker semantics are mapped onto the existing NU6.2 activation boundary.
+            activation_heights.nu6_2 = Some(nu6_3_activation_height);
+            Some(activation_heights)
+        }
+        (None, Some(nu6_3_activation_height)) => Some(ConfiguredActivationHeights {
+            nu6_2: Some(nu6_3_activation_height),
+            ..ConfiguredActivationHeights::default()
+        }),
+        (activation_heights, None) => activation_heights,
+    };
 
     let mut params_builder = testnet::Parameters::build();
 
@@ -998,7 +1065,20 @@ where
     if network_name.is_none() && params_builder == testnet::Parameters::build() {
         Ok(Network::new_default_testnet())
     } else {
-        Ok(params_builder.to_network().map_err(de::Error::custom)?)
+        params_builder.to_network().map_err(|error| {
+            let error = error.to_string();
+
+            if uses_private_nu6_3_marker
+                && (error.contains("first checkpoint hash must match genesis hash")
+                    || error.contains("checkpoints must be provided for block heights below the mandatory checkpoint height"))
+            {
+                de::Error::custom(format!(
+                    "{error}; private NU6.3 marker profiles must provide checkpoints that match the configured genesis hash and mandatory checkpoint coverage"
+                ))
+            } else {
+                de::Error::custom(error)
+            }
+        })
     }
 }
 

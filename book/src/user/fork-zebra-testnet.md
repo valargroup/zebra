@@ -55,6 +55,44 @@ zebrad -c myconf.toml start
 
 Wait for the sync to complete (this may take up to 24 hours, depending on testnet conditions), resulting in a state up to the desired block in `~/cache/zebra`.
 
+## Unity private-fork profile (minimal path)
+
+For Unity-node setup testing, you can avoid adding a brand new network-upgrade variant by using a
+private `NU6.3` marker that maps to Zebra's existing `NU6.2` activation machinery.
+
+Use a dedicated profile with explicit identity/isolation settings:
+
+```toml
+[network]
+network = "Testnet"
+initial_testnet_peers = [
+  "10.10.0.11:18233",
+  "10.10.0.12:18233",
+]
+cache_dir = "/var/lib/zebra/unity-private/network-cache"
+
+[network.testnet_parameters]
+network_name = "UnityPrivate"
+network_magic = [250, 191, 180, 45]
+fork_height = 3_366_799
+nu6_3_activation_height = 3_366_900
+checkpoints = true
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+"NU6.2" = 3_366_900
+
+[state]
+cache_dir = "/var/lib/zebra/unity-private/state"
+```
+
+Operator checklist for this profile:
+- Use private peers only, never default public Testnet seeders.
+- Keep `network.cache_dir` and `state.cache_dir` isolated from shared/public deployments.
+- Set `network_magic` explicitly and keep it unique to your private fork.
+- Keep `nu6_3_activation_height >= fork_height`.
+- If you set `activation_heights."NU6.2"`, it must match `nu6_3_activation_height`.
+
 ## Code changes
 
 We need to add the network upgrade variant to the `zcash_primitives` crate and Zebra.

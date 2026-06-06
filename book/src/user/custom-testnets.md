@@ -62,6 +62,48 @@ NU6 = 1
 listen_addr = "0.0.0.0:18232"
 ```
 
+### Private fork profile for Unity testing (NU6.3 marker)
+
+If you are seeding a private Testnet from a mainnet snapshot and want a lightweight replay-protection
+boundary for Unity-node bring-up, use a private `nu6_3_activation_height` marker.
+
+In Zebra this marker is intentionally mapped to the existing `NU6.2` activation machinery, so no
+new consensus upgrade enum is required for this workflow.
+
+```toml
+[network]
+network = "Testnet"
+initial_testnet_peers = [
+  "10.10.0.11:18233",
+  "10.10.0.12:18233",
+]
+
+# Keep this isolated from public Testnet peer cache state.
+cache_dir = "/var/lib/zebra/unity-private/network-cache"
+
+[network.testnet_parameters]
+network_name = "UnityPrivate"
+network_magic = [250, 191, 180, 45]
+fork_height = 3_366_799
+nu6_3_activation_height = 3_366_900
+
+# Keep checkpoint validation strict in private-fork mode.
+checkpoints = true
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+"NU6.2" = 3_366_900
+
+[state]
+cache_dir = "/var/lib/zebra/unity-private/state"
+```
+
+For this private profile:
+- `network_magic` is required and must be non-default for your isolated network.
+- `initial_testnet_peers` must be explicitly set and must not contain default public seeds.
+- `nu6_3_activation_height` must be at or above `fork_height`.
+- If `activation_heights."NU6.2"` is set, it must exactly match `nu6_3_activation_height`.
+
 Relevant parts of the configuration file with some Mainnet parameters[^fn1]:
 
 ```toml
@@ -131,6 +173,10 @@ There are also a few other restrictions on these parameters:
   - be shorter than the `MAX_NETWORK_NAME_LENGTH` of `30`.
 - The network magic must not be any of the reserved network magics: `[36, 233, 39, 100]` and `[170, 232, 63, 95]`, these are the `Mainnet` and `Regtest` network magics respectively.
 - The network upgrade activation heights must be in order, such that the activation height for every network upgrade is at or above the activation height of every preceding network upgrade.
+- In private `nu6_3_activation_height` marker mode, Zebra requires:
+  - `fork_height` and `nu6_3_activation_height` together,
+  - explicit custom peers and custom network magic, and
+  - checkpoint coverage consistent with the configured genesis and mandatory checkpoint rules.
 
 ## Comparison To Mainnet and Default Public Testnet Consensus Rules
 
