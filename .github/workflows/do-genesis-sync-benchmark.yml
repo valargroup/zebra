@@ -7,6 +7,10 @@ on:
         description: Number of mainnet blocks to sync from genesis
         required: true
         default: "50000"
+      source_ref:
+        description: Zebra source branch, tag, or commit SHA to build. Defaults to the selected workflow branch.
+        required: false
+        default: ""
       droplet_size:
         description: DigitalOcean size slug
         required: true
@@ -52,6 +56,7 @@ jobs:
     env:
       DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
       TARGET_BLOCKS: ${{ inputs.blocks }}
+      SOURCE_REF_INPUT: ${{ inputs.source_ref }}
       DROPLET_SIZE: ${{ inputs.droplet_size }}
       DROPLET_REGION: ${{ inputs.region }}
       DROPLET_IMAGE: ${{ inputs.image }}
@@ -61,11 +66,8 @@ jobs:
       KEEP_DROPLET: ${{ inputs.keep_droplet }}
       DO_RESOURCE_FILE: /tmp/zebra-do-genesis-bench-resources.env
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-        with:
-          persist-credentials: false
-
       - name: Validate inputs
+        id: inputs
         run: |
           set -euo pipefail
 
@@ -96,10 +98,47 @@ jobs:
             echo "::warning::keep_droplet=true without extra_ssh_key_ids may leave a droplet that is hard to access after the runner deletes its private key"
           fi
 
-          short_sha="${GITHUB_SHA:0:7}"
-          raw_variant="${GITHUB_REF_NAME}-${short_sha}"
-          variant=$(printf '%s' "$raw_variant" | tr -c 'A-Za-z0-9._-' '-')
-          echo "BENCH_VARIANT=$variant" >> "$GITHUB_ENV"
+          source_ref=$SOURCE_REF_INPUT
+          if [[ -z "$source_ref" ]]; then
+            source_ref=$GITHUB_REF_NAME
+          fi
+
+          if [[ "$source_ref" == *$'\n'* || "$source_ref" == *$'\r'* ]]; then
+            echo "source_ref must not contain newlines" >&2
+            exit 1
+          fi
+
+          echo "SOURCE_REF=$source_ref" >> "$GITHUB_ENV"
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout benchmark harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          path: benchmark-harness
+
+      - name: Checkout Zebra source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          path: source
+          ref: ${{ steps.inputs.outputs.source_ref }}
+
+      - name: Prepare benchmark metadata
+        run: |
+          set -euo pipefail
+
+          source_sha=$(git -C source rev-parse HEAD)
+          source_short_sha=${source_sha:0:7}
+          source_slug=$(printf '%s' "$SOURCE_REF" | tr -c 'A-Za-z0-9._-' '-')
+          variant="${source_slug}-${source_short_sha}"
+
+          {
+            echo "BENCH_VARIANT=$variant"
+            echo "SOURCE_SHA=$source_sha"
+            echo "WORKFLOW_REF=$GITHUB_REF_NAME"
+            echo "WORKFLOW_SHA=$GITHUB_SHA"
+          } >> "$GITHUB_ENV"
 
       - name: Generate temporary SSH key
         run: |
@@ -212,7 +251,7 @@ jobs:
           echo "Timed out waiting for SSH on ${DROPLET_IP}" >&2
           exit 1
 
-      - name: Upload source
+      - name: Upload source and benchmark harness
         env:
           DROPLET_IP: ${{ steps.create.outputs.droplet_ip }}
         run: |
@@ -223,14 +262,20 @@ jobs:
             --exclude=.git \
             --exclude=target \
             --exclude=bench-artifacts \
+            -C source \
             -czf "$RUNNER_TEMP/zebra-src.tgz" .
+
+          tar \
+            -C benchmark-harness/.github/workflows/scripts \
+            -czf "$RUNNER_TEMP/zebra-benchmark-harness.tgz" .
 
           scp -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" \
             "$RUNNER_TEMP/zebra-src.tgz" \
-            "root@${DROPLET_IP}:/root/zebra-src.tgz"
+            "$RUNNER_TEMP/zebra-benchmark-harness.tgz" \
+            "root@${DROPLET_IP}:/root/"
 
           ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" \
-            'rm -rf /mnt/zebra/src && mkdir -p /mnt/zebra/src /mnt/zebra/runs /mnt/zebra/network-cache && tar -xzf /root/zebra-src.tgz -C /mnt/zebra/src'
+            'rm -rf /mnt/zebra/src /mnt/zebra/bench-harness && mkdir -p /mnt/zebra/src /mnt/zebra/bench-harness /mnt/zebra/runs /mnt/zebra/network-cache && tar -xzf /root/zebra-src.tgz -C /mnt/zebra/src && tar -xzf /root/zebra-benchmark-harness.tgz -C /mnt/zebra/bench-harness && chmod +x /mnt/zebra/bench-harness/*.sh'
 
       - name: Build and run genesis sync benchmark
         env:
@@ -239,14 +284,18 @@ jobs:
           set -euo pipefail
           ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
-          remote_env=$(printf 'TARGET_BLOCKS=%q BENCH_VARIANT=%q MAX_ELAPSED_SECONDS=%q MAX_STALL_SECONDS=%q ' \
+          remote_env=$(printf 'TARGET_BLOCKS=%q BENCH_VARIANT=%q MAX_ELAPSED_SECONDS=%q MAX_STALL_SECONDS=%q SOURCE_REF=%q SOURCE_SHA=%q WORKFLOW_REF=%q WORKFLOW_SHA=%q ' \
             "$TARGET_BLOCKS" \
             "$BENCH_VARIANT" \
             "$MAX_ELAPSED_SECONDS" \
-            "$MAX_STALL_SECONDS")
+            "$MAX_STALL_SECONDS" \
+            "$SOURCE_REF" \
+            "$SOURCE_SHA" \
+            "$WORKFLOW_REF" \
+            "$WORKFLOW_SHA")
 
           ssh -i ~/.ssh/zebra_do_genesis_bench "${ssh_opts[@]}" "root@${DROPLET_IP}" \
-            "${remote_env}bash /mnt/zebra/src/.github/workflows/scripts/do-genesis-sync-remote-runner.sh"
+            "${remote_env}bash /mnt/zebra/bench-harness/do-genesis-sync-remote-runner.sh"
 
       - name: Collect benchmark artifacts
         if: always() && steps.create.outputs.droplet_ip != ''
@@ -290,13 +339,20 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          workflow_ref=${WORKFLOW_REF:-$GITHUB_REF_NAME}
+          workflow_sha=${WORKFLOW_SHA:-$GITHUB_SHA}
+          source_ref=${SOURCE_REF:-${SOURCE_REF_INPUT:-$GITHUB_REF_NAME}}
+          source_sha=${SOURCE_SHA:-unknown}
+
           {
             echo "## Workflow Run"
             echo
             echo "| Field | Value |"
             echo "| --- | --- |"
-            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
-            echo "| SHA | \`${GITHUB_SHA}\` |"
+            echo "| Workflow ref | \`${workflow_ref}\` |"
+            echo "| Workflow SHA | \`${workflow_sha}\` |"
+            echo "| Source ref | \`${source_ref}\` |"
+            echo "| Source SHA | \`${source_sha}\` |"
             echo "| Target blocks | ${TARGET_BLOCKS} |"
             echo "| Droplet size | \`${DROPLET_SIZE}\` |"
             echo "| Region | \`${DROPLET_REGION}\` |"

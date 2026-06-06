@@ -6,6 +6,8 @@ BENCH_VARIANT=${BENCH_VARIANT:?BENCH_VARIANT is required}
 MAX_ELAPSED_SECONDS=${MAX_ELAPSED_SECONDS:-14400}
 MAX_STALL_SECONDS=${MAX_STALL_SECONDS:-900}
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -39,6 +41,10 @@ cargo build --release --locked --bin zebrad
 VARIANT="$BENCH_VARIANT" \
   MAX_ELAPSED_SECONDS="$MAX_ELAPSED_SECONDS" \
   MAX_STALL_SECONDS="$MAX_STALL_SECONDS" \
-  bash ./.github/workflows/scripts/do-genesis-sync-benchmark.sh \
+  SOURCE_REF="${SOURCE_REF:-}" \
+  SOURCE_SHA="${SOURCE_SHA:-}" \
+  WORKFLOW_REF="${WORKFLOW_REF:-}" \
+  WORKFLOW_SHA="${WORKFLOW_SHA:-}" \
+  bash "$SCRIPT_DIR/do-genesis-sync-benchmark.sh" \
     /mnt/zebra/src/target/release/zebrad \
     "$TARGET_BLOCKS"
