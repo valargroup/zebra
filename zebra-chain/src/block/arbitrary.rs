@@ -599,7 +599,7 @@ where
                 ..
             } => *sapling_shielded_data = None,
             Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(zcash_unstable = "nu7")]
             Transaction::V6 { .. } => {}
         }
     }

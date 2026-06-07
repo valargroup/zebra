@@ -21,7 +21,7 @@ use zebra_chain::{
     transparent,
 };
 
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[cfg(zcash_unstable = "nu7")]
 use zebra_chain::amount::NegativeAllowed;
 
 use crate::error::TransactionError;
@@ -125,11 +125,11 @@ pub fn lock_time_has_passed(
 ///
 /// This check counts both `Coinbase` and `PrevOut` transparent inputs.
 pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+    #[cfg(zcash_unstable = "nu7")]
     let has_other_circulation_effects =
         tx.ironwood_value_balance().ironwood_amount() != Amount::<NegativeAllowed>::zero();
 
-    #[cfg(not(all(zcash_unstable = "nu7", feature = "tx_v6")))]
+    #[cfg(not(zcash_unstable = "nu7"))]
     let has_other_circulation_effects = false;
 
     if !tx.has_transparent_or_shielded_inputs() {

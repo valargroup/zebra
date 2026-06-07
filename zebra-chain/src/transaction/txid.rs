@@ -1,8 +1,35 @@
 //! Transaction ID computation. Contains code for generating the Transaction ID
 //! from the transaction.
 
+#[cfg(zcash_unstable = "nu7")]
+use blake2b_simd::{Hash as Blake2bHash, Params};
+#[cfg(zcash_unstable = "nu7")]
+use byteorder::{LittleEndian, WriteBytesExt};
+
 use super::{Hash, Transaction};
 use crate::serialization::{sha256d, ZcashSerialize};
+
+#[cfg(zcash_unstable = "nu7")]
+use crate::{block, parameters::TX_V6_VERSION_GROUP_ID, transaction::LockTime};
+
+#[cfg(zcash_unstable = "nu7")]
+use zcash_primitives::transaction::txid::TxIdDigester;
+
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_TX_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZcashTxHash_";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_HEADERS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdHeadersHash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_TRANSPARENT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdTranspaHash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_SAPLING_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdSaplingHash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_IRONWOOD_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIronwd_Hash";
+
+#[cfg(zcash_unstable = "nu7")]
+fn hasher(personal: &[u8; 16]) -> blake2b_simd::State {
+    Params::new().hash_length(32).personal(personal).to_state()
+}
 
 /// A Transaction ID builder. It computes the transaction ID by hashing
 /// different parts of the transaction, depending on the transaction version.
@@ -28,7 +55,7 @@ impl<'a> TxIdBuilder<'a> {
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => self.txid_v1_to_v4(),
             Transaction::V5 { .. } => self.txid_v5(),
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(zcash_unstable = "nu7")]
             Transaction::V6 { .. } => self.txid_v6(),
         }
     }
@@ -52,8 +79,143 @@ impl<'a> TxIdBuilder<'a> {
     }
 
     /// Compute the Transaction ID for a V6 transaction.
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+    #[cfg(zcash_unstable = "nu7")]
     fn txid_v6(self) -> Option<Hash> {
-        self.txid_v1_to_v4()
+        let Transaction::V6 {
+            network_upgrade,
+            lock_time,
+            expiry_height,
+            inputs,
+            outputs,
+            orchard_shielded_data,
+            ironwood_value_balance,
+        } = self.trans
+        else {
+            unreachable!("txid_v6() is only called for v6 transactions");
+        };
+
+        let fake_v5 = Transaction::V5 {
+            network_upgrade: *network_upgrade,
+            lock_time: *lock_time,
+            expiry_height: *expiry_height,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: orchard_shielded_data.clone(),
+        };
+
+        // TODO: route v6 txid computation through librustzcash once it supports
+        // Ironwood transaction fields.
+        let v5_tx = fake_v5.to_librustzcash(*network_upgrade).ok()?;
+        let v5_digests = v5_tx.into_data().digest(TxIdDigester);
+
+        let branch_id = u32::from(network_upgrade.branch_id()?);
+        let header_digest = hash_v6_header_txid_data(branch_id, *lock_time, *expiry_height);
+        let transparent_digest =
+            hash_transparent_txid_data(v5_digests.transparent_digests.as_ref());
+        let sapling_digest = hash_sapling_txid_empty();
+        let orchard_digest = v5_digests
+            .orchard_digest
+            .unwrap_or_else(::orchard::bundle::commitments::hash_bundle_txid_empty);
+        let ironwood_digest = hash_ironwood_txid_data(*ironwood_value_balance);
+
+        Some(Hash(
+            v6_txid_hash(
+                branch_id,
+                header_digest,
+                transparent_digest,
+                sapling_digest,
+                orchard_digest,
+                ironwood_digest,
+            )
+            .as_bytes()
+            .try_into()
+            .expect("Blake2b hash is 32 bytes"),
+        ))
     }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn hash_v6_header_txid_data(
+    branch_id: u32,
+    lock_time: LockTime,
+    expiry_height: block::Height,
+) -> Blake2bHash {
+    let mut h = hasher(ZCASH_HEADERS_HASH_PERSONALIZATION);
+
+    h.update(&(1_u32 << 31 | 6).to_le_bytes());
+    h.update(&TX_V6_VERSION_GROUP_ID.to_le_bytes());
+    h.update(&branch_id.to_le_bytes());
+    h.update(&lock_time_to_u32(lock_time).to_le_bytes());
+    h.update(&expiry_height.0.to_le_bytes());
+
+    h.finalize()
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn lock_time_to_u32(lock_time: LockTime) -> u32 {
+    let mut bytes = Vec::new();
+    lock_time
+        .zcash_serialize(&mut bytes)
+        .expect("lock_time should serialize");
+
+    u32::from_le_bytes(bytes.try_into().expect("lock_time serializes as 4 bytes"))
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn hash_transparent_txid_data(
+    transparent_digests: Option<&zcash_primitives::transaction::TransparentDigests<Blake2bHash>>,
+) -> Blake2bHash {
+    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
+
+    if let Some(digests) = transparent_digests {
+        h.update(digests.prevouts_digest.as_bytes());
+        h.update(digests.sequence_digest.as_bytes());
+        h.update(digests.outputs_digest.as_bytes());
+    }
+
+    h.finalize()
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn hash_sapling_txid_empty() -> Blake2bHash {
+    hasher(ZCASH_SAPLING_HASH_PERSONALIZATION).finalize()
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn hash_ironwood_txid_data(
+    ironwood_value_balance: crate::amount::Amount<crate::amount::NegativeAllowed>,
+) -> Blake2bHash {
+    let mut h = hasher(ZCASH_IRONWOOD_HASH_PERSONALIZATION);
+
+    ironwood_value_balance
+        .zcash_serialize(&mut h)
+        .expect("amount serialization to a hash state should never fail");
+
+    h.finalize()
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn v6_txid_hash(
+    branch_id: u32,
+    header_digest: Blake2bHash,
+    transparent_digest: Blake2bHash,
+    sapling_digest: Blake2bHash,
+    orchard_digest: Blake2bHash,
+    ironwood_digest: Blake2bHash,
+) -> Blake2bHash {
+    let mut personal = [0; 16];
+    personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
+    (&mut personal[12..])
+        .write_u32::<LittleEndian>(branch_id)
+        .expect("writing to a byte slice should never fail");
+
+    let mut h = hasher(&personal);
+    h.update(header_digest.as_bytes());
+    h.update(transparent_digest.as_bytes());
+    h.update(sapling_digest.as_bytes());
+    h.update(orchard_digest.as_bytes());
+    h.update(ironwood_digest.as_bytes());
+
+    h.finalize()
 }
