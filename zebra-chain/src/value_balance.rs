@@ -352,8 +352,8 @@ impl ValueBalance<NonNegative> {
             self.sprout.to_bytes(),
             self.sapling.to_bytes(),
             self.orchard.to_bytes(),
-            self.ironwood.to_bytes(),
             self.deferred.to_bytes(),
+            self.ironwood.to_bytes(),
         ]
         .concat()
         .try_into()
@@ -404,31 +404,25 @@ impl ValueBalance<NonNegative> {
         )
         .map_err(Orchard)?;
 
+        let deferred = match bytes_length {
+            32 => Amount::zero(),
+            40 | 48 => Amount::from_bytes(
+                bytes[32..40]
+                    .try_into()
+                    .expect("deferred amount should be parsable"),
+            )
+            .map_err(Deferred)?,
+            _ => return Err(Unparsable),
+        };
+
         let ironwood = match bytes_length {
             32 | 40 => Amount::zero(),
             48 => Amount::from_bytes(
-                bytes[32..40]
+                bytes[40..48]
                     .try_into()
                     .expect("ironwood amount should be parsable"),
             )
             .map_err(Ironwood)?,
-            _ => return Err(Unparsable),
-        };
-
-        let deferred = match bytes_length {
-            32 => Amount::zero(),
-            40 => Amount::from_bytes(
-                bytes[32..40]
-                    .try_into()
-                    .expect("deferred amount should be parsable"),
-            )
-            .map_err(Deferred)?,
-            48 => Amount::from_bytes(
-                bytes[40..48]
-                    .try_into()
-                    .expect("deferred amount should be parsable"),
-            )
-            .map_err(Deferred)?,
             _ => return Err(Unparsable),
         };
 
