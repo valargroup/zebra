@@ -157,6 +157,14 @@ pub fn has_enough_orchard_flags(tx: &Transaction) -> Result<(), TransactionError
     Ok(())
 }
 
+/// Check that Ironwood actions have at least one active flag.
+pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.has_enough_ironwood_flags() {
+        return Err(TransactionError::NotEnoughIronwoodFlags);
+    }
+    Ok(())
+}
+
 /// Check that a coinbase transaction has no PrevOut inputs, JoinSplits, or spends.
 ///
 /// # Consensus
@@ -185,6 +193,12 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
             if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
                 return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if ironwood_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+                return Err(TransactionError::CoinbaseHasEnableSpendsIronwood);
             }
         }
     }
@@ -275,11 +289,13 @@ pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError
     let sprout_nullifiers = transaction.sprout_nullifiers().map(Cow::Borrowed);
     let sapling_nullifiers = transaction.sapling_nullifiers().map(Cow::Borrowed);
     let orchard_nullifiers = transaction.orchard_nullifiers().map(Cow::Borrowed);
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Borrowed);
 
     check_for_duplicates(transparent_outpoints, DuplicateTransparentSpend)?;
     check_for_duplicates(sprout_nullifiers, DuplicateSproutNullifier)?;
     check_for_duplicates(sapling_nullifiers, DuplicateSaplingNullifier)?;
     check_for_duplicates(orchard_nullifiers, DuplicateOrchardNullifier)?;
+    check_for_duplicates(ironwood_nullifiers, DuplicateIronwoodNullifier)?;
 
     Ok(())
 }

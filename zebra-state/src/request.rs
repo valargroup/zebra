@@ -13,7 +13,7 @@ use zebra_chain::{
     block::{self, Block, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     sapling,
     serialization::SerializationError,
@@ -339,8 +339,10 @@ impl Treestate {
         sprout: Arc<sprout::tree::NoteCommitmentTree>,
         sapling: Arc<sapling::tree::NoteCommitmentTree>,
         orchard: Arc<orchard::tree::NoteCommitmentTree>,
+        ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
         sapling_subtree: Option<NoteCommitmentSubtree<sapling_crypto::Node>>,
         orchard_subtree: Option<NoteCommitmentSubtree<orchard::tree::Node>>,
+        ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
         history_tree: Arc<HistoryTree>,
     ) -> Self {
         Self {
@@ -350,6 +352,8 @@ impl Treestate {
                 sapling_subtree,
                 orchard,
                 orchard_subtree,
+                ironwood,
+                ironwood_subtree,
             },
             history_tree,
         }

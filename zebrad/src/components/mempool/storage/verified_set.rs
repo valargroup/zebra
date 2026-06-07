@@ -8,7 +8,7 @@ use std::{
 
 use zebra_chain::{
     block::Height,
-    orchard, sapling, sprout,
+    ironwood, orchard, sapling, sprout,
     transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -65,6 +65,9 @@ pub struct VerifiedSet {
 
     /// The set of revealed Orchard nullifiers.
     orchard_nullifiers: HashSet<orchard::Nullifier>,
+
+    /// The set of revealed Ironwood nullifiers.
+    ironwood_nullifiers: HashSet<ironwood::Nullifier>,
 }
 
 impl Drop for VerifiedSet {
@@ -180,6 +183,7 @@ impl VerifiedSet {
         self.sprout_nullifiers.extend(tx.sprout_nullifiers());
         self.sapling_nullifiers.extend(tx.sapling_nullifiers());
         self.orchard_nullifiers.extend(tx.orchard_nullifiers());
+        self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
 
         self.transactions_serialized_size += transaction.transaction.size;
         self.total_cost += transaction.cost();
@@ -321,6 +325,7 @@ impl VerifiedSet {
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
             || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
             || Self::has_conflicts(&self.orchard_nullifiers, tx.orchard_nullifiers().copied())
+            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers().copied())
     }
 
     /// Removes the tracked transaction outputs from the mempool.
@@ -339,11 +344,13 @@ impl VerifiedSet {
         let sprout_nullifiers = tx.sprout_nullifiers().map(Cow::Borrowed);
         let sapling_nullifiers = tx.sapling_nullifiers().map(Cow::Borrowed);
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
+        let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Borrowed);
 
         Self::remove_from_set(&mut self.spent_outpoints, spent_outpoints);
         Self::remove_from_set(&mut self.sprout_nullifiers, sprout_nullifiers);
         Self::remove_from_set(&mut self.sapling_nullifiers, sapling_nullifiers);
         Self::remove_from_set(&mut self.orchard_nullifiers, orchard_nullifiers);
+        Self::remove_from_set(&mut self.ironwood_nullifiers, ironwood_nullifiers);
     }
 
     /// Returns `true` if the two sets have common items.

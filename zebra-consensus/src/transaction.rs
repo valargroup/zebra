@@ -404,6 +404,7 @@ where
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
+            check::has_enough_ironwood_flags(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
@@ -439,6 +440,12 @@ where
                 if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
                     if !orchard_shielded_data.proof_size_is_canonical() {
                         return Err(TransactionError::OrchardProofSize);
+                    }
+                }
+
+                if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+                    if !ironwood_shielded_data.proof_size_is_canonical() {
+                        return Err(TransactionError::IronwoodProofSize);
                     }
                 }
             }
@@ -1006,7 +1013,7 @@ where
         }
     }
 
-    /// Passthrough to verify_v5_transaction, but for V6 transactions.
+    /// Verifies a V6 transaction.
     #[cfg(zcash_unstable = "nu7")]
     fn verify_v6_transaction(
         request: &Request,
@@ -1014,7 +1021,59 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
     ) -> Result<AsyncChecks, TransactionError> {
-        Self::verify_v5_transaction(request, network, script_verifier, cached_ffi_transaction)
+        let mut async_checks = Self::verify_v5_transaction(
+            request,
+            network,
+            script_verifier,
+            cached_ffi_transaction.clone(),
+        )?;
+
+        let transaction = request.transaction();
+        let Transaction::V6 {
+            network_upgrade,
+            lock_time,
+            expiry_height,
+            inputs,
+            outputs,
+            ironwood_shielded_data,
+            ..
+        } = transaction.as_ref()
+        else {
+            unreachable!("verify_v6_transaction() is only called for v6 transactions");
+        };
+
+        if ironwood_shielded_data.is_some() {
+            let fake_ironwood_v5 = Arc::new(Transaction::V5 {
+                network_upgrade: *network_upgrade,
+                lock_time: *lock_time,
+                expiry_height: *expiry_height,
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: ironwood_shielded_data.clone(),
+            });
+            let ironwood_sighasher = fake_ironwood_v5
+                .sighasher(
+                    *network_upgrade,
+                    Arc::new(cached_ffi_transaction.all_previous_outputs().clone()),
+                )
+                .map_err(|_| {
+                    TransactionError::UnsupportedByNetworkUpgrade(
+                        transaction.version(),
+                        request.upgrade(network),
+                    )
+                })?;
+            let ironwood_bundle = ironwood_sighasher.orchard_bundle();
+            let sighash = ironwood_sighasher.sighash(HashType::ALL, None);
+
+            async_checks = async_checks.and(Self::verify_ironwood_bundle(
+                ironwood_bundle,
+                &sighash,
+                request.upgrade(network),
+            ));
+        }
+
+        Ok(async_checks)
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided
@@ -1222,6 +1281,19 @@ where
         }
 
         async_checks
+    }
+
+    /// Verifies a transaction's Ironwood shielded data.
+    ///
+    /// Ironwood uses the same action proof system as Orchard, but its note
+    /// commitment and nullifier state are tracked separately.
+    #[cfg(zcash_unstable = "nu7")]
+    fn verify_ironwood_bundle(
+        bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+        sighash: &SigHash,
+        network_upgrade: NetworkUpgrade,
+    ) -> AsyncChecks {
+        Self::verify_orchard_bundle(bundle, sighash, network_upgrade)
     }
 }
 
