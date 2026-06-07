@@ -173,3 +173,5 @@ zebra-rpc/qa/cache/
 zebra-chain/fuzz/artifacts
 zebra-chain/fuzz/corpus
 
+# Local analysis data
+local_data/

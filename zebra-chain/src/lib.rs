@@ -29,6 +29,7 @@ pub mod error;
 pub mod fmt;
 pub mod history_tree;
 pub mod local_genesis;
+pub mod ironwood;
 pub mod orchard;
 pub mod parallel;
 pub mod parameters;

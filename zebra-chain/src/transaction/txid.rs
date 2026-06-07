@@ -87,8 +87,9 @@ impl<'a> TxIdBuilder<'a> {
             expiry_height,
             inputs,
             outputs,
+            sapling_shielded_data,
             orchard_shielded_data,
-            ironwood_value_balance,
+            ironwood_shielded_data,
         } = self.trans
         else {
             unreachable!("txid_v6() is only called for v6 transactions");
@@ -100,7 +101,7 @@ impl<'a> TxIdBuilder<'a> {
             expiry_height: *expiry_height,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
-            sapling_shielded_data: None,
+            sapling_shielded_data: sapling_shielded_data.clone(),
             orchard_shielded_data: orchard_shielded_data.clone(),
         };
 
@@ -108,16 +109,29 @@ impl<'a> TxIdBuilder<'a> {
         // Ironwood transaction fields.
         let v5_tx = fake_v5.to_librustzcash(*network_upgrade).ok()?;
         let v5_digests = v5_tx.into_data().digest(TxIdDigester);
+        let fake_ironwood_v5 = Transaction::V5 {
+            network_upgrade: *network_upgrade,
+            lock_time: *lock_time,
+            expiry_height: *expiry_height,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: ironwood_shielded_data.clone(),
+        };
+        let ironwood_v5_tx = fake_ironwood_v5.to_librustzcash(*network_upgrade).ok()?;
+        let ironwood_v5_digests = ironwood_v5_tx.into_data().digest(TxIdDigester);
 
         let branch_id = u32::from(network_upgrade.branch_id()?);
         let header_digest = hash_v6_header_txid_data(branch_id, *lock_time, *expiry_height);
         let transparent_digest =
             hash_transparent_txid_data(v5_digests.transparent_digests.as_ref());
-        let sapling_digest = hash_sapling_txid_empty();
+        let sapling_digest = v5_digests
+            .sapling_digest
+            .unwrap_or_else(hash_sapling_txid_empty);
         let orchard_digest = v5_digests
             .orchard_digest
             .unwrap_or_else(::orchard::bundle::commitments::hash_bundle_txid_empty);
-        let ironwood_digest = hash_ironwood_txid_data(*ironwood_value_balance);
+        let ironwood_digest = hash_ironwood_txid_data(ironwood_v5_digests.orchard_digest);
 
         Some(Hash(
             v6_txid_hash(
@@ -183,14 +197,12 @@ fn hash_sapling_txid_empty() -> Blake2bHash {
 }
 
 #[cfg(zcash_unstable = "nu7")]
-fn hash_ironwood_txid_data(
-    ironwood_value_balance: crate::amount::Amount<crate::amount::NegativeAllowed>,
-) -> Blake2bHash {
+fn hash_ironwood_txid_data(ironwood_orchard_digest: Option<Blake2bHash>) -> Blake2bHash {
     let mut h = hasher(ZCASH_IRONWOOD_HASH_PERSONALIZATION);
 
-    ironwood_value_balance
-        .zcash_serialize(&mut h)
-        .expect("amount serialization to a hash state should never fail");
+    let ironwood_orchard_digest = ironwood_orchard_digest
+        .unwrap_or_else(::orchard::bundle::commitments::hash_bundle_txid_empty);
+    h.update(ironwood_orchard_digest.as_bytes());
 
     h.finalize()
 }
