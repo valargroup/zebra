@@ -10,7 +10,7 @@ use zebra_chain::{
     amount::{self, NegativeAllowed, NonNegative},
     block,
     history_tree::HistoryTreeError,
-    orchard, sapling, sprout, transaction, transparent,
+    ironwood, orchard, sapling, sprout, transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
     work::difficulty::CompactDifficulty,
 };
@@ -384,6 +384,18 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     UnknownOrchardAnchor {
         anchor: orchard::tree::Root,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
+        transaction_hash: transaction::Hash,
+    },
+
+    #[error(
+        "unknown Ironwood anchor: {anchor:?},\n\
+         {height:?}, index in block: {tx_index_in_block:?}, {transaction_hash:?}"
+    )]
+    #[non_exhaustive]
+    UnknownIronwoodAnchor {
+        anchor: ironwood::tree::Root,
         height: Option<block::Height>,
         tx_index_in_block: Option<usize>,
         transaction_hash: transaction::Hash,

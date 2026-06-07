@@ -122,16 +122,9 @@ pub fn lock_time_has_passed(
 ///
 /// This check counts both `Coinbase` and `PrevOut` transparent inputs.
 pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
-    #[cfg(zcash_unstable = "nu7")]
-    let has_other_circulation_effects =
-        tx.ironwood_value_balance().ironwood_amount() != Amount::<NegativeAllowed>::zero();
-
-    #[cfg(not(zcash_unstable = "nu7"))]
-    let has_other_circulation_effects = false;
-
     if !tx.has_transparent_or_shielded_inputs() {
         Err(TransactionError::NoInputs)
-    } else if !tx.has_transparent_or_shielded_outputs() && !has_other_circulation_effects {
+    } else if !tx.has_transparent_or_shielded_outputs() {
         Err(TransactionError::NoOutputs)
     } else {
         Ok(())
@@ -272,7 +265,7 @@ pub fn disabled_add_to_orchard_pool(
 
     let zero = Amount::<NegativeAllowed>::zero();
 
-    if height >= nu7_activation_height && tx.orchard_value_balance().orchard_amount() > zero {
+    if height >= nu7_activation_height && tx.orchard_value_balance().orchard_amount() < zero {
         return Err(TransactionError::DisabledAddToOrchardPool);
     }
 
