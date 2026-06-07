@@ -14,7 +14,7 @@ impl Arbitrary for ValueBalance<NegativeAllowed> {
             any::<Amount<NegativeAllowed>>(),
         )
             .prop_map(
-                |(transparent, sprout, sapling, orchard, ironwood, deferred)| Self {
+                |(transparent, sprout, sapling, orchard, deferred, ironwood)| Self {
                     transparent,
                     sprout,
                     sapling,
@@ -42,7 +42,7 @@ impl Arbitrary for ValueBalance<NonNegative> {
             any::<Amount<NonNegative>>(),
         )
             .prop_map(
-                |(transparent, sprout, sapling, orchard, ironwood, deferred)| Self {
+                |(transparent, sprout, sapling, orchard, deferred, ironwood)| Self {
                     transparent,
                     sprout,
                     sapling,

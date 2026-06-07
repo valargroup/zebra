@@ -138,7 +138,7 @@ fn sapling_orchard_anchors_refer_to_final_treestates(
             .unwrap_or(false)
             && !finalized_state.contains_ironwood_anchor(&ironwood_shielded_data.shared_anchor)
         {
-            return Err(ValidateContextError::UnknownOrchardAnchor {
+            return Err(ValidateContextError::UnknownIronwoodAnchor {
                 anchor: ironwood_shielded_data.shared_anchor,
                 height,
                 tx_index_in_block,
