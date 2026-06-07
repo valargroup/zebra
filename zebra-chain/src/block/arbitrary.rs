@@ -598,12 +598,9 @@ where
                 sapling_shielded_data,
                 ..
             } => *sapling_shielded_data = None,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            Transaction::V6 {
-                sapling_shielded_data,
-                ..
-            } => *sapling_shielded_data = None,
             Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
+            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            Transaction::V6 { .. } => {}
         }
     }
 

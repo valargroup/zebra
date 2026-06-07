@@ -2509,8 +2509,6 @@ where
             miner_params,
             mempool_txs,
             mempool_tx_deps,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            None,
         );
 
         tracing::debug!(
@@ -2531,8 +2529,6 @@ where
             server_long_poll_id,
             mempool_txs,
             submit_old,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            None,
         )
         .into())
     }
@@ -3350,7 +3346,7 @@ impl GetInfoResponse {
 }
 
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
-pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 5];
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
 /// Response to a `getblockchaininfo` RPC request.
 ///

@@ -661,16 +661,10 @@ impl SpendConflictTestInput {
                     Self::remove_sapling_transfers_with_conflicts(sapling_shielded_data, &conflicts)
                 }
 
-                #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-                Transaction::V6 {
-                    sapling_shielded_data,
-                    ..
-                } => {
-                    Self::remove_sapling_transfers_with_conflicts(sapling_shielded_data, &conflicts)
-                }
-
                 // No Spends
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
+                #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+                Transaction::V6 { .. } => {}
             }
         }
     }
