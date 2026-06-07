@@ -478,6 +478,7 @@ where
             // [Canopy onward]: `vpub_old` MUST be zero.
             // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
             check::disabled_add_to_sprout_pool(&tx, req.height(), &network)?;
+            check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
 
             check::spend_conflicts(&tx)?;
 
