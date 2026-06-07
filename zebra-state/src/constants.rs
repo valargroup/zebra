@@ -46,7 +46,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 27;
+const DATABASE_FORMAT_VERSION: u64 = 28;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.

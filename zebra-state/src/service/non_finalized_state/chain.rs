@@ -1607,17 +1607,9 @@ impl Chain {
                 V6 {
                     inputs,
                     outputs,
-                    sapling_shielded_data,
                     orchard_shielded_data,
                     ..
-                } => (
-                    inputs,
-                    outputs,
-                    &None,
-                    &None,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
-                ),
+                } => (inputs, outputs, &None, &None, &None, orchard_shielded_data),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
                     "older transaction versions only exist in finalized blocks, because of the mandatory canopy checkpoint",
@@ -1802,17 +1794,9 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 V6 {
                     inputs,
                     outputs,
-                    sapling_shielded_data,
                     orchard_shielded_data,
                     ..
-                } => (
-                    inputs,
-                    outputs,
-                    &None,
-                    &None,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
-                ),
+                } => (inputs, outputs, &None, &None, &None, orchard_shielded_data),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
                     "older transaction versions only exist in finalized blocks, because of the mandatory canopy checkpoint",
