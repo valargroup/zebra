@@ -156,9 +156,9 @@ proptest! {
     }
 
     /// The previous version of [`ValueBalance`] had 40 bytes, with deferred
-    /// value stored immediately after Orchard. The current version inserts
-    /// Ironwood before deferred, so we test that Zebra still deserializes the
-    /// previous format correctly.
+    /// value stored immediately after Orchard. The current version appends
+    /// Ironwood after deferred, so the previous format remains a prefix of the
+    /// current format.
     #[test]
     fn pre_ironwood_value_balance_deserialization(bytes in any::<[u8; 40]>()) {
         let _init_guard = zebra_test::init();
@@ -166,8 +166,7 @@ proptest! {
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
             let mut extended_bytes = [0u8; 48];
-            extended_bytes[..32].copy_from_slice(&bytes[..32]);
-            extended_bytes[40..48].copy_from_slice(&bytes[32..40]);
+            extended_bytes[..40].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
     }
