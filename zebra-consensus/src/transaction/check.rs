@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
     orchard::Flags,
     parameters::{Network, NetworkUpgrade},
@@ -20,9 +20,6 @@ use zebra_chain::{
     transaction::{LockTime, Transaction},
     transparent,
 };
-
-#[cfg(zcash_unstable = "nu7")]
-use zebra_chain::amount::NegativeAllowed;
 
 use crate::error::TransactionError;
 
@@ -258,6 +255,25 @@ pub fn disabled_add_to_sprout_pool(
                 return Err(TransactionError::DisabledAddToSproutPool);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Check if a transaction is adding to the Orchard pool after NU7 activation.
+pub fn disabled_add_to_orchard_pool(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    let Some(nu7_activation_height) = NetworkUpgrade::Nu7.activation_height(network) else {
+        return Ok(());
+    };
+
+    let zero = Amount::<NegativeAllowed>::zero();
+
+    if height >= nu7_activation_height && tx.orchard_value_balance().orchard_amount() > zero {
+        return Err(TransactionError::DisabledAddToOrchardPool);
     }
 
     Ok(())

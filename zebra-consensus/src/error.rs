@@ -165,6 +165,9 @@ pub enum TransactionError {
     #[error("adding to the sprout pool is disabled after Canopy")]
     DisabledAddToSproutPool,
 
+    #[error("adding to the orchard pool is disabled after NU7")]
+    DisabledAddToOrchardPool,
+
     #[error("could not calculate the transaction fee")]
     IncorrectFee,
 
@@ -371,6 +374,7 @@ impl TransactionError {
             | RedPallas(_)
             | BothVPubsNonZero
             | DisabledAddToSproutPool
+            | DisabledAddToOrchardPool
             | NotEnoughFlags
             | NotEnoughIronwoodFlags
             | WrongConsensusBranchId

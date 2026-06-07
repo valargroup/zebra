@@ -1752,6 +1752,7 @@ impl Chain {
             .zip(transaction_hashes.iter().cloned())
             .enumerate()
         {
+            let no_ironwood_shielded_data = &None::<ironwood::ShieldedData>;
             let (
                 inputs,
                 outputs,
@@ -1774,7 +1775,7 @@ impl Chain {
                     sapling_shielded_data,
                     &None,
                     &None,
-                    &None,
+                    no_ironwood_shielded_data,
                 ),
                 V5 {
                     inputs,
@@ -1789,7 +1790,7 @@ impl Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                    &None,
+                    no_ironwood_shielded_data,
                 ),
                 #[cfg(zcash_unstable = "nu7")]
                 V6 {
@@ -1966,6 +1967,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         for (transaction, transaction_hash) in
             block.transactions.iter().zip(transaction_hashes.iter())
         {
+            let no_ironwood_shielded_data = &None::<ironwood::ShieldedData>;
             let (
                 inputs,
                 outputs,
@@ -1988,7 +1990,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     sapling_shielded_data,
                     &None,
                     &None,
-                    &None,
+                    no_ironwood_shielded_data,
                 ),
                 V5 {
                     inputs,
@@ -2003,7 +2005,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                    &None,
+                    no_ironwood_shielded_data,
                 ),
                 #[cfg(zcash_unstable = "nu7")]
                 V6 {
