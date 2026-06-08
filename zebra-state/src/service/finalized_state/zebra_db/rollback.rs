@@ -830,6 +830,7 @@ fn delete_shielded_block(db: &ZebraDb, batch: &mut DiskWriteBatch, block: &Block
     let sprout_nullifiers = db.db.cf_handle("sprout_nullifiers").unwrap();
     let sapling_nullifiers = db.db.cf_handle("sapling_nullifiers").unwrap();
     let orchard_nullifiers = db.db.cf_handle("orchard_nullifiers").unwrap();
+    let ironwood_nullifiers = db.db.cf_handle("ironwood_nullifiers").unwrap();
 
     for transaction in &block.transactions {
         for nullifier in transaction.sprout_nullifiers() {
@@ -840,6 +841,9 @@ fn delete_shielded_block(db: &ZebraDb, batch: &mut DiskWriteBatch, block: &Block
         }
         for nullifier in transaction.orchard_nullifiers() {
             batch.zs_delete(&orchard_nullifiers, nullifier);
+        }
+        for nullifier in transaction.ironwood_nullifiers() {
+            batch.zs_delete(&ironwood_nullifiers, nullifier);
         }
     }
 }

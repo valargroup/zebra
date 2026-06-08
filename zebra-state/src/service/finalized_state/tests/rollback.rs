@@ -592,6 +592,49 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
     })
 }
 
+#[cfg(zcash_unstable = "nu7")]
+fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
+    use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
+    use zebra_chain::{
+        at_least_one,
+        orchard::{self, tree},
+        primitives::Halo2Proof,
+    };
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+    let nullifier = action.nullifier;
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: orchard::Flags::ENABLE_SPENDS,
+        value_balance: Amount::zero(),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    (
+        Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu7,
+            lock_time: LockTime::unlocked(),
+            expiry_height,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(ironwood_shielded_data),
+        }),
+        nullifier,
+    )
+}
+
 fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
@@ -1080,5 +1123,55 @@ fn rollback_prunes_subtrees_above_target() {
         ironwood,
         vec![0],
         "ironwood subtree above the target is pruned"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu7")]
+fn rollback_prunes_ironwood_nullifiers_above_target() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let (ironwood_tx, ironwood_nullifier) = ironwood_v6_tx(Height(2));
+    let block2 = child_block(
+        &block1,
+        vec![coinbase_tx(Height(2), dust, &address), ironwood_tx],
+    );
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    assert!(
+        open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "forward sync indexes the Ironwood nullifier"
+    );
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+
+    assert!(
+        !open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "rollback prunes Ironwood nullifiers above the target"
     );
 }
