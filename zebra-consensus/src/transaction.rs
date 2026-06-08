@@ -1064,6 +1064,11 @@ where
             unreachable!("verify_v6_transaction() is only called for v6 transactions");
         };
 
+        Self::verify_v6_transaction_network_upgrade(
+            transaction.as_ref(),
+            request.upgrade(network),
+        )?;
+
         let v5_compatible_transaction = Arc::new(Transaction::V5 {
             network_upgrade: *network_upgrade,
             lock_time: *lock_time,
@@ -1115,6 +1120,24 @@ where
         }
 
         Ok((async_checks, v5_compatible_cached_ffi_transaction))
+    }
+
+    /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
+    #[cfg(zcash_unstable = "nu7")]
+    fn verify_v6_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade == NetworkUpgrade::Nu7
+            && transaction.network_upgrade() == Some(NetworkUpgrade::Nu7)
+        {
+            return Ok(());
+        }
+
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            network_upgrade,
+        ))
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided

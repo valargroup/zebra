@@ -721,6 +721,13 @@ impl ZcashSerialize for Transaction {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             } => {
+                if *network_upgrade != NetworkUpgrade::Nu7 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "v6 transaction must have NU7 consensus branch ID",
+                    ));
+                }
+
                 // Transaction V6 spec:
                 // TODO: add ZIP link when the Ironwood transaction format is specified.
 
@@ -1066,11 +1073,9 @@ impl ZcashDeserialize for Transaction {
                 // Convert it to a NetworkUpgrade
                 let network_upgrade =
                     NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
-                // V6 transactions are only valid from NU5 onward, so reject
-                // transactions with pre-NU5 consensus branch IDs.
-                if network_upgrade < NetworkUpgrade::Nu5 {
+                if network_upgrade != NetworkUpgrade::Nu7 {
                     return Err(SerializationError::Parse(
-                        "v6 transaction must have NU5 or later consensus branch ID",
+                        "v6 transaction must have NU7 consensus branch ID",
                     ));
                 }
                 // Denoted as `lock_time` in the spec.
