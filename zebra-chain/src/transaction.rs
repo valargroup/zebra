@@ -33,7 +33,8 @@ pub use serialize::{
 };
 pub use sighash::{HashType, SigHash, SigHasher};
 pub use unmined::{
-    zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
+    zip317, UnminedTx, UnminedTxError, UnminedTxId, VerifiedUnminedTx,
+    MEMPOOL_TRANSACTION_COST_THRESHOLD,
 };
 use zcash_protocol::consensus;
 
@@ -197,8 +198,6 @@ impl fmt::Display for Transaction {
         fmter.field("sapling_outputs", &self.sapling_outputs().count());
         fmter.field("orchard_actions", &self.orchard_actions().count());
 
-        fmter.field("unmined_id", &self.unmined_id());
-
         fmter.finish()
     }
 }
@@ -270,8 +269,7 @@ impl Transaction {
     /// Compute the authorizing data commitment of this transaction as specified
     /// in [ZIP-244].
     ///
-    /// Returns None for pre-v5 transactions, and for v6 until an Ironwood
-    /// authorizing data commitment is specified.
+    /// Returns None for pre-v5 transactions.
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244.
     pub fn auth_digest(&self) -> Option<AuthDigest> {
@@ -280,9 +278,9 @@ impl Transaction {
             | Transaction::V2 { .. }
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => None,
-            #[cfg(zcash_unstable = "nu7")]
-            Transaction::V6 { .. } => None,
             Transaction::V5 { .. } => Some(AuthDigest::from(self)),
+            #[cfg(zcash_unstable = "nu7")]
+            Transaction::V6 { .. } => Some(AuthDigest::from(self)),
         }
     }
 

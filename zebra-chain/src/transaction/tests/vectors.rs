@@ -1067,18 +1067,18 @@ fn v6_transactions_reject_pre_nu7_branch_id() {
 #[test]
 #[cfg(zcash_unstable = "nu7")]
 fn v6_txid_commits_to_ironwood_digest() {
-    use group::prime::PrimeCurveAffine;
-    use reddsa::Signature;
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
 
     use crate::{
         at_least_one,
-        orchard::{
-            keys::EphemeralPublicKey, tree, Action, AuthorizedAction, EncryptedNote, Flags,
-            NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
-        },
+        ironwood::{self, tree},
+        orchard::Flags,
         primitives::Halo2Proof,
     };
-    use halo2::pasta::pallas;
 
     let _init_guard = zebra_test::init();
 
@@ -1093,26 +1093,22 @@ fn v6_txid_commits_to_ironwood_digest() {
         ironwood_shielded_data: None,
     };
 
-    let action = Action {
-        cv: ValueCommitment(pallas::Affine::identity()),
-        nullifier: Nullifier(pallas::Base::zero()),
-        rk: [0u8; 32].into(),
-        cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
-        ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
-        enc_ciphertext: EncryptedNote([0u8; 580]),
-        out_ciphertext: WrappedNoteKey([0u8; 80]),
-    };
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
 
-    let ironwood_shielded_data = ShieldedData {
+    let ironwood_shielded_data = ironwood::ShieldedData {
         flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
         value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
         shared_anchor: tree::Root::default(),
-        proof: Halo2Proof(vec![]),
-        actions: at_least_one![AuthorizedAction {
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
             action,
-            spend_auth_sig: Signature::from([0u8; 64]),
+            spend_auth_sig: [0u8; 64].into(),
         }],
-        binding_sig: Signature::from([0u8; 64]),
+        binding_sig: [0u8; 64].into(),
     };
 
     let mut tx_with_ironwood = tx_without_ironwood.clone();
@@ -1130,6 +1126,85 @@ fn v6_txid_commits_to_ironwood_digest() {
         tx_without_ironwood.hash(),
         "V6 txid must commit to Ironwood shielded data"
     );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu7")]
+fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
+    let _init_guard = zebra_test::init();
+
+    let mut orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    orchard_shielded_data.proof.0.push(0);
+
+    let transaction = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ironwood_shielded_data: None,
+    };
+
+    let error = UnminedTx::try_from_mempool_transaction(transaction)
+        .expect_err("padded Orchard proof must be rejected before hashing");
+
+    assert_eq!(error, UnminedTxError::OrchardProofSize);
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu7")]
+fn unmined_v6_rejects_padded_ironwood_proof_before_hashing() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let transaction = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood::ShieldedData {
+            flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+            value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1) + 1]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }),
+    };
+
+    let error = UnminedTx::try_from_mempool_transaction(transaction)
+        .expect_err("padded Ironwood proof must be rejected before hashing");
+
+    assert_eq!(error, UnminedTxError::IronwoodProofSize);
 }
 
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.

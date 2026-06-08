@@ -395,11 +395,11 @@ where
         let mempool = self.mempool.clone();
 
         let tx = req.transaction();
-        let tx_id = req.tx_id();
-        let span = tracing::debug_span!("tx", ?tx_id);
+        let tx_mined_id = req.tx_mined_id();
+        let span = tracing::debug_span!("tx", ?tx_mined_id);
 
         async move {
-            tracing::trace!(?tx_id, ?req, "got tx verify request");
+            tracing::trace!(?tx_mined_id, "got tx verify request");
 
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
@@ -436,19 +436,7 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-
-                if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
-                    if !ironwood_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::IronwoodProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -482,7 +470,7 @@ where
 
             check::spend_conflicts(&tx)?;
 
-            tracing::trace!(?tx_id, "passed quick checks");
+            tracing::trace!(?tx_mined_id, "passed quick checks");
 
             if let Some(block_time) = req.block_time() {
                 check::lock_time_has_passed(&tx, req.height(), block_time)?;
@@ -526,7 +514,7 @@ where
             let nu = req.upgrade(&network);
             let all_previous_outputs = Arc::new(spent_outputs);
 
-            tracing::trace!(?tx_id, "got state UTXOs");
+            tracing::trace!(?tx_mined_id, "got state UTXOs");
 
             let (mut async_checks, cached_ffi_transaction) = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
@@ -594,9 +582,11 @@ where
                 async_checks.push(check_anchors_and_revealed_nullifiers_query);
             }
 
-            tracing::trace!(?tx_id, "awaiting async checks...");
+            tracing::trace!(?tx_mined_id, "awaiting async checks...");
 
             async_checks.check().await?;
+
+            let tx_id = req.tx_id();
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -667,7 +657,7 @@ where
         }
             .inspect(move |result| {
                 // Hide the transaction data to avoid filling the logs
-                tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
+                tracing::trace!(?tx_mined_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })
             .instrument(span)
             .boxed()
@@ -1050,76 +1040,31 @@ where
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<(AsyncChecks, Arc<CachedFfiTransaction>), TransactionError> {
         let transaction = request.transaction();
-        let Transaction::V6 {
-            network_upgrade,
-            lock_time,
-            expiry_height,
-            inputs,
-            outputs,
-            sapling_shielded_data,
-            orchard_shielded_data,
-            ironwood_shielded_data,
-        } = transaction.as_ref()
-        else {
-            unreachable!("verify_v6_transaction() is only called for v6 transactions");
-        };
+        let nu = request.upgrade(network);
 
-        Self::verify_v6_transaction_network_upgrade(
-            transaction.as_ref(),
-            request.upgrade(network),
-        )?;
+        Self::verify_v6_transaction_network_upgrade(transaction.as_ref(), nu)?;
 
-        let v5_compatible_transaction = Arc::new(Transaction::V5 {
-            network_upgrade: *network_upgrade,
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
-            sapling_shielded_data: sapling_shielded_data.clone(),
-            orchard_shielded_data: orchard_shielded_data.clone(),
-        });
-        let v5_compatible_cached_ffi_transaction = Self::cached_ffi_transaction(
-            v5_compatible_transaction,
-            all_previous_outputs.clone(),
-            request.upgrade(network),
-        )?;
+        let cached_ffi_transaction =
+            Self::cached_ffi_transaction(transaction.clone(), all_previous_outputs, nu)?;
 
-        let mut async_checks = Self::verify_v5_transaction(
+        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+
+        let sighash = cached_ffi_transaction
+            .sighasher()
+            .sighash(HashType::ALL, None);
+
+        let async_checks = Self::verify_transparent_inputs_and_outputs(
             request,
-            network,
             script_verifier,
-            v5_compatible_cached_ffi_transaction.clone(),
-        )?;
+            cached_ffi_transaction.clone(),
+        )?
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu))
+        .and(Self::verify_ironwood_bundle(ironwood_bundle, &sighash, nu));
 
-        if ironwood_shielded_data.is_some() {
-            let fake_ironwood_v5 = Arc::new(Transaction::V5 {
-                network_upgrade: *network_upgrade,
-                lock_time: *lock_time,
-                expiry_height: *expiry_height,
-                inputs: inputs.clone(),
-                outputs: outputs.clone(),
-                sapling_shielded_data: None,
-                orchard_shielded_data: ironwood_shielded_data.clone(),
-            });
-            let ironwood_sighasher = fake_ironwood_v5
-                .sighasher(*network_upgrade, all_previous_outputs.clone())
-                .map_err(|_| {
-                    TransactionError::UnsupportedByNetworkUpgrade(
-                        transaction.version(),
-                        request.upgrade(network),
-                    )
-                })?;
-            let ironwood_bundle = ironwood_sighasher.orchard_bundle();
-            let sighash = ironwood_sighasher.sighash(HashType::ALL, None);
-
-            async_checks = async_checks.and(Self::verify_ironwood_bundle(
-                ironwood_bundle,
-                &sighash,
-                request.upgrade(network),
-            ));
-        }
-
-        Ok((async_checks, v5_compatible_cached_ffi_transaction))
+        Ok((async_checks, cached_ffi_transaction))
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.

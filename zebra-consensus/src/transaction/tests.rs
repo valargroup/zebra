@@ -317,6 +317,60 @@ fn ironwood_withdraw_balances() {
     );
 }
 
+#[cfg(zcash_unstable = "nu7")]
+#[tokio::test]
+async fn v6_with_padded_orchard_proof_returns_consensus_error() {
+    let (network, height) = nu7_test_network_and_height();
+    let mut orchard_shielded_data =
+        orchard_shielded_data(0, Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS);
+    orchard_shielded_data.proof.0.push(0);
+
+    let transaction = v6_pool_flow_transaction(Some(orchard_shielded_data), None, vec![]);
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let result = Verifier::new_for_tests(&network, state_service)
+        .oneshot(Request::Block {
+            transaction_hash: Hash::from([0; 32]),
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(HashMap::new()),
+            known_outpoint_hashes: Arc::new(HashSet::new()),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+
+    assert_eq!(result, Err(TransactionError::OrchardProofSize));
+}
+
+#[cfg(zcash_unstable = "nu7")]
+#[tokio::test]
+async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
+    let (network, height) = nu7_test_network_and_height();
+    let mut ironwood_shielded_data = ironwood_shielded_data(
+        0,
+        ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+    );
+    ironwood_shielded_data.proof.0.push(0);
+
+    let transaction = v6_pool_flow_transaction(None, Some(ironwood_shielded_data), vec![]);
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let result = Verifier::new_for_tests(&network, state_service)
+        .oneshot(Request::Block {
+            transaction_hash: Hash::from([0; 32]),
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(HashMap::new()),
+            known_outpoint_hashes: Arc::new(HashSet::new()),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+
+    assert_eq!(result, Err(TransactionError::IronwoodProofSize));
+}
+
 #[test]
 fn v5_transaction_with_orchard_actions_has_flags() {
     for net in Network::iter() {
