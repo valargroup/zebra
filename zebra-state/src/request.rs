@@ -13,16 +13,15 @@ use zebra_chain::{
     block::{self, Block, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
-    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
-    sapling,
     serialization::SerializationError,
-    sprout,
-    subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
+    subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, UnminedTx},
     transparent::{self, utxos_from_ordered_utxos},
     value_balance::{ValueBalance, ValueBalanceError},
 };
+#[cfg(feature = "indexer")]
+use zebra_chain::{orchard, sapling, sprout};
 
 /// Allow *only* these unused imports, so that rustdoc link resolution
 /// will work with inline links.
@@ -336,25 +335,11 @@ pub struct Treestate {
 impl Treestate {
     #[allow(missing_docs)]
     pub(crate) fn new(
-        sprout: Arc<sprout::tree::NoteCommitmentTree>,
-        sapling: Arc<sapling::tree::NoteCommitmentTree>,
-        orchard: Arc<orchard::tree::NoteCommitmentTree>,
-        ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
-        sapling_subtree: Option<NoteCommitmentSubtree<sapling_crypto::Node>>,
-        orchard_subtree: Option<NoteCommitmentSubtree<orchard::tree::Node>>,
-        ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
+        note_commitment_trees: NoteCommitmentTrees,
         history_tree: Arc<HistoryTree>,
     ) -> Self {
         Self {
-            note_commitment_trees: NoteCommitmentTrees {
-                sprout,
-                sapling,
-                sapling_subtree,
-                orchard,
-                orchard_subtree,
-                ironwood,
-                ironwood_subtree,
-            },
+            note_commitment_trees,
             history_tree,
         }
     }
@@ -371,7 +356,7 @@ pub enum FinalizableBlock {
     },
     Contextual {
         contextually_verified: ContextuallyVerifiedBlock,
-        treestate: Treestate,
+        treestate: Box<Treestate>,
     },
 }
 
@@ -431,7 +416,7 @@ impl FinalizableBlock {
     pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate) -> Self {
         Self::Contextual {
             contextually_verified,
-            treestate,
+            treestate: Box::new(treestate),
         }
     }
 
