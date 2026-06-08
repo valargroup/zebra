@@ -391,6 +391,10 @@ impl Chain {
             self.orchard_subtrees.pop_first();
         }
 
+        if treestate.note_commitment_trees.ironwood_subtree.is_some() {
+            self.ironwood_subtrees.pop_first();
+        }
+
         // Remove the lowest height block from `self.blocks`.
         let block = self
             .blocks
@@ -1413,7 +1417,7 @@ impl Chain {
             .remove(&block_height)
             .expect("only called while blocks is populated");
 
-        // If the popped block completed a Sapling or Orchard subtree, remove the corresponding
+        // If the popped block completed a Sapling, Orchard, or Ironwood subtree, remove the corresponding
         // subtree from this chain too. Subtrees are inserted by `push` keyed by the highest subtree
         // index, so the last entry's `end_height` matches the popped block iff a subtree was
         // completed at that height.
@@ -1430,6 +1434,13 @@ impl Chain {
             .is_some_and(|(_, subtree)| subtree.end_height == block_height)
         {
             self.orchard_subtrees.pop_last();
+        }
+        if self
+            .ironwood_subtrees
+            .last_key_value()
+            .is_some_and(|(_, subtree)| subtree.end_height == block_height)
+        {
+            self.ironwood_subtrees.pop_last();
         }
 
         assert!(
@@ -2638,6 +2649,16 @@ impl Chain {
     ) {
         self.inner
             .orchard_subtrees
+            .insert(subtree.index, subtree.into_data());
+    }
+
+    /// Inserts the supplied Ironwood note commitment subtree into the chain.
+    pub(crate) fn insert_ironwood_subtree(
+        &mut self,
+        subtree: NoteCommitmentSubtree<ironwood::tree::Node>,
+    ) {
+        self.inner
+            .ironwood_subtrees
             .insert(subtree.index, subtree.into_data());
     }
 }

@@ -498,6 +498,34 @@ impl ZebraDb {
         Some(Arc::new(tree))
     }
 
+    /// Returns the Ironwood note commitment trees in the supplied range, in increasing height order.
+    pub fn ironwood_tree_by_height_range<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = (Height, Arc<ironwood::tree::NoteCommitmentTree>)> + '_
+    where
+        R: std::ops::RangeBounds<Height>,
+    {
+        let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
+        self.db.zs_forward_range_iter(&ironwood_trees, range)
+    }
+
+    /// Returns a list of Ironwood [`NoteCommitmentSubtree`]s in the provided range.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn ironwood_subtree_list_by_index_range(
+        &self,
+        range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
+    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
+        let ironwood_subtrees = self
+            .db
+            .cf_handle("ironwood_note_commitment_subtree")
+            .unwrap();
+
+        self.db
+            .zs_forward_range_iter(&ironwood_subtrees, range)
+            .collect()
+    }
+
     /// Get the Ironwood note commitment subtree for the finalized tip.
     #[allow(clippy::unwrap_in_result)]
     fn ironwood_subtree_for_tip(&self) -> Option<NoteCommitmentSubtree<ironwood::tree::Node>> {
@@ -905,5 +933,37 @@ impl DiskWriteBatch {
 
         // TODO: convert zs_delete_range() to take std::ops::RangeBounds
         self.zs_delete_range(&orchard_subtree_cf, from, to);
+    }
+
+    /// Deletes the Ironwood note commitment tree at the given [`Height`].
+    pub fn delete_ironwood_tree(&mut self, zebra_db: &ZebraDb, height: &Height) {
+        let ironwood_tree_cf = zebra_db
+            .db
+            .cf_handle("ironwood_note_commitment_tree")
+            .unwrap();
+        self.zs_delete(&ironwood_tree_cf, height);
+    }
+
+    /// Deletes the given Ironwood note commitment tree `anchor`.
+    pub fn delete_ironwood_anchor(&mut self, zebra_db: &ZebraDb, anchor: &ironwood::tree::Root) {
+        let ironwood_anchors = zebra_db.db.cf_handle("ironwood_anchors").unwrap();
+        self.zs_delete(&ironwood_anchors, anchor);
+    }
+
+    /// Deletes the range of Ironwood subtrees at the given [`NoteCommitmentSubtreeIndex`]es.
+    /// Doesn't delete the upper bound.
+    pub fn delete_range_ironwood_subtree(
+        &mut self,
+        zebra_db: &ZebraDb,
+        from: NoteCommitmentSubtreeIndex,
+        to: NoteCommitmentSubtreeIndex,
+    ) {
+        let ironwood_subtree_cf = zebra_db
+            .db
+            .cf_handle("ironwood_note_commitment_subtree")
+            .unwrap();
+
+        // TODO: convert zs_delete_range() to take std::ops::RangeBounds
+        self.zs_delete_range(&ironwood_subtree_cf, from, to);
     }
 }
