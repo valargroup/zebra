@@ -17,6 +17,8 @@ use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, ServiceExt};
 
+#[cfg(zcash_unstable = "nu7")]
+use zebra_chain::{amount::NegativeAllowed, ironwood, orchard};
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
@@ -125,6 +127,194 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 
         assert!(check::has_inputs_and_outputs(&tx).is_ok());
     }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn nu7_test_network_and_height() -> (Network, Height) {
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU7 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    (network, Height(1))
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn orchard_fixture() -> orchard::ShieldedData {
+    let default_testnet = Network::new_default_testnet();
+
+    v5_transactions(default_testnet.block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data")
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn orchard_shielded_data(value_balance: i64, flags: Flags) -> orchard::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwood::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn v6_pool_flow_transaction(
+    orchard_shielded_data: Option<orchard::ShieldedData>,
+    ironwood_shielded_data: Option<ironwood::ShieldedData>,
+    transparent_outputs: Vec<transparent::Output>,
+) -> Transaction {
+    Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::Height(block::Height(0)),
+        expiry_height: Height(1),
+        inputs: vec![],
+        outputs: transparent_outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data,
+        ironwood_shielded_data,
+    }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn transparent_output(value: u64) -> transparent::Output {
+    transparent::Output {
+        value: Amount::<NonNegative>::try_from(value).expect("valid test amount"),
+        lock_script: transparent::Script::new(&[1, 1]),
+    }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn empty_utxos() -> HashMap<transparent::OutPoint, transparent::Utxo> {
+    HashMap::new()
+}
+
+#[cfg(zcash_unstable = "nu7")]
+#[test]
+fn orchard_is_withdraw_only_after_nu7() {
+    let (network, height) = nu7_test_network_and_height();
+
+    let orchard_withdraw = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        None,
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_withdraw, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&orchard_withdraw), Ok(()));
+    assert_eq!(
+        orchard_withdraw
+            .value_balance(&empty_utxos())
+            .expect("valid value balance")
+            .remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+
+    let orchard_no_flow = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        )),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_no_flow, height, &network),
+        Ok(())
+    );
+
+    let orchard_deposit = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(-10, Flags::ENABLE_OUTPUTS)),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_deposit, height, &network),
+        Err(TransactionError::DisabledAddToOrchardPool)
+    );
+}
+
+#[cfg(zcash_unstable = "nu7")]
+#[test]
+fn orchard_to_ironwood_migration_balances() {
+    let (network, height) = nu7_test_network_and_height();
+    let tx = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.orchard_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+}
+
+#[cfg(zcash_unstable = "nu7")]
+#[test]
+fn ironwood_withdraw_balances() {
+    let tx = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.transparent_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
 }
 
 #[test]
