@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use zebra_chain::parameters::NetworkKind;
 
-use crate::components::zcashd_compat::Config;
+use super::Config;
 
 /// The full configuration used by the zcashd-compat supervisor task.
 #[derive(Clone, Debug)]
