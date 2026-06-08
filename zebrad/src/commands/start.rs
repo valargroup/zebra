@@ -352,7 +352,7 @@ impl StartCmd {
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let zcashd_compat_task_handle =
+        let mut zcashd_compat_task_handle =
             if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
                 let supervisor_config = zcashd_compat::SupervisorConfig::new(
                     &config.zcashd_compat,
@@ -537,7 +537,6 @@ impl StartCmd {
         pin!(progress_task_handle);
         pin!(end_of_support_task_handle);
         pin!(miner_task_handle);
-        pin!(zcashd_compat_task_handle);
 
         // startup tasks
         let BackgroundTaskHandles {
@@ -551,10 +550,15 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         // Wait for tasks to finish
-        let exit_status = loop {
-            let mut exit_when_task_finishes = true;
+        let mut zcashd_compat_task_finished = false;
+        let exit_status = {
+            let zcashd_compat_task_handle_fused = (&mut zcashd_compat_task_handle).fuse();
+            pin!(zcashd_compat_task_handle_fused);
 
-            let result = select! {
+            loop {
+                let mut exit_when_task_finishes = true;
+
+                let result = select! {
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
@@ -636,19 +640,23 @@ impl StartCmd {
                     .expect("unexpected panic in the miner task")
                     .map(|_| info!("miner task exited")),
 
-                zcashd_compat_result = &mut zcashd_compat_task_handle => zcashd_compat_result
-                    .expect("unexpected panic in the zcashd-compat supervisor task")
-                    .map(|_| info!("zcashd-compat supervisor task exited")),
-            };
+                    zcashd_compat_result = &mut zcashd_compat_task_handle_fused => {
+                        zcashd_compat_task_finished = true;
+                        exit_when_task_finishes =
+                            Self::zcashd_compat_supervisor_should_exit(zcashd_compat_result);
+                        Ok(())
+                    },
+                };
 
-            // Stop Zebra if a task finished and returned an error,
-            // or if an ongoing task exited.
-            if let Err(err) = result {
-                break Err(err);
-            }
+                // Stop Zebra if a task finished and returned an error,
+                // or if an ongoing task exited.
+                if let Err(err) = result {
+                    break Err(err);
+                }
 
-            if exit_when_task_finishes {
-                break Ok(());
+                if exit_when_task_finishes {
+                    break Ok(());
+                }
             }
         };
 
@@ -666,7 +674,9 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
-        if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
+        if zcashd_compat_task_finished {
+            debug!("zcashd-compat supervisor task already exited before shutdown");
+        } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
             let _ = zcashd_compat_shutdown_tx.send(true);
             if tokio::time::timeout(
                 zcashd_compat_shutdown_timeout,
@@ -690,6 +700,33 @@ impl StartCmd {
         );
 
         exit_status
+    }
+
+    /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
+    fn zcashd_compat_supervisor_should_exit(
+        zcashd_compat_result: Result<Result<(), Report>, tokio::task::JoinError>,
+    ) -> bool {
+        match zcashd_compat_result {
+            Ok(Ok(())) => {
+                warn!(
+                    "zcashd-compat supervisor task exited unexpectedly in supervision mode; continuing without zcashd supervision"
+                );
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    ?err,
+                    "zcashd-compat supervisor task failed in supervision mode; continuing without zcashd supervision"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    ?join_err,
+                    "zcashd-compat supervisor task panicked in supervision mode; continuing without zcashd supervision"
+                );
+            }
+        }
+
+        false
     }
 
     /// Returns the bound for the state service buffer,
@@ -789,6 +826,7 @@ impl config::Override<ZebradConfig> for StartCmd {
 #[cfg(test)]
 mod tests {
     use abscissa_core::config::Override;
+    use color_eyre::eyre::eyre;
 
     use super::StartCmd;
     use crate::config::ZebradConfig;
@@ -917,5 +955,30 @@ mod tests {
             StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
             None
         );
+    }
+
+    #[test]
+    fn zcashd_compat_supervisor_ok_exit_does_not_exit_zebra() {
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Ok(()))));
+    }
+
+    #[test]
+    fn zcashd_compat_supervisor_error_does_not_exit_zebra() {
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Err(
+            eyre!("simulated zcashd supervisor runtime failure"),
+        ))));
+    }
+
+    #[tokio::test]
+    async fn zcashd_compat_supervisor_panic_does_not_exit_zebra() {
+        let join_err = tokio::spawn(async {
+            panic!("simulated zcashd supervisor panic");
+        })
+        .await
+        .expect_err("task should panic");
+
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Err(
+            join_err
+        )));
     }
 }

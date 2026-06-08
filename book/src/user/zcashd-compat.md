@@ -88,8 +88,12 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
 
 - If `zcashd` exits unexpectedly, Zebra's zcashd-compat supervisor restarts it using
   `restart_backoff`, up to `max_restarts`.
-- Zebra only exits when the zcashd-compat supervisor returns a fatal error (for
-  example, spawn failures or restart-limit exhaustion).
+- If the zcashd-compat supervisor later exits or returns a runtime error (for
+  example, spawn failures or restart-limit exhaustion while running), Zebra logs
+  a warning and keeps running without zcashd supervision.
+- Startup-time zcashd-compat config validation is unchanged. For example, if
+  `zcashd_compat.manage_zcashd = true` and `zcashd_path` cannot be resolved,
+  Zebra startup fails with an error.
 - If `zebrad` is shut down normally, it asks the zcashd-compat supervisor to stop
   `zcashd` gracefully: SIGTERM first, then SIGKILL after
   `shutdown_grace_period` if needed.
