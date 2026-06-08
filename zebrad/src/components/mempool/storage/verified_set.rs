@@ -33,6 +33,7 @@ use zebra_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the Sprout nullifiers revealed by transactions in the mempool
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
+/// - the Ironwood nullifiers revealed by transactions in the mempool
 #[derive(Default)]
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
@@ -135,6 +136,7 @@ impl VerifiedSet {
         self.sprout_nullifiers.clear();
         self.sapling_nullifiers.clear();
         self.orchard_nullifiers.clear();
+        self.ironwood_nullifiers.clear();
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
@@ -478,5 +480,23 @@ impl VerifiedSet {
         .set(size_with_weight_gt3 as f64);
         metrics::gauge!("zcash.mempool.size.bytes",).set(self.transactions_serialized_size as f64);
         metrics::gauge!("zcash.mempool.cost.bytes").set(self.total_cost as f64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_removes_ironwood_nullifiers() {
+        let mut verified = VerifiedSet::default();
+
+        verified.ironwood_nullifiers.insert(
+            ironwood::Nullifier::try_from([0; 32]).expect("zero is a valid Pallas base field"),
+        );
+
+        verified.clear();
+
+        assert!(verified.ironwood_nullifiers.is_empty());
     }
 }
