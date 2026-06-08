@@ -485,7 +485,6 @@ the release candidate was published but otherwise mostly includes technical impr
 
 ### Changed
 
-
 ### Added
 
 - Added ZIP 233 (Network Sustainability Mechanism) implementation  ([#8930](https://github.com/ZcashFoundation/zebra/pull/8930))
