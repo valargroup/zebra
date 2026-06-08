@@ -524,12 +524,11 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let all_previous_outputs = Arc::new(spent_outputs);
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            let (mut async_checks, cached_ffi_transaction) = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -537,21 +536,35 @@ where
                 Transaction::V4 {
                     joinsplit_data,
                     ..
-                } => Self::verify_v4_transaction(
-                    &req,
-                    &network,
-                    script_verifier,
-                    cached_ffi_transaction.clone(),
-                    joinsplit_data,
-                )?,
+                } => {
+                    let cached_ffi_transaction =
+                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
+
+                    let async_checks = Self::verify_v4_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                        joinsplit_data,
+                    )?;
+
+                    (async_checks, cached_ffi_transaction)
+                }
                 Transaction::V5 {
                     ..
-                } => Self::verify_v5_transaction(
-                    &req,
-                    &network,
-                    script_verifier,
-                    cached_ffi_transaction.clone(),
-                )?,
+                } => {
+                    let cached_ffi_transaction =
+                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
+
+                    let async_checks = Self::verify_v5_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                    )?;
+
+                    (async_checks, cached_ffi_transaction)
+                }
                 #[cfg(zcash_unstable = "nu7")]
                 Transaction::V6 {
                     ..
@@ -559,7 +572,7 @@ where
                     &req,
                     &network,
                     script_verifier,
-                    cached_ffi_transaction.clone(),
+                    all_previous_outputs.clone(),
                 )?,
             };
 
@@ -1014,21 +1027,28 @@ where
         }
     }
 
+    /// Constructs cached FFI transaction data for transparent and shielded verification.
+    fn cached_ffi_transaction(
+        transaction: Arc<Transaction>,
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+        nu: NetworkUpgrade,
+    ) -> Result<Arc<CachedFfiTransaction>, TransactionError> {
+        let version = transaction.version();
+
+        Ok(Arc::new(
+            CachedFfiTransaction::new(transaction, all_previous_outputs, nu)
+                .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(version, nu))?,
+        ))
+    }
+
     /// Verifies a V6 transaction.
     #[cfg(zcash_unstable = "nu7")]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
-    ) -> Result<AsyncChecks, TransactionError> {
-        let mut async_checks = Self::verify_v5_transaction(
-            request,
-            network,
-            script_verifier,
-            cached_ffi_transaction.clone(),
-        )?;
-
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+    ) -> Result<(AsyncChecks, Arc<CachedFfiTransaction>), TransactionError> {
         let transaction = request.transaction();
         let Transaction::V6 {
             network_upgrade,
@@ -1036,12 +1056,35 @@ where
             expiry_height,
             inputs,
             outputs,
+            sapling_shielded_data,
+            orchard_shielded_data,
             ironwood_shielded_data,
-            ..
         } = transaction.as_ref()
         else {
             unreachable!("verify_v6_transaction() is only called for v6 transactions");
         };
+
+        let v5_compatible_transaction = Arc::new(Transaction::V5 {
+            network_upgrade: *network_upgrade,
+            lock_time: *lock_time,
+            expiry_height: *expiry_height,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            sapling_shielded_data: sapling_shielded_data.clone(),
+            orchard_shielded_data: orchard_shielded_data.clone(),
+        });
+        let v5_compatible_cached_ffi_transaction = Self::cached_ffi_transaction(
+            v5_compatible_transaction,
+            all_previous_outputs.clone(),
+            request.upgrade(network),
+        )?;
+
+        let mut async_checks = Self::verify_v5_transaction(
+            request,
+            network,
+            script_verifier,
+            v5_compatible_cached_ffi_transaction.clone(),
+        )?;
 
         if ironwood_shielded_data.is_some() {
             let fake_ironwood_v5 = Arc::new(Transaction::V5 {
@@ -1054,10 +1097,7 @@ where
                 orchard_shielded_data: ironwood_shielded_data.clone(),
             });
             let ironwood_sighasher = fake_ironwood_v5
-                .sighasher(
-                    *network_upgrade,
-                    Arc::new(cached_ffi_transaction.all_previous_outputs().clone()),
-                )
+                .sighasher(*network_upgrade, all_previous_outputs.clone())
                 .map_err(|_| {
                     TransactionError::UnsupportedByNetworkUpgrade(
                         transaction.version(),
@@ -1074,7 +1114,7 @@ where
             ));
         }
 
-        Ok(async_checks)
+        Ok((async_checks, v5_compatible_cached_ffi_transaction))
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided
