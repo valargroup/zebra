@@ -753,3 +753,32 @@ fn temporary_orchard_disabling_soft_fork_heights() {
     );
     assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
 }
+
+/// Checks the canonical proof-size rule activation boundary.
+#[test]
+fn orchard_canonical_proof_size_rule_activation() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_nu6_2_height = NetworkUpgrade::Nu6_2
+        .activation_height(&Network::Mainnet)
+        .expect("mainnet NU6.2 activation height is configured");
+    assert!(!Network::Mainnet.orchard_canonical_proof_size_rule_active(
+        (mainnet_nu6_2_height - 1).expect("NU6.2 is not genesis"),
+    ));
+    assert!(Network::Mainnet.orchard_canonical_proof_size_rule_active(mainnet_nu6_2_height));
+
+    let nu7_height = Height(10);
+    let nu7_only_network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(nu7_height.0),
+            ..Default::default()
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    assert!(!nu7_only_network
+        .orchard_canonical_proof_size_rule_active((nu7_height - 1).expect("NU7 is not genesis")));
+    assert!(nu7_only_network.orchard_canonical_proof_size_rule_active(nu7_height));
+}
