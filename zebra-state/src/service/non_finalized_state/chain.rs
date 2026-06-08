@@ -266,6 +266,7 @@ impl Chain {
         sprout_note_commitment_tree: Arc<sprout::tree::NoteCommitmentTree>,
         sapling_note_commitment_tree: Arc<sapling::tree::NoteCommitmentTree>,
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
+        ironwood_note_commitment_tree: Arc<ironwood::tree::NoteCommitmentTree>,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
     ) -> Self {
@@ -311,10 +312,7 @@ impl Chain {
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
         chain.add_sapling_tree_and_anchor(finalized_tip_height, sapling_note_commitment_tree);
         chain.add_orchard_tree_and_anchor(finalized_tip_height, orchard_note_commitment_tree);
-        chain.add_ironwood_tree_and_anchor(
-            finalized_tip_height,
-            Arc::<ironwood::tree::NoteCommitmentTree>::default(),
-        );
+        chain.add_ironwood_tree_and_anchor(finalized_tip_height, ironwood_note_commitment_tree);
         chain.add_history_tree(finalized_tip_height, history_tree);
 
         chain
