@@ -64,7 +64,7 @@ fn ironwood_v6_tx(
             flags: orchard::Flags::ENABLE_SPENDS,
             value_balance: Amount::zero(),
             shared_anchor: tree::Root::default(),
-            proof: Halo2Proof(vec![]),
+            proof: Halo2Proof(vec![0; 4992]),
             actions: at_least_one![ironwood::AuthorizedAction {
                 action,
                 spend_auth_sig: [0u8; 64].into(),

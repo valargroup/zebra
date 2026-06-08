@@ -165,7 +165,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -176,7 +176,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1428,7 +1428,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1592,7 +1592,7 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -1624,7 +1624,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1640,7 +1640,7 @@ dependencies = [
 [[package]]
 name = "f4jumble"
 version = "0.1.1"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "blake2b_simd",
 ]
@@ -2666,7 +2666,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2906,7 +2906,7 @@ version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a1886916523694cd6ea3d175f03a1e5010699a2a4cc13696d83d7bea1d80638"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3248,7 +3248,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3627,8 +3627,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "orchard"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a54f8d29bfb1e76a9d4e868a1a08cce2e57dd2bdc66232982822ad3114b91ab3"
+source = "git+https://github.com/valargroup/qr_orchard?branch=ironwood-qr#2b531b9d61a564a11cbdd9418a9788d1dd7d20de"
 dependencies = [
  "aes",
  "bitvec",
@@ -4790,7 +4789,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4849,7 +4848,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5412,7 +5411,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5629,7 +5628,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6831,7 +6830,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7244,7 +7243,7 @@ dependencies = [
 [[package]]
 name = "zcash_address"
 version = "0.12.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "bech32",
  "bs58",
@@ -7257,7 +7256,7 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "corez",
  "hex",
@@ -7267,7 +7266,7 @@ dependencies = [
 [[package]]
 name = "zcash_history"
 version = "0.4.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "blake2b_simd",
  "byteorder",
@@ -7277,7 +7276,7 @@ dependencies = [
 [[package]]
 name = "zcash_keys"
 version = "0.14.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "bech32",
  "blake2b_simd",
@@ -7317,7 +7316,7 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.28.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -7347,7 +7346,7 @@ dependencies = [
 [[package]]
 name = "zcash_proofs"
 version = "0.28.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -7369,7 +7368,7 @@ dependencies = [
 [[package]]
 name = "zcash_protocol"
 version = "0.9.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "corez",
  "document-features",
@@ -7407,7 +7406,7 @@ dependencies = [
 [[package]]
 name = "zcash_transparent"
 version = "0.8.0"
-source = "git+https://github.com/valargroup/librustzcash.git?rev=cdc9278602672ebaede6e144378d767158754638#cdc9278602672ebaede6e144378d767158754638"
+source = "git+https://github.com/valargroup/librustzcash.git?rev=83fe3950b50704f21610c63e65e5672793a4e8a9#83fe3950b50704f21610c63e65e5672793a4e8a9"
 dependencies = [
  "bip32",
  "bs58",

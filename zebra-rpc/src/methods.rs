@@ -1169,13 +1169,14 @@ where
         let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
             .map_error(server::error::LegacyCode::Deserialization)?;
 
-        let transaction_hash = raw_transaction.hash();
+        let unmined_transaction = UnminedTx::try_from_mempool_transaction(raw_transaction)
+            .map_error(server::error::LegacyCode::Verify)?;
+        let transaction_hash = unmined_transaction.id.mined_id();
 
         // send transaction to the rpc queue, ignore any error.
-        let unmined_transaction = UnminedTx::from(raw_transaction.clone());
-        let _ = queue_sender.send(unmined_transaction);
+        let _ = queue_sender.send(unmined_transaction.clone());
 
-        let transaction_parameter = mempool::Gossip::Tx(raw_transaction.into());
+        let transaction_parameter = mempool::Gossip::Tx(unmined_transaction);
         let request = mempool::Request::Queue(vec![transaction_parameter]);
 
         let response = mempool.oneshot(request).await.map_misc_error()?;

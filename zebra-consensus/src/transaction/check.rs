@@ -155,6 +155,29 @@ pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionErro
     Ok(())
 }
 
+/// Checks that shielded proof sizes are canonical when the proof-size rule is active.
+pub fn shielded_proof_size_is_canonical(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    if network.orchard_canonical_proof_size_rule_active(height) {
+        if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+            if !orchard_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::OrchardProofSize);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if !ironwood_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::IronwoodProofSize);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Check that a coinbase transaction has no PrevOut inputs, JoinSplits, or spends.
 ///
 /// # Consensus
