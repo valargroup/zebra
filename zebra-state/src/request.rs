@@ -21,7 +21,7 @@ use zebra_chain::{
     value_balance::{ValueBalance, ValueBalanceError},
 };
 #[cfg(feature = "indexer")]
-use zebra_chain::{orchard, sapling, sprout};
+use zebra_chain::{ironwood, orchard, sapling, sprout};
 
 /// Allow *only* these unused imports, so that rustdoc link resolution
 /// will work with inline links.
@@ -50,6 +50,8 @@ pub enum Spend {
     Sapling(sapling::Nullifier),
     /// A spend identified by a [`orchard::Nullifier`].
     Orchard(orchard::Nullifier),
+    /// A spend identified by an [`ironwood::Nullifier`].
+    Ironwood(ironwood::Nullifier),
 }
 
 #[cfg(feature = "indexer")]

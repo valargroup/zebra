@@ -104,6 +104,18 @@ impl ZebraDb {
         self.db.zs_get(&orchard_nullifiers, &orchard_nullifier)?
     }
 
+    /// Returns the [`TransactionLocation`] of the transaction that revealed
+    /// the given [`ironwood::Nullifier`], if it is revealed in the finalized state and its
+    /// spending transaction hash has been indexed.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn ironwood_revealing_tx_loc(
+        &self,
+        ironwood_nullifier: &ironwood::Nullifier,
+    ) -> Option<TransactionLocation> {
+        let ironwood_nullifiers = self.db.cf_handle("ironwood_nullifiers").unwrap();
+        self.db.zs_get(&ironwood_nullifiers, &ironwood_nullifier)?
+    }
+
     /// Returns `true` if the finalized state contains `sprout_anchor`.
     #[allow(dead_code)]
     pub fn contains_sprout_anchor(&self, sprout_anchor: &sprout::tree::Root) -> bool {

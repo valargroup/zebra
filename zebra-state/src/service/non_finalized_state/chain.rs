@@ -1517,6 +1517,7 @@ impl Chain {
             Spend::Sprout(nullifier) => self.sprout_nullifiers.get(nullifier),
             Spend::Sapling(nullifier) => self.sapling_nullifiers.get(nullifier),
             Spend::Orchard(nullifier) => self.orchard_nullifiers.get(nullifier),
+            Spend::Ironwood(nullifier) => self.ironwood_nullifiers.get(nullifier),
         }
         .cloned()
     }
