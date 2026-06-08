@@ -1042,6 +1042,30 @@ fn test_coinbase_script() -> Result<()> {
 
 #[test]
 #[cfg(zcash_unstable = "nu7")]
+fn v6_transactions_reject_pre_nu7_branch_id() {
+    use crate::parameters::TX_V6_VERSION_GROUP_ID;
+
+    let _init_guard = zebra_test::init();
+
+    let mut tx_bytes = Vec::new();
+    tx_bytes.extend_from_slice(&((1u32 << 31) | 6).to_le_bytes());
+    tx_bytes.extend_from_slice(&TX_V6_VERSION_GROUP_ID.to_le_bytes());
+    tx_bytes.extend_from_slice(&u32::from(NetworkUpgrade::Nu5.branch_id().unwrap()).to_le_bytes());
+    tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+    tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+    tx_bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+
+    let error = Transaction::zcash_deserialize(&tx_bytes[..])
+        .expect_err("V6 transactions must use the NU7 branch ID");
+
+    assert!(
+        matches!(error, SerializationError::Parse(message) if message.contains("NU7")),
+        "unexpected V6 branch ID parse error: {error:?}"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu7")]
 fn v6_txid_commits_to_ironwood_digest() {
     use group::prime::PrimeCurveAffine;
     use reddsa::Signature;
