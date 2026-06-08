@@ -227,7 +227,7 @@ impl From<Transaction> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: Transaction) -> Self {
         // use the ref implementation, to avoid cloning the transaction
         WtxId::from(&transaction)
@@ -239,11 +239,13 @@ impl From<&Transaction> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: &Transaction) -> Self {
         Self {
             id: transaction.into(),
-            auth_digest: transaction.into(),
+            auth_digest: transaction
+                .auth_digest()
+                .expect("witnessed transaction IDs require an authorizing data commitment"),
         }
     }
 }
@@ -253,7 +255,7 @@ impl From<Arc<Transaction>> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: Arc<Transaction>) -> Self {
         transaction.as_ref().into()
     }
