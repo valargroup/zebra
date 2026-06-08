@@ -23,7 +23,7 @@ use zebra_chain::{
     orchard,
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
-        Network,
+        Network, NetworkUpgrade,
     },
     primitives::ed25519,
     sapling::ValueCommitment,
@@ -184,18 +184,29 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
+        let nu7_active = NetworkUpgrade::Nu7
+            .activation_height(net)
+            .is_some_and(|nu7_height| height >= nu7_height);
+
         match miner_params.addr() {
-            Address::Unified(addr) => addr
-                .orchard()
-                .and_then(|addr| add_orchard_reward(&mut builder, addr))
-                .or_else(|| {
-                    addr.sapling()
-                        .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                })
-                .or_else(|| {
-                    addr.transparent()
-                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                }),
+            Address::Unified(addr) => {
+                let orchard_reward = if nu7_active {
+                    None
+                } else {
+                    addr.orchard()
+                        .and_then(|addr| add_orchard_reward(&mut builder, addr))
+                };
+
+                orchard_reward
+                    .or_else(|| {
+                        addr.sapling()
+                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                    })
+                    .or_else(|| {
+                        addr.transparent()
+                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                    })
+            }
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 
