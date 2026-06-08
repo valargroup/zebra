@@ -7,8 +7,9 @@
 //!
 //! Transaction versions 1-4 are uniquely identified by legacy
 //! [`struct@Hash`] transaction IDs, whether they have been mined or not.
-//! So Zebra, and the Zcash network protocol, don't use witnessed transaction
-//! IDs for them.
+//! V6 transactions also use [`struct@Hash`] until their authorizing data
+//! commitment is specified. So Zebra, and the Zcash network protocol, don't use
+//! witnessed transaction IDs for these transactions.
 //!
 //! Zebra's [`UnminedTxId`] and [`UnminedTx`] enums provide the correct unique
 //! ID for unmined transactions. They can be used to handle transactions
@@ -93,9 +94,10 @@ const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 40_000;
 pub enum UnminedTxId {
     /// A legacy unmined transaction identifier.
     ///
-    /// Used to uniquely identify unmined version 1-4 transactions.
-    /// (After v1-4 transactions are mined, they can be uniquely identified
-    /// using the same [`struct@Hash`].)
+    /// Used to uniquely identify unmined version 1-4 transactions and V6
+    /// transactions while their authorizing data commitment is unspecified.
+    /// (After these transactions are mined, they can be identified using the
+    /// same [`struct@Hash`].)
     Legacy(Hash),
 
     /// A witnessed unmined transaction identifier.
@@ -144,7 +146,7 @@ impl From<&Transaction> for UnminedTxId {
             V1 { .. } | V2 { .. } | V3 { .. } | V4 { .. } => Legacy(transaction.into()),
             V5 { .. } => Witnessed(transaction.into()),
             #[cfg(zcash_unstable = "nu7")]
-            V6 { .. } => Witnessed(transaction.into()),
+            V6 { .. } => Legacy(transaction.into()),
         }
     }
 }
