@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use zebra_chain::{
     amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Block, Height},
+    ironwood, orchard,
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
         Network, NetworkKind, NetworkUpgrade,
@@ -1001,10 +1002,11 @@ fn rollback_prunes_subtrees_above_target() {
     let config = config_at(dir.path());
     sync_to(&config, &network, &chain);
 
-    // Insert subtrees straddling the rollback target (height 2): index 0 ends at/below it (kept),
-    // index 1 ends above it (pruned).
+    // Insert subtrees straddling the rollback target (height 2): index 0 ends at or below it,
+    // and index 1 ends above it.
     let sapling_node = sapling_crypto::Node::from_bytes([0; 32]).expect("dummy sapling node");
-    let orchard_node = zebra_chain::orchard::tree::Node::default();
+    let orchard_node = orchard::tree::Node::default();
+    let ironwood_node = ironwood::tree::Node::default();
     {
         let db = open_unchecked_db(&config, &network);
         let mut batch = DiskWriteBatch::new();
@@ -1023,6 +1025,14 @@ fn rollback_prunes_subtrees_above_target() {
         batch.insert_orchard_subtree(
             &db,
             &NoteCommitmentSubtree::new(1u16, Height(3), orchard_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), ironwood_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(1u16, Height(3), ironwood_node),
         );
         db.write_batch(batch)
             .expect("database accepts the synthetic subtree batch");
@@ -1050,6 +1060,11 @@ fn rollback_prunes_subtrees_above_target() {
         .keys()
         .map(|index| index.0)
         .collect();
+    let ironwood: Vec<u16> = rolled
+        .ironwood_subtree_list_by_index_range(..)
+        .keys()
+        .map(|index| index.0)
+        .collect();
 
     assert_eq!(
         sapling,
@@ -1060,5 +1075,10 @@ fn rollback_prunes_subtrees_above_target() {
         orchard,
         vec![0],
         "orchard subtree above the target is pruned"
+    );
+    assert_eq!(
+        ironwood,
+        vec![0],
+        "ironwood subtree above the target is pruned"
     );
 }

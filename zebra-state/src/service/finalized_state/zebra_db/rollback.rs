@@ -879,7 +879,7 @@ fn reset_tip_trees(db: &ZebraDb, batch: &mut DiskWriteBatch, treestate: &Rebuilt
     batch.update_sprout_tree(db, &treestate.sprout_tree);
     batch.update_history_tree(db, &treestate.history_tree);
 
-    // The sapling and orchard trees are height-keyed and de-duplicated: the forward write only
+    // The sapling, orchard, and ironwood trees are height-keyed and de-duplicated: the forward write only
     // stores a tree when its root changes, and reads find the tip tree by searching backwards.
     // Deleting the trees above the target height (see `prune_tree_indexes`) therefore already
     // leaves the correct de-duplicated trees for the new tip. Writing a tree at the target height
@@ -926,7 +926,18 @@ fn prune_tree_indexes(
         batch.delete_orchard_anchor(db, &tree.root());
     }
 
-    // Delete every sapling/orchard subtree whose notes extend past the target height. Subtree
+    let ironwood_trees: BTreeMap<_, _> = db
+        .ironwood_tree_by_height_range((
+            std::ops::Bound::Excluded(target_height),
+            std::ops::Bound::Unbounded,
+        ))
+        .collect();
+    for (height, tree) in ironwood_trees {
+        batch.delete_ironwood_tree(db, &height);
+        batch.delete_ironwood_anchor(db, &tree.root());
+    }
+
+    // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
     // (the exclusive end of the single-index delete range) cannot overflow.
     for (index, _) in db
@@ -943,6 +954,14 @@ fn prune_tree_indexes(
         .filter(|(_, subtree)| subtree.end_height > target_height)
     {
         batch.delete_range_orchard_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
+    }
+
+    for (index, _) in db
+        .ironwood_subtree_list_by_index_range(..)
+        .into_iter()
+        .filter(|(_, subtree)| subtree.end_height > target_height)
+    {
+        batch.delete_range_ironwood_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
     }
 
     // Sprout has no by-height anchor index, so enumerate every anchor and drop the ones not seen
