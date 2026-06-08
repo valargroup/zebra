@@ -5,12 +5,16 @@
 use blake2b_simd::{Hash as Blake2bHash, Params};
 #[cfg(zcash_unstable = "nu7")]
 use byteorder::{LittleEndian, WriteBytesExt};
+#[cfg(zcash_unstable = "nu7")]
+use group::ff::PrimeField;
 
 use super::{Hash, Transaction};
 use crate::serialization::{sha256d, ZcashSerialize};
 
 #[cfg(zcash_unstable = "nu7")]
-use crate::{block, parameters::TX_V6_VERSION_GROUP_ID, transaction::LockTime};
+use crate::{
+    block, orchard::ShieldedData, parameters::TX_V6_VERSION_GROUP_ID, transaction::LockTime,
+};
 
 #[cfg(zcash_unstable = "nu7")]
 use zcash_primitives::transaction::txid::TxIdDigester;
@@ -25,6 +29,29 @@ const ZCASH_TRANSPARENT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdTranspaHash";
 const ZCASH_SAPLING_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdSaplingHash";
 #[cfg(zcash_unstable = "nu7")]
 const ZCASH_IRONWOOD_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIronwd_Hash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_IRONWOOD_ACTIONS_COMPACT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIrnActCHash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_IRONWOOD_ACTIONS_MEMOS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIrnActMHash";
+#[cfg(zcash_unstable = "nu7")]
+const ZCASH_IRONWOOD_ACTIONS_NONCOMPACT_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIrnActNHash";
+
+#[cfg(zcash_unstable = "nu7")]
+struct OrchardStyleBundlePersonalization {
+    txid_bundle: &'static [u8; 16],
+    txid_actions_compact: &'static [u8; 16],
+    txid_actions_memos: &'static [u8; 16],
+    txid_actions_noncompact: &'static [u8; 16],
+}
+
+#[cfg(zcash_unstable = "nu7")]
+const IRONWOOD_BUNDLE_PERSONALIZATION: OrchardStyleBundlePersonalization =
+    OrchardStyleBundlePersonalization {
+        txid_bundle: ZCASH_IRONWOOD_HASH_PERSONALIZATION,
+        txid_actions_compact: ZCASH_IRONWOOD_ACTIONS_COMPACT_HASH_PERSONALIZATION,
+        txid_actions_memos: ZCASH_IRONWOOD_ACTIONS_MEMOS_HASH_PERSONALIZATION,
+        txid_actions_noncompact: ZCASH_IRONWOOD_ACTIONS_NONCOMPACT_HASH_PERSONALIZATION,
+    };
 
 #[cfg(zcash_unstable = "nu7")]
 fn hasher(personal: &[u8; 16]) -> blake2b_simd::State {
@@ -109,17 +136,6 @@ impl<'a> TxIdBuilder<'a> {
         // Ironwood transaction fields.
         let v5_tx = fake_v5.to_librustzcash(*network_upgrade).ok()?;
         let v5_digests = v5_tx.into_data().digest(TxIdDigester);
-        let fake_ironwood_v5 = Transaction::V5 {
-            network_upgrade: *network_upgrade,
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            sapling_shielded_data: None,
-            orchard_shielded_data: ironwood_shielded_data.clone(),
-        };
-        let ironwood_v5_tx = fake_ironwood_v5.to_librustzcash(*network_upgrade).ok()?;
-        let ironwood_v5_digests = ironwood_v5_tx.into_data().digest(TxIdDigester);
 
         let branch_id = u32::from(network_upgrade.branch_id()?);
         let header_digest = hash_v6_header_txid_data(branch_id, *lock_time, *expiry_height);
@@ -131,7 +147,7 @@ impl<'a> TxIdBuilder<'a> {
         let orchard_digest = v5_digests
             .orchard_digest
             .unwrap_or_else(::orchard::bundle::commitments::hash_bundle_txid_empty);
-        let ironwood_digest = hash_ironwood_txid_data(ironwood_v5_digests.orchard_digest);
+        let ironwood_digest = hash_ironwood_txid_data(ironwood_shielded_data.as_ref());
 
         Some(Hash(
             v6_txid_hash(
@@ -197,12 +213,43 @@ fn hash_sapling_txid_empty() -> Blake2bHash {
 }
 
 #[cfg(zcash_unstable = "nu7")]
-fn hash_ironwood_txid_data(ironwood_orchard_digest: Option<Blake2bHash>) -> Blake2bHash {
-    let mut h = hasher(ZCASH_IRONWOOD_HASH_PERSONALIZATION);
+fn hash_ironwood_txid_data(ironwood_shielded_data: Option<&ShieldedData>) -> Blake2bHash {
+    let personal = &IRONWOOD_BUNDLE_PERSONALIZATION;
+    let mut h = hasher(personal.txid_bundle);
 
-    let ironwood_orchard_digest = ironwood_orchard_digest
-        .unwrap_or_else(::orchard::bundle::commitments::hash_bundle_txid_empty);
-    h.update(ironwood_orchard_digest.as_bytes());
+    let Some(ironwood_shielded_data) = ironwood_shielded_data else {
+        return h.finalize();
+    };
+
+    let mut ch = hasher(personal.txid_actions_compact);
+    let mut mh = hasher(personal.txid_actions_memos);
+    let mut nh = hasher(personal.txid_actions_noncompact);
+
+    for action in ironwood_shielded_data.actions() {
+        let nullifier_bytes: [u8; 32] = action.nullifier.into();
+        let ephemeral_key_bytes: [u8; 32] = (&action.ephemeral_key).into();
+        let cv_bytes: [u8; 32] = action.cv.into();
+        let rk_bytes: [u8; 32] = action.rk.into();
+
+        ch.update(&nullifier_bytes);
+        ch.update(&action.cm_x.to_repr());
+        ch.update(&ephemeral_key_bytes);
+        ch.update(&action.enc_ciphertext.0[..52]);
+
+        mh.update(&action.enc_ciphertext.0[52..564]);
+
+        nh.update(&cv_bytes);
+        nh.update(&rk_bytes);
+        nh.update(&action.enc_ciphertext.0[564..]);
+        nh.update(&action.out_ciphertext.0);
+    }
+
+    h.update(ch.finalize().as_bytes());
+    h.update(mh.finalize().as_bytes());
+    h.update(nh.finalize().as_bytes());
+    h.update(&[ironwood_shielded_data.flags.bits()]);
+    h.update(&ironwood_shielded_data.value_balance.to_bytes());
+    h.update(&<[u8; 32]>::from(&ironwood_shielded_data.shared_anchor));
 
     h.finalize()
 }
