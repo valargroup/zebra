@@ -1040,6 +1040,74 @@ fn test_coinbase_script() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[cfg(zcash_unstable = "nu7")]
+fn v6_txid_commits_to_ironwood_digest() {
+    use group::prime::PrimeCurveAffine;
+    use reddsa::Signature;
+
+    use crate::{
+        at_least_one,
+        orchard::{
+            keys::EphemeralPublicKey, tree, Action, AuthorizedAction, EncryptedNote, Flags,
+            NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
+        },
+        primitives::Halo2Proof,
+    };
+    use halo2::pasta::pallas;
+
+    let _init_guard = zebra_test::init();
+
+    let tx_without_ironwood = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+
+    let action = Action {
+        cv: ValueCommitment(pallas::Affine::identity()),
+        nullifier: Nullifier(pallas::Base::zero()),
+        rk: [0u8; 32].into(),
+        cm_x: NoteCommitment(pallas::Affine::identity()).extract_x(),
+        ephemeral_key: EphemeralPublicKey(pallas::Affine::generator()),
+        enc_ciphertext: EncryptedNote([0u8; 580]),
+        out_ciphertext: WrappedNoteKey([0u8; 80]),
+    };
+
+    let ironwood_shielded_data = ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![]),
+        actions: at_least_one![AuthorizedAction {
+            action,
+            spend_auth_sig: Signature::from([0u8; 64]),
+        }],
+        binding_sig: Signature::from([0u8; 64]),
+    };
+
+    let mut tx_with_ironwood = tx_without_ironwood.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: tx_ironwood_shielded_data,
+        ..
+    } = &mut tx_with_ironwood
+    else {
+        unreachable!("test transaction is V6");
+    };
+    *tx_ironwood_shielded_data = Some(ironwood_shielded_data);
+
+    assert_ne!(
+        tx_with_ironwood.hash(),
+        tx_without_ironwood.hash(),
+        "V6 txid must commit to Ironwood shielded data"
+    );
+}
+
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.
 ///
 /// A v5 transaction whose Orchard action has `rk = [0u8; 32]` (the Pallas
