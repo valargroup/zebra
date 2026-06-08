@@ -408,7 +408,7 @@ impl FinalizedState {
             } => (
                 contextually_verified.height,
                 contextually_verified.hash,
-                FinalizedBlock::from_contextually_verified(contextually_verified, treestate),
+                FinalizedBlock::from_contextually_verified(contextually_verified, *treestate),
                 prev_note_commitment_trees,
             ),
         };

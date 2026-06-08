@@ -1356,13 +1356,15 @@ impl Chain {
         let ironwood_subtree = self.ironwood_subtree(hash_or_height);
 
         Some(Treestate::new(
-            sprout_tree,
-            sapling_tree,
-            orchard_tree,
-            ironwood_tree,
-            sapling_subtree,
-            orchard_subtree,
-            ironwood_subtree,
+            NoteCommitmentTrees {
+                sprout: sprout_tree,
+                sapling: sapling_tree,
+                sapling_subtree,
+                orchard: orchard_tree,
+                orchard_subtree,
+                ironwood: ironwood_tree,
+                ironwood_subtree,
+            },
             history_tree,
         ))
     }
