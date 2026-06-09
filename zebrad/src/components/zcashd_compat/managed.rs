@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{BufReader, Read},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     thread::sleep,
     time::{Duration, Instant},
@@ -51,7 +51,10 @@ pub fn effective_zcashd_source(config: &Config) -> Result<ZcashdBinarySource, Re
 }
 
 /// Resolves and validates the `zcashd` executable path.
-pub fn resolve_zcashd_binary_path(config: &Config, state_cache_dir: &Path) -> Result<PathBuf, Report> {
+pub fn resolve_zcashd_binary_path(
+    config: &Config,
+    state_cache_dir: &Path,
+) -> Result<PathBuf, Report> {
     match effective_zcashd_source(config)? {
         ZcashdBinarySource::Path(path) => {
             if !is_command_resolvable(&path) {
@@ -83,14 +86,12 @@ fn resolve_managed_zcashd_binary_from_manifest(
         )
     })?;
 
-    let artifact = manifest
-        .artifact_for_target(target)
-        .ok_or_else(|| {
-            eyre!(
-                "no managed zcashd release is configured for target {target}; \
+    let artifact = manifest.artifact_for_target(target).ok_or_else(|| {
+        eyre!(
+            "no managed zcashd release is configured for target {target}; \
                  set zcashd_compat.zcashd_path to a local zcashd binary"
-            )
-        })?;
+        )
+    })?;
 
     let cache_dir = state_cache_dir
         .join("zcashd-compat")
@@ -101,14 +102,18 @@ fn resolve_managed_zcashd_binary_from_manifest(
 
     let binary_path = cache_dir.join("zcashd");
     let provenance_path = cache_dir.join("zcashd.sha256");
-    if binary_path.is_file() && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)? {
+    if binary_path.is_file()
+        && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)?
+    {
         return Ok(binary_path);
     }
 
     let _lock = acquire_lock(&cache_dir.join(".install.lock"), Duration::from_secs(30))?;
 
     // Re-check after acquiring the lock.
-    if binary_path.is_file() && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)? {
+    if binary_path.is_file()
+        && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)?
+    {
         return Ok(binary_path);
     }
 
@@ -138,7 +143,10 @@ fn resolve_managed_zcashd_binary_from_manifest(
             err.error
         )
     })?;
-    fs::write(&provenance_path, format!("{}\n", artifact.runtime_archive_sha256))?;
+    fs::write(
+        &provenance_path,
+        format!("{}\n", artifact.runtime_archive_sha256),
+    )?;
 
     Ok(binary_path)
 }
@@ -150,7 +158,8 @@ fn resolve_managed_zcashd_binary_from_manifest(
 /// - redirects must remain HTTPS;
 /// - tests may use localhost HTTP endpoints.
 fn download_archive(url: &str, out: &mut fs::File) -> Result<(), Report> {
-    let parsed = Url::parse(url).map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err}"))?;
+    let parsed =
+        Url::parse(url).map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err}"))?;
     if parsed.scheme() != "https" {
         #[cfg(test)]
         let localhost_http = parsed.scheme() == "http"
@@ -223,12 +232,7 @@ fn extract_archive_member_to_path(
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let candidate = normalize_member_path(
-            &entry
-                .path()?
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let candidate = normalize_member_path(&entry.path()?.to_string_lossy().into_owned());
         if candidate == requested {
             entry
                 .unpack(destination)
@@ -312,20 +316,30 @@ impl Drop for InstallLock {
 /// This prevents concurrent zebrad processes from racing archive downloads and
 /// replacing the same cached binary simultaneously.
 fn acquire_lock(lock_path: &Path, timeout: Duration) -> Result<InstallLock, Report> {
-    let started = Instant::now();
+    let mut started = Instant::now();
     loop {
         match OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(lock_path)
         {
-            Ok(_file) => {
+            Ok(mut file) => {
+                if let Err(error) = write_install_lock_owner(&mut file, lock_path) {
+                    let _ = fs::remove_file(lock_path);
+                    return Err(error);
+                }
+
                 return Ok(InstallLock {
                     path: lock_path.to_path_buf(),
-                })
+                });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 if started.elapsed() > timeout {
+                    if remove_stale_lock(lock_path, timeout)? {
+                        started = Instant::now();
+                        continue;
+                    }
+
                     return Err(eyre!(
                         "timed out waiting for managed zcashd installation lock: {}",
                         lock_path.display()
@@ -343,12 +357,105 @@ fn acquire_lock(lock_path: &Path, timeout: Duration) -> Result<InstallLock, Repo
     }
 }
 
+fn write_install_lock_owner(file: &mut fs::File, lock_path: &Path) -> Result<(), Report> {
+    writeln!(file, "pid={}", std::process::id()).map_err(|err| {
+        eyre!(
+            "failed to write managed zcashd installation lock {}: {err}",
+            lock_path.display()
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        eyre!(
+            "failed to sync managed zcashd installation lock {}: {err}",
+            lock_path.display()
+        )
+    })
+}
+
+fn remove_stale_lock(lock_path: &Path, stale_after: Duration) -> Result<bool, Report> {
+    let content = match fs::read_to_string(lock_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => {
+            return Err(eyre!(
+                "failed to read managed zcashd installation lock {}: {err}",
+                lock_path.display()
+            ))
+        }
+    };
+
+    if let Some(pid) = lock_owner_pid(&content) {
+        if process_is_running(pid) {
+            return Ok(false);
+        }
+    } else if !lock_file_is_older_than(lock_path, stale_after)? {
+        return Ok(false);
+    }
+
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(eyre!(
+            "failed to remove stale managed zcashd installation lock {}: {err}",
+            lock_path.display()
+        )),
+    }
+}
+
+fn lock_owner_pid(content: &str) -> Option<u32> {
+    content.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|pid| pid.trim().parse().ok())
+    })
+}
+
+fn lock_file_is_older_than(lock_path: &Path, age: Duration) -> Result<bool, Report> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => {
+            return Err(eyre!(
+                "failed to inspect managed zcashd installation lock {}: {err}",
+                lock_path.display()
+            ))
+        }
+    };
+
+    let Ok(modified_age) = metadata.modified()?.elapsed() else {
+        return Ok(false);
+    };
+
+    Ok(modified_age >= age)
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) => true,
+        Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
         thread,
+        time::Duration,
     };
 
     use flate2::{write::GzEncoder, Compression};
@@ -356,7 +463,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        effective_zcashd_source, normalize_member_path, provenance_matches,
+        acquire_lock, effective_zcashd_source, normalize_member_path, provenance_matches,
         resolve_managed_zcashd_binary_from_manifest, sha256_hex_file, zcashd_target_triple, Config,
         ZcashdBinarySource,
     };
@@ -423,6 +530,72 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn acquire_lock_replaces_dead_owner_lock() {
+        let temp = tempdir().expect("tempdir should exist");
+        let lock_path = temp.path().join(".install.lock");
+        std::fs::write(&lock_path, "pid=4294967295\n").expect("lock file should write");
+
+        let lock =
+            acquire_lock(&lock_path, Duration::ZERO).expect("dead owner lock should recover");
+        let content = std::fs::read_to_string(&lock_path).expect("lock file should be readable");
+
+        assert!(
+            content.contains(&format!("pid={}\n", std::process::id())),
+            "lock file should contain current process owner: {content}"
+        );
+
+        drop(lock);
+        assert!(
+            !lock_path.exists(),
+            "dropping the recovered lock should remove the lock file"
+        );
+    }
+
+    #[test]
+    fn acquire_lock_replaces_legacy_stale_lock() {
+        let temp = tempdir().expect("tempdir should exist");
+        let lock_path = temp.path().join(".install.lock");
+        std::fs::write(&lock_path, "").expect("legacy lock file should write");
+
+        let lock =
+            acquire_lock(&lock_path, Duration::ZERO).expect("legacy stale lock should recover");
+        let content = std::fs::read_to_string(&lock_path).expect("lock file should be readable");
+
+        assert!(
+            content.contains(&format!("pid={}\n", std::process::id())),
+            "lock file should contain current process owner: {content}"
+        );
+
+        drop(lock);
+        assert!(
+            !lock_path.exists(),
+            "dropping the recovered lock should remove the lock file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_lock_keeps_live_owner_lock() {
+        let temp = tempdir().expect("tempdir should exist");
+        let lock_path = temp.path().join(".install.lock");
+        std::fs::write(&lock_path, format!("pid={}\n", std::process::id()))
+            .expect("lock file should write");
+
+        let error = acquire_lock(&lock_path, Duration::ZERO)
+            .expect_err("live owner lock should not be replaced");
+
+        assert!(
+            error.to_string().contains("timed out waiting"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            lock_path.exists(),
+            "live owner lock should remain for its owner"
+        );
+    }
+
     #[test]
     fn managed_download_rejects_non_https_non_localhost_urls() {
         let Some(target) = zcashd_target_triple() else {
@@ -460,7 +633,8 @@ mod tests {
         let binary_contents = b"#!/bin/sh\necho zcashd-compat-test\n";
 
         {
-            let file = std::fs::File::create(&archive_path).expect("archive file should be created");
+            let file =
+                std::fs::File::create(&archive_path).expect("archive file should be created");
             let encoder = GzEncoder::new(file, Compression::default());
             let mut tar = Builder::new(encoder);
 
@@ -478,7 +652,9 @@ mod tests {
         let archive_bytes = std::fs::read(&archive_path).expect("archive bytes should be readable");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have local address");
+        let address = listener
+            .local_addr()
+            .expect("listener should have local address");
         let payload = archive_bytes.clone();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("one client should connect");
