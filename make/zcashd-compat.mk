@@ -27,13 +27,40 @@ HEIGHT_MAX_DRIFT ?= 10
 ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
 ZCASHD_COMPAT_URL ?= https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz
 ZCASHD_COMPAT_SHA256 ?= 09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c
+ZCASHD_COMPAT_ARTIFACT_DIR ?= $(CURDIR)/target/zcashd-compat
+ZCASHD_COMPAT_ARCHIVE_PATH ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/zcashd-compat.tar.gz
+ZCASHD_COMPAT_EXTRACT_DIR ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/extracted
+# Optional override for callers that prepare zcashd by other means.
+# This directory must contain a Linux executable at ./bin/zcashd.
+ZCASHD_COMPAT_BUILD_CONTEXT ?=
 
-compat-docker-build:
+.PHONY: compat-zcashd-prepare
+
+compat-zcashd-prepare:
+	@set -eu; \
+	if [ -n "$(ZCASHD_COMPAT_BUILD_CONTEXT)" ]; then \
+		echo "Using provided zcashd build context: $(ZCASHD_COMPAT_BUILD_CONTEXT)"; \
+		test -x "$(ZCASHD_COMPAT_BUILD_CONTEXT)/bin/zcashd"; \
+	else \
+		echo "Fetching hash-pinned zcashd-compat archive..."; \
+		mkdir -p "$(ZCASHD_COMPAT_ARTIFACT_DIR)"; \
+		curl -fsSL "$(ZCASHD_COMPAT_URL)" -o "$(ZCASHD_COMPAT_ARCHIVE_PATH)"; \
+		echo "$(ZCASHD_COMPAT_SHA256)  $(ZCASHD_COMPAT_ARCHIVE_PATH)" | sha256sum -c -; \
+		rm -rf "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
+		mkdir -p "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
+		tar -xzf "$(ZCASHD_COMPAT_ARCHIVE_PATH)" -C "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
+		test -x "$(ZCASHD_COMPAT_EXTRACT_DIR)/bin/zcashd"; \
+	fi
+
+compat-docker-build: compat-zcashd-prepare
 	@echo "Building Docker zcashd-compat image..."
-	docker build -f ./docker/Dockerfile --target runtime \
-		--build-arg ZCASHD_COMPAT_ENABLED=true \
-		--build-arg ZCASHD_COMPAT_URL="$(ZCASHD_COMPAT_URL)" \
-		--build-arg ZCASHD_COMPAT_SHA256="$(ZCASHD_COMPAT_SHA256)" \
+	@set -eu; \
+	context_dir="$(ZCASHD_COMPAT_BUILD_CONTEXT)"; \
+	if [ -z "$$context_dir" ]; then \
+		context_dir="$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
+	fi; \
+	docker build -f ./docker/Dockerfile --target runtime-zcashd-compat \
+		--build-context "zcashd_compat=$$context_dir" \
 		--tag "$(ZEBRA_DOCKER_IMAGE)" .
 
 compat-docker-start:

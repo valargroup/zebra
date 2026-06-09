@@ -99,17 +99,21 @@ by default. Release builds publish a separate `zfnd/zebra-zcashd-compat` image,
 or you can build a local compat image with:
 
 ```console
-docker build -f ./docker/Dockerfile --target runtime \
-  --build-arg ZCASHD_COMPAT_ENABLED=true \
-  --build-arg ZCASHD_COMPAT_URL=https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz \
-  --build-arg ZCASHD_COMPAT_SHA256=09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c \
-  --tag zebra:zcashd-compat .
+make compat-docker-build
 ```
 
-When `ZCASHD_COMPAT_ENABLED=true` is set at build time, the Dockerfile vendors
-a verified `zcashd` binary from the provided URL. For non-`amd64` builds, set
-`ZCASHD_COMPAT_URL` and `ZCASHD_COMPAT_SHA256` to the matching artifact for
-your target platform.
+`make compat-docker-build` downloads a hash-pinned zcashd-compat archive,
+verifies its SHA256, and passes the extracted `zcashd` binary into the Docker
+build using a named BuildKit context. This keeps network fetching outside the
+Dockerfile and lets callers supply their own binary source.
+
+To override the default source, set `ZCASHD_COMPAT_BUILD_CONTEXT` to a local
+directory that contains `./bin/zcashd`:
+
+```console
+make compat-docker-build \
+  ZCASHD_COMPAT_BUILD_CONTEXT=/path/to/extracted-zcashd-context
+```
 
 At runtime, enable the vendored binary with:
 
