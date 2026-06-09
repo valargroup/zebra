@@ -55,6 +55,35 @@ When overriding `zcashd_extra_args` via environment variables, pass a JSON array
 ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-printtoconsole"]'
 ```
 
+## Hardware preflight (Linux)
+
+When zcashd-compat mode is enabled, Zebra runs Linux-only startup preflight checks
+for CPU, effective RAM, and mount-aware disk space.
+
+If hardware is below minimum requirements, Zebra fails closed by default.
+If hardware is below recommended requirements but above minimums, Zebra logs
+explicit warnings and continues.
+
+Use `--unsafe-low-specs` to bypass minimum-check failures only when you
+explicitly accept degraded or unstable operation.
+
+### Minimum requirements (fail closed by default)
+
+- CPU: 4 logical CPUs available to the process
+- RAM: 16 GiB effective memory (host memory, constrained by cgroup limits when applicable)
+- Disk:
+  - Zebra state mount: at least 350 GiB available, and at least 500 GiB total capacity
+  - zcashd datadir mount: at least 300 GiB available, and at least 300 GiB total capacity
+  - If Zebra state and zcashd datadir are on the same filesystem, required available
+    space is summed (650 GiB available)
+
+### Recommended requirements (warn if below)
+
+- CPU: 8 logical CPUs available to the process
+- RAM: 32 GiB effective memory
+- Disk: at least 1 TiB combined capacity across the filesystems used by Zebra state
+  and zcashd datadir
+
 ## Containers
 
 The standard container image does not enable zcashd-compat or include `zcashd`

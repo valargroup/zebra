@@ -116,6 +116,10 @@ pub struct StartCmd {
     /// Enable zcashd-compat mode and apply zcashd-compat RPC guardrails.
     #[clap(long)]
     zcashd_compat: bool,
+
+    /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
+    #[clap(long = "unsafe-low-specs")]
+    unsafe_low_specs: bool,
 }
 
 /// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
@@ -204,6 +208,10 @@ impl StartCmd {
         } else {
             config
         };
+
+        if config.zcashd_compat.enabled {
+            zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;
+        }
 
         let resolved_zcashd_path = if config.zcashd_compat.enabled
             && config.zcashd_compat.manage_zcashd
@@ -861,6 +869,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = false;
@@ -888,6 +897,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
@@ -916,6 +926,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
@@ -938,6 +949,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
@@ -958,6 +970,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
@@ -973,6 +986,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
