@@ -33,6 +33,16 @@ impl ZakuraTestCluster {
         Ok(self.nodes.len() - 1)
     }
 
+    /// Spawn one preconfigured node and append it to the cluster.
+    pub async fn spawn_node_with(
+        &mut self,
+        builder: super::ZakuraTestNodeBuilder,
+    ) -> Result<usize, BoxError> {
+        let node = builder.spawn().await?;
+        self.nodes.push(node);
+        Ok(self.nodes.len() - 1)
+    }
+
     /// Spawn one node with a per-node JSONL trace directory.
     pub async fn spawn_traced_node(
         &mut self,
@@ -133,9 +143,27 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::HostilePeer;
+    use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
+
+    use super::super::{HostilePeer, TestEchoStatusService, TEST_ECHO_STATUS_SERVICE_ID};
     use super::*;
-    use crate::{zakura::ZakuraLocalLimits, Config};
+    use crate::{
+        protocol::internal::{InventoryResponse, PeerSource, Request, Response},
+        zakura::{
+            Frame, InboundSink, InboundSinkReject, LegacyGossipSink, ZakuraDiscoveryConfig,
+            ZakuraDualStackService, ZakuraLocalLimits, ZakuraNodeRecord, ZakuraPeerId,
+            ZakuraServiceId, ZAKURA_STREAM_TEST_ECHO_STATUS,
+        },
+        Config,
+    };
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tower::{Service, ServiceExt};
+    use zebra_chain::{
+        block::{self, Block},
+        serialization::ZcashDeserialize,
+        transaction::{LockTime, Transaction, UnminedTx},
+    };
+    use zebra_test::vectors::BLOCK_TESTNET_141042_BYTES;
 
     #[tokio::test]
     #[ignore = "native handler mesh smoke is exercised by the zakura-integration nextest profile once dial scheduling is made deterministic"]
@@ -315,5 +343,355 @@ mod tests {
         hostile.shutdown().await;
         victim.shutdown().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_zakura_discovery_e2e_transitive_service_and_block_propagation(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let service = ZakuraServiceId::new(TEST_ECHO_STATUS_SERVICE_ID)
+            .expect("test echo/status service id is valid");
+        let discovery_config = ZakuraDiscoveryConfig {
+            discovery_connection_headroom: 0,
+            refresh_interval: Duration::from_millis(50),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let transaction = UnminedTx::from(empty_v5_transaction(44));
+
+        let (seed, _seed_rx) = legacy_recorder_node(901, discovery_config.clone()).await?;
+        let node2_echo = Arc::new(TestEchoStatusService::accepting());
+        let node2 = block_provider_echo_node(
+            902,
+            discovery_config.clone(),
+            service.clone(),
+            node2_echo.clone(),
+            block.clone(),
+            transaction,
+        )
+        .await?;
+        let (node3, mut node3_rx) = legacy_recorder_node(903, discovery_config).await?;
+        let seed_id = node_id(&seed).await;
+        let node2_id = node_id(&node2).await;
+        let node3_id = node_id(&node3).await;
+
+        node2.insert_static_discovery_candidate(&seed).await?;
+        node3.insert_static_discovery_candidate(&seed).await?;
+        let node2_bootstrap = node2.spawn_discovery_dialer();
+        let node3_bootstrap = node3.spawn_discovery_dialer();
+        wait_for_registered_peer(&node2, seed_id).await?;
+        wait_for_registered_peer(&node3, seed_id).await?;
+        node2_bootstrap.abort();
+        node3_bootstrap.abort();
+
+        let node3_seen_by_node2 = wait_for_discovery_record(&node2, node3_id).await?;
+        let node2_seen_by_node3 = wait_for_discovery_record(&node3, node2_id).await?;
+        assert_eq!(node3_seen_by_node2.body.node_id, node3_id);
+        assert_eq!(node2_seen_by_node3.body.node_id, node2_id);
+        assert!(!registered_peers(&node2)
+            .await
+            .contains(&peer_id_for(node3_id)));
+        assert!(!registered_peers(&node3)
+            .await
+            .contains(&peer_id_for(node2_id)));
+
+        // The records above prove transitive discovery through the seed. Local
+        // Iroh endpoints are loopback-only, while untrusted peer imports must
+        // reject loopback addresses, so the testkit replaces the discovered
+        // address with a trusted static loopback record for the same NodeId
+        // before starting the real discovery dialer.
+        node2
+            .import_static_loopback_record(&node3, node3_seen_by_node2.body.sequence + 1)
+            .await?;
+        let node2_to_node3_dialer = node2.spawn_discovery_dialer();
+        wait_for_registered_peer(&node2, node3_id).await?;
+        wait_for_registered_peer(&node3, node2_id).await?;
+
+        let service_response = node3
+            .request_test_echo_status(&service, b"all-zakura-e2e".to_vec())
+            .await?;
+        assert_eq!(service_response.responder, node2_id);
+        assert_eq!(service_response.payload, b"all-zakura-e2e");
+        assert!(!service_response.used_fallback);
+        assert_eq!(node2_echo.call_count(), 1);
+
+        let mut node2_all_zakura =
+            ZakuraDualStackService::new(LegacyDisabled, node2.supervisor(), false);
+        node2_all_zakura
+            .ready()
+            .await?
+            .call(Request::AdvertiseBlockToAll(block.hash()))
+            .await?;
+        match recv_request(&mut node3_rx).await? {
+            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
+                assert_eq!(hash, block.hash());
+                assert_eq!(peer_id, peer_id_for(node2_id));
+            }
+            request => panic!("unexpected node3 gossip request: {request:?}"),
+        }
+
+        let mut node3_all_zakura =
+            ZakuraDualStackService::new(LegacyDisabled, node3.supervisor(), false);
+        let block_response = node3_all_zakura
+            .ready()
+            .await?
+            .call(Request::BlocksByHashFrom {
+                hashes: HashSet::from([block.hash()]),
+                source: PeerSource::Zakura(peer_id_for(node2_id)),
+            })
+            .await?;
+        let Response::Blocks(blocks) = block_response else {
+            panic!("unexpected block response: {block_response:?}");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
+        ));
+        node2_to_node3_dialer.abort();
+        seed.shutdown().await;
+        node2.shutdown().await;
+        node3.shutdown().await;
+        Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    struct RequestRecorder {
+        tx: tokio::sync::mpsc::UnboundedSender<Request>,
+    }
+
+    impl Service<Request> for RequestRecorder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            match self.tx.send(request) {
+                Ok(()) => std::future::ready(Ok(Response::Nil)),
+                Err(error) => std::future::ready(Err(Box::new(error))),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockProvider {
+        block: Arc<Block>,
+        transaction: UnminedTx,
+    }
+
+    impl Service<Request> for BlockProvider {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            let response = match request {
+                Request::AdvertiseBlock(..) | Request::AdvertiseTransactionIds(..) => Response::Nil,
+                Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
+                Request::FindHeaders { .. } => Response::BlockHeaders(vec![block::CountedHeader {
+                    header: self.block.header.clone(),
+                }]),
+                Request::MempoolTransactionIds => {
+                    Response::TransactionIds(vec![self.transaction.id])
+                }
+                Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+                    Response::Blocks(
+                        hashes
+                            .into_iter()
+                            .map(|hash| {
+                                if hash == self.block.hash() {
+                                    InventoryResponse::Available((self.block.clone(), None))
+                                } else {
+                                    InventoryResponse::Missing(hash)
+                                }
+                            })
+                            .collect(),
+                    )
+                }
+                request => {
+                    return std::future::ready(Err(format!(
+                        "unexpected all-Zakura block-provider request: {request:?}"
+                    )
+                    .into()));
+                }
+            };
+            std::future::ready(Ok(response))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct LegacyDisabled;
+
+    impl Service<Request> for LegacyDisabled {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            std::future::ready(Err(format!(
+                "legacy path must be disabled in all-Zakura e2e, got {request:?}"
+            )
+            .into()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CombinedSink {
+        legacy: LegacyGossipSink,
+        echo: Arc<TestEchoStatusService>,
+    }
+
+    impl InboundSink for CombinedSink {
+        fn deliver(
+            &self,
+            peer_id: ZakuraPeerId,
+            stream_kind: u16,
+            frame: Frame,
+        ) -> Result<(), InboundSinkReject> {
+            if stream_kind == ZAKURA_STREAM_TEST_ECHO_STATUS {
+                self.echo.deliver(peer_id, stream_kind, frame)
+            } else {
+                self.legacy.deliver(peer_id, stream_kind, frame)
+            }
+        }
+
+        fn request<'a>(
+            &'a self,
+            peer_id: ZakuraPeerId,
+            stream_kind: u16,
+            request_id: u64,
+            max_frame_bytes: u32,
+            frame: Frame,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, InboundSinkReject>> + Send + 'a>>
+        {
+            if stream_kind == ZAKURA_STREAM_TEST_ECHO_STATUS {
+                self.echo
+                    .request(peer_id, stream_kind, request_id, max_frame_bytes, frame)
+            } else {
+                self.legacy
+                    .request(peer_id, stream_kind, request_id, max_frame_bytes, frame)
+            }
+        }
+    }
+
+    async fn legacy_recorder_node(
+        seed: u64,
+        discovery_config: ZakuraDiscoveryConfig,
+    ) -> Result<(ZakuraTestNode, UnboundedReceiver<Request>), BoxError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let node = ZakuraTestNode::builder(seed)
+            .discovery_config(discovery_config)
+            .inbound_sink_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(RequestRecorder { tx }, supervisor))
+            })
+            .spawn()
+            .await?;
+        Ok((node, rx))
+    }
+
+    async fn block_provider_echo_node(
+        seed: u64,
+        discovery_config: ZakuraDiscoveryConfig,
+        service: ZakuraServiceId,
+        echo: Arc<TestEchoStatusService>,
+        block: Arc<Block>,
+        transaction: UnminedTx,
+    ) -> Result<ZakuraTestNode, BoxError> {
+        let node = ZakuraTestNode::builder(seed)
+            .discovery_config(discovery_config)
+            .add_advertised_service(service)
+            .inbound_sink_from_supervisor(move |supervisor| {
+                Arc::new(CombinedSink {
+                    legacy: LegacyGossipSink::spawn(
+                        BlockProvider { block, transaction },
+                        supervisor,
+                    ),
+                    echo,
+                })
+            })
+            .spawn()
+            .await?;
+        Ok(node)
+    }
+
+    async fn node_id(node: &ZakuraTestNode) -> iroh::NodeId {
+        node.node_addr().await.node_id
+    }
+
+    fn peer_id_for(node_id: iroh::NodeId) -> ZakuraPeerId {
+        ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("iroh node ids are valid peer ids")
+    }
+
+    async fn registered_peers(node: &ZakuraTestNode) -> Vec<ZakuraPeerId> {
+        node.supervisor().registered_ids().await
+    }
+
+    async fn wait_for_registered_peer(
+        node: &ZakuraTestNode,
+        node_id: iroh::NodeId,
+    ) -> Result<(), BoxError> {
+        let peer_id = peer_id_for(node_id);
+        await_until("registered Zakura peer", Duration::from_secs(5), || {
+            node.supervisor().subscribe().borrow().contains(&peer_id)
+        })
+        .await
+        .map_err(|error| -> BoxError { Box::new(error) })
+    }
+
+    async fn wait_for_discovery_record(
+        node: &ZakuraTestNode,
+        node_id: iroh::NodeId,
+    ) -> Result<ZakuraNodeRecord, BoxError> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = node.discovery().record_for(node_id).await {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for discovery record".into() })
+    }
+
+    async fn recv_request(rx: &mut UnboundedReceiver<Request>) -> Result<Request, BoxError> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .map_err(|_| -> BoxError { "timed out waiting for request".into() })?
+            .ok_or_else(|| "request recorder closed".into())
+    }
+
+    fn empty_v5_transaction(byte: u8) -> Transaction {
+        Transaction::V5 {
+            network_upgrade: zebra_chain::parameters::NetworkUpgrade::Nu5,
+            lock_time: LockTime::min_lock_time_timestamp(),
+            expiry_height: block::Height(u32::from(byte)),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        }
     }
 }

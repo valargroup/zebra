@@ -1,13 +1,19 @@
 //! Raw peer harness for adversarial Zakura tests.
 
-use byteorder::{LittleEndian, WriteBytesExt};
-use iroh::endpoint::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use std::io::Cursor;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use iroh::{
+    endpoint::{Connection, Endpoint, RecvStream, SendStream, VarInt},
+    NodeId,
+};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
     zakura::{
-        run_native_initiator_handshake, Frame, StreamPrelude, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        run_native_initiator_handshake, DiscoveryMessage, Frame, StreamPrelude,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_LEGACY_REQUESTS,
     },
     BoxError, Config,
 };
@@ -50,6 +56,11 @@ impl HostilePeer {
         )?)
     }
 
+    /// Return this peer's authenticated Iroh node id.
+    pub fn node_id(&self) -> NodeId {
+        self.endpoint.node_id()
+    }
+
     /// Open one stream and send a valid prelude and frame.
     pub async fn send_frame(&self, stream_kind: u16, payload: Vec<u8>) -> Result<(), BoxError> {
         let (mut send, _recv) = self.connection.open_bi().await?;
@@ -63,6 +74,48 @@ impl HostilePeer {
             .await?;
         let _ = send.finish();
         Ok(())
+    }
+
+    /// Open one request-less discovery stream.
+    pub async fn open_discovery_stream(&self) -> Result<(SendStream, RecvStream), BoxError> {
+        let (mut send, recv) = self.connection.open_bi().await?;
+        self.write_prelude(&mut send, ZAKURA_STREAM_DISCOVERY)
+            .await?;
+        Ok((send, recv))
+    }
+
+    /// Write one discovery message frame on an already-open discovery stream.
+    pub async fn write_discovery_message(
+        &self,
+        send: &mut SendStream,
+        message: DiscoveryMessage,
+    ) -> Result<(), BoxError> {
+        let frame = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: message.encode()?,
+        };
+        send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+            .await?;
+        Ok(())
+    }
+
+    /// Read one discovery message frame from an already-open discovery stream.
+    pub async fn read_discovery_message(
+        &self,
+        recv: &mut RecvStream,
+    ) -> Result<DiscoveryMessage, BoxError> {
+        let mut header = vec![0; FRAME_HEADER_BYTES];
+        recv.read_exact(&mut header).await?;
+        let mut payload_len_reader = Cursor::new(&header[4..FRAME_HEADER_BYTES]);
+        let payload_len = payload_len_reader.read_u32::<LittleEndian>()?;
+        let payload_len =
+            usize::try_from(payload_len).expect("u32 payload length always fits usize");
+        let mut payload = vec![0; payload_len];
+        recv.read_exact(&mut payload).await?;
+        header.extend_from_slice(&payload);
+        let frame = Frame::decode(&header, self.limits.max_frame_bytes)?;
+        Ok(DiscoveryMessage::decode(&frame.payload)?)
     }
 
     /// Open one stream whose prelude names the given kind and version, then send
@@ -119,7 +172,7 @@ impl HostilePeer {
 
     /// Accept the next bidi stream opened by the victim and respond with raw frames.
     pub async fn respond_to_next_request(&self, frames: Vec<Frame>) -> Result<(), BoxError> {
-        let (mut send, _recv) = self.connection.accept_bi().await?;
+        let (mut send, _recv, _request_id) = self.accept_next_request_stream().await?;
         for frame in frames {
             send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
                 .await?;
@@ -133,11 +186,7 @@ impl HostilePeer {
         &self,
         build_frames: impl FnOnce(u64) -> Vec<Frame>,
     ) -> Result<(), BoxError> {
-        let (mut send, mut recv) = self.connection.accept_bi().await?;
-        let prelude = Self::read_prelude(&mut recv).await?;
-        let request_id = prelude
-            .request_id
-            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        let (mut send, _recv, request_id) = self.accept_next_request_stream().await?;
         for frame in build_frames(request_id) {
             send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
                 .await?;
@@ -148,11 +197,7 @@ impl HostilePeer {
 
     /// Accept the next request stream and keep the response side open.
     pub async fn accept_next_request_without_response(&mut self) -> Result<(), BoxError> {
-        let (send, mut recv) = self.connection.accept_bi().await?;
-        let prelude = Self::read_prelude(&mut recv).await?;
-        prelude
-            .request_id
-            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        let (send, _recv, _request_id) = self.accept_next_request_stream().await?;
         self.held_streams.push(send);
         Ok(())
     }
@@ -254,5 +299,18 @@ impl HostilePeer {
         recv.read_exact(&mut cap).await?;
         bytes.extend_from_slice(&cap);
         Ok(StreamPrelude::decode(&bytes)?)
+    }
+
+    async fn accept_next_request_stream(&self) -> Result<(SendStream, RecvStream, u64), BoxError> {
+        loop {
+            let (send, mut recv) = self.connection.accept_bi().await?;
+            let prelude = Self::read_prelude(&mut recv).await?;
+            if prelude.stream_kind == ZAKURA_STREAM_LEGACY_REQUESTS {
+                let request_id = prelude
+                    .request_id
+                    .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+                return Ok((send, recv, request_id));
+            }
+        }
     }
 }

@@ -14,6 +14,7 @@ use crate::{
     PeerSocketAddr,
 };
 
+mod discovery;
 mod handler;
 mod handshake;
 mod legacy_gossip;
@@ -21,6 +22,7 @@ mod legacy_gossip;
 pub mod testkit;
 mod trace;
 
+pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;
 pub use legacy_gossip::*;

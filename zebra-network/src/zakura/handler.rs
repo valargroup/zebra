@@ -1,7 +1,7 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     io::{Cursor, Read},
@@ -47,12 +47,16 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, Frame, StreamPrelude, ZakuraAcceptedLimits, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor,
-        ZakuraProtocolError, ZakuraRejectReason, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC,
-        CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_PROTOCOL_VERSION_1,
+        direct_endpoint_builder, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError, Frame,
+        StreamPrelude, ZakuraAcceptedLimits, ZakuraControlAck, ZakuraControlHello,
+        ZakuraControlRole, ZakuraControlValidation, ZakuraDiscoveryConfig,
+        ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraInitialLimits, ZakuraLimits,
+        ZakuraNodeRecord, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError,
+        ZakuraRejectReason, ZakuraServiceId, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC,
+        CONTROL_HELLO_MAGIC, CONTROL_VERSION, DEFAULT_DISCOVERY_CONNECTION_HEADROOM,
+        FRAME_HEADER_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_DISCOVERY,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -98,6 +102,8 @@ const ZAKURA_REDIAL_HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
 /// so the retry window stays within the liveness keeper's appear timeout
 /// (`ZAKURA_LIVENESS_APPEAR_TIMEOUT` in the parent module).
 const ZAKURA_UPGRADE_DIAL_ATTEMPTS: usize = 3;
+/// Poll interval for discovery-backed candidate dialing.
+const ZAKURA_DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Clock used by Zakura rate-limit logic.
 pub trait Clock: Clone + Send + Sync + 'static {
@@ -123,6 +129,8 @@ const STREAM_PRELUDE_CAP_BYTES: usize = 4;
 const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCOVERY_FRAME_MESSAGE_TYPE: u16 = 1;
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
 // below keep this transport-side budget validator pinned to the codec constants.
 const LEGACY_GOSSIP_STREAM_KIND: u16 = 2;
@@ -149,6 +157,15 @@ const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
 const LEGACY_INVENTORY_HASH_BYTES: usize = 36;
 const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
+#[cfg(any(test, feature = "zakura-testkit"))]
+/// Test-only native request stream for echo/status service routing coverage.
+pub const ZAKURA_STREAM_TEST_ECHO_STATUS: u16 = 5;
+#[cfg(any(test, feature = "zakura-testkit"))]
+/// Test-only echo/status request message type.
+pub const TEST_ECHO_STATUS_REQUEST: u16 = 1;
+#[cfg(any(test, feature = "zakura-testkit"))]
+/// Test-only echo/status response message type.
+pub const TEST_ECHO_STATUS_RESPONSE: u16 = 2;
 const _: () = assert!(LEGACY_GOSSIP_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_GOSSIP);
 const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
@@ -383,6 +400,7 @@ pub struct ZakuraConnectionLimits {
 pub struct ZakuraEndpoint {
     router: Router,
     supervisor: ZakuraSupervisorHandle,
+    discovery: Option<ZakuraDiscoveryHandle>,
     handler: ZakuraProtocolHandler,
 }
 
@@ -412,6 +430,11 @@ impl ZakuraEndpoint {
     /// Returns the active supervisor handle.
     pub fn supervisor(&self) -> ZakuraSupervisorHandle {
         self.supervisor.clone()
+    }
+
+    /// Returns the passive native discovery runtime handle, if enabled.
+    pub fn discovery(&self) -> Option<ZakuraDiscoveryHandle> {
+        self.discovery.clone()
     }
 
     /// Returns the endpoint's current direct node address.
@@ -447,10 +470,27 @@ impl ZakuraEndpoint {
         tokio::spawn(native_dial_supervised(endpoint, node_addr, limits, policy))
     }
 
+    fn has_native_admission_capacity(&self) -> bool {
+        self.handler.admission.available_permits() > 0
+    }
+
     /// Shut down the Router's ordered accept/handler lifecycle.
     pub async fn shutdown(&self) {
         self.supervisor.shutdown();
         let _ = self.router.shutdown().await;
+    }
+
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    /// Route a test-only echo/status request through service-aware candidate selection.
+    pub async fn request_test_echo_status(
+        &self,
+        service: &ZakuraServiceId,
+        payload: Vec<u8>,
+    ) -> Result<ZakuraTestServiceResponse, BoxError> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| -> BoxError {
+            "Zakura test echo/status routing requires discovery state".into()
+        })?;
+        request_test_echo_status_routed(&self.supervisor, discovery, service, payload).await
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
@@ -459,12 +499,28 @@ impl ZakuraEndpoint {
         supervisor: ZakuraSupervisorHandle,
         handler: ZakuraProtocolHandler,
     ) -> Self {
+        let discovery = handler.discovery.clone();
         Self {
             router,
             supervisor,
+            discovery,
             handler,
         }
     }
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+/// Outcome of a test-only service-aware echo/status request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZakuraTestServiceResponse {
+    /// Connected peer that answered the request.
+    pub responder: NodeId,
+    /// Response payload after the per-request id prefix is validated and stripped.
+    pub payload: Vec<u8>,
+    /// Whether the request was answered by the general-peer fallback path.
+    pub used_fallback: bool,
+    /// Service-advertising connected candidates that failed live request handling.
+    pub failed_service_candidates: Vec<NodeId>,
 }
 
 /// Shared supervisor handle for Zakura peer registration and outbound work.
@@ -477,6 +533,8 @@ pub struct ZakuraSupervisorHandle {
 }
 
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(any(test, feature = "zakura-testkit"))]
+static NEXT_TEST_SERVICE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct ZakuraSupervisorState {
@@ -705,6 +763,20 @@ impl ZakuraSupervisorHandle {
             ZakuraUpgradeOutcome::Duplicate { .. } => ZakuraRegistration::Duplicate { peer_id },
             ZakuraUpgradeOutcome::Rejected { reason } => ZakuraRegistration::Rejected(reason),
         }
+    }
+
+    async fn can_accept_remote_ip_with_in_flight(
+        &self,
+        remote_ip: IpAddr,
+        in_flight_count: usize,
+    ) -> bool {
+        let state = self.inner.lock().await;
+        let active_count = state
+            .active_by_ip
+            .get(&remote_ip)
+            .copied()
+            .unwrap_or_default();
+        active_count.saturating_add(in_flight_count) < state.max_connections_per_ip
     }
 
     async fn deregister(&self, peer_id: &ZakuraPeerId, remote_ip: Option<IpAddr>) {
@@ -956,6 +1028,7 @@ pub struct ZakuraProtocolHandler {
     handshake_config: ZakuraHandshakeConfig,
     limits: ZakuraLocalLimits,
     inbound_sink: Arc<dyn InboundSink>,
+    discovery: Option<ZakuraDiscoveryHandle>,
     trace: ZakuraTrace,
     next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
@@ -1003,10 +1076,30 @@ impl ZakuraProtocolHandler {
         inbound_sink: Arc<dyn InboundSink>,
         trace: ZakuraTrace,
     ) -> Self {
+        Self::new_with_sink_trace_and_discovery(
+            supervisor,
+            handshake_config,
+            limits,
+            inbound_sink,
+            trace,
+            None,
+        )
+    }
+
+    /// Create a handler with an injected inbound sink, trace emitter, and discovery state.
+    pub fn new_with_sink_trace_and_discovery(
+        supervisor: ZakuraSupervisorHandle,
+        handshake_config: ZakuraHandshakeConfig,
+        limits: ZakuraLocalLimits,
+        inbound_sink: Arc<dyn InboundSink>,
+        trace: ZakuraTrace,
+        discovery: Option<ZakuraDiscoveryHandle>,
+    ) -> Self {
         Self {
             supervisor,
             handshake_config,
             inbound_sink,
+            discovery,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
             next_stream_id: Arc::new(AtomicU64::new(1)),
@@ -1202,6 +1295,15 @@ impl ZakuraProtocolHandler {
             connection_token.clone(),
             self.inbound_sink.clone(),
         ));
+        if let Some(discovery) = self.discovery.clone() {
+            workers.spawn(discovery_exchange_loop(
+                connection.clone(),
+                peer_id.clone(),
+                limits,
+                connection_token.clone(),
+                discovery,
+            ));
+        }
 
         loop {
             tokio::select! {
@@ -1394,7 +1496,20 @@ impl ZakuraProtocolHandler {
             return;
         }
 
-        if prelude.stream_kind == LEGACY_REQUEST_STREAM_KIND && prelude.request_id.is_none() {
+        if prelude.stream_kind == ZAKURA_STREAM_DISCOVERY && prelude.request_id.is_some() {
+            debug!("rejecting Zakura discovery stream with request id");
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+            metrics::counter!("zakura.p2p.stream.rejected.discovery_request_id").increment(1);
+            admission.trace.emit(
+                STREAM_TABLE,
+                admission
+                    .event("rejected.discovery_request_id", stream_id)
+                    .stream_kind(stream_kind),
+            );
+            return;
+        }
+
+        if is_request_stream_kind(prelude.stream_kind) && prelude.request_id.is_none() {
             debug!("rejecting Zakura request stream without request id");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
             admission.connection_token.cancel();
@@ -1452,7 +1567,16 @@ impl ZakuraProtocolHandler {
             inbound_tx: admission.inbound_tx.clone(),
         };
 
-        if prelude.stream_kind == LEGACY_REQUEST_STREAM_KIND {
+        if prelude.stream_kind == ZAKURA_STREAM_DISCOVERY {
+            let Some(discovery) = self.discovery.clone() else {
+                debug!("rejecting Zakura discovery stream without local discovery state");
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+                return;
+            };
+            admission.workers.spawn(discovery_stream_worker(
+                send, recv, prelude, context, discovery,
+            ));
+        } else if is_request_stream_kind(prelude.stream_kind) {
             admission.workers.spawn(request_stream_worker(
                 send,
                 recv,
@@ -1563,6 +1687,7 @@ pub async fn spawn_zakura_endpoint(
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
+    let discovery_secret_key = secret_key.clone();
     let mut builder =
         direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
@@ -1574,6 +1699,30 @@ pub async fn spawn_zakura_endpoint(
     }
     let endpoint = builder.bind().await?;
     let supervisor = ZakuraSupervisorHandle::new(config.max_connections_per_ip);
+    let handshake_config = ZakuraHandshakeConfig::for_network(&config.network);
+    let bootstrap_peers = parse_bootstrap_peers(&config.zakura.bootstrap_peers);
+    let discovery = ZakuraDiscoveryHandle::new(
+        ZakuraDiscoveryLocalConfig {
+            secret_key: discovery_secret_key,
+            direct_addrs: config.zakura.listen_addr.into_iter().collect(),
+            services: default_advertised_services(),
+            zakura_protocol_min: handshake_config.zakura_protocol_min,
+            zakura_protocol_max: handshake_config.zakura_protocol_max,
+            network_id: handshake_config.network_id,
+            chain_id: handshake_config.chain_id,
+            last_authored_sequence: None,
+        },
+        ZakuraDiscoveryConfig {
+            max_zakura_connections: config.zakura.max_connections,
+            discovery_connection_headroom: effective_discovery_connection_headroom(
+                bootstrap_peers.len(),
+            ),
+            ..ZakuraDiscoveryConfig::default()
+        },
+        supervisor.subscribe(),
+    )?;
+    // Discovery cache persistence is intentionally deferred to the cache-file
+    // persistence slice; runtime state exposes import/snapshot hooks for it.
     // Build the inbound sink from the endpoint's supervisor so the adapter and
     // the supervisor share one first-seen cache (see ZakuraDualStackService).
     let inbound_sink = sink_factory(supervisor.clone());
@@ -1584,12 +1733,13 @@ pub async fn spawn_zakura_endpoint(
         .map(zebra_jsonl_trace::JsonlTracer::spawn)
         .unwrap_or_else(zebra_jsonl_trace::JsonlTracer::noop);
     let trace = ZakuraTrace::new(tracer, zebra_jsonl_trace::node_id());
-    let handler = ZakuraProtocolHandler::new_with_sink_and_trace(
+    let handler = ZakuraProtocolHandler::new_with_sink_trace_and_discovery(
         supervisor.clone(),
-        ZakuraHandshakeConfig::for_network(&config.network),
+        handshake_config,
         limits.clone(),
         inbound_sink,
         trace,
+        Some(discovery.clone()),
     );
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
@@ -1597,6 +1747,7 @@ pub async fn spawn_zakura_endpoint(
     let endpoint = ZakuraEndpoint {
         router,
         supervisor,
+        discovery: Some(discovery.clone()),
         handler,
     };
 
@@ -1618,17 +1769,15 @@ pub async fn spawn_zakura_endpoint(
         });
     }
 
-    spawn_native_bootstrap_dialer(
-        endpoint.clone(),
-        config.zakura.bootstrap_peers.clone(),
-        limits,
-    );
+    insert_static_bootstrap_candidates(&discovery, &bootstrap_peers).await;
+    spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone());
+    spawn_native_discovery_dialer(endpoint.clone(), limits);
     Ok(Some(endpoint))
 }
 
 fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
-    bootstrap_peers: Vec<String>,
+    bootstrap_peers: Vec<NodeAddr>,
     limits: ZakuraLocalLimits,
 ) {
     if bootstrap_peers.is_empty() {
@@ -1645,15 +1794,265 @@ fn spawn_native_bootstrap_dialer(
         DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
     );
 
-    for entry in bootstrap_peers {
+    for node_addr in bootstrap_peers {
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tokio::spawn(async move {
-            match parse_bootstrap_peer(&entry) {
-                Ok(node_addr) => native_dial_supervised(endpoint, node_addr, limits, policy).await,
-                Err(error) => warn!(?error, ?entry, "invalid Zakura bootstrap peer"),
-            }
+            native_dial_supervised(endpoint, node_addr, limits, policy).await;
         });
+    }
+}
+
+fn spawn_native_discovery_dialer(endpoint: ZakuraEndpoint, limits: ZakuraLocalLimits) {
+    let Some(discovery) = endpoint.discovery() else {
+        return;
+    };
+    tokio::spawn(run_native_discovery_dialer(endpoint, discovery, limits));
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DiscoveryDialResult {
+    Registered,
+    Failed,
+    LocalResourceLimit,
+}
+
+#[derive(Debug)]
+struct DiscoveryDialWorkerResult {
+    node_id: NodeId,
+    reserved_ips: Vec<IpAddr>,
+    result: DiscoveryDialResult,
+}
+
+pub(crate) async fn run_native_discovery_dialer(
+    endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
+    limits: ZakuraLocalLimits,
+) {
+    let mut registered = endpoint.supervisor().subscribe();
+    let mut in_flight = HashSet::new();
+    let mut in_flight_by_ip = HashMap::new();
+    let mut workers = JoinSet::new();
+
+    loop {
+        spawn_discovery_dial_candidates(
+            &endpoint,
+            &discovery,
+            &limits,
+            &mut in_flight,
+            &mut in_flight_by_ip,
+            &mut workers,
+        )
+        .await;
+
+        tokio::select! {
+            joined = workers.join_next(), if !workers.is_empty() => {
+                match joined {
+                    Some(Ok(worker_result)) => {
+                        in_flight.remove(&worker_result.node_id);
+                        release_discovery_in_flight_ips(
+                            &mut in_flight_by_ip,
+                            &worker_result.reserved_ips,
+                        );
+                        apply_discovery_dial_result(
+                            &discovery,
+                            &worker_result.node_id,
+                            worker_result.result,
+                        ).await;
+                    }
+                    Some(Err(error)) => {
+                        debug!(?error, "Zakura discovery dial worker failed");
+                        metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
+                    }
+                    None => {}
+                }
+            }
+            changed = registered.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
+        }
+    }
+}
+
+async fn spawn_discovery_dial_candidates(
+    endpoint: &ZakuraEndpoint,
+    discovery: &ZakuraDiscoveryHandle,
+    limits: &ZakuraLocalLimits,
+    in_flight: &mut HashSet<NodeId>,
+    in_flight_by_ip: &mut HashMap<IpAddr, usize>,
+    workers: &mut JoinSet<DiscoveryDialWorkerResult>,
+) {
+    if !endpoint.has_native_admission_capacity() {
+        return;
+    }
+
+    let in_flight_node_ids: Vec<_> = in_flight.iter().copied().collect();
+    for candidate in discovery.dial_candidates(&[], &in_flight_node_ids).await {
+        if !endpoint.has_native_admission_capacity() {
+            return;
+        }
+        let Some((node_addr, reserved_ips)) =
+            discovery_node_addr_with_reserved_ip_capacity(endpoint, &candidate, in_flight_by_ip)
+                .await
+        else {
+            continue;
+        };
+        let node_id = candidate.node_id;
+        if !in_flight.insert(node_id) {
+            continue;
+        }
+        reserve_discovery_in_flight_ips(in_flight_by_ip, &reserved_ips);
+
+        discovery.mark_dial_attempt(&node_id).await;
+        metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
+        workers.spawn(run_discovery_dial_once(
+            endpoint.clone(),
+            node_addr,
+            limits.clone(),
+            node_id,
+            reserved_ips,
+        ));
+    }
+}
+
+async fn discovery_node_addr_with_reserved_ip_capacity(
+    endpoint: &ZakuraEndpoint,
+    candidate: &ZakuraDiscoveryDialCandidate,
+    in_flight_by_ip: &HashMap<IpAddr, usize>,
+) -> Option<(NodeAddr, Vec<IpAddr>)> {
+    let mut direct_addrs = Vec::new();
+    let mut reserved_ips = Vec::new();
+    for addr in &candidate.direct_addrs {
+        if can_accept_discovery_dial_ip(endpoint, addr.ip(), in_flight_by_ip).await {
+            if !reserved_ips.contains(&addr.ip()) {
+                reserved_ips.push(addr.ip());
+            }
+            direct_addrs.push(*addr);
+        }
+    }
+
+    (!direct_addrs.is_empty()).then(|| {
+        (
+            NodeAddr::new(candidate.node_id).with_direct_addresses(direct_addrs),
+            reserved_ips,
+        )
+    })
+}
+
+async fn can_accept_discovery_dial_ip(
+    endpoint: &ZakuraEndpoint,
+    remote_ip: IpAddr,
+    in_flight_by_ip: &HashMap<IpAddr, usize>,
+) -> bool {
+    let in_flight = in_flight_by_ip.get(&remote_ip).copied().unwrap_or_default();
+    endpoint
+        .supervisor()
+        .can_accept_remote_ip_with_in_flight(remote_ip, in_flight)
+        .await
+}
+
+fn reserve_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>, ips: &[IpAddr]) {
+    for ip in ips {
+        *in_flight_by_ip.entry(*ip).or_default() += 1;
+    }
+}
+
+fn release_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>, ips: &[IpAddr]) {
+    for ip in ips {
+        let Some(count) = in_flight_by_ip.get_mut(ip) else {
+            continue;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            in_flight_by_ip.remove(ip);
+        }
+    }
+}
+
+async fn run_discovery_dial_once(
+    endpoint: ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: ZakuraLocalLimits,
+    node_id: NodeId,
+    reserved_ips: Vec<IpAddr>,
+) -> DiscoveryDialWorkerResult {
+    let Ok(peer_id) = ZakuraPeerId::new(node_id.as_bytes().to_vec()) else {
+        return DiscoveryDialWorkerResult {
+            node_id,
+            reserved_ips,
+            result: DiscoveryDialResult::Failed,
+        };
+    };
+    let mut registered = endpoint.supervisor().subscribe();
+    let dial = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { native_bootstrap_dial(&endpoint, node_addr, &limits).await }
+    });
+    tokio::pin!(dial);
+
+    let result = loop {
+        if registered
+            .borrow_and_update()
+            .iter()
+            .any(|id| id == &peer_id)
+        {
+            break DiscoveryDialResult::Registered;
+        }
+
+        tokio::select! {
+            dial_result = &mut dial => {
+                break match dial_result {
+                    // `native_bootstrap_dial` returns `Ok(())` only after the connection
+                    // finishes; discovery success is the peer appearing in the registration watch.
+                    Ok(Ok(())) => DiscoveryDialResult::Failed,
+                    Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => {
+                        DiscoveryDialResult::LocalResourceLimit
+                    }
+                    Ok(Err(error)) => {
+                        debug!(?error, "Zakura discovery dial failed");
+                        DiscoveryDialResult::Failed
+                    }
+                    Err(error) => {
+                        debug!(?error, "Zakura discovery dial task failed");
+                        DiscoveryDialResult::Failed
+                    }
+                };
+            }
+            changed = registered.changed() => {
+                if changed.is_err() {
+                    break DiscoveryDialResult::Failed;
+                }
+            }
+        }
+    };
+
+    DiscoveryDialWorkerResult {
+        node_id,
+        reserved_ips,
+        result,
+    }
+}
+
+async fn apply_discovery_dial_result(
+    discovery: &ZakuraDiscoveryHandle,
+    node_id: &NodeId,
+    result: DiscoveryDialResult,
+) {
+    match result {
+        DiscoveryDialResult::Registered => {
+            discovery.mark_dial_success(node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
+        }
+        DiscoveryDialResult::Failed => {
+            discovery.mark_dial_failure(node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.failed").increment(1);
+        }
+        DiscoveryDialResult::LocalResourceLimit => {
+            metrics::counter!("zakura.p2p.discovery.dial.local_resource_limit").increment(1);
+        }
     }
 }
 
@@ -2096,6 +2495,536 @@ async fn request_stream_worker(
     let _ = send.finish();
 }
 
+async fn discovery_exchange_loop(
+    connection: Connection,
+    peer_id: ZakuraPeerId,
+    limits: ZakuraConnectionLimits,
+    connection_token: CancellationToken,
+    discovery: ZakuraDiscoveryHandle,
+) {
+    let refresh_interval = discovery
+        .refresh_interval()
+        .await
+        .max(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            biased;
+            _ = connection_token.cancelled() => return,
+            result = run_outbound_discovery_exchange(&connection, &peer_id, limits, &discovery) => {
+                if let Err(error) = result {
+                    debug!(?peer_id, ?error, "Zakura discovery exchange failed");
+                    metrics::counter!("zakura.p2p.discovery.exchange.failed").increment(1);
+                }
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = connection_token.cancelled() => return,
+            _ = tokio::time::sleep(refresh_interval) => {}
+        }
+    }
+}
+
+async fn run_outbound_discovery_exchange(
+    connection: &Connection,
+    peer_id: &ZakuraPeerId,
+    limits: ZakuraConnectionLimits,
+    discovery: &ZakuraDiscoveryHandle,
+) -> Result<(), BoxError> {
+    let peer_node_id = peer_node_id(peer_id).ok_or_else(|| -> BoxError {
+        "authenticated Zakura peer id is not an iroh node id".into()
+    })?;
+    let (mut send, mut recv) = timeout(DISCOVERY_EXCHANGE_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| -> BoxError { "Zakura discovery stream open timed out".into() })??;
+    write_stream_prelude(
+        &mut send,
+        ZAKURA_STREAM_DISCOVERY,
+        None,
+        limits.max_frame_bytes,
+        DISCOVERY_EXCHANGE_TIMEOUT,
+    )
+    .await?;
+
+    write_discovery_message(
+        &mut send,
+        DiscoveryMessage::Hello {
+            record: discovery.current_self_record().as_ref().clone(),
+        },
+        limits.max_frame_bytes,
+    )
+    .await?;
+
+    let peer_hello = read_discovery_message(&mut recv, limits).await?;
+    let peer_record = discovery_hello_record(peer_hello, peer_node_id)?;
+    if let Err(error) = import_discovery_self_record(discovery, peer_record, peer_node_id).await {
+        if is_advisory_self_record_import_error(&error) {
+            debug!(
+                ?peer_node_id,
+                ?error,
+                "ignoring unhelpful Zakura discovery peer hello record"
+            );
+        } else {
+            return Err(Box::new(error));
+        }
+    }
+
+    let limit = discovery
+        .peer_sample_limit()
+        .await
+        .min(super::MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+    let exclude_node_ids = discovery.peer_sample_exclusions().await;
+    write_discovery_message(
+        &mut send,
+        DiscoveryMessage::GetPeers {
+            limit: u16::try_from(limit).expect("discovery sample limit fits in u16"),
+            wanted_services: Vec::new(),
+            exclude_node_ids,
+        },
+        limits.max_frame_bytes,
+    )
+    .await?;
+    let _ = send.finish();
+
+    match read_discovery_message(&mut recv, limits).await? {
+        DiscoveryMessage::Peers { records } => {
+            discovery
+                .import_peer_records(records, Some(peer_node_id))
+                .await;
+            Ok(())
+        }
+        message => Err(format!("unexpected discovery response: {message:?}").into()),
+    }
+}
+
+async fn discovery_stream_worker(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    prelude: StreamPrelude,
+    context: StreamWorkerContext,
+    discovery: ZakuraDiscoveryHandle,
+) {
+    let Some(peer_node_id) = peer_node_id(&context.peer_id) else {
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+        return;
+    };
+    let response_frame_cap = context.limits.max_frame_bytes.min(prelude.max_frame_bytes);
+
+    let message = match read_admitted_discovery_message(&mut recv, &context).await {
+        Ok(message) => message,
+        Err(ZakuraHandlerError::Closed) => return,
+        Err(error) => {
+            debug!(
+                ?peer_node_id,
+                ?error,
+                "closing Zakura discovery stream with invalid first message"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+            return;
+        }
+    };
+
+    let record = match discovery_hello_record(message, peer_node_id) {
+        Ok(record) => record,
+        Err(error) => {
+            debug!(
+                ?peer_node_id,
+                ?error,
+                "closing Zakura discovery stream whose first message was not a valid peer hello"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+            return;
+        }
+    };
+    if let Err(error) = import_discovery_self_record(&discovery, record, peer_node_id).await {
+        if is_advisory_self_record_import_error(&error) {
+            debug!(
+                ?peer_node_id,
+                ?error,
+                "ignoring unhelpful Zakura discovery peer hello record"
+            );
+        } else {
+            debug!(
+                ?peer_node_id,
+                ?error,
+                "closing Zakura discovery stream with invalid peer hello"
+            );
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+            return;
+        }
+    }
+
+    if let Err(error) = write_discovery_message(
+        &mut send,
+        DiscoveryMessage::Hello {
+            record: discovery.current_self_record().as_ref().clone(),
+        },
+        response_frame_cap,
+    )
+    .await
+    {
+        debug!(?error, "failed to write Zakura discovery hello response");
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+        return;
+    }
+
+    let mut accepted_followup_hello = false;
+    let mut imported_peer_batch = false;
+    loop {
+        let message = match read_admitted_discovery_message(&mut recv, &context).await {
+            Ok(message) => message,
+            Err(ZakuraHandlerError::Closed) => break,
+            Err(error) => {
+                debug!(
+                    ?peer_node_id,
+                    ?error,
+                    "closing Zakura discovery stream with invalid message"
+                );
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                break;
+            }
+        };
+
+        match message {
+            DiscoveryMessage::Hello { record } => {
+                if accepted_followup_hello {
+                    debug!(
+                        ?peer_node_id,
+                        "closing Zakura discovery stream after extra peer hello"
+                    );
+                    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                    break;
+                }
+                if record.body.node_id == peer_node_id {
+                    if let Err(error) =
+                        import_discovery_self_record(&discovery, record, peer_node_id).await
+                    {
+                        if is_advisory_self_record_import_error(&error) {
+                            debug!(
+                                ?peer_node_id,
+                                ?error,
+                                "ignoring unhelpful Zakura discovery peer hello record"
+                            );
+                        } else {
+                            debug!(
+                                ?peer_node_id,
+                                ?error,
+                                "closing Zakura discovery stream with invalid peer hello"
+                            );
+                            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                            break;
+                        }
+                    }
+                    accepted_followup_hello = true;
+                } else {
+                    debug!(
+                        ?peer_node_id,
+                        "closing Zakura discovery stream with mismatched hello author"
+                    );
+                    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                    break;
+                }
+            }
+            DiscoveryMessage::GetPeers {
+                limit,
+                wanted_services,
+                exclude_node_ids,
+            } => {
+                let records = discovery
+                    .sample_peers(usize::from(limit), &wanted_services, &exclude_node_ids)
+                    .await;
+                if let Err(error) = write_discovery_message(
+                    &mut send,
+                    DiscoveryMessage::Peers { records },
+                    response_frame_cap,
+                )
+                .await
+                {
+                    debug!(?error, "failed to write Zakura discovery peer sample");
+                    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                } else {
+                    let _ = send.finish();
+                }
+                break;
+            }
+            DiscoveryMessage::Peers { records } => {
+                if imported_peer_batch {
+                    debug!(
+                        ?peer_node_id,
+                        "closing Zakura discovery stream after extra peer-record batch"
+                    );
+                    let _ = send.finish();
+                    break;
+                }
+                discovery
+                    .import_peer_records(records, Some(peer_node_id))
+                    .await;
+                imported_peer_batch = true;
+            }
+            DiscoveryMessage::GetServices { .. } | DiscoveryMessage::Services { .. } => {
+                debug!(
+                    ?peer_node_id,
+                    "closing Zakura discovery stream with unsupported service-discovery message"
+                );
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                break;
+            }
+        }
+    }
+}
+
+async fn read_admitted_discovery_message(
+    recv: &mut RecvStream,
+    context: &StreamWorkerContext,
+) -> Result<DiscoveryMessage, ZakuraHandlerError> {
+    let frame = read_frame(
+        recv,
+        context.limits.max_frame_bytes,
+        context.limits.idle_timeout,
+    )
+    .await?;
+    let _ = context.freshness_tx.send(Instant::now());
+    match admit_inbound_message(frame.payload.len(), context, ZAKURA_STREAM_DISCOVERY) {
+        InboundMessageAdmission::Admit => {}
+        InboundMessageAdmission::Oversize => return Err(ZakuraHandlerError::Oversize),
+        InboundMessageAdmission::Throttled => {
+            return Err(ZakuraHandlerError::ResourceLimit("discovery message rate"))
+        }
+    }
+    decode_discovery_frame(frame).map_err(ZakuraHandlerError::Discovery)
+}
+
+async fn read_discovery_message(
+    recv: &mut RecvStream,
+    limits: ZakuraConnectionLimits,
+) -> Result<DiscoveryMessage, BoxError> {
+    let frame = timeout(
+        DISCOVERY_EXCHANGE_TIMEOUT,
+        read_frame(recv, limits.max_frame_bytes, limits.idle_timeout),
+    )
+    .await
+    .map_err(|_| -> BoxError { "Zakura discovery frame read timed out".into() })??;
+    decode_discovery_frame(frame)
+}
+
+fn decode_discovery_frame(frame: Frame) -> Result<DiscoveryMessage, BoxError> {
+    if frame.message_type != DISCOVERY_FRAME_MESSAGE_TYPE {
+        return Err("Zakura discovery frame used unexpected message type".into());
+    }
+    if frame.flags != 0 {
+        return Err("Zakura discovery frame used non-zero flags".into());
+    }
+    Ok(DiscoveryMessage::decode(&frame.payload)?)
+}
+
+async fn write_discovery_message(
+    send: &mut SendStream,
+    message: DiscoveryMessage,
+    max_frame_bytes: u32,
+) -> Result<(), BoxError> {
+    let frame = Frame {
+        message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
+        flags: 0,
+        payload: message.encode()?,
+    };
+    let bytes = frame.encode(max_frame_bytes)?;
+    timeout(DISCOVERY_EXCHANGE_TIMEOUT, send.write_all(&bytes))
+        .await
+        .map_err(|_| -> BoxError { "Zakura discovery frame write timed out".into() })??;
+    Ok(())
+}
+
+async fn write_stream_prelude(
+    send: &mut SendStream,
+    stream_kind: u16,
+    request_id: Option<u64>,
+    max_frame_bytes: u32,
+    write_timeout: Duration,
+) -> Result<(), BoxError> {
+    let prelude = StreamPrelude {
+        magic: STREAM_PRELUDE_MAGIC,
+        stream_kind,
+        stream_version: ZAKURA_STREAM_VERSION_1,
+        request_id,
+        max_frame_bytes,
+    };
+    let bytes = prelude.encode()?;
+    timeout(write_timeout, send.write_all(&bytes))
+        .await
+        .map_err(|_| -> BoxError { "Zakura stream prelude write timed out".into() })??;
+    Ok(())
+}
+
+fn discovery_hello_record(
+    message: DiscoveryMessage,
+    peer_node_id: NodeId,
+) -> Result<ZakuraNodeRecord, BoxError> {
+    let DiscoveryMessage::Hello { record } = message else {
+        return Err("Zakura discovery stream expected hello".into());
+    };
+    if record.body.node_id != peer_node_id {
+        return Err("Zakura discovery hello author did not match authenticated peer".into());
+    }
+    Ok(record)
+}
+
+async fn import_discovery_self_record(
+    discovery: &ZakuraDiscoveryHandle,
+    record: ZakuraNodeRecord,
+    peer_node_id: NodeId,
+) -> Result<(), DiscoveryBookError> {
+    discovery
+        .import_connected_peer_record(record, peer_node_id)
+        .await
+        .map(|_| ())
+}
+
+fn is_advisory_self_record_import_error(error: &DiscoveryBookError) -> bool {
+    matches!(
+        error,
+        DiscoveryBookError::NoUsableDirectAddress
+            | DiscoveryBookError::NonDialableDirectAddress { .. }
+            | DiscoveryBookError::Record(
+                DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry
+            )
+    )
+}
+
+fn peer_node_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
+    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+async fn request_test_echo_status_routed(
+    supervisor: &ZakuraSupervisorHandle,
+    discovery: &ZakuraDiscoveryHandle,
+    service: &ZakuraServiceId,
+    payload: Vec<u8>,
+) -> Result<ZakuraTestServiceResponse, BoxError> {
+    // Live request routing can only use already-connected service advertisers.
+    // Discovery dial candidates and helper-level fallback are reserved for a
+    // future dialer-backed router; this path falls back over connected peers.
+    let candidates = discovery.service_candidates(service, false, &[]).await;
+    let handles = supervisor.outbound_peer_handles().await;
+    let mut failed_service_candidates = Vec::new();
+
+    for node_id in candidates.connected {
+        let Some(handle) = select_handle_for_node_id(&handles, node_id) else {
+            failed_service_candidates.push(node_id);
+            continue;
+        };
+
+        match request_test_echo_status_one(handle, payload.clone()).await {
+            Ok(payload) => {
+                return Ok(ZakuraTestServiceResponse {
+                    responder: node_id,
+                    payload,
+                    used_fallback: false,
+                    failed_service_candidates,
+                });
+            }
+            Err(error) => {
+                debug!(
+                    ?node_id,
+                    ?error,
+                    "Zakura test service candidate failed live request; falling back"
+                );
+                failed_service_candidates.push(node_id);
+            }
+        }
+    }
+
+    for handle in handles {
+        let Some(node_id) = peer_node_id(handle.peer_id()) else {
+            continue;
+        };
+        if failed_service_candidates.contains(&node_id) {
+            continue;
+        }
+
+        if let Ok(payload) = request_test_echo_status_one(handle, payload.clone()).await {
+            return Ok(ZakuraTestServiceResponse {
+                responder: node_id,
+                payload,
+                used_fallback: true,
+                failed_service_candidates,
+            });
+        }
+    }
+
+    Err("no ready Zakura peer answered the test echo/status request".into())
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+fn select_handle_for_node_id(
+    handles: &[ZakuraPeerHandle],
+    node_id: NodeId,
+) -> Option<ZakuraPeerHandle> {
+    handles
+        .iter()
+        .find(|handle| peer_node_id(handle.peer_id()) == Some(node_id))
+        .cloned()
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+async fn request_test_echo_status_one(
+    handle: ZakuraPeerHandle,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, BoxError> {
+    let request_id = NEXT_TEST_SERVICE_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let frames = timeout(
+        OUTBOUND_REQUEST_RESPONSE_TIMEOUT,
+        handle.request(
+            ZAKURA_STREAM_TEST_ECHO_STATUS,
+            request_id,
+            TEST_ECHO_STATUS_REQUEST,
+            0,
+            payload,
+        ),
+    )
+    .await
+    .map_err(|_| -> BoxError {
+        format!(
+            "Zakura test echo/status request timed out for peer {:?}",
+            handle.peer_id()
+        )
+        .into()
+    })??;
+
+    let [frame] = frames.as_slice() else {
+        return Err("test echo/status response returned an unexpected frame count".into());
+    };
+    let (_, payload) = test_echo_status_response_payload(&frame.payload)
+        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+    Ok(payload.to_vec())
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+/// Prefix a test-only echo/status response with the request id for bounded validation.
+pub fn encode_test_echo_status_response_payload(request_id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut response = Vec::with_capacity(LEGACY_RESPONSE_REQUEST_ID_BYTES + payload.len());
+    response.extend_from_slice(&request_id.to_le_bytes());
+    response.extend_from_slice(payload);
+    response
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+fn test_echo_status_response_payload(payload: &[u8]) -> Result<(u64, &[u8]), OutboundRequestError> {
+    if payload.len() < LEGACY_RESPONSE_REQUEST_ID_BYTES {
+        return Err(OutboundRequestError::Fatal(
+            "truncated test echo/status response id".into(),
+        ));
+    }
+    let mut id = [0; LEGACY_RESPONSE_REQUEST_ID_BYTES];
+    id.copy_from_slice(&payload[..LEGACY_RESPONSE_REQUEST_ID_BYTES]);
+    Ok((
+        u64::from_le_bytes(id),
+        &payload[LEGACY_RESPONSE_REQUEST_ID_BYTES..],
+    ))
+}
+
 async fn inbound_message_sink(
     mut inbound_rx: mpsc::Receiver<ZakuraInboundMessage>,
     connection_token: CancellationToken,
@@ -2335,7 +3264,13 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    let mut state = OutboundResponseReadState::from_request(
+        stream_kind,
+        request_id,
+        message_type,
+        &payload,
+        limits,
+    )?;
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -2372,11 +3307,10 @@ async fn write_outbound_request_frame_inner(
     let _ = send.finish();
 
     let mut frames = Vec::new();
-    let mut state = LegacyResponseReadState::new(budget);
     loop {
         match read_frame(&mut recv, limits.max_frame_bytes, limits.idle_timeout).await {
             Ok(frame) => {
-                state.validate_frame(request_id, &frame)?;
+                state.validate_frame(&frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
@@ -2402,6 +3336,140 @@ async fn write_outbound_request_frame_inner(
 enum OutboundRequestError {
     Local(BoxError),
     Fatal(BoxError),
+}
+
+#[derive(Debug)]
+enum OutboundResponseReadState {
+    Legacy {
+        request_id: u64,
+        state: LegacyResponseReadState,
+    },
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    TestEchoStatus(TestEchoStatusResponseReadState),
+}
+
+impl OutboundResponseReadState {
+    fn from_request(
+        stream_kind: u16,
+        request_id: u64,
+        message_type: u16,
+        payload: &[u8],
+        limits: ZakuraConnectionLimits,
+    ) -> Result<Self, OutboundRequestError> {
+        match stream_kind {
+            LEGACY_REQUEST_STREAM_KIND => Ok(Self::Legacy {
+                request_id,
+                state: LegacyResponseReadState::new(LegacyResponseBudget::from_request(
+                    message_type,
+                    payload,
+                    limits,
+                )?),
+            }),
+            #[cfg(any(test, feature = "zakura-testkit"))]
+            ZAKURA_STREAM_TEST_ECHO_STATUS => Ok(Self::TestEchoStatus(
+                TestEchoStatusResponseReadState::new(request_id, message_type, limits)?,
+            )),
+            _ => Err(OutboundRequestError::Local(
+                format!("unsupported Zakura request stream kind: {stream_kind}").into(),
+            )),
+        }
+    }
+
+    fn validate_frame(&mut self, frame: &Frame) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy { request_id, state } => state.validate_frame(*request_id, frame),
+            #[cfg(any(test, feature = "zakura-testkit"))]
+            Self::TestEchoStatus(state) => state.validate_frame(frame),
+        }
+    }
+
+    fn finish(self) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy { state, .. } => state.finish(),
+            #[cfg(any(test, feature = "zakura-testkit"))]
+            Self::TestEchoStatus(state) => state.finish(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+#[derive(Debug)]
+struct TestEchoStatusResponseReadState {
+    request_id: u64,
+    frames: usize,
+    max_message_bytes: usize,
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+impl TestEchoStatusResponseReadState {
+    fn new(
+        request_id: u64,
+        message_type: u16,
+        limits: ZakuraConnectionLimits,
+    ) -> Result<Self, OutboundRequestError> {
+        if message_type != TEST_ECHO_STATUS_REQUEST {
+            return Err(OutboundRequestError::Local(
+                format!("unsupported test echo/status request type: {message_type}").into(),
+            ));
+        }
+
+        let max_message_bytes = usize::try_from(limits.max_message_bytes)
+            .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
+        Ok(Self {
+            request_id,
+            frames: 0,
+            max_message_bytes,
+        })
+    }
+
+    fn validate_frame(&mut self, frame: &Frame) -> Result<(), OutboundRequestError> {
+        if self.frames != 0 {
+            return Err(OutboundRequestError::Fatal(
+                "test echo/status response sent too many frames".into(),
+            ));
+        }
+        self.frames += 1;
+
+        if frame.message_type != TEST_ECHO_STATUS_RESPONSE {
+            return Err(OutboundRequestError::Fatal(
+                format!(
+                    "test echo/status response used wrong message type: {}",
+                    frame.message_type
+                )
+                .into(),
+            ));
+        }
+        if frame.flags != 0 {
+            return Err(OutboundRequestError::Fatal(
+                "test echo/status response used non-zero flags".into(),
+            ));
+        }
+        if frame.payload.len() > self.max_message_bytes {
+            return Err(OutboundRequestError::Fatal(
+                "test echo/status response exceeded message byte cap".into(),
+            ));
+        }
+        let (response_id, _) = test_echo_status_response_payload(&frame.payload)?;
+        if response_id != self.request_id {
+            return Err(OutboundRequestError::Fatal(
+                format!(
+                    "wrong test echo/status response request id: expected {}, got {}",
+                    self.request_id, response_id
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), OutboundRequestError> {
+        if self.frames == 0 {
+            return Err(OutboundRequestError::Fatal(
+                "test echo/status response sent no frames".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2923,6 +3991,47 @@ fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandlerError> {
     Ok(NodeAddr::new(node_id).with_direct_addresses([direct_addr]))
 }
 
+fn parse_bootstrap_peers(entries: &[String]) -> Vec<NodeAddr> {
+    entries
+        .iter()
+        .filter_map(|entry| match parse_bootstrap_peer(entry) {
+            Ok(node_addr) => Some(node_addr),
+            Err(error) => {
+                warn!(?error, ?entry, "invalid Zakura bootstrap peer");
+                None
+            }
+        })
+        .collect()
+}
+
+fn effective_discovery_connection_headroom(bootstrap_peer_count: usize) -> usize {
+    DEFAULT_DISCOVERY_CONNECTION_HEADROOM.max(bootstrap_peer_count)
+}
+
+async fn insert_static_bootstrap_candidates(
+    discovery: &ZakuraDiscoveryHandle,
+    bootstrap_peers: &[NodeAddr],
+) {
+    for node_addr in bootstrap_peers {
+        if let Err(error) = discovery.insert_static_candidate(node_addr.clone()).await {
+            warn!(
+                ?error,
+                ?node_addr,
+                "invalid Zakura static bootstrap discovery candidate"
+            );
+        }
+    }
+}
+
+fn default_advertised_services() -> Vec<ZakuraServiceId> {
+    vec![
+        ZakuraServiceId::discovery(),
+        ZakuraServiceId::legacy_gossip(),
+        ZakuraServiceId::legacy_requests(),
+        ZakuraServiceId::service_discovery(),
+    ]
+}
+
 fn validate_idle_invariant(limits: &ZakuraLocalLimits) -> Result<(), ZakuraHandlerError> {
     if limits.keep_alive_interval >= limits.quic_idle_timeout {
         return Err(ZakuraHandlerError::InvalidLocalLimits);
@@ -2948,6 +4057,9 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         1 => "request",
         LEGACY_GOSSIP_STREAM_KIND => "gossip",
         LEGACY_REQUEST_STREAM_KIND => "legacy_request",
+        ZAKURA_STREAM_DISCOVERY => "discovery",
+        #[cfg(any(test, feature = "zakura-testkit"))]
+        ZAKURA_STREAM_TEST_ECHO_STATUS => "test_echo_status",
         _ => "unknown",
     }
 }
@@ -2964,8 +4076,25 @@ const ZAKURA_STREAM_VERSION_1: u16 = 1;
 /// this in one place means [`stream_kind_label`] (used for metrics/trace) and
 /// admission agree on what "known" means.
 fn is_supported_stream(stream_kind: u16, stream_version: u16) -> bool {
-    let known_kind = stream_kind <= LEGACY_REQUEST_STREAM_KIND;
+    let known_kind = stream_kind <= LEGACY_REQUEST_STREAM_KIND
+        || stream_kind == ZAKURA_STREAM_DISCOVERY
+        || is_test_service_stream_kind(stream_kind);
     known_kind && stream_version == ZAKURA_STREAM_VERSION_1
+}
+
+fn is_request_stream_kind(stream_kind: u16) -> bool {
+    stream_kind == LEGACY_REQUEST_STREAM_KIND || is_test_service_stream_kind(stream_kind)
+}
+
+fn is_test_service_stream_kind(_stream_kind: u16) -> bool {
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    {
+        _stream_kind == ZAKURA_STREAM_TEST_ECHO_STATUS
+    }
+    #[cfg(not(any(test, feature = "zakura-testkit")))]
+    {
+        false
+    }
 }
 
 /// One message-rate [`TokenBucket`] shared by every stream worker serving the
@@ -3102,6 +4231,9 @@ pub enum ZakuraHandlerError {
     /// Zakura validation error.
     #[error(transparent)]
     Validation(#[from] super::ZakuraValidationError),
+    /// Zakura discovery exchange error.
+    #[error("Zakura discovery exchange failed: {0}")]
+    Discovery(#[source] BoxError),
     /// I/O error while encoding or decoding local buffers.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -3113,6 +4245,17 @@ mod tests {
     use crate::{
         protocol::internal::{InventoryResponse, Response},
         zakura::legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
+        zakura::testkit::{
+            await_until, HostilePeer, LocalEndpointFactory, TestEchoStatusService, ZakuraTestNode,
+            TEST_ECHO_STATUS_SERVICE_ID,
+        },
+        zakura::{DiscoveryWireError, ZakuraDiscoveryPersistedEntry},
+    };
+    use std::{
+        collections::HashSet,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
     };
     use zebra_chain::{
         block::{self, Block},
@@ -3162,10 +4305,16 @@ mod tests {
 
     #[test]
     fn supported_stream_accepts_known_kinds_at_version_one_only() {
-        // FLUP-015: the prelude is peer-controlled. Only the known kinds
-        // (control=0, request=1, gossip=2, legacy_request=3) at version 1 are
+        // FLUP-015: the prelude is peer-controlled. Only known kinds at version 1 are
         // served; everything else is rejected before admission.
-        for kind in [0u16, 1, 2, 3] {
+        for kind in [
+            0u16,
+            1,
+            2,
+            3,
+            ZAKURA_STREAM_DISCOVERY,
+            ZAKURA_STREAM_TEST_ECHO_STATUS,
+        ] {
             assert!(
                 is_supported_stream(kind, ZAKURA_STREAM_VERSION_1),
                 "known kind {kind} at version 1 must be supported"
@@ -3180,13 +4329,1047 @@ mod tests {
             );
         }
 
-        for kind in [4u16, 7, 255, u16::MAX] {
+        assert_eq!(stream_kind_label(ZAKURA_STREAM_DISCOVERY), "discovery");
+        assert_eq!(
+            stream_kind_label(ZAKURA_STREAM_TEST_ECHO_STATUS),
+            "test_echo_status"
+        );
+
+        for kind in [7u16, 255, u16::MAX] {
             assert!(
                 !is_supported_stream(kind, ZAKURA_STREAM_VERSION_1),
                 "unknown kind {kind} must be rejected even at version 1"
             );
             assert_eq!(stream_kind_label(kind), "unknown");
         }
+    }
+
+    #[test]
+    fn test_echo_status_response_validator_accepts_one_matching_frame() -> Result<(), BoxError> {
+        let request_id = 42;
+        let mut state = TestEchoStatusResponseReadState::new(
+            request_id,
+            TEST_ECHO_STATUS_REQUEST,
+            test_connection_limits(),
+        )
+        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        let frame = test_echo_status_response_frame(request_id, b"ok");
+
+        state
+            .validate_frame(&frame)
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        state
+            .finish()
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        assert_eq!(
+            test_echo_status_response_payload(&frame.payload)
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?,
+            (request_id, b"ok".as_slice())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_echo_status_response_validator_rejects_malformed_frames() {
+        let request_id = 42;
+        let valid_frame = test_echo_status_response_frame(request_id, b"ok");
+
+        let mut two_frame_state = test_echo_status_response_state(request_id);
+        assert!(two_frame_state.validate_frame(&valid_frame).is_ok());
+        assert!(two_frame_state.validate_frame(&valid_frame).is_err());
+
+        let mut wrong_type = valid_frame.clone();
+        wrong_type.message_type = TEST_ECHO_STATUS_REQUEST;
+        assert!(test_echo_status_response_state(request_id)
+            .validate_frame(&wrong_type)
+            .is_err());
+
+        let mut non_zero_flags = valid_frame.clone();
+        non_zero_flags.flags = 1;
+        assert!(test_echo_status_response_state(request_id)
+            .validate_frame(&non_zero_flags)
+            .is_err());
+
+        let mut oversized_limits = test_connection_limits();
+        oversized_limits.max_message_bytes =
+            u32::try_from(LEGACY_RESPONSE_REQUEST_ID_BYTES).expect("request id length fits in u32");
+        let oversized = test_echo_status_response_frame(request_id, b"x");
+        let mut oversized_state = TestEchoStatusResponseReadState::new(
+            request_id,
+            TEST_ECHO_STATUS_REQUEST,
+            oversized_limits,
+        )
+        .expect("test limits fit in usize");
+        assert!(oversized_state.validate_frame(&oversized).is_err());
+
+        let wrong_id = test_echo_status_response_frame(request_id + 1, b"ok");
+        assert!(test_echo_status_response_state(request_id)
+            .validate_frame(&wrong_id)
+            .is_err());
+
+        let truncated_id = Frame {
+            message_type: TEST_ECHO_STATUS_RESPONSE,
+            flags: 0,
+            payload: vec![0; LEGACY_RESPONSE_REQUEST_ID_BYTES - 1],
+        };
+        assert!(test_echo_status_response_state(request_id)
+            .validate_frame(&truncated_id)
+            .is_err());
+        assert!(test_echo_status_response_payload(&truncated_id.payload).is_err());
+
+        assert!(test_echo_status_response_state(request_id)
+            .finish()
+            .is_err());
+    }
+
+    async fn wait_for_discovery_record(
+        node: &ZakuraTestNode,
+        node_id: NodeId,
+    ) -> Result<ZakuraNodeRecord, BoxError> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = node.discovery().record_for(node_id).await {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for discovery record".into() })
+    }
+
+    async fn node_id(node: &ZakuraTestNode) -> NodeId {
+        node.node_addr().await.node_id
+    }
+
+    fn test_record_body(node_id: NodeId) -> crate::zakura::ZakuraNodeRecordBody {
+        test_record_body_with_addrs(
+            node_id,
+            1,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250)),
+                28_233,
+            )],
+        )
+    }
+
+    fn test_record_body_with_addrs(
+        node_id: NodeId,
+        sequence: u64,
+        direct_addrs: Vec<SocketAddr>,
+    ) -> crate::zakura::ZakuraNodeRecordBody {
+        let config = ZakuraHandshakeConfig::for_network(&Config::default().network);
+        let expires_at_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test system clock is after Unix epoch")
+            .as_secs()
+            .saturating_add(3600);
+        crate::zakura::ZakuraNodeRecordBody {
+            node_id,
+            direct_addrs,
+            services: vec![ZakuraServiceId::discovery()],
+            zakura_protocol_min: config.zakura_protocol_min,
+            zakura_protocol_max: config.zakura_protocol_max,
+            network_id: config.network_id,
+            chain_id: config.chain_id,
+            sequence,
+            expires_at_unix_secs,
+        }
+    }
+
+    fn signed_test_record(
+        seed: u64,
+        sequence: u64,
+        direct_addrs: Vec<SocketAddr>,
+    ) -> Result<ZakuraNodeRecord, DiscoveryWireError> {
+        let secret = LocalEndpointFactory::secret_key(seed);
+        ZakuraNodeRecord::sign(
+            test_record_body_with_addrs(secret.public(), sequence, direct_addrs),
+            &secret,
+        )
+    }
+
+    fn dead_routable_addr(index: u8) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, index.max(1))),
+            28_000 + u16::from(index),
+        )
+    }
+
+    fn peer_id_for(node_id: NodeId) -> ZakuraPeerId {
+        ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("iroh node ids are valid peer ids")
+    }
+
+    fn test_echo_status_service_id() -> ZakuraServiceId {
+        ZakuraServiceId::new(TEST_ECHO_STATUS_SERVICE_ID)
+            .expect("test echo/status service id is valid")
+    }
+
+    async fn wait_for_registered_peer(
+        node: &ZakuraTestNode,
+        node_id: NodeId,
+    ) -> Result<(), BoxError> {
+        let peer_id = peer_id_for(node_id);
+        let mut registered = node.supervisor().subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registered.borrow_and_update().contains(&peer_id) {
+                    return Ok(());
+                }
+                registered.changed().await.map_err(|_| -> BoxError {
+                    "peer-set watcher closed before expected registration".into()
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for peer registration".into() })?
+    }
+
+    async fn wait_for_registered_count_at_least(
+        node: &ZakuraTestNode,
+        count: usize,
+    ) -> Result<(), BoxError> {
+        let mut registered = node.supervisor().subscribe();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if registered.borrow_and_update().len() >= count {
+                    return Ok(());
+                }
+                registered.changed().await.map_err(|_| -> BoxError {
+                    "peer-set watcher closed before expected count".into()
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for peer count".into() })?
+    }
+
+    async fn wait_for_discovery_attempt(
+        discovery: &ZakuraDiscoveryHandle,
+        node_id: NodeId,
+    ) -> Result<ZakuraDiscoveryPersistedEntry, BoxError> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = discovery
+                    .persisted_entries()
+                    .await
+                    .into_iter()
+                    .find(|entry| entry.record.body.node_id == node_id)
+                    .filter(|entry| entry.last_dial_attempt.is_some())
+                {
+                    return entry;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for discovery dial attempt".into() })
+    }
+
+    fn spawn_wired_discovery_dialer(node: &ZakuraTestNode) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(run_native_discovery_dialer(
+            node.endpoint(),
+            node.discovery(),
+            node.limits().clone(),
+        ))
+    }
+
+    async fn insert_static_candidate(
+        node: &ZakuraTestNode,
+        peer: &ZakuraTestNode,
+    ) -> Result<NodeId, BoxError> {
+        let node_addr = peer.node_addr().await;
+        let node_id = node_addr.node_id;
+        node.discovery().insert_static_candidate(node_addr).await?;
+        Ok(node_id)
+    }
+
+    async fn import_static_loopback_record(
+        node: &ZakuraTestNode,
+        peer: &ZakuraTestNode,
+        sequence: u64,
+    ) -> Result<NodeId, BoxError> {
+        let node_addr = peer.node_addr().await;
+        let direct_addrs = node_addr.direct_addresses().copied().collect();
+        let record = signed_test_record(peer.seed(), sequence, direct_addrs)?;
+        let node_id = record.body.node_id;
+        node.discovery().import_static_record(record).await?;
+        Ok(node_id)
+    }
+
+    #[tokio::test]
+    async fn discovery_exchange_imports_connected_self_records() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(301).spawn().await?;
+        let node_b = ZakuraTestNode::builder(302).spawn().await?;
+        let node_a_id = node_id(&node_a).await;
+        let node_b_id = node_id(&node_b).await;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+
+        let b_on_a = wait_for_discovery_record(&node_a, node_b_id).await?;
+        let a_on_b = wait_for_discovery_record(&node_b, node_a_id).await?;
+        assert_eq!(b_on_a.body.node_id, node_b_id);
+        assert_eq!(a_on_b.body.node_id, node_a_id);
+        assert_eq!(
+            node_a.discovery().active_services(node_b_id).await,
+            Some(b_on_a.body.services)
+        );
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_exchange_imports_third_party_peer_sample() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(311).spawn().await?;
+        let node_b = ZakuraTestNode::builder(312).spawn().await?;
+        let node_c = ZakuraTestNode::builder(313).spawn().await?;
+        let node_c_id = node_id(&node_c).await;
+
+        node_b
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_b, node_c_id).await?;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let c_on_a = wait_for_discovery_record(&node_a, node_c_id).await?;
+
+        assert_eq!(c_on_a.body.node_id, node_c_id);
+        assert_eq!(node_a.supervisor().registered_ids().await.len(), 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_service_advertised_by_one_node_is_discovered_and_called() -> Result<(), BoxError>
+    {
+        let _guard = zebra_test::init();
+        let service = test_echo_status_service_id();
+        let echo = Arc::new(TestEchoStatusService::accepting());
+        let node_a = ZakuraTestNode::builder(501).spawn().await?;
+        let node_b = ZakuraTestNode::builder(502)
+            .add_advertised_service(service.clone())
+            .inbound_sink(echo.clone())
+            .spawn()
+            .await?;
+        let node_b_id = node_id(&node_b).await;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+
+        let response = node_a
+            .request_test_echo_status(&service, b"zakura-echo".to_vec())
+            .await?;
+
+        assert_eq!(response.responder, node_b_id);
+        assert_eq!(response.payload, b"zakura-echo");
+        assert!(!response.used_fallback);
+        assert!(response.failed_service_candidates.is_empty());
+        assert_eq!(echo.call_count(), 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_service_live_request_failure_falls_back_to_general_peer() -> Result<(), BoxError>
+    {
+        let _guard = zebra_test::init();
+        let service = test_echo_status_service_id();
+        let rejecting = Arc::new(TestEchoStatusService::rejecting());
+        let fallback = Arc::new(TestEchoStatusService::accepting());
+        let node_a = ZakuraTestNode::builder(511).spawn().await?;
+        let node_b = ZakuraTestNode::builder(512)
+            .add_advertised_service(service.clone())
+            .inbound_sink(rejecting.clone())
+            .spawn()
+            .await?;
+        let node_c = ZakuraTestNode::builder(513)
+            .inbound_sink(fallback.clone())
+            .spawn()
+            .await?;
+        let node_b_id = node_id(&node_b).await;
+        let node_c_id = node_id(&node_c).await;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        node_a
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+
+        let response = node_a
+            .request_test_echo_status(&service, b"fallback".to_vec())
+            .await?;
+
+        assert_eq!(response.responder, node_c_id);
+        assert_eq!(response.payload, b"fallback");
+        assert!(response.used_fallback);
+        assert_eq!(response.failed_service_candidates, vec![node_b_id]);
+        assert_eq!(rejecting.call_count(), 1);
+        assert_eq!(fallback.call_count(), 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_service_advertising_peer_is_preferred_for_matching_request(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let service = test_echo_status_service_id();
+        let preferred = Arc::new(TestEchoStatusService::accepting());
+        let fallback = Arc::new(TestEchoStatusService::accepting());
+        let node_a = ZakuraTestNode::builder(521).spawn().await?;
+        let node_b = ZakuraTestNode::builder(522)
+            .add_advertised_service(service.clone())
+            .inbound_sink(preferred.clone())
+            .spawn()
+            .await?;
+        let node_c = ZakuraTestNode::builder(523)
+            .inbound_sink(fallback.clone())
+            .spawn()
+            .await?;
+        let node_b_id = node_id(&node_b).await;
+
+        node_a
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+
+        let response = node_a
+            .request_test_echo_status(&service, b"preferred".to_vec())
+            .await?;
+
+        assert_eq!(response.responder, node_b_id);
+        assert_eq!(response.payload, b"preferred");
+        assert!(!response.used_fallback);
+        assert_eq!(preferred.call_count(), 1);
+        assert_eq!(fallback.call_count(), 0);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wired_discovery_dialer_connects_static_test_candidate() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(371)
+            .discovery_config(ZakuraDiscoveryConfig {
+                discovery_connection_headroom: 0,
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(372).spawn().await?;
+        let node_b_id = insert_static_candidate(&node_a, &node_b).await?;
+        let discovery_loop = spawn_wired_discovery_dialer(&node_a);
+
+        wait_for_registered_peer(&node_a, node_b_id).await?;
+
+        discovery_loop.abort();
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wired_discovery_dialer_connects_peer_learned_through_seed() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(381)
+            .discovery_config(ZakuraDiscoveryConfig {
+                discovery_connection_headroom: 0,
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(382).spawn().await?;
+        let node_c = ZakuraTestNode::builder(383).spawn().await?;
+        let node_c_id = node_id(&node_c).await;
+
+        node_b
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_b, node_c_id).await?;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let c_on_a = wait_for_discovery_record(&node_a, node_c_id).await?;
+        let trusted_c_id =
+            import_static_loopback_record(&node_a, &node_c, c_on_a.body.sequence + 1).await?;
+        let discovery_loop = spawn_wired_discovery_dialer(&node_a);
+
+        wait_for_registered_peer(&node_a, trusted_c_id).await?;
+
+        discovery_loop.abort();
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wired_discovery_dialer_preserves_bootstrap_headroom_under_discovered_flood(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 5;
+        limits.max_pending_handshakes = 8;
+        limits.max_open_streams = 16;
+        limits.max_inbound_queue_depth = 64;
+        let bootstrap_count = 2;
+        let headroom = effective_discovery_connection_headroom(bootstrap_count);
+        let discovery_config = ZakuraDiscoveryConfig {
+            discovery_connection_headroom: headroom,
+            max_concurrent_discovery_dials: 4,
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let node_a = ZakuraTestNode::builder(391)
+            .limits(limits.clone())
+            .discovery_config(discovery_config)
+            .spawn()
+            .await?;
+        let bootstrap_b = ZakuraTestNode::builder(392).spawn().await?;
+        let bootstrap_c = ZakuraTestNode::builder(393).spawn().await?;
+        let discovered_d = ZakuraTestNode::builder(394).spawn().await?;
+        let discovered_e = ZakuraTestNode::builder(395).spawn().await?;
+        let bootstrap_b_id = node_id(&bootstrap_b).await;
+        let bootstrap_peers = vec![bootstrap_b.node_addr().await, bootstrap_c.node_addr().await];
+
+        node_a
+            .connect_native(&bootstrap_b, Duration::from_secs(5))
+            .await?;
+        node_a
+            .connect_native(&bootstrap_c, Duration::from_secs(5))
+            .await?;
+        insert_static_bootstrap_candidates(&node_a.discovery(), &bootstrap_peers).await;
+        spawn_native_bootstrap_dialer(node_a.endpoint(), bootstrap_peers, limits.clone());
+        let discovery_loop = spawn_wired_discovery_dialer(&node_a);
+        let _ = import_static_loopback_record(&node_a, &discovered_d, 1).await?;
+        let _ = import_static_loopback_record(&node_a, &discovered_e, 1).await?;
+
+        for index in 1..=32 {
+            let record = signed_test_record(
+                10_000 + u64::from(index),
+                1,
+                vec![dead_routable_addr(index)],
+            )?;
+            node_a
+                .discovery()
+                .import_peer_record(record, Some(node_id(&bootstrap_b).await))
+                .await?;
+        }
+        wait_for_registered_peer(&node_a, bootstrap_b_id).await?;
+        wait_for_registered_count_at_least(&node_a, limits.max_connections - headroom).await?;
+
+        node_a
+            .supervisor()
+            .deregister(
+                &peer_id_for(bootstrap_b_id),
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            )
+            .await;
+        await_until("bootstrap peer drops", Duration::from_secs(5), || {
+            !node_a
+                .supervisor()
+                .subscribe()
+                .borrow()
+                .contains(&peer_id_for(bootstrap_b_id))
+        })
+        .await?;
+
+        wait_for_registered_peer(&node_a, bootstrap_b_id).await?;
+        assert!(
+            node_a.supervisor().registered_ids().await.len() <= node_a.limits().max_connections,
+            "discovery and bootstrap dials must not exceed max_connections"
+        );
+
+        discovery_loop.abort();
+        node_a.shutdown().await;
+        bootstrap_b.shutdown().await;
+        bootstrap_c.shutdown().await;
+        discovered_d.shutdown().await;
+        discovered_e.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combined_native_dialers_respect_max_connections() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 3;
+        limits.max_pending_handshakes = 8;
+        limits.max_open_streams = 16;
+        limits.max_inbound_queue_depth = 64;
+        let node_a = ZakuraTestNode::builder(401)
+            .limits(limits.clone())
+            .discovery_config(ZakuraDiscoveryConfig {
+                discovery_connection_headroom: 0,
+                max_concurrent_discovery_dials: 4,
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let peers = [
+            ZakuraTestNode::builder(402).spawn().await?,
+            ZakuraTestNode::builder(403).spawn().await?,
+            ZakuraTestNode::builder(404).spawn().await?,
+            ZakuraTestNode::builder(405).spawn().await?,
+            ZakuraTestNode::builder(406).spawn().await?,
+        ];
+        let bootstrap_peers = vec![peers[0].node_addr().await, peers[1].node_addr().await];
+        spawn_native_bootstrap_dialer(node_a.endpoint(), bootstrap_peers, limits.clone());
+        let discovery_loop = spawn_wired_discovery_dialer(&node_a);
+        for peer in &peers[2..] {
+            insert_static_candidate(&node_a, peer).await?;
+        }
+        let upgrade_like = node_a
+            .endpoint()
+            .spawn_native_dial(peers[4].node_addr().await);
+
+        wait_for_registered_count_at_least(&node_a, node_a.limits().max_connections).await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            node_a.supervisor().registered_ids().await.len() <= node_a.limits().max_connections,
+            "combined bootstrap, upgrade, and discovery dialers exceeded max_connections"
+        );
+
+        discovery_loop.abort();
+        upgrade_like.abort();
+        node_a.shutdown().await;
+        for peer in peers {
+            peer.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dead_discovered_address_backs_off_and_releases_dial_capacity() -> Result<(), BoxError>
+    {
+        let _guard = zebra_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 1;
+        limits.control_timeout = Duration::from_millis(150);
+        let node = ZakuraTestNode::builder(411)
+            .limits(limits)
+            .discovery_config(ZakuraDiscoveryConfig {
+                discovery_connection_headroom: 0,
+                max_concurrent_discovery_dials: 1,
+                dial_backoff_base: Duration::from_secs(60),
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let first = signed_test_record(412, 1, vec![dead_routable_addr(12)])?;
+        let first_id = first.body.node_id;
+        let second = signed_test_record(413, 1, vec![dead_routable_addr(12)])?;
+        let second_id = second.body.node_id;
+        node.discovery().import_peer_record(first, None).await?;
+        node.discovery().import_peer_record(second, None).await?;
+        let discovery_loop = spawn_wired_discovery_dialer(&node);
+
+        let first_entry = wait_for_discovery_attempt(&node.discovery(), first_id).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node
+                    .discovery()
+                    .persisted_entries()
+                    .await
+                    .into_iter()
+                    .any(|entry| entry.record.body.node_id == first_id && entry.failure_count > 0)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for first dead candidate failure".into() })?;
+        let second_entry = wait_for_discovery_attempt(&node.discovery(), second_id).await?;
+
+        assert!(first_entry.last_dial_attempt.is_some());
+        assert!(second_entry.last_dial_attempt.is_some());
+        assert_eq!(node.supervisor().registered_ids().await.len(), 0);
+
+        discovery_loop.abort();
+        node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wired_discovery_dialer_filters_connected_local_and_caps_stampede(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 16;
+        limits.control_timeout = Duration::from_secs(2);
+        let node_a = ZakuraTestNode::builder(421)
+            .limits(limits)
+            .discovery_config(ZakuraDiscoveryConfig {
+                discovery_connection_headroom: 0,
+                max_concurrent_discovery_dials: 2,
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(422).spawn().await?;
+        let node_b_id = node_id(&node_b).await;
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+
+        for index in 1..=16 {
+            let record = signed_test_record(
+                20_000 + u64::from(index),
+                1,
+                vec![dead_routable_addr(index)],
+            )?;
+            node_a.discovery().import_peer_record(record, None).await?;
+        }
+        let discovery_loop = spawn_wired_discovery_dialer(&node_a);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let attempted = node_a
+            .discovery()
+            .persisted_entries()
+            .await
+            .into_iter()
+            .filter(|entry| entry.last_dial_attempt.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            attempted.len() <= 2,
+            "wired dial loop started {} dials with max_concurrent_discovery_dials=2",
+            attempted.len()
+        );
+        assert!(
+            node_a
+                .discovery()
+                .record_for(node_id(&node_a).await)
+                .await
+                .is_none(),
+            "local node record must not be dialable"
+        );
+        let b_entry = node_a
+            .discovery()
+            .persisted_entries()
+            .await
+            .into_iter()
+            .find(|entry| entry.record.body.node_id == node_b_id);
+        assert!(
+            b_entry.is_none_or(|entry| entry.last_dial_attempt.is_none()),
+            "already-connected peer must not be dialed by discovery"
+        );
+
+        discovery_loop.abort();
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_exchange_continues_after_addressless_self_record() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(315)
+            .discovery_direct_addrs(Vec::new())
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(316).spawn().await?;
+        let node_c = ZakuraTestNode::builder(317).spawn().await?;
+        let node_c_id = node_id(&node_c).await;
+
+        node_b
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_b, node_c_id).await?;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let c_on_a = wait_for_discovery_record(&node_a, node_c_id).await?;
+
+        assert_eq!(c_on_a.body.node_id, node_c_id);
+        assert!(node_b
+            .discovery()
+            .record_for(node_id(&node_a).await)
+            .await
+            .is_none());
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_get_peers_response_is_capped_by_responder_limit() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(321).spawn().await?;
+        let node_b = ZakuraTestNode::builder(322)
+            .discovery_config(ZakuraDiscoveryConfig {
+                peer_sample_limit: 1,
+                ..ZakuraDiscoveryConfig::default()
+            })
+            .spawn()
+            .await?;
+        let node_c = ZakuraTestNode::builder(323).spawn().await?;
+        let node_d = ZakuraTestNode::builder(324).spawn().await?;
+        let node_c_id = node_id(&node_c).await;
+        let node_d_id = node_id(&node_d).await;
+
+        node_b
+            .connect_native(&node_c, Duration::from_secs(5))
+            .await?;
+        node_b
+            .connect_native(&node_d, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_b, node_c_id).await?;
+        let _ = wait_for_discovery_record(&node_b, node_d_id).await?;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let imported = [
+                    node_a.discovery().record_for(node_c_id).await,
+                    node_a.discovery().record_for(node_d_id).await,
+                ]
+                .into_iter()
+                .flatten()
+                .count();
+                if imported == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for capped discovery sample".into() })?;
+
+        let imported: HashSet<_> = [
+            node_a.discovery().record_for(node_c_id).await,
+            node_a.discovery().record_for(node_d_id).await,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|record| record.body.node_id)
+        .collect();
+        assert_eq!(imported.len(), 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        node_c.shutdown().await;
+        node_d.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_discovery_streams_on_one_connection_are_harmless() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node_a = ZakuraTestNode::builder(331).spawn().await?;
+        let node_b = ZakuraTestNode::builder(332).spawn().await?;
+        let node_a_id = node_id(&node_a).await;
+        let node_b_id = node_id(&node_b).await;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+        let _ = wait_for_discovery_record(&node_b, node_a_id).await?;
+        assert_eq!(node_a.supervisor().registered_ids().await.len(), 1);
+        assert_eq!(node_b.supervisor().registered_ids().await.len(), 1);
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_refresh_task_exits_after_deregistration() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let discovery_config = ZakuraDiscoveryConfig {
+            refresh_interval: Duration::from_millis(50),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let node_a = ZakuraTestNode::builder(335)
+            .discovery_config(discovery_config.clone())
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(336)
+            .discovery_config(discovery_config)
+            .spawn()
+            .await?;
+        let node_b_id = node_id(&node_b).await;
+
+        node_a
+            .connect_native(&node_b, Duration::from_secs(5))
+            .await?;
+        let _ = wait_for_discovery_record(&node_a, node_b_id).await?;
+
+        node_b.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node_a.supervisor().registered_ids().await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError {
+            "timed out waiting for discovery refresh task deregistration".into()
+        })?;
+
+        node_a.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_discovery_hello_signature_does_not_poison_book() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node = ZakuraTestNode::builder(341).spawn().await?;
+        let hostile = HostilePeer::connect_native(&node, 342).await?;
+        let hostile_id = hostile.node_id();
+        let other_secret = SecretKey::generate(OsRng);
+        let mut record =
+            ZakuraNodeRecord::sign(test_record_body(other_secret.public()), &other_secret)?;
+        record.body.node_id = hostile_id;
+
+        hostile
+            .send_frame(
+                ZAKURA_STREAM_DISCOVERY,
+                DiscoveryMessage::Hello { record }.encode()?,
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(node.discovery().record_for(hostile_id).await.is_none());
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn addressless_discovery_hello_still_gets_peer_sample_answer() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node = ZakuraTestNode::builder(351).spawn().await?;
+        let hostile_seed = 352;
+        let hostile = HostilePeer::connect_native(&node, hostile_seed).await?;
+        let hostile_secret = LocalEndpointFactory::secret_key(hostile_seed);
+        let mut body = test_record_body(hostile.node_id());
+        body.direct_addrs.clear();
+        let record = ZakuraNodeRecord::sign(body, &hostile_secret)?;
+
+        let (mut send, mut recv) = hostile.open_discovery_stream().await?;
+        hostile
+            .write_discovery_message(&mut send, DiscoveryMessage::Hello { record })
+            .await?;
+
+        match hostile.read_discovery_message(&mut recv).await? {
+            DiscoveryMessage::Hello { .. } => {}
+            message => return Err(format!("unexpected discovery response: {message:?}").into()),
+        }
+
+        hostile
+            .write_discovery_message(
+                &mut send,
+                DiscoveryMessage::GetPeers {
+                    limit: 0,
+                    wanted_services: Vec::new(),
+                    exclude_node_ids: Vec::new(),
+                },
+            )
+            .await?;
+
+        match hostile.read_discovery_message(&mut recv).await? {
+            DiscoveryMessage::Peers { records } => assert!(records.is_empty()),
+            message => return Err(format!("unexpected discovery response: {message:?}").into()),
+        }
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_discovery_stream_imports_only_one_peer_batch() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node = ZakuraTestNode::builder(353).spawn().await?;
+        let hostile_seed = 354;
+        let hostile = HostilePeer::connect_native(&node, hostile_seed).await?;
+        let hostile_secret = LocalEndpointFactory::secret_key(hostile_seed);
+        let hostile_record =
+            ZakuraNodeRecord::sign(test_record_body(hostile.node_id()), &hostile_secret)?;
+        let first_secret = LocalEndpointFactory::secret_key(355);
+        let first_record =
+            ZakuraNodeRecord::sign(test_record_body(first_secret.public()), &first_secret)?;
+        let first_id = first_record.body.node_id;
+        let second_secret = LocalEndpointFactory::secret_key(356);
+        let second_record =
+            ZakuraNodeRecord::sign(test_record_body(second_secret.public()), &second_secret)?;
+        let second_id = second_record.body.node_id;
+
+        let (mut send, mut recv) = hostile.open_discovery_stream().await?;
+        hostile
+            .write_discovery_message(
+                &mut send,
+                DiscoveryMessage::Hello {
+                    record: hostile_record,
+                },
+            )
+            .await?;
+        let _ = hostile.read_discovery_message(&mut recv).await?;
+        hostile
+            .write_discovery_message(
+                &mut send,
+                DiscoveryMessage::Peers {
+                    records: vec![first_record],
+                },
+            )
+            .await?;
+        let _ = wait_for_discovery_record(&node, first_id).await?;
+
+        hostile
+            .write_discovery_message(
+                &mut send,
+                DiscoveryMessage::Peers {
+                    records: vec![second_record],
+                },
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(node.discovery().record_for(second_id).await.is_none());
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(())
     }
 
     #[test]
@@ -3299,6 +5482,23 @@ mod tests {
             .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
 
         Ok(())
+    }
+
+    fn test_echo_status_response_state(request_id: u64) -> TestEchoStatusResponseReadState {
+        TestEchoStatusResponseReadState::new(
+            request_id,
+            TEST_ECHO_STATUS_REQUEST,
+            test_connection_limits(),
+        )
+        .expect("test connection limits fit in usize")
+    }
+
+    fn test_echo_status_response_frame(request_id: u64, payload: &[u8]) -> Frame {
+        Frame {
+            message_type: TEST_ECHO_STATUS_RESPONSE,
+            flags: 0,
+            payload: encode_test_echo_status_response_payload(request_id, payload),
+        }
     }
 
     fn test_connection_limits() -> ZakuraConnectionLimits {
@@ -3436,6 +5636,151 @@ mod tests {
     fn bootstrap_peer_requires_node_id_and_direct_address() {
         assert!(parse_bootstrap_peer("missing-address").is_err());
         assert!(parse_bootstrap_peer("not-a-node@127.0.0.1:8233").is_err());
+    }
+
+    #[test]
+    fn bootstrap_peer_parser_keeps_valid_entries_and_drops_invalid_entries() {
+        let node_id = SecretKey::generate(OsRng).public();
+        let valid = format!("{node_id}@127.0.0.1:8233");
+        let parsed = parse_bootstrap_peers(&[valid, "missing-address".to_string()]);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].node_id, node_id);
+    }
+
+    #[tokio::test]
+    async fn discovery_dial_result_updates_failure_metadata_without_penalizing_local_limits() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let local_secret = SecretKey::generate(OsRng);
+        let peer_secret = SecretKey::generate(OsRng);
+        let handshake_config = ZakuraHandshakeConfig::for_network(&Config::default().network);
+        let discovery = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: local_secret,
+                direct_addrs: vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                    8233,
+                )],
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake_config.zakura_protocol_min,
+                zakura_protocol_max: handshake_config.zakura_protocol_max,
+                network_id: handshake_config.network_id,
+                chain_id: handshake_config.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )
+        .expect("discovery state constructs");
+        let record = ZakuraNodeRecord::sign(
+            crate::zakura::ZakuraNodeRecordBody {
+                node_id: peer_secret.public(),
+                direct_addrs: vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                    8233,
+                )],
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake_config.zakura_protocol_min,
+                zakura_protocol_max: handshake_config.zakura_protocol_max,
+                network_id: handshake_config.network_id,
+                chain_id: handshake_config.chain_id,
+                sequence: 1,
+                expires_at_unix_secs: crate::zakura::DEFAULT_DISCOVERY_RECORD_TTL.as_secs()
+                    + SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("test system clock is after the Unix epoch")
+                        .as_secs(),
+            },
+            &peer_secret,
+        )
+        .expect("peer record signs");
+        let node_id = record.body.node_id;
+        discovery
+            .import_peer_record(record, Some(SecretKey::generate(OsRng).public()))
+            .await
+            .expect("peer record imports");
+
+        apply_discovery_dial_result(
+            &discovery,
+            &node_id,
+            DiscoveryDialResult::LocalResourceLimit,
+        )
+        .await;
+        let entry = discovery
+            .persisted_entries()
+            .await
+            .pop()
+            .expect("entry remains after local limit");
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.last_success, None);
+
+        apply_discovery_dial_result(&discovery, &node_id, DiscoveryDialResult::Failed).await;
+        let entry = discovery
+            .persisted_entries()
+            .await
+            .pop()
+            .expect("entry remains after failure");
+        assert_eq!(entry.failure_count, 1);
+
+        apply_discovery_dial_result(&discovery, &node_id, DiscoveryDialResult::Registered).await;
+        let entry = discovery
+            .persisted_entries()
+            .await
+            .pop()
+            .expect("entry remains after success");
+        assert_eq!(entry.failure_count, 0);
+        assert!(entry.last_success.is_some());
+    }
+
+    #[test]
+    fn discovery_headroom_reserves_at_least_bootstrap_peer_count() {
+        assert_eq!(
+            effective_discovery_connection_headroom(0),
+            DEFAULT_DISCOVERY_CONNECTION_HEADROOM
+        );
+        assert_eq!(
+            effective_discovery_connection_headroom(DEFAULT_DISCOVERY_CONNECTION_HEADROOM - 1),
+            DEFAULT_DISCOVERY_CONNECTION_HEADROOM
+        );
+        assert_eq!(
+            effective_discovery_connection_headroom(DEFAULT_DISCOVERY_CONNECTION_HEADROOM + 2),
+            DEFAULT_DISCOVERY_CONNECTION_HEADROOM + 2
+        );
+    }
+
+    #[test]
+    fn discovery_in_flight_ip_reservations_are_counted_and_released() {
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11));
+        let mut in_flight_by_ip = HashMap::new();
+
+        reserve_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip, ip, other_ip]);
+        assert_eq!(in_flight_by_ip.get(&ip), Some(&2));
+        assert_eq!(in_flight_by_ip.get(&other_ip), Some(&1));
+
+        release_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip, other_ip]);
+        assert_eq!(in_flight_by_ip.get(&ip), Some(&1));
+        assert!(!in_flight_by_ip.contains_key(&other_ip));
+
+        release_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip]);
+        assert!(in_flight_by_ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_ip_capacity_includes_discovery_dials_in_flight() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let remote_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12));
+
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(remote_ip, 0)
+                .await
+        );
+        assert!(
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(remote_ip, 1)
+                .await
+        );
     }
 
     #[test]

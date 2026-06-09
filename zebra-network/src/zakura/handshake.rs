@@ -143,7 +143,8 @@ impl ZakuraNetworkId {
         }
     }
 
-    fn code(self) -> u32 {
+    /// Returns this network id's pinned wire value.
+    pub fn code(self) -> u32 {
         // Safe: `ZakuraNetworkId` has `#[repr(u32)]`, so the cast uses the pinned wire value.
         self as u32
     }
