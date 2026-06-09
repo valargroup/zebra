@@ -4,6 +4,8 @@ include make/zcashd-compat.mk
 
 help:
 	@echo "Available targets:"
+	@echo "  compat-docker-build              Build Docker zcashd-compat image"
+	@echo "  compat-docker-start              Start Docker zcashd-compat with mounted snapshots"
 	@echo "  compat-zebrad-start-supervised   Start zebrad with zcashd supervision enabled"
 	@echo "  compat-zebrad-start-unsupervised Start zebrad with zcashd supervision disabled"
 	@echo "  compat-zcashd-start-standalone   Start zcashd -zebra-compat as a standalone process"

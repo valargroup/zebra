@@ -205,7 +205,7 @@ ENV USER=${USER}
 ARG HOME
 ENV HOME=${HOME}
 
-# Install curl for healthchecks and zcashd-compat downloads, and adduser for user/group creation
+# Install curl for healthchecks/downloads and adduser for user/group creation.
 RUN apt-get -q update && \
     apt-get -q install -y --no-install-recommends \
     adduser \
