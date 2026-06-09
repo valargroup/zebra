@@ -205,6 +205,25 @@ impl StartCmd {
             config
         };
 
+        let resolved_zcashd_path = if config.zcashd_compat.enabled
+            && config.zcashd_compat.manage_zcashd
+        {
+            let zcashd_compat_config = config.zcashd_compat.clone();
+            let state_cache_dir = config.state.cache_dir.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    zcashd_compat::resolve_zcashd_binary_path(
+                        &zcashd_compat_config,
+                        &state_cache_dir,
+                    )
+                })
+                .await
+                .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??,
+            )
+        } else {
+            None
+        };
+
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
@@ -352,16 +371,8 @@ impl StartCmd {
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let mut zcashd_compat_task_handle = if config.zcashd_compat.enabled
-            && config.zcashd_compat.manage_zcashd
+        let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
         {
-            let zcashd_compat_config = config.zcashd_compat.clone();
-            let state_cache_dir = config.state.cache_dir.clone();
-            let resolved_zcashd_path = tokio::task::spawn_blocking(move || {
-                zcashd_compat::resolve_zcashd_binary_path(&zcashd_compat_config, &state_cache_dir)
-            })
-            .await
-            .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??;
             let supervisor_config = zcashd_compat::SupervisorConfig::new(
                 &config.zcashd_compat,
                 resolved_zcashd_path,
