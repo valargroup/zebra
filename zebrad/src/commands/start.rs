@@ -941,6 +941,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
@@ -963,6 +964,7 @@ mod tests {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
+            unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
