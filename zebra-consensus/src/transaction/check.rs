@@ -276,7 +276,12 @@ pub fn disabled_add_to_sprout_pool(
     Ok(())
 }
 
-/// Check if a transaction is adding to the Orchard pool after NU7 activation.
+/// Check if a transaction is adding value to the Orchard pool after NU7 activation.
+///
+/// This is a net value balance rule. Negative `valueBalanceOrchard` adds value
+/// to the Orchard chain pool, so it is rejected. Positive values withdraw from
+/// Orchard, and zero leaves the Orchard chain pool unchanged even if the
+/// transaction has both Orchard spends and outputs.
 pub fn disabled_add_to_orchard_pool(
     tx: &Transaction,
     height: Height,
