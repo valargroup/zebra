@@ -55,6 +55,13 @@ pub struct Config {
     /// Dedicated RPC listen address used by `zcashd -zebra-compat`.
     ///
     /// If unset, zcashd-compat startup defaults it to `127.0.0.1:28232`.
+    ///
+    /// Backward compatibility: this field also accepts the legacy `rpc_url` key and env var.
+    #[serde(
+        default,
+        alias = "rpc_url",
+        deserialize_with = "deserialize_listen_addr_or_rpc_url"
+    )]
     pub listen_addr: Option<SocketAddr>,
 
     /// The directory where Zebra stores zcashd-compat RPC cookies.
@@ -66,6 +73,7 @@ pub struct Config {
     ///
     /// This is separate from the standard RPC cookie filename to avoid
     /// conflicts when both RPC servers share the same `cookie_dir`.
+    #[serde(default = "default_cookie_file_name")]
     pub cookie_file_name: String,
 
     /// Delay before the first `zcashd` spawn attempt.
@@ -99,13 +107,58 @@ impl Default for Config {
             zcashd_extra_args: Vec::new(),
             listen_addr: None,
             cookie_dir: default_cache_dir(),
-            cookie_file_name: ".zcashd-compat.cookie".to_string(),
+            cookie_file_name: default_cookie_file_name(),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 10,
             shutdown_grace_period: Duration::from_secs(10),
         }
     }
+}
+
+fn default_cookie_file_name() -> String {
+    ".zcashd-compat.cookie".to_string()
+}
+
+/// Deserializes the compat listen address from either `listen_addr` (`127.0.0.1:28232`)
+/// or legacy `rpc_url` (`http://127.0.0.1:28232`) formats.
+fn deserialize_listen_addr_or_rpc_url<'de, D>(
+    deserializer: D,
+) -> Result<Option<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListenAddrValue {
+        SocketAddr(SocketAddr),
+        String(String),
+    }
+
+    let value = Option::<ListenAddrValue>::deserialize(deserializer)?;
+    value
+        .map(|value| match value {
+            ListenAddrValue::SocketAddr(addr) => Ok(addr),
+            ListenAddrValue::String(raw) => {
+                if let Ok(addr) = raw.parse::<SocketAddr>() {
+                    return Ok(addr);
+                }
+
+                let stripped = raw
+                    .strip_prefix("http://")
+                    .or_else(|| raw.strip_prefix("https://"))
+                    .unwrap_or(&raw)
+                    .trim_end_matches('/');
+
+                stripped.parse::<SocketAddr>().map_err(|error| {
+                    D::Error::custom(format!(
+                        "listen_addr / rpc_url must be a socket address like \
+                         127.0.0.1:28232 or URL like http://127.0.0.1:28232, got {raw:?}: {error}"
+                    ))
+                })
+            }
+        })
+        .transpose()
 }
 
 /// Deserializes `zcashd_extra_args` from either a sequence or a JSON-array string.
@@ -134,6 +187,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::{Config, ZcashdBinarySource};
 
     #[test]
@@ -143,7 +198,38 @@ mod tests {
         assert_eq!(config.zcashd_path, None);
         assert_eq!(config.listen_addr, None);
         assert_eq!(config.cookie_dir, super::default_cache_dir());
-        assert_eq!(config.cookie_file_name, ".zcashd-compat.cookie");
+        assert_eq!(config.cookie_file_name, super::default_cookie_file_name());
+    }
+
+    #[test]
+    fn deserialize_defaults_cookie_file_name_when_missing() {
+        let config: Config = toml::from_str(
+            r#"
+            cookie_dir = "/tmp/zcashd-compat-cookie-dir"
+            "#,
+        )
+        .expect("partial zcashd-compat config should deserialize");
+
+        assert_eq!(
+            config.cookie_file_name,
+            super::default_cookie_file_name(),
+            "missing cookie file names should use the default value"
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_rpc_url_into_listen_addr() {
+        let config: Config = toml::from_str(
+            r#"
+            rpc_url = "http://127.0.0.1:28232"
+            "#,
+        )
+        .expect("legacy rpc_url should deserialize");
+
+        assert_eq!(
+            config.listen_addr,
+            Some(SocketAddr::from(([127, 0, 0, 1], 28232)))
+        );
     }
 
     #[test]
@@ -197,5 +283,4 @@ mod tests {
             "error should explain expected format: {error_message}"
         );
     }
-
 }
