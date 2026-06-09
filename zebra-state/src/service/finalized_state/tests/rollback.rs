@@ -1126,6 +1126,94 @@ fn rollback_prunes_subtrees_above_target() {
     );
 }
 
+fn rewrite_ironwood_trees_as_upgrade_backfill(config: &Config, network: &Network) {
+    let db = open_unchecked_db(config, network);
+    let tip_height = db.finalized_tip_height().expect("test state has a tip");
+    let existing_trees: Vec<_> = db.ironwood_tree_by_height_range(..).collect();
+    let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+    let mut batch = DiskWriteBatch::new();
+
+    for (height, tree) in existing_trees {
+        batch.delete_ironwood_tree(&db, &height);
+        batch.delete_ironwood_anchor(&db, &tree.root());
+    }
+
+    batch.create_ironwood_tree(&db, &tip_height, &ironwood_tree);
+    db.write_batch(batch)
+        .expect("database accepts synthetic Ironwood upgrade backfill");
+}
+
+#[test]
+fn rollback_preserves_backfilled_ironwood_tree_below_upgrade_tip() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let block2 = child_block(&block1, vec![coinbase_tx(Height(2), dust, &address)]);
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+    rewrite_ironwood_trees_as_upgrade_backfill(&config, &network);
+
+    let db = open_unchecked_db(&config, &network);
+    assert!(
+        db.ironwood_tree_by_height_range(..=Height(1))
+            .next()
+            .is_none(),
+        "the synthetic upgraded database only has an Ironwood tree above the rollback target"
+    );
+    drop(db);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+
+    let db = open_unchecked_db(&config, &network);
+    let Some((height, ironwood_tree)) = db.ironwood_tree_by_height_range(..=Height(1)).last()
+    else {
+        panic!("rollback must preserve an Ironwood tree at or below the retained tip");
+    };
+
+    assert_eq!(
+        height,
+        Height(1),
+        "rollback writes the missing empty Ironwood tree at the retained tip"
+    );
+    assert_eq!(
+        ironwood_tree.root(),
+        ironwood::tree::NoteCommitmentTree::default().root(),
+        "the preserved Ironwood tree is empty"
+    );
+    assert!(
+        db.contains_ironwood_anchor(&ironwood_tree.root()),
+        "the preserved Ironwood tree anchor remains indexed"
+    );
+    assert_eq!(
+        db.ironwood_tree_for_tip().root(),
+        ironwood_tree.root(),
+        "tip lookups can find the preserved Ironwood tree"
+    );
+}
+
 #[test]
 #[cfg(zcash_unstable = "nu7")]
 fn rollback_prunes_ironwood_nullifiers_above_target() {

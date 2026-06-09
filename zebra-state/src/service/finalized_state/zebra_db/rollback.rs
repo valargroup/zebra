@@ -11,6 +11,7 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
+    ironwood,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
@@ -930,6 +931,10 @@ fn prune_tree_indexes(
         batch.delete_orchard_anchor(db, &tree.root());
     }
 
+    let needs_empty_ironwood_tree_at_target = db
+        .ironwood_tree_by_height_range(..=target_height)
+        .next()
+        .is_none();
     let ironwood_trees: BTreeMap<_, _> = db
         .ironwood_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
@@ -939,6 +944,10 @@ fn prune_tree_indexes(
     for (height, tree) in ironwood_trees {
         batch.delete_ironwood_tree(db, &height);
         batch.delete_ironwood_anchor(db, &tree.root());
+    }
+    if needs_empty_ironwood_tree_at_target {
+        let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+        batch.create_ironwood_tree(db, &target_height, &ironwood_tree);
     }
 
     // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
