@@ -15,12 +15,12 @@ ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 NETWORK ?= Testnet
 ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state-testnet
 ZCASHD_DATADIR ?= /mnt/data/zcashd-profile-b/.zcashd
-ZCASHD_CONF ?= $(CURDIR)/deploy/profile-b/zcash.testnet.zebra-compat.conf
+ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
 
 ZEBRA_COOKIE_FILE ?= $(HOME)/.cache/zebra/.zcashd-compat.cookie
-HEIGHT_MAX_DRIFT ?= 50
+HEIGHT_MAX_DRIFT ?= 10
 
 compat-zebrad-start-supervised-managed:
 	@echo "Starting zebrad in zcashd-compat mode with managed zcashd download..."
