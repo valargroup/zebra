@@ -63,6 +63,9 @@ pub struct Config {
     /// The directory where Zebra stores RPC cookies.
     pub cookie_dir: PathBuf,
 
+    /// The cookie file name used in `cookie_dir`.
+    pub cookie_file_name: String,
+
     /// Enable cookie-based authentication for RPCs.
     pub enable_cookie_auth: bool,
 
@@ -89,6 +92,7 @@ impl Default for Config {
 
             // Use the default cache dir for the auth cookie.
             cookie_dir: default_cache_dir(),
+            cookie_file_name: ".cookie".to_string(),
 
             // Enable cookie-based authentication by default.
             enable_cookie_auth: true,

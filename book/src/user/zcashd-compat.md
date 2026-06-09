@@ -16,7 +16,7 @@ Zebra:
 
 - enables zcashd-compat mode (`[zcashd_compat].enabled = true`);
 - ensures a dedicated zcashd-compat RPC listen address is configured (defaults to `127.0.0.1:28232`);
-- uses dedicated cookie auth at `zcashd_compat.cookie_dir/.cookie`;
+- uses dedicated cookie auth at `zcashd_compat.cookie_dir/zcashd_compat.cookie_file_name`;
 - raises the zcashd-compat RPC `max_response_body_size` if needed for large batched block responses;
 - optionally spawns and supervises `zcashd -zebra-compat`.
 
@@ -25,7 +25,7 @@ If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
 ```text
 -zebra-compat
 -zebra-compat-url=<rpc_url>
--zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/.cookie
+-zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/<zcashd_compat.cookie_file_name>
 -datadir=<zcashd_compat.zcashd_datadir or state.cache_dir/zcashd-compat-zcashd>
 [-testnet | -regtest]
 ```
@@ -43,7 +43,8 @@ zcashd_path = "/path/to/local/zcashd"               # optional explicit override
 zcashd_datadir = "/path/to/zcashd/datadir"          # optional
 zcashd_extra_args = ["-printtoconsole"]             # optional
 listen_addr = "127.0.0.1:28232"                     # optional, default set when zcashd-compat is enabled
-cookie_dir = "/path/to/zcashd-compat-cookies"       # optional, defaults to <cache_dir>/zcashd-compat-rpc
+cookie_dir = "/path/to/cookies"                     # optional, defaults to <cache_dir>
+cookie_file_name = ".zcashd-compat.cookie"          # optional, defaults to ".zcashd-compat.cookie"
 startup_delay = "1s"
 restart_backoff = "2s"
 max_restarts = 10
