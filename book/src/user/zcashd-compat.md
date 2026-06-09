@@ -64,17 +64,15 @@ or you can build a local compat image with:
 ```console
 docker build -f ./docker/Dockerfile --target runtime \
   --build-arg ZCASHD_COMPAT_ENABLED=true \
-  --build-arg ZCASHD_COMPAT_RELEASE_TAG=v6.2.1-alpha \
-  --build-arg ZCASHD_COMPAT_SHA256_AMD64=09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c \
-  --build-arg ZCASHD_COMPAT_SHA256_ARM64=133e562f86b4f49dd4e69ad55eb94bdd259c5e8af4fc533ec72b1f39bbbb6927 \
+  --build-arg ZCASHD_COMPAT_URL=https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz \
+  --build-arg ZCASHD_COMPAT_SHA256=09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c \
   --tag zebra:zcashd-compat .
 ```
 
 When `ZCASHD_COMPAT_ENABLED=true` is set at build time, the Dockerfile vendors
-a verified `zcashd` binary from the configured zcashd compatibility release. It
-selects the matching runtime archive automatically for `amd64` or `arm64`. To
-use a different artifact URL, pass both `ZCASHD_COMPAT_URL` and
-`ZCASHD_COMPAT_SHA256` instead.
+a verified `zcashd` binary from the provided URL. For non-`amd64` builds, set
+`ZCASHD_COMPAT_URL` and `ZCASHD_COMPAT_SHA256` to the matching artifact for
+your target platform.
 
 At runtime, enable the vendored binary with:
 

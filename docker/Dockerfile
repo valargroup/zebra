@@ -171,19 +171,14 @@ FROM debian:trixie-slim AS runtime
 
 ARG FEATURES
 ENV FEATURES=${FEATURES}
-ARG TARGETARCH
 
 # Optional zcashd compatibility artifact.
 #
 # Set ZCASHD_COMPAT_ENABLED=true to vendor a verified `zcashd` binary at
 # /usr/local/bin/zcashd so containers can run zcashd-compat mode without
-# downloading executables at startup. CI should provide the compatibility
-# release tag and per-architecture SHA256 values. ZCASHD_COMPAT_URL and
-# ZCASHD_COMPAT_SHA256 are optional overrides for custom artifacts.
+# downloading executables at startup. Set ZCASHD_COMPAT_URL and
+# ZCASHD_COMPAT_SHA256 to provide the exact artifact to vendor.
 ARG ZCASHD_COMPAT_ENABLED="false"
-ARG ZCASHD_COMPAT_RELEASE_TAG=""
-ARG ZCASHD_COMPAT_SHA256_AMD64=""
-ARG ZCASHD_COMPAT_SHA256_ARM64=""
 ARG ZCASHD_COMPAT_URL=""
 ARG ZCASHD_COMPAT_SHA256=""
 
@@ -243,23 +238,7 @@ RUN set -e; \
     if [ "${zcashd_compat_enabled}" = true ]; then \
       zcashd_compat_url="${ZCASHD_COMPAT_URL}"; \
       zcashd_compat_sha256="${ZCASHD_COMPAT_SHA256}"; \
-      if [ -z "${zcashd_compat_url}" ] && [ -z "${zcashd_compat_sha256}" ]; then \
-        target_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
-        case "${target_arch}" in \
-          amd64|x86_64) \
-            zcashd_compat_platform="linux-x86_64"; \
-            zcashd_compat_sha256="${ZCASHD_COMPAT_SHA256_AMD64}" ;; \
-          arm64|aarch64) \
-            zcashd_compat_platform="linux-aarch64"; \
-            zcashd_compat_sha256="${ZCASHD_COMPAT_SHA256_ARM64}" ;; \
-          *) echo "Unsupported architecture for zcashd compatibility artifact: ${target_arch}" >&2; exit 1 ;; \
-        esac; \
-        if [ -z "${ZCASHD_COMPAT_RELEASE_TAG}" ] || [ -z "${zcashd_compat_sha256}" ]; then \
-          echo "ZCASHD_COMPAT_RELEASE_TAG and the matching per-architecture SHA256 are required when ZCASHD_COMPAT_ENABLED=true" >&2; \
-          exit 1; \
-        fi; \
-        zcashd_compat_url="https://github.com/valargroup/zcashd/releases/download/${ZCASHD_COMPAT_RELEASE_TAG}/zcashd-zebra-compat-${ZCASHD_COMPAT_RELEASE_TAG}-${zcashd_compat_platform}.tar.gz"; \
-      elif [ -z "${zcashd_compat_url}" ] || [ -z "${zcashd_compat_sha256}" ]; then \
+      if [ -z "${zcashd_compat_url}" ] || [ -z "${zcashd_compat_sha256}" ]; then \
         echo "ZCASHD_COMPAT_URL and ZCASHD_COMPAT_SHA256 must either both be set or both be empty" >&2; \
         exit 1; \
       fi; \

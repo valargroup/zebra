@@ -57,8 +57,9 @@ jobs:
       features: ${{ vars.RUST_PROD_FEATURES }}
       rust_log: ${{ vars.RUST_LOG }}
       zcashd_compat_enabled: true
-      zcashd_compat_release_tag: v6.2.1-alpha
+      zcashd_compat_url_amd64: https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz
       zcashd_compat_sha256_amd64: 09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c
+      zcashd_compat_url_arm64: https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-aarch64.tar.gz
       zcashd_compat_sha256_arm64: 133e562f86b4f49dd4e69ad55eb94bdd259c5e8af4fc533ec72b1f39bbbb6927
       publish_to_dockerhub: true
     # This step needs access to Docker Hub secrets to run successfully
