@@ -158,24 +158,34 @@ fn check_tcp_slow_start_after_idle() {}
 impl StartCmd {
     /// Minimum response body size used in zcashd-compat mode to tolerate large batched block responses.
     const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 100 * 1024 * 1024;
-    /// Default RPC listen address when `--zcashd-compat` is enabled.
+    /// Default zcashd-compat RPC listen address when `--zcashd-compat` is enabled.
     fn zcashd_compat_default_rpc_listen_addr() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 8232))
+        SocketAddr::from(([127, 0, 0, 1], 28232))
     }
 
     fn zcashd_compat_cookie_path(config: &ZebradConfig) -> std::path::PathBuf {
-        config.rpc.cookie_dir.join(".cookie")
+        config
+            .zcashd_compat
+            .cookie_dir
+            .join(&config.zcashd_compat.cookie_file_name)
+    }
+
+    fn zcashd_compat_rpc_config(config: &ZebradConfig) -> zebra_rpc::config::rpc::Config {
+        let mut compat_rpc_config = config.rpc.clone();
+        compat_rpc_config.listen_addr = config.zcashd_compat.listen_addr;
+        compat_rpc_config.enable_cookie_auth = true;
+        compat_rpc_config.cookie_dir = config.zcashd_compat.cookie_dir.clone();
+        compat_rpc_config.cookie_file_name = config.zcashd_compat.cookie_file_name.clone();
+        compat_rpc_config.max_response_body_size = compat_rpc_config
+            .max_response_body_size
+            .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
+        compat_rpc_config
     }
 
     fn zcashd_compat_rpc_url(config: &ZebradConfig) -> Result<String, Report> {
-        if let Some(rpc_url) = config.zcashd_compat.rpc_url.as_ref() {
-            return Ok(rpc_url.clone());
-        }
-
-        let listen_addr = config
-            .rpc
-            .listen_addr
-            .ok_or_else(|| eyre!("zcashd-compat mode requires rpc.listen_addr to be set"))?;
+        let listen_addr = config.zcashd_compat.listen_addr.ok_or_else(|| {
+            eyre!("zcashd-compat mode requires zcashd_compat.listen_addr to be set")
+        })?;
         Ok(format!("http://{listen_addr}"))
     }
 
@@ -368,6 +378,14 @@ impl StartCmd {
             tokio::spawn(std::future::pending().in_current_span())
         };
 
+        let zcashd_compat_rpc_task_handle = if config.zcashd_compat.enabled {
+            RpcServer::start(rpc_impl.clone(), Self::zcashd_compat_rpc_config(&config))
+                .await
+                .expect("zcashd-compat RPC server should start")
+        } else {
+            tokio::spawn(std::future::pending().in_current_span())
+        };
+
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
@@ -548,6 +566,7 @@ impl StartCmd {
 
         // ongoing tasks
         pin!(rpc_task_handle);
+        pin!(zcashd_compat_rpc_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
@@ -583,6 +602,13 @@ impl StartCmd {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
                     info!(?rpc_server_result, "rpc task exited");
+                    Ok(())
+                }
+
+                zcashd_compat_rpc_join_result = &mut zcashd_compat_rpc_task_handle => {
+                    let compat_rpc_server_result = zcashd_compat_rpc_join_result
+                        .expect("unexpected panic in the zcashd-compat rpc task");
+                    info!(?compat_rpc_server_result, "zcashd-compat rpc task exited");
                     Ok(())
                 }
 
@@ -684,6 +710,7 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
+        zcashd_compat_rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
         health_task_handle.abort();
         syncer_task_handle.abort();
@@ -806,24 +833,22 @@ impl config::Override<ZebradConfig> for StartCmd {
         }
 
         if config.zcashd_compat.enabled {
-            if config.rpc.listen_addr.is_none() {
-                config.rpc.listen_addr = Some(Self::zcashd_compat_default_rpc_listen_addr());
+            if config.zcashd_compat.listen_addr.is_none() {
+                config.zcashd_compat.listen_addr =
+                    Some(Self::zcashd_compat_default_rpc_listen_addr());
             }
 
-            if !config.rpc.enable_cookie_auth {
-                warn!(
-                    "zcashd-compat mode requires rpc.enable_cookie_auth=true, overriding configured value"
-                );
-                config.rpc.enable_cookie_auth = true;
-            }
-
-            if config.rpc.max_response_body_size < Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE {
-                warn!(
-                    configured_size = config.rpc.max_response_body_size,
-                    min_size = Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE,
-                    "zcashd-compat mode requires larger rpc.max_response_body_size, overriding configured value"
-                );
-                config.rpc.max_response_body_size = Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE;
+            if let (Some(rpc_listen_addr), Some(compat_listen_addr)) =
+                (config.rpc.listen_addr, config.zcashd_compat.listen_addr)
+            {
+                if rpc_listen_addr == compat_listen_addr {
+                    return Err(std::io::Error::other(format!(
+                        "zcashd-compat mode requires different RPC listen addresses: \
+                         rpc.listen_addr={rpc_listen_addr} conflicts with \
+                         zcashd_compat.listen_addr={compat_listen_addr}"
+                    ))
+                    .into());
+                }
             }
 
             if config.zcashd_compat.manage_zcashd {
@@ -864,8 +889,7 @@ mod tests {
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = false;
-        config.rpc.enable_cookie_auth = false;
-        config.rpc.max_response_body_size = 1024;
+        config.rpc.listen_addr = None;
 
         let config = cmd
             .override_config(config)
@@ -873,14 +897,10 @@ mod tests {
 
         assert!(config.zcashd_compat.enabled);
         assert_eq!(
-            config.rpc.listen_addr,
+            config.zcashd_compat.listen_addr,
             Some(StartCmd::zcashd_compat_default_rpc_listen_addr())
         );
-        assert!(config.rpc.enable_cookie_auth);
-        assert_eq!(
-            config.rpc.max_response_body_size,
-            StartCmd::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE
-        );
+        assert_eq!(config.rpc.listen_addr, None);
     }
 
     #[test]
@@ -892,8 +912,7 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = false;
-        config.rpc.enable_cookie_auth = false;
-        config.rpc.max_response_body_size = 1024;
+        config.rpc.listen_addr = None;
 
         let config = cmd
             .override_config(config)
@@ -901,13 +920,100 @@ mod tests {
 
         assert!(config.zcashd_compat.enabled);
         assert_eq!(
-            config.rpc.listen_addr,
+            config.zcashd_compat.listen_addr,
             Some(StartCmd::zcashd_compat_default_rpc_listen_addr())
         );
-        assert!(config.rpc.enable_cookie_auth);
+        assert_eq!(config.rpc.listen_addr, None);
+    }
+
+    #[test]
+    fn zcashd_compat_flag_rejects_conflicting_rpc_listen_addr() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.manage_zcashd = false;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat should reject overlapping RPC listen addresses");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires different RPC listen addresses"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_conflicting_rpc_listen_addr() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat should reject overlapping configured RPC listen addresses");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires different RPC listen addresses"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_rpc_config_uses_dedicated_cookie_and_min_response_size() {
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
+        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
+        config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
+        config.rpc.cookie_file_name = ".cookie".to_string();
+        config.rpc.max_response_body_size = 1024;
+
+        let compat_rpc_config = StartCmd::zcashd_compat_rpc_config(&config);
         assert_eq!(
-            config.rpc.max_response_body_size,
+            compat_rpc_config.listen_addr,
+            config.zcashd_compat.listen_addr
+        );
+        assert_eq!(
+            compat_rpc_config.cookie_dir,
+            config.zcashd_compat.cookie_dir
+        );
+        assert_eq!(
+            compat_rpc_config.cookie_file_name,
+            config.zcashd_compat.cookie_file_name
+        );
+        assert!(compat_rpc_config.enable_cookie_auth);
+        assert_eq!(
+            compat_rpc_config.max_response_body_size,
             StartCmd::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_cookie_path_uses_compat_cookie_dir() {
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
+        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
+        config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
+        config.rpc.cookie_file_name = ".cookie".to_string();
+
+        assert_eq!(
+            StartCmd::zcashd_compat_cookie_path(&config),
+            std::path::PathBuf::from("/tmp/zcashd-compat-cookie-dir/.zcashd-compat.cookie")
         );
     }
 
