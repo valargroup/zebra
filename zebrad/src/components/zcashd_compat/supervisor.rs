@@ -47,13 +47,14 @@ impl SupervisorConfig {
     /// Builds a runtime supervisor config from `zebrad` and `[zcashd_compat]` settings.
     pub fn new(
         zcashd_compat: &Config,
+        zcashd_path: PathBuf,
         state_cache_dir: &Path,
         network: NetworkKind,
         rpc_url: String,
         cookie_path: PathBuf,
     ) -> Self {
         Self {
-            zcashd_path: zcashd_compat.zcashd_path.clone(),
+            zcashd_path,
             zcashd_datadir: zcashd_compat
                 .zcashd_datadir
                 .clone()

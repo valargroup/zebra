@@ -9,6 +9,7 @@
 use std::{env, fs, io::Write, path::PathBuf, sync::Mutex};
 
 use tempfile::{Builder, TempDir};
+use zebrad::components::zcashd_compat::ConfigZcashdBinarySource;
 use zebrad::config::ZebradConfig;
 
 // Prefix used for environment variables mapped to config values in tests.
@@ -205,6 +206,32 @@ fn config_nested_env_vars() {
     let config = ZebradConfig::load(None).expect("load config with nested env vars");
 
     assert_eq!(config.tracing.filter.as_deref(), Some("debug"));
+}
+
+#[test]
+fn config_zcashd_compat_source_and_path_env() {
+    let env = EnvGuard::new();
+    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "path");
+    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH", "/usr/local/bin/zcashd");
+
+    let config = ZebradConfig::load(None).expect("load config with zcashd compat env vars");
+    assert_eq!(config.zcashd_compat.zcashd_source, ConfigZcashdBinarySource::Path);
+    assert_eq!(
+        config.zcashd_compat.zcashd_path,
+        Some(PathBuf::from("/usr/local/bin/zcashd"))
+    );
+}
+
+#[test]
+fn config_zcashd_compat_managed_source_env() {
+    let env = EnvGuard::new();
+    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "managed");
+
+    let config = ZebradConfig::load(None).expect("load config with managed source");
+    assert_eq!(
+        config.zcashd_compat.zcashd_source,
+        ConfigZcashdBinarySource::Managed
+    );
 }
 
 // --- Specific env mappings used in Docker examples ---

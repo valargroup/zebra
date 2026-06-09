@@ -354,8 +354,13 @@ impl StartCmd {
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
         let mut zcashd_compat_task_handle =
             if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
+                let resolved_zcashd_path = zcashd_compat::resolve_zcashd_binary_path(
+                    &config.zcashd_compat,
+                    &config.state.cache_dir,
+                )?;
                 let supervisor_config = zcashd_compat::SupervisorConfig::new(
                     &config.zcashd_compat,
+                    resolved_zcashd_path,
                     &config.state.cache_dir,
                     config.network.network.kind(),
                     Self::zcashd_compat_rpc_url(&config)?,
@@ -806,16 +811,20 @@ impl config::Override<ZebradConfig> for StartCmd {
                 config.rpc.max_response_body_size = Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE;
             }
 
-            if config.zcashd_compat.manage_zcashd
-                && !zcashd_compat::is_command_resolvable(Path::new(
-                    &config.zcashd_compat.zcashd_path,
-                ))
-            {
-                return Err(std::io::Error::other(format!(
-                    "zcashd-compat mode could not resolve zcashd_path={}",
-                    config.zcashd_compat.zcashd_path.display()
-                ))
-                .into());
+            if config.zcashd_compat.manage_zcashd {
+                match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
+                    Ok(zcashd_compat::ZcashdBinarySource::Path(path))
+                        if !zcashd_compat::is_command_resolvable(Path::new(&path)) =>
+                    {
+                        return Err(std::io::Error::other(format!(
+                            "zcashd-compat mode could not resolve zcashd_path={}",
+                            path.display()
+                        ))
+                        .into());
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(std::io::Error::other(err.to_string()).into()),
+                }
             }
         }
 
@@ -829,6 +838,7 @@ mod tests {
     use color_eyre::eyre::eyre;
 
     use super::StartCmd;
+    use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
 
     #[test]
@@ -894,7 +904,7 @@ mod tests {
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_path = "/definitely/missing/zcashd-compat".into();
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
 
         let error = cmd
             .override_config(config)
@@ -909,6 +919,41 @@ mod tests {
     }
 
     #[test]
+    fn zcashd_compat_path_source_requires_explicit_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Path;
+        config.zcashd_compat.zcashd_path = None;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("path source should require explicit zcashd_path");
+        assert!(
+            error.to_string().contains("zcashd_source=path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_managed_source_allows_missing_local_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_path = None;
+
+        cmd.override_config(config)
+            .expect("managed source should be validated at runtime, not override-time");
+    }
+
+    #[test]
     fn zcashd_compat_config_manage_zcashd_requires_resolvable_path() {
         let cmd = StartCmd {
             filters: Vec::new(),
@@ -917,7 +962,7 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_path = "/definitely/missing/zcashd-compat".into();
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
 
         let error = cmd
             .override_config(config)

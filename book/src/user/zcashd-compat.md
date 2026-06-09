@@ -38,7 +38,8 @@ zcashd-compat mode adds a `[zcashd_compat]` section:
 [zcashd_compat]
 enabled = false
 manage_zcashd = true
-zcashd_path = "zcashd"
+zcashd_source = "managed"                            # "managed" or "path"
+zcashd_path = "/path/to/local/zcashd"               # optional explicit override
 zcashd_datadir = "/path/to/zcashd/datadir"      # optional
 zcashd_extra_args = ["-printtoconsole"]          # optional
 rpc_url = "http://127.0.0.1:8232"               # optional, defaults from rpc.listen_addr
@@ -56,6 +57,22 @@ ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-printtoco
 
 If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, but
 does not spawn `zcashd`.
+
+If `manage_zcashd = true`, Zebra resolves `zcashd` as follows:
+
+1. If `zcashd_path` is set, Zebra uses that local executable directly.
+2. Otherwise, `zcashd_source = "managed"` uses Zebra's embedded release manifest
+   to fetch a compatible `zcashd` archive, verify its SHA256, cache it, and run it.
+3. `zcashd_source = "path"` requires `zcashd_path` to be set.
+
+Managed downloads are cached under:
+
+```text
+<state.cache_dir>/zcashd-compat/bin/<release_tag>/<target>/zcashd
+```
+
+If managed artifacts are unavailable for the local platform, set `zcashd_path`
+to a local binary instead.
 
 ## Quick regtest loop
 
@@ -98,8 +115,10 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
   example, spawn failures or restart-limit exhaustion while running), Zebra logs
   a warning and keeps running without zcashd supervision.
 - Startup-time zcashd-compat config validation is unchanged. For example, if
-  `zcashd_compat.manage_zcashd = true` and `zcashd_path` cannot be resolved,
+  `zcashd_compat.manage_zcashd = true` and explicit `zcashd_path` cannot be resolved,
   Zebra startup fails with an error.
+- Managed download failures (missing target artifact, hash mismatch, transport
+  failures) fail closed before Zebra supervises `zcashd`.
 - If `zebrad` is shut down normally, it asks the zcashd-compat supervisor to stop
   `zcashd` gracefully: SIGTERM first, then SIGKILL after
   `shutdown_grace_period` if needed.
