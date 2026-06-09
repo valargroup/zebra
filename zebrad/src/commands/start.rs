@@ -205,6 +205,25 @@ impl StartCmd {
             config
         };
 
+        let resolved_zcashd_path = if config.zcashd_compat.enabled
+            && config.zcashd_compat.manage_zcashd
+        {
+            let zcashd_compat_config = config.zcashd_compat.clone();
+            let state_cache_dir = config.state.cache_dir.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    zcashd_compat::resolve_zcashd_binary_path(
+                        &zcashd_compat_config,
+                        &state_cache_dir,
+                    )
+                })
+                .await
+                .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??,
+            )
+        } else {
+            None
+        };
+
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
@@ -352,37 +371,38 @@ impl StartCmd {
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let mut zcashd_compat_task_handle =
-            if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
-                let supervisor_config = zcashd_compat::SupervisorConfig::new(
-                    &config.zcashd_compat,
-                    &config.state.cache_dir,
-                    config.network.network.kind(),
-                    Self::zcashd_compat_rpc_url(&config)?,
-                    Self::zcashd_compat_cookie_path(&config),
-                );
+        let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
+        {
+            let supervisor_config = zcashd_compat::SupervisorConfig::new(
+                &config.zcashd_compat,
+                resolved_zcashd_path,
+                &config.state.cache_dir,
+                config.network.network.kind(),
+                Self::zcashd_compat_rpc_url(&config)?,
+                Self::zcashd_compat_cookie_path(&config),
+            );
 
+            info!(
+                rpc_url = %supervisor_config.rpc_url,
+                cookie_file = %supervisor_config.cookie_path.display(),
+                "zcashd-compat source enabled"
+            );
+
+            tokio::spawn(
+                zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
+                    .in_current_span(),
+            )
+        } else {
+            if config.zcashd_compat.enabled {
                 info!(
-                    rpc_url = %supervisor_config.rpc_url,
-                    cookie_file = %supervisor_config.cookie_path.display(),
-                    "zcashd-compat source enabled"
+                    rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
+                    cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
+                    "zcashd-compat source enabled: zcashd supervision disabled"
                 );
+            }
 
-                tokio::spawn(
-                    zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
-                        .in_current_span(),
-                )
-            } else {
-                if config.zcashd_compat.enabled {
-                    info!(
-                        rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
-                        cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
-                        "zcashd-compat source enabled: zcashd supervision disabled"
-                    );
-                }
-
-                tokio::spawn(std::future::pending().in_current_span())
-            };
+            tokio::spawn(std::future::pending().in_current_span())
+        };
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
@@ -806,16 +826,20 @@ impl config::Override<ZebradConfig> for StartCmd {
                 config.rpc.max_response_body_size = Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE;
             }
 
-            if config.zcashd_compat.manage_zcashd
-                && !zcashd_compat::is_command_resolvable(Path::new(
-                    &config.zcashd_compat.zcashd_path,
-                ))
-            {
-                return Err(std::io::Error::other(format!(
-                    "zcashd-compat mode could not resolve zcashd_path={}",
-                    config.zcashd_compat.zcashd_path.display()
-                ))
-                .into());
+            if config.zcashd_compat.manage_zcashd {
+                match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
+                    Ok(zcashd_compat::ZcashdBinarySource::Path(path))
+                        if !zcashd_compat::is_command_resolvable(Path::new(&path)) =>
+                    {
+                        return Err(std::io::Error::other(format!(
+                            "zcashd-compat mode could not resolve zcashd_path={}",
+                            path.display()
+                        ))
+                        .into());
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(std::io::Error::other(err.to_string()).into()),
+                }
             }
         }
 
@@ -829,6 +853,7 @@ mod tests {
     use color_eyre::eyre::eyre;
 
     use super::StartCmd;
+    use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
 
     #[test]
@@ -894,7 +919,7 @@ mod tests {
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_path = "/definitely/missing/zcashd-compat".into();
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
 
         let error = cmd
             .override_config(config)
@@ -909,6 +934,41 @@ mod tests {
     }
 
     #[test]
+    fn zcashd_compat_path_source_requires_explicit_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Path;
+        config.zcashd_compat.zcashd_path = None;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("path source should require explicit zcashd_path");
+        assert!(
+            error.to_string().contains("zcashd_source=path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_managed_source_allows_missing_local_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_path = None;
+
+        cmd.override_config(config)
+            .expect("managed source should be validated at runtime, not override-time");
+    }
+
+    #[test]
     fn zcashd_compat_config_manage_zcashd_requires_resolvable_path() {
         let cmd = StartCmd {
             filters: Vec::new(),
@@ -917,7 +977,7 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_path = "/definitely/missing/zcashd-compat".into();
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
 
         let error = cmd
             .override_config(config)
