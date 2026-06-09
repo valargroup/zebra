@@ -59,9 +59,14 @@ pub struct Config {
 
     /// The directory where Zebra stores zcashd-compat RPC cookies.
     ///
-    /// This is separate from the standard `[rpc].cookie_dir` to keep
-    /// zcashd-compat authentication isolated.
+    /// By default this reuses Zebra's standard cache directory.
     pub cookie_dir: PathBuf,
+
+    /// The zcashd-compat RPC cookie file name.
+    ///
+    /// This is separate from the standard RPC cookie filename to avoid
+    /// conflicts when both RPC servers share the same `cookie_dir`.
+    pub cookie_file_name: String,
 
     /// Delay before the first `zcashd` spawn attempt.
     #[serde(with = "humantime_serde")]
@@ -93,7 +98,8 @@ impl Default for Config {
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
             listen_addr: None,
-            cookie_dir: default_cache_dir().join("zcashd-compat-rpc"),
+            cookie_dir: default_cache_dir(),
+            cookie_file_name: ".zcashd-compat.cookie".to_string(),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 10,
@@ -136,7 +142,8 @@ mod tests {
         assert_eq!(config.zcashd_source, ZcashdBinarySource::Managed);
         assert_eq!(config.zcashd_path, None);
         assert_eq!(config.listen_addr, None);
-        assert!(config.cookie_dir.ends_with("zcashd-compat-rpc"));
+        assert_eq!(config.cookie_dir, super::default_cache_dir());
+        assert_eq!(config.cookie_file_name, ".zcashd-compat.cookie");
     }
 
     #[test]

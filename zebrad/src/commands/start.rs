@@ -164,7 +164,10 @@ impl StartCmd {
     }
 
     fn zcashd_compat_cookie_path(config: &ZebradConfig) -> std::path::PathBuf {
-        config.zcashd_compat.cookie_dir.join(".cookie")
+        config
+            .zcashd_compat
+            .cookie_dir
+            .join(&config.zcashd_compat.cookie_file_name)
     }
 
     fn zcashd_compat_rpc_config(config: &ZebradConfig) -> zebra_rpc::config::rpc::Config {
@@ -172,6 +175,7 @@ impl StartCmd {
         compat_rpc_config.listen_addr = config.zcashd_compat.listen_addr;
         compat_rpc_config.enable_cookie_auth = true;
         compat_rpc_config.cookie_dir = config.zcashd_compat.cookie_dir.clone();
+        compat_rpc_config.cookie_file_name = config.zcashd_compat.cookie_file_name.clone();
         compat_rpc_config.max_response_body_size = compat_rpc_config
             .max_response_body_size
             .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
@@ -916,7 +920,9 @@ mod tests {
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
         config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
+        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
         config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
+        config.rpc.cookie_file_name = ".cookie".to_string();
         config.rpc.max_response_body_size = 1024;
 
         let compat_rpc_config = StartCmd::zcashd_compat_rpc_config(&config);
@@ -925,6 +931,10 @@ mod tests {
             config.zcashd_compat.listen_addr
         );
         assert_eq!(compat_rpc_config.cookie_dir, config.zcashd_compat.cookie_dir);
+        assert_eq!(
+            compat_rpc_config.cookie_file_name,
+            config.zcashd_compat.cookie_file_name
+        );
         assert!(compat_rpc_config.enable_cookie_auth);
         assert_eq!(
             compat_rpc_config.max_response_body_size,
@@ -936,11 +946,13 @@ mod tests {
     fn zcashd_compat_cookie_path_uses_compat_cookie_dir() {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
+        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
         config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
+        config.rpc.cookie_file_name = ".cookie".to_string();
 
         assert_eq!(
             StartCmd::zcashd_compat_cookie_path(&config),
-            std::path::PathBuf::from("/tmp/zcashd-compat-cookie-dir/.cookie")
+            std::path::PathBuf::from("/tmp/zcashd-compat-cookie-dir/.zcashd-compat.cookie")
         );
     }
 
