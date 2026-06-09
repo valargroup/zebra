@@ -46,9 +46,11 @@ pub struct Config {
     /// Extra command-line arguments passed to `zcashd`.
     ///
     /// This can be provided as:
-    /// - a TOML array: `zcashd_extra_args = ["-printtoconsole"]`
+    /// - a TOML array: `zcashd_extra_args = ["-debug=1"]`
     /// - a JSON array string (useful for environment variable overrides):
-    ///   `ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-printtoconsole"]'`
+    ///   `ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
+    ///
+    /// Zebra always includes `-printtoconsole` automatically.
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]
     pub zcashd_extra_args: Vec<String>,
 
@@ -236,17 +238,14 @@ mod tests {
     fn deserialize_extra_args_from_sequence() {
         let config: Config = toml::from_str(
             r#"
-            zcashd_extra_args = ["-conf=/tmp/zcash.conf", "-printtoconsole"]
+            zcashd_extra_args = ["-conf=/tmp/zcash.conf", "-debug=1"]
             "#,
         )
         .expect("valid sequence should deserialize");
 
         assert_eq!(
             config.zcashd_extra_args,
-            vec![
-                "-conf=/tmp/zcash.conf".to_string(),
-                "-printtoconsole".to_string()
-            ]
+            vec!["-conf=/tmp/zcash.conf".to_string(), "-debug=1".to_string()]
         );
     }
 
@@ -254,17 +253,14 @@ mod tests {
     fn deserialize_extra_args_from_json_string() {
         let config: Config = toml::from_str(
             r#"
-            zcashd_extra_args = "[\"-conf=/tmp/zcash.conf\",\"-printtoconsole\"]"
+            zcashd_extra_args = "[\"-conf=/tmp/zcash.conf\",\"-debug=1\"]"
             "#,
         )
         .expect("valid JSON string array should deserialize");
 
         assert_eq!(
             config.zcashd_extra_args,
-            vec![
-                "-conf=/tmp/zcash.conf".to_string(),
-                "-printtoconsole".to_string()
-            ]
+            vec!["-conf=/tmp/zcash.conf".to_string(), "-debug=1".to_string()]
         );
     }
 
@@ -272,7 +268,7 @@ mod tests {
     fn reject_non_array_string_extra_args() {
         let error = toml::from_str::<Config>(
             r#"
-            zcashd_extra_args = "-printtoconsole"
+            zcashd_extra_args = "-debug=1"
             "#,
         )
         .expect_err("plain strings should be rejected");
@@ -283,4 +279,5 @@ mod tests {
             "error should explain expected format: {error_message}"
         );
     }
+
 }
