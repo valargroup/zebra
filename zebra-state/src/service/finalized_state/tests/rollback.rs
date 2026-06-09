@@ -33,7 +33,10 @@ use crate::{
     preview_rollback_finalized_state, rollback_finalized_state,
     service::{
         arbitrary::PreparedChain,
-        finalized_state::{CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE},
+        finalized_state::{
+            disk_format::upgrade::{add_ironwood_tree, DiskFormatUpgrade},
+            CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
     },
     DiskWriteBatch, RollbackFinalizedStateError, RollbackFinalizedStateOptions,
     SemanticallyVerifiedBlock, ZebraDb,
@@ -1141,6 +1144,79 @@ fn rewrite_ironwood_trees_as_upgrade_backfill(config: &Config, network: &Network
     batch.create_ironwood_tree(&db, &tip_height, &ironwood_tree);
     db.write_batch(batch)
         .expect("database accepts synthetic Ironwood upgrade backfill");
+}
+
+#[test]
+fn ironwood_tree_upgrade_backfills_first_finalized_height() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let block2 = child_block(&block1, vec![coinbase_tx(Height(2), dust, &address)]);
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let db = open_unchecked_db(&config, &network);
+    let tip_height = db.finalized_tip_height().expect("test state has a tip");
+    let existing_trees: Vec<_> = db.ironwood_tree_by_height_range(..).collect();
+    let mut batch = DiskWriteBatch::new();
+
+    for (height, tree) in existing_trees {
+        batch.delete_ironwood_tree(&db, &height);
+        batch.delete_ironwood_anchor(&db, &tree.root());
+    }
+
+    db.write_batch(batch)
+        .expect("database accepts synthetic pre-upgrade Ironwood tree deletion");
+    assert!(
+        db.ironwood_tree_by_height_range(..=tip_height)
+            .next()
+            .is_none(),
+        "the synthetic pre-upgrade database has no Ironwood trees"
+    );
+
+    let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+    add_ironwood_tree::Upgrade
+        .run(tip_height, &db, &cancel_receiver)
+        .expect("Ironwood tree upgrade succeeds");
+
+    let ironwood_tree = db
+        .ironwood_tree_by_height(&Height::MIN)
+        .expect("upgrade backfills the empty Ironwood tree at the first finalized height");
+    assert_eq!(
+        ironwood_tree.root(),
+        ironwood::tree::NoteCommitmentTree::default().root(),
+        "the backfilled Ironwood tree is empty"
+    );
+    assert!(
+        db.contains_ironwood_anchor(&ironwood_tree.root()),
+        "the backfilled Ironwood tree anchor is indexed"
+    );
+    assert_eq!(
+        db.ironwood_tree_by_height(&Height(1))
+            .expect("earlier finalized heights can read the backfilled Ironwood tree")
+            .root(),
+        ironwood_tree.root()
+    );
+    assert_eq!(
+        add_ironwood_tree::Upgrade
+            .validate(&db, &cancel_receiver)
+            .expect("Ironwood tree upgrade validation is not cancelled"),
+        Ok(())
+    );
 }
 
 #[test]
