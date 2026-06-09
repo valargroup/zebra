@@ -183,10 +183,9 @@ impl StartCmd {
     }
 
     fn zcashd_compat_rpc_url(config: &ZebradConfig) -> Result<String, Report> {
-        let listen_addr = config
-            .zcashd_compat
-            .listen_addr
-            .ok_or_else(|| eyre!("zcashd-compat mode requires zcashd_compat.listen_addr to be set"))?;
+        let listen_addr = config.zcashd_compat.listen_addr.ok_or_else(|| {
+            eyre!("zcashd-compat mode requires zcashd_compat.listen_addr to be set")
+        })?;
         Ok(format!("http://{listen_addr}"))
     }
 
@@ -839,6 +838,19 @@ impl config::Override<ZebradConfig> for StartCmd {
                     Some(Self::zcashd_compat_default_rpc_listen_addr());
             }
 
+            if let (Some(rpc_listen_addr), Some(compat_listen_addr)) =
+                (config.rpc.listen_addr, config.zcashd_compat.listen_addr)
+            {
+                if rpc_listen_addr == compat_listen_addr {
+                    return Err(std::io::Error::other(format!(
+                        "zcashd-compat mode requires different RPC listen addresses: \
+                         rpc.listen_addr={rpc_listen_addr} conflicts with \
+                         zcashd_compat.listen_addr={compat_listen_addr}"
+                    ))
+                    .into());
+                }
+            }
+
             if config.zcashd_compat.manage_zcashd {
                 match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
                     Ok(zcashd_compat::ZcashdBinarySource::Path(path))
@@ -915,6 +927,52 @@ mod tests {
     }
 
     #[test]
+    fn zcashd_compat_flag_rejects_conflicting_rpc_listen_addr() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+        };
+        let mut config = ZebradConfig::default();
+        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.manage_zcashd = false;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat should reject overlapping RPC listen addresses");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires different RPC listen addresses"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_conflicting_rpc_listen_addr() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat should reject overlapping configured RPC listen addresses");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires different RPC listen addresses"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn zcashd_compat_rpc_config_uses_dedicated_cookie_and_min_response_size() {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
@@ -930,7 +988,10 @@ mod tests {
             compat_rpc_config.listen_addr,
             config.zcashd_compat.listen_addr
         );
-        assert_eq!(compat_rpc_config.cookie_dir, config.zcashd_compat.cookie_dir);
+        assert_eq!(
+            compat_rpc_config.cookie_dir,
+            config.zcashd_compat.cookie_dir
+        );
         assert_eq!(
             compat_rpc_config.cookie_file_name,
             config.zcashd_compat.cookie_file_name
