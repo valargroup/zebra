@@ -11,11 +11,6 @@ High-level changes:
   Ironwood-specific personalization strings.
 - From NU7 activation onward, transactions must not have a negative Orchard
   value balance, so new value cannot enter the Orchard pool.
-- V6 transaction IDs use a local ZIP-244-style tree while librustzcash does
-  not support Ironwood fields. The local implementation reuses librustzcash's
-  v5 Sapling and Orchard transaction ID subtree digests.
-
-TODO:
-
-- Route v6 transaction ID computation through librustzcash once librustzcash
-  supports Ironwood.
+- V6 transaction IDs are computed through the patched librustzcash txid path,
+  which includes Ironwood-specific bundle/action hashing in the ZIP-244-style
+  transaction ID tree.
