@@ -210,7 +210,7 @@ config = { workspace = true }
 
 num-integer = { workspace = true }
 rand = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
 
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
