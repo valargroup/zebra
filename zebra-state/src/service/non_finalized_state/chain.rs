@@ -1280,6 +1280,8 @@ impl Chain {
 
             trace!(?height, ?position, ?anchor, "removing ironwood tree");
 
+            // Multiple removals are expected here,
+            // because the anchors only change if a block has shielded transactions.
             assert!(
                 self.ironwood_anchors.remove(&anchor),
                 "Ironwood anchor must be present if block was added to chain"
