@@ -88,7 +88,14 @@ impl SupervisorConfig {
             NetworkKind::Regtest => args.push("-regtest".to_string()),
         }
 
-        args.extend(self.extra_args.iter().cloned());
+        // Always include -printtoconsole and filter it out from extra_args
+        args.push("-printtoconsole".to_string());
+        args.extend(
+            self.extra_args
+                .iter()
+                .filter(|arg| arg.as_str() != "-printtoconsole")
+                .cloned(),
+        );
         args
     }
 }
@@ -455,7 +462,7 @@ mod tests {
             zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
             rpc_url: "http://127.0.0.1:8232".to_string(),
             cookie_path: PathBuf::from("/tmp/.cookie"),
-            extra_args: vec!["-printtoconsole".to_string()],
+            extra_args: vec!["-debug=1".to_string()],
             network: NetworkKind::Regtest,
             startup_delay: std::time::Duration::from_secs(1),
             restart_backoff: std::time::Duration::from_secs(2),
@@ -474,6 +481,7 @@ mod tests {
             .iter()
             .any(|a| a.starts_with("-zebra-compat-cookiefile=/tmp/.cookie")));
         assert!(args.contains(&"-printtoconsole".to_string()));
+        assert!(args.contains(&"-debug=1".to_string()));
     }
 
     #[tokio::test]
