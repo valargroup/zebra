@@ -275,6 +275,13 @@ pub enum ValidateContextError {
         in_finalized_state: bool,
     },
 
+    #[error("ironwood double-spend: duplicate nullifier: {nullifier:?}, in finalized state: {in_finalized_state:?}")]
+    #[non_exhaustive]
+    DuplicateIronwoodNullifier {
+        nullifier: ironwood::Nullifier,
+        in_finalized_state: bool,
+    },
+
     #[error(
         "the remaining value in the transparent transaction value pool MUST be nonnegative:\n\
          {amount_error:?},\n\
