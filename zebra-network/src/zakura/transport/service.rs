@@ -127,21 +127,23 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         ))
     }
 
+    /// Return this service's request/response handler, if it has one.
+    fn as_request_response(&self) -> Option<&dyn RequestResponseService> {
+        None
+    }
+}
+
+/// A Zakura service that accepts one-shot request/response streams.
+pub trait RequestResponseService: Service {
     /// Deliver one request-response request frame to this service.
     fn request_frame<'a>(
         &'a self,
-        _peer_id: ZakuraPeerId,
-        _stream_kind: u16,
-        _request_id: u64,
-        _max_frame_bytes: u32,
-        _frame: Frame,
-    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
-        Box::pin(async {
-            Err(SinkReject::protocol(
-                "service does not accept request frames",
-            ))
-        })
-    }
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        request_id: u64,
+        max_frame_bytes: u32,
+        frame: Frame,
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>>;
 }
 
 /// A per-stream reader owned by a service.

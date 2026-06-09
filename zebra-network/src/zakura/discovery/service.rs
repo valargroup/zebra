@@ -14,14 +14,15 @@ use iroh::NodeId;
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    BoxRunFuture, Frame, FramedRecv, FramedSend, Peer, Service, Sink, SinkReject, Source, Stream,
-    StreamMode, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
+    BoxRunFuture, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, PeerStreamSession,
+    Service, Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES,
+    ZAKURA_CAP_DISCOVERY,
 };
 
 use super::protocol::{
     DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError, ZakuraDiscoveryHandle,
-    ZakuraNodeRecord, MAX_DISCOVERY_RECORDS_PER_RESPONSE, ZAKURA_DISCOVERY_STREAM_VERSION,
-    ZAKURA_STREAM_DISCOVERY,
+    ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+    ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 
 /// Frame message type carrying a discovery payload (matches the native wire).
@@ -43,6 +44,77 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
 /// Service-declared streams for native discovery.
 pub(crate) fn discovery_streams() -> &'static [Stream] {
     &DISCOVERY_SERVICE_STREAMS
+}
+
+/// Cloneable typed sender for one native discovery ordered stream.
+#[derive(Clone, Debug)]
+pub struct DiscoveryPeerSession {
+    peer_id: ZakuraPeerId,
+    send: FramedSend,
+    cancel: CancellationToken,
+}
+
+impl DiscoveryPeerSession {
+    fn new(session: &PeerStreamSession) -> Self {
+        Self {
+            peer_id: session.peer_id().clone(),
+            send: session.sender(),
+            cancel: session.cancel_token(),
+        }
+    }
+
+    /// Authenticated peer identity for this discovery stream.
+    pub fn peer_id(&self) -> &ZakuraPeerId {
+        &self.peer_id
+    }
+
+    /// Peer disconnect/local shutdown cancellation token.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Send this node's signed self-record.
+    pub fn try_send_hello(&self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
+        self.try_send_message(DiscoveryMessage::Hello { record })
+    }
+
+    /// Ask this peer for more peer records.
+    pub fn try_send_get_peers(
+        &self,
+        limit: u16,
+        wanted_services: Vec<ZakuraServiceId>,
+        exclude_node_ids: Vec<NodeId>,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_message(DiscoveryMessage::GetPeers {
+            limit,
+            wanted_services,
+            exclude_node_ids,
+        })
+    }
+
+    /// Send peer records to this peer.
+    pub fn try_send_peers(&self, records: Vec<ZakuraNodeRecord>) -> Result<(), OrderedSendError> {
+        self.try_send_message(DiscoveryMessage::Peers { records })
+    }
+
+    fn try_send_message(&self, message: DiscoveryMessage) -> Result<(), OrderedSendError> {
+        let payload = message
+            .encode()
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        match self.send.try_send(Frame {
+            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
+            flags: 0,
+            payload,
+        }) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_frame)) => {
+                Err(OrderedSendError::Full)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_frame)) => {
+                Err(OrderedSendError::Closed)
+            }
+        }
+    }
 }
 
 /// Native discovery service backed by a [`ZakuraDiscoveryHandle`] runtime.
@@ -81,12 +153,21 @@ impl Service for DiscoveryService {
             // author; drop the stream without registering an exchange.
             return;
         };
-        let cancel = peer.cancel_token();
+        let session = PeerStreamSession::new(
+            peer.id.clone(),
+            ZAKURA_STREAM_DISCOVERY,
+            recv,
+            send,
+            peer.cancel_token(),
+        );
+        let discovery_session = DiscoveryPeerSession::new(&session);
+        let cancel = discovery_session.cancel_token();
+        let (_peer_id, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
 
         let sink = DiscoverySink {
             handle: self.handle.clone(),
             peer_node_id,
-            send: send.clone(),
+            session: discovery_session.clone(),
         };
         let sink_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -107,10 +188,10 @@ impl Service for DiscoveryService {
 
         let source = DiscoverySource {
             handle: self.handle.clone(),
-            cancel,
+            session: discovery_session,
         };
         tokio::spawn(async move {
-            Box::new(source).run(send).await;
+            source.run().await;
         });
     }
 
@@ -125,7 +206,7 @@ impl Service for DiscoveryService {
 struct DiscoverySink {
     handle: ZakuraDiscoveryHandle,
     peer_node_id: NodeId,
-    send: FramedSend,
+    session: DiscoveryPeerSession,
 }
 
 impl Sink for DiscoverySink {
@@ -153,7 +234,7 @@ impl DiscoverySink {
                     .handle
                     .sample_peers(usize::from(limit), &wanted_services, &exclude_node_ids)
                     .await;
-                self.send_message(DiscoveryMessage::Peers { records }).await
+                self.send_peers(records)
             }
             DiscoveryMessage::Peers { records } => {
                 self.handle
@@ -192,52 +273,53 @@ impl DiscoverySink {
         }
     }
 
-    async fn send_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
-        send_discovery_message(&self.send, message).await
+    fn send_peers(&self, records: Vec<ZakuraNodeRecord>) -> Result<(), SinkReject> {
+        match self.session.try_send_peers(records) {
+            Ok(()) | Err(OrderedSendError::Full) => Ok(()),
+            Err(OrderedSendError::Closed) => {
+                Err(SinkReject::local("Zakura discovery send channel closed"))
+            }
+            Err(OrderedSendError::Encode(error)) => Err(SinkReject::local(error)),
+        }
     }
 }
 
 /// Writer half of the discovery stream: periodic self-record gossip + peer asks.
 struct DiscoverySource {
     handle: ZakuraDiscoveryHandle,
-    cancel: CancellationToken,
-}
-
-impl Source for DiscoverySource {
-    fn run(self: Box<Self>, send: FramedSend) -> BoxRunFuture<'static, ()> {
-        Box::pin(async move {
-            if self.exchange(&send).await.is_err() {
-                return;
-            }
-            let refresh = self
-                .handle
-                .refresh_interval()
-                .await
-                .max(MIN_DISCOVERY_REFRESH_INTERVAL);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => return,
-                    _ = tokio::time::sleep(refresh) => {}
-                }
-                if self.exchange(&send).await.is_err() {
-                    return;
-                }
-            }
-        })
-    }
+    session: DiscoveryPeerSession,
 }
 
 impl DiscoverySource {
+    async fn run(self) {
+        if self.exchange().await.is_err() {
+            return;
+        }
+        let refresh = self
+            .handle
+            .refresh_interval()
+            .await
+            .max(MIN_DISCOVERY_REFRESH_INTERVAL);
+        let cancel = self.session.cancel_token();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(refresh) => {}
+            }
+            if self.exchange().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Gossips the current self-record and asks the peer for more peers.
     ///
     /// Returns `Err(())` once the stream's send side is gone, so the caller
     /// stops the periodic loop.
-    async fn exchange(&self, send: &FramedSend) -> Result<(), ()> {
-        let hello = DiscoveryMessage::Hello {
-            record: (*self.handle.current_self_record()).clone(),
-        };
-        send_discovery_message(send, hello).await.map_err(|_| ())?;
+    async fn exchange(&self) -> Result<(), ()> {
+        let record = (*self.handle.current_self_record()).clone();
+        self.handle_send_result(self.session.try_send_hello(record))?;
 
         let limit = self
             .handle
@@ -246,30 +328,28 @@ impl DiscoverySource {
             .min(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         // `peer_sample_limit` is bounded by MAX_DISCOVERY_RECORDS_PER_RESPONSE
         // (<= u16::MAX), so the cast cannot truncate.
-        let get_peers = DiscoveryMessage::GetPeers {
-            limit: limit as u16,
-            wanted_services: Vec::new(),
-            exclude_node_ids: self.handle.peer_sample_exclusions().await,
-        };
-        send_discovery_message(send, get_peers)
-            .await
-            .map_err(|_| ())
+        let exclude_node_ids = self.handle.peer_sample_exclusions().await;
+        self.handle_send_result(self.session.try_send_get_peers(
+            limit as u16,
+            Vec::new(),
+            exclude_node_ids,
+        ))
     }
-}
 
-/// Encodes and sends a discovery message as a transport frame.
-async fn send_discovery_message(
-    send: &FramedSend,
-    message: DiscoveryMessage,
-) -> Result<(), SinkReject> {
-    let payload = message.encode().map_err(SinkReject::local)?;
-    send.send(Frame {
-        message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-        flags: 0,
-        payload,
-    })
-    .await
-    .map_err(|_| SinkReject::local("Zakura discovery send channel closed"))
+    fn handle_send_result(&self, result: Result<(), OrderedSendError>) -> Result<(), ()> {
+        match result {
+            Ok(()) | Err(OrderedSendError::Full) => Ok(()),
+            Err(OrderedSendError::Closed) => Err(()),
+            Err(OrderedSendError::Encode(error)) => {
+                tracing::debug!(
+                    ?error,
+                    peer = ?self.session.peer_id(),
+                    "failed to encode Zakura discovery message"
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Decodes a discovery message from a transport frame, rejecting a frame whose

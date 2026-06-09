@@ -106,6 +106,7 @@ impl HeaderSyncState {
 
 #[derive(Clone, Debug)]
 pub(super) struct PeerHeaderState {
+    pub(super) session: HeaderSyncPeerSession,
     pub(super) advertised_tip: block::Height,
     pub(super) anchor: block::Height,
     pub(super) max_headers_per_response: u32,
@@ -122,6 +123,7 @@ pub(super) struct PeerHeaderState {
 
 impl PeerHeaderState {
     pub(super) fn new(
+        session: HeaderSyncPeerSession,
         anchor: block::Height,
         local_range: u32,
         local_inflight: u16,
@@ -130,6 +132,7 @@ impl PeerHeaderState {
         inbound_new_block_min_interval: Duration,
     ) -> Self {
         Self {
+            session,
             advertised_tip: anchor,
             anchor,
             max_headers_per_response: clamp_advertised_range(local_range),

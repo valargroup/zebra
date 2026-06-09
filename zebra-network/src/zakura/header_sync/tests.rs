@@ -131,7 +131,7 @@ async fn validate_headers_stateless_after_equihash_acceptance(
 
 fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
     HeaderSyncDecodeContext::for_headers_response(
-        HeaderSyncRequestContract::new(block::Height(1), count).unwrap(),
+        ExpectedHeadersResponse::new(block::Height(1), count).unwrap(),
         peer_cap,
     )
 }
@@ -140,6 +140,7 @@ struct ReactorFixture {
     handle: HeaderSyncHandle,
     actions: mpsc::Receiver<HeaderSyncAction>,
     task: JoinHandle<()>,
+    outbound_receivers: Mutex<Vec<crate::zakura::FramedRecv>>,
 }
 
 impl Drop for ReactorFixture {
@@ -265,6 +266,7 @@ fn spawn_test_reactor(startup: HeaderSyncStartup) -> ReactorFixture {
         handle,
         actions,
         task,
+        outbound_receivers: Mutex::new(Vec::new()),
     }
 }
 
@@ -315,9 +317,16 @@ async fn assert_no_commit_or_misbehavior(actions: &mut mpsc::Receiver<HeaderSync
 }
 
 async fn connect_peer(fixture: &ReactorFixture, peer_id: ZakuraPeerId) {
+    let (send, recv) = crate::zakura::framed_channel(32);
+    fixture
+        .outbound_receivers
+        .lock()
+        .expect("test outbound receiver mutex ok")
+        .push(recv);
+    let session = HeaderSyncPeerSession::from_parts(peer_id, send, CancellationToken::new());
     fixture
         .handle
-        .send(HeaderSyncEvent::PeerConnected(peer_id))
+        .send(HeaderSyncEvent::PeerConnected(session))
         .await
         .unwrap();
 }

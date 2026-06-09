@@ -73,15 +73,6 @@ impl ZakuraTestNode {
         self.endpoint.take_header_sync_actions().await
     }
 
-    /// Send one header-sync message through the production stream-5 sender.
-    pub async fn send_header_sync_message(
-        &self,
-        peer: &ZakuraPeerId,
-        msg: crate::zakura::HeaderSyncMessage,
-    ) {
-        self.endpoint.send_header_sync_message(peer, msg).await;
-    }
-
     /// Local limits used by this node.
     pub fn limits(&self) -> &ZakuraLocalLimits {
         &self.limits

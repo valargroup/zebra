@@ -47,11 +47,10 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, drive_header_sync_actions, header_sync_outbound_for_supervisor,
-        send_header_sync_message as send_header_sync_service_message, spawn_header_sync_reactor,
-        Clock, Frame, FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncMessage, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
-        Peer, RealClock, Service, ServiceRegistry, SinkReject, Stream, StreamMode, StreamPrelude,
+        direct_endpoint_builder, drive_header_sync_actions, spawn_header_sync_reactor, Clock,
+        Frame, FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncFrontiers,
+        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
+        Service, ServiceRegistry, SinkReject, Stream, StreamMode, StreamPrelude,
         ZakuraAcceptedLimits, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
         ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
         ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
@@ -450,11 +449,6 @@ impl ZakuraEndpoint {
         if let Some(tasks) = self.header_sync_tasks.as_ref() {
             tasks.tasks.lock().await.push(task);
         }
-    }
-
-    /// Send a stream-5 header-sync message to a registered Zakura peer.
-    pub async fn send_header_sync_message(&self, peer: &ZakuraPeerId, msg: HeaderSyncMessage) {
-        send_header_sync_service_message(&self.supervisor, peer, msg).await;
     }
 
     /// Returns the endpoint's current direct node address.
@@ -1030,15 +1024,14 @@ pub(crate) struct NativeHandshakeNegotiated {
 }
 
 pub(crate) fn service_registry(
-    supervisor: &ZakuraSupervisorHandle,
+    _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone(), discovery_service];
     if let Some(header_sync) = header_sync {
-        let outbound = header_sync_outbound_for_supervisor(supervisor);
-        services.push(Arc::new(HeaderSyncService::new(header_sync, outbound)) as Arc<dyn Service>);
+        services.push(Arc::new(HeaderSyncService::new(header_sync)) as Arc<dyn Service>);
     } else {
         services
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
@@ -3411,9 +3404,9 @@ mod tests {
         protocol::internal::{InventoryResponse, Response},
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
-            HeaderSyncEvent, HeaderSyncMisbehavior, HeaderSyncOutbound, HeaderSyncStatus,
-            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
+            HeaderSyncStatus, LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
         },
     };
     use zebra_chain::{
@@ -3502,6 +3495,16 @@ mod tests {
 
     fn test_peer(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid")
+    }
+
+    fn header_sync_test_session(
+        peer: ZakuraPeerId,
+    ) -> (HeaderSyncPeerSession, crate::zakura::FramedRecv) {
+        let (send, recv) = crate::zakura::framed_channel(32);
+        (
+            HeaderSyncPeerSession::from_parts(peer, send, CancellationToken::new()),
+            recv,
+        )
     }
 
     fn test_discovery_service(supervisor: &ZakuraSupervisorHandle) -> Arc<dyn Service> {
@@ -3666,11 +3669,12 @@ mod tests {
 
         endpoint.shutdown().await;
 
+        let (session, _recv) = header_sync_test_session(
+            ZakuraPeerId::new(vec![5u8; 32]).expect("32-byte node id is valid"),
+        );
         let send_result = tokio::time::timeout(
             Duration::from_secs(1),
-            header_sync.send(HeaderSyncEvent::PeerConnected(
-                ZakuraPeerId::new(vec![5u8; 32]).expect("32-byte node id is valid"),
-            )),
+            header_sync.send(HeaderSyncEvent::PeerConnected(session)),
         )
         .await
         .expect("send returns promptly after header-sync shutdown");
@@ -3695,8 +3699,9 @@ mod tests {
         )?;
         let peer = test_peer(6);
 
+        let (session, _recv) = header_sync_test_session(peer.clone());
         header_sync
-            .send(HeaderSyncEvent::PeerConnected(peer.clone()))
+            .send(HeaderSyncEvent::PeerConnected(session))
             .await?;
         assert!(matches!(
             next_header_sync_action(&mut actions).await,
@@ -3791,7 +3796,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let startup = header_sync_startup(shutdown.clone());
         let (header_sync, _actions, task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync, HeaderSyncOutbound::default());
+        let service = HeaderSyncService::new(header_sync);
         let peer = test_peer(11);
 
         shutdown.cancel();
@@ -3827,8 +3832,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let startup = header_sync_startup(shutdown.clone());
         let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let outbound = HeaderSyncOutbound::default();
-        let service = HeaderSyncService::new(header_sync, outbound.clone());
+        let service = HeaderSyncService::new(header_sync);
         let peer = test_peer(12);
         let cancel_token = CancellationToken::new();
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
@@ -3844,17 +3848,11 @@ mod tests {
             cancel_token.clone(),
         ));
 
-        let queued = Frame {
-            message_type: u16::from(MSG_HS_STATUS),
-            flags: 0,
-            payload: Vec::new(),
-        };
-        outbound.send(&peer, queued.clone()).await?;
         let received = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
             .await
             .expect("header-sync outbound source is immediately ready")
             .expect("header-sync outbound receiver stays open");
-        assert_eq!(received.message_type, queued.message_type);
+        assert_eq!(received.message_type, u16::from(MSG_HS_STATUS));
 
         assert!(matches!(
             next_header_sync_action(&mut actions).await,

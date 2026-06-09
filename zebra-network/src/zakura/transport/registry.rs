@@ -237,8 +237,13 @@ impl ServiceRegistry {
                 "request stream kind is not registered",
             ));
         };
+        let Some(handler) = service.as_request_response() else {
+            return Err(SinkReject::protocol(
+                "service does not accept request frames",
+            ));
+        };
 
-        service
+        handler
             .request_frame(peer_id, stream_kind, request_id, max_frame_bytes, frame)
             .await
     }
