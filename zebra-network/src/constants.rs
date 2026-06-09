@@ -321,6 +321,11 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
+#[cfg(zcash_unstable = "nu7")]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU7 Mainnet.
+#[cfg(not(zcash_unstable = "nu7"))]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_150; // NU6.2 (Mainnet + Testnet).
+
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
 ///
@@ -333,7 +338,8 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 /// This version of Zebra draws the current network protocol version from
 /// [ZIP-255](https://zips.z.cash/zip-0255).
 // TODO: Update this constant to the correct value after NU7 activation (see NU deployment ZIPs),
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_170); // NU7 Mainnet.
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version =
+    Version(CURRENT_NETWORK_PROTOCOL_VERSION_VALUE);
 
 /// The default RTT estimate for peer responses.
 ///
