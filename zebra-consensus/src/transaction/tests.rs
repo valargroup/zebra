@@ -206,7 +206,7 @@ fn empty_utxos() -> HashMap<transparent::OutPoint, transparent::Utxo> {
 
 #[cfg(zcash_unstable = "nu7")]
 #[test]
-fn orchard_is_withdraw_only_after_nu7() {
+fn orchard_rejects_net_deposits_after_nu7() {
     let (network, height) = nu7_test_network_and_height();
 
     let orchard_withdraw = v6_pool_flow_transaction(
@@ -237,6 +237,8 @@ fn orchard_is_withdraw_only_after_nu7() {
         vec![],
     );
 
+    // Zero value balance leaves the Orchard chain pool unchanged, so Orchard
+    // spends and outputs in the same transaction remain valid after NU7.
     assert_eq!(
         check::disabled_add_to_orchard_pool(&orchard_no_flow, height, &network),
         Ok(())
