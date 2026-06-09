@@ -55,6 +55,37 @@ When overriding `zcashd_extra_args` via environment variables, pass a JSON array
 ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-printtoconsole"]'
 ```
 
+## Containers
+
+The standard container image does not enable zcashd-compat or include `zcashd`
+by default. Release builds publish a separate `zfnd/zebra-zcashd-compat` image,
+or you can build a local compat image with:
+
+```console
+docker build -f ./docker/Dockerfile --target runtime \
+  --build-arg ZCASHD_COMPAT_ENABLED=true \
+  --build-arg ZCASHD_COMPAT_RELEASE_TAG=v6.2.1-alpha \
+  --build-arg ZCASHD_COMPAT_SHA256_AMD64=09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c \
+  --build-arg ZCASHD_COMPAT_SHA256_ARM64=133e562f86b4f49dd4e69ad55eb94bdd259c5e8af4fc533ec72b1f39bbbb6927 \
+  --tag zebra:zcashd-compat .
+```
+
+When `ZCASHD_COMPAT_ENABLED=true` is set at build time, the Dockerfile vendors
+a verified `zcashd` binary from the configured zcashd compatibility release. It
+selects the matching runtime archive automatically for `amd64` or `arm64`. To
+use a different artifact URL, pass both `ZCASHD_COMPAT_URL` and
+`ZCASHD_COMPAT_SHA256` instead.
+
+At runtime, enable the vendored binary with:
+
+```console
+ZCASHD_COMPAT_ENABLED=true
+```
+
+The container entrypoint does not set zcashd-compat config by default. If this
+environment variable is set and `/usr/local/bin/zcashd` exists, the entrypoint
+enables zcashd-compat mode and configures Zebra to use that local binary.
+
 If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, but
 does not spawn `zcashd`.
 

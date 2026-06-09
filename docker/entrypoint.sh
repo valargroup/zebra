@@ -14,6 +14,9 @@ set -eo pipefail
 : "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zebra}"
 : "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zebra}"
 
+# Leave zcashd-compat disabled unless the container runtime explicitly opts in.
+# Compat images can set ZCASHD_COMPAT_ENABLED=true to use a vendored
+# /usr/local/bin/zcashd, while still allowing ZEBRA_ZCASHD_COMPAT__* overrides.
 case "${ZCASHD_COMPAT_ENABLED:-}" in
 true | TRUE | 1 | yes | YES | on | ON)
   export ZEBRA_ZCASHD_COMPAT__ENABLED="${ZEBRA_ZCASHD_COMPAT__ENABLED:-true}"
