@@ -62,7 +62,7 @@ ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]
 ## Hardware preflight (Linux)
 
 When zcashd-compat mode is enabled, Zebra runs Linux-only startup preflight checks
-for CPU, effective RAM, and mount-aware disk space.
+for CPU, effective RAM, and mount-aware provisioned disk space.
 
 If zcashd-compat mode is enabled on a non-Linux host, Zebra fails startup by
 default because zcashd-compat is currently Linux-only. You can explicitly bypass
@@ -80,10 +80,10 @@ explicitly accept degraded or unstable operation.
 - CPU: 4 logical CPUs available to the process
 - RAM: 16 GiB effective memory (host memory, constrained by cgroup limits when applicable)
 - Disk:
-  - Zebra state mount: at least 350 GiB available, and at least 500 GiB total capacity
-  - zcashd datadir mount: at least 300 GiB available, and at least 300 GiB total capacity
-  - If Zebra state and zcashd datadir are on the same filesystem, required available
-    space is summed (650 GiB available)
+  - Zebra state mount: at least 300 GiB provisioned capacity
+  - zcashd datadir mount: at least 300 GiB provisioned capacity
+  - If Zebra state and zcashd datadir are on the same filesystem, required
+    provisioned capacity is summed (600 GiB provisioned)
 
 ### Recommended requirements (warn if below)
 

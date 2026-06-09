@@ -34,19 +34,15 @@ const MIN_RAM_BYTES: u64 = 16 * GIB;
 const RECOMMENDED_RAM_BYTES: u64 = 32 * GIB;
 
 #[cfg(target_os = "linux")]
-const MIN_ZEBRA_AVAILABLE_BYTES: u64 = 350 * GIB;
+const MIN_ZEBRA_PROVISIONED_BYTES: u64 = 300 * GIB;
 #[cfg(target_os = "linux")]
-const MIN_ZCASHD_AVAILABLE_BYTES: u64 = 300 * GIB;
-#[cfg(target_os = "linux")]
-const MIN_ZEBRA_TOTAL_BYTES: u64 = 500 * GIB;
-#[cfg(target_os = "linux")]
-const MIN_ZCASHD_TOTAL_BYTES: u64 = 300 * GIB;
+const MIN_ZCASHD_PROVISIONED_BYTES: u64 = 300 * GIB;
 #[cfg(target_os = "linux")]
 const RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
 
 /// Runs zcashd-compat hardware preflight checks.
 ///
-/// On Linux, checks CPU, effective memory and mount-aware disk availability.
+/// On Linux, checks CPU, effective memory and mount-aware disk provisioning.
 /// On non-Linux, startup fails unless `unsafe_low_specs` is explicitly set.
 pub fn run_preflight(
     config: &ZebradConfig,
@@ -95,8 +91,7 @@ impl DiskRole {
 struct PathRequirement {
     role: DiskRole,
     target_path: PathBuf,
-    min_available_bytes: u64,
-    min_total_bytes: u64,
+    min_provisioned_bytes: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -104,10 +99,8 @@ struct PathRequirement {
 struct FilesystemRequirements {
     roles: Vec<DiskRole>,
     target_paths: Vec<PathBuf>,
-    min_available_sum_bytes: u64,
-    min_total_bytes: u64,
-    available_bytes: u64,
-    total_bytes: u64,
+    min_provisioned_sum_bytes: u64,
+    provisioned_bytes: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -214,14 +207,12 @@ fn check_disk(
         PathRequirement {
             role: DiskRole::ZebraState,
             target_path: zebra_cache_dir.to_path_buf(),
-            min_available_bytes: MIN_ZEBRA_AVAILABLE_BYTES,
-            min_total_bytes: MIN_ZEBRA_TOTAL_BYTES,
+            min_provisioned_bytes: MIN_ZEBRA_PROVISIONED_BYTES,
         },
         PathRequirement {
             role: DiskRole::ZcashdData,
             target_path: zcashd_datadir.to_path_buf(),
-            min_available_bytes: MIN_ZCASHD_AVAILABLE_BYTES,
-            min_total_bytes: MIN_ZCASHD_TOTAL_BYTES,
+            min_provisioned_bytes: MIN_ZCASHD_PROVISIONED_BYTES,
         },
     ];
 
@@ -236,37 +227,27 @@ fn evaluate_disk_thresholds(
     summary: &mut PreflightSummary,
     grouped_filesystems: &HashMap<u64, FilesystemRequirements>,
 ) {
-    let combined_total_capacity = grouped_filesystems
+    let combined_provisioned_capacity = grouped_filesystems
         .values()
-        .map(|filesystem| filesystem.total_bytes)
+        .map(|filesystem| filesystem.provisioned_bytes)
         .sum::<u64>();
 
     for filesystem in grouped_filesystems.values() {
-        if filesystem.total_bytes < filesystem.min_total_bytes {
+        if filesystem.provisioned_bytes < filesystem.min_provisioned_sum_bytes {
             summary.errors.push(format!(
-                "{} mount (paths: {}) has total capacity {}, minimum required is {}",
+                "{} mount (paths: {}) has provisioned capacity {}, minimum required is {}",
                 role_labels(&filesystem.roles),
                 display_paths(&filesystem.target_paths),
-                human_gib(filesystem.total_bytes),
-                human_gib(filesystem.min_total_bytes),
-            ));
-        }
-
-        if filesystem.available_bytes < filesystem.min_available_sum_bytes {
-            summary.errors.push(format!(
-                "{} mount (paths: {}) has available space {}, minimum required is {}",
-                role_labels(&filesystem.roles),
-                display_paths(&filesystem.target_paths),
-                human_gib(filesystem.available_bytes),
-                human_gib(filesystem.min_available_sum_bytes),
+                human_gib(filesystem.provisioned_bytes),
+                human_gib(filesystem.min_provisioned_sum_bytes),
             ));
         }
     }
 
-    if combined_total_capacity < RECOMMENDED_COMBINED_TOTAL_BYTES {
+    if combined_provisioned_capacity < RECOMMENDED_COMBINED_TOTAL_BYTES {
         summary.warnings.push(format!(
             "combined zcashd-compat filesystem capacity is {}, recommended is {}",
-            human_gib(combined_total_capacity),
+            human_gib(combined_provisioned_capacity),
             human_gib(RECOMMENDED_COMBINED_TOTAL_BYTES)
         ));
     }
@@ -287,13 +268,12 @@ fn grouped_requirements_by_filesystem(
             )
         })?;
         let device_id = metadata.dev();
-        let (total_bytes, available_bytes) = statvfs_bytes(&probed_path)?;
+        let provisioned_bytes = statvfs_provisioned_bytes(&probed_path)?;
 
         let entry = grouped
             .entry(device_id)
             .or_insert_with(|| FilesystemRequirements {
-                total_bytes,
-                available_bytes,
+                provisioned_bytes,
                 ..FilesystemRequirements::default()
             });
 
@@ -301,10 +281,9 @@ fn grouped_requirements_by_filesystem(
             entry.roles.push(requirement.role);
         }
         entry.target_paths.push(requirement.target_path.clone());
-        entry.min_available_sum_bytes = entry
-            .min_available_sum_bytes
-            .saturating_add(requirement.min_available_bytes);
-        entry.min_total_bytes = entry.min_total_bytes.max(requirement.min_total_bytes);
+        entry.min_provisioned_sum_bytes = entry
+            .min_provisioned_sum_bytes
+            .saturating_add(requirement.min_provisioned_bytes);
     }
 
     Ok(grouped)
@@ -332,7 +311,7 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, Report> {
 }
 
 #[cfg(target_os = "linux")]
-fn statvfs_bytes(path: &Path) -> Result<(u64, u64), Report> {
+fn statvfs_provisioned_bytes(path: &Path) -> Result<u64, Report> {
     let stats = nix::sys::statvfs::statvfs(path).map_err(|error| {
         eyre!(
             "failed to get filesystem stats for {}: {error}",
@@ -341,10 +320,8 @@ fn statvfs_bytes(path: &Path) -> Result<(u64, u64), Report> {
     })?;
 
     let fragment_size = stats.fragment_size();
-    let total_bytes = stats.blocks().saturating_mul(fragment_size);
-    let available_bytes = stats.blocks_available().saturating_mul(fragment_size);
 
-    Ok((total_bytes, available_bytes))
+    Ok(stats.blocks().saturating_mul(fragment_size))
 }
 
 #[cfg(target_os = "linux")]
@@ -527,22 +504,21 @@ fn human_gib(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    #[test]
-    fn merges_available_requirement_when_paths_share_filesystem() {
-        use super::*;
+    use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn merges_provisioned_requirement_when_paths_share_filesystem() {
         let requirements = vec![
             PathRequirement {
                 role: DiskRole::ZebraState,
                 target_path: PathBuf::from("/tmp"),
-                min_available_bytes: MIN_ZEBRA_AVAILABLE_BYTES,
-                min_total_bytes: MIN_ZEBRA_TOTAL_BYTES,
+                min_provisioned_bytes: MIN_ZEBRA_PROVISIONED_BYTES,
             },
             PathRequirement {
                 role: DiskRole::ZcashdData,
                 target_path: PathBuf::from("/tmp"),
-                min_available_bytes: MIN_ZCASHD_AVAILABLE_BYTES,
-                min_total_bytes: MIN_ZCASHD_TOTAL_BYTES,
+                min_provisioned_bytes: MIN_ZCASHD_PROVISIONED_BYTES,
             },
         ];
 
@@ -551,25 +527,20 @@ mod tests {
         let filesystem = grouped.values().next().expect("group should not be empty");
 
         assert_eq!(
-            filesystem.min_available_sum_bytes,
-            MIN_ZEBRA_AVAILABLE_BYTES + MIN_ZCASHD_AVAILABLE_BYTES
+            filesystem.min_provisioned_sum_bytes,
+            MIN_ZEBRA_PROVISIONED_BYTES + MIN_ZCASHD_PROVISIONED_BYTES
         );
-        assert_eq!(filesystem.min_total_bytes, MIN_ZEBRA_TOTAL_BYTES);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_cgroup_max_as_unlimited() {
-        use super::*;
-
         assert_eq!(parse_cgroup_value("max").expect("valid cgroup value"), None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_cgroup_numeric_value() {
-        use super::*;
-
         assert_eq!(
             parse_cgroup_value("17179869184").expect("valid cgroup value"),
             Some(17_179_869_184)
@@ -579,24 +550,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prefers_v1_when_v2_is_unavailable() {
-        use super::*;
-
         assert_eq!(select_cgroup_memory_limit(None, Some(16)), Some(16));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn chooses_tighter_limit_when_both_are_available() {
-        use super::*;
-
         assert_eq!(select_cgroup_memory_limit(Some(32), Some(16)), Some(16));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_v2_and_v1_process_cgroup_paths() {
-        use super::*;
-
         let cgroup = "0::/user.slice/user-1000.slice/session-2.scope\n2:memory:/docker/abcdef";
         let (v2_path, v1_path) = parse_self_cgroup_paths(cgroup);
 
@@ -610,8 +575,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn builds_cgroup_limit_paths_with_root_and_nested_relative_paths() {
-        use super::*;
-
         assert_eq!(
             cgroup_limit_path(Path::new("/sys/fs/cgroup"), "/", "memory.max"),
             PathBuf::from("/sys/fs/cgroup/memory.max")
@@ -628,9 +591,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reports_disk_failures_when_below_minimums() {
-        use super::*;
-
+    fn reports_disk_failure_when_below_minimum_provisioned_capacity() {
         let mut summary = PreflightSummary::default();
         let mut grouped = HashMap::new();
         grouped.insert(
@@ -638,22 +599,21 @@ mod tests {
             FilesystemRequirements {
                 roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
                 target_paths: vec!["/zebra".into(), "/zcashd".into()],
-                min_available_sum_bytes: MIN_ZEBRA_AVAILABLE_BYTES + MIN_ZCASHD_AVAILABLE_BYTES,
-                min_total_bytes: MIN_ZEBRA_TOTAL_BYTES,
-                available_bytes: 200 * GIB,
-                total_bytes: 400 * GIB,
+                min_provisioned_sum_bytes: MIN_ZEBRA_PROVISIONED_BYTES
+                    + MIN_ZCASHD_PROVISIONED_BYTES,
+                provisioned_bytes: 400 * GIB,
             },
         );
 
         evaluate_disk_thresholds(&mut summary, &grouped);
 
-        assert_eq!(summary.errors.len(), 2);
+        assert_eq!(summary.errors.len(), 1);
         assert!(
             summary
                 .errors
                 .iter()
-                .any(|error| error.contains("minimum required")),
-            "expected minimum requirement errors: {:?}",
+                .any(|error| error.contains("provisioned capacity")),
+            "expected provisioned capacity error: {:?}",
             summary.errors
         );
     }
@@ -661,8 +621,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bypass_turns_failures_into_warnings() {
-        use super::*;
-
         let summary = PreflightSummary {
             errors: vec!["cpu below minimum".to_string()],
             warnings: vec!["disk below recommendation".to_string()],
@@ -682,8 +640,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fails_when_below_minimum_without_bypass() {
-        use super::*;
-
         let summary = PreflightSummary {
             errors: vec!["ram below minimum".to_string()],
             warnings: Vec::new(),
