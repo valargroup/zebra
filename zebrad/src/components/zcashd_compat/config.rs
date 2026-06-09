@@ -2,6 +2,17 @@ use std::{path::PathBuf, time::Duration};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
+/// Source selector for Zebra-managed `zcashd` execution.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ZcashdBinarySource {
+    /// Resolve `zcashd` from Zebra's embedded managed release manifest.
+    #[default]
+    Managed,
+    /// Resolve `zcashd` from a local executable path.
+    Path,
+}
+
 /// Configuration for Zebra zcashd-compat mode.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -16,8 +27,15 @@ pub struct Config {
     /// Set this to `false` if `zcashd` is managed externally.
     pub manage_zcashd: bool,
 
-    /// Path to the `zcashd` binary with zcashd-compat support.
-    pub zcashd_path: PathBuf,
+    /// Preferred source for the `zcashd` binary.
+    ///
+    /// If `zcashd_path` is set, that explicit local path overrides this value.
+    pub zcashd_source: ZcashdBinarySource,
+
+    /// Optional explicit path to a local `zcashd` binary with zcashd-compat support.
+    ///
+    /// When set, Zebra uses this path directly and skips managed downloads.
+    pub zcashd_path: Option<PathBuf>,
 
     /// Optional `zcashd` datadir path.
     ///
@@ -63,7 +81,8 @@ impl Default for Config {
         Self {
             enabled: false,
             manage_zcashd: true,
-            zcashd_path: PathBuf::from("zcashd"),
+            zcashd_source: ZcashdBinarySource::Managed,
+            zcashd_path: None,
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
             rpc_url: None,
@@ -101,7 +120,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ZcashdBinarySource};
+
+    #[test]
+    fn defaults_to_managed_source_without_explicit_path() {
+        let config = Config::default();
+        assert_eq!(config.zcashd_source, ZcashdBinarySource::Managed);
+        assert_eq!(config.zcashd_path, None);
+    }
 
     #[test]
     fn deserialize_extra_args_from_sequence() {
