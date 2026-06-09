@@ -352,42 +352,46 @@ impl StartCmd {
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let mut zcashd_compat_task_handle =
-            if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
-                let resolved_zcashd_path = zcashd_compat::resolve_zcashd_binary_path(
-                    &config.zcashd_compat,
-                    &config.state.cache_dir,
-                )?;
-                let supervisor_config = zcashd_compat::SupervisorConfig::new(
-                    &config.zcashd_compat,
-                    resolved_zcashd_path,
-                    &config.state.cache_dir,
-                    config.network.network.kind(),
-                    Self::zcashd_compat_rpc_url(&config)?,
-                    Self::zcashd_compat_cookie_path(&config),
-                );
+        let mut zcashd_compat_task_handle = if config.zcashd_compat.enabled
+            && config.zcashd_compat.manage_zcashd
+        {
+            let zcashd_compat_config = config.zcashd_compat.clone();
+            let state_cache_dir = config.state.cache_dir.clone();
+            let resolved_zcashd_path = tokio::task::spawn_blocking(move || {
+                zcashd_compat::resolve_zcashd_binary_path(&zcashd_compat_config, &state_cache_dir)
+            })
+            .await
+            .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??;
+            let supervisor_config = zcashd_compat::SupervisorConfig::new(
+                &config.zcashd_compat,
+                resolved_zcashd_path,
+                &config.state.cache_dir,
+                config.network.network.kind(),
+                Self::zcashd_compat_rpc_url(&config)?,
+                Self::zcashd_compat_cookie_path(&config),
+            );
 
+            info!(
+                rpc_url = %supervisor_config.rpc_url,
+                cookie_file = %supervisor_config.cookie_path.display(),
+                "zcashd-compat source enabled"
+            );
+
+            tokio::spawn(
+                zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
+                    .in_current_span(),
+            )
+        } else {
+            if config.zcashd_compat.enabled {
                 info!(
-                    rpc_url = %supervisor_config.rpc_url,
-                    cookie_file = %supervisor_config.cookie_path.display(),
-                    "zcashd-compat source enabled"
+                    rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
+                    cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
+                    "zcashd-compat source enabled: zcashd supervision disabled"
                 );
+            }
 
-                tokio::spawn(
-                    zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
-                        .in_current_span(),
-                )
-            } else {
-                if config.zcashd_compat.enabled {
-                    info!(
-                        rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
-                        cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
-                        "zcashd-compat source enabled: zcashd supervision disabled"
-                    );
-                }
-
-                tokio::spawn(std::future::pending().in_current_span())
-            };
+            tokio::spawn(std::future::pending().in_current_span())
+        };
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors

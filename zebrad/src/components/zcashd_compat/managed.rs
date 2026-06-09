@@ -18,6 +18,14 @@ use super::{
 };
 use crate::components::zcashd_compat::supervisor::is_command_resolvable;
 
+/// Maximum time a managed archive download is allowed to take.
+const MANAGED_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Maximum time a process waits for another live process to finish a managed install.
+const INSTALL_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Stale age for legacy lock files that do not contain owner metadata.
+const LEGACY_INSTALL_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const INSTALL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Effective `zcashd` source after local-path overrides are applied.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ZcashdBinarySource {
@@ -108,7 +116,11 @@ fn resolve_managed_zcashd_binary_from_manifest(
         return Ok(binary_path);
     }
 
-    let _lock = acquire_lock(&cache_dir.join(".install.lock"), Duration::from_secs(30))?;
+    let _lock = acquire_lock(
+        &cache_dir.join(".install.lock"),
+        INSTALL_LOCK_WAIT_TIMEOUT,
+        LEGACY_INSTALL_LOCK_STALE_AFTER,
+    )?;
 
     // Re-check after acquiring the lock.
     if binary_path.is_file()
@@ -177,6 +189,7 @@ fn download_archive(url: &str, out: &mut fs::File) -> Result<(), Report> {
 
     let client = Client::builder()
         .redirect(Policy::limited(5))
+        .timeout(MANAGED_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|err| eyre!("failed building managed zcashd HTTP client: {err}"))?;
     let mut response = client
@@ -316,8 +329,12 @@ impl Drop for InstallLock {
 ///
 /// This prevents concurrent zebrad processes from racing archive downloads and
 /// replacing the same cached binary simultaneously.
-fn acquire_lock(lock_path: &Path, timeout: Duration) -> Result<InstallLock, Report> {
-    let mut started = Instant::now();
+fn acquire_lock(
+    lock_path: &Path,
+    wait_timeout: Duration,
+    stale_after: Duration,
+) -> Result<InstallLock, Report> {
+    let started = Instant::now();
     loop {
         match OpenOptions::new()
             .create_new(true)
@@ -335,18 +352,19 @@ fn acquire_lock(lock_path: &Path, timeout: Duration) -> Result<InstallLock, Repo
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if started.elapsed() > timeout {
-                    if remove_stale_lock(lock_path, timeout)? {
-                        started = Instant::now();
-                        continue;
-                    }
+                if remove_stale_lock(lock_path, stale_after)? {
+                    continue;
+                }
 
+                if started.elapsed() >= wait_timeout {
                     return Err(eyre!(
-                        "timed out waiting for managed zcashd installation lock: {}",
-                        lock_path.display()
+                        "timed out after {} seconds waiting for managed zcashd installation lock: {}",
+                        wait_timeout.as_secs(),
+                        lock_path.display(),
                     ));
                 }
-                sleep(Duration::from_millis(250));
+
+                sleep(INSTALL_LOCK_RETRY_DELAY);
             }
             Err(err) => {
                 return Err(eyre!(
@@ -538,8 +556,8 @@ mod tests {
         let lock_path = temp.path().join(".install.lock");
         std::fs::write(&lock_path, "pid=4294967295\n").expect("lock file should write");
 
-        let lock =
-            acquire_lock(&lock_path, Duration::ZERO).expect("dead owner lock should recover");
+        let lock = acquire_lock(&lock_path, Duration::ZERO, Duration::ZERO)
+            .expect("dead owner lock should recover");
         let content = std::fs::read_to_string(&lock_path).expect("lock file should be readable");
 
         assert!(
@@ -560,8 +578,8 @@ mod tests {
         let lock_path = temp.path().join(".install.lock");
         std::fs::write(&lock_path, "").expect("legacy lock file should write");
 
-        let lock =
-            acquire_lock(&lock_path, Duration::ZERO).expect("legacy stale lock should recover");
+        let lock = acquire_lock(&lock_path, Duration::ZERO, Duration::ZERO)
+            .expect("legacy stale lock should recover");
         let content = std::fs::read_to_string(&lock_path).expect("lock file should be readable");
 
         assert!(
@@ -584,13 +602,13 @@ mod tests {
         std::fs::write(&lock_path, format!("pid={}\n", std::process::id()))
             .expect("lock file should write");
 
-        let error = match acquire_lock(&lock_path, Duration::ZERO) {
+        let error = match acquire_lock(&lock_path, Duration::ZERO, Duration::ZERO) {
             Ok(_) => panic!("live owner lock should not be replaced"),
             Err(error) => error,
         };
 
         assert!(
-            error.to_string().contains("timed out waiting"),
+            error.to_string().contains("timed out"),
             "unexpected error: {error}"
         );
         assert!(
