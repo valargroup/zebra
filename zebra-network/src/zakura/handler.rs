@@ -3504,6 +3504,21 @@ mod tests {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid")
     }
 
+    fn test_discovery_service(supervisor: &ZakuraSupervisorHandle) -> Arc<dyn Service> {
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = crate::zakura::discovery::build_discovery_handle(
+            SecretKey::from_bytes(&[7u8; 32]),
+            Vec::new(),
+            crate::zakura::discovery::default_advertised_services(),
+            &handshake,
+            16,
+            0,
+            supervisor.subscribe(),
+        )
+        .expect("test discovery handle builds");
+        Arc::new(crate::zakura::DiscoveryService::new(handle)) as Arc<dyn Service>
+    }
+
     fn header_sync_startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         let network = Network::Mainnet;
         let anchor = (block::Height(0), network.genesis_hash());
@@ -3672,7 +3687,12 @@ mod tests {
         let (header_sync, mut actions, task) = spawn_header_sync_reactor(startup)?;
         let recorder = Arc::new(RecordingService::default());
         let supervisor = ZakuraSupervisorHandle::new(1);
-        let registry = service_registry(&supervisor, Some(header_sync.clone()), recorder.clone())?;
+        let registry = service_registry(
+            &supervisor,
+            Some(header_sync.clone()),
+            recorder.clone(),
+            test_discovery_service(&supervisor),
+        )?;
         let peer = test_peer(6);
 
         header_sync
@@ -3863,6 +3883,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             Arc::new(RecordingService::default()),
+            test_discovery_service(&supervisor),
         )?;
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
