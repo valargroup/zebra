@@ -580,6 +580,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_state = obj.sapling().commitments().final_state().clone();
     let orchard_final_state = obj.orchard().commitments().final_state().clone();
+    let ironwood_final_state = obj.ironwood().commitments().final_state().clone();
     let sprout_final_root = obj
         .sprout()
         .as_ref()
@@ -589,6 +590,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_root = obj.sapling().commitments().final_root().clone();
     let orchard_final_root = obj.orchard().commitments().final_root().clone();
+    let ironwood_final_root = obj.ironwood().commitments().final_root().clone();
 
     let new_obj = GetTreestateResponse::new(
         hash,
@@ -600,6 +602,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         ))),
         Treestate::new(Commitments::new(sapling_final_root, sapling_final_state)),
         Treestate::new(Commitments::new(orchard_final_root, orchard_final_state)),
+        Treestate::new(Commitments::new(ironwood_final_root, ironwood_final_state)),
     );
 
     assert_eq!(obj, new_obj);
@@ -633,12 +636,30 @@ fn test_z_get_subtrees_by_index() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         NoteCommitmentSubtreeIndex(start_index),
         vec![SubtreeRpcData {
-            root: subtree_root,
+            root: subtree_root.clone(),
             end_height: zebra_chain::block::Height(subtree_end_height),
         }],
     );
 
     assert_eq!(obj, new_obj);
+
+    let ironwood_json = r#"
+{
+  "pool": "ironwood",
+  "start_index": 0,
+  "subtrees": [
+    {
+      "root": "d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b",
+      "end_height": 1707429
+    }
+  ]
+}
+"#;
+    let ironwood_obj: GetSubtreesByIndexResponse = serde_json::from_str(ironwood_json)?;
+
+    assert_eq!(ironwood_obj.pool(), "ironwood");
+    assert_eq!(ironwood_obj.subtrees()[0].root, subtree_root);
+    assert_eq!(ironwood_obj.subtrees()[0].end_height.0, subtree_end_height);
 
     Ok(())
 }
