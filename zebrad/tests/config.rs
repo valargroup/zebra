@@ -215,7 +215,10 @@ fn config_zcashd_compat_source_and_path_env() {
     env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH", "/usr/local/bin/zcashd");
 
     let config = ZebradConfig::load(None).expect("load config with zcashd compat env vars");
-    assert_eq!(config.zcashd_compat.zcashd_source, ConfigZcashdBinarySource::Path);
+    assert_eq!(
+        config.zcashd_compat.zcashd_source,
+        ConfigZcashdBinarySource::Path
+    );
     assert_eq!(
         config.zcashd_compat.zcashd_path,
         Some(PathBuf::from("/usr/local/bin/zcashd"))
