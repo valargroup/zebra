@@ -142,8 +142,8 @@ include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 // https://github.com/ZcashFoundation/zebra/issues/10320
 pub(super) const PARAM_VERBOSE_DESC: &str =
     "Boolean flag to indicate verbosity, true for a json object, false for hex encoded data.";
-pub(super) const PARAM_POOL_DESC: &str =
-    "The pool from which subtrees should be returned. Either \"sapling\" or \"orchard\".";
+pub(super) const PARAM_POOL_DESC: &str = "The pool from which subtrees should be returned. \
+Either \"sapling\", \"orchard\", or \"ironwood\".";
 pub(super) const PARAM_START_INDEX_DESC: &str =
     "The index of the first 2^16-leaf subtree to return.";
 pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to return.";
@@ -360,7 +360,7 @@ pub trait Rpc {
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
 
-    /// Returns information about a range of Sapling or Orchard subtrees.
+    /// Returns information about a range of shielded subtrees.
     ///
     /// zcashd reference: [`z_getsubtreesbyindex`](https://zcash.github.io/rpc/z_getsubtreesbyindex.html) - TODO: fix link
     /// method: post
@@ -368,7 +368,8 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `pool`: (string, required) The pool from which subtrees should be returned. Either "sapling" or "orchard".
+    /// - `pool`: (string, required) The pool from which subtrees should be returned.
+    ///   Either "sapling", "orchard", or "ironwood".
     /// - `start_index`: (number, required) The index of the first 2^16-leaf subtree to return.
     /// - `limit`: (number, optional) The maximum number of subtree values to return.
     ///
@@ -1956,6 +1957,30 @@ where
         let (orchard_tree, orchard_root) =
             orchard.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
+        #[cfg(zcash_unstable = "nu7")]
+        let ironwood = if network.is_nu_active(consensus::NetworkUpgrade::Nu7, height.into()) {
+            match read_state
+                .ready()
+                .and_then(|service| {
+                    service.call(zebra_state::ReadRequest::IronwoodTree(hash.into()))
+                })
+                .await
+                .map_misc_error()?
+            {
+                zebra_state::ReadResponse::IronwoodTree(tree) => {
+                    tree.map(|t| (t.to_rpc_bytes(), t.root().bytes_in_display_order().to_vec()))
+                }
+                _ => unreachable!("unmatched response to an Ironwood tree request"),
+            }
+        } else {
+            None
+        };
+        #[cfg(not(zcash_unstable = "nu7"))]
+        let ironwood = None;
+
+        let (ironwood_tree, ironwood_root) =
+            ironwood.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
+
         Ok(GetTreestateResponse::new(
             hash,
             height,
@@ -1965,6 +1990,7 @@ where
             None,
             Treestate::new(trees::Commitments::new(sapling_root, sapling_tree)),
             Treestate::new(trees::Commitments::new(orchard_root, orchard_tree)),
+            Treestate::new(trees::Commitments::new(ironwood_root, ironwood_tree)),
         ))
     }
 
@@ -1976,7 +2002,7 @@ where
     ) -> Result<GetSubtreesByIndexResponse> {
         let mut read_state = self.read_state.clone();
 
-        const POOL_LIST: &[&str] = &["sapling", "orchard"];
+        const POOL_LIST: &[&str] = &["sapling", "orchard", "ironwood"];
 
         if pool == "sapling" {
             let request = zebra_state::ReadRequest::SaplingSubtrees { start_index, limit };
@@ -2014,6 +2040,32 @@ where
 
             let subtrees = match response {
                 zebra_state::ReadResponse::OrchardSubtrees(subtrees) => subtrees,
+                _ => unreachable!("unmatched response to a subtrees request"),
+            };
+
+            let subtrees = subtrees
+                .values()
+                .map(|subtree| SubtreeRpcData {
+                    root: subtree.root.encode_hex(),
+                    end_height: subtree.end_height,
+                })
+                .collect();
+
+            Ok(GetSubtreesByIndexResponse {
+                pool,
+                start_index,
+                subtrees,
+            })
+        } else if pool == "ironwood" {
+            let request = zebra_state::ReadRequest::IronwoodSubtrees { start_index, limit };
+            let response = read_state
+                .ready()
+                .and_then(|service| service.call(request))
+                .await
+                .map_misc_error()?;
+
+            let subtrees = match response {
+                zebra_state::ReadResponse::IronwoodSubtrees(subtrees) => subtrees,
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 

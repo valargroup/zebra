@@ -1068,6 +1068,24 @@ impl Chain {
             .map(|(index, subtree)| subtree.with_index(*index))
     }
 
+    /// Returns a list of Ironwood [`NoteCommitmentSubtree`]s in the provided range.
+    ///
+    /// Unlike the finalized state and `ReadRequest::IronwoodSubtrees`, the returned subtrees
+    /// can start after `start_index`. These subtrees are continuous up to the tip.
+    ///
+    /// There is no API for retrieving single subtrees by index, because it can accidentally be
+    /// used to create an inconsistent list of subtrees after concurrent non-finalized and
+    /// finalized updates.
+    pub fn ironwood_subtrees_in_range(
+        &self,
+        range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
+    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
+        self.ironwood_subtrees
+            .range(range)
+            .map(|(index, subtree)| (*index, *subtree))
+            .collect()
+    }
+
     /// Returns the Ironwood [`NoteCommitmentSubtree`] if it was completed at the tip height.
     pub fn ironwood_subtree_for_tip(&self) -> Option<NoteCommitmentSubtree<ironwood::tree::Node>> {
         if !self.is_empty() {

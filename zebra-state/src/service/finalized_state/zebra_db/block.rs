@@ -21,7 +21,7 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
@@ -252,6 +252,18 @@ impl ZebraDb {
         let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
 
         self.orchard_tree_by_height(&height)
+    }
+
+    /// Returns the Ironwood [`note commitment tree`](ironwood::tree::NoteCommitmentTree)
+    /// specified by a hash or height, if it exists in the finalized state.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn ironwood_tree_by_hash_or_height(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+
+        self.ironwood_tree_by_height(&height)
     }
 
     // Read tip block methods
