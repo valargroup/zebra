@@ -51,7 +51,10 @@ pub fn effective_zcashd_source(config: &Config) -> Result<ZcashdBinarySource, Re
 }
 
 /// Resolves and validates the `zcashd` executable path.
-pub fn resolve_zcashd_binary_path(config: &Config, state_cache_dir: &Path) -> Result<PathBuf, Report> {
+pub fn resolve_zcashd_binary_path(
+    config: &Config,
+    state_cache_dir: &Path,
+) -> Result<PathBuf, Report> {
     match effective_zcashd_source(config)? {
         ZcashdBinarySource::Path(path) => {
             if !is_command_resolvable(&path) {
@@ -83,14 +86,12 @@ fn resolve_managed_zcashd_binary_from_manifest(
         )
     })?;
 
-    let artifact = manifest
-        .artifact_for_target(target)
-        .ok_or_else(|| {
-            eyre!(
-                "no managed zcashd release is configured for target {target}; \
+    let artifact = manifest.artifact_for_target(target).ok_or_else(|| {
+        eyre!(
+            "no managed zcashd release is configured for target {target}; \
                  set zcashd_compat.zcashd_path to a local zcashd binary"
-            )
-        })?;
+        )
+    })?;
 
     let cache_dir = state_cache_dir
         .join("zcashd-compat")
@@ -101,14 +102,18 @@ fn resolve_managed_zcashd_binary_from_manifest(
 
     let binary_path = cache_dir.join("zcashd");
     let provenance_path = cache_dir.join("zcashd.sha256");
-    if binary_path.is_file() && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)? {
+    if binary_path.is_file()
+        && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)?
+    {
         return Ok(binary_path);
     }
 
     let _lock = acquire_lock(&cache_dir.join(".install.lock"), Duration::from_secs(30))?;
 
     // Re-check after acquiring the lock.
-    if binary_path.is_file() && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)? {
+    if binary_path.is_file()
+        && provenance_matches(&provenance_path, artifact.runtime_archive_sha256)?
+    {
         return Ok(binary_path);
     }
 
@@ -138,7 +143,10 @@ fn resolve_managed_zcashd_binary_from_manifest(
             err.error
         )
     })?;
-    fs::write(&provenance_path, format!("{}\n", artifact.runtime_archive_sha256))?;
+    fs::write(
+        &provenance_path,
+        format!("{}\n", artifact.runtime_archive_sha256),
+    )?;
 
     Ok(binary_path)
 }
@@ -150,7 +158,8 @@ fn resolve_managed_zcashd_binary_from_manifest(
 /// - redirects must remain HTTPS;
 /// - tests may use localhost HTTP endpoints.
 fn download_archive(url: &str, out: &mut fs::File) -> Result<(), Report> {
-    let parsed = Url::parse(url).map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err}"))?;
+    let parsed =
+        Url::parse(url).map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err}"))?;
     if parsed.scheme() != "https" {
         #[cfg(test)]
         let localhost_http = parsed.scheme() == "http"
@@ -223,12 +232,7 @@ fn extract_archive_member_to_path(
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let candidate = normalize_member_path(
-            &entry
-                .path()?
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let candidate = normalize_member_path(&entry.path()?.to_string_lossy().into_owned());
         if candidate == requested {
             entry
                 .unpack(destination)
@@ -460,7 +464,8 @@ mod tests {
         let binary_contents = b"#!/bin/sh\necho zcashd-compat-test\n";
 
         {
-            let file = std::fs::File::create(&archive_path).expect("archive file should be created");
+            let file =
+                std::fs::File::create(&archive_path).expect("archive file should be created");
             let encoder = GzEncoder::new(file, Compression::default());
             let mut tar = Builder::new(encoder);
 
@@ -478,7 +483,9 @@ mod tests {
         let archive_bytes = std::fs::read(&archive_path).expect("archive bytes should be readable");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have local address");
+        let address = listener
+            .local_addr()
+            .expect("listener should have local address");
         let payload = archive_bytes.clone();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("one client should connect");
