@@ -1830,8 +1830,8 @@ impl Chain {
             // Shielded-data updates run before the transparent updates and
             // the `tx_loc_by_hash` insert so that a duplicate transaction
             // (same hash → same nullifiers) is rejected with a clean
-            // `Duplicate{Sprout|Sapling|Orchard}Nullifier` error by
-            // `add_to_non_finalized_chain_unique` before reaching the
+            // `Duplicate{Sprout|Sapling|Orchard|Ironwood}Nullifier` error by
+            // the nullifier insertion helpers before reaching the
             // defense-in-depth assertions on `tx_loc_by_hash`,
             // `created_utxos`, and `spent_utxos` below.
             {
@@ -1849,7 +1849,7 @@ impl Chain {
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
                 if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                    check::nullifier::add_to_non_finalized_chain_unique(
+                    check::nullifier::add_ironwood_to_non_finalized_chain_unique(
                         &mut self.ironwood_nullifiers,
                         ironwood_shielded_data.nullifiers(),
                         transaction_hash,
