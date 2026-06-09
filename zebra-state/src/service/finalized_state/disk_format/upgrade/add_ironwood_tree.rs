@@ -23,17 +23,17 @@ impl DiskFormatUpgrade for Upgrade {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: Height,
+        _initial_tip_height: Height,
         db: &ZebraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), CancelFormatChange> {
-        if has_ironwood_tree(db, initial_tip_height) {
+        if has_ironwood_tree_at_or_before(db, Height::MIN) {
             return Ok(());
         }
 
         let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
         let mut batch = DiskWriteBatch::new();
-        batch.create_ironwood_tree(db, &initial_tip_height, &ironwood_tree);
+        batch.create_ironwood_tree(db, &Height::MIN, &ironwood_tree);
 
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
             return Err(CancelFormatChange);
@@ -54,6 +54,12 @@ impl DiskFormatUpgrade for Upgrade {
             return Ok(Ok(()));
         };
 
+        if !has_ironwood_tree_at_or_before(db, Height::MIN) {
+            return Ok(Err(
+                "missing Ironwood note commitment tree for the first finalized height".to_string(),
+            ));
+        }
+
         let Some((_height, ironwood_tree)) = db.ironwood_tree_by_height_range(..=tip_height).last()
         else {
             return Ok(Err(format!(
@@ -71,8 +77,6 @@ impl DiskFormatUpgrade for Upgrade {
     }
 }
 
-fn has_ironwood_tree(db: &ZebraDb, tip_height: Height) -> bool {
-    db.ironwood_tree_by_height_range(..=tip_height)
-        .next()
-        .is_some()
+fn has_ironwood_tree_at_or_before(db: &ZebraDb, height: Height) -> bool {
+    db.ironwood_tree_by_height_range(..=height).next().is_some()
 }
