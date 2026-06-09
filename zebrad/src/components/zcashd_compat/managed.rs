@@ -583,8 +583,10 @@ mod tests {
         std::fs::write(&lock_path, format!("pid={}\n", std::process::id()))
             .expect("lock file should write");
 
-        let error = acquire_lock(&lock_path, Duration::ZERO)
-            .expect_err("live owner lock should not be replaced");
+        let error = match acquire_lock(&lock_path, Duration::ZERO) {
+            Ok(_) => panic!("live owner lock should not be replaced"),
+            Err(error) => error,
+        };
 
         assert!(
             error.to_string().contains("timed out waiting"),
