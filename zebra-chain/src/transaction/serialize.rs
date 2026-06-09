@@ -1112,7 +1112,7 @@ impl ZcashDeserialize for Transaction {
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
                 let ironwood_shielded_data = (&mut limited_reader).zcash_deserialize_into()?;
 
-                Ok(Transaction::V6 {
+                let tx = Transaction::V6 {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1121,7 +1121,11 @@ impl ZcashDeserialize for Transaction {
                     sapling_shielded_data,
                     orchard_shielded_data,
                     ironwood_shielded_data,
-                })
+                };
+
+                tx.to_librustzcash(network_upgrade)?;
+
+                Ok(tx)
             }
             (_, _) => Err(SerializationError::Parse("bad tx header")),
         }
