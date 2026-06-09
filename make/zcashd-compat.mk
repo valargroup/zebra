@@ -1,4 +1,6 @@
 .PHONY: \
+	compat-docker-build \
+	compat-docker-start \
 	compat-zebrad-start-supervised-managed \
 	compat-zebrad-start-supervised \
 	compat-zebrad-start-unsupervised \
@@ -19,8 +21,38 @@ ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
 
-ZEBRA_COOKIE_FILE ?= $(HOME)/.cache/zebra/.zcashd-compat.cookie
+ZEBRA_COOKIE_FILE ?= $(ZEBRA_STATE_CACHE_DIR)/.zcashd-compat.cookie
 HEIGHT_MAX_DRIFT ?= 10
+
+ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
+ZCASHD_COMPAT_URL ?= https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz
+ZCASHD_COMPAT_SHA256 ?= 09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c
+
+compat-docker-build:
+	@echo "Building Docker zcashd-compat image..."
+	docker build -f ./docker/Dockerfile --target runtime \
+		--build-arg ZCASHD_COMPAT_ENABLED=true \
+		--build-arg ZCASHD_COMPAT_URL="$(ZCASHD_COMPAT_URL)" \
+		--build-arg ZCASHD_COMPAT_SHA256="$(ZCASHD_COMPAT_SHA256)" \
+		--tag "$(ZEBRA_DOCKER_IMAGE)" .
+
+compat-docker-start:
+	@echo "Starting Docker zcashd-compat container..."
+	docker run --rm -it \
+		-e ZCASHD_COMPAT_ENABLED=true \
+		-e ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
+		-e ZEBRA_NETWORK__LISTEN_ADDR="[::]:18233" \
+		-e ZEBRA_STATE__CACHE_DIR="/home/zebra/.cache/zebra" \
+		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
+		-e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR="0.0.0.0:28232" \
+		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
+		--mount type=bind,src="$(ZEBRA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zebra" \
+		--mount type=bind,src="$(ZCASHD_DATADIR)",dst="/home/zebra/.cache/zcashd" \
+		-p 18233:18233 \
+		-p 127.0.0.1:28232:28232 \
+		-p 127.0.0.1:18242:18242 \
+		"$(ZEBRA_DOCKER_IMAGE)" \
+		zebrad start --zcashd-compat
 
 compat-zebrad-start-supervised-managed:
 	@echo "Starting zebrad in zcashd-compat mode with managed zcashd download..."
