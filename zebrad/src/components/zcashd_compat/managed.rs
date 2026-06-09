@@ -232,7 +232,8 @@ fn extract_archive_member_to_path(
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let candidate = normalize_member_path(&entry.path()?.to_string_lossy().into_owned());
+        let entry_path = entry.path()?;
+        let candidate = normalize_member_path(entry_path.to_string_lossy().as_ref());
         if candidate == requested {
             entry
                 .unpack(destination)
