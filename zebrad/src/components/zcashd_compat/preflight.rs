@@ -364,8 +364,10 @@ fn meminfo_total_bytes() -> Result<u64, Report> {
 
 #[cfg(target_os = "linux")]
 fn cgroup_memory_limit_bytes() -> Result<Option<u64>, Report> {
-    parse_cgroup_limit("/sys/fs/cgroup/memory.max")
-        .or_else(|_| parse_cgroup_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    let v2_limit = parse_cgroup_limit("/sys/fs/cgroup/memory.max")?;
+    let v1_limit = parse_cgroup_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
+
+    Ok(select_cgroup_memory_limit(v2_limit, v1_limit))
 }
 
 #[cfg(target_os = "linux")]
@@ -391,6 +393,16 @@ fn parse_cgroup_limit(path: &str) -> Result<Option<u64>, Report> {
     }
 
     Ok(Some(parsed_limit))
+}
+
+#[cfg(target_os = "linux")]
+fn select_cgroup_memory_limit(v2_limit: Option<u64>, v1_limit: Option<u64>) -> Option<u64> {
+    match (v2_limit, v1_limit) {
+        (Some(v2), Some(v1)) => Some(v2.min(v1)),
+        (Some(v2), None) => Some(v2),
+        (None, Some(v1)) => Some(v1),
+        (None, None) => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -466,6 +478,22 @@ mod tests {
             parse_cgroup_value("17179869184").expect("valid cgroup value"),
             Some(17_179_869_184)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prefers_v1_when_v2_is_unavailable() {
+        use super::*;
+
+        assert_eq!(select_cgroup_memory_limit(None, Some(16)), Some(16));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chooses_tighter_limit_when_both_are_available() {
+        use super::*;
+
+        assert_eq!(select_cgroup_memory_limit(Some(32), Some(16)), Some(16));
     }
 
     #[cfg(target_os = "linux")]
