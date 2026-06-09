@@ -8,10 +8,10 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 pub struct Config {
     /// Enables zcashd-compat mode.
     ///
-    /// zcashd-compat mode configures Zebra RPC defaults for a local `zcashd -unity` process.
+    /// zcashd-compat mode configures Zebra RPC defaults for a local `zcashd -zebra-compat` process.
     pub enabled: bool,
 
-    /// Whether Zebra should spawn and supervise a `zcashd -unity` child process.
+    /// Whether Zebra should spawn and supervise a `zcashd -zebra-compat` child process.
     ///
     /// Set this to `false` if `zcashd` is managed externally.
     pub manage_zcashd: bool,
@@ -33,7 +33,7 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]
     pub zcashd_extra_args: Vec<String>,
 
-    /// Optional RPC URL passed to `zcashd` via `-unityzebra`.
+    /// Optional RPC URL passed to `zcashd` via `-zebra-compat-url`.
     ///
     /// If unset, Zebra derives the URL from `rpc.listen_addr`.
     pub rpc_url: Option<String>,

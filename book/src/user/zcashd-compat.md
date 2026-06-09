@@ -1,7 +1,7 @@
 # zcashd-compat Mode (`zebrad start --zcashd-compat`)
 
 zcashd-compat mode runs Zebra as the consensus source and optionally supervises a
-`zcashd -unity` child process that uses Zebra's RPC endpoint for chain data,
+`zcashd -zebra-compat` child process that uses Zebra's RPC endpoint for chain data,
 mempool data, and transaction forwarding.
 
 ## What zcashd-compat mode does
@@ -18,14 +18,14 @@ Zebra:
 - ensures an RPC listen address is configured (defaults to `127.0.0.1:8232`);
 - forces cookie auth on (`rpc.enable_cookie_auth = true`);
 - raises `rpc.max_response_body_size` if needed for large zcashd-compat batches;
-- optionally spawns and supervises `zcashd -unity`.
+- optionally spawns and supervises `zcashd -zebra-compat`.
 
 If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
 
 ```text
--unity
--unityzebra=<rpc_url>
--unityzebracookiefile=<rpc.cookie_dir>/.cookie
+-zebra-compat
+-zebra-compat-url=<rpc_url>
+-zebra-compat-cookiefile=<rpc.cookie_dir>/.cookie
 -datadir=<zcashd_compat.zcashd_datadir or state.cache_dir/zcashd-compat-zcashd>
 [-testnet | -regtest]
 ```
@@ -74,13 +74,13 @@ zebrad start --zcashd-compat
 
 1. Confirm the startup log banner shows the zcashd-compat RPC URL and cookie file.
 
-2. Use `zcash-cli getunityinfo` to verify Zebra identity and readiness.
+2. Use `zcash-cli getzebracompatinfo` to verify Zebra identity and readiness.
 
 3. Generate blocks via Zebra RPC (`generate`) and verify `zcashd` follows.
 
 ## Notes
 
-- `zcashd -unity` talks to Zebra over RPC, not over peer-to-peer connections.
+- `zcashd -zebra-compat` talks to Zebra over RPC, not over peer-to-peer connections.
 - On shutdown, Zebra sends SIGTERM to the supervised `zcashd`, then SIGKILL
   after `shutdown_grace_period` if needed.
 - Regtest interoperability can depend on matching assumptions between Zebra and
