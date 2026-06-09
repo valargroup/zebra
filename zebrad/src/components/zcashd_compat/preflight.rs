@@ -47,7 +47,7 @@ const RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
 /// Runs zcashd-compat hardware preflight checks.
 ///
 /// On Linux, checks CPU, effective memory and mount-aware disk availability.
-/// On other platforms, this is a no-op.
+/// On non-Linux, startup fails unless `unsafe_low_specs` is explicitly set.
 pub fn run_preflight(
     config: &ZebradConfig,
     unsafe_low_specs: bool,
@@ -60,9 +60,16 @@ pub fn run_preflight(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (config, unsafe_low_specs);
-        Err(color_eyre::eyre::eyre!(
-            "zcashd-compat mode is supported on Linux only"
-        ))
+        let message = "zcashd-compat mode is supported on Linux only";
+
+        if unsafe_low_specs {
+            tracing::warn!(
+                "{message}. continuing because --unsafe-low-specs was explicitly provided"
+            );
+            Ok(())
+        } else {
+            Err(color_eyre::eyre::eyre!(message))
+        }
     }
 }
 

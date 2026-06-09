@@ -60,6 +60,10 @@ ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-printtoco
 When zcashd-compat mode is enabled, Zebra runs Linux-only startup preflight checks
 for CPU, effective RAM, and mount-aware disk space.
 
+If zcashd-compat mode is enabled on a non-Linux host, Zebra fails startup by
+default because zcashd-compat is currently Linux-only. You can explicitly bypass
+this guardrail with `--unsafe-low-specs`.
+
 If hardware is below minimum requirements, Zebra fails closed by default.
 If hardware is below recommended requirements but above minimums, Zebra logs
 explicit warnings and continues.
