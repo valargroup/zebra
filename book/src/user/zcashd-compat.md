@@ -41,7 +41,7 @@ manage_zcashd = true
 zcashd_source = "managed"                            # "managed" or "path"
 zcashd_path = "/path/to/local/zcashd"               # optional explicit override
 zcashd_datadir = "/path/to/zcashd/datadir"          # optional
-zcashd_extra_args = ["-printtoconsole"]             # optional
+zcashd_extra_args = ["-debug=1"]                    # optional extra args
 listen_addr = "127.0.0.1:28232"                     # optional, default set when zcashd-compat is enabled
 cookie_dir = "/path/to/cookies"                     # optional, defaults to <cache_dir>
 cookie_file_name = ".zcashd-compat.cookie"          # optional, defaults to ".zcashd-compat.cookie"
@@ -54,8 +54,10 @@ shutdown_grace_period = "10s"
 When overriding `zcashd_extra_args` via environment variables, pass a JSON array string:
 
 ```console
-ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-printtoconsole"]'
+ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'
 ```
+
+`zebrad` always adds `-printtoconsole` automatically for supervised `zcashd`.
 
 ## Hardware preflight (Linux)
 
