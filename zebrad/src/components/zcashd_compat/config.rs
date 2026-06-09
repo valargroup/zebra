@@ -1,6 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use zebra_chain::common::default_cache_dir;
 
 /// Source selector for Zebra-managed `zcashd` execution.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Default)]
@@ -51,10 +52,16 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]
     pub zcashd_extra_args: Vec<String>,
 
-    /// Optional RPC URL passed to `zcashd` via `-zebra-compat-url`.
+    /// Dedicated RPC listen address used by `zcashd -zebra-compat`.
     ///
-    /// If unset, Zebra derives the URL from `rpc.listen_addr`.
-    pub rpc_url: Option<String>,
+    /// If unset, zcashd-compat startup defaults it to `127.0.0.1:28232`.
+    pub listen_addr: Option<SocketAddr>,
+
+    /// The directory where Zebra stores zcashd-compat RPC cookies.
+    ///
+    /// This is separate from the standard `[rpc].cookie_dir` to keep
+    /// zcashd-compat authentication isolated.
+    pub cookie_dir: PathBuf,
 
     /// Delay before the first `zcashd` spawn attempt.
     #[serde(with = "humantime_serde")]
@@ -85,7 +92,8 @@ impl Default for Config {
             zcashd_path: None,
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
-            rpc_url: None,
+            listen_addr: None,
+            cookie_dir: default_cache_dir().join("zcashd-compat-rpc"),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 10,
@@ -127,6 +135,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.zcashd_source, ZcashdBinarySource::Managed);
         assert_eq!(config.zcashd_path, None);
+        assert_eq!(config.listen_addr, None);
+        assert!(config.cookie_dir.ends_with("zcashd-compat-rpc"));
     }
 
     #[test]
@@ -180,4 +190,5 @@ mod tests {
             "error should explain expected format: {error_message}"
         );
     }
+
 }

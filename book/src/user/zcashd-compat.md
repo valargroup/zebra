@@ -15,9 +15,9 @@ zebrad start --zcashd-compat
 Zebra:
 
 - enables zcashd-compat mode (`[zcashd_compat].enabled = true`);
-- ensures an RPC listen address is configured (defaults to `127.0.0.1:8232`);
-- forces cookie auth on (`rpc.enable_cookie_auth = true`);
-- raises `rpc.max_response_body_size` if needed for large zcashd-compat batches;
+- ensures a dedicated zcashd-compat RPC listen address is configured (defaults to `127.0.0.1:28232`);
+- uses dedicated cookie auth at `zcashd_compat.cookie_dir/.cookie`;
+- raises the zcashd-compat RPC `max_response_body_size` if needed for large batched block responses;
 - optionally spawns and supervises `zcashd -zebra-compat`.
 
 If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
@@ -25,7 +25,7 @@ If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
 ```text
 -zebra-compat
 -zebra-compat-url=<rpc_url>
--zebra-compat-cookiefile=<rpc.cookie_dir>/.cookie
+-zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/.cookie
 -datadir=<zcashd_compat.zcashd_datadir or state.cache_dir/zcashd-compat-zcashd>
 [-testnet | -regtest]
 ```
@@ -40,9 +40,10 @@ enabled = false
 manage_zcashd = true
 zcashd_source = "managed"                            # "managed" or "path"
 zcashd_path = "/path/to/local/zcashd"               # optional explicit override
-zcashd_datadir = "/path/to/zcashd/datadir"      # optional
-zcashd_extra_args = ["-printtoconsole"]          # optional
-rpc_url = "http://127.0.0.1:8232"               # optional, defaults from rpc.listen_addr
+zcashd_datadir = "/path/to/zcashd/datadir"          # optional
+zcashd_extra_args = ["-printtoconsole"]             # optional
+listen_addr = "127.0.0.1:28232"                     # optional, default set when zcashd-compat is enabled
+cookie_dir = "/path/to/zcashd-compat-cookies"       # optional, defaults to <cache_dir>/zcashd-compat-rpc
 startup_delay = "1s"
 restart_backoff = "2s"
 max_restarts = 10
@@ -86,6 +87,10 @@ enables zcashd-compat mode and configures Zebra to use that local binary.
 
 If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, but
 does not spawn `zcashd`.
+
+The standard `[rpc]` listener remains independent. zcashd-compat uses a separate
+listener and separate cookie auth so operators can keep user-facing Zebra RPC
+and zcashd backend RPC isolated.
 
 If `manage_zcashd = true`, Zebra resolves `zcashd` as follows:
 
