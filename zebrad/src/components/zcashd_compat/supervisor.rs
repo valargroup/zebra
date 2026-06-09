@@ -25,9 +25,9 @@ pub struct SupervisorConfig {
     pub zcashd_path: PathBuf,
     /// Datadir for `zcashd`.
     pub zcashd_datadir: PathBuf,
-    /// RPC URL passed to `-unityzebra`.
+    /// RPC URL passed to `-zebra-compat-url`.
     pub rpc_url: String,
-    /// Cookie file path passed to `-unityzebracookiefile`.
+    /// Cookie file path passed to `-zebra-compat-cookiefile`.
     pub cookie_path: PathBuf,
     /// Any extra user-provided arguments.
     pub extra_args: Vec<String>,
@@ -72,10 +72,10 @@ impl SupervisorConfig {
     /// Builds the zcashd command-line arguments.
     pub fn command_args(&self) -> Vec<String> {
         let mut args = vec![
-            "-unity".to_string(),
-            format!("-unityzebra={}", self.rpc_url),
+            "-zebra-compat".to_string(),
+            format!("-zebra-compat-url={}", self.rpc_url),
             format!(
-                "-unityzebracookiefile={}",
+                "-zebra-compat-cookiefile={}",
                 self.cookie_path.to_string_lossy()
             ),
             format!("-datadir={}", self.zcashd_datadir.to_string_lossy()),
@@ -464,14 +464,14 @@ mod tests {
 
         let args = config.command_args();
 
-        assert!(args.contains(&"-unity".to_string()));
+        assert!(args.contains(&"-zebra-compat".to_string()));
         assert!(args.contains(&"-regtest".to_string()));
         assert!(args
             .iter()
-            .any(|a| a.starts_with("-unityzebra=http://127.0.0.1:8232")));
+            .any(|a| a.starts_with("-zebra-compat-url=http://127.0.0.1:8232")));
         assert!(args
             .iter()
-            .any(|a| a.starts_with("-unityzebracookiefile=/tmp/.cookie")));
+            .any(|a| a.starts_with("-zebra-compat-cookiefile=/tmp/.cookie")));
         assert!(args.contains(&"-printtoconsole".to_string()));
     }
 

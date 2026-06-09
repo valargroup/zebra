@@ -15,7 +15,7 @@ NETWORK ?= Testnet
 ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state-testnet
 ZEBRA_RPC_LISTEN_ADDR ?= 127.0.0.1:28232
 ZCASHD_DATADIR ?= /mnt/data/zcashd-profile-b/.zcashd
-ZCASHD_CONF ?= $(CURDIR)/deploy/profile-b/zcash.testnet.unity.conf
+ZCASHD_CONF ?= $(CURDIR)/deploy/profile-b/zcash.testnet.zebra-compat.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 
 ZEBRA_RPC_URL ?= http://$(ZEBRA_RPC_LISTEN_ADDR)
@@ -45,11 +45,11 @@ compat-zebrad-start-unsupervised:
 	"$(ZEBRAD_BIN)" start --zcashd-compat
 
 compat-zcashd-start-standalone:
-	@echo "Starting zcashd -unity as a standalone process..."
+	@echo "Starting zcashd -zebra-compat as a standalone process..."
 	"$(ZCASHD_BIN)" \
-		-unity \
-		-unityzebra="$(ZEBRA_RPC_URL)" \
-		-unityzebracookiefile="$(ZEBRA_COOKIE_FILE)" \
+		-zebra-compat \
+		-zebra-compat-url="$(ZEBRA_RPC_URL)" \
+		-zebra-compat-cookiefile="$(ZEBRA_COOKIE_FILE)" \
 		-datadir="$(ZCASHD_DATADIR)" \
 		-conf="$(ZCASHD_CONF)" \
 		$(ZCASHD_EXTRA_ARGS)
@@ -75,14 +75,14 @@ compat-zebrad-status:
 
 compat-zcashd-status:
 	@echo "Checking zcashd process..."
-	@if pgrep -f "zcashd.*-unity" >/dev/null; then \
+	@if pgrep -f "zcashd.*-zebra-compat" >/dev/null; then \
 		echo "zcashd process: OK"; \
 	else \
 		echo "zcashd process: NOT RUNNING"; \
 		exit 1; \
 	fi
-	@echo "Checking zcashd unity status..."
-	@"$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getunityinfo >/dev/null
+	@echo "Checking zcashd zebra-compat status..."
+	@"$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getzebracompatinfo >/dev/null
 	@zcashd_height="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getblockcount )"; \
 		echo "zcashd height: $$zcashd_height"
 
