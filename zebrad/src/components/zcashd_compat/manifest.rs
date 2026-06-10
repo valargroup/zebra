@@ -34,12 +34,12 @@ pub struct ZcashdReleaseArtifact {
 ///
 pub const EMBEDDED_ZCASHD_RELEASE_MANIFEST: ZcashdReleaseManifest = ZcashdReleaseManifest {
     schema_version: EMBEDDED_MANIFEST_SCHEMA_VERSION,
-    release_tag: "v6.2.1-alpha-zebra-regtest-compat.2",
+    release_tag: "v6.2.1-alpha.3",
     artifacts: &[
         ZcashdReleaseArtifact {
             target_triple: "x86_64-pc-linux-gnu",
-            runtime_archive_url: "https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha-zebra-regtest-compat.2/zcashd-zebra-compat-v6.2.1-alpha-zebra-regtest-compat.2-linux-x86_64.tar.gz",
-            runtime_archive_sha256: "e92374902085bdbf12faeff4e5f4f026abe3225895bd0035bcc3f146246c5a2c",
+            runtime_archive_url: "https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha.3/zcashd-zebra-compat-v6.2.1-alpha.3-linux-x86_64.tar.gz",
+            runtime_archive_sha256: "2025f065ff1fa6388cfbd11bf351701700c916c12046d59002cb4ddd963df1ac",
             runtime_archive_member_binary_path: "./bin/zcashd",
         },
     ],
