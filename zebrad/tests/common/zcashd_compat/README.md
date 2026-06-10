@@ -157,37 +157,38 @@ Entry points are the `#[tokio::test] #[ignore]` functions in
 1. Choose the right submodule (or create a new one).
 2. Write an `async fn my_test() -> Result<()>` function:
 
-```rust
-pub async fn my_test() -> Result<()> {
-    let Some(setup) = setup_zcashd_compat().await? else {
-        return Ok(());   // TEST_ZCASHD_COMPAT unset — silent skip
-    };
+   ```rust
+   pub async fn my_test() -> Result<()> {
+       let Some(setup) = setup_zcashd_compat().await? else {
+           return Ok(());   // TEST_ZCASHD_COMPAT unset — silent skip
+       };
 
-    if !setup.can_mutate() {
-        // On mainnet/testnet: read-only check or skip
-        return setup.teardown();
-    }
+       if !setup.can_mutate() {
+           // On mainnet/testnet: read-only check or skip
+           return setup.teardown();
+       }
 
-    // Regtest path — free to mine, send, inspect state
-    use crate::common::regtest::MiningRpcMethods;
-    setup.zebra_client.generate(1).await?;
-    // ...
+       // Regtest path — free to mine, send, inspect state
+       use crate::common::regtest::MiningRpcMethods;
+       setup.zebra_client.generate(1).await?;
+       // ...
 
-    setup.teardown()
-}
-```
+       setup.teardown()
+   }
+   ```
 
 3. Add a corresponding entry point in `zebrad/tests/acceptance.rs`:
 
-```rust
-#[tokio::test]
-#[ignore]
-async fn zcashd_compat_my_test() -> Result<()> {
-    common::zcashd_compat::my_module::my_test().await
-}
-```
+   ```rust
+   #[tokio::test]
+   #[ignore]
+   async fn zcashd_compat_my_test() -> Result<()> {
+       common::zcashd_compat::my_module::my_test().await
+   }
+   ```
 
 Key rules:
+
 - Call `setup.teardown()` on every exit path that owns a managed process.
 - Guard all writes (`generate`, `sendtoaddress`, `z_sendmany`) behind `setup.can_mutate()`.
 - Use `setup.zebra_client` (unauthenticated) for zebrad and `setup.zcashd_client` (Basic Auth) for zcashd.
