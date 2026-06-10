@@ -1284,18 +1284,18 @@ where
                 next_block_hash,
             } = *block_header;
 
+            // # Concurrency
+            //
+            // We look up by block hash so the hash, transaction IDs, and confirmations
+            // are consistent.
+            let hash_or_height = hash.into();
             let transactions_request = match verbosity {
                 1 => zebra_state::ReadRequest::TransactionIdsForBlock(hash_or_height),
                 2 => zebra_state::ReadRequest::BlockAndSize(hash_or_height),
                 _other => panic!("get_block_header_fut should be none"),
             };
 
-            // # Concurrency
-            //
-            // We look up by block hash so the hash, transaction IDs, and confirmations
-            // are consistent.
-            let hash_or_height = hash.into();
-            let requests = vec![
+            let mut requests = vec![
                 // Get transaction IDs from the transaction index by block hash
                 //
                 // # Concurrency
@@ -1306,10 +1306,22 @@ where
                 transactions_request,
                 // Orchard trees
                 zebra_state::ReadRequest::OrchardTree(hash_or_height),
+            ];
+
+            #[cfg(zcash_unstable = "nu7")]
+            let nu7_active = network.is_nu_active(consensus::NetworkUpgrade::Nu7, height.into());
+
+            #[cfg(zcash_unstable = "nu7")]
+            if nu7_active {
+                // Ironwood trees
+                requests.push(zebra_state::ReadRequest::IronwoodTree(hash_or_height));
+            }
+
+            requests.extend([
                 // Block info
                 zebra_state::ReadRequest::BlockInfo(previous_block_hash.into()),
                 zebra_state::ReadRequest::BlockInfo(hash_or_height),
-            ];
+            ]);
 
             let mut futs = FuturesOrdered::new();
 
@@ -1384,7 +1396,32 @@ where
                 size: orchard_tree_size,
             };
 
-            let trees = GetBlockTrees { sapling, orchard };
+            #[cfg(zcash_unstable = "nu7")]
+            let ironwood = if nu7_active {
+                let ironwood_tree_response = futs.next().await.expect("`futs` should not be empty");
+                let zebra_state::ReadResponse::IronwoodTree(ironwood_tree) =
+                    ironwood_tree_response.map_misc_error()?
+                else {
+                    unreachable!("unmatched response to an IronwoodTree request");
+                };
+
+                // This could be `None` if there's a chain reorg between state queries.
+                let ironwood_tree = ironwood_tree.ok_or_misc_error("missing Ironwood tree")?;
+                Some(IronwoodTrees {
+                    size: ironwood_tree.count(),
+                })
+            } else {
+                None
+            };
+
+            #[cfg(not(zcash_unstable = "nu7"))]
+            let ironwood = None;
+
+            let trees = GetBlockTrees {
+                sapling,
+                orchard,
+                ironwood,
+            };
 
             let block_info_response = futs.next().await.expect("`futs` should not be empty");
             let zebra_state::ReadResponse::BlockInfo(prev_block_info) =
@@ -1978,10 +2015,10 @@ where
         #[cfg(not(zcash_unstable = "nu7"))]
         let ironwood = None;
 
-        let (ironwood_tree, ironwood_root) =
-            ironwood.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
+        let ironwood = ironwood
+            .map(|(tree, root)| Treestate::new(trees::Commitments::new(Some(root), Some(tree))));
 
-        Ok(GetTreestateResponse::new(
+        Ok(GetTreestateResponse::new_with_optional_ironwood(
             hash,
             height,
             time,
@@ -1990,7 +2027,7 @@ where
             None,
             Treestate::new(trees::Commitments::new(sapling_root, sapling_tree)),
             Treestate::new(trees::Commitments::new(orchard_root, orchard_tree)),
-            Treestate::new(trees::Commitments::new(ironwood_root, ironwood_tree)),
+            ironwood,
         ))
     }
 
@@ -4410,13 +4447,15 @@ impl ValidateAddresses for GetAddressTxIdsRequest {
     }
 }
 
-/// Information about the sapling and orchard note commitment trees if any.
+/// Information about note commitment trees if any.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GetBlockTrees {
     #[serde(skip_serializing_if = "SaplingTrees::is_empty")]
     sapling: SaplingTrees,
     #[serde(skip_serializing_if = "OrchardTrees::is_empty")]
     orchard: OrchardTrees,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ironwood: Option<IronwoodTrees>,
 }
 
 impl Default for GetBlockTrees {
@@ -4424,6 +4463,7 @@ impl Default for GetBlockTrees {
         GetBlockTrees {
             sapling: SaplingTrees { size: 0 },
             orchard: OrchardTrees { size: 0 },
+            ironwood: None,
         }
     }
 }
@@ -4434,6 +4474,16 @@ impl GetBlockTrees {
         GetBlockTrees {
             sapling: SaplingTrees { size: sapling },
             orchard: OrchardTrees { size: orchard },
+            ironwood: None,
+        }
+    }
+
+    /// Constructs a new instance of ['GetBlockTrees'] with Ironwood data.
+    pub fn new_with_ironwood(sapling: u64, orchard: u64, ironwood: u64) -> Self {
+        GetBlockTrees {
+            sapling: SaplingTrees { size: sapling },
+            orchard: OrchardTrees { size: orchard },
+            ironwood: Some(IronwoodTrees { size: ironwood }),
         }
     }
 
@@ -4445,6 +4495,11 @@ impl GetBlockTrees {
     /// Returns orchard data held by ['GetBlockTrees'].
     pub fn orchard(self) -> u64 {
         self.orchard.size
+    }
+
+    /// Returns ironwood data held by ['GetBlockTrees'].
+    pub fn ironwood(self) -> Option<u64> {
+        self.ironwood.map(|ironwood| ironwood.size)
     }
 }
 
@@ -4470,6 +4525,12 @@ impl OrchardTrees {
     fn is_empty(&self) -> bool {
         self.size == 0
     }
+}
+
+/// Ironwood note commitment tree information.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct IronwoodTrees {
+    size: u64,
 }
 
 /// Build a valid height range from the given optional start and end numbers.
