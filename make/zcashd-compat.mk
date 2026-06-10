@@ -30,10 +30,11 @@ ZEBRA_COOKIE_FILE ?= $(ZEBRA_COOKIE_DIR)/.zcashd-compat.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
-ZCASHD_COMPAT_RELEASE_TAG ?= v6.2.1-alpha-zebra-regtest-compat.2
-ZCASHD_COMPAT_PLATFORM ?= linux-x86_64
-ZCASHD_COMPAT_URL ?= https://github.com/valargroup/zcashd/releases/download/$(ZCASHD_COMPAT_RELEASE_TAG)/zcashd-zebra-compat-$(ZCASHD_COMPAT_RELEASE_TAG)-$(ZCASHD_COMPAT_PLATFORM).tar.gz
-ZCASHD_COMPAT_SHA256 ?= e92374902085bdbf12faeff4e5f4f026abe3225895bd0035bcc3f146246c5a2c
+ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zebrad/zcashd-compat-manifest.json
+ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
+ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
+ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))
+ZCASHD_COMPAT_SHA256 ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_sha256' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_ARTIFACT_DIR ?= $(CURDIR)/target/zcashd-compat
 ZCASHD_COMPAT_ARCHIVE_PATH ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/zcashd-compat.tar.gz
 ZCASHD_COMPAT_EXTRACT_DIR ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/extracted
