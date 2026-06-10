@@ -100,7 +100,7 @@ the watchdog logs locally (stdout/journald) and is otherwise fully functional.
 
 Reporting behavior is designed to avoid event spam:
 
-- **Discrete Sentry events** are captured only on status *transitions*: when a
+- **Discrete Sentry events** are captured only on status _transitions_: when a
   check goes from passing to failing (error event) and when it recovers
   (info event). A check that fails persistently produces one event, not one
   per cycle.
