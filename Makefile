@@ -13,3 +13,6 @@ help:
 	@echo "  compat-zebrad-status             Check zebrad liveness and Zebra RPC health"
 	@echo "  compat-zcashd-status             Check zcashd liveness and zebra-compat RPC health"
 	@echo "  compat-status-sync               Run both status checks and enforce max drift"
+	@echo "  compat-test-regtest              Run full zcashd-compat test suite (regtest, spawns processes)"
+	@echo "  compat-test-mainnet              Run read-only zcashd-compat tests against live mainnet"
+	@echo "  compat-test-testnet              Run read-only zcashd-compat tests against live testnet"
