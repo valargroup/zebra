@@ -10,6 +10,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::{DateTime, Utc};
+use iroh::NodeId;
 use serde_json::{Number, Value};
 use thiserror::Error;
 use tokio::{

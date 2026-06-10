@@ -1,5 +1,8 @@
 use super::{config::*, error::*, validation::*, wire::*, *};
-use crate::zakura::HeaderSyncPeerSession;
+use crate::zakura::{
+    HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
+    ZakuraHeaderSyncCandidateState,
+};
 
 /// Cached state frontiers used by the header-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -72,6 +75,8 @@ pub struct HeaderSyncHandle {
     pub(super) events: mpsc::Sender<HeaderSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<HeaderSyncEvent>,
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
+    pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
+    pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
 }
 
 impl HeaderSyncHandle {
@@ -110,6 +115,26 @@ impl HeaderSyncHandle {
     pub fn best_header_tip(&self) -> (block::Height, block::Hash) {
         *self.tip.borrow()
     }
+
+    /// Subscribe to header-sync peer slot snapshots.
+    pub fn subscribe_peer_snapshot(&self) -> watch::Receiver<ServicePeerSnapshot> {
+        self.peers.clone()
+    }
+
+    /// Return the currently cached peer slot snapshot.
+    pub fn peer_snapshot(&self) -> ServicePeerSnapshot {
+        *self.peers.borrow()
+    }
+
+    /// Subscribe to header-sync candidate hints for discovery selection.
+    pub fn subscribe_candidate_state(&self) -> watch::Receiver<ZakuraHeaderSyncCandidateState> {
+        self.candidates.clone()
+    }
+
+    /// Return the currently cached header-sync candidate hints.
+    pub fn candidate_state(&self) -> ZakuraHeaderSyncCandidateState {
+        self.candidates.borrow().clone()
+    }
 }
 
 /// Facts accepted by the header-sync reactor.
@@ -119,6 +144,13 @@ pub enum HeaderSyncEvent {
     PeerConnected(HeaderSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
+    /// First-party header-sync summary observed over the authenticated discovery stream.
+    AdvisoryHeaderSummary {
+        /// Peer that supplied its own summary.
+        peer: ZakuraPeerId,
+        /// Advisory header-sync summary for dial/admission preference only.
+        summary: HeaderSyncServiceSummary,
+    },
     /// State committed a full block.
     FullBlockCommitted {
         /// Committed block height.

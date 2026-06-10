@@ -1478,6 +1478,7 @@ mod tests {
                 }
                 // The victim's own discovery source also asks us for peers.
                 DiscoveryMessage::GetPeers { .. } => {}
+                DiscoveryMessage::GetServices(_) => {}
                 other => panic!("unexpected discovery message: {other:?}"),
             }
         }
@@ -1841,12 +1842,14 @@ mod tests {
 
         let mut sink_exited = false;
         let mut source_exited = false;
-        while !sink_exited || !source_exited {
+        let mut removed = false;
+        while !sink_exited || !source_exited || !removed {
             match wait_for_probe_event(&mut events_rx, "service task exit", |event| {
                 matches!(
                     event,
                     TaskExitProbeEvent::SinkExited(peer)
                         | TaskExitProbeEvent::SourceExited(peer)
+                        | TaskExitProbeEvent::Removed(peer)
                         if peer == &peer_id
                 )
             })
@@ -1854,16 +1857,10 @@ mod tests {
             {
                 TaskExitProbeEvent::SinkExited(peer) if peer == peer_id => sink_exited = true,
                 TaskExitProbeEvent::SourceExited(peer) if peer == peer_id => source_exited = true,
+                TaskExitProbeEvent::Removed(peer) if peer == peer_id => removed = true,
                 _ => {}
             }
         }
-
-        wait_for_probe_event(
-            &mut events_rx,
-            "service remove",
-            |event| matches!(event, TaskExitProbeEvent::Removed(peer) if peer == &peer_id),
-        )
-        .await?;
 
         let second =
             HostilePeer::connect_native_with_capabilities(&victim, 23, ZAKURA_CAP_LEGACY_GOSSIP)

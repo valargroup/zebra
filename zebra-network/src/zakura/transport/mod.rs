@@ -14,6 +14,7 @@ pub use clock::{Clock, RealClock};
 pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 pub use registry::{RegistryError, ServiceRegistry};
+pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
     StreamMode,

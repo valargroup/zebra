@@ -1,4 +1,8 @@
 use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
+use crate::zakura::{
+    HeaderSyncServiceSummary, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraHeaderSyncCandidateState,
+};
 
 /// Spawn a header-sync reactor and return its handle plus action stream.
 pub fn spawn_header_sync_reactor(
@@ -16,10 +20,19 @@ pub fn spawn_header_sync_reactor(
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let (tip_tx, tip_rx) = watch::channel((state.best_header_tip, state.best_header_hash));
+    let (peers_tx, peers_rx) =
+        watch::channel(ServicePeerSnapshot::new(0, 0, startup.config.peer_limits));
+    let (candidates_tx, candidates_rx) = watch::channel(ZakuraHeaderSyncCandidateState {
+        target_height: header_sync_candidate_target(state.best_header_tip),
+        admitted_node_ids: Vec::new(),
+        backed_off_node_ids: Vec::new(),
+    });
     let handle = HeaderSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
         tip: tip_rx,
+        peers: peers_rx,
+        candidates: candidates_rx,
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -28,6 +41,8 @@ pub fn spawn_header_sync_reactor(
         lifecycle: lifecycle_rx,
         actions: actions_tx,
         tip: tip_tx,
+        peers: peers_tx,
+        candidates: candidates_tx,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -42,6 +57,8 @@ pub(super) struct HeaderSyncReactor {
     lifecycle: mpsc::UnboundedReceiver<HeaderSyncEvent>,
     actions: mpsc::Sender<HeaderSyncAction>,
     tip: watch::Sender<(block::Height, block::Hash)>,
+    peers: watch::Sender<ServicePeerSnapshot>,
+    candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
 }
 
 impl HeaderSyncReactor {
@@ -91,6 +108,9 @@ impl HeaderSyncReactor {
         match event {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
+                self.handle_advisory_header_summary(peer, summary)
+            }
             HeaderSyncEvent::FullBlockCommitted {
                 height,
                 hash,
@@ -169,12 +189,164 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn admission_decision_for(
+        &self,
+        peer: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> ServiceAdmissionDecision {
+        if self.state.peers.contains_key(peer) {
+            return ServiceAdmissionDecision::Admit;
+        }
+
+        let limits = self.startup.config.peer_limits;
+        let admitted = self.admitted_count(direction);
+        let cap = match direction {
+            ServicePeerDirection::Inbound => limits.max_inbound_peers,
+            ServicePeerDirection::Outbound => limits.max_outbound_peers,
+        };
+
+        if admitted >= cap {
+            ServiceAdmissionDecision::RejectFull
+        } else {
+            ServiceAdmissionDecision::Admit
+        }
+    }
+
+    fn admitted_count(&self, direction: ServicePeerDirection) -> usize {
+        self.state
+            .peers
+            .values()
+            .filter(|peer| peer.direction == direction)
+            .count()
+    }
+
+    fn publish_peer_snapshot(&self) {
+        let snapshot = ServicePeerSnapshot::new(
+            self.admitted_count(ServicePeerDirection::Inbound),
+            self.admitted_count(ServicePeerDirection::Outbound),
+            self.startup.config.peer_limits,
+        );
+        let _ = self.peers.send(snapshot);
+    }
+
+    fn publish_candidate_state(&mut self) {
+        let now = Instant::now();
+        self.state
+            .advisory
+            .retain(|_, advisory| !advisory.is_expired(now));
+        for advisory in self.state.advisory.values_mut() {
+            if advisory.backoff_until.is_some_and(|until| until <= now) {
+                advisory.record_confirmed();
+            }
+        }
+
+        let mut admitted_node_ids: Vec<_> = self
+            .state
+            .peers
+            .keys()
+            .filter_map(node_id_from_header_peer_id)
+            .collect();
+        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.dedup();
+
+        let mut backed_off_node_ids: Vec<_> = self
+            .state
+            .advisory
+            .iter()
+            .filter_map(|(peer, advisory)| {
+                advisory
+                    .is_backed_off(now)
+                    .then(|| node_id_from_header_peer_id(peer))
+                    .flatten()
+            })
+            .collect();
+        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        backed_off_node_ids.dedup();
+
+        let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {
+            target_height: header_sync_candidate_target(self.state.best_header_tip),
+            admitted_node_ids,
+            backed_off_node_ids,
+        });
+    }
+
+    fn handle_advisory_header_summary(
+        &mut self,
+        peer: ZakuraPeerId,
+        summary: HeaderSyncServiceSummary,
+    ) {
+        if self.state.peers.contains_key(&peer) {
+            return;
+        }
+        if !header_summary_is_useful(
+            summary,
+            header_sync_candidate_target(self.state.best_header_tip),
+        ) {
+            self.state.advisory.remove(&peer);
+            self.publish_candidate_state();
+            return;
+        }
+
+        self.state
+            .advisory
+            .entry(peer)
+            .and_modify(|advisory| advisory.refresh_summary(summary, Instant::now()))
+            .or_insert_with(|| HeaderSyncAdvisoryPeerState::new(summary, Instant::now()));
+        self.publish_candidate_state();
+    }
+
+    fn confirm_advisory_status(&mut self, peer: &ZakuraPeerId, status: HeaderSyncStatus) {
+        let Some(summary) = self
+            .state
+            .advisory
+            .get(peer)
+            .map(|advisory| advisory.summary)
+        else {
+            return;
+        };
+
+        if status.tip_height >= summary.best_height {
+            self.state.advisory.remove(peer);
+        } else if let Some(advisory) = self.state.advisory.get_mut(peer) {
+            advisory.record_unconfirmed(Instant::now());
+        }
+        self.publish_candidate_state();
+    }
+
+    fn record_advisory_unconfirmed(&mut self, peer: &ZakuraPeerId) {
+        let Some(advisory) = self.state.advisory.get_mut(peer) else {
+            return;
+        };
+        advisory.record_unconfirmed(Instant::now());
+        self.publish_candidate_state();
+    }
+
     async fn handle_peer_connected(&mut self, session: HeaderSyncPeerSession) {
         let peer = session.peer_id().clone();
+        let direction = session.direction();
+        let decision = self.admission_decision_for(&peer, direction);
+        if decision != ServiceAdmissionDecision::Admit {
+            tracing::debug!(
+                ?peer,
+                ?direction,
+                ?decision,
+                "locally parking Zakura header-sync service session"
+            );
+            self.state.parked_peers.insert(peer);
+            session.cancel_token().cancel();
+            self.publish_peer_snapshot();
+            self.publish_candidate_state();
+            return;
+        }
+
+        self.state.parked_peers.remove(&peer);
         self.state
             .peers
             .entry(peer.clone())
-            .and_modify(|peer_state| peer_state.session = session.clone())
+            .and_modify(|peer_state| {
+                peer_state.session = session.clone();
+                peer_state.direction = direction;
+            })
             .or_insert_with(|| {
                 PeerHeaderState::new(
                     session,
@@ -186,13 +358,19 @@ impl HeaderSyncReactor {
                     DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 )
             });
+        self.publish_peer_snapshot();
+        self.publish_candidate_state();
         self.send_status(&peer);
         self.schedule().await;
     }
 
     fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
         self.state.peers.remove(&peer);
+        self.state.parked_peers.remove(&peer);
+        self.state.advisory.remove(&peer);
         self.state.schedule.forget_peer(&peer);
+        self.publish_peer_snapshot();
+        self.publish_candidate_state();
     }
 
     async fn handle_full_block_committed(&mut self, height: block::Height, hash: block::Hash) {
@@ -292,6 +470,9 @@ impl HeaderSyncReactor {
         peer: ZakuraPeerId,
         error: Arc<HeaderSyncWireError>,
     ) {
+        if self.state.parked_peers.contains(&peer) {
+            return;
+        }
         self.trace_peer_violation(&peer, HeaderSyncMisbehavior::MalformedMessage);
         tracing::debug!(?peer, ?error, "malformed Zakura header-sync frame");
         self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
@@ -304,6 +485,9 @@ impl HeaderSyncReactor {
         reason: HeaderSyncMisbehavior,
         error: Arc<HeaderSyncWireError>,
     ) {
+        if self.state.parked_peers.contains(&peer) {
+            return;
+        }
         self.trace_peer_violation(&peer, reason);
         tracing::debug!(?peer, ?error, ?reason, "invalid Zakura header-sync message");
         self.report_misbehavior(peer, reason).await;
@@ -422,6 +606,10 @@ impl HeaderSyncReactor {
     }
 
     async fn handle_wire_message(&mut self, peer: ZakuraPeerId, msg: HeaderSyncMessage) {
+        if self.state.parked_peers.contains(&peer) {
+            return;
+        }
+
         match msg {
             HeaderSyncMessage::Status(status) => {
                 metrics::counter!("sync.header.peer.status.received").increment(1);
@@ -447,6 +635,7 @@ impl HeaderSyncReactor {
                     .max_inflight_requests
                     .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER);
                 peer_state.received_status = true;
+                self.confirm_advisory_status(&peer, status);
                 self.trace_status_received(&peer, status);
                 self.schedule().await;
             }
@@ -652,6 +841,7 @@ impl HeaderSyncReactor {
         in_flight_count: usize,
     ) {
         if headers.is_empty() {
+            self.record_advisory_unconfirmed(&peer);
             let deadline = Instant::now() + self.empty_headers_retry_delay();
             self.trace_headers_received(
                 &peer,
@@ -892,6 +1082,7 @@ impl HeaderSyncReactor {
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_advanced(height, hash);
         let _ = self.tip.send((height, hash));
+        self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
 
@@ -1189,4 +1380,22 @@ impl HeaderSyncReactor {
             }
         }
     }
+}
+
+fn header_sync_candidate_target(best_header_tip: block::Height) -> block::Height {
+    next_height(best_header_tip).unwrap_or(best_header_tip)
+}
+
+fn header_summary_is_useful(
+    summary: HeaderSyncServiceSummary,
+    target_height: block::Height,
+) -> bool {
+    summary.serving_headers
+        && summary.inbound_slots_free > 0
+        && summary.best_height >= target_height
+}
+
+fn node_id_from_header_peer_id(peer: &ZakuraPeerId) -> Option<NodeId> {
+    let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
 }

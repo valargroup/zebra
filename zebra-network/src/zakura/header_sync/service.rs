@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use super::{events::*, validation::*, wire::*, *};
 use crate::zakura::{
     BoxRunFuture, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, PeerStreamSession,
-    Service, Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC,
+    Service, ServicePeerDirection, Sink, SinkReject, Stream, StreamMode, ZakuraPeerId,
+    ZakuraSupervisorHandle, ZAKURA_CAP_HEADER_SYNC,
 };
 
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
@@ -34,6 +34,7 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
+    direction: ServicePeerDirection,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
 
@@ -45,9 +46,10 @@ struct HeaderSyncPeerSessionInner {
 }
 
 impl HeaderSyncPeerSession {
-    pub(crate) fn new(session: &PeerStreamSession) -> Self {
-        Self::from_parts(
+    pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
+        Self::from_parts_with_direction(
             session.peer_id().clone(),
+            direction,
             session.sender(),
             session.cancel_token(),
         )
@@ -59,8 +61,19 @@ impl HeaderSyncPeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
+        Self::from_parts_with_direction(peer_id, ServicePeerDirection::Inbound, send, cancel_token)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_with_direction(
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             peer_id,
+            direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -70,13 +83,15 @@ impl HeaderSyncPeerSession {
     }
 
     #[cfg(not(test))]
-    fn from_parts(
+    fn from_parts_with_direction(
         peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
             peer_id,
+            direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -88,6 +103,11 @@ impl HeaderSyncPeerSession {
     /// Authenticated peer identity for this header-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Direction of the underlying Zakura connection.
+    pub fn direction(&self) -> ServicePeerDirection {
+        self.direction
     }
 
     /// Peer disconnect/local shutdown cancellation token.
@@ -246,6 +266,21 @@ impl Service for HeaderSyncService {
         header_sync_streams()
     }
 
+    fn wants_peer(
+        &self,
+        _peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> bool {
+        // Escalation is a local-room check. First-party summary usefulness is
+        // advisory and is applied by header-sync candidate selection upstream.
+        let snapshot = self.header_sync.peer_snapshot();
+        match direction {
+            ServicePeerDirection::Inbound => snapshot.inbound_slots_free > 0,
+            ServicePeerDirection::Outbound => snapshot.outbound_slots_free > 0,
+        }
+    }
+
     fn add_peer(&self, mut peer: Peer) {
         let Some((recv, send)) = peer.take_stream(ZAKURA_STREAM_HEADER_SYNC) else {
             return;
@@ -257,10 +292,11 @@ impl Service for HeaderSyncService {
             ZAKURA_STREAM_HEADER_SYNC,
             recv,
             send,
-            peer.cancel_token(),
+            peer.service_cancel_token(),
         );
-        let cancel_token = session.cancel_token();
-        let header_sync_session = HeaderSyncPeerSession::new(&session);
+        let service_cancel_token = session.cancel_token();
+        let connection_cancel_token = peer.cancel_token();
+        let header_sync_session = HeaderSyncPeerSession::new(&session, peer.direction);
 
         let _ = self
             .header_sync
@@ -271,7 +307,8 @@ impl Service for HeaderSyncService {
             session,
             header_sync_session,
             self.header_sync.clone(),
-            cancel_token,
+            service_cancel_token,
+            connection_cancel_token,
         );
     }
 
@@ -314,6 +351,15 @@ impl Service for HeaderSyncPassthroughService {
 
     fn streams(&self) -> &[Stream] {
         header_sync_streams()
+    }
+
+    fn wants_peer(
+        &self,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> bool {
+        self.inner.wants_peer(peer, negotiated, direction)
     }
 
     fn add_peer(&self, mut peer: Peer) {
@@ -370,15 +416,16 @@ fn spawn_header_sync_sink(
     session: PeerStreamSession,
     header_sync_session: HeaderSyncPeerSession,
     header_sync: HeaderSyncHandle,
-    cancel_token: CancellationToken,
+    service_cancel_token: CancellationToken,
+    connection_cancel_token: CancellationToken,
 ) {
     task::spawn(async move {
         let (_session_peer, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
         let sink = Box::new(HeaderSyncSink {
             peer_id: peer_id.clone(),
-            header_sync,
+            header_sync: header_sync.clone(),
             session: header_sync_session,
-            cancel_token: cancel_token.clone(),
+            cancel_token: service_cancel_token.clone(),
         });
 
         let result = sink.run(recv).await;
@@ -391,7 +438,7 @@ fn spawn_header_sync_sink(
                     ?peer_id,
                     "header-sync stream rejected protocol-invalid frame"
                 );
-                cancel_token.cancel();
+                connection_cancel_token.cancel();
             }
             Err(SinkReject::Local(error)) => {
                 tracing::debug!(
@@ -401,6 +448,8 @@ fn spawn_header_sync_sink(
                 );
             }
         }
+
+        let _ = header_sync.send_lifecycle(HeaderSyncEvent::PeerDisconnected(peer_id));
     });
 }
 
