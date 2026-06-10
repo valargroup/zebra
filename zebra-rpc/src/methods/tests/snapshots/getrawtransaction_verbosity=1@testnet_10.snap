@@ -48,6 +48,11 @@ expression: rsp
       "valueBalance": 0.0,
       "valueBalanceZat": 0
     },
+    "ironwood": {
+      "actions": [],
+      "valueBalance": 0.0,
+      "valueBalanceZat": 0
+    },
     "valueBalance": 0.0,
     "valueBalanceZat": 0,
     "size": 130,

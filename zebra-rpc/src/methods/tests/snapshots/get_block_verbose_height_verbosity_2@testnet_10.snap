@@ -58,6 +58,11 @@ expression: block
         "valueBalance": 0.0,
         "valueBalanceZat": 0
       },
+      "ironwood": {
+        "actions": [],
+        "valueBalance": 0.0,
+        "valueBalanceZat": 0
+      },
       "valueBalance": 0.0,
       "valueBalanceZat": 0,
       "size": 130,
@@ -107,6 +112,14 @@ expression: block
     },
     {
       "id": "orchard",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false,
+      "valueDelta": 0.0,
+      "valueDeltaZat": 0
+    },
+    {
+      "id": "ironwood",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false,
