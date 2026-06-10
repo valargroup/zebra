@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "release_tag": "v6.2.1-alpha.3",
+  "artifacts": [
+    {
+      "target_triple": "x86_64-pc-linux-gnu",
+      "runtime_archive_url": "https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha.3/zcashd-zebra-compat-v6.2.1-alpha.3-linux-x86_64.tar.gz",
+      "runtime_archive_sha256": "2025f065ff1fa6388cfbd11bf351701700c916c12046d59002cb4ddd963df1ac",
+      "runtime_archive_member_binary_path": "./bin/zcashd"
+    }
+  ]
+}

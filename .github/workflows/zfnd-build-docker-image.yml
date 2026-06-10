@@ -47,26 +47,6 @@ on:
         required: false
         type: boolean
         default: false
-      zcashd_compat_url_amd64:
-        description: "Hash-pinned artifact URL for linux/amd64 zcashd compatibility builds"
-        required: false
-        type: string
-        default: 'https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz'
-      zcashd_compat_sha256_amd64:
-        description: "SHA256 for the linux/amd64 zcashd compatibility runtime artifact"
-        required: false
-        type: string
-        default: '09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c'
-      zcashd_compat_url_arm64:
-        description: "Hash-pinned artifact URL for linux/arm64 zcashd compatibility builds"
-        required: false
-        type: string
-        default: 'https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-aarch64.tar.gz'
-      zcashd_compat_sha256_arm64:
-        description: "SHA256 for the linux/arm64 zcashd compatibility runtime artifact"
-        required: false
-        type: string
-        default: '133e562f86b4f49dd4e69ad55eb94bdd259c5e8af4fc533ec72b1f39bbbb6927'
       no_cache:
         description: Disable the Docker cache for this build
         required: false
@@ -136,6 +116,9 @@ jobs:
     steps:
       - name: Set build matrix
         id: set-matrix
+        env:
+          INPUT_DOCKERFILE_TARGET: ${{ inputs.dockerfile_target }}
+          INPUT_ZCASHD_COMPAT_ENABLED: ${{ inputs.zcashd_compat_enabled }}
         run: |
           # Runners are configurable via repository variables to allow larger runners
           # for ZcashFoundation (more disk space) while forks use default runners.
@@ -143,8 +126,11 @@ jobs:
           ARM64_RUNNER="${{ vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}"
 
           # Runtime builds: AMD64 + ARM64 (multi-arch)
+          # zcashd-compat runtime builds: AMD64 only, matching published compat artifacts
           # Other targets: AMD64 only (lightwalletd dependency)
-          if [[ "${{ inputs.dockerfile_target }}" == "runtime" ]]; then
+          if [ "$INPUT_DOCKERFILE_TARGET" = "runtime" ] && [ "$INPUT_ZCASHD_COMPAT_ENABLED" = "true" ]; then
+            MATRIX='{"include":[{"platform":"linux/amd64","runner":"'"$AMD64_RUNNER"'"}]}'
+          elif [ "$INPUT_DOCKERFILE_TARGET" = "runtime" ]; then
             MATRIX='{"include":[{"platform":"linux/amd64","runner":"'"$AMD64_RUNNER"'"},{"platform":"linux/arm64","runner":"'"$ARM64_RUNNER"'"}]}'
           else
             MATRIX='{"include":[{"platform":"linux/amd64","runner":"'"$AMD64_RUNNER"'"}]}'
@@ -268,10 +254,6 @@ jobs:
           INPUT_TARGET: ${{ inputs.dockerfile_target }}
           PLATFORM: ${{ matrix.platform }}
           ZCASHD_COMPAT_ENABLED: ${{ inputs.zcashd_compat_enabled }}
-          ZCASHD_COMPAT_URL_AMD64: ${{ inputs.zcashd_compat_url_amd64 }}
-          ZCASHD_COMPAT_SHA256_AMD64: ${{ inputs.zcashd_compat_sha256_amd64 }}
-          ZCASHD_COMPAT_URL_ARM64: ${{ inputs.zcashd_compat_url_arm64 }}
-          ZCASHD_COMPAT_SHA256_ARM64: ${{ inputs.zcashd_compat_sha256_arm64 }}
         run: |
           set -euo pipefail
           context_dir="${RUNNER_TEMP}/zcashd-compat-context"
@@ -288,37 +270,9 @@ jobs:
             exit 1
           fi
 
-          case "$PLATFORM" in
-            linux/amd64)
-              artifact_url="$ZCASHD_COMPAT_URL_AMD64"
-              artifact_sha256="$ZCASHD_COMPAT_SHA256_AMD64"
-              ;;
-            linux/arm64)
-              artifact_url="$ZCASHD_COMPAT_URL_ARM64"
-              artifact_sha256="$ZCASHD_COMPAT_SHA256_ARM64"
-              ;;
-            *)
-              echo "Unsupported platform for zcashd compatibility artifact: $PLATFORM" >&2
-              exit 1
-              ;;
-          esac
-
-          if [ -z "$artifact_url" ] || [ -z "$artifact_sha256" ]; then
-            echo "zcashd compatibility URL and SHA256 must be set for platform $PLATFORM" >&2
-            exit 1
-          fi
-
-          work_dir="$(mktemp -d)"
-          trap 'rm -rf "$work_dir"' EXIT
-
-          archive_path="$work_dir/zcashd-compat.tar.gz"
-          extract_dir="$work_dir/extracted"
-          curl -fsSL "$artifact_url" -o "$archive_path"
-          echo "$artifact_sha256  $archive_path" | sha256sum -c -
-          mkdir -p "$extract_dir"
-          tar -xzf "$archive_path" -C "$extract_dir"
-
-          install -D -m 0755 "$extract_dir/bin/zcashd" "$context_dir/bin/zcashd"
+          ./scripts/resolve-zcashd-compat-manifest.sh \
+            --prepare-build-context "$context_dir" \
+            --platform "$PLATFORM"
 
       # Build and push image by digest to Google Artifact Registry
       # Images are pushed by digest only and will be merged into multi-arch manifest in the merge job
