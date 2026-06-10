@@ -1,17 +1,14 @@
 //! Reorg regression and stress test bodies for the zcashd-compat integration suite.
 
-use std::{
-    path::PathBuf,
-    process::Command,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result};
 use tokio::time::sleep;
 
 use super::{
-    launch::ZcashdCompatSetup, setup_zcashd_compat, ZcashdRpcClient,
-    TEST_ZCASHD_COMPAT_REORG_ITERATIONS, TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG,
+    launch::{send_signal, ZcashdCompatSetup},
+    setup_zcashd_compat, ZcashdRpcClient, TEST_ZCASHD_COMPAT_REORG_ITERATIONS,
+    TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG,
 };
 use crate::common::regtest::MiningRpcMethods;
 
@@ -334,20 +331,6 @@ async fn compat_info(client: &ZcashdRpcClient) -> Result<serde_json::Value> {
         .map_err(|e| eyre!("getzebracompatinfo: {e}"))
 }
 
-fn zcashd_pid(setup: &ZcashdCompatSetup) -> Result<u32> {
-    let datadir = setup
-        .zcashd_datadir
-        .as_ref()
-        .ok_or_else(|| eyre!("zcashd datadir is unavailable outside managed regtest mode"))?;
-    let pid_path: PathBuf = datadir.join("regtest").join("zcashd.pid");
-    let pid = std::fs::read_to_string(&pid_path)
-        .map_err(|e| eyre!("failed to read zcashd pid file {}: {e}", pid_path.display()))?;
-
-    pid.trim()
-        .parse()
-        .map_err(|e| eyre!("invalid zcashd pid in {}: {e}", pid_path.display()))
-}
-
 struct ZcashdPauseGuard {
     pid: u32,
     paused: bool,
@@ -355,7 +338,7 @@ struct ZcashdPauseGuard {
 
 impl ZcashdPauseGuard {
     fn pause(setup: &ZcashdCompatSetup) -> Result<Self> {
-        let pid = zcashd_pid(setup)?;
+        let pid = setup.zcashd_pid()?;
         send_signal(pid, "-STOP")?;
 
         Ok(Self { pid, paused: true })
@@ -380,22 +363,8 @@ impl Drop for ZcashdPauseGuard {
     }
 }
 
-fn send_signal(pid: u32, signal: &str) -> Result<()> {
-    let status = Command::new("kill")
-        .arg(signal)
-        .arg(pid.to_string())
-        .status()
-        .map_err(|e| eyre!("failed to run kill {signal} {pid}: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(eyre!("kill {signal} {pid} failed with status {status}"))
-    }
-}
-
 async fn restart_zcashd_and_wait_for_tips(setup: &ZcashdCompatSetup) -> Result<()> {
-    let old_pid = zcashd_pid(setup)?;
+    let old_pid = setup.zcashd_pid()?;
 
     let _: serde_json::Value = setup
         .zcashd_client
@@ -424,7 +393,7 @@ async fn wait_for_restarted_zcashd_rpc(
             .await;
 
         let last_seen = match rpc_result {
-            Ok(_) => match zcashd_pid(setup) {
+            Ok(_) => match setup.zcashd_pid() {
                 Ok(new_pid) if new_pid != old_pid => return Ok(()),
                 Ok(new_pid) => format!("zcashd RPC responded from original pid {new_pid}"),
                 Err(error) => format!("zcashd RPC responded but pid was unavailable: {error}"),
