@@ -84,7 +84,7 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
 
     let mut zebrad = dir
         .with_config(&mut zebrad_config)?
-        .spawn_child(args!["start", "--zcashd-compat"])?;
+        .spawn_child(args!["start", "--zcashd-compat", "--unsafe-low-specs"])?;
 
     // Main RPC logs first; zcashd-compat RPC logs second.
     // We pre-chose both ports via random_known_port(), so we only need to wait

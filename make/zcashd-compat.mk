@@ -24,7 +24,8 @@ ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
 
-ZEBRA_COOKIE_FILE ?= $(ZEBRA_STATE_CACHE_DIR)/.zcashd-compat.cookie
+ZEBRA_COOKIE_DIR ?= $(ZEBRA_STATE_CACHE_DIR)
+ZEBRA_COOKIE_FILE ?= $(ZEBRA_COOKIE_DIR)/.zcashd-compat.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
@@ -88,6 +89,7 @@ compat-zebrad-start-supervised-managed:
 	@echo "Starting zebrad in zcashd-compat mode with managed zcashd download..."
 	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
 	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
+	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
 	"$(ZEBRAD_BIN)" start --zcashd-compat
@@ -96,6 +98,7 @@ compat-zebrad-start-supervised:
 	@echo "Starting zebrad in zcashd-compat mode with supervision enabled..."
 	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
 	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
+	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
@@ -105,6 +108,7 @@ compat-zebrad-start-unsupervised:
 	@echo "Starting zebrad in zcashd-compat mode with supervision disabled..."
 	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
 	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
+	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
 	ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD=false \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
 	ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
