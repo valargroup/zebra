@@ -1,24 +1,18 @@
 //! In-process Zakura test node built from the production handler.
 
-use std::{
-    fmt,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::TransportConfig, protocol::Router, NodeAddr};
+use iroh::{endpoint::TransportConfig, protocol::Router, NodeAddr, NodeId};
 use tokio::{sync::Mutex, task::JoinHandle};
 use zebra_jsonl_trace::JsonlTracer;
 
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
     zakura::{
-        run_native_discovery_dialer, InboundSink, ZakuraDiscoveryConfig, ZakuraDiscoveryHandle,
-        ZakuraDiscoveryLocalConfig, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
-        ZakuraNodeRecord, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
-        ZakuraSupervisorHandle, ZakuraTestServiceResponse, ZakuraTrace,
-        DEFAULT_DISCOVERY_RECORD_TTL, P2P_V2_ALPN,
+        discovery::build_discovery_handle, service_registry, DiscoveryService, Service,
+        ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
+        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
+        P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -28,6 +22,7 @@ use crate::{
 pub struct ZakuraTestNode {
     seed: u64,
     endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     recorder: InboundRecorder,
     dial_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -50,21 +45,9 @@ impl ZakuraTestNode {
         self.endpoint.node_addr().await
     }
 
-    /// Clone the production endpoint backing this test node.
-    pub(crate) fn endpoint(&self) -> ZakuraEndpoint {
-        self.endpoint.clone()
-    }
-
     /// Active supervisor handle.
     pub fn supervisor(&self) -> ZakuraSupervisorHandle {
         self.endpoint.supervisor()
-    }
-
-    /// Passive native discovery state.
-    pub fn discovery(&self) -> ZakuraDiscoveryHandle {
-        self.endpoint
-            .discovery()
-            .expect("ZakuraTestNode always enables discovery")
     }
 
     /// Local limits used by this node.
@@ -77,53 +60,31 @@ impl ZakuraTestNode {
         self.recorder.clone()
     }
 
-    /// Spawn the real discovery dial loop for this test node.
+    /// Native discovery runtime handle backing this node's discovery service.
+    pub fn discovery(&self) -> ZakuraDiscoveryHandle {
+        self.discovery.clone()
+    }
+
+    /// Spawn this node's discovery candidate dialer (book-driven outbound dials).
     pub fn spawn_discovery_dialer(&self) -> JoinHandle<()> {
-        tokio::spawn(run_native_discovery_dialer(
-            self.endpoint(),
-            self.discovery(),
+        tokio::spawn(crate::zakura::discovery::run_native_discovery_dialer(
+            self.endpoint.clone(),
+            self.discovery.clone(),
             self.limits.clone(),
         ))
     }
 
-    /// Insert a trusted static discovery candidate for `peer`.
+    /// Insert `peer` as a trusted static discovery candidate (loopback allowed)
+    /// and teach iroh its route, so the candidate dialer can connect to it.
     pub async fn insert_static_discovery_candidate(
         &self,
         peer: &ZakuraTestNode,
-    ) -> Result<iroh::NodeId, BoxError> {
+    ) -> Result<NodeId, BoxError> {
         let node_addr = peer.node_addr().await;
         let node_id = node_addr.node_id;
-        self.discovery().insert_static_candidate(node_addr).await?;
+        self.endpoint.add_node_addr(node_addr.clone())?;
+        self.discovery.insert_static_candidate(node_addr).await?;
         Ok(node_id)
-    }
-
-    /// Import a trusted static signed record for `peer` using its loopback endpoint address.
-    pub async fn import_static_loopback_record(
-        &self,
-        peer: &ZakuraTestNode,
-        sequence: u64,
-    ) -> Result<iroh::NodeId, BoxError> {
-        let node_addr = peer.node_addr().await;
-        let mut body = peer.discovery().current_self_record().body.clone();
-        body.direct_addrs = node_addr.direct_addresses().copied().collect();
-        body.sequence = sequence;
-        body.expires_at_unix_secs =
-            current_unix_secs().saturating_add(DEFAULT_DISCOVERY_RECORD_TTL.as_secs());
-        let record = ZakuraNodeRecord::sign(body, &LocalEndpointFactory::secret_key(peer.seed()))?;
-        let node_id = record.body.node_id;
-        self.discovery().import_static_record(record).await?;
-        Ok(node_id)
-    }
-
-    /// Route a test-only echo/status request through service-aware Zakura selection.
-    pub async fn request_test_echo_status(
-        &self,
-        service: &ZakuraServiceId,
-        payload: Vec<u8>,
-    ) -> Result<ZakuraTestServiceResponse, BoxError> {
-        self.endpoint
-            .request_test_echo_status(service, payload)
-            .await
     }
 
     /// Start a native dial to `peer` and wait until this node registers it.
@@ -207,13 +168,10 @@ pub struct ZakuraTestNodeBuilder {
     transport_config: Option<TransportConfig>,
     legacy_upgrade: bool,
     tracer: JsonlTracer,
-    discovery_config: ZakuraDiscoveryConfig,
-    discovery_direct_addrs: Option<Vec<SocketAddr>>,
+    service: Option<Arc<dyn Service>>,
+    service_factory: Option<Box<dyn FnOnce(ZakuraSupervisorHandle) -> Arc<dyn Service> + Send>>,
+    discovery_direct_addrs: Vec<SocketAddr>,
     extra_advertised_services: Vec<ZakuraServiceId>,
-    loopback_port: u16,
-    inbound_sink: Option<Arc<dyn InboundSink>>,
-    inbound_sink_factory:
-        Option<Box<dyn FnOnce(ZakuraSupervisorHandle) -> Arc<dyn InboundSink> + Send>>,
 }
 
 impl fmt::Debug for ZakuraTestNodeBuilder {
@@ -224,13 +182,9 @@ impl fmt::Debug for ZakuraTestNodeBuilder {
             .field("transport_config", &self.transport_config.is_some())
             .field("legacy_upgrade", &self.legacy_upgrade)
             .field("tracer", &self.tracer)
-            .field("discovery_config", &self.discovery_config)
-            .field("discovery_direct_addrs", &self.discovery_direct_addrs)
-            .field("extra_advertised_services", &self.extra_advertised_services)
-            .field("loopback_port", &self.loopback_port)
             .field(
-                "inbound_sink",
-                &(self.inbound_sink.is_some() || self.inbound_sink_factory.is_some()),
+                "service",
+                &(self.service.is_some() || self.service_factory.is_some()),
             )
             .finish()
     }
@@ -250,13 +204,23 @@ impl ZakuraTestNodeBuilder {
             transport_config: None,
             legacy_upgrade: false,
             tracer: JsonlTracer::noop(),
-            discovery_config: ZakuraDiscoveryConfig::default(),
-            discovery_direct_addrs: None,
+            service: None,
+            service_factory: None,
+            discovery_direct_addrs: Vec::new(),
             extra_advertised_services: Vec::new(),
-            loopback_port: 0,
-            inbound_sink: None,
-            inbound_sink_factory: None,
         }
+    }
+
+    /// Advertise these direct addresses in this node's discovery self-record.
+    pub fn discovery_direct_addrs(mut self, direct_addrs: Vec<SocketAddr>) -> Self {
+        self.discovery_direct_addrs = direct_addrs;
+        self
+    }
+
+    /// Advertise an additional service id in this node's discovery self-record.
+    pub fn add_advertised_service(mut self, service: ZakuraServiceId) -> Self {
+        self.extra_advertised_services.push(service);
+        self
     }
 
     /// Override local limits.
@@ -285,42 +249,18 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Override passive discovery configuration.
-    pub fn discovery_config(mut self, discovery_config: ZakuraDiscoveryConfig) -> Self {
-        self.discovery_config = discovery_config;
+    /// Install a custom service instead of the default recorder.
+    pub fn service(mut self, service: Arc<dyn Service>) -> Self {
+        self.service = Some(service);
         self
     }
 
-    /// Override locally advertised discovery direct addresses.
-    pub fn discovery_direct_addrs(mut self, direct_addrs: Vec<SocketAddr>) -> Self {
-        self.discovery_direct_addrs = Some(direct_addrs);
-        self
-    }
-
-    /// Add a custom service id to this node's signed discovery self-record.
-    pub fn add_advertised_service(mut self, service: ZakuraServiceId) -> Self {
-        self.extra_advertised_services.push(service);
-        self
-    }
-
-    /// Bind the node's Iroh endpoint to a specific loopback port.
-    pub fn loopback_port(mut self, port: u16) -> Self {
-        self.loopback_port = port;
-        self
-    }
-
-    /// Install a custom inbound sink instead of the default recorder.
-    pub fn inbound_sink(mut self, inbound_sink: Arc<dyn InboundSink>) -> Self {
-        self.inbound_sink = Some(inbound_sink);
-        self
-    }
-
-    /// Install a custom inbound sink that needs this node's supervisor.
-    pub fn inbound_sink_from_supervisor(
+    /// Install a custom service that needs this node's supervisor.
+    pub fn service_from_supervisor(
         mut self,
-        factory: impl FnOnce(ZakuraSupervisorHandle) -> Arc<dyn InboundSink> + Send + 'static,
+        factory: impl FnOnce(ZakuraSupervisorHandle) -> Arc<dyn Service> + Send + 'static,
     ) -> Self {
-        self.inbound_sink_factory = Some(Box::new(factory));
+        self.service_factory = Some(Box::new(factory));
         self
     }
 
@@ -337,58 +277,48 @@ impl ZakuraTestNodeBuilder {
             .transport_config
             .unwrap_or_else(|| self.limits.transport_config());
         let endpoint = LocalEndpointFactory::with_transport_config(transport)
-            .endpoint_on_loopback_port(self.seed, self.loopback_port)
+            .endpoint(self.seed)
             .await?;
         let supervisor = ZakuraSupervisorHandle::new(self.limits.max_connections);
-        let handshake_config = ZakuraHandshakeConfig::for_network(&Config::default().network);
-        let mut services = vec![
-            ZakuraServiceId::discovery(),
-            ZakuraServiceId::legacy_gossip(),
-            ZakuraServiceId::legacy_requests(),
-            ZakuraServiceId::service_discovery(),
-        ];
-        services.extend(self.extra_advertised_services);
-        let discovery = ZakuraDiscoveryHandle::new(
-            ZakuraDiscoveryLocalConfig {
-                secret_key: LocalEndpointFactory::secret_key(self.seed),
-                direct_addrs: self
-                    .discovery_direct_addrs
-                    .unwrap_or_else(|| vec![test_discovery_addr(self.seed)]),
-                services,
-                zakura_protocol_min: handshake_config.zakura_protocol_min,
-                zakura_protocol_max: handshake_config.zakura_protocol_max,
-                network_id: handshake_config.network_id,
-                chain_id: handshake_config.chain_id,
-                last_authored_sequence: None,
-            },
-            ZakuraDiscoveryConfig {
-                max_zakura_connections: self.limits.max_connections,
-                ..self.discovery_config
-            },
-            supervisor.subscribe(),
-        )?;
         let recorder = InboundRecorder::new(usize::from(self.limits.max_inbound_queue_depth));
-        let inbound_sink = if let Some(factory) = self.inbound_sink_factory {
+        let base_service = if let Some(factory) = self.service_factory {
             factory(supervisor.clone())
         } else {
-            self.inbound_sink
-                .unwrap_or_else(|| Arc::new(recorder.clone()))
+            self.service.unwrap_or_else(|| Arc::new(recorder.clone()))
         };
-        let handler = ZakuraProtocolHandler::new_with_sink_trace_and_discovery(
+        let network = Config::default().network;
+        let handshake_config = ZakuraHandshakeConfig::for_network(&network);
+        let mut advertised_services = crate::zakura::discovery::default_advertised_services();
+        advertised_services.extend(self.extra_advertised_services.clone());
+        let discovery = build_discovery_handle(
+            LocalEndpointFactory::secret_key(self.seed),
+            self.discovery_direct_addrs.clone(),
+            advertised_services,
+            &handshake_config,
+            self.limits.max_connections,
+            0,
+            supervisor.subscribe(),
+        )?;
+        let discovery_service =
+            Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>;
+        let registry = service_registry(&supervisor, base_service, discovery_service)?;
+        let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),
+            network.clone(),
             handshake_config,
             self.limits.clone(),
-            inbound_sink,
+            registry,
             ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
-            Some(discovery),
         );
         let router = Router::builder(endpoint)
             .accept(P2P_V2_ALPN, handler.clone())
             .spawn();
+        let endpoint = ZakuraEndpoint::from_parts(router, supervisor, handler);
 
         Ok(ZakuraTestNode {
             seed: self.seed,
-            endpoint: ZakuraEndpoint::from_parts(router, supervisor, handler),
+            endpoint,
+            discovery,
             limits: self.limits,
             recorder,
             dial_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -399,19 +329,6 @@ impl ZakuraTestNodeBuilder {
 
 fn seed_label(seed: u64) -> String {
     format!("{seed:02}")
-}
-
-fn test_discovery_addr(seed: u64) -> SocketAddr {
-    let host = u8::try_from(seed % 250 + 1).expect("test host octet is in range");
-    let port = 20_000 + u16::try_from(seed % 10_000).expect("test port offset fits in u16");
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, host)), port)
-}
-
-fn current_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("test system clock is after the Unix epoch")
-        .as_secs()
 }
 
 impl Drop for ZakuraTestNode {

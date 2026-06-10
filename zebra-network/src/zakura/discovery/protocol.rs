@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zebra_chain::primitives::ed25519::{Signature, SigningKey, VerificationKey};
 
-use super::{ZakuraNetworkId, ZakuraPeerId};
+use crate::zakura::{ZakuraNetworkId, ZakuraPeerId};
 
 /// Native discovery stream kind.
 pub const ZAKURA_STREAM_DISCOVERY: u16 = 4;

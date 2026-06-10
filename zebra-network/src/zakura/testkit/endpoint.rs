@@ -45,17 +45,8 @@ impl LocalEndpointFactory {
 
     /// Bind a relay-free endpoint to an OS-assigned loopback port.
     pub async fn endpoint(self, seed: u64) -> Result<Endpoint, BoxError> {
-        self.endpoint_on_loopback_port(seed, 0).await
-    }
-
-    /// Bind a relay-free endpoint to a specific loopback port.
-    pub async fn endpoint_on_loopback_port(
-        self,
-        seed: u64,
-        port: u16,
-    ) -> Result<Endpoint, BoxError> {
         let mut builder = direct_endpoint_builder(Self::secret_key(seed))
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
         if let Some(transport_config) = self.transport_config {
             builder = builder.transport_config(transport_config);
         }

@@ -9,7 +9,6 @@ mod matrix;
 mod node;
 mod pinned;
 mod recorder;
-mod service;
 mod trace_capture;
 mod trace_reader;
 mod wait;
@@ -29,7 +28,6 @@ pub use pinned::{
     MAX_PINNED_ALPNS,
 };
 pub use recorder::{InboundRecorder, RecordedInbound};
-pub use service::{TestEchoStatusService, TEST_ECHO_STATUS_SERVICE_ID};
 pub use trace_capture::TraceCapture;
 pub use trace_reader::{TraceQuery, TraceReader};
 pub use wait::{await_until, WaitError};
