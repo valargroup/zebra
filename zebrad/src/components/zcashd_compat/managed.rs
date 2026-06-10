@@ -37,11 +37,15 @@ pub enum ZcashdBinarySource {
 
 /// Returns the current platform target triple used for managed release lookups.
 pub fn zcashd_target_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("x86_64-pc-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-linux-gnu"),
         _ => None,
-    }
+    }?;
+
+    EMBEDDED_ZCASHD_RELEASE_MANIFEST
+        .artifact_for_target(target)
+        .map(|_| target)
 }
 
 /// Resolves the effective source for `zcashd`.
@@ -488,6 +492,7 @@ mod tests {
     };
     use crate::components::zcashd_compat::{
         ConfigZcashdBinarySource, ZcashdReleaseArtifact, ZcashdReleaseManifest,
+        EMBEDDED_ZCASHD_RELEASE_MANIFEST,
     };
 
     #[test]
@@ -517,11 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn target_triple_is_known_or_none() {
+    fn target_triple_is_configured_or_none() {
         if let Some(target) = zcashd_target_triple() {
             assert!(
-                target == "x86_64-pc-linux-gnu" || target == "aarch64-linux-gnu",
-                "unexpected target triple: {target}"
+                EMBEDDED_ZCASHD_RELEASE_MANIFEST
+                    .artifact_for_target(target)
+                    .is_some(),
+                "managed target triple is not configured in embedded manifest: {target}"
             );
         }
     }

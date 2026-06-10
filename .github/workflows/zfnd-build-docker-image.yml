@@ -47,26 +47,36 @@ on:
         required: false
         type: boolean
         default: false
+      zcashd_compat_manifest_url:
+        description: "Optional full zcashd compat manifest URL override"
+        required: false
+        type: string
+        default: ''
+      zcashd_compat_release_tag:
+        description: "zcashd compat release tag used to resolve the default manifest URL"
+        required: false
+        type: string
+        default: ''
       zcashd_compat_url_amd64:
-        description: "Hash-pinned artifact URL for linux/amd64 zcashd compatibility builds"
+        description: "Optional hash-pinned artifact URL override for linux/amd64 zcashd compatibility builds"
         required: false
         type: string
-        default: 'https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz'
+        default: ''
       zcashd_compat_sha256_amd64:
-        description: "SHA256 for the linux/amd64 zcashd compatibility runtime artifact"
+        description: "SHA256 for the linux/amd64 zcashd compatibility runtime artifact override"
         required: false
         type: string
-        default: '09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c'
+        default: ''
       zcashd_compat_url_arm64:
-        description: "Hash-pinned artifact URL for linux/arm64 zcashd compatibility builds"
+        description: "Optional hash-pinned artifact URL override for linux/arm64 zcashd compatibility builds"
         required: false
         type: string
-        default: 'https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-aarch64.tar.gz'
+        default: ''
       zcashd_compat_sha256_arm64:
-        description: "SHA256 for the linux/arm64 zcashd compatibility runtime artifact"
+        description: "SHA256 for the linux/arm64 zcashd compatibility runtime artifact override"
         required: false
         type: string
-        default: '133e562f86b4f49dd4e69ad55eb94bdd259c5e8af4fc533ec72b1f39bbbb6927'
+        default: ''
       no_cache:
         description: Disable the Docker cache for this build
         required: false
@@ -268,6 +278,9 @@ jobs:
           INPUT_TARGET: ${{ inputs.dockerfile_target }}
           PLATFORM: ${{ matrix.platform }}
           ZCASHD_COMPAT_ENABLED: ${{ inputs.zcashd_compat_enabled }}
+          ZCASHD_COMPAT_MANIFEST_URL: ${{ inputs.zcashd_compat_manifest_url }}
+          INPUT_ZCASHD_COMPAT_RELEASE_TAG: ${{ inputs.zcashd_compat_release_tag }}
+          DEFAULT_ZCASHD_COMPAT_RELEASE_TAG: ${{ vars.ZCASHD_COMPAT_RELEASE_TAG }}
           ZCASHD_COMPAT_URL_AMD64: ${{ inputs.zcashd_compat_url_amd64 }}
           ZCASHD_COMPAT_SHA256_AMD64: ${{ inputs.zcashd_compat_sha256_amd64 }}
           ZCASHD_COMPAT_URL_ARM64: ${{ inputs.zcashd_compat_url_arm64 }}
@@ -292,10 +305,12 @@ jobs:
             linux/amd64)
               artifact_url="$ZCASHD_COMPAT_URL_AMD64"
               artifact_sha256="$ZCASHD_COMPAT_SHA256_AMD64"
+              target_triple="x86_64-pc-linux-gnu"
               ;;
             linux/arm64)
               artifact_url="$ZCASHD_COMPAT_URL_ARM64"
               artifact_sha256="$ZCASHD_COMPAT_SHA256_ARM64"
+              target_triple="aarch64-linux-gnu"
               ;;
             *)
               echo "Unsupported platform for zcashd compatibility artifact: $PLATFORM" >&2
@@ -304,8 +319,32 @@ jobs:
           esac
 
           if [ -z "$artifact_url" ] || [ -z "$artifact_sha256" ]; then
-            echo "zcashd compatibility URL and SHA256 must be set for platform $PLATFORM" >&2
-            exit 1
+            manifest_url="$ZCASHD_COMPAT_MANIFEST_URL"
+            zcashd_compat_release_tag="$INPUT_ZCASHD_COMPAT_RELEASE_TAG"
+            if [ -z "$zcashd_compat_release_tag" ]; then
+              zcashd_compat_release_tag="$DEFAULT_ZCASHD_COMPAT_RELEASE_TAG"
+            fi
+
+            if [ -z "$manifest_url" ]; then
+              if [ -z "$zcashd_compat_release_tag" ]; then
+                echo "zcashd compatibility builds require zcashd_compat_manifest_url, zcashd_compat_release_tag, ZCASHD_COMPAT_RELEASE_TAG, or explicit URL/SHA inputs." >&2
+                exit 1
+              fi
+
+              manifest_url="https://github.com/valargroup/zcashd/releases/download/${zcashd_compat_release_tag}/zcashd-zebra-compat-manifest-${zcashd_compat_release_tag}.json"
+            fi
+
+            manifest_path="$RUNNER_TEMP/zcashd-compat-manifest.json"
+            curl -fsSL "$manifest_url" -o "$manifest_path"
+            manifest_release_tag="$(jq -r '.release_tag' "$manifest_path")"
+            if [ -n "$zcashd_compat_release_tag" ] && [ "$manifest_release_tag" != "$zcashd_compat_release_tag" ]; then
+              echo "zcashd compat manifest release tag mismatch: expected $zcashd_compat_release_tag, got $manifest_release_tag" >&2
+              exit 1
+            fi
+
+            artifact_entry="$(jq -er --arg target "$target_triple" '.artifacts[] | select(.target_triple == $target)' "$manifest_path")"
+            artifact_url="$(jq -r '.runtime.url' <<< "$artifact_entry")"
+            artifact_sha256="$(jq -r '.runtime.sha256' <<< "$artifact_entry")"
           fi
 
           work_dir="$(mktemp -d)"
@@ -319,6 +358,7 @@ jobs:
           tar -xzf "$archive_path" -C "$extract_dir"
 
           install -D -m 0755 "$extract_dir/bin/zcashd" "$context_dir/bin/zcashd"
+          "$context_dir/bin/zcashd" --version
 
       # Build and push image by digest to Google Artifact Registry
       # Images are pushed by digest only and will be merged into multi-arch manifest in the merge job

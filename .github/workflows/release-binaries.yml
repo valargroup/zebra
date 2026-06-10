@@ -16,6 +16,10 @@ on:
         description: "Optional full manifest URL override"
         required: false
         type: string
+      zcashd_compat_release_tag:
+        description: "zcashd compat release tag used to resolve the default manifest URL"
+        required: false
+        type: string
       publish_assets_to_release:
         description: "Upload zebrad assets to the GitHub release tag"
         required: false
@@ -81,28 +85,41 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_MANIFEST_URL: ${{ inputs.zcashd_compat_manifest_url }}
-          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          INPUT_ZCASHD_COMPAT_RELEASE_TAG: ${{ inputs.zcashd_compat_release_tag }}
+          DEFAULT_ZCASHD_COMPAT_RELEASE_TAG: ${{ vars.ZCASHD_COMPAT_RELEASE_TAG }}
         run: |
           set -euo pipefail
           manifest_url="$INPUT_MANIFEST_URL"
+          zcashd_compat_release_tag="$INPUT_ZCASHD_COMPAT_RELEASE_TAG"
+          if [ -z "$zcashd_compat_release_tag" ]; then
+            zcashd_compat_release_tag="$DEFAULT_ZCASHD_COMPAT_RELEASE_TAG"
+          fi
+
           if [ -z "$manifest_url" ]; then
-            manifest_url="https://github.com/valargroup/zcashd/releases/download/${RELEASE_TAG}/zcashd-zebra-compat-manifest-${RELEASE_TAG}.json"
+            if [ -z "$zcashd_compat_release_tag" ]; then
+              if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                echo "::warning::Skipping zcashd compat image build because no zcashd compat release tag or manifest URL was provided."
+                echo "available=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              echo "Set ZCASHD_COMPAT_RELEASE_TAG or pass zcashd_compat_manifest_url before publishing zcashd compat Docker images." >&2
+              exit 1
+            fi
+
+            manifest_url="https://github.com/valargroup/zcashd/releases/download/${zcashd_compat_release_tag}/zcashd-zebra-compat-manifest-${zcashd_compat_release_tag}.json"
           fi
 
           if ! curl -fsSL "$manifest_url" -o manifest.json; then
-            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-              echo "::warning::Skipping zcashd compat image build because manifest was not found: $manifest_url"
-              {
-                echo "available=false"
-                echo "manifest_url=$manifest_url"
-              } >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
+            echo "Failed to download zcashd compat manifest: $manifest_url" >&2
             exit 1
           fi
 
           manifest_release_tag="$(jq -r '.release_tag' manifest.json)"
+          if [ -n "$zcashd_compat_release_tag" ] && [ "$manifest_release_tag" != "$zcashd_compat_release_tag" ]; then
+            echo "zcashd compat manifest release tag mismatch: expected $zcashd_compat_release_tag, got $manifest_release_tag" >&2
+            exit 1
+          fi
           amd64_entry="$(jq -er '.artifacts[] | select(.target_triple == "x86_64-pc-linux-gnu")' manifest.json)"
           arm64_entry="$(jq -er '.artifacts[] | select(.target_triple == "aarch64-linux-gnu")' manifest.json)"
 
@@ -465,6 +482,7 @@ jobs:
           rm -rf "$context_dir"
           mkdir -p "$context_dir"
           install -D -m 0755 "$extract_dir/bin/zcashd" "$context_dir/bin/zcashd"
+          "$context_dir/bin/zcashd" --version
 
       - name: Build zcashd compat runtime image
         if: github.event_name != 'release' && !inputs.publish_docker_to_dockerhub

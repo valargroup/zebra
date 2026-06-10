@@ -206,8 +206,9 @@ for c in zebra-test tower-fallback zebra-chain tower-batch-control zebra-node-se
 ## Publish Docker Images
 
 - [ ] Confirm the zcashd compat release inputs are set before publishing:
-  - [ ] Set `ZCASHD_COMPAT_RELEASE_TAG` repository variable to the intended `zcashd` compat release tag (or pass `zcashd_compat_release_tag` when manually dispatching `release-binaries.yml`).
-  - [ ] Confirm the resolved release contains `x86_64-pc-linux-gnu` and `aarch64-linux-gnu` artifacts in `zcashd-zebra-compat-manifest-<tag>.json`.
+  - [ ] Set `ZCASHD_COMPAT_RELEASE_TAG` repository variable to the intended `zcashd` compat release tag, pass `zcashd_compat_release_tag`, or pass `zcashd_compat_manifest_url` when manually dispatching `release-binaries.yml`.
+  - [ ] Confirm the resolved `zcashd` release contains `x86_64-pc-linux-gnu` and `aarch64-linux-gnu` artifacts in `zcashd-zebra-compat-manifest-<tag>.json`.
+  - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for each zcashd-compat image variant.
 - [ ] If needed, update [`zebrad/src/components/zcashd_compat/manifest.rs`](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/src/components/zcashd_compat/manifest.rs) so managed downloads use the same zcashd compat release used by Docker builds.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease).
 - [ ] Confirm `release-binaries.yml` published `zebrad-<tag>-linux-x86_64.tar.gz`, `zebrad-<tag>-linux-aarch64.tar.gz`, `zebrad-manifest-<tag>.json`, and `SHA256SUMS.txt` to the GitHub release.

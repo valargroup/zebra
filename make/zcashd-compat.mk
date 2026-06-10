@@ -30,7 +30,9 @@ ZEBRA_COOKIE_FILE ?= $(ZEBRA_COOKIE_DIR)/.zcashd-compat.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
-ZCASHD_COMPAT_URL ?= https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha-zebra-regtest-compat.2/zcashd-zebra-compat-v6.2.1-alpha-zebra-regtest-compat.2-linux-x86_64.tar.gz
+ZCASHD_COMPAT_RELEASE_TAG ?= v6.2.1-alpha-zebra-regtest-compat.2
+ZCASHD_COMPAT_PLATFORM ?= linux-x86_64
+ZCASHD_COMPAT_URL ?= https://github.com/valargroup/zcashd/releases/download/$(ZCASHD_COMPAT_RELEASE_TAG)/zcashd-zebra-compat-$(ZCASHD_COMPAT_RELEASE_TAG)-$(ZCASHD_COMPAT_PLATFORM).tar.gz
 ZCASHD_COMPAT_SHA256 ?= e92374902085bdbf12faeff4e5f4f026abe3225895bd0035bcc3f146246c5a2c
 ZCASHD_COMPAT_ARTIFACT_DIR ?= $(CURDIR)/target/zcashd-compat
 ZCASHD_COMPAT_ARCHIVE_PATH ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/zcashd-compat.tar.gz
