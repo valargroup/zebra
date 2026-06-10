@@ -22,7 +22,7 @@ on:
         description: "Seconds to wait for the remote sync check"
         required: true
         type: string
-        default: "600"
+        default: "1800"
 
 permissions:
   contents: read
@@ -53,14 +53,17 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
         with:
-          toolchain: 1.91 # zebrad MSRV
+          toolchain: stable
           cache-on-failure: true
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae #v2
         with:
           cache-on-failure: true
 
-      - uses: ./.github/actions/setup-zebra-build
+      - name: Install protoc
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends protobuf-compiler
 
       - name: Build zebrad
         run: cargo build --release --locked -p zebrad
@@ -87,21 +90,25 @@ jobs:
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -T 30 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
       - name: Upload binary and sync check
         run: |
           set -euo pipefail
 
-          scp target/release/zebrad "$DEPLOY_USER@$DEPLOY_HOST:/usr/local/bin/zebrad.new"
-          scp deploy/zcashd-compat/sync-check.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/zcashd-compat-sync-check.sh"
+          ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+
+          scp "${ssh_options[@]}" target/release/zebrad "$DEPLOY_USER@$DEPLOY_HOST:/usr/local/bin/zebrad.new"
+          scp "${ssh_options[@]}" deploy/zcashd-compat/sync-check.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/zcashd-compat-sync-check.sh"
 
       - name: Install and restart zebrad
         run: |
           set -euo pipefail
 
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
+          ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
           set -euo pipefail
 
           if [ -x /usr/local/bin/zebrad ]; then
@@ -124,12 +131,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+
           # shellcheck disable=SC2029
-          if ! ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+          if ! ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
             "HEIGHT_MAX_DRIFT='$HEIGHT_MAX_DRIFT' SYNC_CHECK_TIMEOUT='$SYNC_CHECK_TIMEOUT' SYNC_CHECK_INTERVAL='$SYNC_CHECK_INTERVAL' /tmp/zcashd-compat-sync-check.sh"
           then
             echo "Sync check failed, rolling back to /usr/local/bin/zebrad.bak" >&2
-            ssh "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
+            ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<'EOF'
           set -euo pipefail
 
           if [ ! -x /usr/local/bin/zebrad.bak ]; then
@@ -147,4 +156,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          ssh "$DEPLOY_USER@$DEPLOY_HOST" '/usr/local/bin/zebrad --version'
+          ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+
+          ssh "${ssh_options[@]}" "$DEPLOY_USER@$DEPLOY_HOST" '/usr/local/bin/zebrad --version'
