@@ -11,7 +11,7 @@ use tokio::time::sleep;
 
 use super::{
     launch::ZcashdCompatSetup, setup_zcashd_compat, ZcashdRpcClient,
-    TEST_ZCASHD_COMPAT_REORG_ITERATIONS,
+    TEST_ZCASHD_COMPAT_REORG_ITERATIONS, TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG,
 };
 use crate::common::regtest::MiningRpcMethods;
 
@@ -159,6 +159,96 @@ pub async fn branch_too_large_sticky() -> Result<()> {
     setup.teardown()
 }
 
+/// Opt-in probe for zcashd block-index reloads after Zebra-side regtest reorgs.
+///
+/// Current zcashd builds can restart after a single trusted Zebra chain, but
+/// repeated reorgs leave old trusted side-branch block-index entries on disk.
+/// `LoadBlockIndex()` still checks those side branches' regtest work on
+/// restart, so the supervised zcashd exits with `CheckProofOfWork failed`.
+/// Keep this probe manual until zcashd reloads all trusted Zebra regtest
+/// entries safely.
+#[allow(clippy::print_stderr)]
+pub async fn restart_after_reorg() -> Result<()> {
+    let Some(setup) = setup_zcashd_compat().await? else {
+        return Ok(());
+    };
+
+    if !setup.can_mutate() {
+        return setup.teardown();
+    }
+
+    if std::env::var_os(TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG).is_none() {
+        eprintln!(
+            "Skipped restart-after-reorg reload probe; set \
+             {TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG}=1 after zcashd can reload \
+             trusted Zebra regtest side branches"
+        );
+        return setup.teardown();
+    }
+
+    setup.zebra_client.generate(12).await?;
+    wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
+
+    for depth in 1..=3 {
+        let fork_height = zebra_tip(&setup).await?.0 - u64::from(depth);
+        force_zebra_reorg(&setup, fork_height, depth + 1)
+            .await
+            .map_err(|e| eyre!("force depth-{depth} reorg before restart: {e}"))?;
+        wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT)
+            .await
+            .map_err(|e| eyre!("wait for depth-{depth} reorg convergence before restart: {e}"))?;
+    }
+
+    restart_zcashd_and_wait_for_tips(&setup).await?;
+
+    setup.teardown()
+}
+
+/// Requires zcashd to recover when Zebra's best tip temporarily rolls behind zcashd's local tip.
+///
+/// zcashd must report `zebra_tip_behind_local` as a degraded, retryable state,
+/// then recover when Zebra mines a replacement branch. Sticky local-tip-ahead
+/// failures are regressions.
+pub async fn zebra_tip_behind_local() -> Result<()> {
+    let Some(setup) = setup_zcashd_compat().await? else {
+        return Ok(());
+    };
+
+    if !setup.can_mutate() {
+        return setup.teardown();
+    }
+
+    setup.zebra_client.generate(10).await?;
+    wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
+
+    let old_zcashd_tip = zcashd_tip(&setup.zcashd_client).await?;
+    let old_zebra_tip = zebra_tip(&setup).await?;
+    assert_eq!(old_zcashd_tip, old_zebra_tip);
+
+    let params = serde_json::to_string(&vec![old_zebra_tip.1])?;
+    let _: () = setup
+        .zebra_client
+        .json_result_from_call("invalidateblock", &params)
+        .await
+        .map_err(|e| eyre!("zebrad invalidate tip block: {e}"))?;
+
+    let info = wait_for_sync_detail(
+        &setup.zcashd_client,
+        "zebra_tip_behind_local",
+        STANDARD_SYNC_TIMEOUT,
+    )
+    .await?;
+
+    assert_eq!(info["sync"]["state"].as_str(), Some("degraded"));
+    assert_eq!(info["readiness"].as_str(), Some("degraded"));
+
+    setup.zebra_client.generate(2).await?;
+    wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
+    wait_for_readiness(&setup.zcashd_client, "ready", STANDARD_SYNC_TIMEOUT).await?;
+
+    setup.teardown()
+}
+
 /// Repeatedly forces small reorgs and occasional mid-sync depth-1 churn.
 pub async fn churn() -> Result<()> {
     let Some(setup) = setup_zcashd_compat().await? else {
@@ -301,6 +391,52 @@ fn send_signal(pid: u32, signal: &str) -> Result<()> {
         Ok(())
     } else {
         Err(eyre!("kill {signal} {pid} failed with status {status}"))
+    }
+}
+
+async fn restart_zcashd_and_wait_for_tips(setup: &ZcashdCompatSetup) -> Result<()> {
+    let old_pid = zcashd_pid(setup)?;
+
+    let _: serde_json::Value = setup
+        .zcashd_client
+        .json_result_from_call("stop", "[]")
+        .await
+        .map_err(|e| eyre!("zcashd stop: {e}"))?;
+
+    wait_for_restarted_zcashd_rpc(setup, old_pid, STANDARD_SYNC_TIMEOUT).await?;
+    wait_for_readiness(&setup.zcashd_client, "ready", STANDARD_SYNC_TIMEOUT).await?;
+    wait_for_tips_match(setup, STANDARD_SYNC_TIMEOUT).await
+}
+
+async fn wait_for_restarted_zcashd_rpc(
+    setup: &ZcashdCompatSetup,
+    old_pid: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        sleep(Duration::from_secs(1)).await;
+
+        let rpc_result = setup
+            .zcashd_client
+            .json_result_from_call::<serde_json::Value>("getblockchaininfo", "[]")
+            .await;
+
+        let last_seen = match rpc_result {
+            Ok(_) => match zcashd_pid(setup) {
+                Ok(new_pid) if new_pid != old_pid => return Ok(()),
+                Ok(new_pid) => format!("zcashd RPC responded from original pid {new_pid}"),
+                Err(error) => format!("zcashd RPC responded but pid was unavailable: {error}"),
+            },
+            Err(error) => format!("zcashd RPC unavailable: {error}"),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(eyre!(
+                "zcashd did not restart within {timeout:?}; last seen: {last_seen}"
+            ));
+        }
     }
 }
 
