@@ -7,7 +7,7 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{fmt, fs::File, io::BufReader, panic, sync::Arc, time::Duration};
+use std::{fmt, fs::File, io::BufReader, panic, sync::Arc};
 
 use cookie::Cookie;
 use jsonrpsee::server::{
@@ -15,7 +15,7 @@ use jsonrpsee::server::{
     ServerHandle,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
+use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, TlsAcceptor};
 use tracing::*;
 
@@ -171,14 +171,7 @@ impl RpcServer {
                     let (socket, remote_addr) = tokio::select! {
                         result = listener.accept() => match result {
                             Ok(connection) => connection,
-                            Err(error) => {
-                                warn!(
-                                    ?error,
-                                    "TLS RPC listener failed to accept a connection; retrying"
-                                );
-                                sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
+                            Err(error) => return Err(error.into()),
                         },
                         _ = stop_handle.clone().shutdown() => break,
                     };
