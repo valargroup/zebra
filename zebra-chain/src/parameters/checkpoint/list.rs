@@ -56,9 +56,11 @@ impl Network {
     pub fn genesis_hash(&self) -> block::Hash {
         match self {
             // zcash-cli getblockhash 0
-            Network::Mainnet => "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08"
-                .parse()
-                .expect("hard-coded hash parses"),
+            Network::Mainnet | Network::ForkedMainnet(_) => {
+                "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08"
+                    .parse()
+                    .expect("hard-coded hash parses")
+            }
             // See `zebra_chain::parameters::network::testnet` for more details.
             Network::Testnet(params) => params.genesis_hash(),
         }
@@ -67,6 +69,7 @@ impl Network {
     pub fn checkpoint_list(&self) -> Arc<CheckpointList> {
         match self {
             Network::Mainnet => MAINNET_CHECKPOINT_LIST.clone(),
+            Network::ForkedMainnet(params) => params.checkpoints(),
             Network::Testnet(params) => params.checkpoints(),
         }
     }

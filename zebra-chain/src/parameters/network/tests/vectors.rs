@@ -1,12 +1,18 @@
 //! Fixed test vectors for the network consensus parameters.
 
-use zcash_protocol::consensus::{self as zp_consensus, NetworkConstants as _, Parameters};
+use std::collections::BTreeMap;
+
+use zcash_protocol::consensus::{
+    self as zp_consensus, NetworkConstants as _, NetworkType, Parameters,
+};
 
 use crate::{
     amount::{Amount, NonNegative},
-    block::Height,
+    block::{self, Height},
     parameters::{
+        fork,
         network::error::ParametersBuilderError,
+        network::magic::Magic,
         subsidy::{self, block_subsidy, funding_stream_values, FundingStreamReceiver},
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
@@ -15,6 +21,7 @@ use crate::{
         },
         Network, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS, TESTNET_ACTIVATION_HEIGHTS,
     },
+    work::difficulty::{ExpandedDifficulty, ParameterDifficulty, U256},
 };
 
 /// Checks that every method in the `Parameters` impl for `zebra_chain::Network` has the same output
@@ -162,6 +169,246 @@ fn activates_network_upgrades_correctly() {
             "network activation list should match expected activation heights"
         );
     }
+}
+
+fn forked_mainnet_network() -> Network {
+    let fork_height = Height(3_400_000);
+    let fork_hash = block::Hash([0x11; 32]);
+    let network_magic = Magic([0xab, 0xcd, 0xef, 0x01]);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+    let post_fork_activation_heights = BTreeMap::from([(post_fork_height, NetworkUpgrade::Nu7)]);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    Network::new_forked_mainnet(
+        fork::Parameters::new(
+            "LocalFork",
+            fork_height,
+            fork_hash,
+            network_magic,
+            post_fork_activation_heights,
+            post_fork_limit,
+            true,
+        )
+        .expect("test fork parameters should be valid"),
+    )
+}
+
+#[test]
+fn forked_mainnet_uses_mainnet_activations_through_fork_height() {
+    let network = forked_mainnet_network();
+    let fork_height = Height(3_400_000);
+
+    let mainnet_activation_list = Network::Mainnet.activation_list();
+    for (height, network_upgrade) in mainnet_activation_list
+        .iter()
+        .filter(|(height, _)| **height <= fork_height)
+    {
+        assert_eq!(
+            network.activation_list().get(height),
+            Some(network_upgrade),
+            "forked mainnet must preserve Mainnet activation at {height:?}"
+        );
+    }
+
+    let before_fork = fork_height
+        .previous()
+        .expect("test fork height is above Height::MIN");
+    assert_eq!(
+        NetworkUpgrade::current(&network, before_fork),
+        NetworkUpgrade::current(&Network::Mainnet, before_fork)
+    );
+    assert_eq!(
+        NetworkUpgrade::current(&network, fork_height),
+        NetworkUpgrade::current(&Network::Mainnet, fork_height)
+    );
+}
+
+#[test]
+fn forked_mainnet_uses_configured_post_fork_activations() {
+    let network = forked_mainnet_network();
+    let fork_height = Height(3_400_000);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+
+    assert_eq!(
+        NetworkUpgrade::current(&network, post_fork_height),
+        NetworkUpgrade::Nu7,
+        "the first configurable block is fork_height + 1"
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&network),
+        Some(post_fork_height)
+    );
+}
+
+#[test]
+fn forked_mainnet_uses_height_aware_difficulty_parameters() {
+    let network = forked_mainnet_network();
+    let fork_height = Height(3_400_000);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+    let mainnet_limit = Network::Mainnet.target_difficulty_limit();
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1)
+        .to_compact()
+        .to_expanded()
+        .expect("test difficulty limit is valid");
+
+    assert_eq!(
+        network.target_difficulty_limit_at_height(fork_height),
+        mainnet_limit
+    );
+    assert_eq!(
+        network.target_difficulty_limit_at_height(post_fork_height),
+        post_fork_limit
+    );
+
+    assert!(!network.disable_pow_at_height(fork_height));
+    assert!(network.disable_pow_at_height(post_fork_height));
+}
+
+#[test]
+fn forked_mainnet_identity_is_distinct_but_uses_mainnet_kind() {
+    let network = forked_mainnet_network();
+    let fork_height = Height(3_400_000);
+
+    assert_eq!(network.to_string(), "ForkedMainnet_LocalFork");
+    assert_eq!(network.lowercase_name(), "forkedmainnet_localfork");
+    assert_eq!(network.kind(), Network::Mainnet.kind());
+    assert_eq!(network.t_addr_kind(), Network::Mainnet.t_addr_kind());
+    assert_eq!(network.network_type(), NetworkType::Main);
+    assert_eq!(network.genesis_hash(), Network::Mainnet.genesis_hash());
+
+    let checkpoints = network.checkpoint_list();
+    assert_eq!(checkpoints.max_height(), fork_height);
+    assert_eq!(checkpoints.hash(fork_height), Some(block::Hash([0x11; 32])));
+}
+
+#[test]
+fn forked_mainnet_rejects_pre_mandatory_checkpoint_fork_height() {
+    let fork_height = Height(1);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+    let post_fork_activation_heights = BTreeMap::from([(post_fork_height, NetworkUpgrade::Nu7)]);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    let err = fork::Parameters::new(
+        "LocalFork",
+        fork_height,
+        block::Hash([0x11; 32]),
+        Magic([0xab, 0xcd, 0xef, 0x01]),
+        post_fork_activation_heights,
+        post_fork_limit,
+        true,
+    )
+    .expect_err("fork heights before the mandatory checkpoint should be rejected");
+
+    assert!(matches!(
+        err,
+        fork::ParametersError::ForkHeightBeforeMandatoryCheckpoint { .. }
+    ));
+}
+
+#[test]
+fn forked_mainnet_rejects_fork_height_above_max() {
+    let fork_height = Height(Height::MAX.0 + 1);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    let err = fork::Parameters::new(
+        "LocalFork",
+        fork_height,
+        block::Hash([0x11; 32]),
+        Magic([0xab, 0xcd, 0xef, 0x01]),
+        BTreeMap::new(),
+        post_fork_limit,
+        true,
+    )
+    .expect_err("fork heights above Height::MAX should be rejected");
+
+    assert!(matches!(
+        err,
+        fork::ParametersError::ForkHeightAboveMax { .. }
+    ));
+}
+
+#[test]
+fn forked_mainnet_rejects_non_ascii_fork_name() {
+    let fork_height = Height(3_400_000);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+    let post_fork_activation_heights = BTreeMap::from([(post_fork_height, NetworkUpgrade::Nu7)]);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    let err = fork::Parameters::new(
+        "LocålFork",
+        fork_height,
+        block::Hash([0x11; 32]),
+        Magic([0xab, 0xcd, 0xef, 0x01]),
+        post_fork_activation_heights,
+        post_fork_limit,
+        true,
+    )
+    .expect_err("non-ASCII fork names should be rejected");
+
+    assert!(matches!(
+        err,
+        fork::ParametersError::InvalidForkNameCharacter
+    ));
+}
+
+#[test]
+fn forked_mainnet_rejects_activation_height_above_max() {
+    let fork_height = Height(3_400_000);
+    let post_fork_activation_heights =
+        BTreeMap::from([(Height(Height::MAX.0 + 1), NetworkUpgrade::Nu7)]);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    let err = fork::Parameters::new(
+        "LocalFork",
+        fork_height,
+        block::Hash([0x11; 32]),
+        Magic([0xab, 0xcd, 0xef, 0x01]),
+        post_fork_activation_heights,
+        post_fork_limit,
+        true,
+    )
+    .expect_err("post-fork activation heights above Height::MAX should be rejected");
+
+    assert!(matches!(
+        err,
+        fork::ParametersError::PostForkActivationAboveMax { .. }
+    ));
+}
+
+#[test]
+fn forked_mainnet_rejects_duplicate_post_fork_upgrade() {
+    let fork_height = Height(3_400_000);
+    let post_fork_activation_heights = BTreeMap::from([
+        (Height(3_400_001), NetworkUpgrade::Nu7),
+        (Height(3_400_002), NetworkUpgrade::Nu7),
+    ]);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    let err = fork::Parameters::new(
+        "LocalFork",
+        fork_height,
+        block::Hash([0x11; 32]),
+        Magic([0xab, 0xcd, 0xef, 0x01]),
+        post_fork_activation_heights,
+        post_fork_limit,
+        true,
+    )
+    .expect_err("duplicate post-fork upgrades should be rejected");
+
+    assert!(matches!(
+        err,
+        fork::ParametersError::OutOfOrderPostForkActivations
+    ));
 }
 
 /// Checks that configured testnet names are validated and used correctly.

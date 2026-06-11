@@ -196,7 +196,9 @@ impl AdjustedDifficulty {
                 self.network.is_a_test_network(),
                 "invalid network: the minimum difficulty rule only applies on test networks"
             );
-            self.network.target_difficulty_limit().to_compact()
+            self.network
+                .target_difficulty_limit_at_height(self.candidate_height)
+                .to_compact()
         } else {
             self.threshold_bits()
         }
@@ -218,7 +220,11 @@ impl AdjustedDifficulty {
 
         let threshold = (self.mean_target_difficulty() / averaging_window_timespan.num_seconds())
             * self.median_timespan_bounded().num_seconds();
-        let threshold = min(self.network.target_difficulty_limit(), threshold);
+        let threshold = min(
+            self.network
+                .target_difficulty_limit_at_height(self.candidate_height),
+            threshold,
+        );
 
         threshold.to_compact()
     }
@@ -229,6 +235,12 @@ impl AdjustedDifficulty {
     ///
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
+        if let Network::ForkedMainnet(params) = &self.network {
+            if params.is_post_fork_height(self.candidate_height) {
+                return self.mean_target_difficulty_after_mainnet_fork(params.fork_height());
+            }
+        }
+
         // In Zebra, contextual validation starts after Canopy activation, so we
         // can assume that the relevant chain contains at least 17 blocks.
         // Therefore, the `PoWLimit` case of `MeanTarget()` from the Zcash
@@ -238,7 +250,9 @@ impl AdjustedDifficulty {
             if self.relevant_difficulty_thresholds.len() >= POW_AVERAGING_WINDOW {
                 &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW]
             } else {
-                return self.network.target_difficulty_limit();
+                return self
+                    .network
+                    .target_difficulty_limit_at_height(self.candidate_height);
             };
 
         // Since the PoWLimits are `2^251 − 1` for Testnet, and `2^243 − 1` for
@@ -252,6 +266,47 @@ impl AdjustedDifficulty {
                     .to_expanded()
                     .expect("difficulty thresholds in previously verified blocks are valid")
             })
+            .sum();
+
+        let divisor: U256 = POW_AVERAGING_WINDOW.into();
+        total / divisor
+    }
+
+    /// Calculate the arithmetic mean for the first post-fork DAA window.
+    ///
+    /// Forked Mainnet starts from Mainnet history, but local fork miners should not
+    /// need to mine through a Mainnet-difficulty averaging window before the fork's
+    /// configured difficulty limit can take effect. Until there are enough
+    /// post-fork blocks to fill the averaging window, seed missing entries with
+    /// the post-fork target difficulty limit.
+    fn mean_target_difficulty_after_mainnet_fork(
+        &self,
+        fork_height: block::Height,
+    ) -> ExpandedDifficulty {
+        let previous_post_fork_block_count = usize::try_from(
+            self.candidate_height - fork_height - 1,
+        )
+        .expect("post-fork candidate heights have a non-negative number of previous fork blocks");
+        let post_fork_threshold_count = previous_post_fork_block_count
+            .min(POW_AVERAGING_WINDOW)
+            .min(self.relevant_difficulty_thresholds.len());
+        let missing_threshold_count = POW_AVERAGING_WINDOW - post_fork_threshold_count;
+        let post_fork_target_limit = self
+            .network
+            .target_difficulty_limit_at_height(self.candidate_height);
+
+        let total: ExpandedDifficulty = self.relevant_difficulty_thresholds.as_slice()
+            [0..post_fork_threshold_count]
+            .iter()
+            .map(|compact| {
+                compact
+                    .to_expanded()
+                    .expect("difficulty thresholds in previously verified blocks are valid")
+            })
+            .chain(std::iter::repeat_n(
+                post_fork_target_limit,
+                missing_threshold_count,
+            ))
             .sum();
 
         let divisor: U256 = POW_AVERAGING_WINDOW.into();
@@ -361,5 +416,86 @@ impl AdjustedDifficulty {
         // <https://zips.z.cash/protocol/protocol.pdf>, section 7.7.3, Difficulty Adjustment (p. 132)
         let median_idx = median_block_span_times.len() / 2;
         median_block_span_times[median_idx]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use zebra_chain::{
+        block::{self, Height},
+        parameters::{fork, Magic},
+    };
+
+    use super::*;
+
+    fn forked_mainnet_with_difficulty(post_fork_limit: CompactDifficulty) -> Network {
+        Network::new_forked_mainnet(
+            fork::Parameters::new(
+                "StateDifficulty",
+                Height(3_400_000),
+                block::Hash([0x33; 32]),
+                Magic([0xab, 0xcd, 0xef, 0x03]),
+                BTreeMap::new(),
+                post_fork_limit,
+                false,
+            )
+            .expect("test fork parameters should be valid"),
+        )
+    }
+
+    #[test]
+    fn forked_mainnet_initial_daa_window_uses_post_fork_limit() {
+        let candidate_height = Height(3_400_001);
+        let candidate_time = Utc::now();
+        let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+        let network = forked_mainnet_with_difficulty(post_fork_limit);
+        let averaging_window_timespan =
+            NetworkUpgrade::averaging_window_timespan_for_height(&network, candidate_height);
+        let newer_median_time = candidate_time - Duration::seconds(1);
+        let older_median_time = newer_median_time - averaging_window_timespan;
+
+        let relevant_data = (0..POW_ADJUSTMENT_BLOCK_SPAN).map(|index| {
+            let time = if index < POW_MEDIAN_BLOCK_SPAN {
+                newer_median_time
+            } else if index >= POW_AVERAGING_WINDOW {
+                older_median_time
+            } else {
+                newer_median_time
+            };
+
+            (
+                Network::Mainnet.target_difficulty_limit().to_compact(),
+                time,
+            )
+        });
+
+        let adjusted_difficulty = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            Height(3_400_000),
+            &network,
+            relevant_data,
+        );
+
+        let expected_seeded_threshold = ((post_fork_limit
+            .to_expanded()
+            .expect("test difficulty should expand")
+            / averaging_window_timespan.num_seconds())
+            * averaging_window_timespan.num_seconds())
+        .to_compact();
+
+        assert_eq!(
+            adjusted_difficulty.expected_difficulty_threshold(),
+            expected_seeded_threshold,
+            "the first post-fork DAA window should start from the fork's easy limit, not Mainnet difficulty"
+        );
+        assert!(
+            expected_seeded_threshold
+                .to_expanded()
+                .expect("test difficulty should expand")
+                > Network::Mainnet.target_difficulty_limit(),
+            "the seeded fork threshold should be easier than Mainnet difficulty"
+        );
     }
 }

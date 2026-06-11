@@ -92,44 +92,44 @@ impl Version {
         Version(match (network, network_upgrade) {
             (_, Genesis) | (_, BeforeOverwinter) => 170_002,
             (Testnet(params), Overwinter) if params.is_default_testnet() => 170_003,
-            (Mainnet, Overwinter) => 170_005,
+            (Mainnet | ForkedMainnet(_), Overwinter) => 170_005,
             (Testnet(params), Sapling) if params.is_default_testnet() => 170_007,
             (Testnet(params), Sapling) if params.is_regtest() => 170_006,
-            (Mainnet, Sapling) => 170_007,
+            (Mainnet | ForkedMainnet(_), Sapling) => 170_007,
             (Testnet(params), Blossom) if params.is_default_testnet() || params.is_regtest() => {
                 170_008
             }
-            (Mainnet, Blossom) => 170_009,
+            (Mainnet | ForkedMainnet(_), Blossom) => 170_009,
             (Testnet(params), Heartwood) if params.is_default_testnet() || params.is_regtest() => {
                 170_010
             }
-            (Mainnet, Heartwood) => 170_011,
+            (Mainnet | ForkedMainnet(_), Heartwood) => 170_011,
             (Testnet(params), Canopy) if params.is_default_testnet() || params.is_regtest() => {
                 170_012
             }
-            (Mainnet, Canopy) => 170_013,
+            (Mainnet | ForkedMainnet(_), Canopy) => 170_013,
             (Testnet(params), Nu5) if params.is_default_testnet() || params.is_regtest() => 170_050,
-            (Mainnet, Nu5) => 170_100,
+            (Mainnet | ForkedMainnet(_), Nu5) => 170_100,
             (Testnet(params), Nu6) if params.is_default_testnet() || params.is_regtest() => 170_110,
-            (Mainnet, Nu6) => 170_120,
+            (Mainnet | ForkedMainnet(_), Nu6) => 170_120,
             (Testnet(params), Nu6_1) if params.is_default_testnet() || params.is_regtest() => {
                 170_130
             }
-            (Mainnet, Nu6_1) => 170_140,
+            (Mainnet | ForkedMainnet(_), Nu6_1) => 170_140,
             (Testnet(params), Nu6_2) if params.is_default_testnet() || params.is_regtest() => {
                 170_150
             }
-            (Mainnet, Nu6_2) => 170_150,
+            (Mainnet | ForkedMainnet(_), Nu6_2) => 170_150,
             // TODO(NU6.2): these Nu7 protocol versions are provisional, bumped above Nu6_2's
             // 170_150. Update them when the real Nu7 values are specified.
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_160,
-            (Mainnet, Nu7) => 170_170,
+            (Mainnet | ForkedMainnet(_), Nu7) => 170_170,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
 
             #[cfg(zcash_unstable = "zfuture")]
-            (Mainnet, ZFuture) => {
+            (Mainnet | ForkedMainnet(_), ZFuture) => {
                 panic!("ZFuture network upgrade should not be active on Mainnet")
             }
         })

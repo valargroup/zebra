@@ -16,6 +16,7 @@
 
 use std::{
     collections::HashMap,
+    fs,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -41,9 +42,11 @@ use zebra_chain::{
 
 use crate::{
     constants::{
-        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_LEGACY_CHAIN_BLOCKS,
+        MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
+        MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
+    forked_mainnet_marker_contents,
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
     service::{
@@ -81,7 +84,7 @@ pub mod arbitrary;
 mod tests;
 
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
-use write::NonFinalizedWriteMessage;
+use write::{NonFinalizedWriteMessage, SemanticFinalization};
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
 
@@ -323,6 +326,7 @@ impl StateService {
                     #[cfg(feature = "elasticsearch")]
                     true,
                 );
+                validate_forked_mainnet_anchor(&finalized_state.db, &network);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -333,6 +337,8 @@ impl StateService {
             .await
             .expect("failed to join blocking task")
         };
+
+        let semantic_finalization = semantic_finalization(network);
 
         // # Correctness
         //
@@ -351,6 +357,7 @@ impl StateService {
             false
         };
         let backup_dir_path = config.non_finalized_state_backup_dir(network);
+        write_forked_mainnet_marker(&config, network);
         let skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
         let (non_finalized_state, non_finalized_state_sender, non_finalized_state_receiver) =
             NonFinalizedState::new(network)
@@ -390,6 +397,7 @@ impl StateService {
             non_finalized_state_sender,
             should_use_finalized_block_write_sender,
             sync_backup_dir_path,
+            semantic_finalization,
         );
 
         let read_service = ReadStateService::new(
@@ -942,6 +950,88 @@ impl StateService {
         self.non_finalized_block_write_sent_hashes
             .contains(hash)
             .then_some(KnownBlock::WriteChannel)
+    }
+}
+
+/// Writes a marker identifying the forked-mainnet non-finalized backup cache.
+fn write_forked_mainnet_marker(config: &Config, network: &Network) {
+    let Some(marker_path) = config.forked_mainnet_marker_path(network) else {
+        return;
+    };
+    let marker_contents = forked_mainnet_marker_contents(network)
+        .expect("marker path only exists for forked-mainnet");
+    let marker_dir = marker_path
+        .parent()
+        .expect("marker file has a non-finalized backup parent directory");
+
+    fs::create_dir_all(marker_dir)
+        .expect("must be able to create forked-mainnet non-finalized backup directory");
+    fs::write(&marker_path, marker_contents)
+        .expect("must be able to write forked-mainnet non-finalized backup marker");
+}
+
+/// Returns the semantic finalization policy for `network`.
+///
+/// Forked Mainnet shares Mainnet's finalized database, so finalizing any
+/// post-fork block would write fork-only state into the shared Mainnet DB.
+/// Keep all fork blocks non-finalized and recover by deleting the fork-specific
+/// non-finalized backup cache.
+fn semantic_finalization(network: &Network) -> SemanticFinalization {
+    match network {
+        Network::ForkedMainnet(_) => SemanticFinalization::Disabled,
+        _ => SemanticFinalization::Enabled {
+            depth: MAX_BLOCK_REORG_HEIGHT,
+        },
+    }
+}
+
+/// Validates that the shared Mainnet finalized state is anchored at the
+/// configured fork point before restoring or committing forked blocks.
+fn validate_forked_mainnet_anchor(db: &ZebraDb, network: &Network) {
+    let Network::ForkedMainnet(params) = network else {
+        return;
+    };
+
+    let fork_height = params.fork_height();
+    let fork_hash = params.fork_hash();
+
+    let Some((tip_height, tip_hash)) = db.tip() else {
+        panic!(
+            "forked-mainnet state requires a Mainnet finalized database containing \
+             the fork anchor {fork_height:?} ({fork_hash}), but the finalized state is empty"
+        );
+    };
+
+    if tip_height < fork_height {
+        panic!(
+            "forked-mainnet state requires a Mainnet finalized database containing \
+             the fork anchor {fork_height:?} ({fork_hash}), but finalized tip is \
+             {tip_height:?} ({tip_hash})"
+        );
+    }
+
+    if tip_height > fork_height {
+        panic!(
+            "forked-mainnet state requires the Mainnet finalized database tip to be \
+             exactly the fork anchor {fork_height:?} ({fork_hash}), but finalized \
+             tip is {tip_height:?} ({tip_hash}); rollback the finalized state to \
+             the fork height before starting the fork"
+        );
+    }
+
+    let Some(actual_hash) = db.hash(fork_height) else {
+        panic!(
+            "forked-mainnet state requires fork anchor {fork_height:?} ({fork_hash}) \
+             to exist in the Mainnet finalized database, but no block hash was found \
+             at that height"
+        );
+    };
+
+    if actual_hash != fork_hash {
+        panic!(
+            "forked-mainnet state fork anchor mismatch at {fork_height:?}: \
+             expected {fork_hash}, found {actual_hash}"
+        );
     }
 }
 

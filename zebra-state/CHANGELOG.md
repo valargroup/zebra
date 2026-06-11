@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Add forked-mainnet state guardrails: startup validates the Mainnet finalized
+  fork anchor, and forked-mainnet disables semantic finalization so fork-only
+  blocks remain isolated in the fork-specific non-finalized backup cache.
+- Add forked-mainnet non-finalized cache marker helpers and write a marker at
+  fork startup so cleanup can validate the selected fork cache.
+- Seed the first forked-mainnet post-fork DAA window from the configured fork
+  target difficulty limit, and skip contextual expected-difficulty equality
+  when post-fork proof-of-work validation is disabled.
+
 ## [8.0.0] - 2026-06-02
 
 ### Changed

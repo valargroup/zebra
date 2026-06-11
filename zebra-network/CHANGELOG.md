@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Add forked-mainnet network configuration and explicit `initial_fork_peers`,
+  keeping forked nodes off public Mainnet and Testnet seeders by default.
+
+### Changed
+
+- Require forked-mainnet configured difficulty values to be compact 8-hex or
+  expanded 64-hex strings.
+
 ## [8.0.0] - 2026-06-02
 
 ### Changed

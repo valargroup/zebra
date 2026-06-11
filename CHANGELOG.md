@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Add `zebrad fork-mainnet prepare`, which generates a config for local
+  forked-mainnet testing from an anchored Mainnet state. Forked-mainnet mode
+  reuses Mainnet finalized state at the anchor but never finalizes fork-only
+  blocks into the shared Mainnet database. Generated fork configs default to an
+  easy post-fork DAA starting limit instead of requiring users to choose a
+  fixed difficulty, and reject ambiguous difficulty formats and out-of-range
+  fork heights.
+- Add `zebrad reset-non-finalized-state`, which deletes the selected network's
+  non-finalized backup cache after a `--dry-run` preview or explicit `--force`.
+  Mainnet resets also require `--confirm-mainnet`.
 - Include the `zebra-rollback-state` utility alongside `zebrad` in release
   Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.

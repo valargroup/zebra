@@ -11,7 +11,8 @@ use crate::config::ZebradConfig;
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
 use self::{
-    copy_state::CopyStateCmd, generate::GenerateCmd, rollback_state::RollbackStateCmd,
+    copy_state::CopyStateCmd, fork_mainnet::ForkMainnetCmd, generate::GenerateCmd,
+    reset_non_finalized_state::ResetNonFinalizedStateCmd, rollback_state::RollbackStateCmd,
     tip_height::TipHeightCmd,
 };
 
@@ -19,7 +20,9 @@ pub mod start;
 
 mod copy_state;
 mod entry_point;
+mod fork_mainnet;
 mod generate;
+mod reset_non_finalized_state;
 pub mod rollback_state;
 mod tip_height;
 
@@ -41,8 +44,14 @@ pub enum ZebradCmd {
     /// Generate a default `zebrad.toml` configuration
     Generate(GenerateCmd),
 
+    /// Generate configuration for a local fork of Mainnet
+    ForkMainnet(ForkMainnetCmd),
+
     /// Roll back Zebra's finalized chain state on disk
     RollbackState(RollbackStateCmd),
+
+    /// Delete Zebra's non-finalized chain state backup cache
+    ResetNonFinalizedState(ResetNonFinalizedStateCmd),
 
     /// Start the application (default command)
     Start(StartCmd),
@@ -64,7 +73,11 @@ impl ZebradCmd {
             CopyState(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            Generate(_) | RollbackState(_) | TipHeight(_) => false,
+            Generate(_)
+            | ForkMainnet(_)
+            | RollbackState(_)
+            | ResetNonFinalizedState(_)
+            | TipHeight(_) => false,
         }
     }
 
@@ -78,14 +91,19 @@ impl ZebradCmd {
             Start(_) => true,
 
             // Utility commands
-            CopyState(_) | Generate(_) | RollbackState(_) | TipHeight(_) => false,
+            CopyState(_)
+            | ForkMainnet(_)
+            | Generate(_)
+            | RollbackState(_)
+            | ResetNonFinalizedState(_)
+            | TipHeight(_) => false,
         }
     }
 
     /// Returns true if this command should ignore errors when
     /// attempting to load a config file.
     pub(crate) fn should_ignore_load_config_error(&self) -> bool {
-        matches!(self, ZebradCmd::Generate(_))
+        matches!(self, ZebradCmd::Generate(_) | ZebradCmd::ForkMainnet(_))
     }
 
     /// Returns the default log level for this command, based on the `verbose` command line flag.
@@ -97,7 +115,11 @@ impl ZebradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            Generate(_) | RollbackState(_) | TipHeight(_) => true,
+            Generate(_)
+            | ForkMainnet(_)
+            | RollbackState(_)
+            | ResetNonFinalizedState(_)
+            | TipHeight(_) => true,
 
             // Commands that generate informative logging output by default.
             CopyState(_) | Start(_) => false,
@@ -117,8 +139,10 @@ impl Runnable for ZebradCmd {
     fn run(&self) {
         match self {
             CopyState(cmd) => cmd.run(),
+            ForkMainnet(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
             RollbackState(cmd) => cmd.run(),
+            ResetNonFinalizedState(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
         }

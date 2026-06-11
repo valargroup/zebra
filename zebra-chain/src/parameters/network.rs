@@ -12,6 +12,7 @@ use crate::{
 };
 
 mod error;
+pub mod fork;
 pub mod magic;
 pub mod subsidy;
 pub mod testnet;
@@ -66,6 +67,9 @@ pub enum Network {
     /// The production mainnet.
     #[default]
     Mainnet,
+
+    /// A fork of the production mainnet with configurable post-fork consensus parameters.
+    ForkedMainnet(Arc<fork::Parameters>),
 
     /// A test network such as the default public testnet,
     /// a configured testnet, or Regtest.
@@ -139,6 +143,7 @@ impl<'a> From<&'a Network> for &'a str {
     fn from(network: &'a Network) -> &'a str {
         match network {
             Network::Mainnet => "Mainnet",
+            Network::ForkedMainnet(params) => params.network_name(),
             Network::Testnet(params) => params.network_name(),
         }
     }
@@ -154,6 +159,7 @@ impl std::fmt::Debug for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mainnet => write!(f, "{self}"),
+            Self::ForkedMainnet(params) => f.debug_tuple("ForkedMainnet").field(params).finish(),
             Self::Testnet(params) if params.is_regtest() => f
                 .debug_struct("Regtest")
                 .field("activation_heights", params.activation_heights())
@@ -178,6 +184,11 @@ impl Network {
     /// Creates a new configured [`Network::Testnet`] with the provided Testnet [`testnet::Parameters`].
     pub fn new_configured_testnet(params: testnet::Parameters) -> Self {
         Self::Testnet(Arc::new(params))
+    }
+
+    /// Creates a new configured [`Network::ForkedMainnet`] with the provided fork parameters.
+    pub fn new_forked_mainnet(params: fork::Parameters) -> Self {
+        Self::ForkedMainnet(Arc::new(params))
     }
 
     /// Creates a new [`Network::Testnet`] with `Regtest` parameters and the provided network upgrade activation heights.
@@ -210,6 +221,7 @@ impl Network {
     pub fn kind(&self) -> NetworkKind {
         match self {
             Network::Mainnet => NetworkKind::Mainnet,
+            Network::ForkedMainnet(_) => NetworkKind::Mainnet,
             Network::Testnet(params) if params.is_regtest() => NetworkKind::Regtest,
             Network::Testnet(_) => NetworkKind::Testnet,
         }
@@ -220,7 +232,7 @@ impl Network {
     /// This is used for transparent addresses, as the address prefix is the same on Regtest as it is on Testnet.
     pub fn t_addr_kind(&self) -> NetworkKind {
         match self {
-            Network::Mainnet => NetworkKind::Mainnet,
+            Network::Mainnet | Network::ForkedMainnet(_) => NetworkKind::Mainnet,
             Network::Testnet(_) => NetworkKind::Testnet,
         }
     }
@@ -240,7 +252,7 @@ impl Network {
     /// Part of the consensus rules at <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     pub fn is_max_block_time_enforced(&self, height: block::Height) -> bool {
         match self {
-            Network::Mainnet => true,
+            Network::Mainnet | Network::ForkedMainnet(_) => true,
             // TODO: Move `TESTNET_MAX_TIME_START_HEIGHT` to a field on testnet::Parameters (#8364)
             Network::Testnet(_params) => height >= super::TESTNET_MAX_TIME_START_HEIGHT,
         }
@@ -249,7 +261,7 @@ impl Network {
     /// Get the default port associated to this network.
     pub fn default_port(&self) -> u16 {
         match self {
-            Network::Mainnet => 8233,
+            Network::Mainnet | Network::ForkedMainnet(_) => 8233,
             // TODO: Add a `default_port` field to `testnet::Parameters` to return here. (zcashd uses 18344 for Regtest)
             Network::Testnet(_params) => 18233,
         }
@@ -308,6 +320,9 @@ impl Network {
             Self::Mainnet => {
                 subsidy::constants::mainnet::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL
             }
+            Self::ForkedMainnet(_) => {
+                subsidy::constants::mainnet::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL
+            }
             Self::Testnet(params) if params.is_default_testnet() => {
                 subsidy::constants::testnet::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL
             }
@@ -325,7 +340,9 @@ impl Network {
         };
 
         let expected_lockbox_disbursements = match self {
-            Self::Mainnet => subsidy::constants::mainnet::NU6_1_LOCKBOX_DISBURSEMENTS.to_vec(),
+            Self::Mainnet | Self::ForkedMainnet(_) => {
+                subsidy::constants::mainnet::NU6_1_LOCKBOX_DISBURSEMENTS.to_vec()
+            }
             Self::Testnet(params) if params.is_default_testnet() => {
                 subsidy::constants::testnet::NU6_1_LOCKBOX_DISBURSEMENTS.to_vec()
             }
@@ -347,7 +364,9 @@ impl Network {
     /// actions in transactions activates, if it is configured for this network.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         match self {
-            Network::Mainnet => Some(MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT),
+            Network::Mainnet | Network::ForkedMainnet(_) => {
+                Some(MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT)
+            }
             Network::Testnet(parameters) => {
                 parameters.temporary_orchard_disabling_soft_fork_height()
             }

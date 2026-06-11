@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Add `Network::ForkedMainnet` and forked-mainnet parameters for preserving
+  Mainnet history through a fork height while configuring post-fork upgrade and
+  difficulty behavior.
+
+### Changed
+
+- Reject forked-mainnet fork and post-fork activation heights above
+  `Height::MAX`.
+
 ## [9.0.0] - 2026-06-02
 
 ### Added

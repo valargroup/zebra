@@ -718,7 +718,7 @@ pub trait Rpc {
     ///
     /// # Notes
     ///
-    /// Only works if the network of the running zebrad process is `Regtest`.
+    /// Only works if proof of work is disabled at the next block height.
     ///
     /// zcashd reference: [`generate`](https://zcash.github.io/rpc/generate.html)
     /// method: post
@@ -2937,11 +2937,23 @@ where
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {
         let mut rpc = self.clone();
         let network = self.network.clone();
+        let next_block_height = self
+            .latest_chain_tip
+            .best_tip_height()
+            .unwrap_or(Height::MIN)
+            .next()
+            .map_err(|_| {
+                ErrorObject::borrowed(
+                    0,
+                    "generate is not supported after the maximum block height",
+                    None,
+                )
+            })?;
 
-        if !network.disable_pow() {
+        if !network.disable_pow_at_height(next_block_height) {
             return Err(ErrorObject::borrowed(
                 0,
-                "generate is only supported on networks where PoW is disabled",
+                "generate is only supported when PoW is disabled at the next block height",
                 None,
             ));
         }

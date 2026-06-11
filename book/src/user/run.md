@@ -13,6 +13,9 @@ health endpoints](./health.md).
 Zebra supports a variety of optional features which you can enable and configure
 manually.
 
+Developer testing modes are documented in [Forked Mainnet](./forked-mainnet.md),
+[Custom Testnets](./custom-testnets.md), and [Regtest](./regtest.md).
+
 ### Initializing Configuration File
 
 The command below generates a `zebrad.toml` config file at the default location

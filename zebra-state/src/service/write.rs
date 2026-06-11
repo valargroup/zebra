@@ -139,6 +139,20 @@ struct WriteBlockWorkerTask {
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
+    /// Whether semantically verified blocks should be finalized from the
+    /// non-finalized best chain.
+    semantic_finalization: SemanticFinalization,
+}
+
+/// Semantic finalization policy for the block write task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SemanticFinalization {
+    /// Finalize the oldest block when the non-finalized best chain grows past
+    /// `depth`.
+    Enabled { depth: u32 },
+
+    /// Never finalize semantically verified blocks.
+    Disabled,
 }
 
 /// The message type for the non-finalized block write task channel.
@@ -199,6 +213,7 @@ impl BlockWriteSender {
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
         should_use_finalized_block_write_sender: bool,
         backup_dir_path: Option<PathBuf>,
+        semantic_finalization: SemanticFinalization,
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
@@ -229,6 +244,7 @@ impl BlockWriteSender {
                     chain_tip_sender,
                     non_finalized_state_sender,
                     backup_dir_path,
+                    semantic_finalization,
                 }
                 .run()
             })
@@ -269,6 +285,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             backup_dir_path,
+            semantic_finalization,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees = None;
@@ -448,11 +465,12 @@ impl WriteBlockWorkerTask {
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
-            while non_finalized_state
-                .best_chain_len()
-                .expect("just successfully inserted a non-finalized block above")
-                > MAX_BLOCK_REORG_HEIGHT
-            {
+            while should_finalize_semantically_verified(
+                non_finalized_state
+                    .best_chain_len()
+                    .expect("just successfully inserted a non-finalized block above"),
+                *semantic_finalization,
+            ) {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
@@ -483,5 +501,40 @@ impl WriteBlockWorkerTask {
         // done writing to the finalized state, so we can force it to shut down.
         finalized_state.db.shutdown(true);
         std::mem::drop(self.finalized_state);
+    }
+}
+
+fn should_finalize_semantically_verified(
+    best_chain_len: u32,
+    semantic_finalization: SemanticFinalization,
+) -> bool {
+    match semantic_finalization {
+        SemanticFinalization::Enabled { depth } => best_chain_len > depth,
+        SemanticFinalization::Disabled => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_finalize_semantically_verified, SemanticFinalization};
+
+    #[test]
+    fn semantic_finalization_depth_controls_finalization() {
+        let policy = SemanticFinalization::Enabled { depth: 10 };
+
+        assert!(!should_finalize_semantically_verified(10, policy));
+        assert!(should_finalize_semantically_verified(11, policy));
+        assert!(should_finalize_semantically_verified(
+            1,
+            SemanticFinalization::Enabled { depth: 0 },
+        ));
+    }
+
+    #[test]
+    fn disabled_semantic_finalization_never_finalizes() {
+        assert!(!should_finalize_semantically_verified(
+            u32::MAX,
+            SemanticFinalization::Disabled,
+        ));
     }
 }

@@ -544,7 +544,7 @@ proptest! {
         tokio::time::pause();
 
         let genesis_block = match network {
-            Network::Mainnet => {
+            Network::Mainnet | Network::ForkedMainnet(_) => {
                 let block_bytes = &zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
                 let block: Arc<Block> = block_bytes.zcash_deserialize_into().expect("block is valid");
                 block

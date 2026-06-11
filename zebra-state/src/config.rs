@@ -20,6 +20,10 @@ use crate::{
     state_database_format_version_in_code, BoxError,
 };
 
+/// File name for the marker that identifies a forked-mainnet non-finalized
+/// backup cache.
+pub const FORKED_MAINNET_MARKER_FILE_NAME: &str = "forked-mainnet.toml";
+
 /// Configuration for the state service.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -159,7 +163,7 @@ impl Config {
     ) -> PathBuf {
         let db_kind = db_kind.as_ref();
         let major_version = format!("v{major_version}");
-        let net_dir = network.lowercase_name();
+        let net_dir = database_network_dir(db_kind, network);
 
         if self.ephemeral {
             gen_temp_path(&format!("zebra-{db_kind}-{major_version}-{net_dir}-"))
@@ -183,6 +187,23 @@ impl Config {
 
         let net_dir = network.lowercase_name();
         Some(self.cache_dir.join("non_finalized_state").join(net_dir))
+    }
+
+    /// Returns the marker file path for a forked-mainnet non-finalized state
+    /// backup directory.
+    pub fn forked_mainnet_marker_path(&self, network: &Network) -> Option<PathBuf> {
+        let Network::ForkedMainnet(_) = network else {
+            return None;
+        };
+
+        if self.ephemeral || !self.should_backup_non_finalized_state {
+            return None;
+        }
+
+        Some(self.cache_dir.join("non_finalized_state").join(format!(
+            "{}.{FORKED_MAINNET_MARKER_FILE_NAME}",
+            network.lowercase_name()
+        )))
     }
 
     /// Returns the path for the database format minor/patch version file,
@@ -209,6 +230,29 @@ impl Config {
     }
 }
 
+/// Returns marker file contents for a forked-mainnet non-finalized state
+/// backup directory.
+pub fn forked_mainnet_marker_contents(network: &Network) -> Option<String> {
+    let Network::ForkedMainnet(params) = network else {
+        return None;
+    };
+    let network_magic = params.network_magic().0;
+
+    Some(format!(
+        "fork_name = \"{}\"\n\
+         fork_height = {}\n\
+         fork_hash = \"{}\"\n\
+         network_magic = \"{:02x}{:02x}{:02x}{:02x}\"\n",
+        params.fork_name(),
+        params.fork_height().0,
+        params.fork_hash(),
+        network_magic[0],
+        network_magic[1],
+        network_magic[2],
+        network_magic[3],
+    ))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -226,6 +270,145 @@ impl Default for Config {
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: "".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use zebra_chain::{
+        block::{self, Height},
+        parameters::{fork, Magic, NetworkUpgrade},
+        work::difficulty::ParameterDifficulty,
+    };
+
+    use super::*;
+
+    fn forked_mainnet_network() -> Network {
+        let fork_height = Height(3_400_000);
+        let fork_hash = block::Hash([0x11; 32]);
+        let network_magic = Magic([0xab, 0xcd, 0xef, 0x01]);
+        let post_fork_height = fork_height
+            .next()
+            .expect("test fork height is below Height::MAX");
+        let post_fork_activation_heights =
+            BTreeMap::from([(post_fork_height, NetworkUpgrade::Nu7)]);
+        let post_fork_limit = Network::Mainnet.target_difficulty_limit().to_compact();
+
+        Network::new_forked_mainnet(
+            fork::Parameters::new(
+                "LocalFork",
+                fork_height,
+                fork_hash,
+                network_magic,
+                post_fork_activation_heights,
+                post_fork_limit,
+                true,
+            )
+            .expect("test fork parameters should be valid"),
+        )
+    }
+
+    #[test]
+    fn db_path_forked_mainnet_uses_mainnet_finalized_db_path() {
+        let cache_dir = tempfile::Builder::new()
+            .prefix("zebra-state-cache")
+            .tempdir()
+            .expect("temporary directory is created successfully");
+        let config = Config {
+            cache_dir: cache_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let forked_mainnet = forked_mainnet_network();
+
+        assert_eq!(
+            config.db_path(STATE_DATABASE_KIND, 1, &forked_mainnet),
+            config.db_path(STATE_DATABASE_KIND, 1, &Network::Mainnet),
+            "forked Mainnet must share the finalized Mainnet database"
+        );
+
+        assert_ne!(
+            config.db_path("secondary_state", 1, &forked_mainnet),
+            config.db_path("secondary_state", 1, &Network::Mainnet),
+            "non-finalized and other state cache paths must remain fork-specific"
+        );
+    }
+
+    #[test]
+    fn non_finalized_state_backup_dir_is_fork_specific() {
+        let cache_dir = tempfile::Builder::new()
+            .prefix("zebra-state-cache")
+            .tempdir()
+            .expect("temporary directory is created successfully");
+        let config = Config {
+            cache_dir: cache_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let forked_mainnet = forked_mainnet_network();
+
+        assert_eq!(
+            config.non_finalized_state_backup_dir(&forked_mainnet),
+            Some(
+                config
+                    .cache_dir
+                    .join("non_finalized_state")
+                    .join(forked_mainnet.lowercase_name())
+            ),
+            "forked Mainnet non-finalized backup must use the fork identity"
+        );
+
+        assert_ne!(
+            config.non_finalized_state_backup_dir(&forked_mainnet),
+            config.non_finalized_state_backup_dir(&Network::Mainnet),
+            "forked Mainnet backups must not mix with normal Mainnet backups"
+        );
+    }
+
+    #[test]
+    fn forked_mainnet_marker_path_and_contents_use_fork_identity() {
+        let cache_dir = tempfile::Builder::new()
+            .prefix("zebra-state-cache")
+            .tempdir()
+            .expect("temporary directory is created successfully");
+        let config = Config {
+            cache_dir: cache_dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        let forked_mainnet = forked_mainnet_network();
+        let marker_path = config
+            .forked_mainnet_marker_path(&forked_mainnet)
+            .expect("forked-mainnet marker path should exist");
+        let marker_contents = forked_mainnet_marker_contents(&forked_mainnet)
+            .expect("forked-mainnet marker contents should exist");
+
+        assert_eq!(
+            marker_path,
+            config
+                .cache_dir
+                .join("non_finalized_state")
+                .join("forkedmainnet_localfork.forked-mainnet.toml")
+        );
+        assert!(marker_contents.contains("fork_name = \"LocalFork\""));
+        assert!(marker_contents.contains("fork_height = 3400000"));
+        assert!(marker_contents.contains("network_magic = \"abcdef01\""));
+        assert!(config
+            .forked_mainnet_marker_path(&Network::Mainnet)
+            .is_none());
+        assert!(forked_mainnet_marker_contents(&Network::Mainnet).is_none());
+    }
+}
+
+/// Returns the network-specific database path segment for `db_kind`.
+///
+/// Forked Mainnet shares Mainnet's finalized database, but keeps all other
+/// state-related cache paths fork-specific.
+fn database_network_dir(db_kind: &str, network: &Network) -> String {
+    match network {
+        Network::ForkedMainnet(_) if db_kind == STATE_DATABASE_KIND => {
+            Network::Mainnet.lowercase_name()
+        }
+        _ => network.lowercase_name(),
     }
 }
 
@@ -294,9 +477,10 @@ fn delete_old_databases(config: Config, db_kind: String, major_version: u64, net
 
     let mut db_path = config.db_path(&db_kind, major_version, network);
     // Check and remove the network path.
+    let expected_net_dir = database_network_dir(&db_kind, network);
     assert_eq!(
         db_path.file_name(),
-        Some(network.lowercase_name().as_ref()),
+        Some(expected_net_dir.as_ref()),
         "unexpected database network path structure"
     );
     assert!(db_path.pop());

@@ -1,7 +1,7 @@
 //! Configuration for Zebra's network communication.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -12,17 +12,20 @@ use indexmap::IndexSet;
 use serde::{de, Deserialize, Deserializer};
 use tokio::fs;
 
+use hex::FromHex;
 use tracing::Span;
 use zebra_chain::{
+    block::{self, Height},
     common::atomic_write,
     parameters::{
+        fork,
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
         },
-        Magic, Network, NetworkKind,
+        Magic, Network, NetworkKind, NetworkUpgrade,
     },
-    work::difficulty::U256,
+    work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
 };
 
 use crate::{
@@ -99,6 +102,14 @@ pub struct Config {
     /// A list of initial peers for the peerset when operating on
     /// testnet.
     pub initial_testnet_peers: IndexSet<String>,
+
+    /// A list of initial peers for the peerset when operating on
+    /// a configured fork of Mainnet.
+    ///
+    /// Forked Mainnet never uses the public Mainnet or Testnet DNS seeders by
+    /// default. Configure explicit local fork peers here when running a forked
+    /// network.
+    pub initial_fork_peers: IndexSet<String>,
 
     /// An optional root directory for storing cached peer address data.
     ///
@@ -244,6 +255,7 @@ impl Config {
     pub fn initial_peer_hostnames(&self) -> IndexSet<String> {
         match &self.network {
             Network::Mainnet => self.initial_mainnet_peers.clone(),
+            Network::ForkedMainnet(_params) => self.initial_fork_peers.clone(),
             Network::Testnet(_params) => self.initial_testnet_peers.clone(),
         }
     }
@@ -571,6 +583,7 @@ impl Default for Config {
             network: Network::Mainnet,
             initial_mainnet_peers: mainnet_peers,
             initial_testnet_peers: testnet_peers,
+            initial_fork_peers: IndexSet::new(),
             cache_dir: CacheDir::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -614,11 +627,26 @@ struct DTestnetParameters {
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DForkedMainnetParameters {
+    fork_name: String,
+    fork_height: u32,
+    fork_hash: String,
+    network_magic: [u8; 4],
+    target_difficulty_limit: String,
+    disable_pow_after_fork: bool,
+    post_fork_activation_heights: Option<ConfiguredActivationHeights>,
+}
+
 /// Network configuration used during deserialization.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
+    ConfiguredForkedMainnet {
+        forked_mainnet: Box<DForkedMainnetParameters>,
+    },
     ConfiguredRegtest {
         params: Box<DTestnetParameters>,
 
@@ -647,6 +675,7 @@ struct DConfig {
 
     initial_mainnet_peers: IndexSet<String>,
     initial_testnet_peers: IndexSet<String>,
+    initial_fork_peers: IndexSet<String>,
     cache_dir: CacheDir,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -664,6 +693,7 @@ impl Default for DConfig {
             testnet_parameters: None,
             initial_mainnet_peers: config.initial_mainnet_peers,
             initial_testnet_peers: config.initial_testnet_peers,
+            initial_fork_peers: config.initial_fork_peers,
             cache_dir: config.cache_dir,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -711,6 +741,23 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
     }
 }
 
+impl From<Arc<fork::Parameters>> for DForkedMainnetParameters {
+    fn from(params: Arc<fork::Parameters>) -> Self {
+        Self {
+            fork_name: params.fork_name().to_string(),
+            fork_height: params.fork_height().0,
+            fork_hash: params.fork_hash().to_string(),
+            network_magic: params.network_magic().0,
+            target_difficulty_limit: params
+                .post_fork_target_difficulty_limit()
+                .to_compact()
+                .to_string(),
+            disable_pow_after_fork: params.disable_pow_after_fork(),
+            post_fork_activation_heights: Some(params.post_fork_activation_heights().into()),
+        }
+    }
+}
+
 impl From<Config> for DConfig {
     fn from(
         Config {
@@ -719,6 +766,7 @@ impl From<Config> for DConfig {
             network,
             initial_mainnet_peers,
             initial_testnet_peers,
+            initial_fork_peers,
             cache_dir,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -726,6 +774,13 @@ impl From<Config> for DConfig {
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
+            NetworkKind::Mainnet => match network {
+                Network::ForkedMainnet(params) => DNetwork::ConfiguredForkedMainnet {
+                    forked_mainnet: Box::new(params.into()),
+                },
+                _ => DNetwork::DefaultForKind(NetworkKind::Mainnet),
+            },
+
             NetworkKind::Testnet => match network
                 .parameters()
                 .filter(|params| !params.is_default_testnet())
@@ -742,8 +797,6 @@ impl From<Config> for DConfig {
                 },
                 None => DNetwork::DefaultForKind(NetworkKind::Regtest),
             },
-
-            other_kind => DNetwork::DefaultForKind(other_kind),
         };
 
         DConfig {
@@ -753,6 +806,7 @@ impl From<Config> for DConfig {
             testnet_parameters: None,
             initial_mainnet_peers,
             initial_testnet_peers,
+            initial_fork_peers,
             cache_dir,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -773,6 +827,7 @@ impl<'de> Deserialize<'de> for Config {
             testnet_parameters,
             initial_mainnet_peers,
             initial_testnet_peers,
+            initial_fork_peers,
             cache_dir,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -780,6 +835,9 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let network = match (dnetwork, testnet_parameters) {
+            (DNetwork::ConfiguredForkedMainnet { forked_mainnet }, _) => {
+                build_forked_mainnet::<D>(*forked_mainnet)?
+            }
             (DNetwork::ConfiguredTestnet(params), _) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
@@ -848,12 +906,114 @@ impl<'de> Deserialize<'de> for Config {
             network,
             initial_mainnet_peers,
             initial_testnet_peers,
+            initial_fork_peers,
             cache_dir,
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
         })
     }
+}
+
+fn build_forked_mainnet<'de, D>(params: DForkedMainnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let DForkedMainnetParameters {
+        fork_name,
+        fork_height,
+        fork_hash,
+        network_magic,
+        target_difficulty_limit,
+        disable_pow_after_fork,
+        post_fork_activation_heights,
+    } = params;
+
+    let fork_hash = block::Hash::from_hex(fork_hash).map_err(de::Error::custom)?;
+    let target_difficulty_limit =
+        parse_configured_difficulty(&target_difficulty_limit).map_err(de::Error::custom)?;
+    let post_fork_activation_heights =
+        configured_activation_heights_to_map(post_fork_activation_heights.unwrap_or_default())
+            .map_err(de::Error::custom)?;
+
+    fork::Parameters::new(
+        fork_name,
+        Height(fork_height),
+        fork_hash,
+        Magic(network_magic),
+        post_fork_activation_heights,
+        target_difficulty_limit,
+        disable_pow_after_fork,
+    )
+    .map(Network::new_forked_mainnet)
+    .map_err(de::Error::custom)
+}
+
+fn parse_configured_difficulty(configured: &str) -> Result<CompactDifficulty, BoxError> {
+    let configured = configured.trim().trim_start_matches("0x");
+
+    match configured.len() {
+        8 => CompactDifficulty::from_hex(configured),
+        64 => {
+            if configured.chars().all(|character| character == '0') {
+                return Err("zero difficulty values are invalid".into());
+            }
+
+            Ok(ExpandedDifficulty::from_hex(configured)?.to_compact())
+        }
+        _ => Err(format!(
+            "difficulty values must be compact 8-hex or expanded 64-hex, got {} hex characters",
+            configured.len()
+        )
+        .into()),
+    }
+}
+
+fn configured_activation_heights_to_map(
+    activation_heights: ConfiguredActivationHeights,
+) -> Result<BTreeMap<Height, NetworkUpgrade>, String> {
+    let mut activations = BTreeMap::new();
+
+    let ConfiguredActivationHeights {
+        before_overwinter,
+        overwinter,
+        sapling,
+        blossom,
+        heartwood,
+        canopy,
+        nu5,
+        nu6,
+        nu6_1,
+        nu6_2,
+        nu7,
+        #[cfg(zcash_unstable = "zfuture")]
+        zfuture,
+    } = activation_heights;
+
+    for (height, network_upgrade) in [
+        (before_overwinter, NetworkUpgrade::BeforeOverwinter),
+        (overwinter, NetworkUpgrade::Overwinter),
+        (sapling, NetworkUpgrade::Sapling),
+        (blossom, NetworkUpgrade::Blossom),
+        (heartwood, NetworkUpgrade::Heartwood),
+        (canopy, NetworkUpgrade::Canopy),
+        (nu5, NetworkUpgrade::Nu5),
+        (nu6, NetworkUpgrade::Nu6),
+        (nu6_1, NetworkUpgrade::Nu6_1),
+        (nu6_2, NetworkUpgrade::Nu6_2),
+        (nu7, NetworkUpgrade::Nu7),
+        #[cfg(zcash_unstable = "zfuture")]
+        (zfuture, NetworkUpgrade::ZFuture),
+    ] {
+        if let Some(height) = height {
+            let height = Height::try_from(height).map_err(|error| {
+                format!("{network_upgrade} activation height is invalid: {error}")
+            })?;
+            activations.insert(height, network_upgrade);
+        }
+    }
+
+    Ok(activations)
 }
 
 /// Accepts an [`IndexSet`] of initial peers,

@@ -20,6 +20,7 @@
   - [Kibana blockchain explorer](user/elasticsearch.md)
   - [zcashd-compat Mode](user/zcashd-compat.md)
   - [Forking the Zcash Testnet with Zebra](user/fork-zebra-testnet.md)
+  - [Forked Mainnet](user/forked-mainnet.md)
   - [Custom Testnets](user/custom-testnets.md)
     - [Regtest with Zebra](user/regtest.md)
   - [Troubleshooting](user/troubleshooting.md)

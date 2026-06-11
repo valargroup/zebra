@@ -89,13 +89,14 @@ pub fn difficulty_threshold_is_valid(
 
     // The PowLimit check is part of `Threshold()` in the spec, but it doesn't
     // actually depend on any previous blocks.
-    if difficulty_threshold > network.target_difficulty_limit() {
+    let target_difficulty_limit = network.target_difficulty_limit_at_height(*height);
+    if difficulty_threshold > target_difficulty_limit {
         Err(BlockError::TargetDifficultyLimit(
             *height,
             *hash,
             difficulty_threshold,
             network.clone(),
-            network.target_difficulty_limit(),
+            target_difficulty_limit,
         ))?;
     }
 

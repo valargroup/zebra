@@ -718,6 +718,12 @@ pub trait ParameterDifficulty {
     /// See `PoWLimit` in the Zcash specification:
     /// <https://zips.z.cash/protocol/protocol.pdf#constants>
     fn target_difficulty_limit(&self) -> ExpandedDifficulty;
+
+    /// Returns the easiest target difficulty allowed on `network` at `height`.
+    fn target_difficulty_limit_at_height(&self, height: block::Height) -> ExpandedDifficulty {
+        let _ = height;
+        self.target_difficulty_limit()
+    }
 }
 
 impl ParameterDifficulty for Network {
@@ -727,7 +733,7 @@ impl ParameterDifficulty for Network {
         let limit: U256 = match self {
             // Mainnet PoWLimit is defined as `2^243 - 1` on page 73 of the protocol specification:
             // <https://zips.z.cash/protocol/protocol.pdf>
-            Network::Mainnet => (U256::one() << 243) - 1,
+            Network::Mainnet | Network::ForkedMainnet(_) => (U256::one() << 243) - 1,
             // 2^251 - 1 for the default testnet, see `testnet::ParametersBuilder::default`()
             Network::Testnet(params) => return params.target_difficulty_limit(),
         };
@@ -742,6 +748,13 @@ impl ParameterDifficulty for Network {
             .to_compact()
             .to_expanded()
             .expect("difficulty limits are valid expanded values")
+    }
+
+    fn target_difficulty_limit_at_height(&self, height: block::Height) -> ExpandedDifficulty {
+        match self {
+            Network::ForkedMainnet(params) => params.target_difficulty_limit_at_height(height),
+            _ => self.target_difficulty_limit(),
+        }
     }
 }
 

@@ -307,6 +307,15 @@ fn difficulty_threshold_and_time_are_valid(
         })?
     }
 
+    // In forked-mainnet mode with proof of work disabled, keep time checks active but
+    // skip the contextual DAA threshold equality so local test blocks can be
+    // generated without matching Mainnet-derived difficulty windows.
+    if matches!(network, Network::ForkedMainnet(_))
+        && network.disable_pow_at_height(candidate_height)
+    {
+        return Ok(());
+    }
+
     // # Consensus
     //
     // > For a block at block height `Height`, `nBits` MUST be equal to `ThresholdBits(Height)`.

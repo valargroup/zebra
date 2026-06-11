@@ -23,6 +23,7 @@ impl Network {
     pub fn magic(&self) -> Magic {
         match self {
             Network::Mainnet => magics::MAINNET,
+            Network::ForkedMainnet(params) => params.network_magic(),
             Network::Testnet(params) => params.network_magic(),
         }
     }

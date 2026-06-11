@@ -13,10 +13,11 @@ use zebra_chain::{
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{fork, Magic, Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction, transparent,
     value_balance::ValueBalance,
+    work::difficulty::{ExpandedDifficulty, U256},
 };
 
 use zebra_test::{prelude::*, transcript::Transcript};
@@ -24,12 +25,50 @@ use zebra_test::{prelude::*, transcript::Transcript};
 use crate::{
     arbitrary::Prepare,
     init_test,
-    service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
+    service::{
+        arbitrary::populated_state, chain_tip::TipAction, write::SemanticFinalization, StateService,
+    },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+fn forked_mainnet_network() -> Network {
+    let fork_height = Height(3_400_000);
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1).to_compact();
+
+    Network::new_forked_mainnet(
+        fork::Parameters::new(
+            "StateServiceFork",
+            fork_height,
+            block::Hash([0x11; 32]),
+            Magic([0xab, 0xcd, 0xef, 0x05]),
+            [].into(),
+            post_fork_limit,
+            true,
+        )
+        .expect("test fork parameters should be valid"),
+    )
+}
+
+#[test]
+fn semantic_finalization_defaults_to_production_limit() {
+    assert_eq!(
+        super::semantic_finalization(&Network::Mainnet),
+        SemanticFinalization::Enabled {
+            depth: crate::constants::MAX_BLOCK_REORG_HEIGHT,
+        }
+    );
+}
+
+#[test]
+fn semantic_finalization_is_disabled_for_forked_mainnet() {
+    assert_eq!(
+        super::semantic_finalization(&forked_mainnet_network()),
+        SemanticFinalization::Disabled
+    );
+}
 
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,

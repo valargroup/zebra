@@ -1209,6 +1209,15 @@ impl Network {
         }
     }
 
+    /// Returns true if proof-of-work validation should be disabled at `height`.
+    pub fn disable_pow_at_height(&self, height: Height) -> bool {
+        match self {
+            Self::ForkedMainnet(params) => params.disable_pow_at_height(height),
+            Self::Testnet(params) => params.disable_pow(),
+            Self::Mainnet => false,
+        }
+    }
+
     /// Returns slow start interval for this network
     pub fn slow_start_interval(&self) -> Height {
         if let Self::Testnet(params) = self {
@@ -1256,7 +1265,7 @@ impl Network {
     /// Returns the list of founders' reward addresses for this network.
     pub fn founder_address_list(&self) -> &[&str] {
         match self {
-            Network::Mainnet => &mainnet::FOUNDER_ADDRESS_LIST,
+            Network::Mainnet | Network::ForkedMainnet(_) => &mainnet::FOUNDER_ADDRESS_LIST,
             Network::Testnet(_) => &testnet::FOUNDER_ADDRESS_LIST,
         }
     }

@@ -281,6 +281,7 @@ impl Network {
     pub fn activation_list(&self) -> BTreeMap<block::Height, NetworkUpgrade> {
         match self {
             Mainnet => MAINNET_ACTIVATION_HEIGHTS.iter().cloned().collect(),
+            ForkedMainnet(params) => params.activation_heights(),
             Testnet(params) => params.activation_heights().clone(),
         }
     }
@@ -453,7 +454,7 @@ impl NetworkUpgrade {
             {
                 None
             }
-            (Network::Mainnet, _) => None,
+            (Network::Mainnet | Network::ForkedMainnet(_), _) => None,
             (Network::Testnet(_params), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
                 Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)

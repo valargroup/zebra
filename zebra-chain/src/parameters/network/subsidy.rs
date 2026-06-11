@@ -241,7 +241,7 @@ impl ParameterSubsidy for Network {
         // while in Testnet is at block constant height of `1_116_000`
         // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
         match self {
-            Network::Mainnet => NetworkUpgrade::Canopy
+            Network::Mainnet | Network::ForkedMainnet(_) => NetworkUpgrade::Canopy
                 .activation_height(self)
                 .expect("canopy activation height should be available"),
             Network::Testnet(params) => {
@@ -258,14 +258,14 @@ impl ParameterSubsidy for Network {
 
     fn post_blossom_halving_interval(&self) -> HeightDiff {
         match self {
-            Network::Mainnet => POST_BLOSSOM_HALVING_INTERVAL,
+            Network::Mainnet | Network::ForkedMainnet(_) => POST_BLOSSOM_HALVING_INTERVAL,
             Network::Testnet(params) => params.post_blossom_halving_interval(),
         }
     }
 
     fn pre_blossom_halving_interval(&self) -> HeightDiff {
         match self {
-            Network::Mainnet => PRE_BLOSSOM_HALVING_INTERVAL,
+            Network::Mainnet | Network::ForkedMainnet(_) => PRE_BLOSSOM_HALVING_INTERVAL,
             Network::Testnet(params) => params.pre_blossom_halving_interval(),
         }
     }

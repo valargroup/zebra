@@ -299,7 +299,7 @@ fn invalidate_block_removes_block_and_descendants_from_chain_for_network(
         .unwrap();
 
     match network {
-        Network::Mainnet => assert!(
+        Network::Mainnet | Network::ForkedMainnet(_) => assert!(
             invalidated_blocks_state_descendants
                 .iter()
                 .any(|block| block.height == block::Height(653601)),

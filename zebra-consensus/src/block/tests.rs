@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+use std::collections::BTreeMap;
+
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
@@ -14,10 +16,12 @@ use zebra_chain::{
         },
         Block, Height,
     },
-    parameters::{subsidy::block_subsidy, NetworkUpgrade},
+    parameters::{fork, subsidy::block_subsidy, Magic, Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
-    work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
+    work::difficulty::{
+        ExpandedDifficulty, ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY, U256,
+    },
 };
 use zebra_script::Sigops;
 use zebra_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -257,6 +261,62 @@ fn difficulty_validation_failure() -> Result<(), Report> {
         .unwrap_err();
     let expected =
         BlockError::DifficultyFilter(height, bad_hash, difficulty_threshold, Network::Mainnet);
+    assert_eq!(expected, result);
+
+    Ok(())
+}
+
+fn forked_mainnet_with_difficulty(post_fork_limit: ExpandedDifficulty) -> Network {
+    Network::new_forked_mainnet(
+        fork::Parameters::new(
+            "ConsensusDifficulty",
+            Height(3_400_000),
+            block::Hash([0x22; 32]),
+            Magic([0xab, 0xcd, 0xef, 0x02]),
+            BTreeMap::new(),
+            post_fork_limit.to_compact(),
+            false,
+        )
+        .expect("test fork parameters should be valid"),
+    )
+}
+
+#[test]
+fn forked_mainnet_uses_post_fork_target_difficulty_limit() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_415000_BYTES[..])
+            .expect("block should deserialize");
+    let mut block = Arc::try_unwrap(block).expect("block should unwrap");
+    let header = Arc::make_mut(&mut block.header);
+
+    let fork_height = Height(3_400_000);
+    let post_fork_height = fork_height
+        .next()
+        .expect("test fork height is below Height::MAX");
+    let post_fork_limit = ExpandedDifficulty::from((U256::one() << 251) - 1);
+    let post_fork_limit = post_fork_limit
+        .to_compact()
+        .to_expanded()
+        .expect("post-fork limit compact representation is valid");
+    let network = forked_mainnet_with_difficulty(post_fork_limit);
+
+    header.difficulty_threshold = post_fork_limit.to_compact();
+    let hash = block.hash();
+
+    check::difficulty_threshold_is_valid(&block.header, &network, &post_fork_height, &hash)
+        .expect("post-fork difficulty limit should allow easy fork threshold");
+
+    let result = check::difficulty_threshold_is_valid(&block.header, &network, &fork_height, &hash)
+        .unwrap_err();
+    let expected = BlockError::TargetDifficultyLimit(
+        fork_height,
+        hash,
+        post_fork_limit,
+        network,
+        Network::Mainnet.target_difficulty_limit(),
+    );
     assert_eq!(expected, result);
 
     Ok(())
