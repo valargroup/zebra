@@ -103,7 +103,8 @@ impl Default for Config {
     /// Returns conservative zcashd-compat defaults suitable for local supervision.
     ///
     /// Defaults keep zcashd-compat disabled unless explicitly requested, and use a
-    /// short restart/backoff policy for child-process recovery.
+    /// short restart/backoff policy for child-process recovery. Shutdowns allow
+    /// enough time for `zcashd` to flush wallet and chainstate data after SIGTERM.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -118,7 +119,7 @@ impl Default for Config {
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 10,
-            shutdown_grace_period: Duration::from_secs(10),
+            shutdown_grace_period: Duration::from_secs(300),
         }
     }
 }
@@ -206,6 +207,16 @@ mod tests {
         assert_eq!(config.listen_addr, None);
         assert_eq!(config.cookie_dir, super::default_cache_dir());
         assert_eq!(config.cookie_file_name, super::default_cookie_file_name());
+    }
+
+    #[test]
+    fn default_shutdown_grace_period_allows_zcashd_to_flush_state() {
+        let config = Config::default();
+
+        assert_eq!(
+            config.shutdown_grace_period,
+            std::time::Duration::from_secs(300)
+        );
     }
 
     #[test]

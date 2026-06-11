@@ -64,7 +64,7 @@ cookie_file_name = ".zcashd-compat.cookie"          # optional, defaults to ".zc
 startup_delay = "1s"
 restart_backoff = "2s"
 max_restarts = 10
-shutdown_grace_period = "10s"
+shutdown_grace_period = "300s"
 ```
 
 When overriding `zcashd_extra_args` via environment variables, pass a JSON array string:
@@ -348,7 +348,9 @@ use `make compat-test-soak` for extended local churn runs.
 
 - `zcashd -zebra-compat` talks to Zebra over RPC, not over peer-to-peer connections.
 - On shutdown, Zebra sends SIGTERM to the supervised `zcashd`, then SIGKILL
-  after `shutdown_grace_period` if needed.
+  after `shutdown_grace_period` if needed. Keep this long enough for the node's
+  wallet and chainstate to flush cleanly; large mainnet nodes can need several
+  minutes, while small test nodes can override it lower.
 - Regtest interoperability can depend on matching assumptions between Zebra and
   `zcashd` builds. If regtest semantics diverge, use testnet for initial
   interoperability validation.
@@ -370,7 +372,9 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
   failures) fail closed before Zebra supervises `zcashd`.
 - If `zebrad` is shut down normally, it asks the zcashd-compat supervisor to stop
   `zcashd` gracefully: SIGTERM first, then SIGKILL after
-  `shutdown_grace_period` if needed.
+  `shutdown_grace_period` if needed. A forced kill can interrupt `zcashd` wallet
+  or chainstate flushes, so production nodes should size this grace period for
+  their local data set.
 - If `zebrad` is terminated ungracefully (for example `kill -9`), normal
   shutdown handlers do not run, so `zcashd` can remain running until it is
   stopped externally.
