@@ -103,9 +103,10 @@ impl SupervisorConfig {
         // port (8233 mainnet / 18233 testnet). Operators often reuse a legacy
         // full-node zcash.conf with listen=1, and CLI args are parsed before
         // zcash.conf without being overwritten by it — so pass these explicitly
-        // as defense in depth (zcashd also force-disables them when -zebra-compat
-        // is set). extra_args remain last. P2P-enabling flags there are rejected
-        // by zcashd startup validation rather than silently taking effect.
+        // as defense in depth. zcashd also force-disables P2P boolean flags
+        // when -zebra-compat is set, including later extra_args such as -p2p=1.
+        // Peer-selection extra_args are still rejected by zcashd startup
+        // validation rather than silently taking effect.
         args.push("-p2p=0".to_string());
         args.push("-listen=0".to_string());
 

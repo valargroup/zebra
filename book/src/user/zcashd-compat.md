@@ -42,9 +42,10 @@ Zebra always passes `-p2p=0` and `-listen=0` before `zcashd_extra_args`. CLI
 arguments are parsed before `zcash.conf` and are not overwritten by config-file
 values, so legacy full-node configs with `listen=1` do not cause `zcashd` to
 bind the network P2P port (8233 mainnet / 18233 testnet) that Zebra already
-uses. `zcashd` also force-disables P2P listen flags when `-zebra-compat` is
-active. P2P-enabling flags in `zcashd_extra_args` are rejected by `zcashd`
-startup validation rather than silently taking effect.
+uses. `zcashd` also force-disables P2P boolean flags when `-zebra-compat` is
+active, including later `zcashd_extra_args` such as `-p2p=1` or `-listen=1`.
+Peer-selection options in `zcashd_extra_args` are rejected by `zcashd` startup
+validation rather than silently taking effect.
 
 ## Configuration
 
@@ -119,6 +120,7 @@ Operators often reuse an existing `zcash.conf`. In compat mode:
 - `listen=1`, `p2p=1`, `dnsseed=1`, and `listenonion=1` in the file may remain
   on disk but are overridden at startup (supervisor CLI plus `zcashd`
   `-zebra-compat` preset). They do not need manual removal for those flags.
+  The same boolean flags are force-disabled if repeated in `zcashd_extra_args`.
 - Remove or avoid P2P peer options that fail startup validation: `bind=`,
   `whitebind=`, `connect=`, `addnode=`, `seednode=`, and similar.
 
