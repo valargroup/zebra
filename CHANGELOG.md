@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   10 seconds, allow 30 seconds for tip acquisition, increase default block
   download concurrency to 100, increase the default peer target size to 100, and
   cap inbound peers at the peer target size.
+- Increase the default zcashd-compat supervised shutdown grace period to 5
+  minutes, giving `zcashd` more time to flush wallet and chainstate data before
+  force-kill.
 - Update `zebra-rollback-state` and `zebrad rollback-state` to run rollback by
   default and use `--dry-run` for rollback-plan previews (replacing the old
   `--force` gate).

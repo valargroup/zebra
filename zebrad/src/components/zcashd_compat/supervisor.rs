@@ -491,7 +491,7 @@ mod tests {
             startup_delay: std::time::Duration::from_secs(1),
             restart_backoff: std::time::Duration::from_secs(2),
             max_restarts: 3,
-            shutdown_grace_period: std::time::Duration::from_secs(10),
+            shutdown_grace_period: std::time::Duration::from_secs(300),
         };
 
         let args = config.command_args();
