@@ -217,16 +217,17 @@ fn check_permissions(
     config: &ZebradConfig,
     zcashd_datadir: &Path,
 ) -> Result<(), Report> {
-    let mut requirements = vec![
-        WriteRequirement {
-            role: PermissionRole::ZebraState,
-            target_path: config.state.cache_dir.clone(),
-        },
-        WriteRequirement {
+    let mut requirements = vec![WriteRequirement {
+        role: PermissionRole::ZebraState,
+        target_path: config.state.cache_dir.clone(),
+    }];
+
+    if config.zcashd_compat.enable_cookie_auth {
+        requirements.push(WriteRequirement {
             role: PermissionRole::RpcCookieDir,
             target_path: config.zcashd_compat.cookie_dir.clone(),
-        },
-    ];
+        });
+    }
 
     if config.zcashd_compat.manage_zcashd {
         requirements.push(WriteRequirement {
@@ -976,6 +977,32 @@ mod tests {
         .expect("permission checks should succeed");
 
         assert_eq!(summary.errors, Vec::<String>::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_cookie_auth_skips_cookie_dir_permission_check() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let mut config = permission_test_config(&temp_dir);
+        config.zcashd_compat.enable_cookie_auth = false;
+        config.zcashd_compat.cookie_dir = PathBuf::from("/proc/zebra-cookie-dir");
+        let mut summary = PreflightSummary::default();
+
+        check_permissions(
+            &mut summary,
+            &config,
+            &permission_test_zcashd_datadir(&config),
+        )
+        .expect("permission checks should succeed even if no-auth cookie dir is unusable");
+
+        assert!(
+            summary
+                .errors
+                .iter()
+                .all(|error| !error.contains("rpc cookie directory")),
+            "no-auth preflight should not check cookie directory: {:?}",
+            summary.errors
+        );
     }
 
     #[cfg(target_os = "linux")]
