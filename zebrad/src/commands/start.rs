@@ -340,6 +340,12 @@ impl StartCmd {
             ));
         }
 
+        if config.zcashd_compat.tls_ca_file.is_some() && !config.zcashd_compat.tls_enabled() {
+            return Err(eyre!(
+                "zcashd_compat.tls_ca_file requires zcashd-compat TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
+            ));
+        }
+
         for (name, path) in [
             (
                 "zcashd_compat.tls_cert_file",
@@ -1315,6 +1321,30 @@ mod tests {
             .expect_err("missing TLS files should be rejected");
         assert!(
             error.to_string().contains("could not read"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_tls_ca_without_tls_listener() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let ca_file = tempdir.path().join("ca.pem");
+        std::fs::write(&ca_file, "placeholder ca").expect("CA file should be writable");
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.tls_ca_file = Some(ca_file);
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("CA file should require an enabled TLS listener");
+        assert!(
+            error.to_string().contains("tls_ca_file requires"),
             "unexpected error: {error}"
         );
     }
