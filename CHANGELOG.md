@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.
 - zcashd-compat mode for managing zcashd as a wallet while leveraging zebra for p2p.
+- zcashd-compat preflight now validates filesystem permissions for the zcashd
+  datadir, `zcash.conf`, zcashd binary, Zebra state directory, and RPC cookie
+  directory before creating directories or config files, reporting all problems
+  in one aggregated error. Failures can be bypassed with `--unsafe-low-specs`.
 
 ### Changed
 

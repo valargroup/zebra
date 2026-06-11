@@ -78,6 +78,11 @@ Supervised `zcashd` still requires a normal datadir and `zcash.conf`. When
 and bootstraps a minimal config file only when the effective `zcash.conf` is
 absent. Existing operator configs are never overwritten.
 
+Before creating the datadir or bootstrap config, Zebra checks that the effective
+datadir and `zcash.conf` location can be used by the current user. Existing
+`zcash.conf` files must be readable; if the config is missing, the parent
+directory must be writable so Zebra can create the bootstrap file.
+
 Minimum first-start `zcash.conf`:
 
 ```conf
@@ -141,18 +146,23 @@ ss -ltnp 'sport = :8233'    # mainnet example
 ## Hardware preflight (Linux)
 
 When zcashd-compat mode is enabled, Zebra runs Linux-only startup preflight checks
-for CPU, effective RAM, and mount-aware provisioned disk space.
+for CPU, effective RAM, mount-aware provisioned disk space, and filesystem
+permissions.
 
 If zcashd-compat mode is enabled on a non-Linux host, Zebra fails startup by
 default because zcashd-compat is currently Linux-only. You can explicitly bypass
 this guardrail with `--unsafe-low-specs`.
 
-If hardware is below minimum requirements, Zebra fails closed by default.
-If hardware is below recommended requirements but above minimums, Zebra logs
-explicit warnings and continues.
+If hardware is below minimum requirements, or required filesystem paths are not
+usable by the current user, Zebra fails closed by default. If hardware is below
+recommended requirements but above minimums, Zebra logs explicit warnings and
+continues.
 
 Use `--unsafe-low-specs` to bypass minimum-check failures only when you
-explicitly accept degraded or unstable operation.
+explicitly accept degraded or unstable operation. This also downgrades
+filesystem permission failures to warnings, but it does not grant permissions:
+later datadir bootstrap, config creation, or managed `zcashd` download steps can
+still fail with the underlying operating-system error.
 
 ### Minimum requirements (fail closed by default)
 
@@ -170,6 +180,31 @@ explicitly accept degraded or unstable operation.
 - RAM: 32 GiB effective memory
 - Disk: at least 1 TiB combined capacity across the filesystems used by Zebra state
   and zcashd datadir
+
+### Filesystem permission checks (fail closed by default)
+
+Zebra validates the paths that zcashd-compat needs before it creates any missing
+directories or config files. Permission problems are collected into the same
+aggregated preflight error as CPU, RAM, and disk failures, so operators can fix
+all reported paths at once.
+
+Preflight validates:
+
+- Zebra's state cache directory (`state.cache_dir`);
+- the zcashd-compat RPC cookie directory (`zcashd_compat.cookie_dir`);
+- the effective supervised `zcashd` datadir, including `-datadir=` overrides in
+  `zcashd_extra_args`;
+- the effective `zcash.conf` path, including `-conf=` overrides in
+  `zcashd_extra_args`;
+- explicit `zcashd_path` executability when `zcashd_source = "path"` or
+  `zcashd_path` is set;
+- the managed `zcashd` cache directory when `zcashd_source = "managed"` and the
+  cached binary is missing, stale, or has mismatched provenance.
+
+For paths that do not exist yet, Zebra checks the nearest existing ancestor and
+reports whether the target cannot be created because that ancestor is not
+writable by the current user. Existing `zcash.conf` files must be readable, and
+an existing `zcashd` binary must be executable.
 
 ## Containers
 
