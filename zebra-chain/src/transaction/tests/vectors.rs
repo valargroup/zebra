@@ -1130,6 +1130,81 @@ fn v6_txid_commits_to_ironwood_digest() {
 
 #[test]
 #[cfg(zcash_unstable = "nu7")]
+fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    fn test_anchor(byte: u8) -> tree::Root {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        tree::Root::try_from(bytes).expect("test anchor must be canonical")
+    }
+
+    let _init_guard = zebra_test::init();
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: test_anchor(1),
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    let tx_a = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data.clone()),
+    };
+
+    let mut tx_b = tx_a.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+        ..
+    } = &mut tx_b
+    else {
+        unreachable!("test transaction is V6 with Ironwood shielded data");
+    };
+    ironwood_shielded_data.shared_anchor = test_anchor(2);
+
+    assert_eq!(
+        tx_a.hash(),
+        tx_b.hash(),
+        "V6 txid must not commit to the Ironwood anchor"
+    );
+    assert_ne!(
+        tx_a.auth_digest(),
+        tx_b.auth_digest(),
+        "V6 auth digest must commit to the Ironwood anchor"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu7")]
 fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
     let _init_guard = zebra_test::init();
 
