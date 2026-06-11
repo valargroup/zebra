@@ -16,7 +16,10 @@ use tracing::{debug, error, info, warn};
 
 use zebra_chain::parameters::NetworkKind;
 
-use super::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path, Config};
+use super::{
+    effective_zcashd_datadir, ensure_zcashd_datadir, normalize_zcashd_extra_args,
+    resolve_zcashd_datadir_path, Config,
+};
 
 /// The full configuration used by the zcashd-compat supervisor task.
 #[derive(Clone, Debug)]
@@ -52,14 +55,14 @@ impl SupervisorConfig {
         network: NetworkKind,
         rpc_url: String,
         cookie_path: PathBuf,
-    ) -> Self {
-        let extra_args = zcashd_compat.zcashd_extra_args.clone();
+    ) -> Result<Self, Report> {
+        let extra_args = normalize_zcashd_extra_args(&zcashd_compat.zcashd_extra_args)?;
         let zcashd_datadir = resolve_zcashd_datadir_path(
             &effective_zcashd_datadir(zcashd_compat, state_cache_dir),
             &extra_args,
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             zcashd_path,
             zcashd_datadir,
             rpc_url,
@@ -70,7 +73,7 @@ impl SupervisorConfig {
             restart_backoff: zcashd_compat.restart_backoff,
             max_restarts: zcashd_compat.max_restarts,
             shutdown_grace_period: zcashd_compat.shutdown_grace_period,
-        }
+        })
     }
 
     /// Builds the zcashd command-line arguments.
