@@ -16,7 +16,8 @@ Zebra:
 
 - enables zcashd-compat mode (`[zcashd_compat].enabled = true`);
 - ensures a dedicated zcashd-compat RPC listen address is configured (defaults to `127.0.0.1:28232`);
-- uses dedicated cookie auth at `zcashd_compat.cookie_dir/zcashd_compat.cookie_file_name`;
+- uses dedicated cookie auth at `zcashd_compat.cookie_dir/zcashd_compat.cookie_file_name` by default;
+- optionally serves the dedicated zcashd-compat RPC listener over TLS;
 - raises the zcashd-compat RPC `max_response_body_size` to at least `128` MiB
   for large batched block responses;
 - validates coordinated zcashd batch-size, zcashd response-budget, and Zebra
@@ -28,7 +29,8 @@ If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
 ```text
 -zebra-compat
 -zebra-compat-url=<rpc_url>
--zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/<zcashd_compat.cookie_file_name>
+[-zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/<zcashd_compat.cookie_file_name> | -zebra-compat-no-auth=1]
+[-zebra-compat-tls-ca-file=<zcashd_compat.tls_ca_file>]
 -zebra-compat-zebra-rpc-max-response-body-bytes=<effective Zebra compat RPC limit>
 -datadir=<zcashd_compat.zcashd_datadir or state.cache_dir/zcashd-compat-zcashd>
 [-testnet | -regtest]
@@ -47,6 +49,10 @@ active, including later `zcashd_extra_args` such as `-p2p=1` or `-listen=1`.
 Peer-selection options in `zcashd_extra_args` are rejected by `zcashd` startup
 validation rather than silently taking effect.
 
+Cookie auth remains the default in supervised mode. Zebra only passes
+`-zebra-compat-no-auth=1` when `[zcashd_compat].enable_cookie_auth = false`,
+which is accepted only for TLS-enabled zcashd-compat RPC listeners.
+
 ## Configuration
 
 zcashd-compat mode adds a `[zcashd_compat]` section:
@@ -62,6 +68,10 @@ zcashd_extra_args = ["-debug=1"]                    # optional extra args
 listen_addr = "127.0.0.1:28232"                     # optional, default set when zcashd-compat is enabled
 cookie_dir = "/path/to/cookies"                     # optional, defaults to <cache_dir>
 cookie_file_name = ".zcashd-compat.cookie"          # optional, defaults to ".zcashd-compat.cookie"
+enable_cookie_auth = true                           # optional, defaults to true
+tls_cert_file = "/path/to/zebra.crt"                # optional, enables HTTPS with tls_key_file
+tls_key_file = "/path/to/zebra.key"                 # optional, required with tls_cert_file
+tls_ca_file = "/path/to/internal-ca.pem"            # optional, passed to supervised zcashd
 startup_delay = "1s"
 restart_backoff = "2s"                              # base exponential backoff
 restart_backoff_max = "5m"                          # maximum retry delay
@@ -76,6 +86,46 @@ ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]
 ```
 
 `zebrad` always adds `-printtoconsole` automatically for supervised `zcashd`.
+
+### zcashd-compat RPC TLS and auth
+
+The dedicated zcashd-compat RPC listener uses cookie authentication by default,
+independent of the operator-facing `[rpc]` listener. This keeps the backend
+channel isolated even when both listeners share the same process.
+
+To serve the zcashd-compat listener over HTTPS, configure both certificate and
+private-key files:
+
+```toml
+[zcashd_compat]
+listen_addr = "127.0.0.1:28232"
+tls_cert_file = "/path/to/zebra.crt"
+tls_key_file = "/path/to/zebra.key"
+tls_ca_file = "/path/to/internal-ca.pem"
+```
+
+When `manage_zcashd = true`, Zebra uses an `https://` `-zebra-compat-url` and
+passes `-zebra-compat-tls-ca-file=<tls_ca_file>` to supervised zcashd. The CA
+file should contain the public CA certificate zcashd needs to verify Zebra's
+server certificate. It is not Zebra's private key.
+
+Cookie auth can be disabled for the dedicated zcashd-compat listener only when
+TLS is enabled:
+
+```toml
+[zcashd_compat]
+listen_addr = "127.0.0.1:28232"
+tls_cert_file = "/path/to/zebra.crt"
+tls_key_file = "/path/to/zebra.key"
+tls_ca_file = "/path/to/internal-ca.pem"
+enable_cookie_auth = false
+```
+
+In this mode, supervised zcashd receives `-zebra-compat-no-auth=1` instead of a
+cookie file. Use this only when another layer controls access to the HTTPS
+endpoint, such as Cloudflare Access, mTLS, IP allowlists, or a private network.
+Without cookie auth, any client that can reach the listener can call the exposed
+RPC methods.
 
 ## `zcashd` configuration
 
@@ -109,7 +159,7 @@ Do not disable the wrong listener:
 | Listener | Default / typical | Role in zcashd-compat |
 |---|---|---|
 | **Zebra network P2P** (`network.listen_addr`) | enabled | Zebra syncs blocks from the Zcash network. Keep enabled. |
-| **Zebra compat RPC** (`zcashd_compat.listen_addr`) | `127.0.0.1:28232` | Cookie-auth channel for supervised `zcashd -zebra-compat`. Separate from `[rpc]`. |
+| **Zebra compat RPC** (`zcashd_compat.listen_addr`) | `127.0.0.1:28232` | Backend channel for supervised `zcashd -zebra-compat`. Cookie-auth by default; HTTPS/no-cookie is opt-in. Separate from `[rpc]`. |
 | **Zebra user RPC** (`[rpc].listen_addr`) | optional | Operator-facing Zebra JSON-RPC (for example `127.0.0.1:8232`). |
 | **zcashd network P2P** (`-listen`, port 8233/18233) | forced off | Must stay off; Zebra owns P2P. |
 | **zcashd wallet RPC** (`-rpcbind`, `-rpcport`) | operator choice | Unrelated to `-listen`; configure separately if needed. |
@@ -250,8 +300,8 @@ If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, bu
 does not spawn `zcashd`.
 
 The standard `[rpc]` listener remains independent. zcashd-compat uses a separate
-listener and separate cookie auth so operators can keep user-facing Zebra RPC
-and zcashd backend RPC isolated.
+listener and separate authentication/TLS settings so operators can keep
+user-facing Zebra RPC and zcashd backend RPC isolated.
 
 ## Sync batch size and response limits
 
