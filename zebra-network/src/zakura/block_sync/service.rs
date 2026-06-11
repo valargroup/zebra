@@ -151,6 +151,19 @@ impl BlockSyncService {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
+    pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
+        Self {
+            inner: Arc::new(BlockSyncServiceInner {
+                config,
+                events: handle.events.clone(),
+                lifecycle: handle.lifecycle.clone(),
+                peers: StdMutex::new(HashMap::new()),
+            }),
+            _held_events: None,
+            _reactor_task: None,
+        }
+    }
+
     pub(crate) fn new_with_header_tip(
         config: ZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
@@ -216,16 +229,7 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
         handle: BlockSyncHandle,
     ) -> Self {
-        Self {
-            inner: Arc::new(BlockSyncServiceInner {
-                config,
-                events: handle.events.clone(),
-                lifecycle: handle.lifecycle.clone(),
-                peers: StdMutex::new(HashMap::new()),
-            }),
-            _held_events: None,
-            _reactor_task: None,
-        }
+        Self::new_with_handle(config, handle)
     }
 
     #[cfg(test)]

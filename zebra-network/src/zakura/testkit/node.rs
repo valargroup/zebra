@@ -389,7 +389,13 @@ impl ZakuraTestNodeBuilder {
         } else {
             Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>
         };
-        let registry = service_registry(&supervisor, header_sync, base_service, discovery_service)?;
+        let registry = service_registry(
+            &supervisor,
+            header_sync,
+            None,
+            base_service,
+            discovery_service,
+        )?;
         let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),
             network.clone(),

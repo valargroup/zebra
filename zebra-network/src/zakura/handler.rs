@@ -47,8 +47,9 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, drive_header_sync_actions, spawn_header_sync_reactor,
-        BlockSyncService, Clock, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+        direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
+        spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
+        BlockSyncService, BlockSyncStartup, Clock, Frame, FramedRecv, FramedSend, HeaderSyncAction,
         HeaderSyncFrontiers, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
         Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
         Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
@@ -374,8 +375,10 @@ pub struct ZakuraEndpoint {
     supervisor: ZakuraSupervisorHandle,
     handler: ZakuraProtocolHandler,
     header_sync: Option<super::HeaderSyncHandle>,
+    block_sync: Option<BlockSyncHandle>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
+    block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     upgrade_dials: Arc<StdMutex<HashSet<ZakuraPeerId>>>,
 }
 
@@ -392,6 +395,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Hash of `frontiers.verified_block_tip`.
+    pub verified_block_tip_hash: block::Hash,
 }
 
 impl ZakuraEndpoint {
@@ -432,9 +437,20 @@ impl ZakuraEndpoint {
         self.header_sync.clone()
     }
 
+    /// Returns the block-sync handle when native block sync is active.
+    pub fn block_sync(&self) -> Option<BlockSyncHandle> {
+        self.block_sync.clone()
+    }
+
     /// Take the header-sync action receiver when this endpoint was started in external-driver mode.
     pub async fn take_header_sync_actions(&self) -> Option<mpsc::Receiver<HeaderSyncAction>> {
         let actions = self.header_sync_actions.as_ref()?;
+        actions.lock().await.take()
+    }
+
+    /// Take the block-sync action receiver when this endpoint was started in external-driver mode.
+    pub async fn take_block_sync_actions(&self) -> Option<mpsc::Receiver<BlockSyncAction>> {
+        let actions = self.block_sync_actions.as_ref()?;
         actions.lock().await.take()
     }
 
@@ -450,6 +466,11 @@ impl ZakuraEndpoint {
         if let Some(tasks) = self.header_sync_tasks.as_ref() {
             tasks.tasks.lock().await.push(task);
         }
+    }
+
+    /// Track a block-sync integration task under the endpoint shutdown owner.
+    pub async fn push_block_sync_task(&self, task: JoinHandle<()>) {
+        self.push_header_sync_task(task).await;
     }
 
     /// Returns the endpoint's current direct node address.
@@ -559,8 +580,10 @@ impl ZakuraEndpoint {
             supervisor,
             handler,
             header_sync: None,
+            block_sync: None,
             header_sync_tasks: None,
             header_sync_actions: None,
+            block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
@@ -580,11 +603,13 @@ impl ZakuraEndpoint {
             supervisor,
             handler,
             header_sync: Some(header_sync),
+            block_sync: None,
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
                 tasks: Mutex::new(tasks),
             })),
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
+            block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
@@ -1030,6 +1055,7 @@ pub(crate) struct NativeHandshakeNegotiated {
 pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
+    block_sync: Option<BlockSyncHandle>,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
@@ -1040,15 +1066,20 @@ pub(crate) fn service_registry(
         services
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
     }
-    let block_sync = header_sync.as_ref().map_or_else(
-        || BlockSyncService::new(ZakuraBlockSyncConfig::default()),
-        |header_sync| {
-            BlockSyncService::new_with_header_tip(
-                ZakuraBlockSyncConfig::default(),
-                header_sync.subscribe_tip(),
-            )
-        },
-    );
+    let block_sync = match block_sync {
+        Some(block_sync) => {
+            BlockSyncService::new_with_handle(ZakuraBlockSyncConfig::default(), block_sync)
+        }
+        None => header_sync.as_ref().map_or_else(
+            || BlockSyncService::new(ZakuraBlockSyncConfig::default()),
+            |header_sync| {
+                BlockSyncService::new_with_header_tip(
+                    ZakuraBlockSyncConfig::default(),
+                    header_sync.subscribe_tip(),
+                )
+            },
+        ),
+    };
     services.push(Arc::new(block_sync) as Arc<dyn Service>);
 
     Ok(Arc::new(
@@ -2064,6 +2095,26 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         startup.inbound_new_block_acceptance_enabled = true;
     }
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
+    let block_sync_driver_enabled = header_sync_driver_startup.is_some();
+    let (block_sync, block_sync_actions, block_sync_task) =
+        if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
+            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let mut startup = BlockSyncStartup::new(
+                BlockSyncFrontiers {
+                    finalized_height: driver_startup.frontiers.finalized_height,
+                    verified_block_tip: driver_startup.frontiers.verified_block_tip,
+                    verified_block_hash: driver_startup.verified_block_tip_hash,
+                },
+                best_header_tip,
+                header_sync.subscribe_tip(),
+                ZakuraBlockSyncConfig::default(),
+            );
+            startup.shutdown = header_sync_shutdown.clone();
+            let (handle, actions, task) = spawn_block_sync_reactor(startup);
+            (Some(handle), Some(actions), Some(task))
+        } else {
+            (None, None, None)
+        };
     let discovery_service = Arc::new(super::DiscoveryService::with_header_sync(
         discovery.clone(),
         header_sync.clone(),
@@ -2072,11 +2123,15 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let registry = service_registry(
         &supervisor,
         Some(header_sync.clone()),
+        block_sync.clone(),
         legacy_service,
         discovery_service,
     )?;
     let mut tasks = vec![header_sync_task];
-    let header_sync_actions = if header_sync_driver_startup.is_some() {
+    if let Some(task) = block_sync_task {
+        tasks.push(task);
+    }
+    let header_sync_actions = if block_sync_driver_enabled {
         Some(Arc::new(Mutex::new(Some(header_sync_actions))))
     } else {
         let action_driver_task = tokio::spawn(drive_header_sync_actions(
@@ -2088,6 +2143,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         tasks.push(action_driver_task);
         None
     };
+    let block_sync_actions = block_sync_actions
+        .filter(|_| block_sync_driver_enabled)
+        .map(|actions| Arc::new(Mutex::new(Some(actions))));
     let header_sync_tasks = Arc::new(HeaderSyncBackgroundTasks {
         shutdown: header_sync_shutdown,
         tasks: Mutex::new(tasks),
@@ -2108,8 +2166,10 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         supervisor,
         handler,
         header_sync: Some(header_sync),
+        block_sync,
         header_sync_tasks: Some(header_sync_tasks),
         header_sync_actions,
+        block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
     };
 
@@ -3841,6 +3901,7 @@ mod tests {
         let registry = service_registry(
             &supervisor,
             Some(header_sync.clone()),
+            None,
             recorder.clone(),
             test_discovery_service(&supervisor),
         )?;
@@ -4059,6 +4120,7 @@ mod tests {
         let registry = service_registry(
             &supervisor,
             Some(header_sync.clone()),
+            None,
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
         )?;
@@ -4137,6 +4199,7 @@ mod tests {
         let registry = service_registry(
             &supervisor,
             Some(header_sync.clone()),
+            None,
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;
@@ -4238,6 +4301,7 @@ mod tests {
         let registry = service_registry(
             &supervisor,
             Some(header_sync.clone()),
+            None,
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;
