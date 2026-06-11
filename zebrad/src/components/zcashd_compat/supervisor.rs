@@ -29,6 +29,8 @@ pub struct SupervisorConfig {
     pub rpc_url: String,
     /// Cookie file path passed to `-zebra-compat-cookiefile`.
     pub cookie_path: PathBuf,
+    /// Zebra RPC response body limit passed to zcashd for startup validation.
+    pub zebra_rpc_max_response_body_size: usize,
     /// Any extra user-provided arguments.
     pub extra_args: Vec<String>,
     /// Active Zebra network kind.
@@ -52,6 +54,7 @@ impl SupervisorConfig {
         network: NetworkKind,
         rpc_url: String,
         cookie_path: PathBuf,
+        zebra_rpc_max_response_body_size: usize,
     ) -> Self {
         let extra_args = zcashd_compat.zcashd_extra_args.clone();
         let zcashd_datadir = resolve_zcashd_datadir_path(
@@ -64,6 +67,7 @@ impl SupervisorConfig {
             zcashd_datadir,
             rpc_url,
             cookie_path,
+            zebra_rpc_max_response_body_size,
             extra_args,
             network,
             startup_delay: zcashd_compat.startup_delay,
@@ -81,6 +85,10 @@ impl SupervisorConfig {
             format!(
                 "-zebra-compat-cookiefile={}",
                 self.cookie_path.to_string_lossy()
+            ),
+            format!(
+                "-zebra-compat-zebra-rpc-max-response-body-bytes={}",
+                self.zebra_rpc_max_response_body_size
             ),
             format!("-datadir={}", self.zcashd_datadir.to_string_lossy()),
         ];
@@ -477,6 +485,7 @@ mod tests {
             zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
             rpc_url: "http://127.0.0.1:8232".to_string(),
             cookie_path: PathBuf::from("/tmp/.cookie"),
+            zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
             extra_args: vec!["-debug=1".to_string()],
             network: NetworkKind::Regtest,
             startup_delay: std::time::Duration::from_secs(1),
@@ -495,6 +504,9 @@ mod tests {
         assert!(args
             .iter()
             .any(|a| a.starts_with("-zebra-compat-cookiefile=/tmp/.cookie")));
+        assert!(args
+            .iter()
+            .any(|a| a == "-zebra-compat-zebra-rpc-max-response-body-bytes=134217728"));
         assert!(args.contains(&"-p2p=0".to_string()));
         assert!(args.contains(&"-listen=0".to_string()));
         assert!(args.contains(&"-printtoconsole".to_string()));
