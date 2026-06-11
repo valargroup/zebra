@@ -34,6 +34,10 @@ pub struct SupervisorConfig {
     pub rpc_url: String,
     /// Cookie file path passed to `-zebra-compat-cookiefile`.
     pub cookie_path: PathBuf,
+    /// Whether supervised zcashd should authenticate to Zebra using the cookie file.
+    pub enable_cookie_auth: bool,
+    /// Optional CA file passed to zcashd for Zebra TLS verification.
+    pub tls_ca_file: Option<PathBuf>,
     /// Zebra RPC response body limit passed to zcashd for startup validation.
     pub zebra_rpc_max_response_body_size: usize,
     /// Any extra user-provided arguments.
@@ -74,6 +78,8 @@ impl SupervisorConfig {
             zcashd_datadir,
             rpc_url,
             cookie_path,
+            enable_cookie_auth: zcashd_compat.enable_cookie_auth,
+            tls_ca_file: zcashd_compat.tls_ca_file.clone(),
             zebra_rpc_max_response_body_size,
             extra_args,
             network,
@@ -91,15 +97,25 @@ impl SupervisorConfig {
             "-zebra-compat".to_string(),
             format!("-zebra-compat-url={}", self.rpc_url),
             format!(
-                "-zebra-compat-cookiefile={}",
-                self.cookie_path.to_string_lossy()
-            ),
-            format!(
                 "-zebra-compat-zebra-rpc-max-response-body-bytes={}",
                 self.zebra_rpc_max_response_body_size
             ),
             format!("-datadir={}", self.zcashd_datadir.to_string_lossy()),
         ];
+        if self.enable_cookie_auth {
+            args.push(format!(
+                "-zebra-compat-cookiefile={}",
+                self.cookie_path.to_string_lossy()
+            ));
+        } else {
+            args.push("-zebra-compat-no-auth=1".to_string());
+        }
+        if let Some(tls_ca_file) = &self.tls_ca_file {
+            args.push(format!(
+                "-zebra-compat-tls-ca-file={}",
+                tls_ca_file.to_string_lossy()
+            ));
+        }
 
         match self.network {
             NetworkKind::Mainnet => {}
@@ -570,6 +586,8 @@ mod tests {
             zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
             rpc_url: "http://127.0.0.1:8232".to_string(),
             cookie_path: PathBuf::from("/tmp/.cookie"),
+            enable_cookie_auth: true,
+            tls_ca_file: None,
             zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
             extra_args: vec!["-debug=1".to_string()],
             network: NetworkKind::Regtest,
@@ -612,6 +630,34 @@ mod tests {
             .expect("extra arg present");
         assert!(p2p_idx < debug_idx);
         assert!(listen_idx < debug_idx);
+    }
+
+    #[test]
+    fn command_args_use_explicit_no_auth_flag_when_cookie_auth_disabled() {
+        let config = SupervisorConfig {
+            zcashd_path: PathBuf::from("zcashd"),
+            zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
+            rpc_url: "https://127.0.0.1:8232".to_string(),
+            cookie_path: PathBuf::from("/tmp/.cookie"),
+            enable_cookie_auth: false,
+            tls_ca_file: Some(PathBuf::from("/tmp/ca.pem")),
+            zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
+            extra_args: Vec::new(),
+            network: NetworkKind::Regtest,
+            startup_delay: Duration::from_secs(1),
+            restart_backoff: Duration::from_secs(2),
+            restart_reset_after: Duration::from_secs(60 * 60),
+            max_restarts: 3,
+            shutdown_grace_period: Duration::from_secs(300),
+        };
+
+        let args = config.command_args();
+
+        assert!(args.contains(&"-zebra-compat-no-auth=1".to_string()));
+        assert!(args.contains(&"-zebra-compat-tls-ca-file=/tmp/ca.pem".to_string()));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("-zebra-compat-cookiefile=")));
     }
 
     #[test]

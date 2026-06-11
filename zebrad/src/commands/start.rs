@@ -195,9 +195,19 @@ impl StartCmd {
     fn zcashd_compat_rpc_config(config: &ZebradConfig) -> zebra_rpc::config::rpc::Config {
         let mut compat_rpc_config = config.rpc.clone();
         compat_rpc_config.listen_addr = config.zcashd_compat.listen_addr;
-        compat_rpc_config.enable_cookie_auth = true;
+        compat_rpc_config.enable_cookie_auth = config.zcashd_compat.enable_cookie_auth;
         compat_rpc_config.cookie_dir = config.zcashd_compat.cookie_dir.clone();
         compat_rpc_config.cookie_file_name = config.zcashd_compat.cookie_file_name.clone();
+        compat_rpc_config.tls = match (
+            &config.zcashd_compat.tls_cert_file,
+            &config.zcashd_compat.tls_key_file,
+        ) {
+            (Some(cert_file), Some(key_file)) => Some(zebra_rpc::config::rpc::TlsConfig {
+                cert_file: cert_file.clone(),
+                key_file: key_file.clone(),
+            }),
+            _ => None,
+        };
         compat_rpc_config.max_response_body_size = compat_rpc_config
             .max_response_body_size
             .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
@@ -321,11 +331,58 @@ impl StartCmd {
         Ok(())
     }
 
+    fn validate_zcashd_compat_tls_config(config: &ZebradConfig) -> Result<(), Report> {
+        if config.zcashd_compat.tls_cert_file.is_some()
+            != config.zcashd_compat.tls_key_file.is_some()
+        {
+            return Err(eyre!(
+                "zcashd-compat TLS requires both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
+            ));
+        }
+
+        for (name, path) in [
+            (
+                "zcashd_compat.tls_cert_file",
+                &config.zcashd_compat.tls_cert_file,
+            ),
+            (
+                "zcashd_compat.tls_key_file",
+                &config.zcashd_compat.tls_key_file,
+            ),
+            (
+                "zcashd_compat.tls_ca_file",
+                &config.zcashd_compat.tls_ca_file,
+            ),
+        ] {
+            if let Some(path) = path {
+                std::fs::File::open(path)
+                    .map_err(|error| eyre!("could not read {name}={}: {error}", path.display()))?;
+            }
+        }
+
+        if config.zcashd_compat.enabled
+            && config.zcashd_compat.manage_zcashd
+            && config.zcashd_compat.tls_enabled()
+            && config.zcashd_compat.tls_ca_file.is_none()
+        {
+            return Err(eyre!(
+                "zcashd-compat supervision with TLS requires zcashd_compat.tls_ca_file so zcashd can verify Zebra"
+            ));
+        }
+
+        Ok(())
+    }
+
     fn zcashd_compat_rpc_url(config: &ZebradConfig) -> Result<String, Report> {
         let listen_addr = config.zcashd_compat.listen_addr.ok_or_else(|| {
             eyre!("zcashd-compat mode requires zcashd_compat.listen_addr to be set")
         })?;
-        Ok(format!("http://{listen_addr}"))
+        let scheme = if config.zcashd_compat.tls_enabled() {
+            "https"
+        } else {
+            "http"
+        };
+        Ok(format!("{scheme}://{listen_addr}"))
     }
 
     /// Returns the supervisor shutdown timeout when zcashd-compat `zcashd` supervision is active.
@@ -998,6 +1055,16 @@ impl config::Override<ZebradConfig> for StartCmd {
                 }
             }
 
+            Self::validate_zcashd_compat_tls_config(&config)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+            if !config.zcashd_compat.enable_cookie_auth && !config.zcashd_compat.tls_enabled() {
+                return Err(std::io::Error::other(
+                    "zcashd_compat.enable_cookie_auth=false requires TLS on the zcashd-compat RPC listener",
+                )
+                .into());
+            }
+
             Self::validate_zcashd_compat_sync_batch_response_size(&config)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -1154,6 +1221,176 @@ mod tests {
         assert_eq!(
             compat_rpc_config.max_response_body_size,
             StartCmd::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_rpc_config_can_disable_cookie_auth() {
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.enable_cookie_auth = false;
+
+        let compat_rpc_config = StartCmd::zcashd_compat_rpc_config(&config);
+
+        assert!(!compat_rpc_config.enable_cookie_auth);
+    }
+
+    #[test]
+    fn zcashd_compat_rpc_url_uses_https_when_tls_enabled() {
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
+        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra.crt".into());
+        config.zcashd_compat.tls_key_file = Some("/tmp/zebra.key".into());
+
+        let rpc_url =
+            StartCmd::zcashd_compat_rpc_url(&config).expect("zcashd-compat RPC URL should format");
+
+        assert!(rpc_url.starts_with("https://"));
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_no_cookie_auth_without_tls() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.enable_cookie_auth = false;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("no-cookie zcashd-compat RPC should require TLS");
+
+        assert!(
+            error
+                .to_string()
+                .contains("enable_cookie_auth=false requires TLS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_no_cookie_auth_with_tls() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let cert_file = tempdir.path().join("zebra.crt");
+        let key_file = tempdir.path().join("zebra.key");
+        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
+        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.enable_cookie_auth = false;
+        config.zcashd_compat.tls_cert_file = Some(cert_file);
+        config.zcashd_compat.tls_key_file = Some(key_file);
+
+        cmd.override_config(config)
+            .expect("no-cookie zcashd-compat RPC should be allowed with TLS");
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_missing_tls_files() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra-missing.crt".into());
+        config.zcashd_compat.tls_key_file = Some("/tmp/zebra-missing.key".into());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("missing TLS files should be rejected");
+        assert!(
+            error.to_string().contains("could not read"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_managed_tls_without_ca_file() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let cert_file = tempdir.path().join("zebra.crt");
+        let key_file = tempdir.path().join("zebra.key");
+        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
+        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.tls_cert_file = Some(cert_file);
+        config.zcashd_compat.tls_key_file = Some(key_file);
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("managed TLS should require a CA file");
+        assert!(
+            error.to_string().contains("tls_ca_file"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_managed_tls_with_ca_file() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let cert_file = tempdir.path().join("zebra.crt");
+        let key_file = tempdir.path().join("zebra.key");
+        let ca_file = tempdir.path().join("ca.pem");
+        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
+        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
+        std::fs::write(&ca_file, "placeholder ca").expect("CA file should be writable");
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.tls_cert_file = Some(cert_file);
+        config.zcashd_compat.tls_key_file = Some(key_file);
+        config.zcashd_compat.tls_ca_file = Some(ca_file);
+
+        cmd.override_config(config)
+            .expect("managed zcashd-compat RPC should accept TLS with a CA file");
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_incomplete_tls_pair() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra.crt".into());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("TLS should require both cert and key files");
+
+        assert!(
+            error.to_string().contains("tls_cert_file")
+                && error.to_string().contains("tls_key_file"),
+            "unexpected error: {error}"
         );
     }
 
