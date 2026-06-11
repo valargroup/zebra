@@ -406,7 +406,7 @@ impl StartCmd {
                 config.network.network.kind(),
                 Self::zcashd_compat_rpc_url(&config)?,
                 Self::zcashd_compat_cookie_path(&config),
-            )?;
+            );
 
             info!(
                 rpc_url = %supervisor_config.rpc_url,

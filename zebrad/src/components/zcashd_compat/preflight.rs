@@ -17,10 +17,7 @@ use std::os::unix::fs::MetadataExt;
 use tracing::warn;
 
 #[cfg(target_os = "linux")]
-use super::{
-    effective_zcashd_datadir, ensure_zcashd_datadir, normalize_zcashd_extra_args,
-    resolve_zcashd_datadir_path,
-};
+use super::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path};
 use crate::config::ZebradConfig;
 
 #[cfg(target_os = "linux")]
@@ -117,14 +114,13 @@ struct PreflightSummary {
 
 #[cfg(target_os = "linux")]
 fn run_linux_preflight(config: &ZebradConfig, unsafe_low_specs: bool) -> Result<(), Report> {
-    let zcashd_extra_args = normalize_zcashd_extra_args(&config.zcashd_compat.zcashd_extra_args)?;
-    let zcashd_datadir = resolve_zcashd_datadir_path(
-        &effective_zcashd_datadir(&config.zcashd_compat, &config.state.cache_dir),
-        &zcashd_extra_args,
-    )?;
+    let mut zcashd_datadir =
+        effective_zcashd_datadir(&config.zcashd_compat, &config.state.cache_dir);
 
     if config.zcashd_compat.manage_zcashd {
-        ensure_zcashd_datadir(&zcashd_datadir, &zcashd_extra_args)?;
+        zcashd_datadir =
+            resolve_zcashd_datadir_path(&zcashd_datadir, &config.zcashd_compat.zcashd_extra_args);
+        ensure_zcashd_datadir(&zcashd_datadir, &config.zcashd_compat.zcashd_extra_args)?;
     }
 
     let mut summary = PreflightSummary::default();

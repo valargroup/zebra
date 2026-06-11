@@ -40,18 +40,6 @@ const DEPRECATION_ACK: &str = "i-am-aware-zcashd-will-be-replaced-by-zebrad-and-
 const OVERRIDDEN_P2P_BOOL_OPTIONS: &[&str] = &["listen", "p2p", "dnsseed", "listenonion"];
 const VALIDATION_ERROR_OPTIONS: &[&str] = &["bind", "whitebind", "connect", "addnode", "seednode"];
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum PathArgForm {
-    Equals,
-    Paired,
-}
-
-#[derive(Copy, Clone, Debug, Default)]
-struct PathArgForms {
-    conf: Option<PathArgForm>,
-    datadir: Option<PathArgForm>,
-}
-
 /// Returns the effective datadir used by supervised `zcashd`.
 pub fn effective_zcashd_datadir(zcashd_compat: &Config, state_cache_dir: &Path) -> PathBuf {
     zcashd_compat
@@ -60,16 +48,11 @@ pub fn effective_zcashd_datadir(zcashd_compat: &Config, state_cache_dir: &Path) 
         .unwrap_or_else(|| state_cache_dir.join(DEFAULT_ZCASHD_DATADIR))
 }
 
-/// Applies zcashd's last-value-wins `-datadir` command-line override.
-pub fn resolve_zcashd_datadir_path(
-    datadir: &Path,
-    extra_args: &[String],
-) -> Result<PathBuf, Report> {
-    let extra_args = normalize_zcashd_extra_args(extra_args)?;
-
-    Ok(find_datadir_arg(&extra_args)
+/// Applies the first valid `-datadir=<path>` command-line override we can infer.
+pub fn resolve_zcashd_datadir_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
+    find_datadir_arg(extra_args)
         .map(PathBuf::from)
-        .unwrap_or_else(|| datadir.to_path_buf()))
+        .unwrap_or_else(|| datadir.to_path_buf())
 }
 
 /// Ensures the supervised `zcashd` datadir and effective config file are ready.
@@ -78,16 +61,16 @@ pub fn resolve_zcashd_datadir_path(
 /// effective `zcash.conf` is absent, and warns about existing config settings
 /// that are surprising or incompatible in zcashd-compat mode.
 ///
-/// Spec: `extra_args` are applied after Zebra's managed `-datadir=...`, so this
-/// must resolve any later `-datadir=...` override before preparing the config.
+/// Spec: `extra_args` are passed to zcashd unchanged, so this only performs
+/// best-effort path inference for bootstrap and logs warnings for ambiguous
+/// path options.
 ///
 /// # Errors
 ///
 /// Returns an error if the datadir or config file cannot be created, or if an
 /// existing config file cannot be read.
 pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<(), Report> {
-    let extra_args = normalize_zcashd_extra_args(extra_args)?;
-    let datadir = find_datadir_arg(&extra_args)
+    let datadir = find_datadir_arg(extra_args)
         .map(PathBuf::from)
         .unwrap_or_else(|| datadir.to_path_buf());
 
@@ -131,79 +114,6 @@ pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<()
         Err(error) => Err(error)
             .wrap_err_with(|| format!("failed to inspect zcashd config {}", conf_path.display())),
     }
-}
-
-/// Converts supported paired path args to zcashd's equals form.
-///
-/// zcashd only assigns values from `-name=value`, but operator-facing config is
-/// easier to use if we accept one paired form and normalize it before spawn.
-/// Mixing equals and paired forms for the same option is ambiguous, so fail
-/// closed instead of guessing which zcashd should use.
-pub fn normalize_zcashd_extra_args(extra_args: &[String]) -> Result<Vec<String>, Report> {
-    let mut normalized_args = Vec::with_capacity(extra_args.len());
-    let mut forms = PathArgForms::default();
-    let mut iter = extra_args.iter().peekable();
-
-    while let Some(arg) = iter.next() {
-        match path_arg_name_from_equals(arg) {
-            Some(name) => {
-                record_path_arg_form(&mut forms, name, PathArgForm::Equals)?;
-                normalized_args.push(arg.clone());
-            }
-            None if is_paired_path_arg(arg, "conf") => {
-                record_path_arg_form(&mut forms, "conf", PathArgForm::Paired)?;
-                let value = iter
-                    .next()
-                    .ok_or_else(|| eyre!("zcashd_extra_args contains {arg} without a value"))?;
-                normalized_args.push(format!("{arg}={value}"));
-            }
-            None if is_paired_path_arg(arg, "datadir") => {
-                record_path_arg_form(&mut forms, "datadir", PathArgForm::Paired)?;
-                let value = iter
-                    .next()
-                    .ok_or_else(|| eyre!("zcashd_extra_args contains {arg} without a value"))?;
-                normalized_args.push(format!("{arg}={value}"));
-            }
-            None => normalized_args.push(arg.clone()),
-        }
-    }
-
-    Ok(normalized_args)
-}
-
-fn path_arg_name_from_equals(arg: &str) -> Option<&'static str> {
-    if arg.starts_with("-conf=") || arg.starts_with("--conf=") {
-        Some("conf")
-    } else if arg.starts_with("-datadir=") || arg.starts_with("--datadir=") {
-        Some("datadir")
-    } else {
-        None
-    }
-}
-
-fn is_paired_path_arg(arg: &str, name: &str) -> bool {
-    arg == format!("-{name}") || arg == format!("--{name}")
-}
-
-fn record_path_arg_form(
-    forms: &mut PathArgForms,
-    name: &'static str,
-    form: PathArgForm,
-) -> Result<(), Report> {
-    let slot = match name {
-        "conf" => &mut forms.conf,
-        "datadir" => &mut forms.datadir,
-        _ => unreachable!("unsupported path argument name"),
-    };
-
-    if slot.is_some_and(|existing_form| existing_form != form) {
-        return Err(eyre!(
-            "zcashd_extra_args mixes paired and equals forms for -{name}; use only one form"
-        ));
-    }
-
-    *slot = Some(form);
-    Ok(())
 }
 
 /// Writes the bootstrap config without clobbering an operator-created file.
@@ -292,13 +202,14 @@ fn unique_temp_conf_path(parent: &Path) -> PathBuf {
     parent.join(format!(".zcash.conf.tmp.{}.{}", std::process::id(), nanos))
 }
 
-/// Extracts the last `-datadir` value supported by Zebra's extra args.
+/// Extracts the first valid `-datadir=<path>` value from Zebra's extra args.
 fn find_datadir_arg(extra_args: &[String]) -> Option<&str> {
-    find_last_arg_value(extra_args, "datadir")
+    find_first_path_arg_value(extra_args, "datadir")
 }
 
-/// Resolves zcashd's effective config path using the same `-conf` rule shape:
-/// relative config paths are anchored under the selected datadir.
+/// Resolves the first valid `-conf=<path>` we can infer from extra args.
+///
+/// Relative config paths are anchored under the selected datadir.
 fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     let conf_path = find_conf_arg(extra_args)
         .map(PathBuf::from)
@@ -311,28 +222,58 @@ fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     }
 }
 
-/// Extracts the last `-conf` value supported by Zebra's extra args.
+/// Extracts the first valid `-conf=<path>` value from Zebra's extra args.
 fn find_conf_arg(extra_args: &[String]) -> Option<&str> {
-    find_last_arg_value(extra_args, "conf")
+    find_first_path_arg_value(extra_args, "conf")
 }
 
-fn find_last_arg_value<'a>(extra_args: &'a [String], name: &str) -> Option<&'a str> {
+fn find_first_path_arg_value<'a>(extra_args: &'a [String], name: &str) -> Option<&'a str> {
     let mut value_arg = None;
     let short_equals = format!("-{name}=");
     let long_equals = format!("--{name}=");
+    let short = format!("-{name}");
+    let long = format!("--{name}");
 
     for arg in extra_args {
+        if arg == &short || arg == &long {
+            warn!(
+                option = %arg,
+                "zcashd-compat cannot infer a path from paired zcashd_extra_args; leaving argument unchanged for zcashd"
+            );
+            continue;
+        }
+
         if let Some(value) = arg.strip_prefix(&short_equals) {
-            value_arg = Some(value);
+            record_path_arg_value(name, value, &mut value_arg);
             continue;
         }
 
         if let Some(value) = arg.strip_prefix(&long_equals) {
-            value_arg = Some(value);
+            record_path_arg_value(name, value, &mut value_arg);
         }
     }
 
     value_arg
+}
+
+fn record_path_arg_value<'a>(name: &str, value: &'a str, value_arg: &mut Option<&'a str>) {
+    if value.is_empty() {
+        warn!(
+            option = %format!("-{name}"),
+            "zcashd-compat cannot infer a path from an empty zcashd_extra_args value"
+        );
+        return;
+    }
+
+    if value_arg.is_some() {
+        warn!(
+            option = %format!("-{name}"),
+            "zcashd-compat found multiple path values in zcashd_extra_args; using the first inferred value for bootstrap"
+        );
+        return;
+    }
+
+    *value_arg = Some(value);
 }
 
 /// Audits existing configs without modifying them.
@@ -411,8 +352,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        audit_zcash_conf, ensure_zcashd_datadir, normalize_zcashd_extra_args,
-        resolve_zcashd_conf_path, BOOTSTRAP_ZCASH_CONF,
+        audit_zcash_conf, ensure_zcashd_datadir, resolve_zcashd_conf_path, BOOTSTRAP_ZCASH_CONF,
     };
 
     #[test]
@@ -479,71 +419,45 @@ mod tests {
     }
 
     #[test]
-    fn resolves_last_conf_arg() {
+    #[tracing_test::traced_test]
+    fn resolves_first_conf_arg_and_warns_on_duplicate() {
         let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf=old.conf".to_string(), "--conf=new.conf".to_string()];
 
         assert_eq!(
             resolve_zcashd_conf_path(&datadir, &extra_args),
-            datadir.join("new.conf")
+            datadir.join("old.conf")
         );
+
+        assert!(logs_contain("multiple path values"));
     }
 
     #[test]
-    fn normalizes_paired_conf_arg() {
+    #[tracing_test::traced_test]
+    fn ignores_paired_conf_arg_and_warns() {
+        let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf".to_string(), "custom.conf".to_string()];
 
         assert_eq!(
-            normalize_zcashd_extra_args(&extra_args).expect("paired conf should normalize"),
-            vec!["-conf=custom.conf".to_string()]
+            resolve_zcashd_conf_path(&datadir, &extra_args),
+            datadir.join("zcash.conf")
         );
+
+        assert!(logs_contain("paired zcashd_extra_args"));
     }
 
     #[test]
-    fn rejects_mixed_conf_arg_forms() {
-        let extra_args = vec![
-            "-conf=old.conf".to_string(),
-            "--conf".to_string(),
-            "new.conf".to_string(),
-        ];
-
-        let error =
-            normalize_zcashd_extra_args(&extra_args).expect_err("mixed conf forms should fail");
-
-        assert!(error
-            .to_string()
-            .contains("mixes paired and equals forms for -conf"));
-    }
-
-    #[test]
-    fn rejects_mixed_datadir_arg_forms() {
-        let extra_args = vec![
-            "-datadir=/old".to_string(),
-            "--datadir".to_string(),
-            "/new".to_string(),
-        ];
-
-        let error =
-            normalize_zcashd_extra_args(&extra_args).expect_err("mixed datadir forms should fail");
-
-        assert!(error
-            .to_string()
-            .contains("mixes paired and equals forms for -datadir"));
-    }
-
-    #[test]
-    fn bootstraps_paired_conf_path() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let datadir = temp_dir.path().join("zcashd-datadir");
-        let extra_args = vec!["-conf".to_string(), "paired.conf".to_string()];
-
-        ensure_zcashd_datadir(&datadir, &extra_args).expect("paired conf should be supported");
+    #[tracing_test::traced_test]
+    fn ignores_empty_conf_arg_and_warns() {
+        let datadir = PathBuf::from("/zcashd-datadir");
+        let extra_args = vec!["-conf=".to_string()];
 
         assert_eq!(
-            fs::read_to_string(datadir.join("paired.conf"))
-                .expect("paired config should be readable"),
-            BOOTSTRAP_ZCASH_CONF
+            resolve_zcashd_conf_path(&datadir, &extra_args),
+            datadir.join("zcash.conf")
         );
+
+        assert!(logs_contain("empty zcashd_extra_args value"));
     }
 
     #[test]
@@ -567,7 +481,8 @@ mod tests {
     }
 
     #[test]
-    fn bootstraps_paired_datadir_extra_arg_override() {
+    #[tracing_test::traced_test]
+    fn ignores_paired_datadir_extra_arg_override_and_warns() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let datadir = temp_dir.path().join("zcashd-datadir");
         let override_datadir = temp_dir.path().join("operator-datadir");
@@ -577,17 +492,18 @@ mod tests {
         ];
 
         ensure_zcashd_datadir(&datadir, &extra_args)
-            .expect("paired datadir override should be prepared");
+            .expect("paired datadir override warning should be non-fatal");
 
-        assert!(
-            !datadir.exists(),
-            "bootstrap should not prepare the overridden default datadir"
-        );
         assert_eq!(
-            fs::read_to_string(override_datadir.join("zcash.conf"))
-                .expect("override config should be readable"),
+            fs::read_to_string(datadir.join("zcash.conf"))
+                .expect("default config should be readable"),
             BOOTSTRAP_ZCASH_CONF
         );
+        assert!(
+            !override_datadir.exists(),
+            "paired datadir should not be used for bootstrap inference"
+        );
+        assert!(logs_contain("paired zcashd_extra_args"));
     }
 
     #[test]
