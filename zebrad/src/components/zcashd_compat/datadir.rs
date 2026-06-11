@@ -294,18 +294,7 @@ fn unique_temp_conf_path(parent: &Path) -> PathBuf {
 
 /// Extracts the last `-datadir` value supported by Zebra's extra args.
 fn find_datadir_arg(extra_args: &[String]) -> Option<&str> {
-    let mut value_arg = None;
-
-    for arg in extra_args {
-        if let Some(value) = arg
-            .strip_prefix("-datadir=")
-            .or_else(|| arg.strip_prefix("--datadir="))
-        {
-            value_arg = Some(value);
-        }
-    }
-
-    value_arg
+    find_last_arg_value(extra_args, "datadir")
 }
 
 /// Resolves zcashd's effective config path using the same `-conf` rule shape:
