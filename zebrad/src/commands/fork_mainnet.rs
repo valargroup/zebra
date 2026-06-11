@@ -18,7 +18,11 @@ use zebra_chain::{
 use crate::config::ZebradConfig;
 
 const DEFAULT_FORK_LISTEN_ADDR: &str = "127.0.0.1:28233";
-const DEFAULT_EASY_FORK_TARGET_DIFFICULTY: &str = "037fffff";
+// The default Testnet PoW limit (`2^251 - 1`). This is easier than Mainnet's
+// `2^243 - 1` limit, suitable for local CPU testing, and — unlike a very low
+// target such as `037fffff` — its work value fits in the `u128` the
+// non-finalized chain uses to accumulate cumulative work.
+const DEFAULT_EASY_FORK_TARGET_DIFFICULTY: &str = "2007ffff";
 
 /// Generate or manage a local fork of Mainnet.
 #[derive(Command, Debug, Parser)]
@@ -334,7 +338,7 @@ mod tests {
         assert!(!output.contains("fixed_post_fork_difficulty"));
         assert!(output.contains("initial_fork_peers = [\"127.0.0.1:38233\"]"));
         assert!(output.contains("forked_mainnet"));
-        assert!(output.contains("target_difficulty_limit = \"037fffff\""));
+        assert!(output.contains("target_difficulty_limit = \"2007ffff\""));
         assert!(output.contains("NU7 = 3400100"));
 
         let config: ZebradConfig =

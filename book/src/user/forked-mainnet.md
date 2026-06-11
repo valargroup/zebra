@@ -34,14 +34,30 @@ start:
 zebrad -c mainnet.toml start
 ```
 
-Record both the anchor height and block hash:
+Zebra exposes a JSON-RPC endpoint (there is no `zcash-cli`); query it with `curl`.
+The helper below posts a method and params to the RPC port from your Mainnet
+config (`rpc.listen_addr`, `8232` by default):
 
 ```console
-ANCHOR_HEIGHT=3400000
-ANCHOR_HASH=$(zcash-cli getblockhash "$ANCHOR_HEIGHT")
+zrpc() { curl -s --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+  -H 'content-type:application/json' 127.0.0.1:8232; }
 ```
 
-Stop Zebra before preparing or starting the fork. Then generate a fork config:
+The fork anchor must be the **finalized** database tip, not the best chain tip.
+Zebra keeps roughly the last 100 blocks in non-finalized state, so after you stop
+the node the finalized tip is up to ~100 blocks below the height reported by
+`getblockchaininfo`. You do not have to compute this exactly: Zebra validates the
+anchor on startup and, if it does not match, the error message reports the exact
+finalized height and hash to use. A convenient first pass is to use the best tip:
+
+```console
+ANCHOR_HEIGHT=$(zrpc getblockcount '[]' | sed -E 's/.*"result":([0-9]+).*/\1/')
+ANCHOR_HASH=$(zrpc getblockhash "[$ANCHOR_HEIGHT]" | sed -E 's/.*"result":"([0-9a-f]+)".*/\1/')
+```
+
+Stop Zebra before preparing or starting the fork. Then generate a fork config
+(if the anchor is wrong, Zebra's startup error tells you the finalized height and
+hash to put here):
 
 ```console
 zebrad fork-mainnet prepare \
@@ -59,8 +75,9 @@ be unique for the fork; peers with a different magic are rejected during
 handshake.
 
 By default, `fork-mainnet prepare` enables `--easy-difficulty=true`, which writes
-an easy post-fork DAA starting limit. You can override it with
-`--target-difficulty-limit`, using compact 8-hex or expanded 64-hex format:
+an easy post-fork DAA starting limit (the Testnet PoW limit, `2007ffff`). You can
+override it with `--target-difficulty-limit`, using compact 8-hex or expanded
+64-hex format:
 
 ```console
 zebrad fork-mainnet prepare \
@@ -68,31 +85,71 @@ zebrad fork-mainnet prepare \
   --hash "$ANCHOR_HASH" \
   --name LocalFork \
   --network-magic a1b2c3d4 \
-  --target-difficulty-limit 037fffff \
+  --target-difficulty-limit 2007ffff \
   --output-file forked-mainnet.toml
 ```
+
+The limit must be easy enough that its work value fits in a `u128` (its target
+must be at least `2^128`); `fork-mainnet prepare` rejects limits that are too
+hard, such as `037fffff`. The Mainnet, Testnet, and Regtest PoW limits are all
+valid choices.
 
 Post-fork activation heights must be greater than the fork height and no greater
 than Zebra's maximum valid block height.
 
 ## Starting The Fork
 
-Start Zebra with the generated config:
+`fork-mainnet prepare` writes a minimal config. To mine local blocks you must
+also enable the RPC server, set a miner address, and force-enable the mempool
+(a fork node has no peers, so it never reaches "synced to tip" on its own). Add
+these to the generated `forked-mainnet.toml`:
+
+```toml
+[rpc]
+listen_addr = "127.0.0.1:28232"
+enable_cookie_auth = false   # omit, or configure a cookie, for non-local nodes
+
+[mining]
+# Any valid transparent address for this network; coinbase outputs are never
+# finalized on a fork, so a throwaway address is fine.
+miner_address = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs"
+
+[mempool]
+# Force the mempool active so `generate` works without peers (height <= tip).
+debug_enable_at_height = 0
+```
+
+Then start Zebra:
 
 ```console
 zebrad -c forked-mainnet.toml start
 ```
 
 The Mainnet finalized database must already contain the configured anchor block.
-Zebra will validate the anchor hash on startup.
+Zebra validates the anchor height and hash on startup and refuses to start if the
+finalized tip is not exactly the anchor.
 
 If `--disable-pow` was used when preparing the config, post-fork blocks do not
-need valid proof of work. The `generate` RPC can then create local post-fork
-blocks:
+need valid proof of work, and the `generate` RPC can create local post-fork
+blocks. Using the `zrpc` helper from above (pointed at the fork's RPC port):
 
 ```console
-zcash-cli generate 1
+zrpc() { curl -s --data-binary "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+  -H 'content-type:application/json' 127.0.0.1:28232; }
+
+zrpc generate '[1]'                  # mine one block
+zrpc getblockchaininfo '[]'          # inspect tip height and active upgrades
 ```
+
+Block templates are assembled over the full inherited chain state, so each
+`generate` call can take tens of seconds at a high anchor height.
+
+> **Note on not-yet-released upgrades.** Scheduling a post-fork activation for an
+> upgrade whose consensus branch id is not yet finalized upstream (currently NU7)
+> activates the upgrade at the configured height, but **producing** blocks at or
+> after that height requires a build with NU7 support
+> (`--features tx_v6` and `RUSTFLAGS='--cfg zcash_unstable="nu7"'`). Without it,
+> the activation block is rejected with `WrongTransactionConsensusBranchId`.
 
 For multi-node fork tests, generate each node's config with the same anchor,
 activation heights, difficulty settings, and network magic. Add only the fork

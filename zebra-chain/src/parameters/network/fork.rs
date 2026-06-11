@@ -148,6 +148,15 @@ impl Parameters {
         validate_fork_height(fork_height)?;
         validate_post_fork_activation_heights(fork_height, &post_fork_activation_heights)?;
 
+        // Reject difficulty limits whose work value overflows `u128`. The
+        // non-finalized chain accumulates block work as a `u128`, and the
+        // disable-pow path skips the work validation that normally guarantees a
+        // valid work value, so an overflowing limit would panic `Chain::push`
+        // on the first post-fork block instead of being rejected here.
+        if post_fork_target_difficulty_limit.to_work().is_none() {
+            return Err(ParametersError::InvalidTargetDifficultyLimit);
+        }
+
         let post_fork_target_difficulty_limit = post_fork_target_difficulty_limit
             .to_expanded()
             .ok_or(ParametersError::InvalidTargetDifficultyLimit)?;
