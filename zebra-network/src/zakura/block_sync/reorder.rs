@@ -14,7 +14,6 @@ impl ReorderBuffer {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn buffered_bytes(&self) -> u64 {
         self.buffered_bytes
     }

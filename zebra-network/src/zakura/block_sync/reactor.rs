@@ -70,6 +70,7 @@ impl BlockSyncReactor {
                 .max(Duration::from_millis(1)),
         );
 
+        self.publish_metrics();
         loop {
             tokio::select! {
                 biased;
@@ -87,11 +88,15 @@ impl BlockSyncReactor {
                         Ok(()) => {
                             let (height, hash) = *header_tip.borrow_and_update();
                             self.handle_header_tip_changed(height, hash).await;
+                            self.publish_metrics();
                         }
                         Err(_) => header_tip_open = false,
                     }
                 }
-                _ = ticks.tick() => self.handle_timeouts().await,
+                _ = ticks.tick() => {
+                    self.handle_timeouts().await;
+                    self.publish_metrics();
+                }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
             }
         }
@@ -144,6 +149,7 @@ impl BlockSyncReactor {
                 .await;
             }
         }
+        self.publish_metrics();
     }
 
     fn admission_decision_for(
@@ -269,6 +275,7 @@ impl BlockSyncReactor {
     }
 
     async fn handle_chain_tip_reset(&mut self, frontiers: BlockSyncFrontiers) {
+        metrics::counter!("sync.block.reorg.reset").increment(1);
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
@@ -439,6 +446,7 @@ impl BlockSyncReactor {
                 .await;
         }
 
+        metrics::counter!("sync.block.body.received").increment(1);
         self.state.budget.release(estimated_bytes);
         let mut completed = None;
         if let Some(peer_state) = self.state.peers.get_mut(&peer) {
@@ -716,6 +724,7 @@ impl BlockSyncReactor {
                 continue;
             }
 
+            metrics::counter!("sync.block.request.sent").increment(1);
             let deadline = Instant::now() + self.startup.config.request_timeout;
             if let Some(peer) = self.state.peers.get_mut(&peer_id) {
                 peer.outstanding.push(OutstandingBlockRange {
@@ -746,6 +755,7 @@ impl BlockSyncReactor {
             self.state.verified_block_tip = height;
             self.state.verified_block_hash = block.hash();
             self.state.schedule.mark_height_covered(height);
+            metrics::counter!("sync.block.submit.sent").increment(1);
             let _ = self
                 .actions
                 .send(BlockSyncAction::SubmitBlock { block })
@@ -776,6 +786,7 @@ impl BlockSyncReactor {
             tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Block");
             return false;
         }
+        metrics::counter!("sync.block.body.served").increment(1);
         true
     }
 
@@ -851,6 +862,20 @@ impl BlockSyncReactor {
         {
             self.state.pending_status_refresh = true;
         }
+    }
+
+    fn publish_metrics(&self) {
+        // These lossy casts are metrics-only gauges; consensus and scheduling
+        // continue to use the original integer values.
+        metrics::gauge!("sync.block.best_header_tip.height")
+            .set(self.state.best_header_tip.0 as f64);
+        metrics::gauge!("sync.block.verified_tip.height")
+            .set(self.state.verified_block_tip.0 as f64);
+        metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
+        metrics::gauge!("sync.block.budget.reserved_bytes")
+            .set(self.state.budget.reserved() as f64);
+        metrics::gauge!("sync.block.reorder.buffered_bytes")
+            .set(self.state.reorder.buffered_bytes() as f64);
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {

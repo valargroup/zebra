@@ -62,6 +62,11 @@ pub struct ZakuraHeaderSyncConfig {
     pub status_refresh_interval: Duration,
     /// Header-sync peer caps and queue limits owned by this reactor.
     pub peer_limits: ServicePeerLimits,
+    /// Accept full blocks delivered on Zakura full-block gossip paths.
+    ///
+    /// Disabling this keeps range-based header sync and legacy request/response
+    /// active while forcing block bodies to arrive through the block-sync stream.
+    pub accept_new_blocks: bool,
     /// Optional trusted header-sync anchor height.
     ///
     /// When unset, header sync starts from genesis. When set, [`anchor_hash`](Self::anchor_hash)
@@ -81,6 +86,7 @@ impl Default for ZakuraHeaderSyncConfig {
             max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
             status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
             peer_limits: ServicePeerLimits::default(),
+            accept_new_blocks: true,
             anchor_height: None,
             anchor_hash: None,
         }

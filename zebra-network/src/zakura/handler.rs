@@ -216,6 +216,8 @@ pub struct ZakuraConfig {
     pub trace_dir: Option<PathBuf>,
     /// Native stream-5 header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
+    /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
+    pub block_sync: ZakuraBlockSyncConfig,
 }
 
 impl Default for ZakuraConfig {
@@ -229,6 +231,7 @@ impl Default for ZakuraConfig {
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
             header_sync: ZakuraHeaderSyncConfig::default(),
+            block_sync: ZakuraBlockSyncConfig::default(),
         }
     }
 }
@@ -1056,6 +1059,7 @@ pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
+    block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
@@ -1067,18 +1071,14 @@ pub(crate) fn service_registry(
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
     }
     let block_sync = match block_sync {
-        Some(block_sync) => {
-            BlockSyncService::new_with_handle(ZakuraBlockSyncConfig::default(), block_sync)
-        }
-        None => header_sync.as_ref().map_or_else(
-            || BlockSyncService::new(ZakuraBlockSyncConfig::default()),
-            |header_sync| {
-                BlockSyncService::new_with_header_tip(
-                    ZakuraBlockSyncConfig::default(),
-                    header_sync.subscribe_tip(),
-                )
-            },
-        ),
+        Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
+        None => match header_sync.as_ref() {
+            Some(header_sync) => BlockSyncService::new_with_header_tip(
+                block_sync_config,
+                header_sync.subscribe_tip(),
+            ),
+            None => BlockSyncService::new(block_sync_config),
+        },
     };
     services.push(Arc::new(block_sync) as Arc<dyn Service>);
 
@@ -2092,7 +2092,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     startup.shutdown = header_sync_shutdown.clone();
     if header_sync_driver_startup.is_some() {
         startup.range_state_actions_enabled = true;
-        startup.inbound_new_block_acceptance_enabled = true;
+        startup.inbound_new_block_acceptance_enabled = config.zakura.header_sync.accept_new_blocks;
     }
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
@@ -2107,7 +2107,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                 },
                 best_header_tip,
                 header_sync.subscribe_tip(),
-                ZakuraBlockSyncConfig::default(),
+                config.zakura.block_sync.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
@@ -2125,6 +2125,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         &supervisor,
         Some(header_sync.clone()),
         block_sync.clone(),
+        config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
     )?;
@@ -3903,6 +3904,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
+            ZakuraBlockSyncConfig::default(),
             recorder.clone(),
             test_discovery_service(&supervisor),
         )?;
@@ -4122,6 +4124,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
+            ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
         )?;
@@ -4201,6 +4204,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
+            ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;
@@ -4303,6 +4307,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
+            ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;

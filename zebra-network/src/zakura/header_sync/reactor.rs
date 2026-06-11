@@ -352,7 +352,7 @@ impl HeaderSyncReactor {
             .or_insert_with(|| {
                 PeerHeaderState::new(
                     session,
-                    self.state.anchor.0,
+                    self.state.anchor,
                     self.startup.config.advertised_max_headers_per_response(),
                     self.startup.config.advertised_max_inflight_requests(),
                     self.startup.status_refresh_interval,
@@ -631,12 +631,15 @@ impl HeaderSyncReactor {
                 let Some(peer_state) = self.state.peers.get_mut(&peer) else {
                     return;
                 };
-                if !peer_state.inbound_status.try_take(Instant::now()) {
+                let advances_advertised_tip = status.tip_height > peer_state.advertised_tip;
+                let status_token_available = peer_state.inbound_status.try_take(Instant::now());
+                if !advances_advertised_tip && !status_token_available {
                     self.report_misbehavior(peer, HeaderSyncMisbehavior::StatusSpam)
                         .await;
                     return;
                 }
                 peer_state.advertised_tip = status.tip_height;
+                peer_state.advertised_hash = status.tip_hash;
                 peer_state.anchor = status.anchor_height;
                 peer_state.max_headers_per_response =
                     clamp_advertised_range(status.max_headers_per_response);
@@ -919,17 +922,29 @@ impl HeaderSyncReactor {
                 outstanding.expected_max_count,
             ),
         };
-        if validate_header_range_links(outstanding.range.anchor_hash, &headers).is_err() {
+        if let Err(error) = validate_header_range_links(outstanding.range.anchor_hash, &headers) {
+            debug!(
+                ?peer,
+                ?error,
+                anchor_hash = ?outstanding.range.anchor_hash,
+                start_height = ?outstanding.range.start_height,
+                count = ?header_count,
+                "Zakura header-sync rejected header range links"
+            );
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                 .await;
             self.state.schedule.retry(outstanding.range);
             self.schedule().await;
             return;
         }
-        if validate_headers_stateless(headers.clone(), validation_context)
-            .await
-            .is_err()
-        {
+        if let Err(error) = validate_headers_stateless(headers.clone(), validation_context).await {
+            debug!(
+                ?peer,
+                ?error,
+                start_height = ?outstanding.range.start_height,
+                count = ?header_count,
+                "Zakura header-sync rejected stateless header range"
+            );
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                 .await;
             self.state.schedule.retry(outstanding.range);

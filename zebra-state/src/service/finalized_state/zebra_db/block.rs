@@ -822,6 +822,21 @@ impl ZebraDb {
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
     }
+
+    /// Seed or reconcile the Zakura header store from a committed full block.
+    pub(crate) fn seed_zakura_header_from_committed_block(
+        &self,
+        height: block::Height,
+        block: &Arc<block::Block>,
+    ) -> Result<(), CommitHeaderRangeError> {
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_zakura_header_from_committed_block(&self.db, height, block)?;
+        self.db
+            .write(batch)
+            .map_err(|error| CommitHeaderRangeError::StorageWriteError {
+                error: error.to_string(),
+            })
+    }
 }
 
 /// Lookup the output location for an outpoint.
@@ -871,10 +886,8 @@ impl DiskWriteBatch {
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
-        let db = &zebra_db.db;
-
         // Commit block, transaction, and note commitment tree data.
-        self.prepare_block_header_and_transaction_data_batch(db, finalized)?;
+        self.prepare_block_header_and_transaction_data_batch(zebra_db, finalized)?;
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -929,16 +942,15 @@ impl DiskWriteBatch {
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_block_header_and_transaction_data_batch(
         &mut self,
-        db: &DiskDb,
+        zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
     ) -> Result<(), CommitCheckpointVerifiedError> {
+        let db = &zebra_db.db;
+
         // Blocks
         let block_header_by_height = db.cf_handle("block_header_by_height").unwrap();
         let hash_by_height = db.cf_handle("hash_by_height").unwrap();
         let height_by_hash = db.cf_handle("height_by_hash").unwrap();
-        let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
 
         // Transactions
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
@@ -964,38 +976,11 @@ impl DiskWriteBatch {
             );
         }
 
-        let existing_zakura_header: Option<Arc<block::Header>> =
-            db.zs_get(&zakura_header_by_height, height);
-        if existing_zakura_header.is_some_and(|existing_header| existing_header != block.header) {
-            let best_header_tip: Option<(block::Height, block::Hash)> =
-                db.zs_last_key_value(&zakura_hash_by_height);
-
-            if let Some((best_header_tip, _)) = best_header_tip {
-                for old_height in height.0..=best_header_tip.0 {
-                    let old_height = block::Height(old_height);
-
-                    if old_height != *height
-                        && db.zs_contains(
-                            &tx_by_loc,
-                            &TransactionLocation::min_for_height(old_height),
-                        )
-                    {
-                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader {
-                            height: old_height,
-                        }
-                        .into());
-                    }
-
-                    if let Some(old_hash) =
-                        db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &old_height)
-                    {
-                        self.zs_delete(&zakura_height_by_hash, old_hash);
-                    }
-
-                    self.zs_delete(&zakura_hash_by_height, old_height);
-                    self.zs_delete(&zakura_header_by_height, old_height);
-                }
-            }
+        if zebra_db
+            .config()
+            .enable_zakura_header_seed_from_committed_blocks
+        {
+            self.prepare_zakura_header_from_committed_block(db, *height, block)?;
         }
 
         // Index the block header, hash, and height. This also restores the
@@ -1019,6 +1004,80 @@ impl DiskWriteBatch {
             self.zs_insert(&hash_by_tx_loc, transaction_location, transaction_hash);
             self.zs_insert(&tx_loc_by_hash, transaction_hash, transaction_location);
         }
+
+        Ok(())
+    }
+
+    /// Prepare a database batch that seeds the Zakura header store from a
+    /// committed full block.
+    ///
+    /// Full block verification is authoritative for the stored body. If a
+    /// provisional Zakura header at this height differs, replace it with the
+    /// block-derived header and drop stale provisional descendants.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn prepare_zakura_header_from_committed_block(
+        &mut self,
+        db: &DiskDb,
+        height: block::Height,
+        block: &Arc<block::Block>,
+    ) -> Result<(), CommitHeaderRangeError> {
+        let zakura_header_by_height = db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+        let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+        let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
+        let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
+        let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
+
+        let hash = block.hash();
+        let existing_zakura_header: Option<Arc<block::Header>> =
+            db.zs_get(&zakura_header_by_height, &height);
+
+        if existing_zakura_header.as_ref() == Some(&block.header)
+            && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
+        {
+            return Ok(());
+        }
+
+        if existing_zakura_header.is_some_and(|existing_header| existing_header != block.header) {
+            let best_header_tip: Option<(block::Height, block::Hash)> =
+                db.zs_last_key_value(&zakura_hash_by_height);
+
+            if let Some((best_header_tip, _)) = best_header_tip {
+                for old_height in height.0..=best_header_tip.0 {
+                    let old_height = block::Height(old_height);
+
+                    if old_height != height
+                        && db.zs_contains(
+                            &tx_by_loc,
+                            &TransactionLocation::min_for_height(old_height),
+                        )
+                    {
+                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader {
+                            height: old_height,
+                        });
+                    }
+
+                    if let Some(old_hash) =
+                        db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &old_height)
+                    {
+                        self.zs_delete(&zakura_height_by_hash, old_hash);
+                    }
+
+                    self.zs_delete(&zakura_hash_by_height, old_height);
+                    self.zs_delete(&zakura_header_by_height, old_height);
+                    self.zs_delete(&zakura_body_size_by_height, old_height);
+                }
+            }
+        } else if let Some(old_hash) =
+            db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height)
+        {
+            if old_hash != hash {
+                self.zs_delete(&zakura_height_by_hash, old_hash);
+            }
+        }
+
+        self.zs_insert(&zakura_header_by_height, height, &block.header);
+        self.zs_insert(&zakura_hash_by_height, height, hash);
+        self.zs_insert(&zakura_height_by_hash, hash, height);
 
         Ok(())
     }

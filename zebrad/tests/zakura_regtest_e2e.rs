@@ -50,12 +50,22 @@ fn zakura_regtest_dual_stack_e2e() {
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docker/zakura-regtest-e2e/run.sh");
 
-    let status = Command::new("bash")
-        .arg(&script)
-        .status()
-        .expect("failed to spawn the Zakura regtest e2e script");
+    for (label, replace_legacy_syncer) in [("coexistence", false), ("block-sync-only", true)] {
+        let mut command = Command::new("bash");
+        command.arg(&script).env("ZAKURA_REGTEST_E2E_LABEL", label);
+        if replace_legacy_syncer {
+            command.env("ZAKURA_BLOCK_SYNC_REPLACE_LEGACY", "1");
+        }
 
-    assert!(status.success(), "Zakura regtest dual-stack e2e failed");
+        let status = command
+            .status()
+            .expect("failed to spawn the Zakura regtest e2e script");
+
+        assert!(
+            status.success(),
+            "Zakura regtest e2e failed in {label} mode"
+        );
+    }
 }
 
 fn command_succeeds(command: &mut Command) -> bool {

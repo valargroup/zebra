@@ -334,7 +334,6 @@ impl ByteBudget {
         self.max_bytes.saturating_sub(self.reserved_bytes)
     }
 
-    #[cfg(test)]
     pub(super) fn reserved(self) -> u64 {
         self.reserved_bytes
     }

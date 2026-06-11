@@ -15,9 +15,9 @@ use crate::{
     zakura::{
         discovery::build_discovery_handle, service_registry, spawn_header_sync_reactor,
         DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncHandle,
-        HeaderSyncStartup, Service, ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig,
-        ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler,
-        ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
+        HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId,
+        ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -394,6 +394,7 @@ impl ZakuraTestNodeBuilder {
             &supervisor,
             header_sync,
             None,
+            ZakuraBlockSyncConfig::default(),
             base_service,
             discovery_service,
         )?;

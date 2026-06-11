@@ -209,10 +209,16 @@ async fn zakura_header_sync_driver_startup(
     })
 }
 
-async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
-    mut actions: mpsc::Receiver<HeaderSyncAction>,
+#[derive(Clone)]
+struct ZakuraHeaderSyncDriverHandles {
     endpoint: ZakuraEndpoint,
     header_sync: zebra_network::zakura::HeaderSyncHandle,
+    block_sync: Option<BlockSyncHandle>,
+}
+
+async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
+    mut actions: mpsc::Receiver<HeaderSyncAction>,
+    handles: ZakuraHeaderSyncDriverHandles,
     state: State,
     read_state: ReadState,
     block_verifier: BlockVerifier,
@@ -258,7 +264,7 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     ?reason,
                     "disconnecting peer for Zakura header-sync violation"
                 );
-                let _ = endpoint.supervisor().disconnect_peer(&peer).await;
+                let _ = handles.endpoint.supervisor().disconnect_peer(&peer).await;
             }
             HeaderSyncAction::NewBlockReceived {
                 peer,
@@ -272,7 +278,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     .await
                 {
                     Ok(committed_hash) if committed_hash == hash => {
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::NewBlockAccepted {
                                 peer,
                                 height,
@@ -288,7 +295,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                             ?committed_hash,
                             "Zakura NewBlock verifier returned an unexpected hash"
                         );
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::NewBlockRejected { peer, hash })
                             .await;
                     }
@@ -301,7 +309,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                                 ?error,
                                 "Zakura NewBlock was already known by the block verifier"
                             );
-                            let _ = header_sync
+                            let _ = handles
+                                .header_sync
                                 .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
                                 .await;
                             continue;
@@ -313,7 +322,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                             ?error,
                             "Zakura NewBlock rejected by block verifier"
                         );
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::NewBlockRejected { peer, hash })
                             .await;
                     }
@@ -357,7 +367,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                             .into_iter()
                             .map(|(_height, _hash, header)| header)
                             .collect();
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                                 peer,
                                 start_height: start,
@@ -369,7 +380,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     }
                     Ok(response) => {
                         warn!(?peer, ?response, "unexpected HeadersByHeightRange response");
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
                                 start_height: start,
@@ -384,7 +396,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                             ?error,
                             "failed to read Zakura Headers response from state"
                         );
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
                                 start_height: start,
@@ -416,17 +429,25 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     Ok(zebra_state::Response::Committed(tip_hash)) => {
                         let tip_height =
                             block::Height(start_height.0.saturating_add(count.saturating_sub(1)));
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitted {
                                 start_height,
                                 tip_height,
                                 tip_hash,
                             })
                             .await;
+                        notify_block_sync_header_tip(
+                            handles.block_sync.as_ref(),
+                            tip_height,
+                            tip_hash,
+                        )
+                        .await;
                     }
                     Ok(response) => {
                         warn!(?peer, ?response, "unexpected CommitHeaderRange response");
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
                                 start_height,
@@ -445,7 +466,8 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                             ?error,
                             "Zakura header range commit failed"
                         );
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
                                 start_height,
@@ -465,13 +487,20 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     Ok(zebra_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
                         // Reuse the range-commit event as a startup/tip-refresh fact: a
                         // single-height covered mark is harmless and refreshes the reactor tip.
-                        let _ = header_sync
+                        let _ = handles
+                            .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitted {
                                 start_height: tip_height,
                                 tip_height,
                                 tip_hash,
                             })
                             .await;
+                        notify_block_sync_header_tip(
+                            handles.block_sync.as_ref(),
+                            tip_height,
+                            tip_hash,
+                        )
+                        .await;
                     }
                     Ok(zebra_state::ReadResponse::BestHeaderTip(None)) => {}
                     Ok(response) => warn!(?response, "unexpected BestHeaderTip response"),
@@ -489,6 +518,18 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                 log_missing_block_bodies(read_state.clone(), from, limit).await;
             }
         }
+    }
+}
+
+async fn notify_block_sync_header_tip(
+    block_sync: Option<&BlockSyncHandle>,
+    height: block::Height,
+    hash: block::Hash,
+) {
+    if let Some(block_sync) = block_sync {
+        let _ = block_sync
+            .send(BlockSyncEvent::HeaderTipChanged { height, hash })
+            .await;
     }
 }
 
@@ -1135,6 +1176,10 @@ fn block_sync_chain_tip_event(
     }
 }
 
+fn replace_legacy_syncer_on_zakura_path(config: &zebra_network::Config) -> bool {
+    config.v2_p2p && config.zakura.block_sync.replace_legacy_syncer
+}
+
 #[cfg(not(target_os = "linux"))]
 fn check_tcp_slow_start_after_idle() {}
 
@@ -1229,9 +1274,12 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
+        let mut state_config = config.state.clone();
+        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(
-                config.state.clone(),
+                state_config,
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
@@ -1311,8 +1359,11 @@ impl StartCmd {
                 let driver_task = tokio::spawn(
                     drive_zakura_header_sync_actions(
                         actions,
-                        endpoint.clone(),
-                        header_sync.clone(),
+                        ZakuraHeaderSyncDriverHandles {
+                            endpoint: endpoint.clone(),
+                            header_sync: header_sync.clone(),
+                            block_sync: endpoint.block_sync(),
+                        },
                         state.clone(),
                         read_only_state_service.clone(),
                         block_verifier_router.clone(),
@@ -1595,7 +1646,13 @@ impl StartCmd {
                 "validated block hash should match network genesis hash"
             )
         }
-        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
+        let replace_legacy_syncer = replace_legacy_syncer_on_zakura_path(&config.network);
+        let syncer_task_handle = if replace_legacy_syncer {
+            info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+            tokio::spawn(std::future::pending::<Result<(), Report>>().in_current_span())
+        } else {
+            tokio::spawn(syncer.sync().in_current_span())
+        };
 
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
@@ -2243,6 +2300,19 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
+    fn replace_legacy_syncer_gate_is_zakura_only_and_default_safe() {
+        let mut config = zebra_network::Config::default();
+
+        assert!(!replace_legacy_syncer_on_zakura_path(&config));
+
+        config.zakura.block_sync.replace_legacy_syncer = true;
+        assert!(replace_legacy_syncer_on_zakura_path(&config));
+
+        config.v2_p2p = false;
+        assert!(!replace_legacy_syncer_on_zakura_path(&config));
+    }
+
+    #[test]
     fn served_header_body_size_hints_align_with_served_heights() {
         let start = block::Height(10);
         let header_heights = [
@@ -2396,6 +2466,31 @@ mod zakura_header_sync_driver_tests {
             ),
             BlockSyncEvent::ChainTipReset(mapped) if mapped == frontiers
         ));
+    }
+
+    #[tokio::test]
+    async fn header_tip_notification_drives_block_sync_needed_query() {
+        let startup = block_sync_startup_for_test();
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let header_hash = block::Hash([2; 32]);
+
+        notify_block_sync_header_tip(Some(&block_sync), block::Height(2), header_hash).await;
+
+        let action = tokio::time::timeout(Duration::from_secs(5), reactor_actions.recv())
+            .await
+            .expect("reactor emits a needed-block query after a header tip")
+            .expect("reactor action channel remains open");
+
+        assert!(matches!(
+            action,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(2),
+            }
+        ));
+
+        reactor_task.abort();
     }
 
     #[tokio::test]

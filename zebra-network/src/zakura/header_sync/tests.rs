@@ -717,13 +717,34 @@ async fn advertise_tip(
     max_headers_per_response: u32,
     max_inflight_requests: u16,
 ) {
+    advertise_tip_with_hash(
+        fixture,
+        peer_id,
+        anchor_height,
+        tip_height,
+        block::Hash([9; 32]),
+        max_headers_per_response,
+        max_inflight_requests,
+    )
+    .await;
+}
+
+async fn advertise_tip_with_hash(
+    fixture: &ReactorFixture,
+    peer_id: ZakuraPeerId,
+    anchor_height: block::Height,
+    tip_height: block::Height,
+    tip_hash: block::Hash,
+    max_headers_per_response: u32,
+    max_inflight_requests: u16,
+) {
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id,
             msg: HeaderSyncMessage::Status(HeaderSyncStatus {
                 tip_height,
-                tip_hash: block::Hash([9; 32]),
+                tip_hash,
                 anchor_height,
                 max_headers_per_response,
                 max_inflight_requests,
@@ -927,6 +948,7 @@ fn advertised_defaults_and_clamping_match_design() {
     let config = ZakuraHeaderSyncConfig::default();
     assert_eq!(config.max_headers_per_response, DEFAULT_HS_RANGE);
     assert_eq!(config.max_inflight_requests, DEFAULT_HS_MAX_INFLIGHT);
+    assert!(config.accept_new_blocks);
     assert_eq!(
         ZakuraHeaderSyncConfig {
             max_inflight_requests: u16::MAX,
@@ -2384,6 +2406,125 @@ async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rapid_advancing_status_updates_are_not_spam() {
+    let network = Network::Mainnet;
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let status_peer = peer(55);
+    connect_peer(&fixture, status_peer.clone()).await;
+
+    advertise_tip(
+        &fixture,
+        status_peer.clone(),
+        block::Height(0),
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    advertise_tip(
+        &fixture,
+        status_peer,
+        block::Height(0),
+        block::Height(2),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if let HeaderSyncAction::Misbehavior { reason, .. } = action {
+            panic!("advancing status update was reported as {reason:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_height_hash_churn_is_status_spam() {
+    let network = Network::Mainnet;
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let status_peer = peer(59);
+    connect_peer(&fixture, status_peer.clone()).await;
+
+    advertise_tip_with_hash(
+        &fixture,
+        status_peer.clone(),
+        block::Height(0),
+        block::Height(1),
+        block::Hash([1; 32]),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    advertise_tip_with_hash(
+        &fixture,
+        status_peer.clone(),
+        block::Height(0),
+        block::Height(1),
+        block::Hash([2; 32]),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    loop {
+        if let HeaderSyncAction::Misbehavior { peer, reason } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(peer, status_peer);
+            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_height_hash_change_with_token_is_accepted() {
+    let network = Network::Mainnet;
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let status_peer = peer(60);
+    connect_peer(&fixture, status_peer.clone()).await;
+
+    advertise_tip_with_hash(
+        &fixture,
+        status_peer,
+        block::Height(0),
+        block::Height(0),
+        block::Hash([3; 32]),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if let HeaderSyncAction::Misbehavior { reason, .. } = action {
+            panic!("same-height status update with a token was reported as {reason:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_block_spam_does_not_poison_seen_cache() {
     let network = Network::Mainnet;
     let first_block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
@@ -3542,6 +3683,41 @@ async fn stateless_validation_rejects_wrong_solution_size_for_network() {
         validate_headers_stateless(vec![Arc::new(regtest_sized)], context).await,
         Err(HeaderSyncWireError::WrongEquihashSolutionSize)
     ));
+}
+
+#[test]
+fn regtest_header_validation_accepts_common_and_short_solution_sizes() {
+    let regtest = Network::new_regtest(Default::default());
+    let common_sized = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let mut short_sized = *common_sized;
+    short_sized.solution = Solution::Regtest([0; 36]);
+
+    validate_solution_sizes(std::slice::from_ref(&common_sized), &regtest)
+        .expect("regtest accepts Zebra-mined common-size solutions");
+    validate_solution_sizes(&[Arc::new(short_sized)], &regtest)
+        .expect("regtest accepts short regtest solutions");
+    assert!(matches!(
+        validate_solution_sizes(&[Arc::new(short_sized)], &Network::Mainnet),
+        Err(HeaderSyncWireError::WrongEquihashSolutionSize)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regtest_stateless_validation_skips_pow_filter() {
+    let regtest = Network::new_regtest(Default::default());
+    let mut header = *mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    header.difficulty_threshold =
+        CompactDifficulty::from_bytes_in_display_order(&[0x01, 0x01, 0x00, 0x00]).unwrap();
+    let context = HeaderSyncValidationContext {
+        network: &regtest,
+        now: Utc::now(),
+        start_height: block::Height(1),
+        decode_context: headers_context(1, DEFAULT_HS_RANGE),
+    };
+
+    validate_headers_stateless(vec![Arc::new(header)], context)
+        .await
+        .expect("regtest header sync leaves PoW enforcement to block verification");
 }
 
 #[tokio::test(flavor = "current_thread")]

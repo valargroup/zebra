@@ -79,6 +79,11 @@ impl Default for BlockSyncStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuraBlockSyncConfig {
+    /// Disable the legacy `ChainSync` body downloader on Zakura-enabled nodes.
+    ///
+    /// This leaves the legacy syncer available for non-Zakura nodes and as the
+    /// default-safe fallback when the gate is unset.
+    pub replace_legacy_syncer: bool,
     /// Maximum blocks this node advertises per `GetBlocks` response.
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
@@ -104,6 +109,7 @@ pub struct ZakuraBlockSyncConfig {
 impl Default for ZakuraBlockSyncConfig {
     fn default() -> Self {
         Self {
+            replace_legacy_syncer: false,
             max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
