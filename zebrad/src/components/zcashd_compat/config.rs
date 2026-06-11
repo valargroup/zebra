@@ -93,12 +93,15 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     pub restart_backoff: Duration,
 
+    /// Maximum delay between supervisor restart attempts.
+    ///
+    /// This caps exponential restart backoff while retries continue indefinitely.
+    #[serde(with = "humantime_serde")]
+    pub restart_backoff_max: Duration,
+
     /// Child uptime that resets the supervisor's consecutive restart count.
     #[serde(with = "humantime_serde")]
     pub restart_reset_after: Duration,
-
-    /// Maximum number of automatic restarts after unexpected exits.
-    pub max_restarts: u32,
 
     /// Grace period for a clean shutdown after sending SIGTERM.
     #[serde(with = "humantime_serde")]
@@ -124,8 +127,8 @@ impl Default for Config {
             cookie_file_name: default_cookie_file_name(),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
+            restart_backoff_max: Duration::from_secs(5 * 60),
             restart_reset_after: Duration::from_secs(60 * 60),
-            max_restarts: 10,
             shutdown_grace_period: Duration::from_secs(300),
         }
     }
@@ -218,6 +221,10 @@ mod tests {
             config.restart_reset_after,
             std::time::Duration::from_secs(60 * 60)
         );
+        assert_eq!(
+            config.restart_backoff_max,
+            std::time::Duration::from_secs(5 * 60)
+        );
     }
 
     #[test]
@@ -242,6 +249,21 @@ mod tests {
         assert_eq!(
             config.restart_reset_after,
             std::time::Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn deserialize_restart_backoff_max_duration() {
+        let config: Config = toml::from_str(
+            r#"
+            restart_backoff_max = "10m"
+            "#,
+        )
+        .expect("restart backoff cap duration should deserialize");
+
+        assert_eq!(
+            config.restart_backoff_max,
+            std::time::Duration::from_secs(10 * 60)
         );
     }
 

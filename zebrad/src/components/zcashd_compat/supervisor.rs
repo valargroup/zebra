@@ -44,10 +44,10 @@ pub struct SupervisorConfig {
     pub startup_delay: std::time::Duration,
     /// Restart backoff.
     pub restart_backoff: Duration,
+    /// Maximum restart backoff.
+    pub restart_backoff_max: Duration,
     /// Child uptime that resets the consecutive restart count.
     pub restart_reset_after: Duration,
-    /// Restart limit.
-    pub max_restarts: u32,
     /// Grace period after SIGTERM.
     pub shutdown_grace_period: Duration,
 }
@@ -79,8 +79,8 @@ impl SupervisorConfig {
             network,
             startup_delay: zcashd_compat.startup_delay,
             restart_backoff: zcashd_compat.restart_backoff,
+            restart_backoff_max: zcashd_compat.restart_backoff_max,
             restart_reset_after: zcashd_compat.restart_reset_after,
-            max_restarts: zcashd_compat.max_restarts,
             shutdown_grace_period: zcashd_compat.shutdown_grace_period,
         }
     }
@@ -133,12 +133,11 @@ impl SupervisorConfig {
 /// Runs the zcashd-compat zcashd supervisor until shutdown.
 ///
 /// The supervisor keeps restarting `zcashd` exits that happen before Zebra
-/// shutdown, up to `max_restarts`.
+/// shutdown, using capped exponential backoff.
 ///
 /// # Errors
 ///
-/// Returns an error if spawning `zcashd` fails, if shutdown handling fails, or
-/// if the restart limit is exceeded.
+/// Returns an error if spawning `zcashd` fails or if shutdown handling fails.
 pub async fn run(
     config: SupervisorConfig,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -196,21 +195,15 @@ pub async fn run(
                 warn!(
                     ?status,
                     restart_count = consecutive_restart_count,
-                    max_restarts = config.max_restarts,
                     child_uptime_secs = child_uptime.as_secs(),
                     "zcashd-compat zcashd child exited before shutdown, restarting"
                 );
 
-                if restart_budget_exhausted(consecutive_restart_count, config.max_restarts) {
-                    set_supervision_exhausted_metrics();
-                    return Err(eyre!(
-                        "zcashd-compat zcashd child exceeded restart limit: {}",
-                        config.max_restarts
-                    ));
-                }
-
-                let restart_delay =
-                    restart_backoff_delay(config.restart_backoff, consecutive_restart_count);
+                let restart_delay = restart_backoff_delay(
+                    config.restart_backoff,
+                    config.restart_backoff_max,
+                    consecutive_restart_count,
+                );
                 if wait_for_delay_or_shutdown(restart_delay, &mut shutdown_rx).await {
                     info!("zcashd-compat supervisor received shutdown during restart backoff");
                     set_supervision_inactive_metrics();
@@ -244,32 +237,25 @@ fn set_supervision_inactive_metrics() {
     metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
 }
 
-fn set_supervision_exhausted_metrics() {
-    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
-    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
-    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(1.0);
-}
-
 /// Returns `true` when a child ran long enough to make previous failures stale.
 fn should_reset_restart_count(child_uptime: Duration, restart_reset_after: Duration) -> bool {
     restart_reset_after != Duration::ZERO && child_uptime >= restart_reset_after
 }
 
-/// Returns `true` when this unexpected exit exceeds the configured restart budget.
-fn restart_budget_exhausted(restart_count: u32, max_restarts: u32) -> bool {
-    restart_count > max_restarts
-}
-
-/// Calculates exponential restart backoff from the base delay and consecutive exit count.
-fn restart_backoff_delay(base_delay: Duration, restart_count: u32) -> Duration {
+/// Calculates capped exponential restart backoff from the base delay and consecutive exit count.
+fn restart_backoff_delay(
+    base_delay: Duration,
+    max_delay: Duration,
+    restart_count: u32,
+) -> Duration {
     if base_delay == Duration::ZERO || restart_count <= 1 {
-        return base_delay;
+        return base_delay.min(max_delay);
     }
 
     let multiplier = 1u32
         .checked_shl(restart_count.saturating_sub(1))
         .unwrap_or(u32::MAX);
-    base_delay.saturating_mul(multiplier)
+    base_delay.saturating_mul(multiplier).min(max_delay)
 }
 
 /// Spawns `zcashd` with zcashd-compat arguments and connects child output streams.
@@ -559,8 +545,8 @@ mod tests {
     use zebra_chain::parameters::NetworkKind;
 
     use super::{
-        restart_backoff_delay, restart_budget_exhausted, should_reset_restart_count,
-        wait_for_delay_or_shutdown, SupervisorConfig,
+        restart_backoff_delay, should_reset_restart_count, wait_for_delay_or_shutdown,
+        SupervisorConfig,
     };
 
     #[test]
@@ -575,8 +561,8 @@ mod tests {
             network: NetworkKind::Regtest,
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
+            restart_backoff_max: Duration::from_secs(5 * 60),
             restart_reset_after: Duration::from_secs(60 * 60),
-            max_restarts: 3,
             shutdown_grace_period: Duration::from_secs(300),
         };
 
@@ -639,26 +625,34 @@ mod tests {
     }
 
     #[test]
-    fn restart_budget_allows_configured_number_of_restarts() {
-        assert!(!restart_budget_exhausted(10, 10));
-        assert!(restart_budget_exhausted(11, 10));
-    }
-
-    #[test]
     fn restart_backoff_is_exponential_from_base_delay() {
         let base_delay = Duration::from_secs(2);
+        let max_delay = Duration::from_secs(60);
 
-        assert_eq!(restart_backoff_delay(base_delay, 0), base_delay);
-        assert_eq!(restart_backoff_delay(base_delay, 1), base_delay);
-        assert_eq!(restart_backoff_delay(base_delay, 2), Duration::from_secs(4));
-        assert_eq!(restart_backoff_delay(base_delay, 3), Duration::from_secs(8));
+        assert_eq!(restart_backoff_delay(base_delay, max_delay, 0), base_delay);
+        assert_eq!(restart_backoff_delay(base_delay, max_delay, 1), base_delay);
+        assert_eq!(
+            restart_backoff_delay(base_delay, max_delay, 2),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            restart_backoff_delay(base_delay, max_delay, 3),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]
-    fn restart_backoff_saturates_for_large_restart_counts() {
-        let delay = restart_backoff_delay(Duration::MAX, u32::MAX);
+    fn restart_backoff_is_capped() {
+        let delay = restart_backoff_delay(Duration::from_secs(2), Duration::from_secs(10), 10);
 
-        assert_eq!(delay, Duration::MAX);
+        assert_eq!(delay, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn restart_backoff_caps_saturated_delay() {
+        let delay = restart_backoff_delay(Duration::MAX, Duration::from_secs(10), u32::MAX);
+
+        assert_eq!(delay, Duration::from_secs(10));
     }
 
     #[tokio::test]
