@@ -160,8 +160,26 @@ fn check_tcp_slow_start_after_idle() {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
-    /// Minimum response body size used in zcashd-compat mode to tolerate large batched block responses.
-    const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 100 * 1024 * 1024;
+    /// Minimum response body size used in zcashd-compat mode.
+    ///
+    /// zcashd defaults to a 128 MiB response budget. That allows a memory-clamped
+    /// batch of 33 raw blocks, whose worst-case response is 133,082,368 bytes.
+    /// jsonrpsee applies this limit to the whole JSON-RPC batch response.
+    const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 128 * 1024 * 1024;
+    /// zcashd's default sync batch size.
+    const ZCASHD_COMPAT_DEFAULT_SYNC_BATCH_SIZE: u64 = 30;
+    /// Default zcashd raw-block sync response budget.
+    const ZCASHD_COMPAT_DEFAULT_SYNC_RESPONSE_BUDGET_MB: u64 = 128;
+    /// MiB in bytes, matching zcashd's `-zebra-compat-sync-response-budget-mb`.
+    const ZCASHD_COMPAT_MIB: u64 = 1024 * 1024;
+    /// zcashd's consensus maximum serialized block size.
+    const ZCASHD_COMPAT_MAX_BLOCK_BYTES: u64 = 2_000_000;
+    /// zcashd's per-block JSON-RPC response overhead allowance.
+    const ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES: u64 = 1024;
+    /// zcashd's whole-batch JSON-RPC response margin.
+    const ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES: u64 = 1024 * 1024;
+    /// Conservative response budget needed per raw-block sync batch entry.
+    const ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK: u64 = 4 * 1024 * 1024;
     /// Default zcashd-compat RPC listen address when `--zcashd-compat` is enabled.
     fn zcashd_compat_default_rpc_listen_addr() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 28232))
@@ -184,6 +202,123 @@ impl StartCmd {
             .max_response_body_size
             .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
         compat_rpc_config
+    }
+
+    fn zcashd_compat_extra_arg_u64(
+        config: &ZebradConfig,
+        name: &str,
+    ) -> Result<Option<u64>, Report> {
+        let option_name = format!("-{name}=");
+        let long_option_name = format!("--{name}=");
+        let bare_option_name = format!("-{name}");
+        let bare_long_option_name = format!("--{name}");
+
+        config
+            .zcashd_compat
+            .zcashd_extra_args
+            .iter()
+            .filter_map(|arg| {
+                arg.strip_prefix(&option_name)
+                    .or_else(|| arg.strip_prefix(&long_option_name))
+                    .map(|value| (arg, Some(value)))
+                    .or_else(|| {
+                        (arg == &bare_option_name || arg == &bare_long_option_name)
+                            .then_some((arg, None))
+                    })
+            })
+            .map(|(arg, value)| {
+                let value = value.ok_or_else(|| {
+                    eyre!("zcashd_compat.zcashd_extra_args contains {arg:?} without a value")
+                })?;
+
+                value.parse::<u64>().map_err(|error| {
+                    eyre!(
+                        "zcashd_compat.zcashd_extra_args contains invalid {name} value {value:?}: {error}"
+                    )
+                })
+            })
+            .last()
+            .transpose()
+    }
+
+    fn validate_zcashd_compat_sync_batch_response_size(
+        config: &ZebradConfig,
+    ) -> Result<(), Report> {
+        let sync_batch_size =
+            Self::zcashd_compat_extra_arg_u64(config, "zebra-compat-sync-batch-size")?
+                .unwrap_or(Self::ZCASHD_COMPAT_DEFAULT_SYNC_BATCH_SIZE);
+        let sync_response_budget_mb =
+            Self::zcashd_compat_extra_arg_u64(config, "zebra-compat-sync-response-budget-mb")?
+                .unwrap_or(Self::ZCASHD_COMPAT_DEFAULT_SYNC_RESPONSE_BUDGET_MB)
+                .max(1);
+        let sync_response_budget_bytes = sync_response_budget_mb
+            .checked_mul(Self::ZCASHD_COMPAT_MIB)
+            .ok_or_else(|| {
+                eyre!(
+                    "zcashd-compat sync response budget {sync_response_budget_mb} MiB is too large"
+                )
+            })?;
+        let max_batch_size_for_response_budget =
+            if sync_response_budget_bytes <= Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES {
+                1
+            } else {
+                (sync_response_budget_bytes - Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES)
+                    / (2 * Self::ZCASHD_COMPAT_MAX_BLOCK_BYTES
+                        + Self::ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES)
+            }
+            .max(1);
+        let required_sync_response_budget_bytes =
+            Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES
+                .checked_add(
+                    sync_batch_size
+                        .checked_mul(
+                            2 * Self::ZCASHD_COMPAT_MAX_BLOCK_BYTES
+                                + Self::ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES,
+                        )
+                        .ok_or_else(|| {
+                            eyre!("zcashd-compat sync batch size {sync_batch_size} is too large")
+                        })?,
+                )
+                .ok_or_else(|| {
+                    eyre!("zcashd-compat sync batch size {sync_batch_size} is too large")
+                })?;
+        let required_sync_response_budget_mb =
+            (required_sync_response_budget_bytes + Self::ZCASHD_COMPAT_MIB - 1)
+                / Self::ZCASHD_COMPAT_MIB;
+        let required_max_response_body_size = sync_batch_size
+            .checked_mul(Self::ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK)
+            .ok_or_else(|| eyre!("zcashd-compat sync batch size {sync_batch_size} is too large"))?;
+        let required_max_response_body_size: usize = required_max_response_body_size
+            .try_into()
+            .map_err(|_| eyre!("zcashd-compat sync batch size {sync_batch_size} is too large"))?;
+        let effective_max_response_body_size = config
+            .rpc
+            .max_response_body_size
+            .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
+
+        let mut errors = Vec::new();
+        if sync_batch_size > max_batch_size_for_response_budget {
+            errors.push(format!(
+                "zcashd-compat sync batch size {sync_batch_size} requires \
+                 zcashd_compat.zcashd_extra_args to include \
+                 -zebra-compat-sync-response-budget-mb={required_sync_response_budget_mb} or higher; \
+                 configured effective value is {sync_response_budget_mb}"
+            ));
+        }
+
+        if effective_max_response_body_size < required_max_response_body_size {
+            errors.push(format!(
+                "zcashd-compat sync batch size {sync_batch_size} requires \
+                 rpc.max_response_body_size = {required_max_response_body_size} or higher; \
+                 configured effective value is {effective_max_response_body_size}"
+            ));
+        }
+
+        if !errors.is_empty() {
+            return Err(eyre!("{}", errors.join("\n")));
+        }
+
+        Ok(())
     }
 
     fn zcashd_compat_rpc_url(config: &ZebradConfig) -> Result<String, Report> {
@@ -406,6 +541,7 @@ impl StartCmd {
                 config.network.network.kind(),
                 Self::zcashd_compat_rpc_url(&config)?,
                 Self::zcashd_compat_cookie_path(&config),
+                Self::zcashd_compat_rpc_config(&config).max_response_body_size,
             );
 
             info!(
@@ -859,6 +995,9 @@ impl config::Override<ZebradConfig> for StartCmd {
                 }
             }
 
+            Self::validate_zcashd_compat_sync_batch_response_size(&config)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+
             if config.zcashd_compat.manage_zcashd {
                 match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
                     Ok(zcashd_compat::ZcashdBinarySource::Path(path))
@@ -1012,6 +1151,98 @@ mod tests {
         assert_eq!(
             compat_rpc_config.max_response_body_size,
             StartCmd::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_large_sync_batch_without_matching_rpc_response_size() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.zcashd_extra_args =
+            vec!["-zebra-compat-sync-batch-size=80".to_string()];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("large zcashd sync batches should require a matching RPC response limit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("rpc.max_response_body_size = 335544320"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_large_sync_batch_with_matching_rpc_response_size() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.zcashd_extra_args = vec![
+            "-zebra-compat-sync-batch-size=80".to_string(),
+            "-zebra-compat-sync-response-budget-mb=320".to_string(),
+        ];
+        config.rpc.max_response_body_size = 320 * 1024 * 1024;
+
+        cmd.override_config(config)
+            .expect("large zcashd sync batches should allow a matching RPC response limit");
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_large_sync_batch_without_matching_zcashd_response_budget() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.zcashd_extra_args =
+            vec!["-zebra-compat-sync-batch-size=80".to_string()];
+        config.rpc.max_response_body_size = 320 * 1024 * 1024;
+
+        let error = cmd.override_config(config).expect_err(
+            "large zcashd sync batches should require a matching zcashd response budget",
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("-zebra-compat-sync-response-budget-mb=307"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_invalid_sync_batch_size() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.zcashd_extra_args =
+            vec!["-zebra-compat-sync-batch-size=eighty".to_string()];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("invalid zcashd sync batch sizes should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid zebra-compat-sync-batch-size value"),
+            "unexpected error: {error}"
         );
     }
 

@@ -17,7 +17,10 @@ Zebra:
 - enables zcashd-compat mode (`[zcashd_compat].enabled = true`);
 - ensures a dedicated zcashd-compat RPC listen address is configured (defaults to `127.0.0.1:28232`);
 - uses dedicated cookie auth at `zcashd_compat.cookie_dir/zcashd_compat.cookie_file_name`;
-- raises the zcashd-compat RPC `max_response_body_size` if needed for large batched block responses;
+- raises the zcashd-compat RPC `max_response_body_size` to at least `128` MiB
+  for large batched block responses;
+- validates coordinated zcashd batch-size, zcashd response-budget, and Zebra
+  response-body settings before startup;
 - optionally spawns and supervises `zcashd -zebra-compat`.
 
 If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
@@ -26,6 +29,7 @@ If zcashd-compat supervision is enabled, Zebra starts `zcashd` with:
 -zebra-compat
 -zebra-compat-url=<rpc_url>
 -zebra-compat-cookiefile=<zcashd_compat.cookie_dir>/<zcashd_compat.cookie_file_name>
+-zebra-compat-zebra-rpc-max-response-body-bytes=<effective Zebra compat RPC limit>
 -datadir=<zcashd_compat.zcashd_datadir or state.cache_dir/zcashd-compat-zcashd>
 [-testnet | -regtest]
 -p2p=0
@@ -245,6 +249,59 @@ does not spawn `zcashd`.
 The standard `[rpc]` listener remains independent. zcashd-compat uses a separate
 listener and separate cookie auth so operators can keep user-facing Zebra RPC
 and zcashd backend RPC isolated.
+
+## Sync batch size and response limits
+
+Three settings must agree when increasing zebra-compat sync depth:
+
+- `-zebra-compat-sync-batch-size=<blocks>`: how many raw blocks zcashd asks
+  Zebra for in one JSON-RPC batch. zcashd defaults to `30`.
+- `-zebra-compat-sync-response-budget-mb=<MiB>`: zcashd's memory budget for one
+  batched raw-block response. zcashd defaults to `128` MiB, which allows a
+  memory-clamped maximum batch of `33` blocks.
+- `[rpc].max_response_body_size`: Zebra's HTTP response-body limit. Zebra floors
+  the zcashd-compat listener to at least `128` MiB, and jsonrpsee applies this
+  limit to the whole JSON-RPC batch response.
+
+Zebra fails startup if these settings are inconsistent in `zcashd_compat`
+configuration. For example, if `zcashd_extra_args` requests
+`-zebra-compat-sync-batch-size=80`, Zebra reports the missing or undersized
+settings needed to make that batch valid.
+
+For supervised zcashd, configure the zcashd-side batch and response budget in
+`zcashd_extra_args`; Zebra passes its effective response limit to zcashd
+automatically using
+`-zebra-compat-zebra-rpc-max-response-body-bytes=<bytes>`. For example, an
+80-block batch uses a round `320` MiB budget:
+
+```toml
+[rpc]
+max_response_body_size = 335544320
+
+[zcashd_compat]
+zcashd_extra_args = [
+  "-zebra-compat-sync-batch-size=80",
+  "-zebra-compat-sync-response-budget-mb=320",
+]
+```
+
+If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails and
+validates any zcashd batch/budget flags present in `zcashd_extra_args`, but it
+does not start zcashd and cannot pass command-line flags to it. Keep
+`[rpc].max_response_body_size` configured in Zebra, and pass the zcashd-side
+values explicitly to the external process:
+
+```console
+zcashd -zebra-compat \
+  -zebra-compat-sync-batch-size=80 \
+  -zebra-compat-sync-response-budget-mb=320 \
+  -zebra-compat-zebra-rpc-max-response-body-bytes=335544320 \
+  -zebra-compat-url=http://127.0.0.1:8232 \
+  -zebra-compat-cookiefile=/path/to/zebra/.cookie
+```
+
+See zcashd's `doc/zebra-compat.md` for the full batch-size and reorg-depth
+arithmetic.
 
 If `manage_zcashd = true`, Zebra resolves `zcashd` as follows:
 
