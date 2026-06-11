@@ -47,17 +47,18 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        direct_endpoint_builder, drive_header_sync_actions, spawn_header_sync_reactor, Clock,
-        Frame, FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
-        Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
-        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraControlAck, ZakuraControlHello,
-        ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraUpgradeOutcome,
-        CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES,
-        LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
+        direct_endpoint_builder, drive_header_sync_actions, spawn_header_sync_reactor,
+        BlockSyncService, Clock, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+        HeaderSyncFrontiers, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
+        Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
+        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
+        MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC,
         ZAKURA_STREAM_HEADER_SYNC,
     },
 };
@@ -1039,6 +1040,9 @@ pub(crate) fn service_registry(
         services
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
     }
+    services.push(
+        Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default())) as Arc<dyn Service>,
+    );
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
@@ -3293,6 +3297,7 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         LEGACY_REQUEST_STREAM_KIND => "legacy_request",
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
+        ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
         _ => "unknown",
     }
 }
@@ -3305,6 +3310,7 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
                     .expect("header-sync frame cap fits in u32");
             limits.max_frame_bytes.min(header_sync_cap)
         }
+        ZAKURA_STREAM_BLOCK_SYNC => limits.max_frame_bytes.min(MAX_BS_FRAME_BYTES),
         _ => limits.max_frame_bytes.min(LOCAL_MAX_CONTROL_FRAME_BYTES),
     }
     .max(1)
@@ -4599,6 +4605,13 @@ mod tests {
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
                 },
+                Stream {
+                    kind: ZAKURA_STREAM_BLOCK_SYNC,
+                    version: ZAKURA_STREAM_VERSION_1,
+                    frame_cap: MAX_BS_FRAME_BYTES,
+                    capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
+                    mode: StreamMode::Ordered,
+                },
             ],
         }) as Arc<dyn Service>])
         .expect("test registry declares unique stream kinds");
@@ -4608,6 +4621,7 @@ mod tests {
             LEGACY_REQUEST_STREAM_KIND,
             DISCOVERY_STREAM_KIND,
             HEADER_SYNC_STREAM_KIND,
+            ZAKURA_STREAM_BLOCK_SYNC,
         ] {
             assert!(
                 is_supported_stream(&registry, kind, ZAKURA_STREAM_VERSION_1),
@@ -4627,15 +4641,16 @@ mod tests {
         assert_eq!(stream_kind_label(3), "legacy_request");
         assert_eq!(stream_kind_label(4), "discovery");
         assert_eq!(stream_kind_label(5), "header_sync");
+        assert_eq!(stream_kind_label(6), "block_sync");
 
-        for kind in [0u16, 1, 6, 7, 255, u16::MAX] {
+        for kind in [0u16, 1, 7, 255, u16::MAX] {
             assert!(
                 !is_supported_stream(&registry, kind, ZAKURA_STREAM_VERSION_1),
                 "unknown kind {kind} must be rejected even at version 1"
             );
         }
 
-        for kind in [6u16, 7, 255, u16::MAX] {
+        for kind in [7u16, 255, u16::MAX] {
             assert_eq!(stream_kind_label(kind), "unknown");
         }
     }
