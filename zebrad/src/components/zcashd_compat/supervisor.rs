@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use zebra_chain::parameters::NetworkKind;
 
-use super::Config;
+use super::{effective_zcashd_datadir, ensure_zcashd_datadir, Config};
 
 /// The full configuration used by the zcashd-compat supervisor task.
 #[derive(Clone, Debug)]
@@ -55,10 +55,7 @@ impl SupervisorConfig {
     ) -> Self {
         Self {
             zcashd_path,
-            zcashd_datadir: zcashd_compat
-                .zcashd_datadir
-                .clone()
-                .unwrap_or_else(|| state_cache_dir.join("zcashd-compat-zcashd")),
+            zcashd_datadir: effective_zcashd_datadir(zcashd_compat, state_cache_dir),
             rpc_url,
             cookie_path,
             extra_args: zcashd_compat.zcashd_extra_args.clone(),
@@ -123,6 +120,8 @@ pub async fn run(
     config: SupervisorConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Report> {
+    ensure_zcashd_datadir(&config.zcashd_datadir, &config.extra_args)?;
+
     if wait_for_delay_or_shutdown(config.startup_delay, &mut shutdown_rx).await {
         info!("zcashd-compat supervisor received shutdown during startup delay");
         return Ok(());
@@ -495,7 +494,10 @@ mod tests {
         assert!(args.contains(&"-printtoconsole".to_string()));
         assert!(args.contains(&"-debug=1".to_string()));
 
-        let p2p_idx = args.iter().position(|a| a == "-p2p=0").expect("p2p override present");
+        let p2p_idx = args
+            .iter()
+            .position(|a| a == "-p2p=0")
+            .expect("p2p override present");
         let listen_idx = args
             .iter()
             .position(|a| a == "-listen=0")
