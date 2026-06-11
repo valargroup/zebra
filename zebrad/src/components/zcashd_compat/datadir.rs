@@ -1,4 +1,12 @@
 //! `zcashd` datadir and config-file bootstrap for zcashd-compat mode.
+//!
+//! Spec:
+//! - Zebra may create the supervised `zcashd` datadir and a first-start config.
+//! - Zebra must never overwrite an operator-provided config file.
+//! - Existing configs are audited for known zcashd-compat startup issues, then
+//!   left unchanged.
+//! - Missing configs are bootstrapped with the deprecation acknowledgement so
+//!   `zcashd -zebra-compat` can start without manual first-run setup.
 
 use std::{
     fs::{self, OpenOptions},
@@ -67,6 +75,8 @@ pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<()
         )
     })?;
 
+    // Spec: once a config path exists, it is operator-owned. We only inspect it
+    // and warn about known zcashd-compat issues.
     match fs::metadata(&conf_path) {
         Ok(_) => {
             audit_zcash_conf(&conf_path)?;
@@ -89,6 +99,10 @@ pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<()
     }
 }
 
+/// Writes the bootstrap config without clobbering an operator-created file.
+///
+/// Returns `Ok(true)` when this process created `conf_path`, and `Ok(false)`
+/// when another process created it first.
 fn write_bootstrap_zcash_conf(conf_path: &Path) -> Result<bool, Report> {
     let parent = conf_path.parent().ok_or_else(|| {
         eyre!(
@@ -128,10 +142,15 @@ fn write_bootstrap_zcash_conf(conf_path: &Path) -> Result<bool, Report> {
     })();
 
     if let Err(error) = write_result {
+        // Spec: a failed bootstrap write must not leave a partial `zcash.conf`
+        // that later runs mistake for an operator config.
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
 
+    // Spec: publish the fully-written temp file with no-overwrite semantics.
+    // `hard_link` fails with AlreadyExists if an operator or competing Zebra
+    // process won the race to create the config.
     match fs::hard_link(&temp_path, conf_path) {
         Ok(()) => {
             fs::remove_file(&temp_path).wrap_err_with(|| {
@@ -166,6 +185,8 @@ fn unique_temp_conf_path(parent: &Path) -> PathBuf {
     parent.join(format!(".zcash.conf.tmp.{}.{}", std::process::id(), nanos))
 }
 
+/// Resolves zcashd's effective config path using the same `-conf` rule shape:
+/// relative config paths are anchored under the selected datadir.
 fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     let conf_path = find_conf_arg(extra_args)
         .map(PathBuf::from)
@@ -178,6 +199,7 @@ fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     }
 }
 
+/// Extracts the first `-conf` value supported by Zebra's extra args.
 fn find_conf_arg(extra_args: &[String]) -> Option<&str> {
     let mut args = extra_args.iter().map(String::as_str).peekable();
 
@@ -197,6 +219,11 @@ fn find_conf_arg(extra_args: &[String]) -> Option<&str> {
     None
 }
 
+/// Audits existing configs without modifying them.
+///
+/// Spec: warnings are intentionally non-fatal here. Some options are forced off
+/// by supervisor CLI args, and others are left for zcashd startup validation to
+/// reject with its native error message.
 fn audit_zcash_conf(conf_path: &Path) -> Result<(), Report> {
     let contents = fs::read_to_string(conf_path)
         .wrap_err_with(|| format!("failed to read zcashd config {}", conf_path.display()))?;
