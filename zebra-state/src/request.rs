@@ -1325,6 +1325,16 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns contiguous committed blocks by height, in ascending order.
+    ///
+    /// The response stops before the first height without a committed body.
+    BlocksByHeightRange {
+        /// First height to read.
+        start: block::Height,
+        /// Maximum number of blocks to return.
+        count: u32,
+    },
+
     /// Looks up a Sapling note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -1493,6 +1503,7 @@ impl ReadRequest {
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
+            ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
             ReadRequest::SaplingSubtrees { .. } => "sapling_subtrees",

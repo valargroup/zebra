@@ -1681,6 +1681,24 @@ impl Service<ReadRequest> for ReadStateService {
                 read::block_size_hints(state.latest_best_chain(), &state.db, from, count),
             )),
 
+            ReadRequest::BlocksByHeightRange { start, count } => {
+                let best_chain = state.latest_best_chain();
+                let blocks = (0..count)
+                    .map_while(|offset| {
+                        start
+                            .0
+                            .checked_add(offset)
+                            .map(block::Height)
+                            .and_then(|height| {
+                                read::block_and_size(best_chain.clone(), &state.db, height.into())
+                                    .map(|(block, size)| (height, block, size))
+                            })
+                    })
+                    .collect();
+
+                Ok(ReadResponse::Blocks(blocks))
+            }
+
             ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
                 read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
             )),

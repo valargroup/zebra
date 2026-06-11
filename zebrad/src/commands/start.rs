@@ -572,6 +572,64 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
+            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                match tokio::time::timeout(
+                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                    read_state
+                        .clone()
+                        .oneshot(zebra_state::ReadRequest::BlocksByHeightRange { start, count }),
+                )
+                .await
+                {
+                    Ok(Ok(zebra_state::ReadResponse::Blocks(blocks))) => {
+                        let _ = block_sync
+                            .send(BlockSyncEvent::BlockRangeResponseReady {
+                                peer,
+                                start_height: start,
+                                requested_count: count,
+                                blocks,
+                            })
+                            .await;
+                    }
+                    Ok(Ok(response)) => {
+                        warn!(?peer, ?response, "unexpected BlocksByHeightRange response");
+                        let _ = block_sync
+                            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                                peer,
+                                start_height: start,
+                                requested_count: count,
+                                returned_count: 0,
+                            })
+                            .await;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(
+                            ?peer,
+                            ?error,
+                            "failed to read Zakura Blocks response from state"
+                        );
+                        let _ = block_sync
+                            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                                peer,
+                                start_height: start,
+                                requested_count: count,
+                                returned_count: 0,
+                            })
+                            .await;
+                    }
+                    Err(_elapsed) => {
+                        warn!(?peer, "timed out reading Zakura block-sync serving range");
+                        let _ = block_sync
+                            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                                peer,
+                                start_height: start,
+                                requested_count: count,
+                                returned_count: 0,
+                            })
+                            .await;
+                    }
+                }
+            }
             BlockSyncAction::SubmitBlock { block } => {
                 commit_block_sync_body(
                     block_verifier.clone(),
@@ -591,7 +649,6 @@ fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bool {
         BlockSyncMisbehavior::MalformedMessage
             | BlockSyncMisbehavior::UnsolicitedBlock
             | BlockSyncMisbehavior::GetBlocksTooLong
-            | BlockSyncMisbehavior::GetBlocksSpam
             | BlockSyncMisbehavior::InvalidBlock
             | BlockSyncMisbehavior::InvalidStatus
             | BlockSyncMisbehavior::UnsolicitedDone
@@ -2295,6 +2352,9 @@ mod zakura_header_sync_driver_tests {
         ));
         assert!(!block_sync_misbehavior_is_hard(
             BlockSyncMisbehavior::RangeUnavailable
+        ));
+        assert!(!block_sync_misbehavior_is_hard(
+            BlockSyncMisbehavior::GetBlocksSpam
         ));
         assert!(block_sync_misbehavior_is_hard(
             BlockSyncMisbehavior::InvalidBlock

@@ -393,6 +393,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BlockSizeHints`].
     BlockSizeHints(Vec<(block::Height, Option<u32>)>),
 
+    /// Response to [`ReadRequest::BlocksByHeightRange`].
+    Blocks(Vec<(block::Height, Arc<Block>, usize)>),
+
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
@@ -569,6 +572,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::BlockSizeHints(_)
+            | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
                 Err("there is no corresponding Response for this ReadResponse")

@@ -313,6 +313,21 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     assert_eq!(
         read_state
             .clone()
+            .oneshot(ReadRequest::BlocksByHeightRange {
+                start: Height(0),
+                count: 3,
+            })
+            .await?,
+        ReadResponse::Blocks(vec![(
+            Height(0),
+            genesis.clone(),
+            genesis.zcash_serialize_to_vec()?.len(),
+        )]),
+    );
+
+    assert_eq!(
+        read_state
+            .clone()
             .oneshot(ReadRequest::BlockSizeHints {
                 from: Height(0),
                 count: 1,
@@ -418,6 +433,17 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             (Height(2), block2_hash, block2.header.clone()),
         ]),
     );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::BlocksByHeightRange {
+                start: Height(1),
+                count: 2,
+            })
+            .await?,
+        ReadResponse::Blocks(Vec::new()),
+    );
+
     assert_eq!(
         read_state
             .clone()

@@ -73,6 +73,7 @@ pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
+    pub(super) status: watch::Receiver<BlockSyncStatus>,
 }
 
 impl BlockSyncHandle {
@@ -106,6 +107,16 @@ impl BlockSyncHandle {
     pub fn peer_snapshot(&self) -> ServicePeerSnapshot {
         *self.peers.borrow()
     }
+
+    /// Subscribe to local block-sync status advertisements.
+    pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
+        self.status.clone()
+    }
+
+    /// Return the currently cached local status advertisement.
+    pub fn local_status(&self) -> BlockSyncStatus {
+        *self.status.borrow()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +124,8 @@ pub(super) struct BlockSyncState {
     pub(super) finalized_height: block::Height,
     pub(super) verified_block_tip: block::Height,
     pub(super) verified_block_hash: block::Hash,
+    pub(super) servable_high: block::Height,
+    pub(super) servable_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
@@ -120,14 +133,28 @@ pub(super) struct BlockSyncState {
     pub(super) schedule: BlockRangeScheduler,
     pub(super) reorder: ReorderBuffer,
     pub(super) budget: ByteBudget,
+    pub(super) status_refresh: RateMeter,
+    pub(super) pending_status_refresh: bool,
+    pub(super) last_advertised_status: BlockSyncStatus,
 }
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
+        let last_advertised_status = BlockSyncStatus {
+            servable_low: block::Height::MIN,
+            servable_high: startup.frontiers.verified_block_tip,
+            tip_hash: startup.frontiers.verified_block_hash,
+            max_blocks_per_response: startup.config.advertised_max_blocks_per_response(),
+            max_inflight_requests: startup.config.advertised_max_inflight_requests(),
+            max_response_bytes: startup.config.advertised_max_response_bytes(),
+        };
+
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_tip: startup.frontiers.verified_block_tip,
             verified_block_hash: startup.frontiers.verified_block_hash,
+            servable_high: startup.frontiers.verified_block_tip,
+            servable_hash: startup.frontiers.verified_block_hash,
             best_header_tip: startup.best_header_tip.0,
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
@@ -135,6 +162,9 @@ impl BlockSyncState {
             schedule: BlockRangeScheduler::new(startup.config.fanout),
             reorder: ReorderBuffer::new(),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
+            status_refresh: RateMeter::new(startup.config.status_refresh_interval),
+            pending_status_refresh: false,
+            last_advertised_status,
         }
     }
 
@@ -165,6 +195,8 @@ pub(super) struct PeerBlockState {
     pub(super) received_status: bool,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
     pub(super) inbound_status: RateMeter,
+    pub(super) unsolicited: RateMeter,
+    pub(super) served_blocks_inflight: u16,
     pub(super) misbehavior: u32,
 }
 
@@ -183,6 +215,8 @@ impl PeerBlockState {
             inbound_status: RateMeter::new(
                 config.status_refresh_interval.min(Duration::from_secs(1)),
             ),
+            unsolicited: RateMeter::new(config.status_refresh_interval),
+            served_blocks_inflight: 0,
             misbehavior: 0,
         }
     }
@@ -197,6 +231,18 @@ impl PeerBlockState {
         self.outstanding
             .iter()
             .position(|outstanding| outstanding.request.contains(height))
+    }
+
+    pub(super) fn try_start_serving_blocks(&mut self, local_inflight_cap: u16) -> bool {
+        if self.served_blocks_inflight >= local_inflight_cap {
+            return false;
+        }
+        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
+        true
+    }
+
+    pub(super) fn finish_serving_blocks(&mut self) {
+        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
     }
 }
 

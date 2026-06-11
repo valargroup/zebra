@@ -47,6 +47,28 @@ pub enum BlockSyncEvent {
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
+    /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
+    BlockRangeResponseFinished {
+        /// Peer whose served-response slot can be released.
+        peer: ZakuraPeerId,
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested block count.
+        requested_count: u32,
+        /// Number of blocks read from state and sent in the response.
+        returned_count: u32,
+    },
+    /// State returned committed bodies requested by a peer and the reactor should send them.
+    BlockRangeResponseReady {
+        /// Peer whose inbound request is being served.
+        peer: ZakuraPeerId,
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested block count.
+        requested_count: u32,
+        /// Bounded committed blocks returned by state.
+        blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    },
 }
 
 /// Actions emitted by the future block-sync reactor for the service seam.
@@ -65,6 +87,15 @@ pub enum BlockSyncAction {
         verified_block_tip: block::Height,
         /// Current best header target.
         best_header_tip: block::Height,
+    },
+    /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
+    QueryBlocksByHeightRange {
+        /// Peer that requested the range.
+        peer: ZakuraPeerId,
+        /// First height.
+        start: block::Height,
+        /// Maximum count.
+        count: u32,
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
