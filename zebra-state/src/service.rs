@@ -90,7 +90,7 @@ pub use self::traits::{ReadState, State};
 /// A read-write service for Zebra's cached blockchain state.
 ///
 /// This service modifies and provides access to:
-/// - the non-finalized state: the ~100 most recent blocks.
+/// - the non-finalized state: the ~1000 most recent blocks.
 ///   Zebra allows chain forks in the non-finalized state,
 ///   stores it in memory, and re-downloads it when restarted.
 /// - the finalized state: older blocks that have many confirmations.
@@ -192,7 +192,7 @@ pub(crate) struct StateService {
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
 /// This service provides read-only access to:
-/// - the non-finalized state: the ~100 most recent blocks.
+/// - the non-finalized state: the ~1000 most recent blocks.
 /// - the finalized state: older blocks that have many confirmations.
 ///
 /// Requests to this service are processed in parallel,

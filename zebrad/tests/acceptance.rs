@@ -3898,7 +3898,7 @@ async fn nu7_nsm_transactions() -> Result<()> {
 }
 
 /// Checks that the cached finalized state has the spending transaction ids for every
-/// spent outpoint and revealed nullifier in the last 100 blocks of a cached state.
+/// spent outpoint and revealed nullifier across the cached state's rollback window.
 //
 // Note: This test is meant to be run locally with a prepared finalized state that
 //       has spending transaction ids. This can be done by starting Zebra with the
@@ -3928,7 +3928,13 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
     tracing::info!("loading blocks for non-finalized state");
 
-    let non_finalized_blocks = future_blocks(&network, test_type, test_name, 100).await?;
+    let non_finalized_blocks = future_blocks(
+        &network,
+        test_type,
+        test_name,
+        zebra_state::MAX_BLOCK_REORG_HEIGHT,
+    )
+    .await?;
 
     let (mut state, mut read_state, latest_chain_tip, _chain_tip_change) =
         common::cached_state::start_state_service_with_cache_dir(&Mainnet, zebrad_state_path)
@@ -3958,9 +3964,8 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
     tracing::info!("checking indexes of spending transaction ids");
 
-    // Read the last 500 blocks - should be greater than the MAX_BLOCK_REORG_HEIGHT so that
-    // both the finalized and non-finalized state are checked.
-    let num_blocks_to_check = 500;
+    // Read past MAX_BLOCK_REORG_HEIGHT so that both the finalized and non-finalized state are checked.
+    let num_blocks_to_check = zebra_state::MAX_BLOCK_REORG_HEIGHT.saturating_add(1);
     let mut is_failure = false;
     for i in 0..num_blocks_to_check {
         let ReadResponse::Block(block) = read_state

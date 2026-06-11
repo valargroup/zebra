@@ -24,17 +24,34 @@ use structopt::StructOpt;
 use zebra_chain::{
     block::{self, Block, Height, HeightDiff, TryIntoHeight},
     serialization::ZcashDeserializeInto,
-    transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
 use zebra_node_services::{
     constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP},
     rpc_client::RpcRequestClient,
 };
+use zebra_state::MAX_BLOCK_REORG_HEIGHT;
 use zebra_utils::init_tracing;
 
 pub mod args;
 
 use args::{Args, Backend, Transport};
+
+/// The number of blocks below the chain tip that checkpoint generation skips.
+///
+/// A checkpoint is an irreversible commitment, so it must never fall inside the
+/// node's rollback window: a reorg the node *would* follow (up to
+/// [`MAX_BLOCK_REORG_HEIGHT`]) could otherwise orphan a checkpoint we ship and
+/// pin fresh nodes to a losing branch. So this margin must be at least the
+/// rollback window.
+const CHECKPOINT_SETTLEMENT_MARGIN: u32 = MAX_BLOCK_REORG_HEIGHT;
+
+// Enforced at compile time: shipped checkpoints must never fall inside the
+// node's rollback window. If a future change lowers this margin below the
+// rollback policy, the build fails here.
+const _: () = assert!(
+    CHECKPOINT_SETTLEMENT_MARGIN >= MAX_BLOCK_REORG_HEIGHT,
+    "checkpoint settlement margin must be at least the node's MAX_BLOCK_REORG_HEIGHT rollback window",
+);
 
 /// Make an RPC call based on `our_args` and `rpc_command`, and return the response as a [`Value`].
 async fn rpc_output<M, I>(our_args: &Args, method: M, params: I) -> Result<Value>
@@ -162,14 +179,16 @@ async fn main() -> Result<()> {
         .try_into_height()
         .expect("height: unexpected invalid value, missing field, or field type");
 
-    // Checkpoints must be on the main chain, so we skip blocks that are within the
-    // Zcash reorg limit.
-    let height_limit = height_limit - HeightDiff::from(MIN_TRANSPARENT_COINBASE_MATURITY);
+    // Checkpoints are an irreversible commitment, so we skip the blocks within
+    // the rollback window (`CHECKPOINT_SETTLEMENT_MARGIN`), keeping the
+    // settlement margin consistent with the node's rollback policy so a reorg
+    // the node would follow cannot orphan a checkpoint we ship.
+    let height_limit = height_limit - HeightDiff::from(CHECKPOINT_SETTLEMENT_MARGIN);
     let height_limit = height_limit
         .ok_or_else(|| {
             eyre!(
                 "checkpoint generation needs at least {:?} blocks",
-                MIN_TRANSPARENT_COINBASE_MATURITY
+                CHECKPOINT_SETTLEMENT_MARGIN
             )
         })
         .with_suggestion(|| "Hint: wait for the node to sync more blocks")?;

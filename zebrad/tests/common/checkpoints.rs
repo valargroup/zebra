@@ -16,11 +16,10 @@ use tempfile::TempDir;
 use zebra_chain::{
     block::{Height, HeightDiff, TryIntoHeight},
     parameters::Network,
-    transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
 use zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP;
 use zebra_node_services::rpc_client::RpcRequestClient;
-use zebra_state::state_database_format_version_in_code;
+use zebra_state::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 use zebra_test::{
     args,
     command::{Arguments, TestDirExt, NO_MATCHES_REGEX_ITER},
@@ -400,7 +399,7 @@ pub fn wait_for_zebra_checkpoints_generation<
     test_type: TestType,
     show_zebrad_logs: bool,
 ) -> Result<(TestChild<TempDir>, TestChild<P>)> {
-    let last_checkpoint_gap = HeightDiff::from(MIN_TRANSPARENT_COINBASE_MATURITY)
+    let last_checkpoint_gap = HeightDiff::from(MAX_BLOCK_REORG_HEIGHT)
         + HeightDiff::try_from(MAX_CHECKPOINT_HEIGHT_GAP).expect("constant fits in HeightDiff");
     let expected_final_checkpoint_height =
         (zebra_tip_height - last_checkpoint_gap).expect("network tip is high enough");

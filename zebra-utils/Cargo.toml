@@ -40,6 +40,7 @@ default = []
 zebra-checkpoints = [
     "itertools",
     "tokio",
+    "zebra-state",
     "zebra-chain/json-conversion",
     "zebra-node-services/rpc-client"
 ]
@@ -68,6 +69,10 @@ zebra-rpc = { path = "../zebra-rpc", version = "10.0.0" }
 
 # These crates are needed for the zebra-checkpoints binary
 itertools = { workspace = true, optional = true }
+# zebra-checkpoints uses the rollback window (`MAX_BLOCK_REORG_HEIGHT`) as its
+# checkpoint settlement margin. zebra-state is already in the dependency tree via
+# zebra-rpc, so this adds no extra build cost.
+zebra-state = { path = "../zebra-state", version = "9.0.0", optional = true }
 
 # These crates are needed for the search-issue-refs binary
 regex = { workspace = true, optional = true }
