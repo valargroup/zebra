@@ -41,6 +41,10 @@ pub enum BlockSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(BlockSyncFrontiers),
+    /// State grew the verified body chain tip.
+    ChainTipGrow(BlockSyncFrontiers),
+    /// State reset the verified body chain tip after a rollback or best-chain switch.
+    ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
 }

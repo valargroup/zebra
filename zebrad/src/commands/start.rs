@@ -1031,12 +1031,13 @@ async fn mirror_zakura_full_block_commits<ReadState>(
             ))
             .await;
         if let Some(block_sync) = &block_sync {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height,
+                verified_block_tip: height,
+                verified_block_hash: hash,
+            };
             let _ = block_sync
-                .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-                    finalized_height,
-                    verified_block_tip: height,
-                    verified_block_hash: hash,
-                }))
+                .send(block_sync_chain_tip_event(&action, frontiers))
                 .await;
         }
 
@@ -1064,6 +1065,16 @@ async fn mirror_zakura_full_block_commits<ReadState>(
             Ok(response) => warn!(?response, "unexpected block lookup response"),
             Err(error) => warn!(?error, "failed to mirror Zakura full-block commit"),
         }
+    }
+}
+
+fn block_sync_chain_tip_event(
+    action: &zebra_state::TipAction,
+    frontiers: BlockSyncFrontiers,
+) -> BlockSyncEvent {
+    match action {
+        zebra_state::TipAction::Grow { .. } => BlockSyncEvent::ChainTipGrow(frontiers),
+        zebra_state::TipAction::Reset { .. } => BlockSyncEvent::ChainTipReset(frontiers),
     }
 }
 
@@ -2287,6 +2298,43 @@ mod zakura_header_sync_driver_tests {
         ));
         assert!(block_sync_misbehavior_is_hard(
             BlockSyncMisbehavior::InvalidBlock
+        ));
+    }
+
+    #[test]
+    fn block_sync_chain_tip_action_mapping_preserves_reset_vs_grow() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([1; 32]),
+        };
+        let tip_block = zebra_state::ChainTipBlock {
+            hash: block::Hash([1; 32]),
+            height: block::Height(1),
+            time: chrono::Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::<[zebra_chain::transaction::Hash]>::from([]),
+            previous_block_hash: block::Hash([0; 32]),
+        };
+
+        assert!(matches!(
+            block_sync_chain_tip_event(
+                &zebra_state::TipAction::Grow {
+                    block: tip_block.clone()
+                },
+                frontiers
+            ),
+            BlockSyncEvent::ChainTipGrow(mapped) if mapped == frontiers
+        ));
+        assert!(matches!(
+            block_sync_chain_tip_event(
+                &zebra_state::TipAction::Reset {
+                    height: block::Height(1),
+                    hash: block::Hash([1; 32]),
+                },
+                frontiers
+            ),
+            BlockSyncEvent::ChainTipReset(mapped) if mapped == frontiers
         ));
     }
 

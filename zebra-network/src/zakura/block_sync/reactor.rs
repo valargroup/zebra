@@ -90,6 +90,12 @@ impl BlockSyncReactor {
             BlockSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await
             }
+            BlockSyncEvent::ChainTipGrow(frontiers) => {
+                self.handle_state_frontiers_changed(frontiers).await
+            }
+            BlockSyncEvent::ChainTipReset(frontiers) => {
+                self.handle_chain_tip_reset(frontiers).await
+            }
             BlockSyncEvent::NeededBlocks(blocks) => {
                 self.handle_needed_blocks(blocks).await;
             }
@@ -173,7 +179,10 @@ impl BlockSyncReactor {
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
-        self.query_needed_blocks().await;
+        if !self.query_needed_blocks().await {
+            self.drop_ranges_not_in_needed(&HashMap::new());
+            self.state.schedule.retain_matching_needed(&HashMap::new());
+        }
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
@@ -183,6 +192,21 @@ impl BlockSyncReactor {
             self.state.verified_block_tip = frontiers.verified_block_tip;
             self.release_contiguous_blocks().await;
         }
+        if !self.query_needed_blocks().await {
+            self.drop_ranges_not_in_needed(&HashMap::new());
+            self.state.schedule.retain_matching_needed(&HashMap::new());
+        }
+    }
+
+    async fn handle_chain_tip_reset(&mut self, frontiers: BlockSyncFrontiers) {
+        self.state.finalized_height = frontiers.finalized_height;
+        self.state.verified_block_tip = frontiers.verified_block_tip;
+        self.state.verified_block_hash = frontiers.verified_block_hash;
+
+        self.state.reorder.clear(&mut self.state.budget);
+        self.drop_ranges_not_in_needed(&HashMap::new());
+        self.state.schedule.retain_matching_needed(&HashMap::new());
+
         self.query_needed_blocks().await;
     }
 
@@ -194,7 +218,13 @@ impl BlockSyncReactor {
                 hash: block.hash,
                 size: block.size,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let needed_hashes = needed
+            .iter()
+            .map(|block| (block.height, block.hash))
+            .collect::<HashMap<_, _>>();
+        self.drop_ranges_not_in_needed(&needed_hashes);
+        self.state.schedule.retain_matching_needed(&needed_hashes);
         self.state.schedule.refresh_needed(needed);
         self.schedule().await;
     }
@@ -290,10 +320,18 @@ impl BlockSyncReactor {
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let retry_request = outstanding.request.single_height_retry(height);
 
+        if !block_merkle_root_matches_header(block.clone()).await {
+            self.drop_invalid_outstanding(&peer, index);
+            self.report_misbehavior(peer, BlockSyncMisbehavior::InvalidBlock)
+                .await;
+            return;
+        }
+
         let serialized_bytes = match block.zcash_serialize_to_vec() {
             Ok(bytes) => bytes.len() as u64,
             Err(error) => {
                 tracing::debug!(?error, "failed to serialize decoded block-sync body");
+                self.drop_invalid_outstanding(&peer, index);
                 self.report_misbehavior(peer, BlockSyncMisbehavior::InvalidBlock)
                     .await;
                 return;
@@ -353,6 +391,19 @@ impl BlockSyncReactor {
         self.schedule().await;
     }
 
+    fn drop_invalid_outstanding(&mut self, peer: &ZakuraPeerId, index: usize) {
+        let Some(peer_state) = self.state.peers.get_mut(peer) else {
+            return;
+        };
+        if index >= peer_state.outstanding.len() {
+            return;
+        }
+
+        let outstanding = peer_state.outstanding.remove(index);
+        self.state.budget.release(outstanding.reserved_bytes());
+        self.state.schedule.retry(outstanding.request);
+    }
+
     async fn handle_blocks_done(&mut self, peer: ZakuraPeerId, start_height: block::Height) {
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
             self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedDone)
@@ -392,11 +443,11 @@ impl BlockSyncReactor {
         self.schedule().await;
     }
 
-    async fn query_needed_blocks(&mut self) {
+    async fn query_needed_blocks(&mut self) -> bool {
         if !self.startup.state_queries_enabled
             || self.state.best_header_tip <= self.state.verified_block_tip
         {
-            return;
+            return false;
         }
         let _ = self
             .actions
@@ -405,6 +456,22 @@ impl BlockSyncReactor {
                 best_header_tip: self.state.best_header_tip,
             })
             .await;
+        true
+    }
+
+    fn drop_ranges_not_in_needed(&mut self, needed: &HashMap<block::Height, block::Hash>) {
+        for peer in self.state.peers.values_mut() {
+            let mut index = 0;
+            while index < peer.outstanding.len() {
+                if peer.outstanding[index].request.matches_needed(needed) {
+                    index += 1;
+                } else {
+                    let outstanding = peer.outstanding.remove(index);
+                    self.state.budget.release(outstanding.reserved_bytes());
+                    self.state.schedule.clear_assignment(&outstanding.request);
+                }
+            }
+        }
     }
 
     async fn schedule(&mut self) {
@@ -521,4 +588,18 @@ impl BlockSyncReactor {
 
 fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {
     reserved_bytes.saturating_mul(u64::from(tolerance_percent.max(100))) / 100
+}
+
+async fn block_merkle_root_matches_header(block: Arc<block::Block>) -> bool {
+    match task::spawn_blocking(move || {
+        block.transactions.iter().collect::<block::merkle::Root>() == block.header.merkle_root
+    })
+    .await
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            tracing::debug!(?error, "block-sync merkle-root validation task failed");
+            false
+        }
+    }
 }

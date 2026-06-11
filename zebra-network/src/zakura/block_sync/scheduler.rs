@@ -83,6 +83,17 @@ impl BlockRangeScheduler {
         self.prune_covered();
     }
 
+    pub(super) fn retain_matching_needed(&mut self, needed: &HashMap<block::Height, block::Hash>) {
+        self.queue.retain(|range| range.matches_needed(needed));
+        // Active assignments are paired with outstanding requests, which the
+        // reactor hash-prunes before retaining scheduler state.
+        self.assigned.retain(|range, _| {
+            needed
+                .get(&range.start)
+                .is_some_and(|_| needed.contains_key(&range.end))
+        });
+    }
+
     pub(super) fn next_for_peer(
         &mut self,
         peer_id: &ZakuraPeerId,
@@ -149,7 +160,7 @@ impl BlockRangeScheduler {
         }
 
         self.assigned
-            .entry(range.key())
+            .entry(request.key())
             .or_default()
             .insert(peer_id.clone());
         Some(request)
@@ -220,6 +231,11 @@ impl BlockRangeScheduler {
         self.queue.clear();
         let reserved = budget.reserved();
         budget.release(reserved);
+    }
+
+    #[cfg(test)]
+    pub(super) fn assigned_range_count(&self) -> usize {
+        self.assigned.len()
     }
 
     fn ensure(&mut self, range: BlockRange) {
@@ -322,6 +338,12 @@ impl BlockRange {
     fn overlaps(&self, other: &Self) -> bool {
         self.start_height() <= other.end_height() && self.end_height() >= other.start_height()
     }
+
+    fn matches_needed(&self, needed: &HashMap<block::Height, block::Hash>) -> bool {
+        self.blocks
+            .iter()
+            .all(|block| needed.get(&block.height) == Some(&block.hash))
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -387,6 +409,12 @@ impl BlockRangeRequest {
             expected_hashes: vec![(height, hash)],
             expected_bytes: vec![(height, estimated_bytes)],
         })
+    }
+
+    pub(super) fn matches_needed(&self, needed: &HashMap<block::Height, block::Hash>) -> bool {
+        self.expected_hashes
+            .iter()
+            .all(|(height, hash)| needed.get(height) == Some(hash))
     }
 
     fn key(&self) -> BlockRangeKey {

@@ -66,13 +66,6 @@ impl ReorderBuffer {
         released
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "B2 exposes the reset seam for B4; unit tests exercise the accounting"
-        )
-    )]
     pub(crate) fn clear(&mut self, budget: &mut ByteBudget) {
         self.drop_from(block::Height::MIN, budget);
     }

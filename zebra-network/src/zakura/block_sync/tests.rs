@@ -8,10 +8,13 @@ use super::{
     state::*,
 };
 use crate::zakura::{
-    framed_channel, Peer, PeerStreamSession, Service, ServicePeerSnapshot, ServiceRegistry,
-    StreamMode,
+    framed_channel, FramedRecv, FramedSend, Peer, PeerStreamSession, Service, ServicePeerSnapshot,
+    ServiceRegistry, StreamMode,
 };
-use zebra_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+use zebra_chain::{
+    fmt::HexDebug,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
+};
 use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES};
 
 fn peer(byte: u8) -> ZakuraPeerId {
@@ -28,6 +31,36 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
         mainnet_block(&BLOCK_MAINNET_2_BYTES),
         mainnet_block(&BLOCK_MAINNET_3_BYTES),
     ]
+}
+
+fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
+    let mut fork = block.as_ref().clone();
+    let mut header = *fork.header;
+    header.nonce = HexDebug([nonce_tag; 32]);
+    fork.header = Arc::new(header);
+    Arc::new(fork)
+}
+
+fn block_with_bad_merkle_root(
+    block: &Arc<block::Block>,
+    extra_tx: &Arc<block::Block>,
+) -> Arc<block::Block> {
+    let mut bad_block = block.as_ref().clone();
+    bad_block
+        .transactions
+        .push(extra_tx.transactions[0].clone());
+
+    assert_eq!(bad_block.hash(), block.hash());
+    assert_eq!(bad_block.coinbase_height(), block.coinbase_height());
+    assert_ne!(
+        bad_block
+            .transactions
+            .iter()
+            .collect::<block::merkle::Root>(),
+        bad_block.header.merkle_root
+    );
+
+    Arc::new(bad_block)
 }
 
 fn block_size(block: &block::Block) -> u32 {
@@ -104,6 +137,48 @@ async fn wait_for_connect_status(actions: &mut mpsc::Receiver<BlockSyncAction>) 
     }
 }
 
+async fn drain_parent_first_actions(
+    actions: &mut mpsc::Receiver<BlockSyncAction>,
+    verified_tip: &mut block::Height,
+    expected_new_fork: Option<&[Arc<block::Block>]>,
+) {
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(25), actions.recv()).await
+    {
+        match action {
+            BlockSyncAction::SubmitBlock { block } => {
+                let height = block
+                    .coinbase_height()
+                    .expect("submitted test block has height");
+                assert_eq!(
+                    Some(height),
+                    next_height(*verified_tip),
+                    "block sync must submit only the contiguous parent-first prefix"
+                );
+                if let Some(new_fork) = expected_new_fork {
+                    let expected_hash = match height.0 {
+                        2 => new_fork[1].hash(),
+                        3 => new_fork[2].hash(),
+                        _ => panic!("unexpected post-reset submitted height: {height:?}"),
+                    };
+                    assert_eq!(
+                        block.hash(),
+                        expected_hash,
+                        "post-reset submissions must follow the re-derived fork"
+                    );
+                }
+                *verified_tip = height;
+            }
+            BlockSyncAction::Misbehavior {
+                reason: BlockSyncMisbehavior::InvalidBlock | BlockSyncMisbehavior::UnsolicitedBlock,
+                ..
+            } => {}
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action while draining body responses: {action:?}"),
+        }
+    }
+}
+
 fn peer_state(byte: u8) -> (ZakuraPeerId, PeerBlockState) {
     let peer = peer(byte);
     let (_inbound_tx, inbound_rx) = framed_channel(4);
@@ -124,11 +199,60 @@ fn peer_state(byte: u8) -> (ZakuraPeerId, PeerBlockState) {
     (peer, state)
 }
 
+async fn connect_peer_with_status(
+    service: &BlockSyncService,
+    actions: &mut mpsc::Receiver<BlockSyncAction>,
+    byte: u8,
+    servable_high: block::Height,
+    tip_hash: block::Hash,
+    max_inflight_requests: u16,
+    max_response_bytes: u32,
+) -> (ZakuraPeerId, FramedSend, FramedRecv) {
+    let peer = peer(byte);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+    assert_eq!(wait_for_connect_status(actions).await, peer);
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high,
+                tip_hash,
+                max_blocks_per_response: 16,
+                max_inflight_requests,
+                max_response_bytes,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    (peer, inbound_tx, outbound_rx)
+}
+
 fn needed(height: u32, size: BlockSizeEstimate) -> NeededBlock {
     NeededBlock {
         height: block::Height(height),
         hash: block::Hash([height as u8; 32]),
         size,
+    }
+}
+
+fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
+    BlockSyncBlockMeta {
+        height: block.coinbase_height().expect("test block has height"),
+        hash: block.hash(),
+        size: BlockSizeEstimate::Advertised(block_size(block)),
     }
 }
 
@@ -368,6 +492,35 @@ fn scheduler_byte_budget_sizing_shrinks_or_defers_requests() {
 }
 
 #[test]
+fn scheduler_partial_requests_clear_the_issued_assignment_key() {
+    let mut scheduler = BlockRangeScheduler::new(1);
+    scheduler.set_estimator_for_tests(750, 1);
+    scheduler.refresh_needed(vec![
+        needed(10, BlockSizeEstimate::Advertised(100)),
+        needed(11, BlockSizeEstimate::Advertised(100)),
+        needed(12, BlockSizeEstimate::Advertised(100)),
+    ]);
+    let (peer, mut state) = peer_state(38);
+    state.max_response_bytes = 200;
+    state.max_blocks_per_response = 10;
+    let mut budget = ByteBudget::new(1_000);
+
+    let request = scheduler
+        .next_for_peer(&peer, &state, &mut budget)
+        .expect("response-byte cap drains a prefix of the queued range");
+    assert_eq!(request.start_height, block::Height(10));
+    assert_eq!(request.count, 2);
+    assert_eq!(scheduler.assigned_range_count(), 1);
+
+    scheduler.complete(&request, &mut budget);
+    assert_eq!(
+        scheduler.assigned_range_count(),
+        0,
+        "completing a partial request must clear the same range key it assigned"
+    );
+}
+
+#[test]
 fn scheduler_releases_budget_on_completion_timeout_and_cancel() {
     let (peer, state) = peer_state(35);
     let mut scheduler = BlockRangeScheduler::new(1);
@@ -394,6 +547,32 @@ fn scheduler_releases_budget_on_completion_timeout_and_cancel() {
     assert_eq!(budget.reserved(), 2_000);
     assert_eq!(request.count, 1);
     scheduler.release_cancelled(&mut budget);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn scheduler_drops_queued_ranges_whose_anchor_left_current_header_spine() {
+    let (peer, state) = peer_state(37);
+    let mut scheduler = BlockRangeScheduler::new(1);
+    scheduler.set_estimator_for_tests(750, 1);
+    scheduler.refresh_needed(vec![
+        needed(40, BlockSizeEstimate::Advertised(1_000)),
+        needed(41, BlockSizeEstimate::Advertised(1_000)),
+    ]);
+
+    let current = HashMap::from([
+        (block::Height(40), block::Hash([90; 32])),
+        (block::Height(41), block::Hash([91; 32])),
+    ]);
+    scheduler.retain_matching_needed(&current);
+
+    let mut budget = ByteBudget::new(10_000);
+    assert!(
+        scheduler
+            .next_for_peer(&peer, &state, &mut budget)
+            .is_none(),
+        "stale queued anchors must not survive a re-derived needed set"
+    );
     assert_eq!(budget.reserved(), 0);
 }
 
@@ -1079,6 +1258,660 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
 }
 
 #[tokio::test]
+async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 20_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        47,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        20_000,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(1),
+            best_header_tip: block::Height(3),
+        }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: blocks[1].hash(),
+                size: BlockSizeEstimate::Advertised(10_000),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(3),
+                hash: blocks[2].hash(),
+                size: BlockSizeEstimate::Advertised(10_000),
+            },
+        ]))
+        .await
+        .expect("old-fork needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(2), 2)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[2].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("out-of-order old-fork block queues");
+
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        }))
+        .await
+        .expect("reset event queues");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(1),
+            best_header_tip: block::Height(3),
+        }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(2),
+            hash: block::Hash([92; 32]),
+            size: BlockSizeEstimate::Advertised(20_000),
+        }]))
+        .await
+        .expect("new-fork needed metadata queues");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SendMessage {
+                peer,
+                msg:
+                    BlockSyncMessage::GetBlocks {
+                        start_height,
+                        count,
+                    },
+            } => {
+                assert_eq!(
+                    (peer, start_height, count),
+                    (peer_id, block::Height(2), 1),
+                    "a full-budget new fork request can only be scheduled if stale bytes were released"
+                );
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            BlockSyncAction::Misbehavior {
+                reason: BlockSyncMisbehavior::UnsolicitedBlock,
+                ..
+            } => {}
+            action => panic!("unexpected action before new fork request: {action:?}"),
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget() {
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 20_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        50,
+        block::Height(4),
+        block::Hash([4; 32]),
+        1,
+        20_000,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(1),
+            best_header_tip: block::Height(3),
+        }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: blocks[1].hash(),
+                size: BlockSizeEstimate::Advertised(10_000),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(3),
+                hash: blocks[2].hash(),
+                size: BlockSizeEstimate::Advertised(10_000),
+            },
+        ]))
+        .await
+        .expect("initial needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(2), 2)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[2].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("out-of-order body queues");
+
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(3),
+            verified_block_hash: blocks[2].hash(),
+        }))
+        .await
+        .expect("fast-forward reset event queues");
+
+    tip_tx
+        .send((block::Height(4), block::Hash([4; 32])))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(3),
+            best_header_tip: block::Height(4),
+        }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(4),
+            hash: block::Hash([4; 32]),
+            size: BlockSizeEstimate::Advertised(20_000),
+        }]))
+        .await
+        .expect("post-reset needed metadata queues");
+
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id, block::Height(4), 1),
+        "a full-budget request after fast-forward Reset requires releasing buffered bytes"
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
+    #[derive(Copy, Clone)]
+    enum ForkBody {
+        Old(usize),
+        New(usize),
+    }
+
+    let cases = vec![
+        (
+            "stale-high-before-reset",
+            vec![3],
+            vec![],
+            vec![ForkBody::Old(2), ForkBody::New(3), ForkBody::New(2)],
+        ),
+        (
+            "old-prefix-before-reset",
+            vec![2, 1],
+            vec![],
+            vec![ForkBody::Old(3), ForkBody::New(2), ForkBody::New(3)],
+        ),
+        (
+            "stale-before-new-needed",
+            vec![2],
+            vec![3],
+            vec![ForkBody::New(2), ForkBody::Old(2), ForkBody::New(3)],
+        ),
+        (
+            "new-out-of-order-with-stale-tail",
+            vec![],
+            vec![2],
+            vec![ForkBody::New(3), ForkBody::Old(3), ForkBody::New(2)],
+        ),
+    ];
+
+    for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
+        let mut config = ZakuraBlockSyncConfig {
+            max_inflight_block_bytes: 60_000,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        config.peer_limits.outbound_queue_depth = 16;
+        let old_blocks = mainnet_blocks_1_to_3();
+        let new_blocks = vec![
+            forked_block(&old_blocks[0], 101),
+            forked_block(&old_blocks[1], 102),
+            forked_block(&old_blocks[2], 103),
+        ];
+        let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            config.clone(),
+        );
+        let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+        let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+            &service,
+            &mut actions,
+            51,
+            block::Height(4),
+            old_blocks[2].hash(),
+            1,
+            60_000,
+        )
+        .await;
+
+        tip_tx
+            .send((block::Height(3), old_blocks[2].hash()))
+            .expect("tip watch is live");
+        while !matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(3),
+            }
+        ) {}
+        handle
+            .send(BlockSyncEvent::NeededBlocks(
+                old_blocks
+                    .iter()
+                    .map(|block| BlockSyncBlockMeta {
+                        height: block.coinbase_height().expect("test block has height"),
+                        hash: block.hash(),
+                        size: BlockSizeEstimate::Advertised(block_size(block)),
+                    })
+                    .collect(),
+            ))
+            .await
+            .expect("old-fork needed metadata queues");
+        assert_eq!(
+            wait_for_getblocks(&mut actions).await,
+            (peer_id.clone(), block::Height(1), 3),
+            "{case}: old fork request schedules"
+        );
+
+        let mut submitted_tip = block::Height(0);
+        for height in old_before_reset {
+            inbound_tx
+                .send(
+                    BlockSyncMessage::Block(old_blocks[height - 1].clone())
+                        .encode_frame()
+                        .expect("old-fork block encodes"),
+                )
+                .await
+                .expect("old-fork block queues");
+            drain_parent_first_actions(&mut actions, &mut submitted_tip, None).await;
+        }
+
+        handle
+            .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: new_blocks[0].hash(),
+            }))
+            .await
+            .expect("reset event queues");
+        while !matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(1),
+                best_header_tip: block::Height(3),
+            }
+        ) {}
+        submitted_tip = block::Height(1);
+
+        tip_tx
+            .send((block::Height(3), new_blocks[2].hash()))
+            .expect("tip watch is live");
+        while !matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(1),
+                best_header_tip: block::Height(3),
+            }
+        ) {}
+
+        for height in old_before_new_needed {
+            inbound_tx
+                .send(
+                    BlockSyncMessage::Block(old_blocks[height - 1].clone())
+                        .encode_frame()
+                        .expect("stale old-fork block encodes"),
+                )
+                .await
+                .expect("stale old-fork block queues");
+            drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
+        }
+
+        handle
+            .send(BlockSyncEvent::NeededBlocks(vec![
+                BlockSyncBlockMeta {
+                    height: block::Height(2),
+                    hash: new_blocks[1].hash(),
+                    size: BlockSizeEstimate::Advertised(block_size(&new_blocks[1])),
+                },
+                BlockSyncBlockMeta {
+                    height: block::Height(3),
+                    hash: new_blocks[2].hash(),
+                    size: BlockSizeEstimate::Advertised(block_size(&new_blocks[2])),
+                },
+            ]))
+            .await
+            .expect("new-fork needed metadata queues");
+        assert_eq!(
+            wait_for_getblocks(&mut actions).await,
+            (peer_id.clone(), block::Height(2), 2),
+            "{case}: new fork request schedules after reset"
+        );
+
+        for body in after_new_needed {
+            let block = match body {
+                ForkBody::Old(height) => old_blocks[height - 1].clone(),
+                ForkBody::New(height) => new_blocks[height - 1].clone(),
+            };
+            inbound_tx
+                .send(
+                    BlockSyncMessage::Block(block)
+                        .encode_frame()
+                        .expect("fork body encodes"),
+                )
+                .await
+                .expect("fork body queues");
+            drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
+        }
+        assert_eq!(
+            submitted_tip,
+            block::Height(3),
+            "{case}: new fork bodies submit parent-first through height 3"
+        );
+
+        handle
+            .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(3),
+                verified_block_hash: new_blocks[2].hash(),
+            }))
+            .await
+            .expect("post-submit grow event queues");
+        tip_tx
+            .send((block::Height(4), block::Hash([4; 32])))
+            .expect("tip watch is live");
+        while !matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(3),
+                best_header_tip: block::Height(4),
+            }
+        ) {}
+        handle
+            .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+                height: block::Height(4),
+                hash: block::Hash([4; 32]),
+                size: BlockSizeEstimate::Advertised(60_000),
+            }]))
+            .await
+            .expect("post-fuzz needed metadata queues");
+        assert_eq!(
+            wait_for_getblocks(&mut actions).await,
+            (peer_id, block::Height(4), 1),
+            "{case}: byte budget returns to baseline after reset and submissions"
+        );
+
+        reactor_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(
+        ZakuraBlockSyncConfig::default(),
+        handle.clone(),
+    );
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        48,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[1]),
+            block_meta(&blocks[2]),
+        ]))
+        .await
+        .expect("old fork metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(2), 2)
+    );
+
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        }))
+        .await
+        .expect("reset event queues");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(2),
+            hash: block::Hash([222; 32]),
+            size: BlockSizeEstimate::Advertised(block_size(&blocks[1])),
+        }]))
+        .await
+        .expect("new fork metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(2), 1)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[1].clone())
+                .encode_frame()
+                .expect("old-fork body encodes"),
+        )
+        .await
+        .expect("old-fork body queues");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before stale body rejection: {action:?}"),
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 10_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, _inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        49,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        10_000,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            size: BlockSizeEstimate::Advertised(10_000),
+        }]))
+        .await
+        .expect("first needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(1), 1)
+    );
+
+    handle
+        .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        }))
+        .await
+        .expect("legacy commit grow event queues");
+
+    tip_tx
+        .send((block::Height(2), blocks[1].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(1),
+            best_header_tip: block::Height(2),
+        }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+            size: BlockSizeEstimate::Advertised(10_000),
+        }]))
+        .await
+        .expect("second needed metadata queues");
+
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id, block::Height(2), 1),
+        "legacy commit must release the duplicate in-flight reservation"
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
     let config = ZakuraBlockSyncConfig::default();
     let blocks = [
@@ -1355,6 +2188,138 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
             action => panic!("unexpected action before invalid-block report: {action:?}"),
         }
     }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_scores_header_valid_merkle_invalid_body_and_accepts_clean_peer() {
+    let request_bytes: u32 = 10_000;
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: u64::from(request_bytes) * 2,
+        fanout: 2,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+
+    let blocks = mainnet_blocks_1_to_3();
+    let bad_body = block_with_bad_merkle_root(&blocks[0], &blocks[1]);
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (bad_peer, bad_inbound, _bad_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        40,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    let (good_peer, good_inbound, _good_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        41,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            size: BlockSizeEstimate::Advertised(request_bytes),
+        }]))
+        .await
+        .expect("needed metadata queues");
+
+    let mut requested_peers = Vec::new();
+    while requested_peers.len() < 2 {
+        let (peer, start_height, count) = wait_for_getblocks(&mut actions).await;
+        assert_eq!(start_height, block::Height(1));
+        assert_eq!(count, 1);
+        requested_peers.push(peer);
+    }
+    assert!(requested_peers.contains(&bad_peer));
+    assert!(requested_peers.contains(&good_peer));
+
+    bad_inbound
+        .send(
+            BlockSyncMessage::Block(bad_body)
+                .encode_frame()
+                .expect("bad block frame encodes"),
+        )
+        .await
+        .expect("bad block frame queues");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, bad_peer);
+                assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            BlockSyncAction::SubmitBlock { block } => {
+                panic!("merkle-invalid block was buffered and submitted: {block:?}");
+            }
+            action => panic!("unexpected action before invalid body scoring: {action:?}"),
+        }
+    }
+
+    good_inbound
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("good block frame encodes"),
+        )
+        .await
+        .expect("good block frame queues");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block } => {
+                assert_eq!(block.hash(), blocks[0].hash());
+                assert_eq!(block.coinbase_height(), Some(block::Height(1)));
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before clean body submit: {action:?}"),
+        }
+    }
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+            size: BlockSizeEstimate::Advertised(request_bytes * 2),
+        }]))
+        .await
+        .expect("follow-up needed metadata queues");
+    let (_peer, start_height, count) = wait_for_getblocks(&mut actions).await;
+    assert_eq!(start_height, block::Height(2));
+    assert_eq!(count, 1);
 
     reactor_task.abort();
 }
