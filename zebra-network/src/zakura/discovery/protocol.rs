@@ -823,7 +823,7 @@ pub struct ZakuraServiceCandidates {
 }
 
 /// Header-sync candidate selection hints owned by the header-sync reactor.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraHeaderSyncCandidateState {
     /// Lowest header height that would make a new peer useful.
     pub target_height: block::Height,
@@ -831,6 +831,16 @@ pub struct ZakuraHeaderSyncCandidateState {
     pub admitted_node_ids: Vec<NodeId>,
     /// Peers in local, non-punitive advisory backoff after failing to confirm usefulness.
     pub backed_off_node_ids: Vec<NodeId>,
+}
+
+impl Default for ZakuraHeaderSyncCandidateState {
+    fn default() -> Self {
+        Self {
+            target_height: block::Height::MIN,
+            admitted_node_ids: Vec::new(),
+            backed_off_node_ids: Vec::new(),
+        }
+    }
 }
 
 /// The result of importing one signed discovery record.

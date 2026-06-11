@@ -1034,15 +1034,22 @@ pub(crate) fn service_registry(
     discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone(), discovery_service];
-    if let Some(header_sync) = header_sync {
-        services.push(Arc::new(HeaderSyncService::new(header_sync)) as Arc<dyn Service>);
+    if let Some(header_sync) = &header_sync {
+        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
     } else {
         services
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
     }
-    services.push(
-        Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default())) as Arc<dyn Service>,
+    let block_sync = header_sync.as_ref().map_or_else(
+        || BlockSyncService::new(ZakuraBlockSyncConfig::default()),
+        |header_sync| {
+            BlockSyncService::new_with_header_tip(
+                ZakuraBlockSyncConfig::default(),
+                header_sync.subscribe_tip(),
+            )
+        },
     );
+    services.push(Arc::new(block_sync) as Arc<dyn Service>);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,

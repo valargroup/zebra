@@ -124,12 +124,14 @@ impl BlockSyncPeerSession {
 pub(crate) struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
     _held_events: Option<Arc<StdMutex<mpsc::Receiver<BlockSyncEvent>>>>,
+    _reactor_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
     config: ZakuraBlockSyncConfig,
     events: mpsc::Sender<BlockSyncEvent>,
+    lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
 }
 
@@ -137,20 +139,48 @@ struct BlockSyncServiceInner {
 struct BlockSyncPeerRecord {
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
+    #[cfg(test)]
     actions: mpsc::Sender<BlockSyncAction>,
+    #[cfg(not(test))]
+    _actions: mpsc::Sender<BlockSyncAction>,
     _tasks: Vec<JoinHandle<()>>,
 }
 
 impl BlockSyncService {
     pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
-        let (events, event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        Self::new_with_startup(BlockSyncStartup::inert(config))
+    }
+
+    pub(crate) fn new_with_header_tip(
+        config: ZakuraBlockSyncConfig,
+        header_tip: watch::Receiver<(block::Height, block::Hash)>,
+    ) -> Self {
+        let best_header_tip = *header_tip.borrow();
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height::MIN,
+                verified_block_tip: block::Height::MIN,
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            best_header_tip,
+            header_tip,
+            config,
+        );
+        Self::new_with_startup(startup)
+    }
+
+    fn new_with_startup(startup: BlockSyncStartup) -> Self {
+        let config = startup.config.clone();
+        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
         Self {
             inner: Arc::new(BlockSyncServiceInner {
                 config,
-                events,
+                events: handle.events.clone(),
+                lifecycle: handle.lifecycle.clone(),
                 peers: StdMutex::new(HashMap::new()),
             }),
-            _held_events: Some(Arc::new(StdMutex::new(event_rx))),
+            _held_events: None,
+            _reactor_task: Some(reactor_task),
         }
     }
 
@@ -159,17 +189,43 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
     ) -> (Self, mpsc::Receiver<BlockSyncEvent>) {
         let (events, event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let events_for_lifecycle = events.clone();
+        tokio::spawn(async move {
+            while let Some(event) = lifecycle_rx.recv().await {
+                let _ = events_for_lifecycle.send(event).await;
+            }
+        });
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
                     config,
                     events,
+                    lifecycle,
                     peers: StdMutex::new(HashMap::new()),
                 }),
                 _held_events: None,
+                _reactor_task: None,
             },
             event_rx,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_handle_for_test(
+        config: ZakuraBlockSyncConfig,
+        handle: BlockSyncHandle,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BlockSyncServiceInner {
+                config,
+                events: handle.events.clone(),
+                lifecycle: handle.lifecycle.clone(),
+                peers: StdMutex::new(HashMap::new()),
+            }),
+            _held_events: None,
+            _reactor_task: None,
+        }
     }
 
     #[cfg(test)]
@@ -186,9 +242,10 @@ impl BlockSyncService {
         &self,
         action: BlockSyncAction,
     ) -> Result<(), mpsc::error::SendError<BlockSyncAction>> {
-        let peer = match &action {
-            BlockSyncAction::SendMessage { peer, .. } => peer.clone(),
+        let BlockSyncAction::SendMessage { peer, .. } = &action else {
+            return Err(mpsc::error::SendError(action));
         };
+        let peer = peer.clone();
         let sender = match self.inner.peers.lock() {
             Ok(peers) => peers.get(&peer).map(|record| record.actions.clone()),
             Err(_) => return Err(mpsc::error::SendError(action)),
@@ -269,6 +326,7 @@ impl Service for BlockSyncService {
             peer_id.clone(),
             recv,
             self.inner.events.clone(),
+            self.inner.lifecycle.clone(),
             service_cancel_token.clone(),
             connection_cancel_token,
         );
@@ -284,7 +342,10 @@ impl Service for BlockSyncService {
                 BlockSyncPeerRecord {
                     direction: peer.direction,
                     cancel_token: service_cancel_token,
+                    #[cfg(test)]
                     actions: actions_tx.clone(),
+                    #[cfg(not(test))]
+                    _actions: actions_tx.clone(),
                     _tasks: vec![source_task, sink_task],
                 },
             );
@@ -292,13 +353,8 @@ impl Service for BlockSyncService {
 
         let _ = self
             .inner
-            .events
-            .try_send(BlockSyncEvent::PeerConnected(block_sync_session));
-
-        let _ = self.try_send_action(BlockSyncAction::SendMessage {
-            peer: peer_id,
-            msg: BlockSyncMessage::Status(self.inner.config.initial_status()),
-        });
+            .lifecycle
+            .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId) {
@@ -313,8 +369,8 @@ impl Service for BlockSyncService {
         }
         let _ = self
             .inner
-            .events
-            .try_send(BlockSyncEvent::PeerDisconnected(peer.clone()));
+            .lifecycle
+            .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
     }
 
     fn deliver_frame(
@@ -331,29 +387,11 @@ impl Service for BlockSyncService {
     }
 }
 
-impl BlockSyncService {
-    fn try_send_action(
-        &self,
-        action: BlockSyncAction,
-    ) -> Result<(), mpsc::error::TrySendError<BlockSyncAction>> {
-        let peer = match &action {
-            BlockSyncAction::SendMessage { peer, .. } => peer.clone(),
-        };
-        let sender = match self.inner.peers.lock() {
-            Ok(peers) => peers.get(&peer).map(|record| record.actions.clone()),
-            Err(_) => return Err(mpsc::error::TrySendError::Closed(action)),
-        };
-        let Some(sender) = sender else {
-            return Err(mpsc::error::TrySendError::Closed(action));
-        };
-        sender.try_send(action)
-    }
-}
-
 fn spawn_block_sync_sink(
     peer_id: ZakuraPeerId,
     recv: FramedRecv,
     events: mpsc::Sender<BlockSyncEvent>,
+    lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     service_cancel_token: CancellationToken,
     connection_cancel_token: CancellationToken,
 ) -> JoinHandle<()> {
@@ -383,7 +421,7 @@ fn spawn_block_sync_sink(
             }
         }
 
-        let _ = events.try_send(BlockSyncEvent::PeerDisconnected(peer_id));
+        let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
     })
 }
 
@@ -451,7 +489,9 @@ impl Source for BlockSyncSource {
                     }
                 };
 
-                let BlockSyncAction::SendMessage { peer, msg } = action;
+                let BlockSyncAction::SendMessage { peer, msg } = action else {
+                    continue;
+                };
                 if peer != self.peer_id {
                     continue;
                 }
