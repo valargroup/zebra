@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     path::{Path, PathBuf},
     process::Stdio,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{eyre, Report};
@@ -17,6 +18,10 @@ use tracing::{debug, error, info, warn};
 use zebra_chain::parameters::NetworkKind;
 
 use super::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path, Config};
+
+const SUPERVISOR_ACTIVE_METRIC: &str = "zcashd_compat.supervisor.active";
+const SUPERVISOR_DISABLED_METRIC: &str = "zcashd_compat.supervisor.disabled";
+const SUPERVISOR_EXHAUSTED_METRIC: &str = "zcashd_compat.supervisor.exhausted";
 
 /// The full configuration used by the zcashd-compat supervisor task.
 #[derive(Clone, Debug)]
@@ -38,11 +43,13 @@ pub struct SupervisorConfig {
     /// Delay before first spawn.
     pub startup_delay: std::time::Duration,
     /// Restart backoff.
-    pub restart_backoff: std::time::Duration,
+    pub restart_backoff: Duration,
+    /// Child uptime that resets the consecutive restart count.
+    pub restart_reset_after: Duration,
     /// Restart limit.
     pub max_restarts: u32,
     /// Grace period after SIGTERM.
-    pub shutdown_grace_period: std::time::Duration,
+    pub shutdown_grace_period: Duration,
 }
 
 impl SupervisorConfig {
@@ -72,6 +79,7 @@ impl SupervisorConfig {
             network,
             startup_delay: zcashd_compat.startup_delay,
             restart_backoff: zcashd_compat.restart_backoff,
+            restart_reset_after: zcashd_compat.restart_reset_after,
             max_restarts: zcashd_compat.max_restarts,
             shutdown_grace_period: zcashd_compat.shutdown_grace_period,
         }
@@ -135,21 +143,25 @@ pub async fn run(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Report> {
     ensure_zcashd_datadir(&config.zcashd_datadir, &config.extra_args)?;
+    set_supervision_active_metrics();
 
     if wait_for_delay_or_shutdown(config.startup_delay, &mut shutdown_rx).await {
         info!("zcashd-compat supervisor received shutdown during startup delay");
+        set_supervision_inactive_metrics();
         return Ok(());
     }
 
-    let mut restart_count = 0u32;
+    let mut consecutive_restart_count = 0u32;
 
     loop {
         if *shutdown_rx.borrow() {
             info!("zcashd-compat supervisor received shutdown before spawn");
+            set_supervision_inactive_metrics();
             return Ok(());
         }
 
         let mut child = spawn_zcashd(&config)?;
+        let child_started_at = Instant::now();
         info!(
             path = %config.zcashd_path.display(),
             datadir = %config.zcashd_datadir.display(),
@@ -163,31 +175,100 @@ pub async fn run(
             ChildOutcome::ShutdownRequested => {
                 terminate_child(&mut child, config.shutdown_grace_period).await?;
                 info!("zcashd-compat zcashd child stopped on shutdown");
+                set_supervision_inactive_metrics();
                 return Ok(());
             }
             ChildOutcome::Exited(status) => {
-                restart_count = restart_count.saturating_add(1);
+                let child_uptime = child_started_at.elapsed();
+                if should_reset_restart_count(child_uptime, config.restart_reset_after) {
+                    info!(
+                        ?status,
+                        child_uptime_secs = child_uptime.as_secs(),
+                        restart_reset_after_secs = config.restart_reset_after.as_secs(),
+                        previous_restart_count = consecutive_restart_count,
+                        "zcashd-compat zcashd child had healthy uptime, resetting restart count"
+                    );
+                    consecutive_restart_count = 0;
+                }
+
+                consecutive_restart_count = consecutive_restart_count.saturating_add(1);
                 warn!(
                     ?status,
-                    restart_count,
+                    restart_count = consecutive_restart_count,
                     max_restarts = config.max_restarts,
+                    child_uptime_secs = child_uptime.as_secs(),
                     "zcashd-compat zcashd child exited before shutdown, restarting"
                 );
 
-                if restart_count > config.max_restarts {
+                if restart_budget_exhausted(consecutive_restart_count, config.max_restarts) {
+                    set_supervision_exhausted_metrics();
                     return Err(eyre!(
                         "zcashd-compat zcashd child exceeded restart limit: {}",
                         config.max_restarts
                     ));
                 }
 
-                if wait_for_delay_or_shutdown(config.restart_backoff, &mut shutdown_rx).await {
+                let restart_delay =
+                    restart_backoff_delay(config.restart_backoff, consecutive_restart_count);
+                if wait_for_delay_or_shutdown(restart_delay, &mut shutdown_rx).await {
                     info!("zcashd-compat supervisor received shutdown during restart backoff");
+                    set_supervision_inactive_metrics();
                     return Ok(());
                 }
             }
         }
     }
+}
+
+/// Sets metrics for zcashd-compat mode when zcashd supervision is intentionally disabled.
+pub fn set_supervision_config_disabled_metrics() {
+    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
+    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
+}
+
+/// Sets metrics for zcashd-compat mode when supervision has unexpectedly stopped.
+pub fn set_supervision_unexpectedly_disabled_metrics() {
+    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
+}
+
+fn set_supervision_active_metrics() {
+    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(1.0);
+    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(0.0);
+    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
+}
+
+fn set_supervision_inactive_metrics() {
+    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+}
+
+fn set_supervision_exhausted_metrics() {
+    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
+    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(1.0);
+}
+
+/// Returns `true` when a child ran long enough to make previous failures stale.
+fn should_reset_restart_count(child_uptime: Duration, restart_reset_after: Duration) -> bool {
+    restart_reset_after != Duration::ZERO && child_uptime >= restart_reset_after
+}
+
+/// Returns `true` when this unexpected exit exceeds the configured restart budget.
+fn restart_budget_exhausted(restart_count: u32, max_restarts: u32) -> bool {
+    restart_count > max_restarts
+}
+
+/// Calculates exponential restart backoff from the base delay and consecutive exit count.
+fn restart_backoff_delay(base_delay: Duration, restart_count: u32) -> Duration {
+    if base_delay == Duration::ZERO || restart_count <= 1 {
+        return base_delay;
+    }
+
+    let multiplier = 1u32
+        .checked_shl(restart_count.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    base_delay.saturating_mul(multiplier)
 }
 
 /// Spawns `zcashd` with zcashd-compat arguments and connects child output streams.
@@ -476,7 +557,10 @@ mod tests {
     use tokio::sync::watch;
     use zebra_chain::parameters::NetworkKind;
 
-    use super::{wait_for_delay_or_shutdown, SupervisorConfig};
+    use super::{
+        restart_backoff_delay, restart_budget_exhausted, should_reset_restart_count,
+        wait_for_delay_or_shutdown, SupervisorConfig,
+    };
 
     #[test]
     fn command_args_include_zcashd_compat_flags() {
@@ -488,10 +572,11 @@ mod tests {
             zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
             extra_args: vec!["-debug=1".to_string()],
             network: NetworkKind::Regtest,
-            startup_delay: std::time::Duration::from_secs(1),
-            restart_backoff: std::time::Duration::from_secs(2),
+            startup_delay: Duration::from_secs(1),
+            restart_backoff: Duration::from_secs(2),
+            restart_reset_after: Duration::from_secs(60 * 60),
             max_restarts: 3,
-            shutdown_grace_period: std::time::Duration::from_secs(300),
+            shutdown_grace_period: Duration::from_secs(300),
         };
 
         let args = config.command_args();
@@ -526,6 +611,53 @@ mod tests {
             .expect("extra arg present");
         assert!(p2p_idx < debug_idx);
         assert!(listen_idx < debug_idx);
+    }
+
+    #[test]
+    fn restart_count_resets_after_healthy_uptime() {
+        assert!(should_reset_restart_count(
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(60 * 60)
+        ));
+        assert!(should_reset_restart_count(
+            Duration::from_secs(60 * 60 + 1),
+            Duration::from_secs(60 * 60)
+        ));
+    }
+
+    #[test]
+    fn restart_count_does_not_reset_before_threshold() {
+        assert!(!should_reset_restart_count(
+            Duration::from_secs(60 * 60 - 1),
+            Duration::from_secs(60 * 60)
+        ));
+        assert!(!should_reset_restart_count(
+            Duration::from_secs(60 * 60),
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn restart_budget_allows_configured_number_of_restarts() {
+        assert!(!restart_budget_exhausted(10, 10));
+        assert!(restart_budget_exhausted(11, 10));
+    }
+
+    #[test]
+    fn restart_backoff_is_exponential_from_base_delay() {
+        let base_delay = Duration::from_secs(2);
+
+        assert_eq!(restart_backoff_delay(base_delay, 0), base_delay);
+        assert_eq!(restart_backoff_delay(base_delay, 1), base_delay);
+        assert_eq!(restart_backoff_delay(base_delay, 2), Duration::from_secs(4));
+        assert_eq!(restart_backoff_delay(base_delay, 3), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn restart_backoff_saturates_for_large_restart_counts() {
+        let delay = restart_backoff_delay(Duration::MAX, u32::MAX);
+
+        assert_eq!(delay, Duration::MAX);
     }
 
     #[tokio::test]

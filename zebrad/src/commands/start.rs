@@ -556,6 +556,7 @@ impl StartCmd {
             )
         } else {
             if config.zcashd_compat.enabled {
+                zcashd_compat::set_supervision_config_disabled_metrics();
                 info!(
                     rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
                     cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
@@ -897,6 +898,8 @@ impl StartCmd {
     fn zcashd_compat_supervisor_should_exit(
         zcashd_compat_result: Result<Result<(), Report>, tokio::task::JoinError>,
     ) -> bool {
+        zcashd_compat::set_supervision_unexpectedly_disabled_metrics();
+
         match zcashd_compat_result {
             Ok(Ok(())) => {
                 warn!(

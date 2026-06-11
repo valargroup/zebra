@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Increase the default zcashd-compat supervised shutdown grace period to 5
   minutes, giving `zcashd` more time to flush wallet and chainstate data before
   force-kill.
+- Make zcashd-compat supervision use exponential restart backoff, reset the
+  restart budget after healthy child uptime, and expose active/disabled/exhausted
+  supervisor state through metrics.
 - Update `zebra-rollback-state` and `zebrad rollback-state` to run rollback by
   default and use `--dry-run` for rollback-plan previews (replacing the old
   `--force` gate).
