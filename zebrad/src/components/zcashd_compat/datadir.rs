@@ -3,6 +3,8 @@
 //! Spec:
 //! - Zebra may create the supervised `zcashd` datadir and a first-start config.
 //! - Zebra must never overwrite an operator-provided config file.
+//! - The datadir prepared here must match the datadir zcashd will actually use
+//!   after command-line overrides are applied.
 //! - Existing configs are audited for known zcashd-compat startup issues, then
 //!   left unchanged.
 //! - Missing configs are bootstrapped with the deprecation acknowledgement so
@@ -46,21 +48,33 @@ pub fn effective_zcashd_datadir(zcashd_compat: &Config, state_cache_dir: &Path) 
         .unwrap_or_else(|| state_cache_dir.join(DEFAULT_ZCASHD_DATADIR))
 }
 
+/// Applies zcashd's last-value-wins `-datadir` command-line override.
+pub fn resolve_zcashd_datadir_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
+    find_datadir_arg(extra_args)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| datadir.to_path_buf())
+}
+
 /// Ensures the supervised `zcashd` datadir and effective config file are ready.
 ///
 /// Creates the datadir if missing, bootstraps a minimal config file if the
 /// effective `zcash.conf` is absent, and warns about existing config settings
 /// that are surprising or incompatible in zcashd-compat mode.
 ///
+/// Spec: `extra_args` are applied after Zebra's managed `-datadir=...`, so this
+/// must resolve any later `-datadir=...` override before preparing the config.
+///
 /// # Errors
 ///
 /// Returns an error if the datadir or config file cannot be created, or if an
 /// existing config file cannot be read.
 pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<(), Report> {
-    fs::create_dir_all(datadir)
+    let datadir = resolve_zcashd_datadir_path(datadir, extra_args);
+
+    fs::create_dir_all(&datadir)
         .wrap_err_with(|| format!("failed to create zcashd datadir {}", datadir.display()))?;
 
-    let conf_path = resolve_zcashd_conf_path(datadir, extra_args);
+    let conf_path = resolve_zcashd_conf_path(&datadir, extra_args);
     let parent = conf_path.parent().ok_or_else(|| {
         eyre!(
             "zcashd config path has no parent directory: {}",
@@ -185,6 +199,22 @@ fn unique_temp_conf_path(parent: &Path) -> PathBuf {
     parent.join(format!(".zcash.conf.tmp.{}.{}", std::process::id(), nanos))
 }
 
+/// Extracts the last `-datadir` value supported by Zebra's extra args.
+fn find_datadir_arg(extra_args: &[String]) -> Option<&str> {
+    let mut value_arg = None;
+
+    for arg in extra_args {
+        if let Some(value) = arg
+            .strip_prefix("-datadir=")
+            .or_else(|| arg.strip_prefix("--datadir="))
+        {
+            value_arg = Some(value);
+        }
+    }
+
+    value_arg
+}
+
 /// Resolves zcashd's effective config path using the same `-conf` rule shape:
 /// relative config paths are anchored under the selected datadir.
 fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
@@ -199,24 +229,36 @@ fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     }
 }
 
-/// Extracts the first `-conf` value supported by Zebra's extra args.
+/// Extracts the last `-conf` value supported by Zebra's extra args.
 fn find_conf_arg(extra_args: &[String]) -> Option<&str> {
+    find_last_arg_value(extra_args, "conf")
+}
+
+fn find_last_arg_value<'a>(extra_args: &'a [String], name: &str) -> Option<&'a str> {
     let mut args = extra_args.iter().map(String::as_str).peekable();
+    let mut value_arg = None;
+    let short_equals = format!("-{name}=");
+    let long_equals = format!("--{name}=");
+    let short = format!("-{name}");
+    let long = format!("--{name}");
 
     while let Some(arg) = args.next() {
-        if let Some(value) = arg
-            .strip_prefix("-conf=")
-            .or_else(|| arg.strip_prefix("--conf="))
-        {
-            return Some(value);
+        if let Some(value) = arg.strip_prefix(&short_equals) {
+            value_arg = Some(value);
+            continue;
         }
 
-        if matches!(arg, "-conf" | "--conf") {
-            return args.peek().copied();
+        if let Some(value) = arg.strip_prefix(&long_equals) {
+            value_arg = Some(value);
+            continue;
+        }
+
+        if arg == short || arg == long {
+            value_arg = args.next();
         }
     }
 
-    None
+    value_arg
 }
 
 /// Audits existing configs without modifying them.
@@ -369,6 +411,60 @@ mod tests {
         assert_eq!(
             resolve_zcashd_conf_path(&datadir, &extra_args),
             datadir.join("custom.conf")
+        );
+    }
+
+    #[test]
+    fn resolves_last_conf_arg() {
+        let datadir = PathBuf::from("/zcashd-datadir");
+        let extra_args = vec!["-conf=old.conf".to_string(), "--conf=new.conf".to_string()];
+
+        assert_eq!(
+            resolve_zcashd_conf_path(&datadir, &extra_args),
+            datadir.join("new.conf")
+        );
+    }
+
+    #[test]
+    fn bootstraps_datadir_extra_arg_override() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let datadir = temp_dir.path().join("zcashd-datadir");
+        let override_datadir = temp_dir.path().join("operator-datadir");
+        let extra_args = vec![format!("-datadir={}", override_datadir.display())];
+
+        ensure_zcashd_datadir(&datadir, &extra_args).expect("datadir override should be prepared");
+
+        assert!(
+            !datadir.exists(),
+            "bootstrap should not prepare the overridden default datadir"
+        );
+        assert_eq!(
+            fs::read_to_string(override_datadir.join("zcash.conf"))
+                .expect("override config should be readable"),
+            BOOTSTRAP_ZCASH_CONF
+        );
+    }
+
+    #[test]
+    fn bootstraps_conf_relative_to_datadir_extra_arg_override() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let datadir = temp_dir.path().join("zcashd-datadir");
+        let override_datadir = temp_dir.path().join("operator-datadir");
+        let extra_args = vec![
+            format!("--datadir={}", override_datadir.display()),
+            "-conf=custom.conf".to_string(),
+        ];
+
+        ensure_zcashd_datadir(&datadir, &extra_args).expect("datadir override should be prepared");
+
+        assert!(
+            !datadir.exists(),
+            "bootstrap should not prepare the overridden default datadir"
+        );
+        assert_eq!(
+            fs::read_to_string(override_datadir.join("custom.conf"))
+                .expect("override config should be readable"),
+            BOOTSTRAP_ZCASH_CONF
         );
     }
 
