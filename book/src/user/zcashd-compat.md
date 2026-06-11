@@ -63,7 +63,8 @@ listen_addr = "127.0.0.1:28232"                     # optional, default set when
 cookie_dir = "/path/to/cookies"                     # optional, defaults to <cache_dir>
 cookie_file_name = ".zcashd-compat.cookie"          # optional, defaults to ".zcashd-compat.cookie"
 startup_delay = "1s"
-restart_backoff = "2s"
+restart_backoff = "2s"                              # base exponential backoff
+restart_reset_after = "1h"
 max_restarts = 10
 shutdown_grace_period = "300s"
 ```
@@ -363,10 +364,18 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
 `zcashd_compat.manage_zcashd = true`):
 
 - If `zcashd` exits unexpectedly, Zebra's zcashd-compat supervisor restarts it using
-  `restart_backoff`, up to `max_restarts`.
+  exponential backoff based on `restart_backoff`, up to `max_restarts`
+  consecutive failures.
+- If a supervised `zcashd` child runs for at least `restart_reset_after` before
+  exiting, Zebra resets the consecutive restart count before applying the next
+  restart decision. This keeps old, recovered exits from permanently consuming
+  the restart budget.
 - If the zcashd-compat supervisor later exits or returns a runtime error (for
   example, spawn failures or restart-limit exhaustion while running), Zebra logs
   a warning and keeps running without zcashd supervision.
+- Zebra exposes zcashd-compat supervision state through metrics:
+  `zcashd_compat.supervisor.active`, `zcashd_compat.supervisor.disabled`, and
+  `zcashd_compat.supervisor.exhausted`.
 - Startup-time zcashd-compat config validation is unchanged. For example, if
   `zcashd_compat.manage_zcashd = true` and explicit `zcashd_path` cannot be resolved,
   Zebra startup fails with an error.

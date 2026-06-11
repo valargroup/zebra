@@ -88,8 +88,14 @@ pub struct Config {
     pub startup_delay: Duration,
 
     /// Delay between supervisor restart attempts.
+    ///
+    /// This is the base delay for exponential restart backoff.
     #[serde(with = "humantime_serde")]
     pub restart_backoff: Duration,
+
+    /// Child uptime that resets the supervisor's consecutive restart count.
+    #[serde(with = "humantime_serde")]
+    pub restart_reset_after: Duration,
 
     /// Maximum number of automatic restarts after unexpected exits.
     pub max_restarts: u32,
@@ -118,6 +124,7 @@ impl Default for Config {
             cookie_file_name: default_cookie_file_name(),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
+            restart_reset_after: Duration::from_secs(60 * 60),
             max_restarts: 10,
             shutdown_grace_period: Duration::from_secs(300),
         }
@@ -207,6 +214,10 @@ mod tests {
         assert_eq!(config.listen_addr, None);
         assert_eq!(config.cookie_dir, super::default_cache_dir());
         assert_eq!(config.cookie_file_name, super::default_cookie_file_name());
+        assert_eq!(
+            config.restart_reset_after,
+            std::time::Duration::from_secs(60 * 60)
+        );
     }
 
     #[test]
@@ -216,6 +227,21 @@ mod tests {
         assert_eq!(
             config.shutdown_grace_period,
             std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn deserialize_restart_reset_after_duration() {
+        let config: Config = toml::from_str(
+            r#"
+            restart_reset_after = "30m"
+            "#,
+        )
+        .expect("restart reset duration should deserialize");
+
+        assert_eq!(
+            config.restart_reset_after,
+            std::time::Duration::from_secs(30 * 60)
         );
     }
 
