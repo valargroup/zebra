@@ -21,6 +21,7 @@ use zebra_chain::{
         },
         Block, Height,
     },
+    block_info::BlockInfo,
     parameters::{
         testnet,
         Network::{self, *},
@@ -98,7 +99,12 @@ fn header_range_commit_keeps_body_availability_separate() {
 
     let mut batch = DiskWriteBatch::new();
     let committed_hash = batch
-        .prepare_header_range_batch(&state, genesis.hash(), std::slice::from_ref(&block1.header))
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+        )
         .expect("block 1 header links to genesis and has valid context");
     state
         .write_batch(batch)
@@ -127,13 +133,80 @@ fn header_range_commit_keeps_body_availability_separate() {
 }
 
 #[test]
+fn header_range_commit_stores_advertised_body_sizes_with_zero_as_unknown() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+
+    let headers = vec![block1.header.clone(), block2.header.clone()];
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(&state, genesis.hash(), &headers, &[123_456, 0])
+        .expect("block headers link to genesis and have valid context");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    assert_eq!(state.advertised_body_size(Height(1)), Some(123_456));
+    assert_eq!(state.advertised_body_size(Height(2)), None);
+}
+
+#[test]
+fn block_size_hints_prefer_confirmed_block_info_over_advertised_hint() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[999_999],
+        )
+        .expect("block 1 header links to genesis and has valid context");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+    assert_eq!(state.advertised_body_size(Height(1)), Some(999_999));
+
+    write_full_block_header_and_transactions(&state, block1.clone());
+    let block1_size = u32::try_from(block1.zcash_serialize_to_vec().unwrap().len())
+        .expect("serialized block size fits in u32");
+    let mut block_info_batch = DiskWriteBatch::new();
+    let _ = state
+        .block_info_cf()
+        .with_batch_for_writing(&mut block_info_batch)
+        .zs_insert(&Height(1), &BlockInfo::new(Default::default(), block1_size));
+    state
+        .db
+        .write(block_info_batch)
+        .expect("block info batch writes successfully");
+
+    assert_eq!(
+        crate::service::read::block_size_hints(
+            None::<Arc<crate::service::non_finalized_state::Chain>>,
+            &state,
+            Height(1),
+            1,
+        ),
+        vec![(Height(1), Some(block1_size))],
+    );
+}
+
+#[test]
 fn header_range_read_is_contiguous_capped_and_stops_at_first_gap() {
     let _init_guard = zebra_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();
 
     let mut batch = DiskWriteBatch::new();
     batch
-        .prepare_header_range_batch(&state, genesis.hash(), std::slice::from_ref(&block1.header))
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+        )
         .expect("block 1 header is valid");
     state.write_batch(batch).expect("header batch writes");
 
@@ -207,7 +280,7 @@ fn header_range_commit_rejects_finalized_or_body_conflicts() {
 
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
-        batch.prepare_header_range_batch(&state, genesis.hash(), &[Arc::new(conflicting)]),
+        batch.prepare_header_range_batch(&state, genesis.hash(), &[Arc::new(conflicting)], &[0]),
         Err(CommitHeaderRangeError::ImmutableConflict { height: Height(1) })
             | Err(CommitHeaderRangeError::ConflictingFullBlockHeader { height: Height(1) })
     ));
@@ -226,7 +299,7 @@ fn header_range_commit_rejects_checkpoint_conflicts() {
 
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
-        batch.prepare_header_range_batch(&state, genesis.hash(), &[Arc::new(forged)]),
+        batch.prepare_header_range_batch(&state, genesis.hash(), &[Arc::new(forged)], &[0]),
         Err(CommitHeaderRangeError::CheckpointConflict {
             height: Height(1),
             expected,
@@ -365,7 +438,7 @@ fn header_range_reorg_rejects_too_deep_overwrite() {
 
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
-        batch.prepare_header_range_batch(&state, conflict_anchor, &[conflicting_header]),
+        batch.prepare_header_range_batch(&state, conflict_anchor, &[conflicting_header], &[0]),
         Err(CommitHeaderRangeError::ReorgTooDeep {
             height,
             best_header_tip,
@@ -440,7 +513,7 @@ fn header_range_commit_rejects_non_current_anchor_hash() {
 
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
-        batch.prepare_header_range_batch(&state, stale_anchor, &[alternate_block2]),
+        batch.prepare_header_range_batch(&state, stale_anchor, &[alternate_block2], &[0]),
         Err(CommitHeaderRangeError::UnknownAnchor { anchor }) if anchor == stale_anchor
     ));
 
@@ -738,8 +811,9 @@ fn commit_header_range(
     headers: &[Arc<block::Header>],
 ) -> block::Hash {
     let mut batch = DiskWriteBatch::new();
+    let body_sizes = vec![0; headers.len()];
     let committed_hash = batch
-        .prepare_header_range_batch(state, anchor, headers)
+        .prepare_header_range_batch(state, anchor, headers, &body_sizes)
         .expect("header range is valid");
     state
         .write_batch(batch)

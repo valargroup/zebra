@@ -137,7 +137,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_1 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_2 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -3338,6 +3338,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
+const ZAKURA_STREAM_VERSION_2: u16 = 2;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4600,7 +4601,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_1,
+                    version: ZAKURA_STREAM_VERSION_2,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -4616,26 +4617,31 @@ mod tests {
         }) as Arc<dyn Service>])
         .expect("test registry declares unique stream kinds");
 
-        for kind in [
-            LEGACY_GOSSIP_STREAM_KIND,
-            LEGACY_REQUEST_STREAM_KIND,
-            DISCOVERY_STREAM_KIND,
-            HEADER_SYNC_STREAM_KIND,
-            ZAKURA_STREAM_BLOCK_SYNC,
+        for (kind, version) in [
+            (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
+            (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
+            (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_2),
+            (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
-                is_supported_stream(&registry, kind, ZAKURA_STREAM_VERSION_1),
-                "registered kind {kind} at version 1 must be supported"
+                is_supported_stream(&registry, kind, version),
+                "registered kind {kind} at declared version {version} must be supported"
             );
             assert!(
                 !is_supported_stream(&registry, kind, 0),
                 "registered kind {kind} at version 0 must be rejected"
             );
             assert!(
-                !is_supported_stream(&registry, kind, 2),
+                !is_supported_stream(&registry, kind, version.saturating_add(1)),
                 "registered kind {kind} at an unsupported version must be rejected"
             );
         }
+
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
+            "header-sync v1 is intentionally rejected after the clean v2 break"
+        );
 
         assert_eq!(stream_kind_label(2), "gossip");
         assert_eq!(stream_kind_label(3), "legacy_request");

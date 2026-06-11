@@ -932,6 +932,7 @@ impl StateService {
         &self,
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
@@ -944,6 +945,7 @@ impl StateService {
             sender.send(NonFinalizedWriteMessage::CommitHeaderRange {
                 anchor,
                 headers,
+                body_sizes,
                 rsp_tx,
             })
         {
@@ -1174,9 +1176,13 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            Request::CommitHeaderRange { anchor, headers } => {
+            Request::CommitHeaderRange {
+                anchor,
+                headers,
+                body_sizes,
+            } => {
                 let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_header_range(anchor, headers))
+                    span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
                 });
 
                 let span = Span::current();
@@ -1670,6 +1676,10 @@ impl Service<ReadRequest> for ReadStateService {
                         .missing_block_bodies(verified_block_tip, best_header_tip, from, limit),
                 ))
             }
+
+            ReadRequest::BlockSizeHints { from, count } => Ok(ReadResponse::BlockSizeHints(
+                read::block_size_hints(state.latest_best_chain(), &state.db, from, count),
+            )),
 
             ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
                 read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),

@@ -180,11 +180,13 @@ impl HeaderSyncReactor {
                 start_height,
                 requested_count,
                 headers,
+                body_sizes,
             } => self.handle_header_range_response_ready(
                 peer,
                 start_height,
                 requested_count,
                 headers,
+                body_sizes,
             ),
         }
     }
@@ -581,12 +583,19 @@ impl HeaderSyncReactor {
         start_height: block::Height,
         requested_count: u32,
         headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
     ) {
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
             return;
         };
+        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
+            peer_state.finish_serving_headers();
+            return;
+        }
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        let send_result = peer_state.session.try_send_headers(headers);
+        let send_result = peer_state
+            .session
+            .try_send_headers_with_sizes(headers, body_sizes);
         peer_state.finish_serving_headers();
 
         match send_result {
@@ -639,8 +648,11 @@ impl HeaderSyncReactor {
                 self.trace_status_received(&peer, status);
                 self.schedule().await;
             }
-            HeaderSyncMessage::Headers(headers) => {
-                self.handle_headers(peer, headers).await;
+            HeaderSyncMessage::Headers {
+                headers,
+                body_sizes,
+            } => {
+                self.handle_headers(peer, headers, body_sizes).await;
             }
             HeaderSyncMessage::GetHeaders {
                 start_height,
@@ -804,7 +816,12 @@ impl HeaderSyncReactor {
     }
 
     #[tracing::instrument(skip(self, headers))]
-    async fn handle_headers(&mut self, peer: ZakuraPeerId, headers: Vec<Arc<block::Header>>) {
+    async fn handle_headers(
+        &mut self,
+        peer: ZakuraPeerId,
+        headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
+    ) {
         metrics::counter!("sync.header.response.received").increment(1);
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::UnsolicitedHeaders)
@@ -825,6 +842,7 @@ impl HeaderSyncReactor {
         self.handle_headers_for_outstanding(
             peer,
             headers,
+            body_sizes,
             outstanding,
             peer_max_headers_per_response,
             in_flight_count,
@@ -836,10 +854,19 @@ impl HeaderSyncReactor {
         &mut self,
         peer: ZakuraPeerId,
         headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
         outstanding: OutstandingRange,
         peer_max_headers_per_response: u32,
         in_flight_count: usize,
     ) {
+        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
+                .await;
+            self.state.schedule.retry(outstanding.range);
+            self.schedule().await;
+            return;
+        }
+
         if headers.is_empty() {
             self.record_advisory_unconfirmed(&peer);
             let deadline = Instant::now() + self.empty_headers_retry_delay();
@@ -944,6 +971,7 @@ impl HeaderSyncReactor {
                 anchor: outstanding.range.anchor_hash,
                 start_height: outstanding.range.start_height,
                 headers,
+                body_sizes,
                 finalized: outstanding.range.finalized,
             })
             .await;

@@ -302,6 +302,19 @@ pub(super) fn validate_headers_len(len: usize, max: usize) -> Result<(), HeaderS
     Ok(())
 }
 
+pub(super) fn validate_body_sizes_len(
+    headers: usize,
+    body_sizes: usize,
+) -> Result<(), HeaderSyncWireError> {
+    if headers != body_sizes {
+        return Err(HeaderSyncWireError::BodySizeCountMismatch {
+            headers,
+            body_sizes,
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn clamp_advertised_range(value: u32) -> u32 {
     value.clamp(1, MAX_HS_RANGE)
 }

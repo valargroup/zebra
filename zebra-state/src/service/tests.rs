@@ -14,7 +14,7 @@ use zebra_chain::{
     chain_tip::ChainTip,
     fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction, transparent,
     value_balance::ValueBalance,
 };
@@ -308,15 +308,40 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
         ReadResponse::FinalizedTip(Some((Height(0), genesis.hash()))),
     );
 
+    let genesis_size = u32::try_from(genesis.zcash_serialize_to_vec()?.len())
+        .expect("serialized block size fits in u32");
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::BlockSizeHints {
+                from: Height(0),
+                count: 1,
+            })
+            .await?,
+        ReadResponse::BlockSizeHints(vec![(Height(0), Some(genesis_size))]),
+    );
+
     assert_eq!(
         state
             .clone()
             .oneshot(Request::CommitHeaderRange {
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
+                body_sizes: vec![999_999, 0],
             })
             .await?,
         Response::Committed(block2_hash),
+    );
+
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::BlockSizeHints {
+                from: Height(1),
+                count: 2,
+            })
+            .await?,
+        ReadResponse::BlockSizeHints(vec![(Height(1), Some(999_999)), (Height(2), None)]),
     );
 
     assert_eq!(
@@ -360,6 +385,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     );
     assert_eq!(
         state
+            .clone()
             .oneshot(Request::AnyChainBlock(block1_hash.into()))
             .await?,
         Response::Block(None),
@@ -409,6 +435,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .await?,
         ReadResponse::MissingBlockBodies(vec![Height(1), Height(2)]),
     );
+
     assert_eq!(
         read_state.oneshot(ReadRequest::FinalizedTip).await?,
         ReadResponse::FinalizedTip(Some((Height(0), genesis.hash()))),

@@ -130,7 +130,8 @@ pub fn header_sync_count_by_byte_budget(network: &Network, max_frame_bytes: u32)
         .unwrap_or(usize::MAX)
         .saturating_sub(FRAME_HEADER_BYTES);
     let payload_cap = MAX_HS_MESSAGE_BYTES.min(frame_payload_cap);
-    let header_bytes = header_sync_header_bytes_for_network(network);
+    let header_bytes =
+        header_sync_header_bytes_for_network(network).saturating_add(HEADER_SYNC_BODY_SIZE_BYTES);
     let count = payload_cap
         .saturating_sub(HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES)
         / header_bytes;

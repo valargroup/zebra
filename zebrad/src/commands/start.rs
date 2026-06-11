@@ -320,6 +320,33 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                     .await
                 {
                     Ok(zebra_state::ReadResponse::Headers(headers)) => {
+                        let body_size_hints = match read_state
+                            .clone()
+                            .oneshot(zebra_state::ReadRequest::BlockSizeHints {
+                                from: start,
+                                count,
+                            })
+                            .await
+                        {
+                            Ok(zebra_state::ReadResponse::BlockSizeHints(hints)) => hints,
+                            Ok(response) => {
+                                warn!(?peer, ?response, "unexpected BlockSizeHints response");
+                                Vec::new()
+                            }
+                            Err(error) => {
+                                warn!(
+                                    ?peer,
+                                    ?error,
+                                    "failed to read Zakura BlockSizeHints response from state"
+                                );
+                                Vec::new()
+                            }
+                        };
+                        let body_sizes = body_sizes_for_served_header_range(
+                            start,
+                            headers.iter().map(|(height, _, _)| *height),
+                            &body_size_hints,
+                        );
                         let headers = headers
                             .into_iter()
                             .map(|(_height, _hash, header)| header)
@@ -330,6 +357,7 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                                 start_height: start,
                                 requested_count: count,
                                 headers,
+                                body_sizes,
                             })
                             .await;
                     }
@@ -366,12 +394,17 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
                 anchor,
                 start_height,
                 headers,
+                body_sizes,
                 finalized: _finalized,
             } => {
                 let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                 match state
                     .clone()
-                    .oneshot(zebra_state::Request::CommitHeaderRange { anchor, headers })
+                    .oneshot(zebra_state::Request::CommitHeaderRange {
+                        anchor,
+                        headers,
+                        body_sizes,
+                    })
                     .await
                 {
                     Ok(zebra_state::Response::Committed(tip_hash)) => {
@@ -451,6 +484,28 @@ async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
             }
         }
     }
+}
+
+fn body_sizes_for_served_header_range(
+    start: block::Height,
+    header_heights: impl IntoIterator<Item = block::Height>,
+    body_size_hints: &[(block::Height, Option<u32>)],
+) -> Vec<u32> {
+    header_heights
+        .into_iter()
+        .map(|height| {
+            let Some(offset) = usize::try_from(height - start).ok() else {
+                return 0;
+            };
+
+            body_size_hints
+                .get(offset)
+                .and_then(|(hint_height, size)| {
+                    (*hint_height == height).then_some(size.unwrap_or(0))
+                })
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn block_verify_error_is_duplicate<Error>(error: &Error) -> bool
@@ -1680,6 +1735,33 @@ mod tests {
 #[cfg(test)]
 mod zakura_header_sync_driver_tests {
     use super::*;
+
+    #[test]
+    fn served_header_body_size_hints_align_with_served_heights() {
+        let start = block::Height(10);
+        let header_heights = [
+            block::Height(10),
+            block::Height(11),
+            block::Height(12),
+            block::Height(13),
+        ];
+        let body_size_hints = [
+            (block::Height(10), Some(100)),
+            (block::Height(11), None),
+            (block::Height(12), Some(300)),
+            (block::Height(13), Some(400)),
+        ];
+
+        assert_eq!(
+            body_sizes_for_served_header_range(start, header_heights, &body_size_hints),
+            vec![100, 0, 300, 400],
+        );
+
+        assert_eq!(
+            body_sizes_for_served_header_range(start, header_heights, &[]),
+            vec![0, 0, 0, 0],
+        );
+    }
 
     #[test]
     fn block_verify_error_duplicate_classifier_detects_router_and_block_errors() {

@@ -114,6 +114,24 @@ fn mainnet_header(bytes: &[u8]) -> Arc<block::Header> {
     mainnet_block(bytes).header.clone()
 }
 
+fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+    let body_sizes = vec![0; headers.len()];
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+    }
+}
+
+fn headers_message_with_sizes(
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+) -> HeaderSyncMessage {
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+    }
+}
+
 async fn validate_headers_stateless_after_equihash_acceptance(
     headers: Vec<Arc<block::Header>>,
     context: HeaderSyncValidationContext<'_>,
@@ -440,7 +458,7 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -508,7 +526,7 @@ async fn advisory_backoff_is_pruned_on_peer_disconnected() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -748,7 +766,18 @@ fn codec_round_trips_get_headers() {
 #[test]
 fn codec_round_trips_headers_with_bounded_vector() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
-    let message = HeaderSyncMessage::Headers(headers);
+    let message = headers_message_with_sizes(headers, vec![123_456]);
+
+    let encoded = message.encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, headers_context(1, 1)).unwrap();
+
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn codec_round_trips_headers_with_unknown_body_size_sentinel() {
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    let message = headers_message_with_sizes(headers, vec![0]);
 
     let encoded = message.encode().unwrap();
     let decoded = HeaderSyncMessage::decode(&encoded, headers_context(1, 1)).unwrap();
@@ -783,6 +812,36 @@ fn codec_rejects_unknown_message_types_and_trailing_bytes() {
 
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()),
+        Err(HeaderSyncWireError::TrailingBytes)
+    ));
+}
+
+#[test]
+fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    let message = headers_message_with_sizes(headers.clone(), vec![100]);
+
+    assert!(matches!(
+        headers_message_with_sizes(headers.clone(), vec![100, 200]).encode(),
+        Err(HeaderSyncWireError::BodySizeCountMismatch {
+            headers: 1,
+            body_sizes: 2,
+        })
+    ));
+
+    let mut truncated_mid_size = message.encode().unwrap();
+    truncated_mid_size.pop();
+    assert!(HeaderSyncMessage::decode(&truncated_mid_size, headers_context(1, 1)).is_err());
+
+    let mut truncated_mid_header = vec![MSG_HS_HEADERS];
+    truncated_mid_header.write_u32::<LittleEndian>(1).unwrap();
+    truncated_mid_header.extend_from_slice(&[0; 8]);
+    assert!(HeaderSyncMessage::decode(&truncated_mid_header, headers_context(1, 1)).is_err());
+
+    let mut with_trailing = message.encode().unwrap();
+    with_trailing.push(0);
+    assert!(matches!(
+        HeaderSyncMessage::decode(&with_trailing, headers_context(1, 1)),
         Err(HeaderSyncWireError::TrailingBytes)
     ));
 }
@@ -829,13 +888,19 @@ fn decode_rejects_header_counts_over_contract_caps() {
 fn headers_codec_does_not_use_legacy_160_header_cap() {
     let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
     let headers = vec![header; 161];
-    let message = HeaderSyncMessage::Headers(headers);
+    let message = headers_message(headers);
 
     let encoded = message.encode().unwrap();
     let decoded = HeaderSyncMessage::decode(&encoded, headers_context(161, 161)).unwrap();
 
     match decoded {
-        HeaderSyncMessage::Headers(headers) => assert_eq!(headers.len(), 161),
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+        } => {
+            assert_eq!(headers.len(), 161);
+            assert_eq!(body_sizes, vec![0; 161]);
+        }
         _ => panic!("decoded message must be Headers"),
     }
 }
@@ -905,7 +970,7 @@ fn header_serialized_sizes_are_exact_and_message_cap_has_headroom() {
 
     let default_response_bytes = HEADER_SYNC_MESSAGE_TYPE_BYTES
         + HEADER_SYNC_COUNT_BYTES
-        + COMMON_HEADER_BYTES * DEFAULT_HS_RANGE as usize;
+        + (COMMON_HEADER_BYTES + HEADER_SYNC_BODY_SIZE_BYTES) * DEFAULT_HS_RANGE as usize;
     assert!(default_response_bytes < MAX_HS_MESSAGE_BYTES);
     assert!(MAX_HS_MESSAGE_BYTES < LOCAL_MAX_MESSAGE_BYTES as usize);
 }
@@ -924,7 +989,7 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
     let headers =
         truncate_headers_to_byte_budget(headers, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES);
-    let encoded = HeaderSyncMessage::Headers(headers).encode().unwrap();
+    let encoded = headers_message(headers).encode().unwrap();
 
     assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
     assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
@@ -1337,7 +1402,7 @@ async fn incoming_headers_match_outstanding_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
         })
         .await
         .unwrap();
@@ -1399,7 +1464,7 @@ async fn headers_over_outstanding_contract_reports_response_too_long_without_flo
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![
+            msg: headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_1_BYTES),
                 mainnet_header(&BLOCK_MAINNET_2_BYTES),
             ]),
@@ -1471,7 +1536,7 @@ async fn matching_headers_are_statelessly_validated_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![
+            msg: headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_1_BYTES),
                 Arc::new(bad_second),
             ]),
@@ -1569,7 +1634,7 @@ async fn peer_disconnect_removes_outstanding_requests_for_that_peer() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
         })
         .await
         .unwrap();
@@ -1680,7 +1745,7 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: second_peer,
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -1719,7 +1784,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: first_peer.clone(),
-            msg: HeaderSyncMessage::Headers(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
         })
         .await
         .unwrap();
@@ -1878,7 +1943,7 @@ async fn full_block_committed_covers_outstanding_height() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id,
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -2800,7 +2865,7 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_disconnect(
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
         })
         .await
         .unwrap();
@@ -2875,7 +2940,7 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -2912,7 +2977,7 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(Vec::new()),
+            msg: headers_message(Vec::new()),
         })
         .await
         .unwrap();
@@ -3000,7 +3065,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(headers.to_vec()),
+            msg: headers_message(headers.to_vec()),
         })
         .await
         .unwrap();
@@ -3064,7 +3129,7 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(headers[..2].to_vec()),
+            msg: headers_message(headers[..2].to_vec()),
         })
         .await
         .unwrap();
@@ -3121,7 +3186,7 @@ async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(headers.to_vec()),
+            msg: headers_message(headers.to_vec()),
         })
         .await
         .unwrap();
@@ -3179,7 +3244,7 @@ async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![
+            msg: headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
@@ -3231,7 +3296,7 @@ async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_comm
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
         })
         .await
         .unwrap();
@@ -3288,7 +3353,7 @@ async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: HeaderSyncMessage::Headers(headers.to_vec()),
+            msg: headers_message(headers.to_vec()),
         })
         .await
         .unwrap();

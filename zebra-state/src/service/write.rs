@@ -152,6 +152,7 @@ pub enum NonFinalizedWriteMessage {
     CommitHeaderRange {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
         rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
     },
     /// The hash of a block that should be invalidated and removed from
@@ -368,11 +369,17 @@ impl WriteBlockWorkerTask {
                 NonFinalizedWriteMessage::CommitHeaderRange {
                     anchor,
                     headers,
+                    body_sizes,
                     rsp_tx,
                 } => {
                     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
                     let result = batch
-                        .prepare_header_range_batch(&finalized_state.db, anchor, &headers)
+                        .prepare_header_range_batch(
+                            &finalized_state.db,
+                            anchor,
+                            &headers,
+                            &body_sizes,
+                        )
                         .and_then(|hash| {
                             finalized_state
                                 .db

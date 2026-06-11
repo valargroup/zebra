@@ -172,6 +172,14 @@ mod tests {
         BLOCK_MAINNET_5_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
     };
 
+    fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+        let body_sizes = vec![0; headers.len()];
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+        }
+    }
+
     #[derive(Debug, Default)]
     struct OrderedSourceProbeService {
         senders: Arc<Mutex<HashMap<ZakuraPeerId, FramedSend>>>,
@@ -827,7 +835,7 @@ mod tests {
                             .handle
                             .send(HeaderSyncEvent::WireMessage {
                                 peer: local.peer_id.clone(),
-                                msg: HeaderSyncMessage::Headers(headers),
+                                msg: headers_message(headers),
                             })
                             .await;
                         let _ = local
@@ -847,6 +855,7 @@ mod tests {
                     start_height,
                     headers,
                     finalized,
+                    ..
                 } => {
                     let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     let result = local
@@ -2008,7 +2017,7 @@ mod tests {
             HostilePeer::connect_native_with_capabilities(&victim, 13, ZAKURA_CAP_HEADER_SYNC)
                 .await?;
         let unsolicited_headers =
-            HeaderSyncMessage::Headers(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()])
+            headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()])
                 .encode_frame()?;
         unsolicited
             .send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, unsolicited_headers)
@@ -2431,9 +2440,7 @@ mod tests {
             .inject(
                 victim,
                 unsolicited,
-                HeaderSyncMessage::Headers(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES)
-                    .header
-                    .clone()]),
+                headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
             )
             .await;
         cluster
@@ -2452,9 +2459,7 @@ mod tests {
             .inject(
                 victim,
                 out_of_range,
-                HeaderSyncMessage::Headers(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES)
-                    .header
-                    .clone()]),
+                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
             )
             .await;
         cluster
@@ -2496,7 +2501,7 @@ mod tests {
             .inject(
                 victim,
                 response_too_long,
-                HeaderSyncMessage::Headers(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                 ]),
@@ -2534,7 +2539,7 @@ mod tests {
             .inject(
                 bad_continuity_victim,
                 bad_continuity,
-                HeaderSyncMessage::Headers(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
                 ]),
@@ -2566,7 +2571,7 @@ mod tests {
             .inject(
                 bad_pow_victim,
                 bad_pow,
-                HeaderSyncMessage::Headers(vec![Arc::new(bad_pow_header)]),
+                headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
         cluster
@@ -2599,7 +2604,7 @@ mod tests {
             .inject(
                 bad_daa_victim,
                 bad_daa,
-                HeaderSyncMessage::Headers(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
@@ -2639,7 +2644,7 @@ mod tests {
             .inject(
                 checkpointed,
                 bad_checkpoint_backfill,
-                HeaderSyncMessage::Headers(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),

@@ -989,7 +989,10 @@ mod tests {
             .header_sync
             .send(HeaderSyncEvent::WireMessage {
                 peer: fixture.peer_id.clone(),
-                msg: HeaderSyncMessage::Headers(Vec::new()),
+                msg: HeaderSyncMessage::Headers {
+                    headers: Vec::new(),
+                    body_sizes: Vec::new(),
+                },
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
