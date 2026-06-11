@@ -235,14 +235,11 @@ fn find_conf_arg(extra_args: &[String]) -> Option<&str> {
 }
 
 fn find_last_arg_value<'a>(extra_args: &'a [String], name: &str) -> Option<&'a str> {
-    let mut args = extra_args.iter().map(String::as_str).peekable();
     let mut value_arg = None;
     let short_equals = format!("-{name}=");
     let long_equals = format!("--{name}=");
-    let short = format!("-{name}");
-    let long = format!("--{name}");
 
-    while let Some(arg) = args.next() {
+    for arg in extra_args {
         if let Some(value) = arg.strip_prefix(&short_equals) {
             value_arg = Some(value);
             continue;
@@ -250,11 +247,6 @@ fn find_last_arg_value<'a>(extra_args: &'a [String], name: &str) -> Option<&'a s
 
         if let Some(value) = arg.strip_prefix(&long_equals) {
             value_arg = Some(value);
-            continue;
-        }
-
-        if arg == short || arg == long {
-            value_arg = args.next();
         }
     }
 
@@ -404,17 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_paired_conf_arg() {
-        let datadir = PathBuf::from("/zcashd-datadir");
-        let extra_args = vec!["-conf".to_string(), "custom.conf".to_string()];
-
-        assert_eq!(
-            resolve_zcashd_conf_path(&datadir, &extra_args),
-            datadir.join("custom.conf")
-        );
-    }
-
-    #[test]
     fn resolves_last_conf_arg() {
         let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf=old.conf".to_string(), "--conf=new.conf".to_string()];
@@ -422,6 +403,17 @@ mod tests {
         assert_eq!(
             resolve_zcashd_conf_path(&datadir, &extra_args),
             datadir.join("new.conf")
+        );
+    }
+
+    #[test]
+    fn ignores_paired_conf_arg() {
+        let datadir = PathBuf::from("/zcashd-datadir");
+        let extra_args = vec!["-conf".to_string(), "custom.conf".to_string()];
+
+        assert_eq!(
+            resolve_zcashd_conf_path(&datadir, &extra_args),
+            datadir.join("zcash.conf")
         );
     }
 
