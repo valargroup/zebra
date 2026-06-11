@@ -1,5 +1,9 @@
 use super::{config::*, events::*, reorder::*, scheduler::*, state::*, wire::*, *};
-use crate::zakura::{ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot};
+use crate::zakura::{
+    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraBlockSyncCandidateState,
+};
+use iroh::NodeId;
 
 const SOFT_MISBEHAVIOR_DISCONNECT_THRESHOLD: u32 = 3;
 
@@ -18,12 +22,14 @@ pub fn spawn_block_sync_reactor(
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let (peers_tx, peers_rx) = watch::channel(state.peer_snapshot(startup.config.peer_limits));
     let (status_tx, status_rx) = watch::channel(state.last_advertised_status);
+    let (candidates_tx, candidates_rx) = watch::channel(ZakuraBlockSyncCandidateState::default());
 
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
         peers: peers_rx,
         status: status_rx,
+        candidates: candidates_rx,
     };
     let reactor = BlockSyncReactor {
         startup,
@@ -33,6 +39,7 @@ pub fn spawn_block_sync_reactor(
         actions: actions_tx,
         peers: peers_tx,
         status: status_tx,
+        candidates: candidates_tx,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -48,6 +55,7 @@ pub(super) struct BlockSyncReactor {
     actions: mpsc::Sender<BlockSyncAction>,
     peers: watch::Sender<ServicePeerSnapshot>,
     status: watch::Sender<BlockSyncStatus>,
+    candidates: watch::Sender<ZakuraBlockSyncCandidateState>,
 }
 
 impl BlockSyncReactor {
@@ -175,6 +183,22 @@ impl BlockSyncReactor {
             .send(self.state.peer_snapshot(self.startup.config.peer_limits));
     }
 
+    fn publish_candidate_state(&self) {
+        let mut admitted_node_ids: Vec<_> = self
+            .state
+            .peers
+            .keys()
+            .filter_map(node_id_from_block_peer_id)
+            .collect();
+        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.dedup();
+
+        let _ = self.candidates.send(ZakuraBlockSyncCandidateState {
+            missing_block_bodies: self.state.needed_heights.clone(),
+            admitted_node_ids,
+        });
+    }
+
     async fn handle_peer_connected(&mut self, session: BlockSyncPeerSession) {
         let peer = session.peer_id().clone();
         let direction = session.direction();
@@ -183,6 +207,7 @@ impl BlockSyncReactor {
             self.state.parked_peers.insert(peer);
             session.cancel_token().cancel();
             self.publish_peer_snapshot();
+            self.publish_candidate_state();
             return;
         }
 
@@ -196,6 +221,7 @@ impl BlockSyncReactor {
             })
             .or_insert_with(|| PeerBlockState::new(session, &self.startup.config));
         self.publish_peer_snapshot();
+        self.publish_candidate_state();
         self.send_status(&peer).await;
         self.schedule().await;
     }
@@ -210,12 +236,14 @@ impl BlockSyncReactor {
         self.state.parked_peers.remove(&peer);
         self.state.schedule.forget_peer(&peer);
         self.publish_peer_snapshot();
+        self.publish_candidate_state();
     }
 
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         if !self.query_needed_blocks().await {
+            self.clear_needed_heights();
             self.drop_ranges_not_in_needed(&HashMap::new());
             self.state.schedule.retain_matching_needed(&HashMap::new());
         }
@@ -234,6 +262,7 @@ impl BlockSyncReactor {
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
         if !self.query_needed_blocks().await {
+            self.clear_needed_heights();
             self.drop_ranges_not_in_needed(&HashMap::new());
             self.state.schedule.retain_matching_needed(&HashMap::new());
         }
@@ -253,10 +282,17 @@ impl BlockSyncReactor {
 
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
-        self.query_needed_blocks().await;
+        if !self.query_needed_blocks().await {
+            self.clear_needed_heights();
+        }
     }
 
     async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
+        self.state.needed_heights = blocks.iter().map(|block| block.height).collect();
+        self.state.needed_heights.sort_unstable();
+        self.state.needed_heights.dedup();
+        self.publish_candidate_state();
+
         let needed = blocks
             .into_iter()
             .map(|block| NeededBlock {
@@ -273,6 +309,14 @@ impl BlockSyncReactor {
         self.state.schedule.retain_matching_needed(&needed_hashes);
         self.state.schedule.refresh_needed(needed);
         self.schedule().await;
+    }
+
+    fn clear_needed_heights(&mut self) {
+        if self.state.needed_heights.is_empty() {
+            return;
+        }
+        self.state.needed_heights.clear();
+        self.publish_candidate_state();
     }
 
     async fn handle_wire_decode_failed(
@@ -856,6 +900,11 @@ impl BlockSyncReactor {
             .send(BlockSyncAction::Misbehavior { peer, reason })
             .await;
     }
+}
+
+fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
+    let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
 }
 
 fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::zakura::{
     framed_channel, FramedRecv, FramedSend, Peer, PeerStreamSession, Service, ServicePeerSnapshot,
-    ServiceRegistry, StreamMode,
+    ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
 };
 use zebra_chain::{
     fmt::HexDebug,
@@ -119,6 +119,10 @@ async fn wait_for_getblocks(
                     },
             } => return (peer, start_height, count),
             BlockSyncAction::SendMessage { .. } => {}
+            BlockSyncAction::Misbehavior {
+                reason: BlockSyncMisbehavior::UnsolicitedBlock,
+                ..
+            } => {}
             action => panic!("unexpected action before GetBlocks: {action:?}"),
         }
     }
@@ -903,11 +907,13 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
+    let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
         peers,
         status,
+        candidates,
     };
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(91);
@@ -923,7 +929,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         streams,
         CancellationToken::new(),
     ));
-    drop(inbound_tx);
+    let _inbound_tx = inbound_tx;
 
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
@@ -2800,6 +2806,102 @@ async fn reactor_limits_serving_slots_and_disconnects_repeated_soft_misbehavior(
     })
     .await
     .expect("repeated soft misbehavior disconnects the peer");
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_publishes_block_sync_candidate_gap() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer_id = peer(77);
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, _outbound_rx) = framed_channel(8);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer_id.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+    drop(inbound_tx);
+    assert_eq!(wait_for_connect_status(&mut actions).await, peer_id);
+
+    tip_tx
+        .send((block::Height(2), block::Hash([2; 32])))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: block::Hash([2; 32]),
+                size: BlockSizeEstimate::Unknown,
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(1),
+                hash: block::Hash([1; 32]),
+                size: BlockSizeEstimate::Unknown,
+            },
+        ]))
+        .await
+        .expect("needed blocks event queues");
+
+    let mut candidates = handle.subscribe_candidate_state();
+    let observed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            candidates
+                .changed()
+                .await
+                .expect("candidate watch remains open");
+            let state = candidates.borrow().clone();
+            if state.missing_block_bodies == vec![block::Height(1), block::Height(2)] {
+                return state;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| handle.candidate_state());
+    assert_eq!(
+        observed.missing_block_bodies,
+        vec![block::Height(1), block::Height(2)]
+    );
+
+    handle
+        .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(2),
+            verified_block_hash: block::Hash([2; 32]),
+        }))
+        .await
+        .expect("frontier event queues");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.candidate_state().missing_block_bodies.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("candidate state clears after the gap is gone");
 
     reactor_task.abort();
 }

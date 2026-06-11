@@ -35,7 +35,7 @@ mod state;
 mod tests;
 mod wire;
 
-pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig};
+pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior};
 pub use reactor::spawn_block_sync_reactor;

@@ -2115,9 +2115,10 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         } else {
             (None, None, None)
         };
-    let discovery_service = Arc::new(super::DiscoveryService::with_header_sync(
+    let discovery_service = Arc::new(super::DiscoveryService::with_sync_services(
         discovery.clone(),
         header_sync.clone(),
+        block_sync.clone(),
     )) as Arc<dyn Service>;
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let registry = service_registry(

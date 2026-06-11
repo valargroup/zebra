@@ -382,9 +382,10 @@ impl ZakuraTestNodeBuilder {
             None
         };
         let discovery_service = if let Some(header_sync) = header_sync.as_ref() {
-            Arc::new(DiscoveryService::with_header_sync(
+            Arc::new(DiscoveryService::with_sync_services(
                 discovery.clone(),
                 header_sync.clone(),
+                None,
             )) as Arc<dyn Service>
         } else {
             Arc::new(DiscoveryService::new(discovery.clone())) as Arc<dyn Service>

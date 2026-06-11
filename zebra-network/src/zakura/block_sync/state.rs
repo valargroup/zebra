@@ -1,5 +1,5 @@
 use super::{config::*, reorder::*, scheduler::*, *};
-use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot};
+use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 8;
 
@@ -74,6 +74,7 @@ pub struct BlockSyncHandle {
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
+    pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
 }
 
 impl BlockSyncHandle {
@@ -117,6 +118,16 @@ impl BlockSyncHandle {
     pub fn local_status(&self) -> BlockSyncStatus {
         *self.status.borrow()
     }
+
+    /// Subscribe to block-sync candidate-selection hints.
+    pub fn subscribe_candidate_state(&self) -> watch::Receiver<ZakuraBlockSyncCandidateState> {
+        self.candidates.clone()
+    }
+
+    /// Return the currently cached block-sync candidate-selection hints.
+    pub fn candidate_state(&self) -> ZakuraBlockSyncCandidateState {
+        self.candidates.borrow().clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +144,7 @@ pub(super) struct BlockSyncState {
     pub(super) schedule: BlockRangeScheduler,
     pub(super) reorder: ReorderBuffer,
     pub(super) budget: ByteBudget,
+    pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
     pub(super) pending_status_refresh: bool,
     pub(super) last_advertised_status: BlockSyncStatus,
@@ -162,6 +174,7 @@ impl BlockSyncState {
             schedule: BlockRangeScheduler::new(startup.config.fanout),
             reorder: ReorderBuffer::new(),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
+            needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
             pending_status_refresh: false,
             last_advertised_status,
