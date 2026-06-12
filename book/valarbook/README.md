@@ -2,7 +2,7 @@
 
 This proof of concept is a small, committed GitBook layout for evaluating how Zebra documentation would read outside the current mdBook pipeline.
 
-The production documentation remains in `book/src` and is still published by `.github/workflows/book.yml`. Valarbook is intentionally separate so reviewers can compare structure, navigation, and page rendering without changing Zebra's GitHub Pages site, internal Rust documentation, or benchmark dashboard.
+The production documentation remains in `book/src` and is still published by `.github/workflows/book.yml`. Valarbook is intentionally separate so reviewers can compare structure, navigation, and page rendering before deciding whether a broader documentation migration is useful.
 
 ## What This Preview Tests
 
@@ -10,6 +10,7 @@ The production documentation remains in `book/src` and is still published by `.g
 - A compact landing page for orienting readers.
 - A user-facing page adapted from the Zcash integration-tests documentation style.
 - A project-facing page that records the migration questions maintainers need answered before any larger docs change.
+- A GitHub Actions workflow that builds the layout with HonKit and deploys it to GitHub Pages outside pull request runs.
 
 ## Review Checklist
 

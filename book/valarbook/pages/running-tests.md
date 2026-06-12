@@ -32,7 +32,7 @@ mdbook build book --dest-dir target/docs
 
 ## Preview Review
 
-The GitBook POC workflow uploads this directory as the `valarbook-preview` artifact. Reviewers should download that artifact, inspect the committed layout, and compare it with Zebra's current mdBook output.
+The GitBook workflow builds this directory with HonKit. Pull requests run the build as validation, while manual runs and pushes to `ironwood-main` deploy the rendered site to GitHub Pages.
 
 The preview should answer these questions:
 

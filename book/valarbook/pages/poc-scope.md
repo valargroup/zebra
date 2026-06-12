@@ -8,11 +8,11 @@ This page captures the boundaries for the GitBook proof of concept. It is placeh
 - Keep Valarbook independent from the production mdBook deployment.
 - Preserve the current source of truth in `book/src` while the experiment is reviewed.
 - Identify GitBook-specific formatting issues before any broader migration work.
+- Deploy the rendered Valarbook site from CI when the workflow runs outside pull requests.
 
 ## Out Of Scope
 
 - Replacing `.github/workflows/book.yml`.
-- Publishing to the existing `github-pages` environment.
 - Moving internal Rust API docs into GitBook.
 - Mirroring the benchmark dashboard under Valarbook.
 
