@@ -186,6 +186,12 @@ impl StartCmd {
     const ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES: u64 = 1024 * 1024;
     /// Conservative response budget needed per raw-block sync batch entry.
     const ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK: u64 = 4 * 1024 * 1024;
+    /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
+    /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
+    /// the full grace period before its SIGKILL last resort, so the outer wait
+    /// must be strictly longer or aborting the task races the graceful path.
+    const ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN: std::time::Duration =
+        std::time::Duration::from_secs(30);
     /// Default zcashd-compat RPC listen address when `--zcashd-compat` is enabled.
     fn zcashd_compat_default_rpc_listen_addr() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 28232))
@@ -409,11 +415,19 @@ impl StartCmd {
     }
 
     /// Returns the supervisor shutdown timeout when zcashd-compat `zcashd` supervision is active.
+    ///
+    /// This is the configured `shutdown_grace_period` plus a fixed margin, so the
+    /// supervisor task always gets to finish its own SIGTERM → grace → SIGKILL
+    /// sequence before Zebra gives up on the task.
     fn zcashd_compat_supervisor_shutdown_timeout(
         config: &ZebradConfig,
     ) -> Option<std::time::Duration> {
-        (config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd)
-            .then_some(config.zcashd_compat.shutdown_grace_period)
+        (config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd).then_some(
+            config
+                .zcashd_compat
+                .shutdown_grace_period
+                .saturating_add(Self::ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN),
+        )
     }
 
     async fn start(&self) -> Result<(), Report> {
@@ -957,6 +971,9 @@ impl StartCmd {
             .await
             .is_err()
             {
+                // The supervisor spawns zcashd without kill_on_drop, so this
+                // abort abandons an already-signalled child rather than
+                // SIGKILLing it mid-flush.
                 zcashd_compat_task_handle.abort();
             }
         } else {
@@ -1721,7 +1738,12 @@ mod tests {
         config.zcashd_compat.shutdown_grace_period = std::time::Duration::from_secs(42);
         assert_eq!(
             StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
-            Some(std::time::Duration::from_secs(42))
+            Some(
+                std::time::Duration::from_secs(42)
+                    + StartCmd::ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN
+            ),
+            "outer supervisor wait must exceed the child grace period so task \
+             abort cannot preempt graceful termination",
         );
 
         config.zcashd_compat.manage_zcashd = false;

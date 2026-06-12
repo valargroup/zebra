@@ -301,6 +301,14 @@ fn restart_backoff_delay(
 
 /// Spawns `zcashd` with zcashd-compat arguments and connects child output streams.
 ///
+/// `kill_on_drop` is intentionally disabled: a dropped child handle (zebrad
+/// panic, supervisor task abort) must not SIGKILL a zcashd that may be flushing
+/// its chainstate and wallet. An abandoned zcashd finishes any SIGTERM-initiated
+/// shutdown on its own, or keeps running until stopped externally; `init` reaps
+/// it once zebrad exits. The child also runs in its own process group so
+/// group-wide terminal signals aimed at zebrad cannot kill zcashd uncleanly;
+/// [`terminate_child`] remains the only path that force-kills it.
+///
 /// # Errors
 ///
 /// Returns an error if the child process cannot be spawned.
@@ -313,7 +321,9 @@ fn spawn_zcashd(config: &SupervisorConfig) -> Result<Child, Report> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(false);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command
         .spawn()
@@ -483,6 +493,8 @@ async fn terminate_child(
     child: &mut Child,
     shutdown_grace_period: std::time::Duration,
 ) -> Result<(), Report> {
+    let pid = child.id();
+
     #[cfg(unix)]
     {
         use nix::{
@@ -490,20 +502,32 @@ async fn terminate_child(
             unistd::Pid,
         };
 
-        if let Some(id) = child.id() {
-            let pid = id as i32;
-            let _ = kill(Pid::from_raw(pid), SIGTERM);
+        if let Some(id) = pid {
+            let _ = kill(Pid::from_raw(id as i32), SIGTERM);
         }
     }
 
+    let start = std::time::Instant::now();
     let wait_result = timeout(shutdown_grace_period, child.wait()).await;
     match wait_result {
-        Ok(Ok(_status)) => Ok(()),
+        Ok(Ok(_status)) => {
+            info!(
+                ?pid,
+                elapsed = ?start.elapsed(),
+                "zcashd-compat zcashd exited cleanly after SIGTERM"
+            );
+            Ok(())
+        }
         Ok(Err(error)) => Err(eyre!(
             "failed waiting for zcashd-compat zcashd shutdown: {error}"
         )),
         Err(_timeout) => {
-            warn!("zcashd-compat zcashd did not exit after SIGTERM, sending kill");
+            warn!(
+                ?pid,
+                grace_period = ?shutdown_grace_period,
+                "zcashd-compat zcashd did not exit after SIGTERM, sending kill; \
+                 an interrupted shutdown can lose un-flushed chainstate"
+            );
             child
                 .start_kill()
                 .map_err(|err| eyre!("failed to kill zcashd-compat zcashd child: {err}"))?;
@@ -786,5 +810,56 @@ mod tests {
         let sanitized = super::sanitize_child_log_line(line);
 
         assert_eq!(sanitized, line);
+    }
+
+    /// A child that exits on SIGTERM within the grace period is never SIGKILLed,
+    /// so its shutdown flush cannot be interrupted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_child_waits_for_graceful_exit() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(false)
+            .spawn()
+            .expect("sleep is available on unix test hosts");
+
+        let start = std::time::Instant::now();
+        super::terminate_child(&mut child, Duration::from_secs(30))
+            .await
+            .expect("terminate_child should succeed for a SIGTERM-compliant child");
+
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "child should exit on SIGTERM well before the grace period"
+        );
+    }
+
+    /// A child that ignores SIGTERM is force-killed only after the full grace
+    /// period elapses.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn terminate_child_kills_after_grace_period() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh is available on unix test hosts");
+
+        // Give the shell a moment of real time to install the TERM trap before
+        // SIGTERM is sent; the paused clock only skips tokio timers.
+        tokio::task::yield_now().await;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        super::terminate_child(&mut child, Duration::from_secs(5))
+            .await
+            .expect("terminate_child should fall back to SIGKILL");
+
+        let status = child
+            .try_wait()
+            .expect("child status should be queryable after terminate_child");
+        assert!(
+            status.is_some(),
+            "child must have been reaped after the SIGKILL fallback"
+        );
     }
 }

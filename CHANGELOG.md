@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- The zcashd-compat supervisor no longer force-kills `zcashd` outside its own
+  SIGTERM → grace period → SIGKILL sequence. The child is spawned without
+  `kill_on_drop` and in its own process group, so zebrad panics, supervisor
+  task aborts, and group-wide terminal signals can no longer SIGKILL `zcashd`
+  mid-flush, and Zebra now waits the shutdown grace period plus a fixed margin
+  for the supervisor task before abandoning it. An interrupted shutdown was
+  able to silently discard hours of ingested chainstate and force a long
+  replay on the next start.
 - Make `zebra-rollback-state` rollback existing v5 databases without replaying
   note commitment trees from genesis for modern rollback targets whose removed
   blocks did not change the Sprout tree. If rolled-back blocks contain Sprout

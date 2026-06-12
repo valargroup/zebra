@@ -506,10 +506,29 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
   `shutdown_grace_period` if needed. A forced kill can interrupt `zcashd` wallet
   or chainstate flushes, so size the grace period for the local data set: large
   mainnet nodes can need several minutes, while small test nodes can override it
-  lower.
+  lower. The supervisor logs a warning with the child pid if the SIGKILL last
+  resort fires.
+- Zebra waits for the supervisor task itself for `shutdown_grace_period` plus a
+  fixed 30-second margin, so its own shutdown timeout cannot cut the graceful
+  SIGTERM sequence short. The SIGTERM → grace → SIGKILL path in the supervisor
+  is the only way Zebra force-kills `zcashd`: dropping the child handle (for
+  example on a `zebrad` panic or an aborted supervisor task) leaves `zcashd`
+  running so it can finish flushing.
+- Supervised `zcashd` runs in its own process group. Terminal signals aimed at
+  `zebrad`'s process group (for example Ctrl-C in a wrapper script, or a
+  group-wide kill) do not reach `zcashd` directly; the supervisor delivers
+  SIGTERM to it during graceful shutdown instead.
 - If `zebrad` is terminated ungracefully (for example `kill -9`), normal
-  shutdown handlers do not run, so `zcashd` can remain running until it is
-  stopped externally.
+  shutdown handlers do not run, so `zcashd` remains running until it is stopped
+  externally. An orphaned `zcashd` keeps holding its datadir lock, so a
+  restarted supervised `zebrad` retries spawning with backoff until the orphan
+  exits or is stopped; this is visible in the supervisor logs and recovers on
+  its own once the orphan is gone.
+- Pair the supervisor settings with zcashd's `-zebra-compat-flush-interval`
+  (default 300 seconds): it bounds how much chainstate an unclean `zcashd` death
+  can lose, and therefore how much replay a restart needs. See the
+  [zcashd-side documentation](https://github.com/valargroup/zcashd/blob/feat/unity/doc/zebra-compat.md)
+  for the crash-recovery details.
 
 ## Quick regtest loop
 
