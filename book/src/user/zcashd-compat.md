@@ -1,21 +1,89 @@
 # zcashd-compat Mode (`zebrad start --zcashd-compat`)
 
-zcashd-compat mode runs Zebra as the consensus source and optionally supervises a
-`zcashd -zebra-compat` child process that uses Zebra's RPC endpoint for chain data,
-mempool data, and transaction forwarding.
+zcashd-compat mode is for operators — typically exchanges and custodial
+services — that want to migrate to Zebra while keeping the `zcashd` wallet and
+RPC surface their integration already depends on. Zebra becomes the consensus
+node: it syncs the Zcash network over P2P, and a `zcashd` running with P2P
+disabled ingests chain data, mempool data, and transaction forwarding from
+Zebra over JSON-RPC.
 
-For the zcashd side of this integration, see
-[zebra-compat Node Operation](https://github.com/valargroup/zcashd/blob/feat/unity/doc/zebra-compat.md).
+Your systems keep talking to `zcashd` exactly as before:
 
-## What zcashd-compat mode does
+| Provided by `zcashd`, unchanged          | Moved to Zebra                              |
+|------------------------------------------|---------------------------------------------|
+| Wallet behavior and wallet RPC methods   | P2P networking and peer selection           |
+| Local block files, chainstate, indexes   | Block acquisition and best-chain selection  |
+| ZMQ notifications                        | Transaction relay to the network            |
+| Local RPC response semantics             | Expensive cryptographic block verification  |
 
-When you start Zebra with:
+```text
+Zcash network ═P2P═▶ zebrad ◀─JSON-RPC (cookie auth, optional TLS)─ zcashd -zebra-compat ◀─wallet RPC, ZMQ─ your systems
+```
+
+There are two ways to run the pair:
+
+- **Supervised (recommended):** `zebrad start --zcashd-compat` spawns and
+  manages `zcashd` itself. This page covers the Zebra side and supervised
+  operation.
+- **Externally managed:** you run `zcashd -zebra-compat` yourself against a
+  Zebra RPC endpoint. The zcashd-side flags, trust model, sizing arithmetic,
+  diagnostics, and recovery procedures are documented in
+  [zebra-compat Node Operation](https://github.com/valargroup/zcashd/blob/feat/unity/doc/zebra-compat.md);
+  the Zebra-side sections of this page still apply.
+
+## Quick start (supervised)
+
+On `x86_64` Linux, the defaults work without a configuration file:
 
 ```console
 zebrad start --zcashd-compat
 ```
 
-Zebra:
+On first start, Zebra:
+
+1. runs Linux hardware and filesystem preflight checks (see
+   [Hardware preflight](#hardware-preflight-linux));
+2. downloads a SHA256-pinned `zcashd` release archive and caches it (see
+   [zcashd binary resolution](#zcashd-binary-resolution));
+3. bootstraps the `zcashd` datadir and a minimal `zcash.conf` if they are
+   missing (see [zcashd datadir and `zcash.conf`](#zcashd-datadir-and-zcashconf));
+4. starts the dedicated zcashd-compat RPC listener on `127.0.0.1:28232` with
+   cookie authentication;
+5. spawns and supervises `zcashd -zebra-compat`, restarting it with backoff if
+   it exits (see
+   [Monitoring and process lifecycle](#monitoring-and-process-lifecycle)).
+
+The startup log banner shows the zcashd-compat RPC URL and cookie file.
+
+### Verify the integration
+
+`getzebracompatinfo` is the primary status surface on the zcashd side:
+
+```console
+zcash-cli getzebracompatinfo
+```
+
+Confirm `zebra.identity_verified` is `true` and watch `readiness` move from
+`degraded` (syncing) to `ready` once the local `zcashd` tip catches up to
+Zebra's best tip. Expect `"p2p": false` and `"blocksource": "zebra"`.
+
+Confirm `zcashd` has no peer-to-peer activity:
+
+```console
+zcash-cli getconnectioncount   # expect 0
+zcash-cli getpeerinfo          # expect []
+```
+
+Confirm `zcashd` is not listening on the network P2P port (Zebra should be):
+
+```console
+ss -ltnp 'sport = :8233'    # mainnet
+ss -ltnp 'sport = :18233'   # testnet
+```
+
+## What zcashd-compat mode does
+
+When you start Zebra with `zebrad start --zcashd-compat`, Zebra:
 
 - enables zcashd-compat mode (`[zcashd_compat].enabled = true`);
 - ensures a dedicated zcashd-compat RPC listen address is configured (defaults to `127.0.0.1:28232`);
@@ -91,11 +159,94 @@ ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]
 
 `zebrad` always adds `-printtoconsole` automatically for supervised `zcashd`.
 
-### zcashd-compat RPC TLS and auth
+If `manage_zcashd = false`, Zebra still applies the zcashd-compat RPC
+guardrails and startup validation, but does not spawn `zcashd`; see
+[Sync batch size and response limits](#sync-batch-size-and-response-limits)
+for the externally managed workflow.
+
+### zcashd binary resolution
+
+If `manage_zcashd = true`, Zebra resolves `zcashd` as follows:
+
+1. If `zcashd_path` is set, Zebra uses that local executable directly.
+2. Otherwise, `zcashd_source = "managed"` uses Zebra's embedded release manifest
+   to fetch a compatible `zcashd` archive, verify its SHA256, cache it, and run it.
+   Managed downloads are currently available only on `x86_64` Linux.
+3. `zcashd_source = "path"` requires `zcashd_path` to be set.
+
+Managed downloads are cached under:
+
+```text
+<state.cache_dir>/zcashd-compat/bin/<release_tag>/<target>/zcashd
+```
+
+If managed artifacts are unavailable for the local platform, including Linux
+`aarch64`, set `zcashd_path` to a local binary instead.
+
+Managed download failures (missing target artifact, hash mismatch, transport
+failures) fail closed before Zebra supervises `zcashd`.
+
+### zcashd datadir and `zcash.conf`
+
+Supervised `zcashd` still requires a normal datadir and `zcash.conf`. When
+`manage_zcashd = true`, Zebra creates the configured datadir if it is missing
+and bootstraps a minimal config file only when the effective `zcash.conf` is
+absent. Existing operator configs are never overwritten.
+
+Before creating the datadir or bootstrap config, Zebra checks that the effective
+datadir and `zcash.conf` location can be used by the current user. Existing
+`zcash.conf` files must be readable; if the config is missing, the parent
+directory must be writable so Zebra can create the bootstrap file.
+
+Minimum first-start `zcash.conf`:
+
+```conf
+i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
+# zcashd-compat: P2P is disabled; chain data comes from zebrad RPC.
+# Do not add bind=, connect=, addnode=, or listen=1 here.
+```
+
+`zcashd` refuses to start without this deprecation acknowledgement. If an
+existing config has missing or legacy P2P settings, Zebra logs clear warnings;
+some P2P flags are forced off, while peer configuration options can still make
+`zcashd` reject startup validation.
+
+### Migrating a legacy `zcash.conf` from full-node use
+
+Operators often reuse an existing `zcash.conf`. In compat mode:
+
+- `listen=1`, `p2p=1`, `dnsseed=1`, and `listenonion=1` in the file may remain
+  on disk but are overridden at startup (supervisor CLI plus `zcashd`
+  `-zebra-compat` preset). They do not need manual removal for those flags.
+  The same boolean flags are force-disabled if repeated in `zcashd_extra_args`.
+- Remove or avoid P2P peer options that fail startup validation: `bind=`,
+  `whitebind=`, `connect=`, `addnode=`, `seednode=`, and similar.
+
+You do not need to add `listen=0` to `zcashd_extra_args`; the supervisor
+already passes it.
+
+## Listeners, authentication, and TLS
+
+### Listener overview
+
+A zcashd-compat deployment involves several listeners with similar-sounding
+settings. Do not disable the wrong one:
+
+| Listener | Default / typical | Role in zcashd-compat |
+|---|---|---|
+| **Zebra network P2P** (`network.listen_addr`) | enabled | Zebra syncs blocks from the Zcash network. Keep enabled. |
+| **Zebra compat RPC** (`zcashd_compat.listen_addr`) | `127.0.0.1:28232` | Backend channel for supervised `zcashd -zebra-compat`. Cookie-auth by default; HTTPS/no-cookie is opt-in. Separate from `[rpc]`. |
+| **Zebra user RPC** (`[rpc].listen_addr`) | optional | Operator-facing Zebra JSON-RPC (for example `127.0.0.1:8232`). |
+| **zcashd network P2P** (`-listen`, port 8233/18233) | forced off | Must stay off; Zebra owns P2P. |
+| **zcashd wallet RPC** (`-rpcbind`, `-rpcport`) | operator choice | Unrelated to `-listen`; configure separately if needed. |
 
 The dedicated zcashd-compat RPC listener uses cookie authentication by default,
-independent of the operator-facing `[rpc]` listener. This keeps the backend
-channel isolated even when both listeners share the same process.
+independent of the operator-facing `[rpc]` listener. zcashd-compat uses a
+separate listener and separate authentication/TLS settings so operators can
+keep user-facing Zebra RPC and the zcashd backend channel isolated, even when
+both listeners share the same process.
+
+### TLS for the zcashd-compat listener
 
 To serve the zcashd-compat listener over HTTPS, configure both certificate and
 private-key files:
@@ -134,6 +285,8 @@ host, port, path, network, and genesis. For remote endpoints, changing the URL
 scheme is treated as a source change and requires the normal zcashd recovery
 checks.
 
+### Disabling cookie auth (TLS only)
+
 Cookie auth can be disabled for the dedicated zcashd-compat listener only when
 TLS is enabled:
 
@@ -152,78 +305,58 @@ endpoint, such as Cloudflare Access, mTLS, IP allowlists, or a private network.
 Without cookie auth, any client that can reach the listener can call the exposed
 RPC methods.
 
-## `zcashd` configuration
+## Sync batch size and response limits
 
-Supervised `zcashd` still requires a normal datadir and `zcash.conf`. When
-`manage_zcashd = true`, Zebra creates the configured datadir if it is missing
-and bootstraps a minimal config file only when the effective `zcash.conf` is
-absent. Existing operator configs are never overwritten.
+Three settings must agree when increasing zebra-compat sync depth:
 
-Before creating the datadir or bootstrap config, Zebra checks that the effective
-datadir and `zcash.conf` location can be used by the current user. Existing
-`zcash.conf` files must be readable; if the config is missing, the parent
-directory must be writable so Zebra can create the bootstrap file.
+- `-zebra-compat-sync-batch-size=<blocks>`: how many raw blocks zcashd asks
+  Zebra for in one JSON-RPC batch. zcashd defaults to `30`.
+- `-zebra-compat-sync-response-budget-mb=<MiB>`: zcashd's memory budget for one
+  batched raw-block response. zcashd defaults to `128` MiB, which allows a
+  memory-clamped maximum batch of `33` blocks.
+- `[rpc].max_response_body_size`: Zebra's HTTP response-body limit. Zebra floors
+  the zcashd-compat listener to at least `128` MiB, and jsonrpsee applies this
+  limit to the whole JSON-RPC batch response.
 
-Minimum first-start `zcash.conf`:
+Zebra fails startup if these settings are inconsistent in `zcashd_compat`
+configuration. For example, if `zcashd_extra_args` requests
+`-zebra-compat-sync-batch-size=80`, Zebra reports the missing or undersized
+settings needed to make that batch valid.
 
-```conf
-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
-# zcashd-compat: P2P is disabled; chain data comes from zebrad RPC.
-# Do not add bind=, connect=, addnode=, or listen=1 here.
+For supervised zcashd, configure the zcashd-side batch and response budget in
+`zcashd_extra_args`; Zebra passes its effective response limit to zcashd
+automatically using
+`-zebra-compat-zebra-rpc-max-response-body-bytes=<bytes>`. For example, an
+80-block batch uses a round `320` MiB budget:
+
+```toml
+[rpc]
+max_response_body_size = 335544320
+
+[zcashd_compat]
+zcashd_extra_args = [
+  "-zebra-compat-sync-batch-size=80",
+  "-zebra-compat-sync-response-budget-mb=320",
+]
 ```
 
-`zcashd` refuses to start without this deprecation acknowledgement. If an
-existing config has missing or legacy P2P settings, Zebra logs clear warnings;
-some P2P flags are forced off, while peer configuration options can still make
-`zcashd` reject startup validation.
-
-### Three different "listen" concepts
-
-Do not disable the wrong listener:
-
-| Listener | Default / typical | Role in zcashd-compat |
-|---|---|---|
-| **Zebra network P2P** (`network.listen_addr`) | enabled | Zebra syncs blocks from the Zcash network. Keep enabled. |
-| **Zebra compat RPC** (`zcashd_compat.listen_addr`) | `127.0.0.1:28232` | Backend channel for supervised `zcashd -zebra-compat`. Cookie-auth by default; HTTPS/no-cookie is opt-in. Separate from `[rpc]`. |
-| **Zebra user RPC** (`[rpc].listen_addr`) | optional | Operator-facing Zebra JSON-RPC (for example `127.0.0.1:8232`). |
-| **zcashd network P2P** (`-listen`, port 8233/18233) | forced off | Must stay off; Zebra owns P2P. |
-| **zcashd wallet RPC** (`-rpcbind`, `-rpcport`) | operator choice | Unrelated to `-listen`; configure separately if needed. |
-
-### Legacy `zcash.conf` from full-node use
-
-Operators often reuse an existing `zcash.conf`. In compat mode:
-
-- `listen=1`, `p2p=1`, `dnsseed=1`, and `listenonion=1` in the file may remain
-  on disk but are overridden at startup (supervisor CLI plus `zcashd`
-  `-zebra-compat` preset). They do not need manual removal for those flags.
-  The same boolean flags are force-disabled if repeated in `zcashd_extra_args`.
-- Remove or avoid P2P peer options that fail startup validation: `bind=`,
-  `whitebind=`, `connect=`, `addnode=`, `seednode=`, and similar.
-
-You do not need to add `listen=0` to `zcashd_extra_args`; the supervisor
-already passes it.
-
-### Validate P2P is disabled
-
-After both processes are running:
+If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails and
+validates any zcashd batch/budget flags present in `zcashd_extra_args`, but it
+does not start zcashd and cannot pass command-line flags to it. Keep
+`[rpc].max_response_body_size` configured in Zebra, and pass the zcashd-side
+values explicitly to the external process:
 
 ```console
-zcash-cli getzebracompatinfo
+zcashd -zebra-compat \
+  -zebra-compat-sync-batch-size=80 \
+  -zebra-compat-sync-response-budget-mb=320 \
+  -zebra-compat-zebra-rpc-max-response-body-bytes=335544320 \
+  -zebra-compat-url=http://127.0.0.1:8232 \
+  -zebra-compat-cookiefile=/path/to/zebra/.cookie
 ```
 
-Expect `"p2p": false` and `"blocksource": "zebra"`.
-
-```console
-zcash-cli getconnectioncount   # expect 0
-zcash-cli getpeerinfo          # expect []
-```
-
-Confirm `zcashd` is not listening on the network P2P port (Zebra should be):
-
-```console
-ss -ltnp 'sport = :18233'   # testnet example
-ss -ltnp 'sport = :8233'    # mainnet example
-```
+See zcashd's `doc/zebra-compat.md` for the full batch-size and reorg-depth
+arithmetic.
 
 ## Hardware preflight (Linux)
 
@@ -321,9 +454,6 @@ The container entrypoint does not set zcashd-compat config by default. If this
 environment variable is set and `/usr/local/bin/zcashd` exists, the entrypoint
 enables zcashd-compat mode and configures Zebra to use that local binary.
 
-If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, but
-does not spawn `zcashd`.
-
 The `compat-docker-start` target uses the safer single-container pattern:
 
 ```console
@@ -339,116 +469,14 @@ port on host loopback instead:
 -p 127.0.0.1:8232:8232
 ```
 
-The standard `[rpc]` listener remains independent. zcashd-compat uses a separate
-listener and separate authentication/TLS settings so operators can keep
-user-facing Zebra RPC and zcashd backend RPC isolated.
+## Monitoring and process lifecycle
 
-## Sync batch size and response limits
-
-Three settings must agree when increasing zebra-compat sync depth:
-
-- `-zebra-compat-sync-batch-size=<blocks>`: how many raw blocks zcashd asks
-  Zebra for in one JSON-RPC batch. zcashd defaults to `30`.
-- `-zebra-compat-sync-response-budget-mb=<MiB>`: zcashd's memory budget for one
-  batched raw-block response. zcashd defaults to `128` MiB, which allows a
-  memory-clamped maximum batch of `33` blocks.
-- `[rpc].max_response_body_size`: Zebra's HTTP response-body limit. Zebra floors
-  the zcashd-compat listener to at least `128` MiB, and jsonrpsee applies this
-  limit to the whole JSON-RPC batch response.
-
-Zebra fails startup if these settings are inconsistent in `zcashd_compat`
-configuration. For example, if `zcashd_extra_args` requests
-`-zebra-compat-sync-batch-size=80`, Zebra reports the missing or undersized
-settings needed to make that batch valid.
-
-For supervised zcashd, configure the zcashd-side batch and response budget in
-`zcashd_extra_args`; Zebra passes its effective response limit to zcashd
-automatically using
-`-zebra-compat-zebra-rpc-max-response-body-bytes=<bytes>`. For example, an
-80-block batch uses a round `320` MiB budget:
-
-```toml
-[rpc]
-max_response_body_size = 335544320
-
-[zcashd_compat]
-zcashd_extra_args = [
-  "-zebra-compat-sync-batch-size=80",
-  "-zebra-compat-sync-response-budget-mb=320",
-]
-```
-
-If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails and
-validates any zcashd batch/budget flags present in `zcashd_extra_args`, but it
-does not start zcashd and cannot pass command-line flags to it. Keep
-`[rpc].max_response_body_size` configured in Zebra, and pass the zcashd-side
-values explicitly to the external process:
-
-```console
-zcashd -zebra-compat \
-  -zebra-compat-sync-batch-size=80 \
-  -zebra-compat-sync-response-budget-mb=320 \
-  -zebra-compat-zebra-rpc-max-response-body-bytes=335544320 \
-  -zebra-compat-url=http://127.0.0.1:8232 \
-  -zebra-compat-cookiefile=/path/to/zebra/.cookie
-```
-
-See zcashd's `doc/zebra-compat.md` for the full batch-size and reorg-depth
-arithmetic.
-
-If `manage_zcashd = true`, Zebra resolves `zcashd` as follows:
-
-1. If `zcashd_path` is set, Zebra uses that local executable directly.
-2. Otherwise, `zcashd_source = "managed"` uses Zebra's embedded release manifest
-   to fetch a compatible `zcashd` archive, verify its SHA256, cache it, and run it.
-   Managed downloads are currently available only on `x86_64` Linux.
-3. `zcashd_source = "path"` requires `zcashd_path` to be set.
-
-Managed downloads are cached under:
-
-```text
-<state.cache_dir>/zcashd-compat/bin/<release_tag>/<target>/zcashd
-```
-
-If managed artifacts are unavailable for the local platform, including Linux
-`aarch64`, set `zcashd_path` to a local binary instead.
-
-## Quick regtest loop
-
-1. Configure:
-
-```toml
-[network]
-network = "Regtest"
-```
-
-1. Start Zebra in zcashd-compat mode:
-
-```console
-zebrad start --zcashd-compat
-```
-
-1. Confirm the startup log banner shows the zcashd-compat RPC URL and cookie file.
-
-2. Use `zcash-cli getzebracompatinfo` to verify Zebra identity and readiness.
-
-3. Generate blocks via Zebra RPC (`generate`) and verify `zcashd` follows.
-
-The zcashd-compat regtest suite also includes reorg regression and stress tests;
-use `make compat-test-soak` for extended local churn runs.
-
-## Notes
-
-- `zcashd -zebra-compat` talks to Zebra over RPC, not over peer-to-peer connections.
-- On shutdown, Zebra sends SIGTERM to the supervised `zcashd`, then SIGKILL
-  after `shutdown_grace_period` if needed. Keep this long enough for the node's
-  wallet and chainstate to flush cleanly; large mainnet nodes can need several
-  minutes, while small test nodes can override it lower.
-- Regtest interoperability can depend on matching assumptions between Zebra and
-  `zcashd` builds. If regtest semantics diverge, use testnet for initial
-  interoperability validation.
-
-## Process lifecycle behavior
+Use `zcash-cli getzebracompatinfo` as the primary monitoring surface for the
+integration: it reports overall `readiness` (`ready` / `degraded` / `failed` /
+`disabled`), sync state, retry and backoff counters, mempool-mirror and
+transaction-forwarding health, and the active trusted boundary. The
+[zcashd-side documentation](https://github.com/valargroup/zcashd/blob/feat/unity/doc/zebra-compat.md)
+describes the full readiness surface and the matching recovery procedures.
 
 When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
 `zcashd_compat.manage_zcashd = true`):
@@ -473,13 +501,40 @@ When zcashd-compat supervision is enabled (`zcashd_compat.enabled = true` and
 - Startup-time zcashd-compat config validation is unchanged. For example, if
   `zcashd_compat.manage_zcashd = true` and explicit `zcashd_path` cannot be resolved,
   Zebra startup fails with an error.
-- Managed download failures (missing target artifact, hash mismatch, transport
-  failures) fail closed before Zebra supervises `zcashd`.
 - If `zebrad` is shut down normally, it asks the zcashd-compat supervisor to stop
   `zcashd` gracefully: SIGTERM first, then SIGKILL after
   `shutdown_grace_period` if needed. A forced kill can interrupt `zcashd` wallet
-  or chainstate flushes, so production nodes should size this grace period for
-  their local data set.
+  or chainstate flushes, so size the grace period for the local data set: large
+  mainnet nodes can need several minutes, while small test nodes can override it
+  lower.
 - If `zebrad` is terminated ungracefully (for example `kill -9`), normal
   shutdown handlers do not run, so `zcashd` can remain running until it is
   stopped externally.
+
+## Quick regtest loop
+
+1. Configure the network:
+
+   ```toml
+   [network]
+   network = "Regtest"
+   ```
+
+2. Start Zebra in zcashd-compat mode:
+
+   ```console
+   zebrad start --zcashd-compat
+   ```
+
+3. Confirm the startup log banner shows the zcashd-compat RPC URL and cookie file.
+
+4. Use `zcash-cli getzebracompatinfo` to verify Zebra identity and readiness.
+
+5. Generate blocks via Zebra RPC (`generate`) and verify `zcashd` follows.
+
+The zcashd-compat regtest suite also includes reorg regression and stress tests;
+use `make compat-test-soak` for extended local churn runs.
+
+Regtest interoperability can depend on matching assumptions between Zebra and
+`zcashd` builds. If regtest semantics diverge, use testnet for initial
+interoperability validation.
