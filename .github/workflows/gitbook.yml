@@ -50,7 +50,9 @@ jobs:
           node-version: "22"
 
       - name: Build Valarbook site
-        run: npx --yes honkit@latest build book/valarbook target/valarbook
+        run: |
+          npx --yes honkit@latest build book/valarbook
+          test -f book/valarbook/_book/index.html
 
       - name: Setup Pages
         if: github.event_name != 'pull_request'
@@ -59,7 +61,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 #v5.0.0
         with:
-          path: target/valarbook
+          path: book/valarbook/_book
 
   deploy:
     name: Deploy Valarbook
