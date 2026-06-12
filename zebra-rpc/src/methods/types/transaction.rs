@@ -134,6 +134,9 @@ impl TransactionTemplate<NegativeOrZero> {
         let block_subsidy = block_subsidy(height, net)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
+        miner_params
+            .validate_coinbase_receiver(net, height)
+            .map_err(|error| TransactionError::CoinbaseConstruction(error.to_string()))?;
 
         let mut builder = Builder::new(
             net,
@@ -217,7 +220,7 @@ impl TransactionTemplate<NegativeOrZero> {
             ))?,
         }
         .ok_or(TransactionError::CoinbaseConstruction(
-            "Could not construct output with miner reward".to_string(),
+            "Could not construct miner reward output".to_string(),
         ))?;
 
         let mut funding_streams = funding_stream_values(height, net, block_subsidy)?
