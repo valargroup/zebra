@@ -585,6 +585,10 @@ impl ZebraDb {
         self.db
             .write(batch)
             .expect("unexpected rocksdb error while writing block");
+        self.cache_rebuilt_history_tree(
+            (finalized.height, finalized.hash),
+            finalized.treestate.history_tree.clone(),
+        );
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 

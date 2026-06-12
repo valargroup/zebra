@@ -17,8 +17,13 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::NonNegative, block::Height, block_info::BlockInfo, history_tree::HistoryTree,
-    parameters::NetworkUpgrade, serialization::ZcashSerialize as _, transparent,
+    amount::NonNegative,
+    block::{self, Height},
+    block_info::BlockInfo,
+    history_tree::HistoryTree,
+    parameters::NetworkUpgrade,
+    serialization::ZcashSerialize as _,
+    transparent,
     value_balance::ValueBalance,
 };
 
@@ -117,16 +122,11 @@ impl ZebraDb {
     /// returns an empty history tree.
     pub fn history_tree(&self) -> Arc<HistoryTree> {
         if self.needs_history_tree_rebuild_before_read() {
-            let tip_height = self
-                .finalized_tip_height()
-                .expect("checked finalized tip height before rebuilding history tree");
-            let history_tree = self
-                .rebuild_history_tree_to_height(tip_height, || {
-                    Ok::<(), std::convert::Infallible>(())
-                })
-                .expect("history tree rebuild cannot be cancelled");
-
-            return Arc::new(history_tree);
+            return self
+                .cached_rebuild_history_tree_to_tip(|| Ok::<(), std::convert::Infallible>(()))
+                .expect("history tree rebuild cannot be cancelled")
+                .map(|(_tip, history_tree)| history_tree)
+                .unwrap_or_default();
         }
 
         self.history_tree_from_disk()
@@ -179,6 +179,129 @@ impl ZebraDb {
         self.format_version_on_disk()
             .expect("database format version should be readable")
             .is_some_and(|version| version.major < 29)
+    }
+
+    /// Rebuilds or catches up the ZIP-221 history tree to the current finalized tip,
+    /// using the in-memory upgrade cache when possible.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn cached_rebuild_history_tree_to_tip<E>(
+        &self,
+        mut check_cancelled: impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<((Height, block::Hash), Arc<HistoryTree>)>, E> {
+        check_cancelled()?;
+
+        let Some(tip @ (tip_height, _tip_hash)) = self.tip() else {
+            return Ok(None);
+        };
+
+        let network = self.db.network();
+        let network_upgrade = NetworkUpgrade::current(&network, tip_height);
+
+        if network_upgrade < NetworkUpgrade::Heartwood {
+            let history_tree = Arc::new(HistoryTree::default());
+            self.cache_rebuilt_history_tree(tip, history_tree.clone());
+            return Ok(Some((tip, history_tree)));
+        }
+
+        let start_height = network_upgrade
+            .activation_height(&network)
+            .expect("current network upgrade must have an activation height");
+
+        let cached = self
+            .history_tree_rebuild_cache
+            .lock()
+            .expect("history tree rebuild cache lock is not poisoned")
+            .clone();
+
+        let history_tree = if let Some(cached) = cached.filter(|cached| {
+            self.cached_history_tree_can_extend(cached.tip, start_height, tip_height)
+        }) {
+            let cached_height = cached.tip.0;
+            let mut history_tree = (*cached.history_tree).clone();
+
+            for height in ((cached_height.0 + 1)..=tip_height.0).map(Height) {
+                check_cancelled()?;
+
+                let (block, sapling_root, orchard_root, ironwood_root) =
+                    self.history_tree_inputs_at_height(height);
+                history_tree
+                    .push(
+                        &network,
+                        block,
+                        &sapling_root,
+                        &orchard_root,
+                        &ironwood_root,
+                    )
+                    .expect(
+                        "stored blocks and note commitment tree roots should rebuild the history tree",
+                    );
+            }
+
+            check_cancelled()?;
+            history_tree
+        } else {
+            self.rebuild_history_tree_to_height(tip_height, &mut check_cancelled)?
+        };
+
+        let history_tree = Arc::new(history_tree);
+        self.cache_rebuilt_history_tree(tip, history_tree.clone());
+
+        Ok(Some((tip, history_tree)))
+    }
+
+    fn cached_history_tree_can_extend(
+        &self,
+        cached_tip: (Height, block::Hash),
+        start_height: Height,
+        target_height: Height,
+    ) -> bool {
+        let (cached_height, cached_hash) = cached_tip;
+
+        cached_height >= start_height
+            && cached_height <= target_height
+            && self.hash(cached_height) == Some(cached_hash)
+    }
+
+    /// Caches a rebuilt history tree without overwriting a newer valid cache entry.
+    pub(crate) fn cache_rebuilt_history_tree(
+        &self,
+        tip: (Height, block::Hash),
+        history_tree: Arc<HistoryTree>,
+    ) {
+        let mut cache = self
+            .history_tree_rebuild_cache
+            .lock()
+            .expect("history tree rebuild cache lock is not poisoned");
+
+        let should_replace = cache.as_ref().is_none_or(|cached| {
+            self.hash(cached.tip.0) != Some(cached.tip.1) || tip.0 >= cached.tip.0
+        });
+
+        if should_replace {
+            *cache = Some(super::CachedHistoryTree { tip, history_tree });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_tree_rebuild_cache_tip(&self) -> Option<(Height, block::Hash)> {
+        self.history_tree_rebuild_cache
+            .lock()
+            .expect("history tree rebuild cache lock is not poisoned")
+            .as_ref()
+            .map(|cached| cached.tip)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_history_tree_rebuild_cache(
+        &self,
+        tip: (Height, block::Hash),
+        history_tree: Arc<HistoryTree>,
+    ) {
+        *self
+            .history_tree_rebuild_cache
+            .lock()
+            .expect("history tree rebuild cache lock is not poisoned") =
+            Some(super::CachedHistoryTree { tip, history_tree });
     }
 
     /// Rebuilds the ZIP-221 history tree up to `target_height` from finalized blocks and roots.

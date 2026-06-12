@@ -9,6 +9,7 @@
 
 use std::{env, path::Path, sync::Arc};
 
+use semver::Version;
 use tempfile::TempDir;
 
 use zebra_chain::{
@@ -826,6 +827,8 @@ fn modern_rollback_network() -> Network {
             nu6_1: Some(9),
             nu6_2: Some(10),
             nu7: Some(11),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
         })
         .expect("configured activation heights are valid")
         .extend_funding_streams()
@@ -1271,7 +1274,8 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
             nu6_1: Some(9),
             nu6_2: Some(10),
             nu7: Some(11),
-            ..Default::default()
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
         })
         .expect("valid configured activation heights")
         .clear_funding_streams()
@@ -1359,6 +1363,99 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
                     .expect("history tree validation is not cancelled"),
                 Ok(())
             );
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn pre_v29_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu7: Some(11),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(
+        ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())
+        | {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            let stale_height = NetworkUpgrade::Nu7
+                .activation_height(&network)
+                .expect("NU7 activation height is configured");
+            prop_assume!(
+                synced
+                    .last()
+                    .expect("generated chain has a tip")
+                    .height
+                    > stale_height
+            );
+
+            let dir = TempDir::new().expect("temp dir");
+            let config = config_at(dir.path());
+            sync_to(&config, &network, &synced);
+
+            let db = open_unchecked_db(&config, &network);
+            let tip = db.tip().expect("test state has a tip");
+            db.update_format_version_on_disk(&Version::new(28, 0, 0))
+                .expect("test can mark database as pre-v29");
+
+            let expected_tip_tree = db
+                .rebuild_history_tree_to_height(tip.0, || Ok::<(), std::convert::Infallible>(()))
+                .expect("full tip history tree rebuild succeeds");
+
+            let pre_v29_history_tree = db.history_tree();
+            prop_assert_eq!(pre_v29_history_tree.hash(), expected_tip_tree.hash());
+            prop_assert_eq!(db.history_tree_rebuild_cache_tip(), Some(tip));
+
+            let stale_tip = (
+                stale_height,
+                db.hash(stale_height)
+                    .expect("stale height exists in finalized state"),
+            );
+            let stale_history_tree = db
+                .rebuild_history_tree_to_height(stale_height, || {
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("stale history tree rebuild succeeds");
+            db.set_history_tree_rebuild_cache(stale_tip, Arc::new(stale_history_tree));
+
+            let Some((rebuilt_tip, caught_up_history_tree)) = db
+                .cached_rebuild_history_tree_to_tip(|| Ok::<(), std::convert::Infallible>(()))
+                .expect("cached rebuild cannot be cancelled")
+            else {
+                prop_assert!(false, "test state has a tip");
+                return Ok(());
+            };
+
+            prop_assert_eq!(rebuilt_tip, tip);
+            prop_assert_eq!(caught_up_history_tree.hash(), expected_tip_tree.hash());
+            prop_assert_eq!(db.history_tree_rebuild_cache_tip(), Some(tip));
         }
     );
 

@@ -30,12 +30,11 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
         loop {
             check_cancelled(cancel_receiver)?;
 
-            let Some(tip @ (tip_height, _)) = db.tip() else {
+            let Some((tip, history_tree)) =
+                db.cached_rebuild_history_tree_to_tip(|| check_cancelled(cancel_receiver))?
+            else {
                 return Ok(());
             };
-
-            let history_tree =
-                db.rebuild_history_tree_to_height(tip_height, || check_cancelled(cancel_receiver))?;
 
             check_cancelled(cancel_receiver)?;
 
