@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -12,7 +12,7 @@ on:
       - .github/workflows/test-crates.yml
 
   push:
-    branches: [main]
+    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -20,6 +20,11 @@ on:
       - .cargo/config.toml
       - "**/clippy.toml"
       - .github/workflows/test-crates.yml
+
+  # Run the full crate-build suite when a PR is queued so the merge queue
+  # validates the merged result against the latest `main`. `merge_group` ignores
+  # path filters, so this runs unconditionally on every queued entry.
+  merge_group:
 
   workflow_dispatch:
 
