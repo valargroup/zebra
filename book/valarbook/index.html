@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Zebra-Zcashd Compatibility Setup">
+    <title>Zebra-Zcashd Compatibility Setup</title>
+    <link rel="icon" href="static/zcash-logo.svg" type="image/svg+xml">
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #182022;
+        --muted: #596568;
+        --line: #d6dfdc;
+        --paper: #fbfcf9;
+        --panel: #ffffff;
+        --green: #1f6b55;
+        --green-dark: #164b3d;
+        --code-bg: #13211e;
+        --code-ink: #edf7f2;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        background:
+          linear-gradient(180deg, rgba(31, 107, 85, 0.12), rgba(243, 179, 61, 0.08) 42%, transparent 72%),
+          var(--paper);
+        font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      h1, h2, h3, p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: clamp(1.55rem, 4vw, 2.7rem);
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      h2 {
+        font-size: 1.1rem;
+        line-height: 1.25;
+        letter-spacing: 0;
+      }
+
+      h3 {
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 8px;
+      }
+
+      .shell {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 32px 0 56px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 22px 24px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: 0 16px 48px rgba(24, 32, 34, 0.08);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+
+      .eyebrow {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.78rem;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--green-dark);
+        background: #eef8f2;
+        font-size: 0.875rem;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        margin-top: 18px;
+      }
+
+      .panel {
+        min-width: 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: 0 16px 48px rgba(24, 32, 34, 0.08);
+        padding: 22px;
+      }
+
+      .panel-full {
+        grid-column: 1 / -1;
+      }
+
+      .panel-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+      }
+
+      .body-copy {
+        color: var(--muted);
+        font-size: 0.9375rem;
+      }
+
+      .summary-list {
+        margin: 12px 0 0;
+        padding-left: 20px;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .summary-list li + li {
+        margin-top: 8px;
+      }
+
+      .summary-list strong {
+        color: var(--ink);
+      }
+
+      .faq-list li + li {
+        margin-top: 14px;
+      }
+
+      .faq-list .body-copy {
+        margin-top: 4px;
+      }
+
+      .prereq-group {
+        margin-top: 16px;
+      }
+
+      .prereq-group h3 {
+        margin-bottom: 8px;
+      }
+
+      .prereq-group .summary-list {
+        margin-top: 8px;
+      }
+
+      .prereq-group .body-copy + .summary-list {
+        margin-top: 6px;
+      }
+
+      .prereq-group .summary-list + .body-copy {
+        margin-top: 18px;
+      }
+
+      .platform-toggle {
+        display: inline-flex;
+        align-items: center;
+        flex: 0 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: #f4f7f4;
+        padding: 2px;
+      }
+
+      .platform-toggle button {
+        min-height: 26px;
+        padding: 0 9px;
+        border: 0;
+        border-radius: 5px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+
+      .platform-toggle button.active {
+        background: var(--panel);
+        color: var(--green-dark);
+        box-shadow: 0 1px 3px rgba(24, 32, 34, 0.12);
+      }
+
+      .platform-toggle button:focus-visible {
+        outline: 2px solid rgba(31, 107, 85, 0.55);
+        outline-offset: 2px;
+      }
+
+      .setup-toggle {
+        margin-left: auto;
+      }
+
+      .setup-mode-panel[hidden] {
+        display: none;
+      }
+
+      .setup-mode-panel {
+        margin-top: 18px;
+      }
+
+      .join-steps {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        counter-reset: join-step;
+      }
+
+      .join-step {
+        display: grid;
+        grid-template-columns: 32px minmax(0, 1fr);
+        gap: 14px;
+        padding: 18px 0;
+        border-top: 1px solid var(--line);
+        counter-increment: join-step;
+      }
+
+      .join-step:first-child {
+        padding-top: 2px;
+        border-top: 0;
+      }
+
+      .join-step:last-child {
+        padding-bottom: 0;
+      }
+
+      .join-step::before {
+        content: counter(join-step);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        border: 1px solid #b9d7ca;
+        border-radius: 999px;
+        color: var(--green-dark);
+        background: #eef8f2;
+        font-size: 0.85rem;
+        font-weight: 800;
+        line-height: 1;
+      }
+
+      .join-step-body h3 {
+        margin-bottom: 6px;
+        color: var(--green-dark);
+      }
+
+      .code-block {
+        position: relative;
+        margin-top: 10px;
+        border-radius: 7px;
+        background: var(--code-bg);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        overflow: hidden;
+      }
+
+      pre {
+        width: calc(100% - 48px);
+        margin: 0;
+        padding: 13px 15px;
+        overflow-x: auto;
+        background: transparent;
+        color: var(--code-ink);
+        white-space: pre;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .copy {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        z-index: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        width: 32px;
+        min-width: 32px;
+        height: 28px;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 5px;
+        background: rgba(255, 255, 255, 0.07);
+        color: rgba(237, 247, 242, 0.65);
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .copy:hover {
+        background: rgba(255, 255, 255, 0.14);
+        border-color: rgba(255, 255, 255, 0.28);
+        color: var(--code-ink);
+      }
+
+      .copy.done {
+        border-color: rgba(160, 220, 185, 0.4);
+        color: #a8dfc0;
+        background: rgba(160, 220, 185, 0.1);
+      }
+
+      .copy.failed {
+        border-color: rgba(255, 190, 180, 0.44);
+        color: #ffc5bd;
+        background: rgba(255, 190, 180, 0.1);
+      }
+
+      .copy-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 15px;
+        height: 15px;
+      }
+
+      .copy-status {
+        display: none;
+      }
+
+      .copy svg {
+        width: 15px;
+        height: 15px;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2;
+      }
+
+      .note {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+
+      .placeholder {
+        margin-top: 10px;
+        padding: 12px 14px;
+        border: 1px dashed #c9d8d2;
+        border-radius: 6px;
+        color: var(--muted);
+        background: #f7fbf8;
+      }
+
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .shell {
+          width: min(100% - 22px, 1120px);
+          padding-top: 16px;
+        }
+
+        .topbar {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .setup-toggle {
+          width: 100%;
+          margin-left: 0;
+        }
+
+        .setup-toggle button {
+          flex: 1 1 0;
+        }
+
+        .panel {
+          padding: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Page header">
+        <div class="brand">
+          <img src="static/zcash-logo.svg" alt="" width="44" height="44">
+          <div>
+            <p class="eyebrow">Run Zebra for consensus/p2p and zcashd for wallet API</p>
+            <h1>zebra-zcashd-compat</h1>
+          </div>
+        </div>
+        <div class="status">Alpha</div>
+      </section>
+
+      <section class="grid">
+        <article class="panel panel-full">
+          <div class="panel-header">
+            <h2>Integration Summary</h2>
+          </div>
+          <p class="body-copy">
+            This is a Zebra binary that manages a zcashd child process. Zebra is responsible for consensus and P2P. zcashd is kept for wallet and zcashd-compatible RPC surfaces. zcashd ingests chain and mempool data from Zebra over authenticated RPC. The primary purpose of this integration is to allow exchanges to smoothly migrate to Zebra node without disrupting their existing zcashd setup.
+          </p>
+          <ul class="summary-list">
+            <li><strong>Trust boundary:</strong> zcashd trusts the configured Zebra node for block source and transaction forwarding.</li>
+            <li><strong>Transport:</strong> zcashd talks to Zebra over RPC only (no zcashd P2P in compat mode).</li>
+            <li><strong>Auth:</strong> keep Zebra cookie auth enabled and avoid exposing RPC publicly.</li>
+            <li><strong>Deployment:</strong> deploy zcashd and Zebra on the same machine.</li>
+            <li><strong>Lifecycle:</strong> supervised mode manages zcashd process lifecycle at runtime. For container builds, zcashd artifact fetch and SHA verification happen outside the Dockerfile before image build.</li>
+          </ul>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Pre-requisites</h2>
+          </div>
+          <p class="body-copy">
+            Since alongside your zcashd wallet API there is also a Zebra node, the hardware requirements are increased. Please ensure that you provision the recommended hardware before restarting from the updated binary.
+          </p>
+          <div class="prereq-group">
+            <h3>Hardware requirements</h3>
+            <ul class="summary-list">
+              <li><strong>CPU:</strong> 8 logical CPUs available to the process.</li>
+              <li><strong>RAM:</strong> 32 GiB effective memory.</li>
+              <li><strong>Disk:</strong> at least 1 TiB combined capacity across the filesystems used by Zebra state and zcashd datadir.</li>
+            </ul>
+            <p class="body-copy">
+              Startup fails below the minimums: 4 logical CPUs, 16 GiB RAM, 300 GiB per data volume (600 GiB if Zebra state and the zcashd datadir share a filesystem). Bypass only with <code>--unsafe-low-specs</code>. Linux x86_64 only.
+            </p>
+          </div>
+          <div class="prereq-group">
+            <h3>Downloads</h3>
+            <p class="body-copy">Binaries:</p>
+            <ul class="summary-list">
+              <li><a href="https://github.com/valargroup/zebra/releases">Zebra with zcashd compatibility</a></li>
+            </ul>
+            <p class="body-copy">Snapshots:</p>
+            <ul class="summary-list">
+              <li><a href="https://zebra.valargroup.org/">Zebra</a></li>
+              <li><a href="https://zcashd.valargroup.org/">Zcashd</a></li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Configuration</h2>
+            <div
+              class="platform-toggle setup-toggle"
+              role="group"
+              aria-label="zcashd-compat setup mode"
+              data-panel-toggle
+              data-panel-scope=".panel"
+            >
+              <button
+                class="active"
+                type="button"
+                data-panel-target="supervised-panel"
+                aria-pressed="true"
+              >
+                Supervised
+              </button>
+              <button
+                type="button"
+                data-panel-target="source-panel"
+                aria-pressed="false"
+              >
+                Build from source
+              </button>
+              <button
+                type="button"
+                data-panel-target="docker-panel"
+                aria-pressed="false"
+              >
+                Docker
+              </button>
+            </div>
+          </div>
+
+          <div id="supervised-panel" class="setup-mode-panel" data-panel>
+            <ol class="join-steps">
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Start Zebra In zcashd-compat Mode</h3>
+                  <p class="body-copy">
+                    Default path: one Zebra binary. Zebra resolves a hash-pinned compatible zcashd build, starts it as a child process, and supervises restarts.
+                  </p>
+                  <div class="code-block">
+                    <pre><code id="supervised-start">zebrad start --zcashd-compat</code></pre>
+                    <button class="copy" type="button" data-copy="supervised-start" aria-label="Copy supervised start command" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Minimal Config</h3>
+                  <p class="note">
+                    Keep supervision enabled so Zebra manages install + lifecycle.
+                  </p>
+                  <div class="code-block">
+                    <pre><code id="supervised-config">[zcashd_compat]
+enabled = true
+manage_zcashd = true
+zcashd_source = "managed"
+
+# Optionally, customize zcashd data directory.
+zcashd_datadir = "/path/to/zcashd/datadir"
+
+# Optionally, propagate zcashd CLI arguments via env var.
+ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-printtoconsole"]'</code></pre>
+                    <button class="copy" type="button" data-copy="supervised-config" aria-label="Copy supervised config snippet" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                  <p class="note">
+                    For full configuration reference, see
+                    <a href="https://github.com/valargroup/zebra/blob/ironwood-main/book/src/user/zcashd-compat.md">full documentation</a>.
+                  </p>
+                </div>
+              </li>
+            </ol>
+          </div>
+
+          <div id="source-panel" class="setup-mode-panel" data-panel hidden>
+            <ol class="join-steps">
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Build Binaries</h3>
+                  <p class="body-copy">Build Zebra and zcashd from source.</p>
+                  <div class="code-block">
+                    <pre><code id="source-build"># in zebrad tree
+cargo build --release
+
+# in zcashd tree
+./zcutil/build.sh -j"$(nproc)"</code></pre>
+                    <button class="copy" type="button" data-copy="source-build" aria-label="Copy source build commands" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Run Manually (No Supervision)</h3>
+                  <p class="note">
+                    Configure manually and run zcashd against Zebra RPC.
+                  </p>
+                  <div class="code-block">
+                    <pre><code id="source-manual-config">[zcashd_compat]
+enabled = true
+manage_zcashd = false</code></pre>
+                    <button class="copy" type="button" data-copy="source-manual-config" aria-label="Copy manual compat config" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                  <div class="code-block">
+                    <pre><code id="source-manual-shell">zebrad start --zcashd-compat
+
+# Default location, to which Zebra writes an auth cookie
+ZEBRA_COMPAT_COOKIE="$HOME/.cache/zebra/.zcashd-compat.cookie"
+
+# Ensure Zebra has written it
+test -f "$ZEBRA_COMPAT_COOKIE" && echo "cookie ready: $ZEBRA_COMPAT_COOKIE"
+
+# One-time zcashd datadir setup (zcashd refuses to start without this line)
+mkdir -p ~/.zcash
+echo 'i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1' >> ~/.zcash/zcash.conf
+
+# Start zcashd in compat mode, pointed at Zebra's compat listener
+./src/zcashd -zebra-compat \
+  -zebra-compat-url=http://127.0.0.1:28232 \
+  -zebra-compat-cookiefile="$HOME/.cache/zebra/.zcashd-compat.cookie" \
+  -printtoconsole
+
+# verify
+./src/zcash-cli getzebracompatinfo</code></pre>
+                    <button class="copy" type="button" data-copy="source-manual-shell" aria-label="Copy manual compat commands" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+            </ol>
+          </div>
+
+          <div id="docker-panel" class="setup-mode-panel" data-panel hidden>
+            <p class="body-copy">
+              Artifacts are fetched and hash-verified externally, then passed in as build context. Feel free to follow build from source instructions, if desired too.
+            </p>
+            <ol class="join-steps">
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Install Docker Prerequisites</h3>
+                  <p class="body-copy">Install Docker Buildx and verify it before using the Docker setup mode.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-prerequisites">apt-get update && apt-get install -y docker-buildx && docker buildx version</code></pre>
+                    <button class="copy" type="button" data-copy="docker-prerequisites" aria-label="Copy Docker prerequisites commands" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Set Docker Variables</h3>
+                  <p class="body-copy">Set the image tag, choose a hash-pinned zcashd artifact for your platform, and define the local build context path.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-env-vars">export ZEBRA_DOCKER_IMAGE="zebra:zcashd-compat"
+
+# Pick the matching artifact for your host architecture.
+# x86_64 example:
+export ZCASHD_COMPAT_URL="https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha/zcashd-zebra-compat-v6.2.1-alpha-linux-x86_64.tar.gz"
+export ZCASHD_COMPAT_SHA256="09e640b55c9af91dee5742e5e9bb6712f92d7073f0fe899ca58d43f62eb9d13c"
+
+# Local Docker build context that will contain ./bin/zcashd.
+export ZCASHD_COMPAT_CONTEXT="${PWD}/target/zcashd-compat/context"
+
+# State directories for Zebra and zcashd.
+export ZEBRA_STATE_CACHE_DIR="/mnt/data/zebra-state"
+export ZCASHD_DATADIR="/mnt/data/.zcashd"</code></pre>
+                    <button class="copy" type="button" data-copy="docker-env-vars" aria-label="Copy Docker environment variables" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Prepare zcashd Build Context</h3>
+                  <p class="body-copy">Download the artifact, verify its SHA256, extract it into a local Docker build context, and confirm the expected binary exists.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-prepare-context">mkdir -p "${ZCASHD_COMPAT_CONTEXT}"
+curl -fsSL "${ZCASHD_COMPAT_URL}" -o /tmp/zcashd-compat.tar.gz
+echo "${ZCASHD_COMPAT_SHA256}  /tmp/zcashd-compat.tar.gz" | sha256sum -c -
+tar -xzf /tmp/zcashd-compat.tar.gz -C "${ZCASHD_COMPAT_CONTEXT}"
+
+# Guardrail: this fails early if ./bin/zcashd is missing or not executable.
+test -x "${ZCASHD_COMPAT_CONTEXT}/bin/zcashd"</code></pre>
+                    <button class="copy" type="button" data-copy="docker-prepare-context" aria-label="Copy Docker build context preparation commands" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Build Compat Runtime Image</h3>
+                  <p class="body-copy">Build the runtime-zcashd-compat target and inject the prepared zcashd binary via --build-context.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-build-image">docker build \
+  -f ./docker/Dockerfile \
+  --target runtime-zcashd-compat \
+  --build-context "zcashd_compat=${ZCASHD_COMPAT_CONTEXT}" \
+  --tag "${ZEBRA_DOCKER_IMAGE}" \
+  .</code></pre>
+                    <button class="copy" type="button" data-copy="docker-build-image" aria-label="Copy Docker image build command" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Prepare Data Directory Permissions</h3>
+                  <p class="body-copy">Ensure Zebra and zcashd data folders are accessible inside the container.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-data-permissions"># 10001 is the default Dockerfile container user
+# Ensure that zebra and zcashd data folders are accessible inside the container
+mkdir -p "${ZEBRA_STATE_CACHE_DIR}" "${ZCASHD_DATADIR}"
+chown -R 10001:10001 "${ZEBRA_STATE_CACHE_DIR}" "${ZCASHD_DATADIR}"</code></pre>
+                    <button class="copy" type="button" data-copy="docker-data-permissions" aria-label="Copy Docker data permissions commands" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li class="join-step">
+                <div class="join-step-body">
+                  <h3>Run Docker Image</h3>
+                  <p class="body-copy">Start Zebra in zcashd compatibility mode with persistent Zebra and zcashd state mounted from the host.</p>
+                  <div class="code-block">
+                    <pre><code id="docker-run-image">docker run --rm -it \
+  -e ZCASHD_COMPAT_ENABLED=true \
+  -e ZEBRA_NETWORK__LISTEN_ADDR="[::]:18233" \
+  -e ZEBRA_STATE__CACHE_DIR="/home/zebra/.cache/zebra" \
+  -e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
+  -e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
+  --mount type=bind,src="${ZEBRA_STATE_CACHE_DIR}",dst="/home/zebra/.cache/zebra" \
+  --mount type=bind,src="${ZCASHD_DATADIR}",dst="/home/zebra/.cache/zcashd" \
+  -p 18233:18233 \
+  -p 127.0.0.1:8232:8232 \
+  "${ZEBRA_DOCKER_IMAGE}" \
+  zebrad start --zcashd-compat</code></pre>
+                    <button class="copy" type="button" data-copy="docker-run-image" aria-label="Copy Docker image run command" title="Copy">
+                      <span class="copy-icon" aria-hidden="true"></span>
+                      <span class="copy-status" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                </div>
+              </li>
+            </ol>
+          </div>
+        </article>
+
+        <article class="panel panel-full">
+          <div class="panel-header">
+            <h2>FAQ</h2>
+          </div>
+          <ul class="summary-list faq-list">
+            <li>
+              <strong>How do I preserve my original zcashd configuration?</strong>
+              <p class="body-copy">
+                Point Zebra at your existing zcashd data directory with <code>zcashd_datadir</code>, and pass any required zcashd CLI arguments through <code>zcashd_extra_args</code>. These settings can be provided in Zebra configuration, or through equivalent runtime overrides where supported. See the
+                <a href="https://github.com/valargroup/zebra/blob/ironwood-main/book/src/user/zcashd-compat.md">full instructions</a>
+                for details. Remove peer-directing options (<code>bind=</code>, <code>whitebind=</code>, <code>connect=</code>, <code>addnode=</code>, <code>seednode=</code>) from your existing <code>zcash.conf</code> first. Startup fails validation if they are present.
+              </p>
+            </li>
+            <li>
+              <strong>If my original hardware is below the recommended specification, do I have to provision more resources?</strong>
+              <p class="body-copy">
+                Yes. Because this mode runs Zebra alongside the zcashd wallet API, nodes below the minimum specification fail startup preflight; between minimum and recommended, Zebra starts with warnings but is not supported for production. Provision hardware that meets the requirements in this guide before restarting with the updated binary.
+              </p>
+            </li>
+            <li>
+              <strong>I have a restricted setup that does not allow IPC and also restricts networking. What do you recommend?</strong>
+              <p class="body-copy">
+                Build from source and configure the components manually. This gives you direct control over how Zebra and zcashd communicate in your restricted environment.
+              </p>
+            </li>
+            <li>
+              <strong>How is my old zcashd config managed?</strong>
+              <p class="body-copy">
+                Even if present, the system force-disables the following zcashd config parameters: <code>p2p</code>, <code>listen</code>, <code>dnsseed</code>, <code>listenonion</code>, as p2p is unused. Otherwise, zcashd would fail to start.
+              </p>
+            </li>
+            <li>
+              <strong>What happens if I do not have a prior config?</strong>
+              <p class="body-copy">
+                A default one with sane defaults is created for you. See the
+                <a href="https://github.com/valargroup/zebra/blob/ironwood-main/book/src/user/zcashd-compat.md">full instructions</a>
+                for details about location.
+              </p>
+            </li>
+          </ul>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+      const checkIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
+
+      function copySelectionFrom(element) {
+        if (!element || !window.getSelection) return false;
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+
+        let copied = false;
+        try {
+          copied = document.execCommand("copy");
+        } finally {
+          selection.removeAllRanges();
+        }
+        return copied;
+      }
+
+      async function copyText(text, sourceElement) {
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            // Fallback to legacy copy path.
+          }
+        }
+
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.top = "-1000px";
+        textarea.style.left = "-1000px";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+
+        let copied = false;
+        try {
+          copied = document.execCommand("copy");
+        } finally {
+          textarea.remove();
+        }
+
+        return copied || copySelectionFrom(sourceElement);
+      }
+
+      for (const toggle of document.querySelectorAll("[data-panel-toggle]")) {
+        const targetAttribute = "data-panel-target";
+        const panelAttribute = "data-panel";
+        const scopeSelector = toggle.getAttribute("data-panel-scope") || ".panel";
+        const scope = toggle.closest(scopeSelector);
+        const buttons = toggle.querySelectorAll(`[${targetAttribute}]`);
+        const panels = scope ? scope.querySelectorAll(`[${panelAttribute}]`) : [];
+
+        for (const button of buttons) {
+          button.addEventListener("click", () => {
+            const target = button.getAttribute(targetAttribute);
+
+            for (const option of buttons) {
+              const selected = option === button;
+              option.classList.toggle("active", selected);
+              option.setAttribute("aria-pressed", selected ? "true" : "false");
+            }
+
+            for (const panel of panels) {
+              panel.hidden = panel.id !== target;
+            }
+          });
+        }
+      }
+
+      for (const button of document.querySelectorAll("[data-copy]")) {
+        const defaultLabel = button.getAttribute("aria-label") || "Copy command";
+        const icon = button.querySelector(".copy-icon");
+        const status = button.querySelector(".copy-status");
+        if (icon) icon.innerHTML = copyIcon;
+
+        button.addEventListener("click", async () => {
+          const id = button.getAttribute("data-copy");
+          const code = document.getElementById(id);
+          if (!code) return;
+
+          try {
+            const copied = await copyText(code.textContent.trim(), code);
+            if (!copied) throw new Error("copy failed");
+            if (icon) icon.innerHTML = checkIcon;
+            if (status) status.textContent = "Copied";
+            button.classList.add("done");
+            button.classList.remove("failed");
+            button.setAttribute("aria-label", "Copied");
+            button.title = "Copied";
+            setTimeout(() => {
+              if (icon) icon.innerHTML = copyIcon;
+              if (status) status.textContent = "";
+              button.classList.remove("done");
+              button.setAttribute("aria-label", defaultLabel);
+              button.title = "Copy";
+            }, 1400);
+          } catch {
+            if (icon) icon.innerHTML = copyIcon;
+            if (status) status.textContent = "Failed";
+            button.classList.remove("done");
+            button.classList.add("failed");
+            button.setAttribute("aria-label", "Copy failed");
+            button.title = "Copy failed";
+            setTimeout(() => {
+              if (status) status.textContent = "";
+              button.classList.remove("failed");
+              button.setAttribute("aria-label", defaultLabel);
+              button.title = "Copy";
+            }, 1400);
+          }
+        });
+      }
+    </script>
+  </body>
+</html>
