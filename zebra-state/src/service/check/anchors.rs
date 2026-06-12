@@ -16,12 +16,12 @@ use crate::{
     SemanticallyVerifiedBlock, ValidateContextError,
 };
 
-/// Checks the final Sapling and Orchard anchors specified by `transaction`
+/// Checks the final Sapling, Orchard, and Ironwood anchors specified by `transaction`
 ///
 /// This method checks for anchors computed from the final treestate of each block in
 /// the `parent_chain` or `finalized_state`.
 #[tracing::instrument(skip(finalized_state, parent_chain, transaction))]
-fn sapling_orchard_anchors_refer_to_final_treestates(
+fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
     finalized_state: &ZebraDb,
     parent_chain: Option<&Arc<Chain>>,
     transaction: &Arc<Transaction>,
@@ -219,7 +219,7 @@ fn fetch_sprout_final_treestates(
 /// Checks the Sprout anchors specified by `transactions`.
 ///
 /// Sprout anchors may refer to some earlier block's final treestate (like
-/// Sapling and Orchard do exclusively) _or_ to the interstitial output
+/// Sapling, Orchard, and Ironwood do exclusively) _or_ to the interstitial output
 /// treestate of any prior `JoinSplit` _within the same transaction_.
 ///
 /// This method searches for anchors in the supplied `sprout_final_treestates`
@@ -345,12 +345,12 @@ fn sprout_anchors_refer_to_treestates(
 
 /// Accepts a [`ZebraDb`], [`Chain`], and [`SemanticallyVerifiedBlock`].
 ///
-/// Iterates over the transactions in the [`SemanticallyVerifiedBlock`] checking the final Sapling and Orchard anchors.
+/// Iterates over the transactions in the [`SemanticallyVerifiedBlock`] checking the final Sapling, Orchard, and Ironwood anchors.
 ///
 /// This method checks for anchors computed from the final treestate of each block in
 /// the `parent_chain` or `finalized_state`.
 #[tracing::instrument(skip_all)]
-pub(crate) fn block_sapling_orchard_anchors_refer_to_final_treestates(
+pub(crate) fn block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
     finalized_state: &ZebraDb,
     parent_chain: &Arc<Chain>,
     semantically_verified: &SemanticallyVerifiedBlock,
@@ -361,7 +361,7 @@ pub(crate) fn block_sapling_orchard_anchors_refer_to_final_treestates(
         .iter()
         .enumerate()
         .try_for_each(|(tx_index_in_block, transaction)| {
-            sapling_orchard_anchors_refer_to_final_treestates(
+            sapling_orchard_ironwood_anchors_refer_to_final_treestates(
                 finalized_state,
                 Some(parent_chain),
                 transaction,
@@ -413,7 +413,7 @@ pub(crate) fn block_fetch_sprout_final_treestates(
 /// Iterates over the transactions in the [`Block`] checking the final Sprout anchors.
 ///
 /// Sprout anchors may refer to some earlier block's final treestate (like
-/// Sapling and Orchard do exclusively) _or_ to the interstitial output
+/// Sapling, Orchard, and Ironwood do exclusively) _or_ to the interstitial output
 /// treestate of any prior `JoinSplit` _within the same transaction_.
 ///
 /// This method searches for anchors in the supplied `sprout_final_treestates`
@@ -468,7 +468,7 @@ pub(crate) fn block_sprout_anchors_refer_to_treestates(
 
 /// Accepts a [`ZebraDb`], an optional [`Option<Arc<Chain>>`](Chain), and an [`UnminedTx`].
 ///
-/// Checks the final Sprout, Sapling and Orchard anchors specified in the [`UnminedTx`].
+/// Checks the final Sprout, Sapling, Orchard, and Ironwood anchors specified in the [`UnminedTx`].
 ///
 /// This method checks for anchors computed from the final treestate of each block in
 /// the `parent_chain` or `finalized_state`.
@@ -478,7 +478,7 @@ pub(crate) fn tx_anchors_refer_to_final_treestates(
     parent_chain: Option<&Arc<Chain>>,
     unmined_tx: &UnminedTx,
 ) -> Result<(), ValidateContextError> {
-    sapling_orchard_anchors_refer_to_final_treestates(
+    sapling_orchard_ironwood_anchors_refer_to_final_treestates(
         finalized_state,
         parent_chain,
         &unmined_tx.transaction,
