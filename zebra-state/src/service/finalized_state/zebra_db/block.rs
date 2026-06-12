@@ -597,6 +597,16 @@ impl ZebraDb {
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
     }
+
+    /// Writes the given batch only if the finalized tip height still matches `expected_tip`.
+    pub(crate) fn write_batch_if_finalized_tip(
+        &self,
+        batch: DiskWriteBatch,
+        expected_tip: Height,
+    ) -> Result<bool, rocksdb::Error> {
+        self.db
+            .write_if(batch, || self.finalized_tip_height() == Some(expected_tip))
+    }
 }
 
 /// Lookup the output location for an outpoint.

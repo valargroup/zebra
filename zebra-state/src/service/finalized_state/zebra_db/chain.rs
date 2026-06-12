@@ -18,7 +18,8 @@ use std::{
 
 use zebra_chain::{
     amount::NonNegative, block::Height, block_info::BlockInfo, history_tree::HistoryTree,
-    serialization::ZcashSerialize as _, transparent, value_balance::ValueBalance,
+    parameters::NetworkUpgrade, serialization::ZcashSerialize as _, transparent,
+    value_balance::ValueBalance,
 };
 
 use crate::{
@@ -115,6 +116,24 @@ impl ZebraDb {
     /// If history trees have not been activated yet (pre-Heartwood), or the state is empty,
     /// returns an empty history tree.
     pub fn history_tree(&self) -> Arc<HistoryTree> {
+        if self.needs_history_tree_rebuild_before_read() {
+            let tip_height = self
+                .finalized_tip_height()
+                .expect("checked finalized tip height before rebuilding history tree");
+            let history_tree = self
+                .rebuild_history_tree_to_height(tip_height, || {
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("history tree rebuild cannot be cancelled");
+
+            return Arc::new(history_tree);
+        }
+
+        self.history_tree_from_disk()
+    }
+
+    /// Returns the persisted ZIP-221 history tree of the finalized tip without rebuilding it.
+    pub(crate) fn history_tree_from_disk(&self) -> Arc<HistoryTree> {
         let history_tree_cf = self.history_tree_cf();
 
         // # Backwards Compatibility
@@ -150,6 +169,99 @@ impl ZebraDb {
             )
         });
         Arc::new(HistoryTree::from(history_tree))
+    }
+
+    fn needs_history_tree_rebuild_before_read(&self) -> bool {
+        if self.finalized_tip_height().is_none() {
+            return false;
+        }
+
+        self.format_version_on_disk()
+            .expect("database format version should be readable")
+            .is_some_and(|version| version.major < 29)
+    }
+
+    /// Rebuilds the ZIP-221 history tree up to `target_height` from finalized blocks and roots.
+    pub(crate) fn rebuild_history_tree_to_height<E>(
+        &self,
+        target_height: Height,
+        mut check_cancelled: impl FnMut() -> Result<(), E>,
+    ) -> Result<HistoryTree, E> {
+        check_cancelled()?;
+
+        let network = self.db.network();
+        let network_upgrade = NetworkUpgrade::current(&network, target_height);
+
+        if network_upgrade < NetworkUpgrade::Heartwood {
+            return Ok(HistoryTree::default());
+        }
+
+        let start_height = network_upgrade
+            .activation_height(&network)
+            .expect("current network upgrade must have an activation height");
+        let (block, sapling_root, orchard_root, ironwood_root) =
+            self.history_tree_inputs_at_height(start_height);
+        let mut history_tree = HistoryTree::from_block(
+            &network,
+            block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+        )
+        .expect("stored blocks and note commitment tree roots should rebuild the history tree");
+
+        for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
+            check_cancelled()?;
+
+            let (block, sapling_root, orchard_root, ironwood_root) =
+                self.history_tree_inputs_at_height(height);
+            history_tree
+                .push(
+                    &network,
+                    block,
+                    &sapling_root,
+                    &orchard_root,
+                    &ironwood_root,
+                )
+                .expect(
+                    "stored blocks and note commitment tree roots should rebuild the history tree",
+                );
+        }
+
+        check_cancelled()?;
+
+        Ok(history_tree)
+    }
+
+    fn history_tree_inputs_at_height(
+        &self,
+        height: Height,
+    ) -> (
+        Arc<zebra_chain::block::Block>,
+        zebra_chain::sapling::tree::Root,
+        zebra_chain::orchard::tree::Root,
+        zebra_chain::ironwood::tree::Root,
+    ) {
+        let block = self
+            .block(height.into())
+            .expect("finalized block should exist when rebuilding the history tree");
+        let sapling_root = self
+            .sapling_tree_by_height(&height)
+            .expect("Sapling tree should exist when rebuilding the history tree")
+            .root();
+        let orchard_root = self
+            .orchard_tree_by_height(&height)
+            .expect("Orchard tree should exist when rebuilding the history tree")
+            .root();
+        let ironwood_root = match self.ironwood_tree_by_height_range(..=height).last() {
+            Some((_height, tree)) => tree.root(),
+            // Older database formats can rebuild history trees before the Ironwood tree
+            // backfill runs. The backfill creates the empty Ironwood tree, so use that
+            // same root here.
+            None => Default::default(),
+        };
+
+        (block, sapling_root, orchard_root, ironwood_root)
     }
 
     /// Returns all the history tip trees.
@@ -193,7 +305,7 @@ impl ZebraDb {
 impl DiskWriteBatch {
     // History tree methods
 
-    /// Updates the history tree for the tip, if it is not empty.
+    /// Updates the history tree for the tip.
     ///
     /// The batch must be written to the database by the caller.
     pub fn update_history_tree(&mut self, db: &ZebraDb, tree: &HistoryTree) {
@@ -202,6 +314,9 @@ impl DiskWriteBatch {
         if let Some(tree) = tree.as_ref() {
             // The batch is modified by this method and written by the caller.
             let _ = history_tree_cf.zs_insert(&(), &HistoryTreeParts::from(tree));
+        } else {
+            // The batch is modified by this method and written by the caller.
+            let _ = history_tree_cf.zs_delete(&());
         }
     }
 
