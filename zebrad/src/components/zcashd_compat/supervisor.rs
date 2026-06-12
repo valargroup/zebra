@@ -214,6 +214,11 @@ pub async fn run(
         let child_result = wait_for_child_or_shutdown(&mut child, &mut shutdown_rx).await;
         match child_result {
             ChildOutcome::ShutdownRequested => {
+                info!(
+                    pid = ?child.id(),
+                    grace_period = ?config.shutdown_grace_period,
+                    "zcashd-compat supervisor received shutdown request; terminating zcashd child"
+                );
                 terminate_child(&mut child, config.shutdown_grace_period).await?;
                 info!("zcashd-compat zcashd child stopped on shutdown");
                 set_supervision_inactive_metrics();
@@ -503,7 +508,20 @@ async fn terminate_child(
         };
 
         if let Some(id) = pid {
-            let _ = kill(Pid::from_raw(id as i32), SIGTERM);
+            info!(
+                pid = id,
+                grace_period = ?shutdown_grace_period,
+                "sending SIGTERM to zcashd-compat zcashd child"
+            );
+            if let Err(error) = kill(Pid::from_raw(id as i32), SIGTERM) {
+                warn!(
+                    pid = id,
+                    ?error,
+                    "failed to send SIGTERM to zcashd-compat zcashd child"
+                );
+            }
+        } else {
+            warn!("zcashd-compat zcashd child has no process id; cannot send SIGTERM");
         }
     }
 

@@ -963,7 +963,13 @@ impl StartCmd {
         if zcashd_compat_task_finished {
             debug!("zcashd-compat supervisor task already exited before shutdown");
         } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
-            let _ = zcashd_compat_shutdown_tx.send(true);
+            info!(
+                ?zcashd_compat_shutdown_timeout,
+                "requesting zcashd-compat supervisor shutdown"
+            );
+            if zcashd_compat_shutdown_tx.send(true).is_err() {
+                warn!("zcashd-compat supervisor shutdown request was not delivered");
+            }
             if tokio::time::timeout(
                 zcashd_compat_shutdown_timeout,
                 &mut zcashd_compat_task_handle,
@@ -971,12 +977,18 @@ impl StartCmd {
             .await
             .is_err()
             {
+                warn!(
+                    ?zcashd_compat_shutdown_timeout,
+                    "zcashd-compat supervisor did not finish before shutdown timeout; \
+                     abandoning child process handle"
+                );
                 // The supervisor spawns zcashd without kill_on_drop, so this
                 // abort abandons an already-signalled child rather than
                 // SIGKILLing it mid-flush.
                 zcashd_compat_task_handle.abort();
             }
         } else {
+            debug!("aborting zcashd-compat supervisor task without managed child shutdown");
             zcashd_compat_task_handle.abort();
         }
 
