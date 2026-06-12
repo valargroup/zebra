@@ -2377,7 +2377,10 @@ mod zakura_header_sync_driver_tests {
             Some((block::Height(11), 2))
         );
         assert_eq!(
-            block_sync_missing_body_window(block::Height(10), block::Height(1_000)),
+            block_sync_missing_body_window(
+                block::Height(10),
+                block::Height(10 + zebra_state::MAX_BLOCK_REORG_HEIGHT + 100)
+            ),
             Some((block::Height(11), zebra_state::MAX_BLOCK_REORG_HEIGHT))
         );
     }
