@@ -33,7 +33,7 @@
 
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     ops::RangeInclusive,
     sync::Arc,
@@ -72,7 +72,7 @@ use zebra_chain::{
         ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    subtree::NoteCommitmentSubtreeIndex,
+    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
     value_balance::ValueBalance,
@@ -931,6 +931,27 @@ where
     pub fn network(&self) -> &Network {
         &self.network
     }
+}
+
+fn subtrees_by_index_response<Root>(
+    pool: String,
+    start_index: NoteCommitmentSubtreeIndex,
+    subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Root>>,
+    encode_root: impl Fn(&Root) -> String,
+) -> Result<GetSubtreesByIndexResponse> {
+    let subtrees = subtrees
+        .values()
+        .map(|subtree| SubtreeRpcData {
+            root: encode_root(&subtree.root),
+            end_height: subtree.end_height,
+        })
+        .collect();
+
+    Ok(GetSubtreesByIndexResponse {
+        pool,
+        start_index,
+        subtrees,
+    })
 }
 
 #[async_trait]
@@ -2054,18 +2075,8 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            let subtrees = subtrees
-                .values()
-                .map(|subtree| SubtreeRpcData {
-                    root: subtree.root.to_bytes().encode_hex(),
-                    end_height: subtree.end_height,
-                })
-                .collect();
-
-            Ok(GetSubtreesByIndexResponse {
-                pool,
-                start_index,
-                subtrees,
+            subtrees_by_index_response(pool, start_index, subtrees, |root| {
+                root.to_bytes().encode_hex()
             })
         } else if pool == "orchard" {
             let request = zebra_state::ReadRequest::OrchardSubtrees { start_index, limit };
@@ -2080,19 +2091,7 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            let subtrees = subtrees
-                .values()
-                .map(|subtree| SubtreeRpcData {
-                    root: subtree.root.encode_hex(),
-                    end_height: subtree.end_height,
-                })
-                .collect();
-
-            Ok(GetSubtreesByIndexResponse {
-                pool,
-                start_index,
-                subtrees,
-            })
+            subtrees_by_index_response(pool, start_index, subtrees, |root| root.encode_hex())
         } else if pool == "ironwood" {
             let request = zebra_state::ReadRequest::IronwoodSubtrees { start_index, limit };
             let response = read_state
@@ -2106,19 +2105,7 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            let subtrees = subtrees
-                .values()
-                .map(|subtree| SubtreeRpcData {
-                    root: subtree.root.encode_hex(),
-                    end_height: subtree.end_height,
-                })
-                .collect();
-
-            Ok(GetSubtreesByIndexResponse {
-                pool,
-                start_index,
-                subtrees,
-            })
+            subtrees_by_index_response(pool, start_index, subtrees, |root| root.encode_hex())
         } else {
             Err(ErrorObject::owned(
                 server::error::LegacyCode::Misc.into(),
