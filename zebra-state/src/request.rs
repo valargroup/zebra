@@ -37,6 +37,9 @@ use crate::{
 
 /// Identify a spend by a transparent outpoint or revealed nullifier.
 ///
+/// This enum supports [`transparent::OutPoint`], [`sprout::Nullifier`],
+/// [`sapling::Nullifier`], [`orchard::Nullifier`], and [`ironwood::Nullifier`] spends.
+///
 /// This enum implements `From` for [`transparent::OutPoint`], [`sprout::Nullifier`],
 /// [`sapling::Nullifier`], and [`orchard::Nullifier`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1322,7 +1325,7 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// * [`ReadResponse::IronwoodSubtree(BTreeMap<_, NoteCommitmentSubtreeData<_>>))`](crate::ReadResponse::IronwoodSubtrees)
+    /// * [`ReadResponse::IronwoodSubtrees(BTreeMap<_, NoteCommitmentSubtreeData<_>>))`](crate::ReadResponse::IronwoodSubtrees)
     /// * An empty list if there is no subtree at `start_index`.
     IronwoodSubtrees {
         /// The index of the first 2^16-leaf subtree to return.
