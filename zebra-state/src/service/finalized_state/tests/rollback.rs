@@ -34,7 +34,7 @@ use crate::{
     service::{
         arbitrary::PreparedChain,
         finalized_state::{
-            disk_format::upgrade::{add_ironwood_tree, DiskFormatUpgrade},
+            disk_format::upgrade::{add_ironwood_tree, rebuild_history_tree, DiskFormatUpgrade},
             CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
         },
     },
@@ -1217,6 +1217,152 @@ fn ironwood_tree_upgrade_backfills_first_finalized_height() {
             .expect("Ironwood tree upgrade validation is not cancelled"),
         Ok(())
     );
+}
+
+#[test]
+fn history_tree_upgrade_write_guard_checks_tip_hash() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let chain = vec![SemanticallyVerifiedBlock::from(genesis)];
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let db = open_unchecked_db(&config, &network);
+    let (tip_height, tip_hash) = db.tip().expect("test state has a tip");
+    let mut wrong_hash = tip_hash;
+    wrong_hash.0[0] ^= 0xff;
+
+    assert_ne!(wrong_hash, tip_hash, "wrong hash differs from tip hash");
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, wrong_hash))
+        .expect("conditional write succeeds");
+    assert!(
+        !wrote,
+        "write guard rejects the same tip height with a different hash"
+    );
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, tip_hash))
+        .expect("conditional write succeeds");
+    assert!(wrote, "write guard accepts the exact finalized tip");
+}
+
+#[test]
+fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu7: Some(11),
+            ..Default::default()
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(
+        ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())
+        | {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            let stale_height = NetworkUpgrade::Nu7
+                .activation_height(&network)
+                .expect("NU7 activation height is configured");
+            prop_assume!(
+                synced
+                    .last()
+                    .expect("generated chain has a tip")
+                    .height
+                    > stale_height
+            );
+
+            let dir = TempDir::new().expect("temp dir");
+            let config = config_at(dir.path());
+            sync_to(&config, &network, &synced);
+
+            let db = open_unchecked_db(&config, &network);
+            let tip_height = db.finalized_tip_height().expect("test state has a tip");
+            let tip_history_tree = db.history_tree();
+            let stale_block = db
+                .block(stale_height.into())
+                .expect("stale block exists in the finalized state");
+            let stale_sapling_root = db
+                .sapling_tree_by_height(&stale_height)
+                .expect("stale Sapling tree exists")
+                .root();
+            let stale_orchard_root = db
+                .orchard_tree_by_height(&stale_height)
+                .expect("stale Orchard tree exists")
+                .root();
+            let stale_ironwood_root = db
+                .ironwood_tree_by_height(&stale_height)
+                .expect("stale Ironwood tree exists")
+                .root();
+            let stale_history_tree = zebra_chain::history_tree::HistoryTree::from_block(
+                &network,
+                stale_block,
+                &stale_sapling_root,
+                &stale_orchard_root,
+                &stale_ironwood_root,
+            )
+            .expect("stale history tree rebuild succeeds");
+            let mut batch = DiskWriteBatch::new();
+            batch.update_history_tree(&db, &stale_history_tree);
+            db.write_batch(batch)
+                .expect("database accepts synthetic stale history tree");
+
+            let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+            prop_assert!(
+                rebuild_history_tree::RebuildHistoryTree
+                    .validate(&db, &cancel_receiver)
+                    .expect("history tree validation is not cancelled")
+                    .is_err(),
+                "validation rejects the stale history tree"
+            );
+
+            rebuild_history_tree::RebuildHistoryTree
+                .run(tip_height, &db, &cancel_receiver)
+                .expect("history tree rebuild upgrade succeeds");
+
+            prop_assert_eq!(
+                db.history_tree().hash(),
+                tip_history_tree.hash(),
+                "upgrade restores the tip history tree hash"
+            );
+            prop_assert_eq!(
+                rebuild_history_tree::RebuildHistoryTree
+                    .validate(&db, &cancel_receiver)
+                    .expect("history tree validation is not cancelled"),
+                Ok(())
+            );
+        }
+    );
+
+    Ok(())
 }
 
 #[test]

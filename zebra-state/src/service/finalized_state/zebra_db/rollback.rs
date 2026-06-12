@@ -207,6 +207,13 @@ pub enum RollbackFinalizedStateError {
         height: block::Height,
     },
 
+    /// An Ironwood note commitment tree required for rollback could not be loaded.
+    #[error("missing Ironwood note commitment tree at height {height:?}")]
+    MissingIronwoodTree {
+        /// Missing tree height.
+        height: block::Height,
+    },
+
     /// Address balance arithmetic failed while reversing transparent indexes.
     #[error("transparent address balance update failed")]
     AddressBalance(#[from] amount::Error),
@@ -552,13 +559,16 @@ fn rebuild_history_tree_from_upgrade_activation(
         .activation_height(network)
         .expect("current network upgrade must have an activation height");
 
-    let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree = HistoryTree::from_block(network, block, &sapling_root, &orchard_root)?;
+    let (block, sapling_root, orchard_root, ironwood_root) =
+        history_rebuild_inputs_at_height(db, network, start_height)?;
+    let mut history_tree =
+        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
-        let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, height)?;
+        let (block, sapling_root, orchard_root, ironwood_root) =
+            history_rebuild_inputs_at_height(db, network, height)?;
 
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(history_tree)
@@ -566,12 +576,14 @@ fn rebuild_history_tree_from_upgrade_activation(
 
 fn history_rebuild_inputs_at_height(
     db: &ZebraDb,
+    network: &Network,
     height: Height,
 ) -> Result<
     (
         Arc<Block>,
         zebra_chain::sapling::tree::Root,
         zebra_chain::orchard::tree::Root,
+        zebra_chain::ironwood::tree::Root,
     ),
     RollbackFinalizedStateError,
 > {
@@ -586,8 +598,15 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RollbackFinalizedStateError::MissingOrchardTree { height })?
         .root();
+    let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
+        Some((_height, tree)) => tree.root(),
+        None if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu7 => {
+            Default::default()
+        }
+        None => return Err(RollbackFinalizedStateError::MissingIronwoodTree { height }),
+    };
 
-    Ok((block, sapling_root, orchard_root))
+    Ok((block, sapling_root, orchard_root, ironwood_root))
 }
 
 fn rebuild_treestate_to_height(
@@ -609,7 +628,8 @@ fn rebuild_treestate_to_height(
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        let ironwood_root = note_commitment_trees.ironwood.root();
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(RebuiltTreestate {

@@ -233,10 +233,9 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     // TODO: Replace this placeholder once the Valar NU7 consensus branch ID is chosen.
-    #[cfg(zcash_unstable = "nu7")]
     (Nu7, ConsensusBranchId(0xffffffff)),
     #[cfg(zcash_unstable = "zfuture")]
-    (ZFuture, ConsensusBranchId(0xffffffff)),
+    (ZFuture, ConsensusBranchId(0xfffffffe)),
 ];
 
 /// The target block spacing before Blossom.

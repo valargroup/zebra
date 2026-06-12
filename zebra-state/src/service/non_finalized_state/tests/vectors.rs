@@ -663,6 +663,7 @@ fn history_tree_is_updated_for_network_upgrade(
         activation_block.clone(),
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
+        &chain.ironwood_note_commitment_tree_for_tip().root(),
     )
     .unwrap();
 
@@ -746,6 +747,7 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
         activation_block.clone(),
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
+        &chain.ironwood_note_commitment_tree_for_tip().root(),
     )
     .unwrap();
 
