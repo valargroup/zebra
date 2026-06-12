@@ -680,31 +680,31 @@ impl ShieldedOutput {
     }
 }
 
-/// Object with Orchard-specific information.
+/// Object with Orchard or Ironwood action information.
 #[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Orchard {
-    /// Array of Orchard actions.
+    /// Array of Orchard or Ironwood actions.
     actions: Vec<OrchardAction>,
-    /// The net value of Orchard Actions in ZEC.
+    /// The net value of Orchard or Ironwood actions in ZEC.
     #[serde(rename = "valueBalance")]
     value_balance: f64,
-    /// The net value of Orchard Actions in zatoshis.
+    /// The net value of Orchard or Ironwood actions in zatoshis.
     #[serde(rename = "valueBalanceZat")]
     value_balance_zat: i64,
     /// The flags.
     #[serde(skip_serializing_if = "Option::is_none")]
     flags: Option<OrchardFlags>,
-    /// A root of the Orchard note commitment tree at some block height in the past
+    /// A root of the Orchard or Ironwood note commitment tree at some block height in the past.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
     anchor: Option<[u8; 32]>,
-    /// Encoding of aggregated zk-SNARK proofs for Orchard Actions
+    /// Encoding of aggregated zk-SNARK proofs for Orchard or Ironwood actions.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     proof: Option<Vec<u8>>,
-    /// An Orchard binding signature on the SIGHASH transaction hash
+    /// An Orchard or Ironwood binding signature on the SIGHASH transaction hash.
     #[serde(rename = "bindingSig")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
@@ -712,18 +712,18 @@ pub struct Orchard {
     binding_sig: Option<[u8; 64]>,
 }
 
-/// Object with Orchard-specific information.
+/// Object with Orchard or Ironwood flag information.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct OrchardFlags {
-    /// Whether Orchard outputs are enabled.
+    /// Whether Orchard or Ironwood outputs are enabled.
     #[serde(rename = "enableOutputs")]
     enable_outputs: bool,
-    /// Whether Orchard spends are enabled.
+    /// Whether Orchard or Ironwood spends are enabled.
     #[serde(rename = "enableSpends")]
     enable_spends: bool,
 }
 
-/// The Orchard action of a transaction.
+/// The Orchard or Ironwood action of a transaction.
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct OrchardAction {
