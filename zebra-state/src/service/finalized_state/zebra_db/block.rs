@@ -598,14 +598,13 @@ impl ZebraDb {
         self.db.write(batch)
     }
 
-    /// Writes the given batch only if the finalized tip height still matches `expected_tip`.
+    /// Writes the given batch only if the finalized tip still matches `expected_tip`.
     pub(crate) fn write_batch_if_finalized_tip(
         &self,
         batch: DiskWriteBatch,
-        expected_tip: Height,
+        expected_tip: (Height, block::Hash),
     ) -> Result<bool, rocksdb::Error> {
-        self.db
-            .write_if(batch, || self.finalized_tip_height() == Some(expected_tip))
+        self.db.write_if(batch, || self.tip() == Some(expected_tip))
     }
 }
 

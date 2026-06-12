@@ -1220,6 +1220,41 @@ fn ironwood_tree_upgrade_backfills_first_finalized_height() {
 }
 
 #[test]
+fn history_tree_upgrade_write_guard_checks_tip_hash() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let chain = vec![SemanticallyVerifiedBlock::from(genesis)];
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let db = open_unchecked_db(&config, &network);
+    let (tip_height, tip_hash) = db.tip().expect("test state has a tip");
+    let mut wrong_hash = tip_hash;
+    wrong_hash.0[0] ^= 0xff;
+
+    assert_ne!(wrong_hash, tip_hash, "wrong hash differs from tip hash");
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, wrong_hash))
+        .expect("conditional write succeeds");
+    assert!(
+        !wrote,
+        "write guard rejects the same tip height with a different hash"
+    );
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, tip_hash))
+        .expect("conditional write succeeds");
+    assert!(wrote, "write guard accepts the exact finalized tip");
+}
+
+#[test]
 fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
     let _init_guard = zebra_test::init();
 

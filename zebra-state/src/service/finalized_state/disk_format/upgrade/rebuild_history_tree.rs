@@ -30,7 +30,7 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
         loop {
             check_cancelled(cancel_receiver)?;
 
-            let Some(tip_height) = db.finalized_tip_height() else {
+            let Some(tip @ (tip_height, _)) = db.tip() else {
                 return Ok(());
             };
 
@@ -43,7 +43,7 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
             batch.update_history_tree(db, &history_tree);
 
             let wrote_tree = db
-                .write_batch_if_finalized_tip(batch, tip_height)
+                .write_batch_if_finalized_tip(batch, tip)
                 .expect("rewriting history tree data should always succeed");
 
             if wrote_tree {
@@ -60,7 +60,7 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
         loop {
             check_cancelled(cancel_receiver)?;
 
-            let Some(tip_height) = db.finalized_tip_height() else {
+            let Some(tip @ (tip_height, _)) = db.tip() else {
                 return Ok(Ok(()));
             };
 
@@ -68,7 +68,7 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
                 db.rebuild_history_tree_to_height(tip_height, || check_cancelled(cancel_receiver))?;
             let history_tree = db.history_tree_from_disk();
 
-            if db.finalized_tip_height() != Some(tip_height) {
+            if db.tip() != Some(tip) {
                 continue;
             }
 
@@ -92,7 +92,7 @@ impl DiskFormatUpgrade for RebuildHistoryTree {
                 )));
             }
 
-            if db.finalized_tip_height() == Some(tip_height) {
+            if db.tip() == Some(tip) {
                 return Ok(Ok(()));
             }
         }
