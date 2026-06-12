@@ -349,13 +349,11 @@ fn check_zcashd_binary(
                 }
             };
 
-            if binary_path.exists() {
-                if !is_command_resolvable(&binary_path) {
-                    summary.errors.push(format!(
-                        "zcashd binary {} does not exist or is not executable by the current user",
-                        binary_path.display()
-                    ));
-                }
+            if binary_path.exists() && !is_command_resolvable(&binary_path) {
+                summary.errors.push(format!(
+                    "zcashd binary {} does not exist or is not executable by the current user",
+                    binary_path.display()
+                ));
             }
 
             if !cache_is_current {

@@ -71,6 +71,8 @@ compat-docker-build: compat-zcashd-prepare
 		--build-context "zcashd_compat=$$context_dir" \
 		--tag "$(ZEBRA_DOCKER_IMAGE)" .
 
+# The Zebra compat listener is internal to the supervised zcashd process in this
+# container, so keep it on container loopback and publish only zcashd's RPC port.
 compat-docker-start:
 	@echo "Starting Docker zcashd-compat container..."
 	docker run --rm -it \
@@ -79,12 +81,11 @@ compat-docker-start:
 		-e ZEBRA_NETWORK__LISTEN_ADDR="[::]:8233" \
 		-e ZEBRA_STATE__CACHE_DIR="/home/zebra/.cache/zebra" \
 		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
-		-e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR="0.0.0.0:28232" \
+		-e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR="127.0.0.1:28232" \
 		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
 		--mount type=bind,src="$(ZEBRA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zebra" \
 		--mount type=bind,src="$(ZCASHD_DATADIR)",dst="/home/zebra/.cache/zcashd" \
 		-p 8233:8233 \
-		-p 127.0.0.1:28232:28232 \
 		-p 127.0.0.1:8232:8232 \
 		"$(ZEBRA_DOCKER_IMAGE)" \
 		zebrad start --zcashd-compat

@@ -149,11 +149,14 @@ impl SupervisorConfig {
 /// Runs the zcashd-compat zcashd supervisor until shutdown.
 ///
 /// The supervisor keeps restarting `zcashd` exits that happen before Zebra
-/// shutdown, using capped exponential backoff.
+/// shutdown, using capped exponential backoff. Spawn failures use the same
+/// backoff, so a binary that is briefly missing or unspawnable (for example
+/// during an upgrade, or under transient resource pressure) does not
+/// permanently end supervision.
 ///
 /// # Errors
 ///
-/// Returns an error if spawning `zcashd` fails or if shutdown handling fails.
+/// Returns an error if shutdown handling fails.
 pub async fn run(
     config: SupervisorConfig,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -176,7 +179,29 @@ pub async fn run(
             return Ok(());
         }
 
-        let mut child = spawn_zcashd(&config)?;
+        let mut child = match spawn_zcashd(&config) {
+            Ok(child) => child,
+            Err(error) => {
+                consecutive_restart_count = consecutive_restart_count.saturating_add(1);
+                warn!(
+                    %error,
+                    restart_count = consecutive_restart_count,
+                    "failed to spawn zcashd-compat zcashd child, retrying after backoff"
+                );
+
+                let restart_delay = restart_backoff_delay(
+                    config.restart_backoff,
+                    config.restart_backoff_max,
+                    consecutive_restart_count,
+                );
+                if wait_for_delay_or_shutdown(restart_delay, &mut shutdown_rx).await {
+                    info!("zcashd-compat supervisor received shutdown during spawn retry backoff");
+                    set_supervision_inactive_metrics();
+                    return Ok(());
+                }
+                continue;
+            }
+        };
         let child_started_at = Instant::now();
         info!(
             path = %config.zcashd_path.display(),
@@ -632,8 +657,8 @@ mod tests {
             network: NetworkKind::Regtest,
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
+            restart_backoff_max: Duration::from_secs(5 * 60),
             restart_reset_after: Duration::from_secs(60 * 60),
-            max_restarts: 3,
             shutdown_grace_period: Duration::from_secs(300),
         };
 

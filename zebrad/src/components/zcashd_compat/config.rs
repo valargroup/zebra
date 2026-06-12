@@ -99,6 +99,15 @@ pub struct Config {
     /// CA certificate file passed to supervised zcashd so it can verify Zebra's TLS certificate.
     pub tls_ca_file: Option<PathBuf>,
 
+    /// Allow a non-loopback zcashd-compat RPC listener without TLS.
+    ///
+    /// By default, non-loopback `listen_addr` values require TLS because cookie
+    /// credentials would otherwise cross the network in cleartext. Set this only
+    /// when another layer secures the listener, such as a container or private
+    /// network boundary. This mirrors zcashd's `-zebra-compat-allow-remote-http`
+    /// client-side escape hatch.
+    pub unsafe_allow_remote_http: bool,
+
     /// Delay before the first `zcashd` spawn attempt.
     #[serde(with = "humantime_serde")]
     pub startup_delay: Duration,
@@ -145,6 +154,7 @@ impl Default for Config {
             tls_cert_file: None,
             tls_key_file: None,
             tls_ca_file: None,
+            unsafe_allow_remote_http: false,
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             restart_backoff_max: Duration::from_secs(5 * 60),

@@ -77,7 +77,7 @@ pub fn ensure_zcashd_datadir(datadir: &Path, extra_args: &[String]) -> Result<()
     fs::create_dir_all(&datadir)
         .wrap_err_with(|| format!("failed to create zcashd datadir {}", datadir.display()))?;
 
-    let conf_path = resolve_zcashd_conf_path(&datadir, &extra_args);
+    let conf_path = resolve_zcashd_conf_path(&datadir, extra_args);
     let parent = conf_path.parent().ok_or_else(|| {
         eyre!(
             "zcashd config path has no parent directory: {}",

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   datadir, `zcash.conf`, zcashd binary, Zebra state directory, and RPC cookie
   directory before creating directories or config files, reporting all problems
   in one aggregated error. Failures can be bypassed with `--unsafe-low-specs`.
+- `zcashd_compat.unsafe_allow_remote_http` allows a non-loopback zcashd-compat
+  RPC listener without TLS for deployments where another boundary secures the
+  listener, such as a private container network. Non-loopback listeners
+  otherwise require TLS.
 
 ### Changed
 
@@ -33,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Make zcashd-compat supervision retry indefinitely with capped exponential
   restart backoff, reset the backoff ramp after healthy child uptime, and expose
   active/disabled/exhausted supervisor state through metrics.
+- zcashd-compat supervision now also retries `zcashd` spawn failures with the
+  same capped backoff instead of permanently ending supervision when the binary
+  is briefly missing or unspawnable.
 - Update `zebra-rollback-state` and `zebrad rollback-state` to run rollback by
   default and use `--dry-run` for rollback-plan previews (replacing the old
   `--force` gate).

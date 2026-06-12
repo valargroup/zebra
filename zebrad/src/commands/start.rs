@@ -165,6 +165,12 @@ impl StartCmd {
     /// zcashd defaults to a 128 MiB response budget. That allows a memory-clamped
     /// batch of 33 raw blocks, whose worst-case response is 133,082,368 bytes.
     /// jsonrpsee applies this limit to the whole JSON-RPC batch response.
+    ///
+    /// These `ZCASHD_COMPAT_*` constants mirror zcashd's batch/budget arithmetic
+    /// in `zcash/src/zebra_compat/zebra_client.cpp`
+    /// (`ZebraCompatSyncBatchSizeFromMemoryBudget` / `ZebraRpcMaxResponseBodySize`).
+    /// If the formula or constants change on either side, update both together,
+    /// or startup validation will accept configs the other process rejects.
     const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 128 * 1024 * 1024;
     /// zcashd's default sync batch size.
     const ZCASHD_COMPAT_DEFAULT_SYNC_BATCH_SIZE: u64 = 30;
@@ -247,7 +253,7 @@ impl StartCmd {
                     )
                 })
             })
-            .last()
+            .next_back()
             .transpose()
     }
 
@@ -293,8 +299,7 @@ impl StartCmd {
                     eyre!("zcashd-compat sync batch size {sync_batch_size} is too large")
                 })?;
         let required_sync_response_budget_mb =
-            (required_sync_response_budget_bytes + Self::ZCASHD_COMPAT_MIB - 1)
-                / Self::ZCASHD_COMPAT_MIB;
+            required_sync_response_budget_bytes.div_ceil(Self::ZCASHD_COMPAT_MIB);
         let required_max_response_body_size = sync_batch_size
             .checked_mul(Self::ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK)
             .ok_or_else(|| eyre!("zcashd-compat sync batch size {sync_batch_size} is too large"))?;
@@ -367,9 +372,13 @@ impl StartCmd {
         }
 
         if let Some(listen_addr) = config.zcashd_compat.listen_addr {
-            if !listen_addr.ip().is_loopback() && !config.zcashd_compat.tls_enabled() {
+            if !listen_addr.ip().is_loopback()
+                && !config.zcashd_compat.tls_enabled()
+                && !config.zcashd_compat.unsafe_allow_remote_http
+            {
                 return Err(eyre!(
-                    "zcashd_compat.listen_addr={listen_addr} is non-loopback and requires TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
+                    "zcashd_compat.listen_addr={listen_addr} is non-loopback and requires TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file, \
+                     or zcashd_compat.unsafe_allow_remote_http=true when a container or private network boundary secures the listener"
                 ));
             }
         }
@@ -1325,6 +1334,24 @@ mod tests {
 
         cmd.override_config(config)
             .expect("non-loopback zcashd-compat RPC should be allowed with TLS");
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_non_loopback_listen_addr_with_unsafe_override() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
+        config.zcashd_compat.unsafe_allow_remote_http = true;
+
+        cmd.override_config(config).expect(
+            "non-loopback zcashd-compat RPC should be allowed with the explicit unsafe override",
+        );
     }
 
     #[test]

@@ -4,6 +4,9 @@ zcashd-compat mode runs Zebra as the consensus source and optionally supervises 
 `zcashd -zebra-compat` child process that uses Zebra's RPC endpoint for chain data,
 mempool data, and transaction forwarding.
 
+For the zcashd side of this integration, see
+[zebra-compat Node Operation](https://github.com/valargroup/zcashd/blob/feat/unity/doc/zebra-compat.md).
+
 ## What zcashd-compat mode does
 
 When you start Zebra with:
@@ -72,6 +75,7 @@ enable_cookie_auth = true                           # optional, defaults to true
 tls_cert_file = "/path/to/zebra.crt"                # optional, enables HTTPS with tls_key_file
 tls_key_file = "/path/to/zebra.key"                 # optional, required with tls_cert_file
 tls_ca_file = "/path/to/internal-ca.pem"            # optional, passed to supervised zcashd
+unsafe_allow_remote_http = false                    # optional, allows non-loopback listen_addr without TLS
 startup_delay = "1s"
 restart_backoff = "2s"                              # base exponential backoff
 restart_backoff_max = "5m"                          # maximum retry delay
@@ -106,7 +110,17 @@ tls_ca_file = "/path/to/internal-ca.pem"
 
 Non-loopback `zcashd_compat.listen_addr` values require TLS. Loopback listeners
 can use the default plain HTTP channel because credentials stay on the local
-host.
+host. `zcashd_compat.unsafe_allow_remote_http = true` overrides the TLS
+requirement for deployments where another boundary secures the listener, such
+as a private container network or VPN; treat it like zcashd's
+`-zebra-compat-allow-remote-http` escape hatch and prefer TLS. If Zebra and
+supervised zcashd run in the same container, prefer keeping
+`zcashd_compat.listen_addr` on container loopback instead.
+
+The TLS certificate must include an IP Subject Alternative Name for the
+`listen_addr` IP (for example `IP:127.0.0.1`): supervised zcashd connects to
+the raw IP address and verifies the certificate against it, so a certificate
+with only DNS names fails verification.
 
 When `manage_zcashd = true`, Zebra uses an `https://` `-zebra-compat-url` and
 passes `-zebra-compat-tls-ca-file=<tls_ca_file>` to supervised zcashd. The CA
@@ -309,6 +323,21 @@ enables zcashd-compat mode and configures Zebra to use that local binary.
 
 If `manage_zcashd = false`, Zebra still applies zcashd-compat RPC guardrails, but
 does not spawn `zcashd`.
+
+The `compat-docker-start` target uses the safer single-container pattern:
+
+```console
+ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR=127.0.0.1:28232
+```
+
+This listener is only used by the supervised `zcashd` process inside the same
+container, so it does not need to be published to the host and does not need
+`zcashd_compat.unsafe_allow_remote_http`. The target publishes zcashd's own RPC
+port on host loopback instead:
+
+```console
+-p 127.0.0.1:8232:8232
+```
 
 The standard `[rpc]` listener remains independent. zcashd-compat uses a separate
 listener and separate authentication/TLS settings so operators can keep
