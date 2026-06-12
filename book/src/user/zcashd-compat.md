@@ -109,6 +109,13 @@ passes `-zebra-compat-tls-ca-file=<tls_ca_file>` to supervised zcashd. The CA
 file should contain the public CA certificate zcashd needs to verify Zebra's
 server certificate. It is not Zebra's private key.
 
+If TLS is enabled later on the same loopback supervised listener, zcashd keeps
+the existing trusted boundary active even though the supervisor changes the URL
+scheme from `http://` to `https://`. The boundary still must match the configured
+host, port, path, network, and genesis. For remote endpoints, changing the URL
+scheme is treated as a source change and requires the normal zcashd recovery
+checks.
+
 Cookie auth can be disabled for the dedicated zcashd-compat listener only when
 TLS is enabled:
 
