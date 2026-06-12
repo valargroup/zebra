@@ -366,6 +366,14 @@ impl StartCmd {
             }
         }
 
+        if let Some(listen_addr) = config.zcashd_compat.listen_addr {
+            if !listen_addr.ip().is_loopback() && !config.zcashd_compat.tls_enabled() {
+                return Err(eyre!(
+                    "zcashd_compat.listen_addr={listen_addr} is non-loopback and requires TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
+                ));
+            }
+        }
+
         if config.zcashd_compat.enabled
             && config.zcashd_compat.manage_zcashd
             && config.zcashd_compat.tls_enabled()
@@ -1254,6 +1262,69 @@ mod tests {
             StartCmd::zcashd_compat_rpc_url(&config).expect("zcashd-compat RPC URL should format");
 
         assert!(rpc_url.starts_with("https://"));
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_non_loopback_listen_addr_without_tls() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("non-loopback zcashd-compat RPC should require TLS");
+
+        assert!(
+            error
+                .to_string()
+                .contains("listen_addr=192.0.2.1:28232 is non-loopback and requires TLS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_loopback_listen_addr_without_tls() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.listen_addr = Some(([127, 0, 0, 1], 28232).into());
+
+        cmd.override_config(config)
+            .expect("loopback zcashd-compat RPC should allow plain HTTP");
+    }
+
+    #[test]
+    fn zcashd_compat_config_allows_non_loopback_listen_addr_with_tls() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let cert_file = tempdir.path().join("zebra.crt");
+        let key_file = tempdir.path().join("zebra.key");
+        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
+        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
+        config.zcashd_compat.tls_cert_file = Some(cert_file);
+        config.zcashd_compat.tls_key_file = Some(key_file);
+
+        cmd.override_config(config)
+            .expect("non-loopback zcashd-compat RPC should be allowed with TLS");
     }
 
     #[test]

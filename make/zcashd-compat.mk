@@ -18,9 +18,9 @@ ZCASHD_BIN ?= /root/unity/zcash/src/zcashd
 ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 
 # TODO: make more general
-NETWORK ?= Testnet
-ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state-testnet
-ZCASHD_DATADIR ?= /mnt/data/zcashd-profile-b/.zcashd
+NETWORK ?= Mainnet
+ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state
+ZCASHD_DATADIR ?= /mnt/data/zcashd-mainnet
 ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
@@ -76,16 +76,16 @@ compat-docker-start:
 	docker run --rm -it \
 		-e ZCASHD_COMPAT_ENABLED=true \
 		-e ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
-		-e ZEBRA_NETWORK__LISTEN_ADDR="[::]:18233" \
+		-e ZEBRA_NETWORK__LISTEN_ADDR="[::]:8233" \
 		-e ZEBRA_STATE__CACHE_DIR="/home/zebra/.cache/zebra" \
 		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
 		-e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR="0.0.0.0:28232" \
 		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
 		--mount type=bind,src="$(ZEBRA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zebra" \
 		--mount type=bind,src="$(ZCASHD_DATADIR)",dst="/home/zebra/.cache/zcashd" \
-		-p 18233:18233 \
+		-p 8233:8233 \
 		-p 127.0.0.1:28232:28232 \
-		-p 127.0.0.1:18242:18242 \
+		-p 127.0.0.1:8232:8232 \
 		"$(ZEBRA_DOCKER_IMAGE)" \
 		zebrad start --zcashd-compat
 

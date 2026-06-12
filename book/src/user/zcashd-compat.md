@@ -104,6 +104,10 @@ tls_key_file = "/path/to/zebra.key"
 tls_ca_file = "/path/to/internal-ca.pem"
 ```
 
+Non-loopback `zcashd_compat.listen_addr` values require TLS. Loopback listeners
+can use the default plain HTTP channel because credentials stay on the local
+host.
+
 When `manage_zcashd = true`, Zebra uses an `https://` `-zebra-compat-url` and
 passes `-zebra-compat-tls-ca-file=<tls_ca_file>` to supervised zcashd. The CA
 file should contain the public CA certificate zcashd needs to verify Zebra's
