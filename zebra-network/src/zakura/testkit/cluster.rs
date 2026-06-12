@@ -1036,6 +1036,7 @@ mod tests {
                 nu5: None,
                 nu6: None,
                 nu6_1: None,
+                nu6_2: None,
                 nu7: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 zfuture: None,
@@ -1067,6 +1068,7 @@ mod tests {
                 nu5: None,
                 nu6: None,
                 nu6_1: None,
+                nu6_2: None,
                 nu7: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 zfuture: None,
