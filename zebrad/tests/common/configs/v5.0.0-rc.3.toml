@@ -107,11 +107,14 @@ use_journald = false
 [zcashd_compat]
 cookie_dir = "cache_dir"
 cookie_file_name = ".zcashd-compat.cookie"
+enable_cookie_auth = true
 enabled = false
 manage_zcashd = true
-max_restarts = 10
 restart_backoff = "2s"
-shutdown_grace_period = "10s"
+restart_backoff_max = "5m"
+restart_reset_after = "1h"
+shutdown_grace_period = "5m"
 startup_delay = "1s"
+unsafe_allow_remote_http = false
 zcashd_extra_args = []
 zcashd_source = "managed"

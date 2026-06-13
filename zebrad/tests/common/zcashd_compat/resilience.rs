@@ -1,8 +1,12 @@
 //! Process-lifecycle test bodies for the zcashd-compat integration test suite.
 
+#[cfg(unix)]
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Result};
+#[cfg(unix)]
+use color_eyre::eyre::eyre;
+use color_eyre::eyre::Result;
+#[cfg(unix)]
 use tokio::time::sleep;
 
 use super::setup_zcashd_compat;
@@ -41,6 +45,7 @@ pub async fn zebrad_clean_shutdown() -> Result<()> {
 /// supervisor to restart it, then verifies zcashd is responsive again.
 ///
 /// Only runs in managed (regtest) mode.
+#[cfg(unix)]
 pub async fn zcashd_restarts_after_exit() -> Result<()> {
     let Some(setup) = setup_zcashd_compat().await? else {
         return Ok(());

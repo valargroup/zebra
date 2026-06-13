@@ -16,6 +16,7 @@ pub mod chain;
 pub mod config;
 pub mod launch;
 pub mod network;
+#[cfg(unix)]
 pub mod reorg;
 pub mod resilience;
 pub mod startup;
@@ -57,9 +58,11 @@ pub const TEST_ZCASHD_RPC_PASSWORD: &str = "TEST_ZCASHD_RPC_PASSWORD";
 pub const TEST_ZCASHD_COOKIE_FILE: &str = "TEST_ZCASHD_COOKIE_FILE";
 
 /// Number of reorg churn cycles to run in the zcashd-compat stress test.
+#[cfg(unix)]
 pub const TEST_ZCASHD_COMPAT_REORG_ITERATIONS: &str = "TEST_ZCASHD_COMPAT_REORG_ITERATIONS";
 
 /// Enable slow zcashd restart-after-reorg integration probes.
+#[cfg(unix)]
 pub const TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG: &str = "TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG";
 
 // ── Skip guard ────────────────────────────────────────────────────────────────
