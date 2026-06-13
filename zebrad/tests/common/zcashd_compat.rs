@@ -210,6 +210,7 @@ pub async fn setup_zcashd_compat() -> Result<Option<launch::ZcashdCompatSetup>> 
 ///
 /// Options are only applied in managed regtest mode. External mainnet/testnet
 /// validation connects to existing processes and ignores them.
+#[cfg(unix)]
 pub async fn setup_zcashd_compat_with_options(
     options: config::ZcashdCompatTestOptions,
 ) -> Result<Option<launch::ZcashdCompatSetup>> {

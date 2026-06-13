@@ -12,10 +12,11 @@ use zebra_node_services::rpc_client::RpcRequestClient;
 use zebra_rpc::server::OPENED_RPC_ENDPOINT_MSG;
 use zebra_test::{args, command::TestChild};
 
+#[cfg(unix)]
+use super::config::{build_zcashd_compat_config_with_options, ZcashdCompatTestOptions};
 use super::{
     config::{
-        build_zcashd_compat_config, build_zcashd_compat_config_with_options, ZcashdCompatConfig,
-        ZcashdCompatTestOptions, ZCASHD_TEST_RPC_PASS, ZCASHD_TEST_RPC_USER,
+        build_zcashd_compat_config, ZcashdCompatConfig, ZCASHD_TEST_RPC_PASS, ZCASHD_TEST_RPC_USER,
     },
     ZcashdRpcClient, TEST_ZCASHD_COOKIE_FILE, TEST_ZCASHD_RPC_ADDR, TEST_ZCASHD_RPC_PASSWORD,
     TEST_ZCASHD_RPC_USER, TEST_ZEBRAD_RPC_ADDR,
@@ -137,6 +138,7 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
 }
 
 /// Spawns a fresh regtest zebrad with configurable zcashd-compat limits.
+#[cfg(unix)]
 pub async fn spawn_zebrad_with_zcashd_compat_with_options(
     options: ZcashdCompatTestOptions,
 ) -> Result<ZcashdCompatSetup> {
