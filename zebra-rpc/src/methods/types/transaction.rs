@@ -1041,10 +1041,12 @@ impl TransactionObject {
                 tx.orchard_shielded_data(),
                 tx.orchard_value_balance().orchard_amount(),
             )),
-            ironwood: Some(Orchard::from_shielded_data(
-                tx.ironwood_shielded_data(),
-                tx.ironwood_value_balance().ironwood_amount(),
-            )),
+            ironwood: tx.ironwood_shielded_data().map(|ironwood_shielded_data| {
+                Orchard::from_shielded_data(
+                    Some(ironwood_shielded_data),
+                    tx.ironwood_value_balance().ironwood_amount(),
+                )
+            }),
             binding_sig: tx.sapling_binding_sig().map(|raw_sig| raw_sig.into()),
             joinsplit_pub_key: tx.joinsplit_pub_key().map(|raw_key| {
                 // Display order is reversed in the RPC output.
@@ -1161,5 +1163,44 @@ mod tests {
         assert_eq!(ironwood.proof, Some(proof.bytes_in_display_order()));
         assert_eq!(ironwood.binding_sig, Some([9u8; 64]));
         assert_eq!(ironwood.actions[0].spend_auth_sig, [7u8; 64]);
+    }
+
+    #[test]
+    fn transaction_object_omits_absent_ironwood_actions() {
+        let _init_guard = zebra_test::init();
+
+        let tx = Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu7,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        });
+
+        let transaction_object = TransactionObject::from_transaction(
+            tx.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            tx.hash(),
+        );
+
+        assert!(
+            transaction_object.ironwood.is_none(),
+            "Ironwood should be omitted when the transaction has no Ironwood actions"
+        );
+
+        let transaction_json = serde_json::to_value(transaction_object)
+            .expect("verbose transaction object serializes to JSON");
+        assert!(
+            transaction_json.get("ironwood").is_none(),
+            "serialized verbose transaction output should not contain an empty Ironwood object"
+        );
     }
 }
