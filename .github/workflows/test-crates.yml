@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, ironwood-main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -12,7 +12,7 @@ on:
       - .github/workflows/test-crates.yml
 
   push:
-    branches: [main]
+    branches: [main, ironwood-main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
