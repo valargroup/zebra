@@ -15,3 +15,11 @@ High-level changes:
 - V6 transaction IDs are computed through the patched librustzcash txid path,
   which includes Ironwood-specific bundle/action hashing in the ZIP-244-style
   transaction ID tree.
+
+RPC output:
+
+- `getblockchaininfo` includes an `ironwood` value pool entry.
+- Verbose transaction RPCs include an `ironwood` bundle only for transactions
+  with Ironwood shielded data.
+- `z_gettreestate` and `z_getsubtreesbyindex` expose Ironwood tree state and
+  subtrees when Ironwood data is available.

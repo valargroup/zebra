@@ -341,7 +341,8 @@ pub struct TransactionObject {
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]
     pub(crate) orchard: Option<Orchard>,
 
-    /// Ironwood actions of the transaction.
+    /// Ironwood actions of the transaction, omitted when the transaction has no
+    /// Ironwood shielded data.
     #[serde(rename = "ironwood", skip_serializing_if = "Option::is_none")]
     pub(crate) ironwood: Option<Orchard>,
 

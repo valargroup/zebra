@@ -61,6 +61,9 @@ impl Default for GetSubtreesByIndexResponse {
 /// whereas in `CommitmentTree`, the vector of ommers is sparse with [`None`] values in the gaps.
 ///
 /// The dense format might be used in future RPCs.
+///
+/// The serialized response omits `ironwood` unless Ironwood tree state is
+/// available for the requested block.
 #[derive(Clone, Debug, Eq, PartialEq, Getters)]
 pub struct GetTreestateResponse {
     /// The block hash corresponding to the treestate, hex-encoded.
@@ -89,6 +92,7 @@ pub struct GetTreestateResponse {
     orchard: Treestate,
 
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
+    /// Serialized only when [`Self::has_ironwood`] returns true.
     #[getter(skip)]
     ironwood: Treestate,
 
@@ -320,10 +324,9 @@ impl Default for Treestate {
 
 /// A wrapper that contains a shielded note commitment tree.
 ///
-/// Note that in the original [`z_gettreestate`][1] RPC, [`Commitments`] also
-/// contains the field `finalRoot`. Zebra does *not* use this field.
+/// `finalRoot` and `finalState` are omitted when a specific tree state is not
+/// available.
 ///
-/// [1]: https://zcash.github.io/rpc/z_gettreestate.html
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Commitments {

@@ -204,6 +204,9 @@ pub trait Rpc {
     ///
     /// Some fields from the zcashd reference are missing from Zebra's [`GetBlockchainInfoResponse`]. It only contains the fields
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L72-L89)
+    ///
+    /// Zebra includes an `ironwood` value pool entry. Like other value pool
+    /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
 
@@ -277,6 +280,10 @@ pub trait Rpc {
     /// The `size` field is only returned with verbosity=2.
     ///
     /// The undocumented `chainwork` field is not returned.
+    ///
+    /// With verbosity=2, transaction objects include `ironwood` only when the
+    /// transaction contains Ironwood shielded data. Block `trees` can include an
+    /// Ironwood tree entry when the state has one for the requested block.
     #[method(name = "getblock")]
     async fn get_block(
         &self,
@@ -342,7 +349,8 @@ pub trait Rpc {
     #[method(name = "getrawmempool")]
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> Result<GetRawMempoolResponse>;
 
-    /// Returns information about the given block's Sapling & Orchard tree state.
+    /// Returns information about the given block's Sapling, Orchard, and when
+    /// available Ironwood tree state.
     ///
     /// zcashd reference: [`z_gettreestate`](https://zcash.github.io/rpc/z_gettreestate.html)
     /// method: post
@@ -358,6 +366,9 @@ pub trait Rpc {
     /// negative where -1 is the last known valid block". On the other hand,
     /// `lightwalletd` only uses positive heights, so Zebra does not support
     /// negative heights.
+    ///
+    /// The `ironwood` field is serialized only when Ironwood tree state is
+    /// available for the requested block.
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
 
@@ -399,6 +410,11 @@ pub trait Rpc {
     /// - `txid`: (string, required, example="mytxid") The transaction ID of the transaction to be returned.
     /// - `verbose`: (number, optional, default=0, example=1) If 0, return a string of hex-encoded data, otherwise return a JSON object.
     /// - `blockhash` (string, optional) The block in which to look for the transaction
+    ///
+    /// # Notes
+    ///
+    /// Verbose transaction output includes `ironwood` only when the transaction
+    /// contains Ironwood shielded data.
     #[method(name = "getrawtransaction")]
     async fn get_raw_transaction(
         &self,

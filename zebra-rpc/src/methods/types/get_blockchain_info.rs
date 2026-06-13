@@ -37,7 +37,8 @@ pub struct GetBlockchainInfoBalance {
 }
 
 impl GetBlockchainInfoBalance {
-    /// Returns a list of [`GetBlockchainInfoBalance`]s converted from the default [`ValueBalance`].
+    /// Returns zero-value transparent, Sprout, Sapling, Orchard, Ironwood, and
+    /// Lockbox value pools.
     pub fn zero_pools() -> [Self; 6] {
         Self::value_pools(Default::default(), None)
     }
@@ -92,7 +93,8 @@ impl GetBlockchainInfoBalance {
         Self::new_internal("lockbox", amount, delta)
     }
 
-    /// Converts a [`ValueBalance`] to a list of [`GetBlockchainInfoBalance`]s.
+    /// Converts a [`ValueBalance`] to transparent, Sprout, Sapling, Orchard,
+    /// Ironwood, and Lockbox value pool entries, in zcashd-compatible order.
     pub fn value_pools(
         value_balance: ValueBalance<NonNegative>,
         delta_balance: Option<ValueBalance<NegativeAllowed>>,
