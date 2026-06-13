@@ -529,6 +529,8 @@ the release candidate was published but otherwise mostly includes technical impr
 
 ### Changed
 
+- Gated code behind the `tx_v6` feature flag behind the `zcash_unstable=nu7` config flag too ([#10060](https://github.com/ZcashFoundation/zebra/pull/10060))
+
 ### Added
 
 - Added ZIP 233 (Network Sustainability Mechanism) implementation  ([#8930](https://github.com/ZcashFoundation/zebra/pull/8930))
