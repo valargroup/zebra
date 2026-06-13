@@ -541,7 +541,7 @@ version = "0.7.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.equihash]]
-version = "0.3.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.3.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.erased-serde]]
@@ -553,7 +553,7 @@ version = "0.6.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.f4jumble]]
-version = "0.1.1@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.1.1@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
@@ -2117,31 +2117,31 @@ version = "0.10.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_address]]
-version = "0.12.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.12.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_encoding]]
-version = "0.4.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.4.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_history]]
-version = "0.4.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.4.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_keys]]
-version = "0.14.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.14.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_primitives]]
-version = "0.28.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.28.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_proofs]]
-version = "0.28.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.28.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_protocol]]
-version = "0.9.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.9.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_script]]
@@ -2153,7 +2153,7 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_transparent]]
-version = "0.8.0@git:a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae"
+version = "0.8.0@git:f1c37d45f1e7db67d1fa717bddc1691525bff4b0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zebra-chain]]
