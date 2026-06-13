@@ -210,7 +210,7 @@ fn find_datadir_arg(extra_args: &[String]) -> Option<&str> {
 /// Resolves the first valid `-conf=<path>` we can infer from extra args.
 ///
 /// Relative config paths are anchored under the selected datadir.
-fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
+pub(super) fn resolve_zcashd_conf_path(datadir: &Path, extra_args: &[String]) -> PathBuf {
     let conf_path = find_conf_arg(extra_args)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(ZCASH_CONF_FILENAME));
