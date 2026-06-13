@@ -201,8 +201,7 @@ pub async fn sticky_fault_restart_recovers() -> Result<()> {
 
     let current_zcashd_tip = zcashd_tip(&setup.zcashd_client).await?;
     assert_eq!(
-        current_zcashd_tip,
-        old_zcashd_tip,
+        current_zcashd_tip, old_zcashd_tip,
         "zcashd should keep the pre-reorg tip while sticky"
     );
 

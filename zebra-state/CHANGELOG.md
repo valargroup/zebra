@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bumped the state database format through 28 and 29 during upgrade, first
-  backfilling empty Ironwood tree, value pool, and index data, then rebuilding
-  stored history tree entries so they use the Ironwood-capable entry size.
+- Bumped the state database format to 28 during upgrade, backfilling empty
+  Ironwood tree, value pool, and index data, then rebuilding stored history tree
+  entries so they use the Ironwood-capable entry size.
 
 ## [8.0.0] - 2026-06-02
 

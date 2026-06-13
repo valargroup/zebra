@@ -178,7 +178,7 @@ impl ZebraDb {
 
         self.format_version_on_disk()
             .expect("database format version should be readable")
-            .is_some_and(|version| version.major < 29)
+            .is_some_and(|version| version.major < 28)
     }
 
     /// Rebuilds or catches up the ZIP-221 history tree to the current finalized tip,

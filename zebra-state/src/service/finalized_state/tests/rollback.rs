@@ -35,7 +35,7 @@ use crate::{
     service::{
         arbitrary::PreparedChain,
         finalized_state::{
-            disk_format::upgrade::{add_ironwood_tree, rebuild_history_tree, DiskFormatUpgrade},
+            disk_format::upgrade::{add_ironwood_tree, DiskFormatUpgrade},
             CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
         },
     },
@@ -1341,14 +1341,14 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
 
             let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
             prop_assert!(
-                rebuild_history_tree::RebuildHistoryTree
+                add_ironwood_tree::Upgrade
                     .validate(&db, &cancel_receiver)
                     .expect("history tree validation is not cancelled")
                     .is_err(),
                 "validation rejects the stale history tree"
             );
 
-            rebuild_history_tree::RebuildHistoryTree
+            add_ironwood_tree::Upgrade
                 .run(tip_height, &db, &cancel_receiver)
                 .expect("history tree rebuild upgrade succeeds");
 
@@ -1358,7 +1358,7 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
                 "upgrade restores the tip history tree hash"
             );
             prop_assert_eq!(
-                rebuild_history_tree::RebuildHistoryTree
+                add_ironwood_tree::Upgrade
                     .validate(&db, &cancel_receiver)
                     .expect("history tree validation is not cancelled"),
                 Ok(())
@@ -1370,7 +1370,7 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
 }
 
 #[test]
-fn pre_v29_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
+fn pre_v28_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     let network = TestnetParameters::build()
@@ -1422,15 +1422,15 @@ fn pre_v29_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
 
             let db = open_unchecked_db(&config, &network);
             let tip = db.tip().expect("test state has a tip");
-            db.update_format_version_on_disk(&Version::new(28, 0, 0))
-                .expect("test can mark database as pre-v29");
+            db.update_format_version_on_disk(&Version::new(27, 0, 0))
+                .expect("test can mark database as pre-v28");
 
             let expected_tip_tree = db
                 .rebuild_history_tree_to_height(tip.0, || Ok::<(), std::convert::Infallible>(()))
                 .expect("full tip history tree rebuild succeeds");
 
-            let pre_v29_history_tree = db.history_tree();
-            prop_assert_eq!(pre_v29_history_tree.hash(), expected_tip_tree.hash());
+            let pre_v28_history_tree = db.history_tree();
+            prop_assert_eq!(pre_v28_history_tree.hash(), expected_tip_tree.hash());
             prop_assert_eq!(db.history_tree_rebuild_cache_tip(), Some(tip));
 
             let stale_tip = (
