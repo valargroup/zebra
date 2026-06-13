@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Align V6 Orchard and Ironwood flag parsing and proof verification with the
+  Ironwood circuit and NU6.3 flag format.
 - Use V3 chain history metadata from NU7 onward, including Ironwood note
   commitment tree roots and Ironwood transaction counts in FlyClient history
   tree leaves.

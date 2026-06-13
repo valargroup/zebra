@@ -155,6 +155,24 @@ pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionErro
     Ok(())
 }
 
+/// Checks that Orchard shielded data does not enable cross-address transfers.
+///
+/// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool uses the Ironwood
+/// circuit in V6 transactions, but consensus still requires transactional Orchard bundles to keep
+/// cross-address transfers disabled. Ironwood shielded data is allowed to set this flag.
+pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
+    if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+        if orchard_shielded_data
+            .flags
+            .contains(Flags::ENABLE_CROSS_ADDRESS)
+        {
+            return Err(TransactionError::OrchardHasEnableCrossAddress);
+        }
+    }
+
+    Ok(())
+}
+
 /// Checks that shielded proof sizes are canonical when the proof-size rule is active.
 pub fn shielded_proof_size_is_canonical(
     tx: &Transaction,

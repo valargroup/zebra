@@ -192,6 +192,9 @@ pub enum TransactionError {
     #[error("must have at least one active ironwood flag")]
     NotEnoughIronwoodFlags,
 
+    #[error("Orchard transactions MUST NOT have the EnableCrossAddress flag set")]
+    OrchardHasEnableCrossAddress,
+
     #[error("could not find transparent input UTXO in the best chain or mempool")]
     TransparentInputNotFound,
 
@@ -377,6 +380,7 @@ impl TransactionError {
             | DisabledAddToOrchardPool
             | NotEnoughFlags
             | NotEnoughIronwoodFlags
+            | OrchardHasEnableCrossAddress
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)

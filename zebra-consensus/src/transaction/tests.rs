@@ -258,6 +258,40 @@ fn orchard_rejects_net_deposits_after_nu7() {
 
 #[cfg(zcash_unstable = "nu7")]
 #[test]
+fn orchard_cross_address_flag_is_disabled_after_nu7() {
+    let orchard_cross_address = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS | Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&orchard_cross_address),
+        Err(TransactionError::OrchardHasEnableCrossAddress)
+    );
+
+    let ironwood_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(zcash_unstable = "nu7")]
+#[test]
 fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu7_test_network_and_height();
     let tx = v6_pool_flow_transaction(
