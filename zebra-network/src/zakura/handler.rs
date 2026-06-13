@@ -87,6 +87,23 @@ pub const DEFAULT_ZAKURA_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 /// QUIC keepalive interval used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum age of an incumbent Zakura connection before a duplicate connection
+/// for the same identity is allowed to evict it.
+///
+/// A duplicate almost always means the peer restarted or redialed (the redial
+/// supervisor skips peers that are already registered). If the incumbent has
+/// been registered longer than this, it is treated as a stale connection left
+/// behind by a restarted peer: that peer's process is gone, so the connection
+/// only lingers until the QUIC idle timeout ([`DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT`],
+/// ~150s). Evicting it immediately lets the peer's redial take the freed slot in
+/// seconds instead of stalling for the whole idle window.
+///
+/// A younger incumbent is kept: two connections registered close together are a
+/// simultaneous-open race (both sides dialed before either registered), and
+/// evicting on every duplicate would make those flap. The redial backoff
+/// resolves that race instead. This threshold must stay above the worst-case
+/// simultaneous-dial window and below the QUIC idle timeout.
+pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(30);
 /// QUIC stream receive window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
@@ -636,6 +653,10 @@ struct ZakuraSupervisorState {
     outbound_by_peer: HashMap<ZakuraPeerId, ZakuraPeerHandle>,
     disconnect_by_peer: HashMap<ZakuraPeerId, CancellationToken>,
     caps_by_peer: HashMap<ZakuraPeerId, u64>,
+    /// When each authenticated peer's current connection registered, used to
+    /// decide whether a duplicate may evict a stale incumbent (see
+    /// [`ZAKURA_DUPLICATE_EVICT_MIN_AGE`]).
+    registered_at: HashMap<ZakuraPeerId, Instant>,
     active_by_ip: HashMap<IpAddr, usize>,
     max_connections_per_ip: usize,
 }
@@ -724,6 +745,7 @@ impl ZakuraSupervisorHandle {
                 outbound_by_peer: HashMap::new(),
                 disconnect_by_peer: HashMap::new(),
                 caps_by_peer: HashMap::new(),
+                registered_at: HashMap::new(),
                 active_by_ip: HashMap::new(),
                 max_connections_per_ip: max_connections_per_ip.max(1),
             })),
@@ -815,6 +837,7 @@ impl ZakuraSupervisorHandle {
                 state
                     .caps_by_peer
                     .insert(peer_id.clone(), accepted_capabilities);
+                state.registered_at.insert(peer_id.clone(), Instant::now());
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
@@ -829,7 +852,29 @@ impl ZakuraSupervisorHandle {
                     disconnect_token,
                 }
             }
-            ZakuraUpgradeOutcome::Duplicate { .. } => ZakuraRegistration::Duplicate { peer_id },
+            ZakuraUpgradeOutcome::Duplicate { .. } => {
+                // A duplicate for an identity that already has a connection is
+                // almost always a restart or redial. If the incumbent has been
+                // registered long enough to be a stale connection left behind by
+                // a restarted peer, cancel it now so it tears down through its
+                // normal cleanup path and frees the slot in milliseconds; the
+                // peer's redial then takes the freed slot instead of waiting for
+                // the dead connection's QUIC idle timeout (~150s). A young
+                // incumbent is kept to avoid flapping on simultaneous-open races.
+                // The newcomer is still closed (its redial reconnects cleanly
+                // once the slot is free), which avoids racing the incumbent's
+                // service-registration teardown.
+                if let Some(registered_at) = state.registered_at.get(&peer_id) {
+                    if registered_at.elapsed() >= ZAKURA_DUPLICATE_EVICT_MIN_AGE {
+                        if let Some(token) = state.disconnect_by_peer.get(&peer_id) {
+                            token.cancel();
+                            metrics::counter!("zakura.p2p.conn.duplicate.evicted_stale")
+                                .increment(1);
+                        }
+                    }
+                }
+                ZakuraRegistration::Duplicate { peer_id }
+            }
             ZakuraUpgradeOutcome::Rejected { reason } => ZakuraRegistration::Rejected(reason),
         }
     }
@@ -840,6 +885,7 @@ impl ZakuraSupervisorHandle {
         state.outbound_by_peer.remove(peer_id);
         state.disconnect_by_peer.remove(peer_id);
         state.caps_by_peer.remove(peer_id);
+        state.registered_at.remove(peer_id);
         if let Some(remote_ip) = remote_ip {
             if let Some(count) = state.active_by_ip.get_mut(&remote_ip) {
                 *count = count.saturating_sub(1);
@@ -1346,6 +1392,13 @@ impl ZakuraProtocolHandler {
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
+        // Bounded label describing why this connection closed. Updated at each
+        // local teardown site and attached to the final `closed.neutral` trace
+        // so readers can distinguish idle timeouts, peer-side closes, resource
+        // limits, and protocol faults. The default covers the external path:
+        // the connection token was cancelled by a disconnect request, peerset
+        // eviction, or process shutdown.
+        let mut close_reason: &'static str = "cancelled";
         let negotiated_ordered_streams = self
             .registry
             .ordered_streams_for_negotiated(accepted_capabilities);
@@ -1369,6 +1422,7 @@ impl ZakuraProtocolHandler {
                 "closing Zakura peer because negotiated ordered streams exceed max-open-streams"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
+            close_reason = "resource_ordered_streams";
             connection_token.cancel();
         } else if !ordered_streams.is_empty()
             && usize::from(limits.max_inbound_queue_depth) < ordered_streams.len()
@@ -1379,6 +1433,7 @@ impl ZakuraProtocolHandler {
                 "closing Zakura peer because inbound queue depth cannot be split across ordered streams"
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
+            close_reason = "resource_queue_split";
             connection_token.cancel();
         }
         let ordered_kinds: HashSet<u16> = negotiated_ordered_streams
@@ -1437,6 +1492,7 @@ impl ZakuraProtocolHandler {
                             VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
                             b"ordered stream setup",
                         );
+                        close_reason = "stream_setup_failed";
                         connection_token.cancel();
                         break;
                     }
@@ -1469,6 +1525,7 @@ impl ZakuraProtocolHandler {
                 _ = connection_token.cancelled() => break,
                 _ = freshness_reaper(freshness_rx.clone(), limits.idle_timeout), if run_freshness_reaper => {
                     connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"idle");
+                    close_reason = "idle_timeout";
                     break;
                 }
                 Some(joined) = workers.join_next() => {
@@ -1504,6 +1561,7 @@ impl ZakuraProtocolHandler {
                                         stream_kind = admitted.kind,
                                         "closing peer after duplicate or unexpected ordered stream"
                                     );
+                                    close_reason = "duplicate_stream";
                                     connection_token.cancel();
                                     continue;
                                 }
@@ -1553,12 +1611,14 @@ impl ZakuraProtocolHandler {
                         }
                         Err(error) => {
                             debug!(?error, "Zakura connection stopped accepting streams");
+                            close_reason = "accept_failed";
                             break;
                         }
                     }
                 }
                 outbound = outbound_rx.recv() => {
                     let Some(outbound) = outbound else {
+                        close_reason = "outbound_closed";
                         break;
                     };
                     match outbound {
@@ -1599,6 +1659,7 @@ impl ZakuraProtocolHandler {
                                         VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE),
                                         b"malformed response",
                                     );
+                                    close_reason = "bad_response";
                                     connection_token.cancel();
                                     let _ = completion.send(Err(error));
                                 }
@@ -1625,7 +1686,10 @@ impl ZakuraProtocolHandler {
         }
         self.supervisor.deregister(&peer_id, remote_ip).await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
-        self.trace.emit(CONN_TABLE, conn.event("closed.neutral"));
+        self.trace.emit(
+            CONN_TABLE,
+            conn.event("closed.neutral").reason(close_reason),
+        );
         Ok(())
     }
 
@@ -4377,6 +4441,68 @@ mod tests {
             .await
             .expect("disconnect token is cancelled promptly");
         assert!(!supervisor.disconnect_peer(&test_peer(9)).await);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_evicts_stale_incumbent_but_keeps_fresh_one() -> Result<(), BoxError> {
+        // A duplicate connection for an identity that already has one either
+        // means the peer restarted (incumbent is a dead, stale connection that
+        // should be evicted so the redial can reclaim the slot) or that two
+        // connections raced at startup (simultaneous open, both fresh, must NOT
+        // be evicted or they flap). Incumbent age distinguishes the two.
+        let supervisor = ZakuraSupervisorHandle::new(4);
+
+        async fn register_duplicate(
+            supervisor: &ZakuraSupervisorHandle,
+            peer: &ZakuraPeerId,
+            token: CancellationToken,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    peer.clone(),
+                    None,
+                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                    outbound_handle,
+                    token,
+                    ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+                )
+                .await
+        }
+
+        // Fresh incumbent: an immediate duplicate is a simultaneous-open race and
+        // must not evict it.
+        let fresh_peer = test_peer(8);
+        let fresh_incumbent = CancellationToken::new();
+        register_test_peer(&supervisor, fresh_peer.clone(), fresh_incumbent.clone()).await;
+        let registration =
+            register_duplicate(&supervisor, &fresh_peer, CancellationToken::new()).await;
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            !fresh_incumbent.is_cancelled(),
+            "a young incumbent is kept so simultaneous-open races do not flap",
+        );
+
+        // Stale incumbent: once it is older than the threshold, a duplicate
+        // evicts it so a restarted peer's redial can reclaim the slot.
+        let stale_peer = test_peer(9);
+        let stale_incumbent = CancellationToken::new();
+        register_test_peer(&supervisor, stale_peer.clone(), stale_incumbent.clone()).await;
+        tokio::time::advance(ZAKURA_DUPLICATE_EVICT_MIN_AGE + Duration::from_secs(1)).await;
+        let newcomer = CancellationToken::new();
+        let registration = register_duplicate(&supervisor, &stale_peer, newcomer.clone()).await;
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            stale_incumbent.is_cancelled(),
+            "a stale incumbent is evicted so the restarted peer's redial reclaims the slot",
+        );
+        assert!(
+            !newcomer.is_cancelled(),
+            "the rejected newcomer's token is never registered, so it is left to redial",
+        );
 
         Ok(())
     }

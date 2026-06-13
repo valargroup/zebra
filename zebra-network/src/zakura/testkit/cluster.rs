@@ -2079,6 +2079,25 @@ mod tests {
             .await?;
         truncated.shutdown().await;
 
+        // Each misbehavior disconnect cancels the peer's connection token, so the
+        // victim's connection handler exits via the cancellation arm and stamps
+        // the `closed.neutral` row with the bounded `cancelled` reason.
+        await_until(
+            "victim traces closed.neutral with a bounded reason",
+            Duration::from_secs(5),
+            || {
+                capture.reader().is_ok_and(|reader| {
+                    reader.node("11").table("conn").rows().iter().any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some("closed.neutral")
+                            && row.get("reason").and_then(serde_json::Value::as_str)
+                                == Some("cancelled")
+                    })
+                })
+            },
+        )
+        .await?;
+
         capture.flush().await;
         let reader = capture.reader()?;
         let header_sync = reader.node("11").table("header_sync");
@@ -2091,6 +2110,10 @@ mod tests {
         reader.node("11").table("ratelimit").assert_row(
             "frame.oversize",
             &[("stream_kind", TraceValue::Str("header_sync"))],
+        );
+        reader.node("11").table("conn").assert_row(
+            "closed.neutral",
+            &[("reason", TraceValue::Str("cancelled"))],
         );
 
         victim.shutdown().await;

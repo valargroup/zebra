@@ -470,6 +470,75 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     Ok(())
 }
 
+/// A node still in the finalized (checkpoint) write phase must be able to commit
+/// a Zakura header range.
+///
+/// This reproduces the Zakura catch-up deadlock. A freshly started node has an
+/// empty non-finalized chain set, so it keeps its finalized block-write sender
+/// and the block write task drains the finalized channel before handling any
+/// non-finalized message. The finalized->non-finalized transition only fires
+/// when a non-finalized block is queued as a child of the finalized tip (the
+/// legacy commit path). A node catching up to a peer that sits at a *static*
+/// tip over Zakura commits header ranges via `CommitHeaderRange` (a
+/// non-finalized message) but never queues such a block, so before the fix the
+/// request never completes: the header tip stays at genesis, block sync stays
+/// gated off (`best_header_tip <= verified_block_tip`), and the node stalls.
+///
+/// Unlike `header_only_service_requests_preserve_body_boundary`, this test does
+/// NOT drop `block_write_sender.finalized`, so it exercises the real catch-up
+/// state. Without the fix the `CommitHeaderRange` future never resolves and the
+/// bounded wait below fails the test.
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_header_range_completes_while_in_finalized_write_phase(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let (mut state_service, _read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let genesis =
+        zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+    let block1 =
+        zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+    let block2 =
+        zebra_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+    let block2_hash = block2.hash();
+
+    assert_eq!(
+        state_service
+            .ready()
+            .await?
+            .call(Request::CommitCheckpointVerifiedBlock(
+                CheckpointVerifiedBlock::from(genesis.clone()),
+            ))
+            .await?,
+        Response::Committed(genesis.hash()),
+    );
+
+    // The node is still in the finalized write phase: committing a checkpoint
+    // block does not trigger the finalized->non-finalized transition, which is
+    // exactly the state a Zakura node catching up to a static tip is stuck in.
+    assert!(
+        state_service.block_write_sender.finalized.is_some(),
+        "a fresh node stays in the finalized write phase after a checkpoint commit",
+    );
+    let state = Buffer::new(BoxService::new(state_service), 1);
+
+    let committed = tokio::time::timeout(
+        Duration::from_secs(20),
+        state.clone().oneshot(Request::CommitHeaderRange {
+            anchor: genesis.hash(),
+            headers: vec![block1.header.clone(), block2.header.clone()],
+            body_sizes: vec![999_999, 0],
+        }),
+    )
+    .await
+    .expect("CommitHeaderRange must not deadlock while in the finalized write phase")?;
+
+    assert_eq!(committed, Response::Committed(block2_hash));
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<()> {
     let _init_guard = zebra_test::init();
