@@ -57,6 +57,7 @@ impl ZakuraTestNode {
     }
 
     /// Clone the underlying endpoint for test-only external drivers.
+    #[cfg(test)]
     pub(crate) fn endpoint(&self) -> ZakuraEndpoint {
         self.endpoint.clone()
     }

@@ -20,6 +20,9 @@
 !*.lock
 !tower-*
 !xtask
+!deploy
+!deploy/watchdog
+!deploy/watchdog/**
 !zebra-*
 !zebrad
 !docker/entrypoint.sh
