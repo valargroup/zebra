@@ -349,18 +349,20 @@ fn sha256_hex_file(path: &Path) -> Result<String, Report> {
 }
 
 /// Makes `path` executable on Unix targets.
-///
-/// Non-Unix targets currently no-op because managed release targets are Linux.
+#[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), Report> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
 
+    Ok(())
+}
+
+/// No-ops on non-Unix targets because managed release targets are Linux.
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), Report> {
     Ok(())
 }
 
