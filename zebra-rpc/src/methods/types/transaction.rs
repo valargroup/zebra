@@ -192,24 +192,19 @@ impl TransactionTemplate<NegativeOrZero> {
             .is_some_and(|nu7_height| height >= nu7_height);
 
         match miner_params.addr() {
-            Address::Unified(addr) => {
-                let orchard_reward = if nu7_active {
-                    None
-                } else {
-                    addr.orchard()
+            Address::Unified(addr) => addr
+                .sapling()
+                .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                .or_else(|| {
+                    addr.transparent()
+                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                })
+                .or_else(|| {
+                    (!nu7_active)
+                        .then_some(addr)
+                        .and_then(|addr| addr.orchard())
                         .and_then(|addr| add_orchard_reward(&mut builder, addr))
-                };
-
-                orchard_reward
-                    .or_else(|| {
-                        addr.sapling()
-                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                    })
-                    .or_else(|| {
-                        addr.transparent()
-                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                    })
-            }
+                }),
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 

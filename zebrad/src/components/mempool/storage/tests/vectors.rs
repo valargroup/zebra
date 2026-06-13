@@ -2,7 +2,9 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{iter, sync::Arc};
+use std::iter;
+#[cfg(zcash_unstable = "nu7")]
+use std::sync::Arc;
 
 use color_eyre::eyre::Result;
 

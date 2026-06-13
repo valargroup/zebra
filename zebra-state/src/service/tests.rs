@@ -504,16 +504,10 @@ proptest! {
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);
 
+        let mut expected_last_change_hash = None;
+
         for block in finalized_blocks {
             let expected_block = block.clone();
-
-            let expected_action = if expected_block.height <= block::Height(1) {
-                // 0: reset by both initialization and the Genesis network upgrade
-                // 1: reset by the BeforeOverwinter network upgrade
-                TipAction::reset_with(expected_block.clone().into())
-            } else {
-                TipAction::grow_with(expected_block.clone().into())
-            };
 
             let result_receiver = state_service.queue_and_commit_to_finalized_state(block);
             let result = result_receiver.blocking_recv();
@@ -524,19 +518,18 @@ proptest! {
             // TODO: add a blocking method on ChainTipChange
             std::thread::sleep(Duration::from_secs(1));
 
+            let expected_action = expected_tip_action(
+                &network,
+                expected_block.clone().into(),
+                &mut expected_last_change_hash,
+            );
+
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
             prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
         }
 
         for block in non_finalized_blocks {
             let expected_block = block.clone();
-
-            let expected_action = if expected_block.height == block::Height(1) {
-                // 1: reset by the BeforeOverwinter network upgrade
-                TipAction::reset_with(expected_block.clone().into())
-            } else {
-                TipAction::grow_with(expected_block.clone().into())
-            };
 
             let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
             let result = result_receiver.blocking_recv();
@@ -547,10 +540,43 @@ proptest! {
             // TODO: add a blocking method on ChainTipChange
             std::thread::sleep(Duration::from_secs(1));
 
+            let expected_action = expected_tip_action(
+                &network,
+                expected_block.clone().into(),
+                &mut expected_last_change_hash,
+            );
+
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
             prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
         }
     }
+}
+
+/// Mirror `ChainTipChange::action` for the service tip update test.
+fn expected_tip_action(
+    network: &Network,
+    block: crate::service::chain_tip::ChainTipBlock,
+    last_change_hash: &mut Option<block::Hash>,
+) -> TipAction {
+    let next_height = block
+        .height
+        .next()
+        .expect("chain tip height is far below Height::MAX");
+
+    let block_hash = block.hash;
+
+    let action = if Some(block.previous_block_hash) != *last_change_hash
+        || NetworkUpgrade::is_activation_height(network, next_height)
+        || network.is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+    {
+        TipAction::reset_with(block)
+    } else {
+        TipAction::grow_with(block)
+    };
+
+    *last_change_hash = Some(block_hash);
+
+    action
 }
 
 /// Test strategy to generate a chain split in two from the test vectors.

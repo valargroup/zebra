@@ -1095,6 +1095,7 @@ impl DiskDb {
     // Low-level write methods are located in the WriteDisk trait
 
     /// Writes `batch` to the database.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         let _write_lock = self.write_lock.lock().expect("write lock is not poisoned");
 
@@ -1102,6 +1103,7 @@ impl DiskDb {
     }
 
     /// Writes `batch` to the database if `condition` is true while holding the write lock.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn write_if(
         &self,
         batch: DiskWriteBatch,

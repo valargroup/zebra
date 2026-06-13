@@ -260,6 +260,7 @@ pub struct ChainInner {
 
 impl Chain {
     /// Create a new Chain with the given finalized tip trees and network.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         network: &Network,
         finalized_tip_height: Height,

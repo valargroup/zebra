@@ -1,6 +1,8 @@
 //! ZIP-317 tests.
 
-use super::{conventional_actions, mempool_checks, Amount, Error};
+#[cfg(zcash_unstable = "nu7")]
+use super::conventional_actions;
+use super::{mempool_checks, Amount, Error};
 
 #[test]
 fn zip317_unpaid_actions_err() {

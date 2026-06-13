@@ -305,6 +305,7 @@ impl ZebraDb {
     }
 
     /// Rebuilds the ZIP-221 history tree up to `target_height` from finalized blocks and roots.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn rebuild_history_tree_to_height<E>(
         &self,
         target_height: Height,

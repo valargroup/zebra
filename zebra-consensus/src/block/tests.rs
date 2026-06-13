@@ -4,7 +4,9 @@
 
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
-use tower::{buffer::Buffer, service_fn, util::BoxService, ServiceExt};
+use tower::{buffer::Buffer, util::BoxService};
+#[cfg(zcash_unstable = "nu7")]
+use tower::{service_fn, ServiceExt};
 
 #[cfg(zcash_unstable = "nu7")]
 use zebra_chain::{

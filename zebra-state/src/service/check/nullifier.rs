@@ -183,10 +183,10 @@ pub(crate) fn tx_no_duplicates_in_chain(
 /// - both within the same `JoinSplit` (sprout only),
 /// - from different `JoinSplit`s, [`sapling::Spend`][2]s,
 ///   [`orchard::Action`][3]s, or Ironwood actions in this
-///   [`Transaction`][1]'s shielded data, or
+///   [`Transaction`]'s shielded data, or
 /// - one from this shielded data, and another from:
 ///   - a previous transaction in this [`Block`][4], or
-///   - a previous block in this non-finalized [`Chain`][5].
+///   - a previous block in this non-finalized [`Chain`].
 ///
 /// (Duplicate finalized nullifiers are rejected during service contextual validation,
 /// see [`no_duplicates_in_finalized_chain`] for details.)
@@ -205,11 +205,9 @@ pub(crate) fn tx_no_duplicates_in_chain(
 /// with same bit pattern, they won't be considered the same when determining
 /// uniqueness. This is enforced by the callers of this function.
 ///
-/// [1]: zebra_chain::transaction::Transaction
 /// [2]: zebra_chain::sapling::Spend
 /// [3]: zebra_chain::orchard::Action
 /// [4]: zebra_chain::block::Block
-/// [5]: service::non_finalized_state::Chain
 fn add_to_non_finalized_chain_unique_with<'block, NullifierT, DuplicateNullifierErrorFn>(
     chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
