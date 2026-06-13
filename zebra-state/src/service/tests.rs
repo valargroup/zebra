@@ -761,9 +761,12 @@ proptest! {
         for block in finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height <= block::Height(1) {
-                // 0: reset by both initialization and the Genesis network upgrade
-                // 1: reset by the BeforeOverwinter network upgrade
+            let expected_action = if expected_block.height == block::Height(0) {
+                // Height 0 is reset by initialization. The BeforeOverwinter upgrade
+                // (activation height 1) also resets at height 0 rather than at height 1,
+                // because `ChainTipChange` resets one block *before* an activation height
+                // (it checks `height.next()`, matching the height the mempool verifies
+                // against). See `ChainTipChange::action`.
                 TipAction::reset_with(expected_block.clone().into())
             } else {
                 TipAction::grow_with(expected_block.clone().into())
@@ -785,12 +788,10 @@ proptest! {
         for block in non_finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height == block::Height(1) {
-                // 1: reset by the BeforeOverwinter network upgrade
-                TipAction::reset_with(expected_block.clone().into())
-            } else {
-                TipAction::grow_with(expected_block.clone().into())
-            };
+            // The genesis block (height 0) is always finalized, and the BeforeOverwinter
+            // reset fires at height 0 (one block before its activation height of 1), so
+            // every non-finalized block (height >= 1) grows the chain.
+            let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
             let result = result_receiver.blocking_recv();
