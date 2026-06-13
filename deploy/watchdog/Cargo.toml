@@ -6,7 +6,8 @@ description = "Standalone watchdog sidecar that checks Zebra services and report
 license.workspace = true
 repository.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Sentry 0.47 requires Rust 1.88.
+rust-version = "1.88"
 
 # This crate is deploy/operator tooling, not a published library.
 publish = false

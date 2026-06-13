@@ -64,11 +64,8 @@ jobs:
       - uses: ./.github/actions/setup-zebra-build
 
       # This step dynamically creates a JSON containing the values of each crate
-      # available in this repo in the root directory. We use `cargo tree` to accomplish this task.
-      #
-      # The result from `cargo tree` is then sorted so the longest job (zebrad) runs first,
-      # transformed to JSON values between double quotes, and separated by commas,
-      # then added to a `crates.txt`.
+      # available in this repo in the root directory. We use `cargo metadata` to
+      # include each crate's Rust version in the matrix.
       #
       # A JSON object is created and assigned to a $MATRIX variable, which is used to create an
       # output named `matrix`, which is then used as the input in following steps,
@@ -76,13 +73,14 @@ jobs:
       - id: set-matrix
         name: Dynamically build crates JSON
         run: |
-          TEMP_DIR=$(mktemp -d)
-          cargo tree --depth 0 --edges no-normal,no-dev,no-build,no-proc-macro --prefix none | cut -d ' ' -f1 | sed '/^$/d' | LC_ALL=C sort --reverse | awk '{ printf "\"%s\",\n", $0 }' | sed '$ s/.$//' > $TEMP_DIR/crates.txt
-          MATRIX=$( (
-            echo '{ "crate" : ['
-            echo "$(cat $TEMP_DIR/crates.txt)"
-            echo " ]}"
-          ) | jq -c .)
+          MATRIX=$(cargo metadata --no-deps --format-version 1 --locked | jq -c '{
+            include: [
+              .packages
+              | sort_by(.name)
+              | reverse[]
+              | { crate: .name, rust_version: .rust_version }
+            ]
+          }')
           echo $MATRIX
           echo $MATRIX | jq .
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
@@ -164,16 +162,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Extract MSRV from Cargo.toml
-        id: msrv
-        run: |
-          MSRV=$(grep 'rust-version' Cargo.toml | head -n1 | cut -d'"' -f2)
-          echo "version=$MSRV" >> "$GITHUB_OUTPUT"
-          echo "Extracted MSRV: $MSRV"
-
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
         with:
-          toolchain: ${{ steps.msrv.outputs.version }}
+          toolchain: ${{ matrix.rust_version }}
           components: clippy
           cache-key: crate-build-msrv-${{ matrix.crate }}
           cache-on-failure: true
@@ -181,7 +172,7 @@ jobs:
       - uses: ./.github/actions/setup-zebra-build
 
       - name: Build ${{ matrix.crate }} crate with MSRV, all features and all targets
-        # zebrad can have a higher MSRV than the other crates since it is a binary, so we skip the MSRV build for it.
+        # zebrad has a dedicated binary MSRV build in the lint workflow.
         if: matrix.crate != 'zebrad'
         run: |
           cargo clippy --package ${{ matrix.crate }} --all-features --all-targets -- -D warnings

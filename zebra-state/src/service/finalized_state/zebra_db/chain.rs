@@ -283,6 +283,7 @@ impl ZebraDb {
     }
 
     #[cfg(test)]
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn history_tree_rebuild_cache_tip(&self) -> Option<(Height, block::Hash)> {
         self.history_tree_rebuild_cache
             .lock()

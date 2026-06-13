@@ -347,7 +347,11 @@ impl BlockTemplateResponse {
         let target = chain_info
             .expected_difficulty
             .to_expanded()
-            .expect("state always returns a valid difficulty value");
+            .ok_or_else(|| {
+                TransactionError::CoinbaseConstruction(
+                    "state returned an invalid difficulty value".to_string(),
+                )
+            })?;
 
         // Convert default values
         let capabilities: Vec<String> = Self::all_capabilities();
