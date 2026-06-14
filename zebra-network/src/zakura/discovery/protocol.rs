@@ -2574,6 +2574,12 @@ impl ZakuraDiscoveryBook {
         let exclude_node_ids: HashSet<_> = exclude_node_ids.iter().copied().collect();
         let limit = limit.min(self.limits.max_imported_records_per_response);
 
+        // Reservoir-sample references and clone only the chosen records. The book can hold
+        // `max_records` (default 10_000) entries, each up to `max_encoded_record_bytes`, so cloning
+        // every record that passes the filter — when at most `limit` (default 32) are ever returned
+        // — was attacker-paced, allocation-heavy work performed while holding the global discovery
+        // mutex. Per-call clone work is now bounded by `limit`, not the book size. See finding
+        // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
         self.entries
             .iter()
             .filter(|(node_id, entry)| {
@@ -2583,8 +2589,11 @@ impl ZakuraDiscoveryBook {
                     && has_wanted_services(&entry.record, wanted_services)
                     && has_discovery_dialable_direct_addrs(&entry.record)
             })
-            .map(|(_, entry)| entry.record.clone())
+            .map(|(_, entry)| &entry.record)
             .choose_multiple(rng, limit)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
@@ -2601,7 +2610,7 @@ impl ZakuraDiscoveryBook {
             exclusions.connected_node_ids.iter().copied().collect();
         let in_flight_node_ids: HashSet<_> =
             exclusions.in_flight_node_ids.iter().copied().collect();
-        let mut candidates: Vec<_> = self
+        let candidates: Vec<_> = self
             .entries
             .values()
             .filter(|entry| {
@@ -2646,31 +2655,28 @@ impl ZakuraDiscoveryBook {
             }))
             .collect();
 
-        candidates.sort_by_cached_key(|entry| {
-            let non_static_random_tie = if !entry.is_static() {
-                rng.gen::<u64>()
-            } else {
-                0
-            };
-            let static_deterministic_tie = if entry.is_static() {
-                node_id_sort_key(&entry.node_id())
-            } else {
-                [0; NODE_ID_BYTES]
-            };
-            (
-                !entry.is_static(),
-                Reverse(entry.last_success().unwrap_or(0)),
-                entry.failure_count(),
-                Reverse(entry.last_seen()),
-                non_static_random_tie,
-                static_deterministic_tie,
-            )
-        });
-
-        candidates
+        // Bounded top-k selection instead of a full sort. The book can hold `max_records`
+        // (default 10_000) entries and this selection runs under the global discovery mutex on the
+        // per-second candidate-dialer path, yet only `limit` candidates are ever returned. Sorting
+        // the whole candidate set (O(n log n)) just to `take(limit)` is replaced with an O(n)
+        // partial select of the best `limit` candidates plus an O(limit log limit) sort of the
+        // survivors, keeping the order identical. See finding
+        // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
+        let mut keyed: Vec<(DialCandidateSortKey, DialCandidateRef<'_>)> = candidates
             .into_iter()
-            .take(limit)
-            .map(DialCandidateRef::into_candidate)
+            .map(|candidate| (dial_candidate_sort_key(&candidate, rng), candidate))
+            .collect();
+
+        let take = limit.min(keyed.len());
+        if take < keyed.len() {
+            keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
+            keyed.truncate(take);
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        keyed
+            .into_iter()
+            .map(|(_, candidate)| candidate.into_candidate())
             .collect()
     }
 
@@ -3036,6 +3042,48 @@ impl DialCandidateRef<'_> {
             },
         }
     }
+}
+
+/// Total dial-priority key for one candidate: prefer signed records over static ones, then most
+/// recent success, fewest failures, most recently seen, with a per-call random tie-break for
+/// non-static candidates and a deterministic node-id tie-break for static ones.
+type DialCandidateSortKey = (
+    bool,
+    Reverse<u64>,
+    u32,
+    Reverse<u64>,
+    u64,
+    [u8; NODE_ID_BYTES],
+);
+
+/// Computes the dial-priority key used to select the best dial candidates.
+///
+/// Factored out of [`ZakuraDiscoveryBook::dial_candidates`] so the key can be computed once per
+/// candidate and fed to a bounded top-k selection instead of a full sort, which keeps expensive
+/// per-book ordering work bounded under the global discovery mutex (finding
+/// `claude-discovery-expensive-work-under-global-mutex`).
+fn dial_candidate_sort_key<R: rand::Rng + ?Sized>(
+    candidate: &DialCandidateRef<'_>,
+    rng: &mut R,
+) -> DialCandidateSortKey {
+    let non_static_random_tie = if !candidate.is_static() {
+        rng.gen::<u64>()
+    } else {
+        0
+    };
+    let static_deterministic_tie = if candidate.is_static() {
+        node_id_sort_key(&candidate.node_id())
+    } else {
+        [0; NODE_ID_BYTES]
+    };
+    (
+        !candidate.is_static(),
+        Reverse(candidate.last_success().unwrap_or(0)),
+        candidate.failure_count(),
+        Reverse(candidate.last_seen()),
+        non_static_random_tie,
+        static_deterministic_tie,
+    )
 }
 
 fn update_existing_entry(
@@ -7313,6 +7361,159 @@ mod tests {
         assert_eq!(outcome.attempted, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         assert_eq!(outcome.rejected, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         assert_eq!(outcome.added, 0);
+    }
+
+    /// Regression test for `claude-discovery-expensive-work-under-global-mutex` (GetPeers sampling
+    /// facet).
+    ///
+    /// `sample_peers` runs under the global discovery mutex and is driven by attacker-paced GetPeers
+    /// requests. It previously cloned *every* record that passed the filter — up to the whole book
+    /// (`max_records`, default 10_000) — even though at most `max_imported_records_per_response`
+    /// records are ever returned. The clone is now bounded to the chosen sample.
+    ///
+    /// The bound is proven machine-independently by comparing the production `sample_peers` against
+    /// an in-test reference that reproduces the pre-fix clone-the-whole-filtered-set behavior, over
+    /// the same large book in the same run. With the fix, production clones only the returned sample
+    /// and is markedly cheaper than the clone-everything reference; before the fix the two are the
+    /// same computation, so the production-is-cheaper bound fails.
+    #[test]
+    fn sample_peers_clone_cost_is_bounded_by_returned_sample() {
+        const BOOK: usize = 1024;
+        const ITERS: usize = 400;
+
+        let wanted = service(1);
+        // Heavy records (maximum direct-address fan-out plus many services, with the wanted service
+        // first so the filter match itself stays cheap) make each *record clone* far more expensive
+        // than the allocation-free per-entry filter scan, so the clone count is the dominant cost
+        // and the bounded-vs-unbounded clone gap is large.
+        let addrs: Vec<SocketAddr> = (1u8..=MAX_DIRECT_ADDRS_PER_RECORD as u8)
+            .map(test_addr)
+            .collect();
+        let mut services = vec![wanted.clone()];
+        services.extend((100..100 + (MAX_SERVICES_PER_RECORD - 1)).map(service));
+
+        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
+            max_records: BOOK,
+            ..ZakuraDiscoveryBookLimits::default()
+        });
+        for seq in 0..BOOK {
+            let secret = secret_key();
+            let mut record_body = body(&secret);
+            record_body.sequence = seq as u64 + 1;
+            record_body.direct_addrs = addrs.clone();
+            record_body.services = services.clone();
+            let record = ZakuraNodeRecord::sign(record_body, &secret).expect("test record signs");
+            book.import_record(record, None, NOW, &context())
+                .expect("test record imports");
+        }
+
+        let cap = book.limits.max_imported_records_per_response;
+
+        // Reference implementation: the pre-fix behavior of cloning every record that passes the
+        // filter, then reservoir-sampling the clones. Mirrors `sample_peers`'s filter exactly.
+        let naive_sample =
+            |book: &ZakuraDiscoveryBook, rng: &mut StdRng| -> Vec<ZakuraNodeRecord> {
+                book.entries
+                    .iter()
+                    .filter(|(node_id, entry)| {
+                        book.local_node_id != Some(**node_id)
+                            && !entry_is_expired(entry, NOW)
+                            && has_wanted_services(&entry.record, std::slice::from_ref(&wanted))
+                            && has_discovery_dialable_direct_addrs(&entry.record)
+                    })
+                    .map(|(_, entry)| entry.record.clone())
+                    .choose_multiple(rng, cap)
+            };
+
+        let mut rng = StdRng::seed_from_u64(5);
+
+        // Warm up the allocator and instruction caches before timing.
+        let _ = naive_sample(&book, &mut rng);
+        let _ = book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng);
+
+        let naive_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            assert_eq!(naive_sample(&book, &mut rng).len(), cap);
+        }
+        let naive_time = naive_start.elapsed();
+
+        let production_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            assert_eq!(
+                book.sample_peers(cap, std::slice::from_ref(&wanted), &[], NOW, &mut rng)
+                    .len(),
+                cap
+            );
+        }
+        let production_time = production_start.elapsed();
+
+        // Both run the same O(book) filter scan and reservoir sampling; the only difference is how
+        // many records are cloned (production: the returned `cap`; reference: every match in the
+        // book). With the bound in place production must be clearly cheaper than cloning the whole
+        // filtered set. Before the fix they are the identical computation, so production is not
+        // meaningfully cheaper and this fails. The 0.8 factor is a ratio on the same machine, so it
+        // is machine-independent.
+        assert!(
+            production_time.as_nanos() * 5 < naive_time.as_nanos() * 4,
+            "sample_peers did not bound its clone work: production={production_time:?} \
+             clone-everything reference={naive_time:?}; production should be clearly cheaper than \
+             cloning every filtered record"
+        );
+    }
+
+    /// Guards the bounded top-k dial-candidate selection added for
+    /// `claude-discovery-expensive-work-under-global-mutex`.
+    ///
+    /// `dial_candidates` now selects the best `limit` candidates with a partial select instead of
+    /// sorting the whole book before `take(limit)`. With far more matching candidates than `limit`,
+    /// the result must still be exactly the highest dial-priority candidates (most recent
+    /// successful dial first), proving the partial selection keeps the same ordering as a full
+    /// sort.
+    #[test]
+    fn dial_candidates_selects_top_priority_subset_under_limit() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let records = (1u8..=10)
+            .map(|index| signed_record_with(index.into(), service(1), test_addr(index)))
+            .collect::<Vec<_>>();
+        for record in &records {
+            book.import_record(record.clone(), None, NOW, &context())
+                .expect("test record imports");
+        }
+
+        // Three candidates get strictly increasing last-success times, so dial priority is
+        // deterministic (most recent success first); the remaining seven have no successful dial.
+        book.mark_dial_success(&records[5].body.node_id, NOW + 1);
+        book.mark_dial_success(&records[3].body.node_id, NOW + 2);
+        book.mark_dial_success(&records[7].body.node_id, NOW + 3);
+        let expected_top = vec![
+            records[7].body.node_id,
+            records[3].body.node_id,
+            records[5].body.node_id,
+        ];
+
+        let mut rng = StdRng::seed_from_u64(99);
+        let selected = book.dial_candidates(
+            3,
+            &[service(1)],
+            DialCandidateExclusions {
+                connected_node_ids: &[],
+                in_flight_node_ids: &[],
+            },
+            NOW,
+            (
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+            ),
+            &mut rng,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.node_id)
+                .collect::<Vec<_>>(),
+            expected_top,
+        );
     }
 
     #[tokio::test]
