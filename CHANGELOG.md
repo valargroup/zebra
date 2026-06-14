@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - zcashd-compat now defaults to externally managed `zcashd` path mode, so Zebra
   starts the compat RPC endpoint without spawning `zcashd` unless supervision is
   explicitly enabled.
+- The zcashd-compat installer now recommends standard Zebra and `zcashd`
+  datadirs, existing high-capacity datadirs, or high-capacity install roots
+  instead of hard-coded local `/mnt/data` defaults.
 - Update `zebra-rollback-state` and `zebrad rollback-state` to run rollback by
   default and use `--dry-run` for rollback-plan previews (replacing the old
   `--force` gate).
