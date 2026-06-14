@@ -402,6 +402,153 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
     responder_endpoint.shutdown().await;
 }
 
+/// An inbound legacy peer that advertised `NODE_P2P_V2` and frames a `p2pv2up`
+/// message whose payload fails to decode must be disconnected on the first
+/// malformed upgrade message, not silently kept on the legacy connection.
+///
+/// Regression test for `claude-legacy-upgrade-malformed-fallback-fail-open`
+/// (responder facet): `read_upgrade_prelude` previously erased
+/// `P2pV2Upgrade::decode` errors to `None` via `.ok()`, so the responder mapped
+/// malformed bytes to a neutral reject plus legacy fallback. That let a peer
+/// force a downgrade to legacy by sending garbage upgrade bytes (SR-7
+/// fail-open). The malformed prelude must instead surface as a non-neutral
+/// `ZakuraUpgradePreludeMalformed` disconnect.
+#[tokio::test]
+async fn responder_upgrade_disconnects_on_malformed_prelude() {
+    let _init_guard = zebra_test::init();
+
+    let network = test_config(true).network;
+    let config = ZakuraHandshakeConfig::for_network(&network);
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
+        remote_zebra_nonce: Nonce(0x2222_2222_2222_2222),
+    };
+    // The malformed-prelude branch returns before any endpoint use, so a
+    // connector without a live endpoint is enough to exercise the responder
+    // path.
+    let connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
+
+    let (responder_stream, peer_stream) = duplex(16 * 1024);
+    let mut responder_conn = Framed::new(
+        responder_stream,
+        Codec::builder().for_network(&network).finish(),
+    );
+    let mut peer_conn = Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
+
+    // A framed `p2pv2up` message whose payload has an unknown discriminator, so
+    // `P2pV2Upgrade::decode` fails. Oversized/trailing/truncated payloads share
+    // this same decode-error path.
+    let attacker = async move {
+        peer_conn
+            .send(Message::P2pV2Upgrade(vec![0xFF; 16]))
+            .await
+            .expect("the malformed initiator frames its bogus upgrade prelude");
+        peer_conn
+    };
+
+    let responder = run_responder_upgrade(
+        &mut responder_conn,
+        &connector,
+        &config,
+        nonces,
+        vec![1u8; 32],
+        vec![b"127.0.0.1:1".to_vec()],
+    );
+
+    let (outcome, _held_peer_conn) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), responder),
+        attacker,
+    );
+
+    let error = outcome
+        .expect("the responder upgrade resolves within the time bound")
+        .expect_err(
+            "a malformed upgrade prelude must disconnect the peer, not fall back to legacy",
+        );
+    assert!(
+        matches!(error, HandshakeError::ZakuraUpgradePreludeMalformed(_)),
+        "the responder returned {error:?}; a malformed p2pv2up prelude must be a \
+         first-offense disconnect",
+    );
+    assert!(
+        !error.is_neutral_disconnect(),
+        "a malformed upgrade prelude must be a penalized peer failure, not a neutral \
+         legacy fallback",
+    );
+}
+
+/// The TCP initiator side of the same regression: a peer that advertised
+/// `NODE_P2P_V2`, receives our `Init`, and replies with a `p2pv2up` message
+/// whose payload fails to decode must be disconnected, not kept on legacy.
+///
+/// Regression test for `claude-legacy-upgrade-malformed-fallback-fail-open`
+/// (initiator facet): the initiator previously mapped a malformed `Accept` to a
+/// neutral legacy fallback. It must instead surface a non-neutral
+/// `ZakuraUpgradePreludeMalformed` disconnect.
+#[tokio::test]
+async fn initiator_upgrade_disconnects_on_malformed_prelude() {
+    let _init_guard = zebra_test::init();
+
+    let network = test_config(true).network;
+    let config = ZakuraHandshakeConfig::for_network(&network);
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: Nonce(0x3333_3333_3333_3333),
+        remote_zebra_nonce: Nonce(0x4444_4444_4444_4444),
+    };
+    let connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
+
+    let (initiator_stream, peer_stream) = duplex(16 * 1024);
+    let mut initiator_conn = Framed::new(
+        initiator_stream,
+        Codec::builder().for_network(&network).finish(),
+    );
+    let mut peer_conn = Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
+
+    // The malicious responder reads our `Init`, then replies with a framed
+    // `p2pv2up` message whose payload fails to decode (an unknown discriminator)
+    // instead of a well-formed `Accept`.
+    let attacker = async move {
+        let init = peer_conn
+            .next()
+            .await
+            .expect("the initiator frames its upgrade init")
+            .expect("the init frame decodes at the codec layer");
+        assert!(
+            matches!(init, Message::P2pV2Upgrade(_)),
+            "the initiator must send an upgrade init first",
+        );
+        peer_conn
+            .send(Message::P2pV2Upgrade(vec![0xFF; 16]))
+            .await
+            .expect("the malformed responder frames its bogus accept");
+        peer_conn
+    };
+
+    let initiator = run_initiator_upgrade(
+        &mut initiator_conn,
+        &connector,
+        &config,
+        nonces,
+        vec![1u8; 32],
+        vec![b"127.0.0.1:1".to_vec()],
+    );
+
+    let (outcome, _held_peer_conn) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), initiator),
+        attacker,
+    );
+
+    let error = outcome
+        .expect("the initiator upgrade resolves within the time bound")
+        .expect_err("a malformed upgrade accept must disconnect the peer, not fall back to legacy");
+    assert!(
+        matches!(error, HandshakeError::ZakuraUpgradePreludeMalformed(_)),
+        "the initiator returned {error:?}; a malformed p2pv2up accept must be a \
+         first-offense disconnect",
+    );
+    assert!(!error.is_neutral_disconnect());
+}
+
 #[tokio::test]
 async fn p2p_v2_service_bit_advertisement_follows_config() {
     let _init_guard = zebra_test::init();
@@ -454,6 +601,12 @@ fn zakura_upgrade_errors_are_neutral_disconnects() {
             .is_neutral_disconnect()
     );
     assert!(!HandshakeError::Timeout.is_neutral_disconnect());
+    // A malformed upgrade prelude is a real peer failure: it must be demoted
+    // (reported failed), not treated as a neutral legacy fallback.
+    assert!(!HandshakeError::ZakuraUpgradePreludeMalformed(
+        crate::zakura::ZakuraProtocolError::InvalidDiscriminator(0xFF)
+    )
+    .is_neutral_disconnect());
 }
 
 #[test]
