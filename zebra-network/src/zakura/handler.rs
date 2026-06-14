@@ -5117,4 +5117,164 @@ mod tests {
                 < limits.quic_idle_timeout.as_millis()
         );
     }
+
+    // SECURITY AUDIT (candidate claude-legacy-nil-response-nonfatal /
+    // subset-response-correlation-gossip-nil-response-nonfatal): SR-7 fail-closed.
+    //
+    // The outbound request stream worker decides connection-fatality from
+    // `LegacyResponseReadState::validate_frame`: `Fatal` => connection.close() +
+    // connection_token.cancel() (the peer is disconnected); `Ok`/`Local` => the
+    // peer stays connected and the request just returns an error. `validate_nil`
+    // accepts a `MSG_RESPONSE_NIL` sentinel for *every* request kind, so a peer
+    // that answers an inventory fetch (BlocksByHash / TransactionsById) or a Ping
+    // with a correct-id NIL passes the transport budget layer (worker returns
+    // Ok(frames)) and is NOT disconnected. Only the later `decode_response` layer
+    // rejects NIL for these kinds -- as an ordinary request-local error. The two
+    // layers disagree, so an unexpected/unsolicited response is tolerated instead
+    // of failing closed.
+    //
+    // This test asserts the SAFE behavior (the transport budget layer must reject
+    // NIL for inventory/Ping kinds as `Fatal`, so the worker disconnects). It
+    // currently FAILS, which is the reproduction. Do not weaken it to pass.
+    #[test]
+    fn nil_response_to_inventory_or_ping_request_is_not_fail_closed() {
+        let limits = test_connection_limits();
+        let request_id = 99;
+
+        let cases: [(LegacyRequestFrame, LegacyRequestKind); 3] = [
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+                LegacyRequestKind::Blocks,
+            ),
+            (
+                LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(2)]),
+                LegacyRequestKind::Transactions,
+            ),
+            (LegacyRequestFrame::Ping, LegacyRequestKind::Ping),
+        ];
+
+        for (request, request_kind) in cases {
+            let request_frame = request.encode_frame().expect("request frame encodes");
+            let budget = LegacyResponseBudget::from_request(
+                request_frame.message_type,
+                &request_frame.payload,
+                limits,
+            )
+            .expect("budget derives from request");
+
+            // A hostile/buggy responder serializes Response::Nil with the real
+            // codec, addressed to our request id.
+            let nil_frames = LegacyResponseCodec::encode_response(
+                request_id,
+                Response::Nil,
+                limits.max_frame_bytes,
+            )
+            .expect("nil response encodes");
+
+            // The higher decode layer DOES reject NIL for these kinds...
+            let decoded =
+                LegacyResponseCodec::decode_response(request_id, request_kind, nil_frames.clone());
+            assert!(
+                decoded.is_err(),
+                "decode_response must reject a bare NIL for {request_kind:?}",
+            );
+
+            // ...but the transport budget layer -- the one that drives the
+            // fail-closed disconnect in the request stream worker -- must ALSO
+            // reject it as Fatal. It currently accepts it.
+            let mut state = LegacyResponseReadState::new(budget);
+            let mut validate = Ok(());
+            for frame in &nil_frames {
+                validate = state.validate_frame(request_id, frame);
+                if validate.is_err() {
+                    break;
+                }
+            }
+            let validate = validate.and_then(|()| state.finish());
+            assert!(
+                matches!(validate, Err(OutboundRequestError::Fatal(_))),
+                "transport must fail closed (Fatal) on a NIL answer to {request_kind:?} so the \
+                 request stream worker disconnects the peer; got {validate:?}",
+            );
+        }
+    }
+
+    // SECURITY AUDIT (candidate claude-inbound-per-ip-cap-bypassed /
+    // codex-inbound-per-ip-cap-bypass): SR-4 admission.
+    //
+    // `accept_connection` registers every inbound peer with `remote_ip = None`
+    // (handler.rs accept path), and `register` only consults `active_by_ip` when
+    // `remote_ip` is `Some`. So the per-IP connection cap is enforced for native
+    // outbound dials (which pass a real IP) but entirely bypassed for inbound
+    // accepts: one source IP can authenticate as many distinct node ids and fill
+    // the global connection budget (default per-IP cap is 1).
+    //
+    // This is a characterization test driving the real supervisor `register` with
+    // the exact `remote_ip` arguments the two production paths supply. It PASSES,
+    // documenting both the working Some(ip) cap and the None-path bypass. The fix
+    // belongs at the accept site (plumb the real inbound peer IP into register),
+    // not in `register` itself -- so we do NOT assert that register(None) should
+    // reject, which would wrongly cap all distinct inbound peers to one global
+    // slot.
+    #[tokio::test]
+    async fn inbound_accept_remote_ip_none_bypasses_per_ip_cap() {
+        async fn try_register(
+            supervisor: &ZakuraSupervisorHandle,
+            peer: &ZakuraPeerId,
+            remote_ip: Option<IpAddr>,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    peer.clone(),
+                    remote_ip,
+                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                    outbound_handle,
+                    CancellationToken::new(),
+                    ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+                )
+                .await
+        }
+
+        let ip: IpAddr = "203.0.113.7".parse().expect("test ip parses");
+
+        // Control: native outbound dials supply the real source IP, so the per-IP
+        // cap rejects a second distinct identity claiming to come from that IP.
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        assert!(
+            matches!(
+                try_register(&supervisor, &test_peer(1), Some(ip)).await,
+                ZakuraRegistration::Registered { .. }
+            ),
+            "first identity from the IP registers",
+        );
+        assert!(
+            matches!(
+                try_register(&supervisor, &test_peer(2), Some(ip)).await,
+                ZakuraRegistration::Rejected(_)
+            ),
+            "a second distinct identity from the same IP must be rejected at per-IP cap 1",
+        );
+
+        // Inbound shape: accept_connection passes remote_ip = None. Three distinct
+        // node ids -- which an attacker can mint from one source IP -- all register
+        // despite cap 1, because the per-IP gate is skipped when remote_ip is None.
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        for byte in [10u8, 11, 12] {
+            assert!(
+                matches!(
+                    try_register(&supervisor, &test_peer(byte), None).await,
+                    ZakuraRegistration::Registered { .. }
+                ),
+                "inbound (remote_ip=None) registration {byte} succeeds despite per-IP cap 1, \
+                 demonstrating the inbound per-IP admission bypass",
+            );
+        }
+        assert_eq!(
+            supervisor.registered_ids().await.len(),
+            3,
+            "all three same-source inbound identities occupy admission slots past the cap",
+        );
+    }
 }

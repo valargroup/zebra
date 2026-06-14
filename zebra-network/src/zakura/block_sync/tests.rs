@@ -3016,3 +3016,91 @@ async fn reactor_reports_size_mismatch_softly_and_still_submits_valid_block() {
 
     reactor_task.abort();
 }
+
+// SECURITY AUDIT (candidate claude-block-sync-unsolicited-blocksdone-not-rejected /
+// codex-blocksync-unsolicited-blocksdone-not-rejected): SR-6/SR-7 response
+// correlation + fail-closed.
+//
+// `handle_blocks_done` reports `UnsolicitedDone` only when the peer is *unknown*.
+// For a known, active peer that sends a valid `BlocksDone` with no matching
+// outstanding request, the `if let Some(index)` body is skipped and the reactor
+// falls through to `schedule()` with no `else` reporting `UnsolicitedDone`.
+// `UnsolicitedDone` is a *hard* block-sync misbehavior (`block_sync_misbehavior_is_hard`
+// in zebrad start.rs), so the production driver `drive_block_sync_actions`
+// disconnects on the first offense -- but this branch never emits it, so an
+// admitted peer can stream uncorrelated response terminators forever and stay
+// connected.
+//
+// This test asserts the SAFE behavior (the reactor must report `UnsolicitedDone`).
+// It currently FAILS, which is the reproduction. Do not weaken it to pass; the
+// fix is to add the missing `else` branch in `handle_blocks_done`.
+#[tokio::test]
+async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior() {
+    let config = ZakuraBlockSyncConfig::default();
+    let blocks = mainnet_blocks_1_to_3();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    // Connect a peer that advertises no downloadable work (servable_high == our
+    // verified tip), so the reactor never schedules a GetBlocks and the peer has
+    // zero outstanding requests. The peer is known/active (received_status=true).
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        63,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    // Surprising/hostile input: a valid `BlocksDone` terminator with a start
+    // height that matches no outstanding request (there are none).
+    inbound_tx
+        .send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(7),
+                returned: 1,
+            }
+            .encode_frame()
+            .expect("BlocksDone frame encodes"),
+        )
+        .await
+        .expect("BlocksDone frame queues");
+
+    // Expected safe behavior: the reactor reports `UnsolicitedDone` for this peer
+    // (which the production driver maps to a hard disconnect). Collect actions for
+    // a bounded window and assert it appears.
+    let mut saw_unsolicited_done = false;
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(300), actions.recv()).await
+    {
+        if let BlockSyncAction::Misbehavior { peer, reason } = action {
+            if peer == peer_id && reason == BlockSyncMisbehavior::UnsolicitedDone {
+                saw_unsolicited_done = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        saw_unsolicited_done,
+        "a known peer's unsolicited BlocksDone with no matching outstanding request \
+         must be reported as Misbehavior::UnsolicitedDone (SR-6/SR-7), but the reactor \
+         silently tolerated it and kept the peer connected",
+    );
+
+    reactor_task.abort();
+}

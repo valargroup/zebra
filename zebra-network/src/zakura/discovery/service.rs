@@ -21,21 +21,21 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    BlockSyncHandle, BoxRunFuture, Frame, FramedRecv, FramedSend, HeaderSyncEvent,
-    HeaderSyncHandle, OrderedSendError, Peer, PeerStreamSession, Service, ServiceAdmissionDecision,
-    ServicePeerDirection, Sink, SinkReject, Stream, StreamMode, ZakuraPeerId,
+    handle_pipe_exit, spawn_supervised_pipe, BlockSyncHandle, Flow, Frame, FramedRecv, FramedSend,
+    HeaderSyncEvent, HeaderSyncHandle, OrderedSendError, Peer, PeerStreamSession, Pipe, Service,
+    ServiceAdmissionDecision, ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
 };
 
+#[cfg(test)]
+use super::pipe::decode_discovery_frame;
+use super::pipe::{discovery_pipe, DsEnv, DsLocal, DISCOVERY_FRAME_MESSAGE_TYPE};
 use super::protocol::{
     BlockSyncServiceSummary, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError,
     GetServices, HeaderSyncServiceSummary, ServiceSummaryEnvelope, Services, ZakuraDiscoveryHandle,
     ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
-
-/// Frame message type carrying a discovery payload (matches the native wire).
-const DISCOVERY_FRAME_MESSAGE_TYPE: u16 = 1;
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 const DISCOVERY_EXCHANGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -312,23 +312,24 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         progress: progress.clone(),
     };
     let sink_service_cancel = service_cancel.clone();
-    let sink_connection_cancel = connection_cancel.clone();
-    tokio::spawn(async move {
-        match Box::new(sink).run(recv).await {
-            Ok(()) => {}
-            Err(SinkReject::Protocol(error)) => {
-                tracing::debug!(
-                    ?error,
-                    "Zakura discovery stream rejected protocol-invalid frame"
-                );
-                sink_connection_cancel.cancel();
-            }
-            Err(SinkReject::Local(error)) => {
-                tracing::debug!(?error, "Zakura discovery stream stopped on local error");
-            }
-        }
-        sink_service_cancel.cancel();
-    });
+    let reject_connection_cancel = connection_cancel.clone();
+    let panic_connection_cancel = connection_cancel.clone();
+    let sink_peer_id = peer_id.clone();
+    // A protocol reject is fatal to the connection; normal/parked exits leave it
+    // for the source task to tear down once it knows no other service owns the
+    // peer (below). Panic teardown is in `on_panic`.
+    let pipe = async move {
+        let mut pipe = discovery_pipe(sink_peer_id);
+        handle_pipe_exit(
+            "discovery",
+            &reject_connection_cancel,
+            run_discovery_pipe(&mut pipe, recv, sink).await,
+        );
+    };
+    let on_panic = move || panic_connection_cancel.cancel();
+    // Let the returned handle drop to detach the supervised reader task; the
+    // `PipeTeardown` still runs on every exit path.
+    spawn_supervised_pipe(peer_id.clone(), sink_service_cancel, || {}, on_panic, pipe);
 
     let source = DiscoverySource {
         handle: handle.clone(),
@@ -364,29 +365,36 @@ struct DiscoverySink {
     progress: Arc<DiscoveryExchangeProgress>,
 }
 
-impl Sink for DiscoverySink {
-    fn run(self: Box<Self>, mut recv: FramedRecv) -> BoxRunFuture<'static, Result<(), SinkReject>> {
-        Box::pin(async move {
-            let cancel = self.session.cancel_token();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Ok(()),
-                    frame = recv.recv() => {
-                        let Some(frame) = frame else {
-                            return Ok(());
-                        };
-                        self.handle_frame(frame).await?;
-                    }
-                }
-            }
-        })
+async fn run_discovery_pipe(
+    pipe: &mut Pipe<DsLocal, DsEnv>,
+    mut recv: FramedRecv,
+    sink: DiscoverySink,
+) -> Result<(), SinkReject> {
+    let cancel = sink.session.cancel_token();
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            frame = recv.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+
+        match pipe.run_one(frame) {
+            Flow::Continue(()) | Flow::Done => {}
+            Flow::Reject(reject) => return Err(reject),
+        }
+
+        let Some(message) = pipe.local_mut().take_decoded() else {
+            continue;
+        };
+        sink.handle_message(message).await?;
     }
 }
 
 impl DiscoverySink {
-    async fn handle_frame(&self, frame: Frame) -> Result<(), SinkReject> {
-        let message = decode_discovery_frame(&frame).map_err(SinkReject::protocol)?;
+    async fn handle_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
         match message {
             DiscoveryMessage::Hello { record } => self.handle_hello(record).await,
             DiscoveryMessage::GetPeers {
@@ -664,19 +672,6 @@ fn peer_has_other_service_owner(
             .admitted_node_ids
             .contains(&peer_node_id)
     })
-}
-
-/// Decodes a discovery message from a transport frame, rejecting a frame whose
-/// envelope is not a discovery payload.
-fn decode_discovery_frame(frame: &Frame) -> Result<DiscoveryMessage, crate::BoxError> {
-    if frame.message_type != DISCOVERY_FRAME_MESSAGE_TYPE || frame.flags != 0 {
-        return Err(format!(
-            "unexpected discovery frame envelope (message_type={}, flags={})",
-            frame.message_type, frame.flags
-        )
-        .into());
-    }
-    DiscoveryMessage::decode(&frame.payload).map_err(Into::into)
 }
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte

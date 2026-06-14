@@ -15,7 +15,7 @@ pub fn spawn_header_sync_reactor(
     ),
     HeaderSyncStartError,
 > {
-    let state = HeaderSyncState::new(&startup)?;
+    let state = HeaderSyncCore::new(&startup)?;
     let (events_tx, events_rx) = mpsc::channel(128);
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
     let (actions_tx, actions_rx) = mpsc::channel(128);
@@ -52,7 +52,7 @@ pub fn spawn_header_sync_reactor(
 #[derive(Debug)]
 pub(super) struct HeaderSyncReactor {
     startup: HeaderSyncStartup,
-    state: HeaderSyncState,
+    state: HeaderSyncCore,
     events: mpsc::Receiver<HeaderSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<HeaderSyncEvent>,
     actions: mpsc::Sender<HeaderSyncAction>,
@@ -632,7 +632,8 @@ impl HeaderSyncReactor {
                     return;
                 };
                 let advances_advertised_tip = status.tip_height > peer_state.advertised_tip;
-                let status_token_available = peer_state.inbound_status.try_take(Instant::now());
+                let status_token_available =
+                    peer_state.meters.inbound_status.try_take(Instant::now());
                 if !advances_advertised_tip && !status_token_available {
                     self.report_misbehavior(peer, HeaderSyncMisbehavior::StatusSpam)
                         .await;
@@ -755,6 +756,7 @@ impl HeaderSyncReactor {
             .peers
             .get_mut(&peer)
             .expect("peer exists because it was checked before validation")
+            .meters
             .inbound_new_block
             .try_take(Instant::now())
         {
@@ -1136,7 +1138,12 @@ impl HeaderSyncReactor {
             .state
             .peers
             .iter_mut()
-            .filter_map(|(peer_id, peer)| peer.unsolicited.try_take(now).then(|| peer_id.clone()))
+            .filter_map(|(peer_id, peer)| {
+                peer.meters
+                    .unsolicited
+                    .try_take(now)
+                    .then(|| peer_id.clone())
+            })
             .collect();
 
         for peer in peer_ids {

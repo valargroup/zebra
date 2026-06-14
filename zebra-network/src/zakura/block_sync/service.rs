@@ -1,7 +1,8 @@
-use super::{config::*, events::*, wire::*, *};
+use super::{config::*, events::*, pipe::*, wire::*, *};
 use crate::zakura::{
-    BoxRunFuture, FramedRecv, FramedSend, OrderedSendError, Peer, PeerStreamSession, Service, Sink,
-    SinkReject, Source, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, FramedSend, OrderedSendError,
+    Peer, PeerStreamSession, Pipe, PipeSink, Service, SessionGuard, SinkReject, Source, Stream,
+    StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
@@ -326,13 +327,33 @@ impl Service for BlockSyncService {
             service_cancel_token.clone(),
             send,
         );
-        let sink_task = spawn_block_sync_sink(
+        let pipe = block_sync_pipe(peer_id.clone(), self.inner.events.clone());
+        let sink = PipeSink::new(pipe, recv, service_cancel_token.clone());
+        let on_teardown = {
+            let lifecycle = self.inner.lifecycle.clone();
+            let peer_id = peer_id.clone();
+            move || {
+                let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
+            }
+        };
+        let on_panic = {
+            let connection_cancel_token = connection_cancel_token.clone();
+            move || connection_cancel_token.cancel()
+        };
+        // A protocol reject is fatal to the whole connection; a normal/parked exit
+        // leaves it for the other services riding on it. Panic teardown is in
+        // `on_panic`.
+        let pipe = async move {
+            handle_pipe_exit("block-sync", &connection_cancel_token, sink.run().await);
+        };
+        // Let the returned handle drop to detach the supervised task (like
+        // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
+        spawn_supervised_pipe(
             peer_id.clone(),
-            recv,
-            self.inner.events.clone(),
-            self.inner.lifecycle.clone(),
             service_cancel_token.clone(),
-            connection_cancel_token,
+            on_teardown,
+            on_panic,
+            pipe,
         );
 
         {
@@ -350,7 +371,7 @@ impl Service for BlockSyncService {
                     actions: actions_tx.clone(),
                     #[cfg(not(test))]
                     _actions: actions_tx.clone(),
-                    _tasks: vec![source_task, sink_task],
+                    _tasks: vec![source_task],
                 },
             );
         }
@@ -387,46 +408,12 @@ impl Service for BlockSyncService {
             return Ok(());
         }
 
-        deliver_block_sync_frame(&self.inner.events, peer_id, frame)
-    }
-}
-
-fn spawn_block_sync_sink(
-    peer_id: ZakuraPeerId,
-    recv: FramedRecv,
-    events: mpsc::Sender<BlockSyncEvent>,
-    lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
-    service_cancel_token: CancellationToken,
-    connection_cancel_token: CancellationToken,
-) -> JoinHandle<()> {
-    task::spawn(async move {
-        let sink = Box::new(BlockSyncSink {
-            peer_id: peer_id.clone(),
-            events: events.clone(),
-            cancel_token: service_cancel_token,
-        });
-
-        match sink.run(recv).await {
-            Ok(()) => {}
-            Err(SinkReject::Protocol(error)) => {
-                tracing::debug!(
-                    ?error,
-                    ?peer_id,
-                    "block-sync stream rejected protocol-invalid frame"
-                );
-                connection_cancel_token.cancel();
-            }
-            Err(SinkReject::Local(error)) => {
-                tracing::debug!(
-                    ?error,
-                    ?peer_id,
-                    "block-sync stream could not deliver frame locally"
-                );
-            }
+        let mut pipe = block_sync_pipe(peer_id, self.inner.events.clone());
+        match pipe.run_one(frame) {
+            Flow::Continue(()) | Flow::Done => Ok(()),
+            Flow::Reject(reject) => Err(reject),
         }
-
-        let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
-    })
+    }
 }
 
 fn spawn_block_sync_source(
@@ -443,33 +430,6 @@ fn spawn_block_sync_source(
         });
         source.run(send).await;
     })
-}
-
-#[derive(Debug)]
-struct BlockSyncSink {
-    peer_id: ZakuraPeerId,
-    events: mpsc::Sender<BlockSyncEvent>,
-    cancel_token: CancellationToken,
-}
-
-impl Sink for BlockSyncSink {
-    fn run(self: Box<Self>, mut recv: FramedRecv) -> BoxRunFuture<'static, Result<(), SinkReject>> {
-        Box::pin(async move {
-            loop {
-                let frame = tokio::select! {
-                    _ = self.cancel_token.cancelled() => return Ok(()),
-                    frame = recv.recv() => {
-                        let Some(frame) = frame else {
-                            return Ok(());
-                        };
-                        frame
-                    }
-                };
-
-                deliver_block_sync_frame(&self.events, self.peer_id.clone(), frame)?;
-            }
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -520,26 +480,24 @@ impl Source for BlockSyncSource {
     }
 }
 
-fn deliver_block_sync_frame(
-    events: &mpsc::Sender<BlockSyncEvent>,
+pub(super) fn block_sync_pipe(
     peer_id: ZakuraPeerId,
-    frame: Frame,
-) -> Result<(), SinkReject> {
-    let msg = match BlockSyncMessage::decode_frame(frame) {
-        Ok(msg) => msg,
-        Err(error) => {
-            // Block bodies are validated against committed headers in B1+.
-            let protocol_error =
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-            let _ = events.try_send(BlockSyncEvent::WireDecodeFailed {
-                peer: peer_id,
-                error: Arc::new(error),
-            });
-            return Err(SinkReject::protocol(protocol_error));
-        }
-    };
-
-    events
-        .try_send(BlockSyncEvent::WireMessage { peer: peer_id, msg })
-        .map_err(|error| SinkReject::local(format!("block-sync queue closed: {error}")))
+    events: mpsc::Sender<BlockSyncEvent>,
+) -> Pipe<BsLocal, BsEnv> {
+    Pipe::new(
+        peer_id,
+        BsLocal,
+        BsEnv::new(events),
+        // The transport already applies the per-connection count bucket and
+        // frame cap; this guard adds the same payload cap the codec enforces.
+        // Type validity is left to the decode stage on purpose: a disallowed or
+        // unknown stream-6 type must surface as `WireDecodeFailed` so the reactor
+        // records `MalformedMessage` misbehavior — a pre-decode guard reject would
+        // disconnect the peer but drop that misbehavior signal (see BS1). The
+        // block-sync byte budget likewise stays in the reactor scheduler/reorder
+        // state so existing request/retry accounting is not double-counted.
+        SessionGuard::oversize_only(MAX_BS_MESSAGE_BYTES as u32),
+        run_inbound,
+        &PIPE_SHAPE,
+    )
 }
