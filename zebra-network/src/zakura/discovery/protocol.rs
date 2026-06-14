@@ -3235,9 +3235,10 @@ fn has_wanted_services(record: &ZakuraNodeRecord, wanted_services: &[ZakuraServi
 
 /// Validates direct addresses for discovery-book storage.
 ///
-/// Untrusted peer/gossip records must only contain globally dialable addresses, preserving the
-/// discovery security rule that gossiped records cannot inject loopback, link-local, multicast, or
-/// broadcast targets. Static records are trusted-by-configuration bootstrap records, so they may use
+/// Untrusted peer/gossip records must only contain globally routable addresses, preserving the
+/// discovery security rule that gossiped records cannot inject loopback, link-local, multicast,
+/// broadcast, RFC 1918 private, RFC 6598 shared (CGNAT), or RFC 4193 unique-local targets. Static
+/// records are trusted-by-configuration bootstrap records, so they may use
 /// local addresses for regtest and single-host deployments, but still reject empty, unspecified, and
 /// port-0 targets that cannot be dialed as configured peers.
 fn validate_discovery_direct_addrs(
@@ -3283,6 +3284,14 @@ fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
         })
 }
 
+/// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
+///
+/// A signed `ZakuraNodeRecord` proves control of the node key, not ownership of the advertised
+/// `direct_addrs`. To stop an authenticated discovery peer from steering the candidate dialer at
+/// arbitrary non-public targets, gossiped records must advertise only globally routable addresses.
+/// Besides the obvious loopback/link-local/multicast/broadcast cases, this rejects RFC 1918 private,
+/// RFC 6598 shared (CGNAT), and RFC 4193 unique-local ranges, which are reachable internal targets
+/// the dialer would otherwise scan on the operator's network.
 fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
     if addr.port() == 0 {
         return false;
@@ -3295,12 +3304,15 @@ fn is_discovery_dialable_addr(addr: &SocketAddr) -> bool {
                 && !ip.is_multicast()
                 && !ip.is_broadcast()
                 && !ip.is_link_local()
+                && !ip.is_private()
+                && !is_ipv4_shared(&ip)
         }
         IpAddr::V6(ip) => {
             !ip.is_unspecified()
                 && !ip.is_loopback()
                 && !ip.is_multicast()
                 && !is_ipv6_unicast_link_local(&ip)
+                && !is_ipv6_unique_local(&ip)
         }
     }
 }
@@ -3318,6 +3330,18 @@ fn is_static_discovery_configured_addr_usable(addr: &SocketAddr) -> bool {
 
 fn is_ipv6_unicast_link_local(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+// `Ipv4Addr::is_shared` is still unstable, so match the RFC 6598 100.64.0.0/10 range directly,
+// mirroring `is_ipv6_unicast_link_local`.
+fn is_ipv4_shared(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+}
+
+// `Ipv6Addr::is_unique_local` is still unstable, so match the RFC 4193 fc00::/7 range directly.
+fn is_ipv6_unique_local(ip: &Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xfe00) == 0xfc00
 }
 
 // Import accepts records inside the clock-skew window, but runtime liveness is strict.
@@ -5463,6 +5487,68 @@ mod tests {
             ));
             assert!(book.is_empty());
         }
+    }
+
+    #[test]
+    fn discovery_book_peer_import_rejects_private_and_internal_direct_addresses() {
+        // A signed record only proves control of the node key, not ownership of the advertised
+        // direct addresses. Untrusted gossip must therefore be restricted to globally routable
+        // targets; otherwise an authenticated discovery peer could seed signed records pointing at
+        // the honest node's private/internal network and turn the candidate dialer into an internal
+        // SSRF/scanner. RFC 1918 private, RFC 6598 shared (CGNAT), and RFC 4193 unique-local ranges
+        // are neither loopback nor link-local, so the original filter let them through.
+        let bad_addrs = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 5, 5)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)), 8233),
+        ];
+
+        for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
+            let mut book = ZakuraDiscoveryBook::default();
+            // Pair the malicious target with a genuinely routable address to prove the whole
+            // record is rejected, not just dropped down to its usable addresses.
+            let record = signed_record_with_addrs(
+                u64::try_from(index).expect("small test index fits in u64"),
+                service(index),
+                vec![test_addr(30), bad_addr],
+            );
+
+            assert!(
+                matches!(
+                    book.import_record(record, Some(secret_key().public()), NOW, &context()),
+                    Err(DiscoveryBookError::NonDialableDirectAddress { addr }) if addr == bad_addr
+                ),
+                "untrusted gossip must reject internal direct address {bad_addr}"
+            );
+            assert!(book.is_empty());
+        }
+
+        // A genuinely globally routable gossip target still imports.
+        let mut book = ZakuraDiscoveryBook::default();
+        let public_record = signed_record_with_addrs(99, service(99), vec![test_addr(40)]);
+        assert_eq!(
+            book.import_record(public_record, Some(secret_key().public()), NOW, &context())
+                .expect("public gossip record imports"),
+            ImportOutcome::Added
+        );
+
+        // Trusted/static configuration is unchanged: operators may still configure private targets
+        // for LAN/regtest deployments.
+        let mut static_book = ZakuraDiscoveryBook::default();
+        let private_static = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233)],
+        );
+        assert_eq!(
+            static_book
+                .import_static_record(private_static, NOW, &context())
+                .expect("configured static private record imports"),
+            ImportOutcome::Added
+        );
     }
 
     #[test]
