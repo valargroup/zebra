@@ -966,6 +966,7 @@ where
     let outcome = if connected_addr.is_inbound() {
         run_responder_upgrade(
             peer_conn,
+            &connector,
             &config,
             nonces,
             local_node_id,
@@ -1126,6 +1127,7 @@ where
 /// can dial us. Our iroh router accepts that inbound dial separately.
 async fn run_responder_upgrade<PeerTransport>(
     peer_conn: &mut Framed<PeerTransport, Codec>,
+    connector: &ZakuraHandshakeConnector,
     config: &ZakuraHandshakeConfig,
     nonces: ZakuraLegacyNonces,
     local_node_id: Vec<u8>,
@@ -1176,6 +1178,18 @@ where
     let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
         return Ok(neutral_upgrade_fallback());
     };
+
+    // The peer dials our advertised Zakura endpoint over QUIC after receiving
+    // `Accept`, and our iroh router registers that inbound connection
+    // separately. Wait for that native registration before reporting the
+    // upgrade: the outer handshake drops the legacy TCP connection on
+    // `Upgraded`, so without this wait an inbound peer that sends a valid `Init`
+    // and then never completes the native dial would make us discard a working
+    // legacy connection with no Zakura replacement. This mirrors the initiator's
+    // `spawn_zakura_dial_to_hints_and_wait` hand-off wait.
+    if !connector.wait_for_zakura_registration(&peer_id).await {
+        return Ok(neutral_upgrade_fallback());
+    }
 
     Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }

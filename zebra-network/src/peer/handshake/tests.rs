@@ -281,6 +281,127 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     remote_endpoint.shutdown().await;
 }
 
+/// An inbound legacy peer that sends a valid upgrade `Init`, receives our
+/// `Accept`, and then never completes the native QUIC dial must not make the
+/// responder report `Upgraded` and drop the working legacy TCP connection.
+///
+/// Regression test for `claude-legacy-upgrade-premature-upgraded-no-native`:
+/// the responder previously returned `Upgraded` immediately after sending
+/// `Accept`, so the outer handshake dropped legacy TCP with no registered
+/// Zakura replacement. The responder must instead wait for the inbound native
+/// registration (mirroring the initiator's hand-off wait) and otherwise fall
+/// back to a neutral `Rejected`, keeping the legacy connection.
+#[tokio::test]
+async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
+    let _init_guard = zebra_test::init();
+
+    // A real responder endpoint with a live Zakura supervisor.
+    let responder_endpoint = start_test_zakura_endpoint().await;
+    let connector = responder_endpoint.connector();
+
+    let network = test_config(true).network;
+    let config = ZakuraHandshakeConfig::for_network(&network);
+
+    // The legacy `version` nonces the responder observed for this peer.
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
+        remote_zebra_nonce: Nonce(0x2222_2222_2222_2222),
+    };
+
+    // The responder advertises its own live Zakura hints in the `Accept`.
+    let (local_node_id, local_direct_addresses) = connector
+        .local_iroh_hints()
+        .await
+        .expect("a live Zakura endpoint exposes local upgrade hints");
+
+    let (responder_stream, peer_stream) = duplex(16 * 1024);
+    let mut responder_conn = Framed::new(
+        responder_stream,
+        Codec::builder().for_network(&network).finish(),
+    );
+    let mut peer_conn = Framed::new(peer_stream, Codec::builder().for_network(&network).finish());
+
+    // A valid `Init` that passes the responder's static, nonce, and protocol
+    // validation, claiming a real 32-byte iroh identity the attacker never
+    // brings online over native QUIC.
+    let init = P2pV2UpgradeInit {
+        magic: PRELUDE_MAGIC,
+        prelude_version: config.prelude_version,
+        zakura_protocol_min: config.zakura_protocol_min,
+        zakura_protocol_max: config.zakura_protocol_max,
+        network_id: config.network_id,
+        chain_id: config.chain_id,
+        capabilities: config.supported_capabilities,
+        // The peer's nonce labels are the mirror image of the responder's.
+        local_zebra_nonce: nonces.remote_zebra_nonce,
+        remote_zebra_nonce: nonces.local_zebra_nonce,
+        upgrade_nonce: [9u8; 32],
+        iroh_node_id: vec![7u8; 32],
+        iroh_direct_addresses: vec![b"192.0.2.1:1".to_vec()],
+        iroh_relay_hint: None,
+        max_control_frame_bytes: config.max_control_frame_bytes,
+        max_open_streams: config.max_open_streams,
+    };
+
+    // The malicious initiator: send the `Init`, read the `Accept`, then go
+    // silent (never dial the responder's native Zakura endpoint), holding the
+    // legacy stream open for the rest of the test.
+    let attacker = async move {
+        let init_bytes = P2pV2Upgrade::Init(init)
+            .encode()
+            .expect("a valid init encodes");
+        peer_conn
+            .send(Message::P2pV2Upgrade(init_bytes))
+            .await
+            .expect("the initiator sends its upgrade init");
+
+        let reply = peer_conn
+            .next()
+            .await
+            .expect("the responder replies before closing the legacy stream")
+            .expect("the reply frame decodes");
+        let Message::P2pV2Upgrade(payload) = reply else {
+            panic!("the responder must reply with a p2pv2 upgrade message");
+        };
+        assert!(
+            matches!(P2pV2Upgrade::decode(&payload), Ok(P2pV2Upgrade::Accept(_))),
+            "the responder must accept a valid init before waiting for native registration",
+        );
+
+        peer_conn
+    };
+
+    // The responder must not finalize the upgrade until a native registration
+    // appears; with no dial it falls back after the appear timeout. The bound
+    // makes a regression (immediate `Upgraded`) or a hang fail loudly.
+    let responder = run_responder_upgrade(
+        &mut responder_conn,
+        &connector,
+        &config,
+        nonces,
+        local_node_id,
+        local_direct_addresses,
+    );
+
+    let (outcome, _held_peer_conn) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(45), responder),
+        attacker,
+    );
+
+    let outcome = outcome
+        .expect("responder upgrade resolves within the time bound")
+        .expect("responder upgrade returns an outcome, not a handshake error");
+
+    assert!(
+        matches!(outcome, ZakuraUpgradeOutcome::Rejected { .. }),
+        "the responder reported {outcome:?}; it must keep the legacy connection \
+         (a neutral Rejected fallback) when the inbound peer sends a valid Init but \
+         never registers a native Zakura connection",
+    );
+
+    responder_endpoint.shutdown().await;
+}
+
 #[tokio::test]
 async fn p2p_v2_service_bit_advertisement_follows_config() {
     let _init_guard = zebra_test::init();

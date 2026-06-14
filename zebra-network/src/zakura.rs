@@ -309,6 +309,26 @@ impl ZakuraHandshakeConnector {
         false
     }
 
+    /// Wait until the upgraded peer's inbound native QUIC connection registers
+    /// with the local supervisor.
+    ///
+    /// Used by the inbound legacy responder, which does not dial: after sending
+    /// `Accept` the remote peer is expected to dial our advertised Zakura
+    /// endpoint, and our iroh router registers that connection separately. The
+    /// outer handshake drops the legacy TCP connection once the upgrade is
+    /// reported, so the responder must confirm a usable Zakura replacement
+    /// exists first. Returns `false` (keep legacy) if the peer never registers
+    /// within [`ZAKURA_LIVENESS_APPEAR_TIMEOUT`] or this node has no live
+    /// endpoint, so a peer that sends a valid `Init` and then never completes
+    /// the native dial cannot make us silently drop a working legacy peer.
+    pub(crate) async fn wait_for_zakura_registration(&self, peer_id: &ZakuraPeerId) -> bool {
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return false;
+        };
+        let mut registered = endpoint.supervisor().subscribe();
+        wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await
+    }
+
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime
     /// of its Zakura connection, so the outbound crawler does not re-dial it.
     ///
