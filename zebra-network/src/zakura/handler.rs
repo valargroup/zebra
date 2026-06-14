@@ -3395,18 +3395,35 @@ impl LegacyResponseReadState {
         self.add_items(1)
     }
 
-    /// Accept a `MSG_RESPONSE_NIL` empty-result sentinel for any request kind.
+    /// Validate a `MSG_RESPONSE_NIL` empty-result sentinel against the request kind.
     ///
-    /// The inbound service answers an empty `FindBlocks`/`FindHeaders`/
+    /// NIL is the empty-result sentinel only for chain-discovery and mempool
+    /// queries: the inbound service answers an empty `FindBlocks`/`FindHeaders`/
     /// `MempoolTransactionIds` (and a queued `PushTransaction`) with
-    /// `Response::Nil`, so a lone nil frame is a valid empty response for every
-    /// request kind, not just `PushTransaction`. The kind-specific empty
-    /// `Response` is produced later by `LegacyResponseCodec::decode_response`.
+    /// `Response::Nil`. Inventory fetches (`BlocksByHash`/`TransactionsById`) and
+    /// `Ping` must never receive a bare NIL, so reject it as `Fatal` for those
+    /// kinds — fail closed and let the request stream worker disconnect the peer,
+    /// matching `LegacyResponseCodec::decode_response`, which rejects NIL for the
+    /// same kinds. The kind-specific empty `Response` is produced later by
+    /// `decode_response`.
     fn validate_nil(
         &mut self,
         request_id: u64,
         payload: &[u8],
     ) -> Result<(), OutboundRequestError> {
+        match self.budget.kind {
+            LegacyResponseKind::BlockHashes
+            | LegacyResponseKind::BlockHeaders
+            | LegacyResponseKind::TransactionIds
+            | LegacyResponseKind::Nil => {}
+            LegacyResponseKind::Blocks
+            | LegacyResponseKind::Transactions
+            | LegacyResponseKind::Pong => {
+                return Err(OutboundRequestError::Fatal(
+                    "unexpected legacy nil response for inventory or ping request".into(),
+                ));
+            }
+        }
         if self.active_chunk_type.is_some() {
             return Err(OutboundRequestError::Fatal(
                 "legacy nil response interleaved with response chunk".into(),
