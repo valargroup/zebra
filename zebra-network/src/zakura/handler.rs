@@ -2495,7 +2495,7 @@ async fn persistent_stream_worker(
             }
             frame = read_frame(
                 &mut recv,
-                app_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
+                inbound_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
                 context.limits.idle_timeout,
             ) => {
                 match frame {
@@ -2571,7 +2571,7 @@ async fn request_stream_worker(
         _ = context.connection_token.cancelled() => return,
         frame = read_frame(
             &mut recv,
-            app_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
+            inbound_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
             context.limits.idle_timeout,
         ) => frame,
     };
@@ -3461,6 +3461,25 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
         _ => limits.max_frame_bytes.min(LOCAL_MAX_CONTROL_FRAME_BYTES),
     }
     .max(1)
+}
+
+/// Frame cap for reading on an admitted inbound stream, never larger than the
+/// message cap allows.
+///
+/// On an admitted ordered/request stream a frame payload *is* the message, so
+/// `admit_inbound_message` rejects any payload over `max_message_bytes`. A peer
+/// can negotiate `max_frame_bytes > max_message_bytes` (the two caps are clamped
+/// independently in `ZakuraLocalLimits::clamp`), so the cap handed to
+/// `read_frame` must also be limited to the message size. Otherwise a frame whose
+/// `payload_len` falls between the two limits is allocated and read in full by
+/// `read_frame` before `admit_inbound_message` rejects it as oversize, letting a
+/// peer force per-frame allocation/I/O up to the larger frame cap across many
+/// streams.
+fn inbound_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
+    let frame_header_bytes =
+        u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");
+    app_frame_cap_for_stream_kind(limits, stream_kind)
+        .min(limits.max_message_bytes.saturating_add(frame_header_bytes))
 }
 
 fn per_stream_inbound_queue_depth(
@@ -4780,6 +4799,166 @@ mod tests {
         );
 
         client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    // claude-late-message-cap-allocation: read_frame checks only
+    // frame_len > max_frame_bytes before `vec![0; payload_len]`, while the smaller
+    // max_message_bytes is enforced later in admit_inbound_message. A peer can
+    // negotiate max_frame_bytes > max_message_bytes (the caps are clamped
+    // independently), so on every admitted ordered/request stream it could force
+    // read_frame to allocate and read a payload between the two limits before the
+    // message cap rejects it. The inbound read path must instead be handed a cap
+    // already limited to the message size, so an over-message frame is rejected on
+    // its header alone, before the payload is allocated and read.
+    #[tokio::test]
+    async fn inbound_frame_cap_rejects_over_message_frame_before_reading_payload(
+    ) -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/late-message-cap/0";
+        // The negotiated frame cap is far larger than the message cap: exactly the
+        // precondition the finding requires (caps allowed to diverge).
+        const MAX_FRAME_BYTES: u32 = 64 * 1024;
+        const MAX_MESSAGE_BYTES: u32 = 1024;
+        // A payload between the message cap and the frame cap. admit_inbound_message
+        // would reject it, but only after read_frame allocated and read it.
+        const OVER_MESSAGE_PAYLOAD_LEN: u32 = 2048;
+        let stream_kind = LEGACY_GOSSIP_STREAM_KIND;
+
+        let limits = ZakuraConnectionLimits {
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_message_bytes: MAX_MESSAGE_BYTES,
+            ..test_connection_limits()
+        };
+        // Production now passes the message-limited inbound cap; the raw
+        // application cap (what the unfixed read path used) stays at the frame cap.
+        let inbound_cap = inbound_frame_cap_for_stream_kind(&limits, stream_kind);
+        let raw_cap = app_frame_cap_for_stream_kind(&limits, stream_kind);
+        assert!(
+            inbound_cap < raw_cap,
+            "the inbound cap must be tighter than the raw frame cap when the caps diverge \
+             (inbound_cap={inbound_cap}, raw_cap={raw_cap})"
+        );
+
+        let _guard = zebra_test::init();
+        let server = LocalEndpointFactory::new().endpoint(72).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(2);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(73).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+
+        // A frame header (message_type, flags, payload_len) with no payload bytes.
+        let frame_header = |payload_len: u32| -> Vec<u8> {
+            let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+            header.extend_from_slice(&0u16.to_le_bytes());
+            header.extend_from_slice(&0u16.to_le_bytes());
+            header.extend_from_slice(&payload_len.to_le_bytes());
+            header
+        };
+
+        // CaptureConnection forwards at most two streams per connection, so the
+        // two oversized streams share one connection and the in-cap stream uses
+        // another.
+        let conn_a = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr.clone(), ALPN),
+        )
+        .await
+        .expect("client connects for the oversized streams")?;
+
+        // Stream 1: oversized header read with the message-limited inbound cap.
+        // The fix rejects it as Oversize from the header alone, before allocating.
+        let (mut over_send, _over_recv) =
+            timeout(Duration::from_secs(1), conn_a.open_bi())
+                .await
+                .expect("client opens the oversized inbound-cap stream")?;
+        timeout(
+            Duration::from_secs(1),
+            over_send.write_all(&frame_header(OVER_MESSAGE_PAYLOAD_LEN)),
+        )
+        .await
+        .expect("client writes the oversized frame header")?;
+        let _ = over_send.finish();
+        let (_s1_send, mut s1_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the oversized inbound-cap stream")
+            .expect("capture handler forwards the oversized inbound-cap stream");
+        let rejected = read_frame(&mut s1_recv, inbound_cap, Duration::from_secs(2)).await;
+        assert!(
+            matches!(rejected, Err(ZakuraHandlerError::Oversize)),
+            "a frame whose payload exceeds max_message_bytes must be rejected as Oversize \
+             on the header alone with the inbound (message-limited) cap, before the payload \
+             is allocated and read; got {rejected:?}"
+        );
+
+        // Stream 2: the SAME oversized header read with the raw frame cap an
+        // unfixed path used. It passes the frame-cap size check, so read_frame
+        // allocates `vec![0; payload_len]` and reads the body (failing only because
+        // the body was never sent) -- i.e. NOT rejected as Oversize. This is the
+        // allocate-before-reject amplification the fix removes.
+        let (mut raw_send, _raw_recv) = timeout(Duration::from_secs(1), conn_a.open_bi())
+            .await
+            .expect("client opens the oversized raw-cap stream")?;
+        timeout(
+            Duration::from_secs(1),
+            raw_send.write_all(&frame_header(OVER_MESSAGE_PAYLOAD_LEN)),
+        )
+        .await
+        .expect("client writes the oversized frame header again")?;
+        let _ = raw_send.finish();
+        let (_s2_send, mut s2_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the oversized raw-cap stream")
+            .expect("capture handler forwards the oversized raw-cap stream");
+        let allocated = read_frame(&mut s2_recv, raw_cap, Duration::from_secs(2)).await;
+        assert!(
+            allocated.is_err() && !matches!(allocated, Err(ZakuraHandlerError::Oversize)),
+            "with the raw frame cap the same oversized frame passes the size check and \
+             read_frame proceeds to allocate/read the payload (it is not rejected as \
+             Oversize), proving the message cap is enforced too late; got {allocated:?}"
+        );
+
+        // Stream 3 (fresh connection): a frame within the message cap must still
+        // round-trip with the inbound cap, so the clamp rejects nothing legitimate.
+        let conn_b = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects for the in-cap stream")?;
+        let valid_payload = vec![0x5au8; (MAX_MESSAGE_BYTES / 2) as usize];
+        let mut valid_bytes =
+            frame_header(u32::try_from(valid_payload.len()).expect("in-cap payload len fits u32"));
+        valid_bytes.extend_from_slice(&valid_payload);
+        let (mut ok_send, _ok_recv) = timeout(Duration::from_secs(1), conn_b.open_bi())
+            .await
+            .expect("client opens the in-cap stream")?;
+        timeout(Duration::from_secs(1), ok_send.write_all(&valid_bytes))
+            .await
+            .expect("client writes the in-cap frame")?;
+        let _ = ok_send.finish();
+        let (_s3_send, mut s3_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the in-cap stream")
+            .expect("capture handler forwards the in-cap stream");
+        let frame = read_frame(&mut s3_recv, inbound_cap, Duration::from_secs(2))
+            .await
+            .expect("a frame within the message cap is read with the inbound cap");
+        assert_eq!(
+            frame.payload, valid_payload,
+            "an in-cap frame payload must round-trip unchanged"
+        );
+
+        conn_a.close(0u32.into(), b"done");
+        conn_b.close(0u32.into(), b"done");
         client.close().await;
         router.shutdown().await?;
         Ok(())
