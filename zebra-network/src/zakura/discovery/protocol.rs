@@ -1133,6 +1133,39 @@ pub struct ZakuraDiscoveryHandle {
     self_record_tx: watch::Sender<Arc<ZakuraNodeRecord>>,
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     peer_snapshot_tx: watch::Sender<ServicePeerSnapshot>,
+    import_validation: DiscoveryImportValidation,
+}
+
+/// Immutable inputs needed to validate and bound a peer record batch without holding the
+/// global discovery mutex.
+///
+/// These mirror the fields [`ZakuraDiscoveryInner::validation_context`] reads, all of which
+/// are fixed at construction (local identity/network parameters and import limits never
+/// change at runtime). Snapshotting them on the handle lets [`ZakuraDiscoveryHandle::import_peer_records`]
+/// run CPU-heavy Ed25519 verification outside the lock.
+#[derive(Clone, Debug)]
+struct DiscoveryImportValidation {
+    expected_network_id: ZakuraNetworkId,
+    expected_chain_id: [u8; 32],
+    supported_protocol_min: u16,
+    supported_protocol_max: u16,
+    max_record_ttl: Duration,
+    clock_skew_tolerance: Duration,
+    max_imported_records_per_response: usize,
+}
+
+impl DiscoveryImportValidation {
+    fn context(&self, now: u64) -> DiscoveryRecordValidationContext {
+        DiscoveryRecordValidationContext {
+            expected_network_id: self.expected_network_id,
+            expected_chain_id: self.expected_chain_id,
+            current_unix_secs: now,
+            supported_protocol_min: self.supported_protocol_min,
+            supported_protocol_max: self.supported_protocol_max,
+            max_record_ttl: self.max_record_ttl,
+            clock_skew_tolerance: self.clock_skew_tolerance,
+        }
+    }
 }
 
 impl fmt::Debug for ZakuraDiscoveryHandle {
@@ -1405,6 +1438,15 @@ impl ZakuraDiscoveryHandle {
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
         let book = ZakuraDiscoveryBook::with_local_node_id(config.book_limits, local.node_id);
+        let import_validation = DiscoveryImportValidation {
+            expected_network_id: local.network_id,
+            expected_chain_id: local.chain_id,
+            supported_protocol_min: local.zakura_protocol_min,
+            supported_protocol_max: local.zakura_protocol_max,
+            max_record_ttl: config.max_record_ttl,
+            clock_skew_tolerance: config.clock_skew_tolerance,
+            max_imported_records_per_response: config.book_limits.max_imported_records_per_response,
+        };
         Ok(Self {
             inner: Arc::new(Mutex::new(ZakuraDiscoveryInner {
                 book,
@@ -1419,6 +1461,7 @@ impl ZakuraDiscoveryHandle {
             self_record_tx,
             peer_snapshot: peer_snapshot_rx,
             peer_snapshot_tx,
+            import_validation,
         })
     }
 
@@ -1581,15 +1624,47 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Imports peer-supplied signed records through the discovery book validation path.
+    ///
+    /// Record signatures are verified OUTSIDE the global discovery mutex. Ed25519
+    /// verification and signature-domain re-encoding are CPU-heavy and fully
+    /// attacker-driven (an authenticated discovery peer can send a full `Peers` batch of
+    /// records with valid or invalid signatures, repeatedly); running them while holding
+    /// the shared async lock lets that peer stall unrelated discovery admission,
+    /// sampling, and dial selection. Only the cheap book mutation (storage-limit recheck,
+    /// address policy, map insert, eviction) runs under the lock, and the lock is skipped
+    /// entirely when nothing survives verification. See finding
+    /// `claude-discovery-expensive-work-under-global-mutex` (SR-2).
     pub async fn import_peer_records(
         &self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
         source: Option<NodeId>,
     ) -> ImportBatchOutcome {
         let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        inner.book.import_records(records, source, now, &context)
+        let context = self.import_validation.context(now);
+        let max_records = self.import_validation.max_imported_records_per_response;
+
+        let mut outcome = ImportBatchOutcome::default();
+        let mut verified = Vec::new();
+        for record in records {
+            if outcome.attempted >= max_records {
+                outcome.dropped_for_limit += 1;
+                continue;
+            }
+            outcome.attempted += 1;
+            match record.verify(&context) {
+                Ok(()) => verified.push(record),
+                Err(_) => outcome.rejected += 1,
+            }
+        }
+
+        if !verified.is_empty() {
+            let mut inner = self.inner.lock().await;
+            inner
+                .book
+                .import_pre_verified_records(verified, source, now, &context, &mut outcome);
+        }
+
+        outcome
     }
 
     /// Imports one peer-supplied signed record through the discovery book validation path.
@@ -2423,7 +2498,7 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, source, false, now, context)
+        self.import_record_inner(record, source, false, false, now, context)
     }
 
     /// Imports one signed static/bootstrap record.
@@ -2438,7 +2513,30 @@ impl ZakuraDiscoveryBook {
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        self.import_record_inner(record, None, true, now, context)
+        self.import_record_inner(record, None, true, false, now, context)
+    }
+
+    /// Imports a batch of records whose signatures were already verified outside the lock.
+    ///
+    /// [`ZakuraDiscoveryHandle::import_peer_records`] performs signature verification and
+    /// applies the per-response cap before taking the global discovery mutex, so this only
+    /// runs the cheap storage-limit recheck, address-policy check, map mutation, and
+    /// eviction under the lock. `attempted`/`dropped_for_limit` are owned by the caller;
+    /// this updates the per-record success and rejection tallies on `outcome`.
+    fn import_pre_verified_records(
+        &mut self,
+        records: impl IntoIterator<Item = ZakuraNodeRecord>,
+        source: Option<NodeId>,
+        now: u64,
+        context: &DiscoveryRecordValidationContext,
+        outcome: &mut ImportBatchOutcome,
+    ) {
+        for record in records {
+            match self.import_record_inner(record, source, false, true, now, context) {
+                Ok(import_outcome) => outcome.record_success(import_outcome),
+                Err(_) => outcome.rejected += 1,
+            }
+        }
     }
 
     /// Imports a bounded batch of signed peer records from a single response.
@@ -2691,7 +2789,7 @@ impl ZakuraDiscoveryBook {
             last_success: entry.last_success,
             failure_count: entry.failure_count,
         };
-        self.import_validated_record(entry.record, metadata, now, context)
+        self.import_validated_record(entry.record, metadata, false, now, context)
     }
 
     fn import_record_inner(
@@ -2699,6 +2797,7 @@ impl ZakuraDiscoveryBook {
         record: ZakuraNodeRecord,
         source: Option<NodeId>,
         is_static: bool,
+        pre_verified: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
@@ -2710,13 +2809,20 @@ impl ZakuraDiscoveryBook {
             last_success: None,
             failure_count: 0,
         };
-        self.import_validated_record(record, metadata, now, context)
+        self.import_validated_record(record, metadata, pre_verified, now, context)
     }
 
+    /// Validates and stores one record.
+    ///
+    /// When `pre_verified` is set the signature/import-context check has already been run
+    /// outside the global discovery mutex by [`ZakuraDiscoveryHandle::import_peer_records`],
+    /// so it is not repeated here; the cheap storage-limit, address-policy, insertion, and
+    /// eviction steps still run under the caller's lock.
     fn import_validated_record(
         &mut self,
         record: ZakuraNodeRecord,
         metadata: DiscoveryEntryMetadata,
+        pre_verified: bool,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
@@ -2724,7 +2830,9 @@ impl ZakuraDiscoveryBook {
             return Err(DiscoveryBookError::SelfRecord);
         }
 
-        record.verify(context)?;
+        if !pre_verified {
+            record.verify(context)?;
+        }
         self.validate_record_storage_limits(&record)?;
         let direct_addr_policy = if metadata.is_static {
             DiscoveryDirectAddrPolicy::StaticConfigured
@@ -7074,6 +7182,51 @@ mod tests {
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.rejected, 1);
+    }
+
+    /// Regression test for `claude-discovery-expensive-work-under-global-mutex`.
+    ///
+    /// An authenticated discovery peer can send a full `Peers` batch whose records carry
+    /// invalid signatures. Each record still triggers a full Ed25519 verification — the
+    /// expensive, attacker-driven work. Previously that verification ran while holding the
+    /// global discovery mutex, so an attacker could repeatedly stall every other discovery
+    /// operation (admission, sampling, dial selection). Signatures are now verified outside
+    /// the lock, and an all-invalid batch never needs the lock at all, so the import makes
+    /// progress even while another task holds the mutex.
+    #[tokio::test]
+    async fn import_peer_records_verifies_signatures_without_holding_global_mutex() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+
+        // A full Peers batch of records with valid bodies but tampered signatures: bumping
+        // the sequence after signing leaves body validation passing while the Ed25519 check
+        // (re-encoding the body and verifying) runs in full and fails.
+        let mut batch = Vec::with_capacity(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+        for index in 0..MAX_DISCOVERY_RECORDS_PER_RESPONSE {
+            let octet = u8::try_from(index + 1).expect("test batch index fits in u8");
+            let sequence = u64::try_from(index + 1).expect("test batch index fits in u64");
+            let mut record = runtime_record_with(sequence, service(1), test_addr(octet));
+            record.body.sequence += 1;
+            batch.push(record);
+        }
+
+        // Hold the global discovery mutex for the entire import call.
+        let guard = handle.inner.lock().await;
+
+        // Verification and rejection of the whole batch must make progress without the lock;
+        // if it were still performed under the mutex this would deadlock until the timeout.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.import_peer_records(batch, None),
+        )
+        .await
+        .expect("import_peer_records must verify signatures without holding the global mutex");
+
+        drop(guard);
+
+        assert_eq!(outcome.attempted, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+        assert_eq!(outcome.rejected, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+        assert_eq!(outcome.added, 0);
     }
 
     #[tokio::test]
