@@ -18,8 +18,8 @@ ZCASHD_BIN ?= /root/unity/zcash/src/zcashd
 ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 
 NETWORK ?= Mainnet
-ZEBRA_STATE_CACHE_DIR ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/zebra
-ZCASHD_DATADIR ?= $(HOME)/.zcash
+ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state
+ZCASHD_DATADIR ?= /mnt/data/zcashd-mainnet
 ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
