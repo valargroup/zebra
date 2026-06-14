@@ -1791,6 +1791,23 @@ impl ZakuraProtocolHandler {
             return None;
         };
 
+        // Charge the per-connection stream-open rate token immediately after
+        // acquiring a concurrency permit, before parsing the prelude or running
+        // the kind/capability/mode checks below. Each of those rejections resets
+        // the stream only and keeps the connection, so charging the token here is
+        // what bounds protocol-invalid stream churn (bad prelude, unknown kind,
+        // unnegotiated capability): otherwise an authenticated peer could open
+        // such streams indefinitely without ever spending open-rate budget.
+        if !admission.open_limiter.try_take() {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
+            metrics::counter!("zakura.p2p.stream.rejected.open_rate").increment(1);
+            admission.trace.emit(
+                STREAM_TABLE,
+                admission.event("rejected.open_rate", stream_id),
+            );
+            return None;
+        }
+
         let prelude = match read_stream_prelude(&mut recv, admission.limits.prelude_timeout).await {
             Ok(prelude) => prelude,
             Err(error) => {
@@ -1874,18 +1891,6 @@ impl ZakuraProtocolHandler {
                 STREAM_TABLE,
                 admission
                     .event("rejected.request_without_id", stream_id)
-                    .stream_kind(stream_kind),
-            );
-            return None;
-        }
-
-        if !admission.open_limiter.try_take() {
-            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-            metrics::counter!("zakura.p2p.stream.rejected.open_rate").increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission
-                    .event("rejected.open_rate", stream_id)
                     .stream_kind(stream_kind),
             );
             return None;
@@ -4775,6 +4780,121 @@ mod tests {
         );
 
         client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_prelude_stream_churn_charges_open_rate_token() -> Result<(), BoxError> {
+        // claude-invalid-stream-prelude-churn-bypasses-open-rate: a peer that
+        // opens a stream naming an unregistered kind is reset stream-only and the
+        // connection is kept. The per-connection stream-open rate token MUST be
+        // charged for that protocol-invalid open; otherwise an authenticated peer
+        // could churn bad-prelude/unknown-kind/unnegotiated stream opens forever
+        // without ever spending open-rate budget. This drives admit_bi_stream
+        // over a real Iroh transport and asserts the token was consumed even
+        // though the stream itself was rejected as unknown-kind.
+        const ALPN: &[u8] = b"/zakura/testkit/open-rate-churn/0";
+
+        let _guard = zebra_test::init();
+        let server = LocalEndpointFactory::new().endpoint(90).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(91).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects to the open-rate-churn endpoint")?;
+
+        // A well-formed prelude that names an unregistered stream kind. It parses
+        // cleanly, so admission reaches the unknown-kind reject (a stream-only
+        // reset that keeps the connection) rather than the bad-prelude path.
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: 9,
+            stream_version: 1,
+            request_id: None,
+            max_frame_bytes: 1024,
+        };
+        let (mut client_send, _client_recv) =
+            timeout(Duration::from_secs(1), client_conn.open_bi())
+                .await
+                .expect("client opens the unknown-kind stream")?;
+        timeout(
+            Duration::from_secs(1),
+            client_send.write_all(&prelude.encode()?),
+        )
+        .await
+        .expect("client writes the unknown-kind prelude")?;
+        let _ = client_send.finish();
+
+        let (server_send, server_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the unknown-kind stream")
+            .expect("capture handler forwards the unknown-kind stream");
+
+        let supervisor = ZakuraSupervisorHandle::new(16);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor,
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            ZakuraLocalLimits::from_config(&Config::default()),
+        );
+
+        let peer_id = test_peer(9);
+        let stream_sem = Arc::new(Semaphore::new(16));
+        // A full bucket with a known capacity so the token charge is observable
+        // as an exact decrement.
+        let mut open_limiter = TokenBucket::new(4);
+        let mut message_buckets = MessageRateBuckets::new();
+        let mut workers = JoinSet::new();
+        let connection_token = CancellationToken::new();
+        let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
+
+        let mut admission = StreamAdmission {
+            trace: handler.trace.clone(),
+            conn: ZakuraConnTrace::placeholder(),
+            peer_id: &peer_id,
+            stream_sem: &stream_sem,
+            open_limiter: &mut open_limiter,
+            message_buckets: &mut message_buckets,
+            workers: &mut workers,
+            limits: test_connection_limits(),
+            accepted_capabilities: 0,
+            connection_token: connection_token.clone(),
+            freshness_tx,
+        };
+
+        let admitted = handler
+            .admit_bi_stream(server_send, server_recv, &mut admission, 16)
+            .await;
+
+        assert!(
+            admitted.is_none(),
+            "an unknown-kind stream must be rejected, not admitted"
+        );
+        assert!(
+            !connection_token.is_cancelled(),
+            "an unknown-kind stream is reset stream-only and must keep the connection alive"
+        );
+        assert_eq!(
+            admission.open_limiter.tokens, 3,
+            "the protocol-invalid stream open must spend exactly one open-rate token \
+             (capacity 4 -> 3); before the fix the unknown-kind reject returned before \
+             reaching the limiter, leaving the bucket full at 4"
+        );
+
         client.close().await;
         router.shutdown().await?;
         Ok(())
