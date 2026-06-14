@@ -58,9 +58,9 @@ use crate::{
         ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
         FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
-        MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_STREAM_HEADER_SYNC,
+        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -2742,6 +2742,15 @@ async fn read_control_payload(
     max_bytes: u32,
     read_timeout: Duration,
 ) -> Result<Vec<u8>, ZakuraHandlerError> {
+    // Control payloads (Hello/Ack) carry a hard 16 KiB cap that is otherwise only
+    // enforced later in ZakuraControlHello/Ack::decode. Clamp the caller-supplied
+    // frame cap (the configured `max_control_frame_bytes`, 1 MiB by default) to it
+    // here so a peer cannot make us allocate/read a payload up to the much larger
+    // frame cap before decode rejects it as oversized.
+    //
+    // `MAX_CONTROL_PAYLOAD_BYTES` (16 KiB) is a small compile-time constant, so the
+    // cast to u32 cannot truncate; `.min` also preserves any tighter negotiated cap.
+    let max_bytes = max_bytes.min(MAX_CONTROL_PAYLOAD_BYTES as u32);
     let mut len_bytes = [0; CONTROL_LENGTH_BYTES];
     timeout(read_timeout, recv.read_exact(&mut len_bytes))
         .await
@@ -4655,6 +4664,115 @@ mod tests {
             .await
             .expect("server accepts the sibling stream")
             .expect("capture handler sends the sibling stream");
+
+        client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    // Regression for `claude-control-payload-late-hard-cap`: the native control
+    // hello/ack reads passed the configured `max_control_frame_bytes` (1 MiB
+    // default) to `read_control_payload`, so a peer could force allocation/read
+    // of a control payload between the 16 KiB hard cap and 1 MiB before
+    // ZakuraControlHello/Ack::decode rejected it. The reader must instead reject
+    // an oversized control length on the length prefix alone, before reading the
+    // body, while still accepting payloads within the 16 KiB hard cap.
+    #[tokio::test]
+    async fn read_control_payload_enforces_hard_cap_before_reading_body() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/control-hard-cap/0";
+
+        let _guard = zebra_test::init();
+        let server = LocalEndpointFactory::new().endpoint(70).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(71).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+
+        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects to the control-hard-cap endpoint")?;
+
+        // A control length above the 16 KiB hard cap but below the 1 MiB frame
+        // cap the production responder/initiator pass. The body is never sent: a
+        // correct reader must reject on the length prefix alone.
+        let oversized_len =
+            u32::try_from(MAX_CONTROL_PAYLOAD_BYTES + 1).expect("control hard cap + 1 fits in u32");
+        let (mut over_send, _over_recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
+            .await
+            .expect("client opens the oversized control stream")?;
+        timeout(
+            Duration::from_secs(1),
+            over_send.write_all(&oversized_len.to_le_bytes()),
+        )
+        .await
+        .expect("client writes the oversized control length")?;
+        let _ = over_send.finish();
+
+        let (_over_server_send, mut over_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the oversized control stream")
+                .expect("capture handler forwards the oversized control stream");
+
+        // Pass exactly what production passes: the configured frame cap (1 MiB),
+        // NOT the 16 KiB hard cap. The fix clamps internally to the hard cap.
+        let oversized = read_control_payload(
+            &mut over_server_recv,
+            LOCAL_MAX_CONTROL_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(oversized, Err(ZakuraHandlerError::Oversize)),
+            "a control length over the 16 KiB hard cap must be rejected as Oversize \
+             on the length prefix, before the body is read; got {oversized:?}"
+        );
+
+        // A control payload within the hard cap must still be read normally, so
+        // the clamp does not break legitimate sub-16 KiB control frames.
+        let valid_body = vec![0xa5u8; 128];
+        let valid_len = u32::try_from(valid_body.len()).expect("128 fits in u32");
+        let (mut ok_send, _ok_recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
+            .await
+            .expect("client opens the in-cap control stream")?;
+        timeout(
+            Duration::from_secs(1),
+            ok_send.write_all(&valid_len.to_le_bytes()),
+        )
+        .await
+        .expect("client writes the in-cap control length")?;
+        timeout(Duration::from_secs(1), ok_send.write_all(&valid_body))
+            .await
+            .expect("client writes the in-cap control body")?;
+        let _ = ok_send.finish();
+
+        let (_ok_server_send, mut ok_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the in-cap control stream")
+                .expect("capture handler forwards the in-cap control stream");
+        let read_back = read_control_payload(
+            &mut ok_server_recv,
+            LOCAL_MAX_CONTROL_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("a control payload within the hard cap is read");
+        assert_eq!(
+            read_back, valid_body,
+            "an in-cap control payload must round-trip unchanged"
+        );
 
         client_conn.close(0u32.into(), b"done");
         client.close().await;
