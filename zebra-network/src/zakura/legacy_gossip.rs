@@ -94,6 +94,18 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_FIRST_SEEN_CAPACITY: usize = 50_000;
+/// A failed gossip inbound attempt that consumed at least this long is treated as
+/// "expensive" (a slow/backpressured/timed-out service), and the same inventory is
+/// placed in a short cooldown. The first-seen cache is only updated after a
+/// *successful* call, so without this an authenticated peer could replay the same
+/// valid advertisement while the inbound service is slow/erroring and make the
+/// serial gossip worker re-pay the full 30s readiness/call budget for every
+/// duplicate. Fast failures stay below this threshold and remain immediately
+/// retryable, so a transient blip does not drop the advertisement.
+const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
+/// How long an expensive failed attempt suppresses duplicate copies of the same
+/// inventory before a genuine re-advertisement may retry.
+const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -1948,17 +1960,41 @@ fn bounded_u64(value: usize) -> u64 {
 #[derive(Clone, Debug)]
 struct LegacyGossipForwarder {
     broadcast: ZakuraGossipBroadcast,
+    /// Short-lived dedup of inventory already handed to the inbound service but not
+    /// yet confirmed `mark_seen`. Bounds duplicate work when the service is slow,
+    /// not ready, or erroring (see [`LEGACY_GOSSIP_DUPLICATE_COOLDOWN`]).
+    attempt_cooldown: FirstSeenCache,
 }
 
 impl LegacyGossipForwarder {
     fn new(supervisor: ZakuraSupervisorHandle) -> Self {
         Self {
             broadcast: ZakuraGossipBroadcast::new(supervisor),
+            attempt_cooldown: FirstSeenCache::new(
+                DEFAULT_FIRST_SEEN_CAPACITY,
+                LEGACY_GOSSIP_DUPLICATE_COOLDOWN,
+            ),
         }
     }
 
     async fn unseen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
         self.broadcast.unseen(frame).await
+    }
+
+    /// Return the subset of `frame`'s inventory not currently suppressed by a recent
+    /// expensive failed attempt. Read-only: the cooldown is populated only by
+    /// [`Self::note_failed_attempt`], so fast failures remain immediately retryable.
+    async fn fresh_attempt(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
+        self.attempt_cooldown.unseen(frame).await
+    }
+
+    /// Record `frame`'s inventory in the cooldown when a failed attempt consumed at
+    /// least [`LEGACY_GOSSIP_EXPENSIVE_ATTEMPT`], so queued duplicates skip re-paying
+    /// a slow readiness/call. Cheap failures are left immediately retryable.
+    async fn note_failed_attempt(&self, frame: &LegacyGossipFrame, elapsed: Duration) {
+        if elapsed >= LEGACY_GOSSIP_EXPENSIVE_ATTEMPT {
+            self.attempt_cooldown.record_seen(frame).await;
+        }
     }
 
     async fn mark_seen(&self, frame: &LegacyGossipFrame) {
@@ -2269,11 +2305,25 @@ async fn handle_legacy_gossip<Inbound>(
     let Some(unseen_frame) = forwarder.unseen(&gossip.frame).await else {
         return;
     };
+    // Skip inventory whose recent service attempt was expensive but did not succeed.
+    // The not-ready, call-error, and call-timeout paths below all return without
+    // `mark_seen`, so without this an authenticated peer could replay the same valid
+    // advertisement while the inbound service is slow/erroring and make the serial
+    // worker re-pay the full 30s+30s readiness/call budget for every queued
+    // duplicate. Fast failures are not recorded, so a transient blip stays retryable.
+    let Some(unseen_frame) = forwarder.fresh_attempt(&unseen_frame).await else {
+        debug!("legacy gossip duplicate suppressed after recent expensive attempt");
+        return;
+    };
     let request = unseen_frame.clone().into_request(gossip.peer_id.clone());
 
+    let started = Instant::now();
     let ready = timeout(LEGACY_GOSSIP_SERVICE_TIMEOUT, inbound.ready()).await;
     let Ok(Ok(service)) = ready else {
         debug!("legacy gossip inbound service was not ready");
+        forwarder
+            .note_failed_attempt(&unseen_frame, started.elapsed())
+            .await;
         return;
     };
 
@@ -2281,10 +2331,16 @@ async fn handle_legacy_gossip<Inbound>(
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             debug!(?error, "legacy gossip inbound service call failed");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
         Err(_) => {
             debug!("legacy gossip inbound service call timed out");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
     }
@@ -2861,6 +2917,31 @@ mod tests {
         }
 
         fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::pending().boxed()
+        }
+    }
+
+    /// Always ready, but every `call` future is pending forever and counts
+    /// invocations. Models a slow/backpressured inbound service whose calls hit
+    /// `LEGACY_GOSSIP_SERVICE_TIMEOUT`, so `handle_legacy_gossip` returns without
+    /// `mark_seen`, exposing how many times duplicate gossip frames reach the
+    /// expensive readiness/call path.
+    #[derive(Clone, Debug)]
+    struct CountingPendingService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingPendingService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::pending().boxed()
         }
     }
@@ -3606,6 +3687,57 @@ mod tests {
 
         drop(inbound_tx);
         worker.await?;
+        Ok(())
+    }
+
+    /// Regression: while the legacy inbound service is slow/timing out,
+    /// `handle_legacy_gossip` returns without `mark_seen`, so an authenticated peer
+    /// could replay the same valid advertisement and make the serial worker re-pay
+    /// the full readiness/call timeout for every queued duplicate. After one
+    /// expensive failed attempt the cooldown must suppress identical duplicates.
+    ///
+    /// Paused time auto-advances the `LEGACY_GOSSIP_SERVICE_TIMEOUT` so the first
+    /// call's timeout fires without a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_gossip_does_not_repeat_expensive_attempts_while_service_is_slow(
+    ) -> Result<(), BoxError> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+
+        let worker = tokio::spawn(legacy_gossip_worker(
+            CountingPendingService {
+                calls: calls.clone(),
+            },
+            inbound_rx,
+            LegacyGossipForwarder::new(supervisor),
+            ZakuraTrace::noop(),
+        ));
+
+        // The call never completes, so the permanent first-seen cache is never
+        // updated; only the post-timeout cooldown can suppress these duplicates.
+        let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(99));
+        for _ in 0..4 {
+            inbound_tx
+                .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    peer_id: peer_id.clone(),
+                    frame: frame.clone(),
+                }))
+                .await?;
+        }
+
+        drop(inbound_tx);
+        worker.await?;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate gossip frames must not each re-pay the inbound readiness/call \
+             timeout while the service is slow; expected one expensive attempt with \
+             the rest suppressed by the cooldown"
+        );
+
         Ok(())
     }
 
