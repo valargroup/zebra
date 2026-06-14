@@ -22,7 +22,7 @@ use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, service::HeaderSyncPeerCommand, wire::*, *};
+use super::{events::*, scheduler::*, service::HeaderSyncPeerCommand, wire::*, *};
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };
@@ -32,19 +32,48 @@ pub(super) struct HsLocal {
     expected_headers: VecDeque<ExpectedHeadersResponse>,
     /// Commands from shared scheduling state into this peer-local pipe.
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+    /// Pre-decode rate gate for inbound `NewBlock` floods.
+    ///
+    /// `NewBlock` is the only stream-5 message that deserializes a full
+    /// `Arc<Block>` (up to `MAX_HS_MESSAGE_BYTES`) directly from the wire. The
+    /// reactor's semantic `inbound_new_block` meter only fires *after* that
+    /// decode, so an authenticated peer could otherwise force one full-block
+    /// deserialization per frame before being metered. This gate enforces the
+    /// same minimum interval *before* decode so excess `NewBlock` frames are
+    /// dropped without ever reaching `Block::zcash_deserialize`.
+    new_block_meter: RateMeter,
 }
 
 impl HsLocal {
     /// Build per-peer local state around this peer's stream-5 session.
-    pub(super) fn new(commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>) -> Self {
+    pub(super) fn new(
+        commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+        new_block_min_interval: Duration,
+    ) -> Self {
         Self {
             expected_headers: VecDeque::new(),
             commands,
+            new_block_meter: RateMeter::new(new_block_min_interval),
         }
+    }
+
+    /// Take one pre-decode `NewBlock` token. `false` means this frame arrived
+    /// faster than the minimum interval and must be dropped before decode.
+    fn admit_new_block(&mut self) -> bool {
+        self.new_block_meter.try_take(Instant::now())
     }
 
     fn pop_expected_headers_response(&mut self) -> Option<ExpectedHeadersResponse> {
         self.expected_headers.pop_front()
+    }
+
+    /// Restore a solicited-response expectation that was popped for decode but
+    /// whose decoded `Headers` event could not be handed to the reactor (the
+    /// bounded `events` queue was full or closed). It goes back to the *front* so
+    /// FIFO order is preserved and the reactor's still-outstanding range stays
+    /// correlated, instead of leaving the expectation silently consumed.
+    fn restore_expected_headers(&mut self, expected: ExpectedHeadersResponse) {
+        self.expected_headers.push_front(expected);
     }
 
     fn handle_command(&mut self, command: HeaderSyncPeerCommand) {
@@ -138,12 +167,43 @@ pub(super) const PIPE_SHAPE: PipeShape = PipeShape {
 /// the `SinkReject::Local` and continued the loop, so `run_inbound` maps that
 /// one case to a debug log plus [`Flow::Done`] (which [`run_peer`] treats as
 /// "continue"). Protocol rejects pass straight through and tear the peer down.
+///
+/// One addition over the old per-caller handling: when a *solicited* `Headers`
+/// response hits that local-reject path, the expectation popped before decode is
+/// restored to [`HsLocal`] so reactor queue saturation cannot silently consume it
+/// and strand the still-outstanding range.
 pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> Flow<()> {
+    // Pre-decode `NewBlock` rate gate: a `NewBlock` frame that arrives inside the
+    // per-peer minimum interval is dropped *before* the full `Arc<Block>` is
+    // deserialized, so a flood cannot force repeated full-block decode ahead of
+    // the reactor's semantic meter. Throttling (drop, keep the peer) matches the
+    // session guard's back-pressure outcome and the reactor's cheap
+    // dedup-without-scoring policy, so honest re-floods are not penalized; the
+    // first frame in each window still reaches the reactor, preserving
+    // first-offense malformed/spam disconnects.
+    if u8::try_from(frame.message_type).ok() == Some(MSG_HS_NEW_BLOCK) && !cx.local.admit_new_block()
+    {
+        metrics::counter!("sync.header.tip.new_block.predecode_throttled").increment(1);
+        return Flow::Done;
+    }
+
     let expected = (u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS))
         .then(|| cx.local.pop_expected_headers_response())
         .flatten();
     match deliver(&cx.env.handle, expected, cx.peer_id.clone(), frame) {
         Flow::Reject(SinkReject::Local(error)) => {
+            // The reactor `events` queue was full or closed, so this decoded frame
+            // could not be delivered locally. For a *solicited* `Headers` response
+            // the expectation was already popped before decode, so restore it: the
+            // reactor's matching range is still outstanding, and a consumed-but-
+            // undelivered expectation would otherwise lose the response entirely
+            // (recoverable only by the request timeout) and desynchronize the
+            // peer-local FIFO from that outstanding range. Restoring keeps the pipe
+            // in the same state as a request still awaiting its response, which the
+            // timeout/retry machinery already handles correctly.
+            if let Some(expected) = expected {
+                cx.local.restore_expected_headers(expected);
+            }
             tracing::debug!(
                 ?error,
                 peer_id = ?cx.peer_id,
@@ -349,6 +409,31 @@ mod tests {
         )
     }
 
+    /// Build a `HeaderSyncHandle` whose bounded `events` queue is already full,
+    /// so the next `try_send` from the pipe fails with `Full`. The receiver is
+    /// returned (and must be kept alive) so the failure is `Full`, not `Closed`.
+    fn saturated_events_handle() -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
+        let (events, events_rx) = mpsc::channel(1);
+        events
+            .try_send(HeaderSyncEvent::PeerDisconnected(peer()))
+            .expect("the single events slot is free");
+        let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+        let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_candidates_tx, candidates) =
+            watch::channel(ZakuraHeaderSyncCandidateState::default());
+        (
+            HeaderSyncHandle {
+                events,
+                lifecycle,
+                tip,
+                peers,
+                candidates,
+            },
+            events_rx,
+        )
+    }
+
     fn headers_frame(payload: Vec<u8>) -> Frame {
         Frame {
             message_type: u16::from(MSG_HS_HEADERS),
@@ -400,7 +485,7 @@ mod tests {
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let mut local = HsLocal::new(commands_rx);
+        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
 
         let first = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
         let second = ExpectedHeadersResponse::new(block::Height(2), 2).expect("count is valid");
@@ -418,6 +503,129 @@ mod tests {
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
         assert_eq!(local.pop_expected_headers_response(), None);
+    }
+
+    /// A `NewBlock` flood is throttled *before* full-block decode: the first
+    /// frame in a window is decoded and forwarded to the reactor, but a second
+    /// distinct frame inside the per-peer minimum interval is dropped before
+    /// `Block::zcash_deserialize` runs, so nothing reaches the reactor and the
+    /// peer is kept (`Flow::Done`). This proves the amplification gap is closed —
+    /// without the pre-decode gate the second full block is deserialized and
+    /// forwarded too.
+    #[test]
+    fn new_block_flood_is_throttled_before_decode() {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+        let (handle, mut events) = test_handle();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+
+        let block_one: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        let block_two: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_2_BYTES
+                .zcash_deserialize_into()
+                .expect("block 2 vector parses"),
+        );
+        let frame_one = HeaderSyncMessage::NewBlock(block_one.clone())
+            .encode_frame()
+            .expect("new block frame encodes");
+        let frame_two = HeaderSyncMessage::NewBlock(block_two.clone())
+            .encode_frame()
+            .expect("new block frame encodes");
+
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+
+        // First flood frame: admitted, decoded, and forwarded to the reactor.
+        assert!(matches!(pipe.run_one(frame_one), Flow::Continue(())));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireMessage {
+                msg: HeaderSyncMessage::NewBlock(block),
+                ..
+            }) => assert_eq!(block.hash(), block_one.hash()),
+            other => panic!("expected first NewBlock to be forwarded, got {other:?}"),
+        }
+
+        // Second distinct flood frame inside the interval is dropped before
+        // decode: the peer is kept and nothing reaches the reactor.
+        assert!(matches!(pipe.run_one(frame_two), Flow::Done));
+        assert!(
+            matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "second NewBlock must be throttled before decode, not forwarded"
+        );
+    }
+
+    /// Under reactor `events`-queue saturation, a valid *solicited* `Headers`
+    /// response must not silently consume its peer-local expectation. The pipe
+    /// pops the expectation before decode; when the decoded response cannot be
+    /// delivered to the full reactor queue, the pipe logs and continues
+    /// (`Flow::Done`) — but the popped expectation is restored to the FIFO so the
+    /// reactor's still-outstanding range stays correlated. Without the fix the
+    /// expectation is consumed and lost, stranding the range until the request
+    /// timeout and desynchronizing the peer-local FIFO from the outstanding range.
+    #[test]
+    fn saturated_events_queue_restores_solicited_expectation() {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+        // Keep `_events_rx` alive so the saturated queue rejects with `Full`
+        // (a live receiver), not `Closed`.
+        let (handle, _events_rx) = saturated_events_handle();
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+
+        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        commands_tx
+            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
+            .expect("pipe is alive");
+
+        // A syntactically valid one-header solicited response: it decodes against
+        // the expectation and reaches the reactor forward, where the full queue
+        // turns it into a local reject.
+        let block_one: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        let solicited_headers = HeaderSyncMessage::Headers {
+            headers: vec![block_one.header.clone()],
+            body_sizes: vec![0],
+        }
+        .encode_frame()
+        .expect("headers frame encodes");
+
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        // Drain the recorded expectation into `HsLocal`, mirroring `run_peer`'s
+        // pre-frame command drain so the `Headers` frame is correlated.
+        pipe.local_mut().drain_ready_commands();
+
+        // The decoded response cannot be delivered (events queue is full); the
+        // pipe logs and continues, exactly as production does.
+        assert!(matches!(pipe.run_one(solicited_headers), Flow::Done));
+
+        // The popped expectation must be restored so the still-outstanding range
+        // stays correlated. Without the fix the expectation is gone (returns None).
+        assert_eq!(
+            pipe.local_mut().pop_expected_headers_response(),
+            Some(expected),
+            "a solicited Headers response dropped on reactor queue saturation must restore its expectation"
+        );
     }
 
     #[test]

@@ -346,7 +346,7 @@ impl Service for HeaderSyncService {
         // the expected `Headers` response in plain local state.
         let pipe = Pipe::new(
             peer_id.clone(),
-            HsLocal::new(commands_rx),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
             HsEnv::new(self.header_sync.clone()),
             SessionGuard::oversize_only(header_sync_guard_max_bytes()),
             run_inbound,

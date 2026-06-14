@@ -1,9 +1,14 @@
 use super::{config::*, events::*, pipe::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, FramedSend, OrderedSendError,
-    Peer, PeerStreamSession, Pipe, PipeSink, Service, SessionGuard, SinkReject, Source, Stream,
-    StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, Flow, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Pipe, PipeSink, Service, SessionGuard, SinkReject, Stream, StreamMode,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
+// The per-peer block-sync `Source` frame-pump is test-only scaffolding (see
+// `BlockSyncPeerRecord` / `add_peer`); its trait and boxed-future alias are only
+// referenced by that `cfg(test)` task.
+#[cfg(test)]
+use crate::zakura::{BoxRunFuture, Source};
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -140,10 +145,18 @@ struct BlockSyncServiceInner {
 struct BlockSyncPeerRecord {
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
+    // Production outbound block-sync sends are authoritative through
+    // `BlockSyncPeerSession`: the reactor calls `try_send_get_blocks`/etc.
+    // directly (see `reactor::schedule`). The per-peer `BlockSyncSource` action
+    // pump and its `actions` sender are test-only scaffolding — no non-test code
+    // produces into this channel, and `drive_block_sync_actions` deliberately
+    // ignores the reactor's duplicate `SendMessage` to avoid double-sending.
+    // Gating the sender and the task handle to `cfg(test)` keeps that contract
+    // compiler-enforced: production has no producer to wire and therefore cannot
+    // double-send, and it retains no idle frame-pump task/channel per peer.
     #[cfg(test)]
     actions: mpsc::Sender<BlockSyncAction>,
-    #[cfg(not(test))]
-    _actions: mpsc::Sender<BlockSyncAction>,
+    #[cfg(test)]
     _tasks: Vec<JoinHandle<()>>,
 }
 
@@ -318,15 +331,28 @@ impl Service for BlockSyncService {
         let connection_cancel_token = peer.cancel_token();
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
-        let (actions_tx, actions_rx) =
-            mpsc::channel(self.inner.config.peer_limits.outbound_queue_depth.max(1));
 
-        let source_task = spawn_block_sync_source(
-            peer_id.clone(),
-            actions_rx,
-            service_cancel_token.clone(),
-            send,
-        );
+        // The per-peer block-sync source frame-pump is test-only scaffolding (see
+        // `BlockSyncPeerRecord`). Production outbound frames go directly through
+        // `BlockSyncPeerSession`, so only the test build spawns the source to
+        // exercise `send_action`; production drops the redundant transport sender.
+        // The outbound stream stays alive through the `BlockSyncPeerSession` clone
+        // the reactor holds, so nothing is lost by not retaining it here.
+        #[cfg(test)]
+        let (actions_tx, source_task) = {
+            let (actions_tx, actions_rx) =
+                mpsc::channel(self.inner.config.peer_limits.outbound_queue_depth.max(1));
+            let source_task = spawn_block_sync_source(
+                peer_id.clone(),
+                actions_rx,
+                service_cancel_token.clone(),
+                send,
+            );
+            (actions_tx, source_task)
+        };
+        #[cfg(not(test))]
+        drop(send);
+
         let pipe = block_sync_pipe(peer_id.clone(), self.inner.events.clone());
         let sink = PipeSink::new(pipe, recv, service_cancel_token.clone());
         let on_teardown = {
@@ -368,9 +394,8 @@ impl Service for BlockSyncService {
                     direction: peer.direction,
                     cancel_token: service_cancel_token,
                     #[cfg(test)]
-                    actions: actions_tx.clone(),
-                    #[cfg(not(test))]
-                    _actions: actions_tx.clone(),
+                    actions: actions_tx,
+                    #[cfg(test)]
                     _tasks: vec![source_task],
                 },
             );
@@ -416,6 +441,10 @@ impl Service for BlockSyncService {
     }
 }
 
+// Test-only per-peer outbound frame-pump. Production block-sync sends go through
+// `BlockSyncPeerSession` directly (see `add_peer` / `BlockSyncPeerRecord`); this
+// source exists solely so tests can drive outbound frames via `send_action`.
+#[cfg(test)]
 fn spawn_block_sync_source(
     peer_id: ZakuraPeerId,
     actions: mpsc::Receiver<BlockSyncAction>,
@@ -432,6 +461,7 @@ fn spawn_block_sync_source(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct BlockSyncSource {
     peer_id: ZakuraPeerId,
@@ -439,6 +469,7 @@ struct BlockSyncSource {
     cancel_token: CancellationToken,
 }
 
+#[cfg(test)]
 impl Source for BlockSyncSource {
     fn run(mut self: Box<Self>, send: FramedSend) -> BoxRunFuture<'static, ()> {
         Box::pin(async move {
