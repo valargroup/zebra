@@ -104,6 +104,18 @@ const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// fetch on the legacy peer set forever, starving the Zakura path.
 const DUAL_STACK_LEGACY_INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
+/// Maximum cumulative response payload bytes the inbound responder will buffer
+/// for a single legacy request before aborting.
+///
+/// A peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE` block/transaction hashes
+/// on one request; without an aggregate cap `encode_response` would serialize
+/// and retain the entire multi-frame `Vec<Frame>` (worst case
+/// `MAX_TX_INV_IN_SENT_MESSAGE * MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB) before
+/// the first byte is written. The outbound reader already enforces a symmetric
+/// per-response cap (`LegacyResponseBudget`); this is the responder-side mirror.
+/// Sized well above any single response the local service emits (zebrad caps
+/// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
+const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -473,6 +485,11 @@ impl LegacyResponseCodec {
         max_frame_bytes: u32,
     ) -> Result<Vec<Frame>, LegacyGossipError> {
         let mut frames = Vec::new();
+        // Bound the cumulative response so a peer that requests many available
+        // blocks/transactions cannot force us to serialize and retain an
+        // unbounded `Vec<Frame>` before the first byte is written. The budget is
+        // shared across every frame of this response and aborts encoding early.
+        let mut budget = ResponseEncodeBudget::default();
         match response {
             Response::Blocks(blocks) => {
                 let mut missing = Vec::new();
@@ -481,6 +498,7 @@ impl LegacyResponseCodec {
                         InventoryResponse::Available((block, _)) => {
                             push_chunked_response(
                                 &mut frames,
+                                &mut budget,
                                 MSG_RESPONSE_BLOCK,
                                 request_id,
                                 max_frame_bytes,
@@ -491,7 +509,11 @@ impl LegacyResponseCodec {
                     }
                 }
                 if !missing.is_empty() {
-                    frames.push(missing_blocks_frame(request_id, missing)?);
+                    push_response_frame(
+                        &mut frames,
+                        &mut budget,
+                        missing_blocks_frame(request_id, missing)?,
+                    )?;
                 }
             }
             Response::Transactions(transactions) => {
@@ -501,6 +523,7 @@ impl LegacyResponseCodec {
                         InventoryResponse::Available((transaction, _)) => {
                             push_chunked_response(
                                 &mut frames,
+                                &mut budget,
                                 MSG_RESPONSE_TRANSACTION,
                                 request_id,
                                 max_frame_bytes,
@@ -511,29 +534,50 @@ impl LegacyResponseCodec {
                     }
                 }
                 if !missing.is_empty() {
-                    frames.push(missing_transactions_frame(request_id, missing)?);
+                    push_response_frame(
+                        &mut frames,
+                        &mut budget,
+                        missing_transactions_frame(request_id, missing)?,
+                    )?;
                 }
             }
             Response::BlockHashes(hashes) => {
                 // FindBlocks should already be service-capped; overflowing the wire cap is a bug.
-                frames.push(block_hashes_frame(request_id, hashes)?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    block_hashes_frame(request_id, hashes)?,
+                )?;
             }
             Response::BlockHeaders(headers) => {
                 // FindHeaders is protocol-capped by MAX_HEADERS_PER_MESSAGE; reject overflow.
-                frames.push(block_headers_frame(request_id, headers)?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    block_headers_frame(request_id, headers)?,
+                )?;
             }
             Response::TransactionIds(ids) => {
                 // Mempools can exceed one legacy inv response, so advertise the first capped page.
-                frames.push(transaction_ids_frame(
-                    request_id,
-                    truncate_to_inventory_cap(ids)?,
-                )?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    transaction_ids_frame(request_id, truncate_to_inventory_cap(ids)?)?,
+                )?;
             }
             Response::Pong(_) => {
-                frames.push(id_only_frame(MSG_RESPONSE_PONG, request_id));
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    id_only_frame(MSG_RESPONSE_PONG, request_id),
+                )?;
             }
             Response::Nil => {
-                frames.push(id_only_frame(MSG_RESPONSE_NIL, request_id));
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    id_only_frame(MSG_RESPONSE_NIL, request_id),
+                )?;
             }
             response => return Err(LegacyGossipError::UnexpectedResponse(response.command())),
         }
@@ -849,8 +893,43 @@ fn ensure_header_count(count: usize) -> Result<(), LegacyGossipError> {
     Ok(())
 }
 
+/// Tracks the cumulative size of an encoded legacy response so the inbound
+/// responder aborts a single request's response early instead of buffering an
+/// unbounded `Vec<Frame>` before the first byte is written. The outbound reader
+/// enforces a symmetric per-response cap via `LegacyResponseBudget`.
+#[derive(Default)]
+struct ResponseEncodeBudget {
+    bytes: usize,
+}
+
+impl ResponseEncodeBudget {
+    /// Account for one buffered response frame's payload, rejecting the whole
+    /// response once cumulative payload bytes exceed the responder aggregate
+    /// budget.
+    fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
+        self.bytes = self.bytes.saturating_add(payload_len);
+        if self.bytes > LEGACY_RESPONSE_MAX_AGGREGATE_BYTES {
+            return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
+        }
+        Ok(())
+    }
+}
+
+/// Push one fully-built response frame, charging it against the aggregate
+/// budget first so an over-budget response aborts before it is retained.
+fn push_response_frame(
+    frames: &mut Vec<Frame>,
+    budget: &mut ResponseEncodeBudget,
+    frame: Frame,
+) -> Result<(), LegacyGossipError> {
+    budget.account(frame.payload.len())?;
+    frames.push(frame);
+    Ok(())
+}
+
 fn push_chunked_response(
     frames: &mut Vec<Frame>,
+    budget: &mut ResponseEncodeBudget,
     message_type: u16,
     request_id: u64,
     max_frame_bytes: u32,
@@ -879,6 +958,10 @@ fn push_chunked_response(
         payload.extend_from_slice(&request_id.to_le_bytes());
         payload.push(u8::from(index + 1 == chunks.len()));
         payload.extend_from_slice(chunk);
+        // Charge each chunk against the shared budget so a response that
+        // aggregates many available items aborts mid-encode rather than after
+        // the whole `Vec<Frame>` has been materialized.
+        budget.account(payload.len())?;
         frames.push(Frame {
             message_type,
             flags: 0,
@@ -2530,6 +2613,9 @@ pub enum LegacyGossipError {
     /// A response exceeded the protocol message size.
     #[error("oversized legacy response: {0} bytes")]
     OversizedResponse(usize),
+    /// The encoded response would exceed the responder-side aggregate budget.
+    #[error("legacy response exceeded responder aggregate budget: {0} bytes")]
+    ResponseAggregateBudget(usize),
     /// The legacy service returned an unexpected response variant.
     #[error("unexpected legacy response: {0}")]
     UnexpectedResponse(&'static str),
@@ -4046,6 +4132,72 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        Ok(())
+    }
+
+    /// Regression test for `claude-legacy-responder-response-aggregation-unbounded`.
+    ///
+    /// An authenticated peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE`
+    /// block/transaction hashes on one request. Without a responder-side
+    /// aggregate budget, `encode_response` serializes and retains the entire
+    /// multi-frame `Vec<Frame>` for every available item before the first byte
+    /// is written (worst case `MAX_TX_INV_IN_SENT_MESSAGE *
+    /// MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB). The outbound reader already
+    /// enforces a symmetric `LegacyResponseBudget`; the responder must too, and
+    /// must abort encoding early rather than buffering an over-budget response.
+    #[test]
+    fn encode_response_aborts_when_aggregation_exceeds_budget() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let block_bytes = block.zcash_serialize_to_vec()?.len();
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+
+        // A single available block is well within budget and still encodes.
+        LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            frame_cap,
+        )
+        .expect("a single block response is within the responder aggregate budget");
+
+        // Enough available blocks to overflow the cumulative byte budget must be
+        // rejected, not fully materialized as a `Vec<Frame>`.
+        let block_copies = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let many_blocks = Response::Blocks(
+            (0..block_copies)
+                .map(|_| InventoryResponse::Available((block.clone(), None)))
+                .collect(),
+        );
+        assert!(
+            matches!(
+                LegacyResponseCodec::encode_response(2, many_blocks, frame_cap),
+                Err(LegacyGossipError::ResponseAggregateBudget(_)),
+            ),
+            "an over-budget BlocksByHash response must abort encoding early",
+        );
+
+        // The same cumulative budget guards the transaction responder path,
+        // which shares `push_chunked_response`.
+        let tx_copies = 2 * LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let many_transactions = Response::Transactions(
+            (0..tx_copies)
+                .flat_map(|_| {
+                    block
+                        .transactions
+                        .iter()
+                        .map(|tx| InventoryResponse::Available((UnminedTx::from(tx.clone()), None)))
+                })
+                .collect(),
+        );
+        assert!(
+            matches!(
+                LegacyResponseCodec::encode_response(3, many_transactions, frame_cap),
+                Err(LegacyGossipError::ResponseAggregateBudget(_)),
+            ),
+            "an over-budget TransactionsById response must abort encoding early",
+        );
 
         Ok(())
     }
