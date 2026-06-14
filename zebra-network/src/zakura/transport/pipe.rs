@@ -326,6 +326,76 @@ pub(crate) fn spawn_supervised_pipe(
     })
 }
 
+/// Cleanup that runs when a supervised *non-pipe* peer task ends, on every exit
+/// path.
+///
+/// This is the task-level sibling of [`PipeTeardown`] for the peer-influenced
+/// service tasks that are not the generic inbound [`Pipe`] runner — e.g. the
+/// discovery source/admission helpers and (once adopted) the legacy gossip
+/// replay/receive loops. Unlike [`PipeTeardown`] it owns no [`CancellationToken`]
+/// of its own: those tasks decide which token(s) a panic must cancel from inside
+/// their `on_panic` hook, because some of them ride directly on the shared
+/// connection token, which must *not* be cancelled on a normal exit (a clean
+/// stream-end of one service must not tear the whole connection down). On panic
+/// it runs `on_panic` during the unwind; on every exit it runs `on_teardown`.
+struct PeerTaskTeardown<F: FnOnce(), P: FnOnce()> {
+    peer_id: ZakuraPeerId,
+    on_teardown: Option<F>,
+    on_panic: Option<P>,
+}
+
+impl<F: FnOnce(), P: FnOnce()> Drop for PeerTaskTeardown<F, P> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            metrics::counter!("zakura.pipe.panic").increment(1);
+            tracing::error!(
+                peer_id = ?self.peer_id,
+                "Zakura peer task panicked; disconnecting peer only"
+            );
+            if let Some(on_panic) = self.on_panic.take() {
+                on_panic();
+            }
+        }
+        if let Some(on_teardown) = self.on_teardown.take() {
+            on_teardown();
+        }
+    }
+}
+
+/// Launch a peer-influenced, non-pipe service task in its own supervised task.
+///
+/// This is the task-level counterpart to [`spawn_supervised_pipe`] for the
+/// peer-driven helper tasks that are *not* the generic inbound pipe runner
+/// (discovery source/admission, legacy gossip replay/receive). The task runs
+/// inside one spawned task guarded by a [`PeerTaskTeardown`], which runs
+/// `on_teardown` (which must be idempotent) on every exit path — normal return
+/// or panic — and `on_panic` on panic only. Callers put whatever connection /
+/// service cancellation a panic requires inside `on_panic`, so a buggy or hostile
+/// peer that panics one of these tasks still disconnects *that one peer* and runs
+/// its cleanup instead of leaving stale service state behind a half-live
+/// connection (security_requirements.md SR-1). Like [`spawn_supervised_pipe`]
+/// this depends on the build unwinding rather than aborting; the
+/// `#[cfg(panic = "abort")] compile_error!` above guards that for both wrappers.
+///
+/// Returns the task's [`JoinHandle`]: services let it drop to detach the task (it
+/// self-reaps; the `PeerTaskTeardown` still runs on every exit), while the
+/// panic-containment test awaits it to observe the contained panic.
+pub(crate) fn spawn_supervised_peer_task(
+    peer_id: ZakuraPeerId,
+    on_teardown: impl FnOnce() + Send + 'static,
+    on_panic: impl FnOnce() + Send + 'static,
+    task: impl Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _teardown = PeerTaskTeardown {
+            peer_id,
+            on_teardown: Some(on_teardown),
+            on_panic: Some(on_panic),
+        };
+        task.await;
+    })
+}
+
 /// Map a finished pipe run to its connection-teardown effect — the single place
 /// the "is this exit fatal to the whole connection?" decision lives.
 ///
@@ -519,5 +589,76 @@ mod tests {
             "panic-only disconnect hook runs when the pipe panics"
         );
         assert!(cancel.is_cancelled(), "the peer connection is cancelled");
+    }
+
+    #[tokio::test]
+    async fn supervised_peer_task_runs_teardown_and_disconnect_on_panic() {
+        // The surprising input: a peer-influenced helper task (e.g. discovery
+        // source/admission, legacy gossip recv loop) panics *after* its per-peer
+        // service state is registered, before its normal-path cleanup runs.
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let teardown_flag = torn_down.clone();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnect_flag = disconnected.clone();
+
+        // Production drops this handle to detach the task; here we await it to
+        // observe the contained panic.
+        let handle = spawn_supervised_peer_task(
+            peer_id(),
+            move || teardown_flag.store(true, Ordering::SeqCst),
+            move || disconnect_flag.store(true, Ordering::SeqCst),
+            async {
+                panic!("peer task panics after state registration");
+            },
+        );
+
+        let join_error = handle
+            .await
+            .expect_err("a panicking peer task surfaces a join error");
+        assert!(
+            join_error.is_panic(),
+            "the task panic is reported as a panic, not a cancellation"
+        );
+        // The safe expectation (SR-1): the panic still ran cleanup and the
+        // peer-disconnect hook, so no stale service state survives behind a
+        // half-live connection.
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown runs even when the peer task panics"
+        );
+        assert!(
+            disconnected.load(Ordering::SeqCst),
+            "panic-only disconnect hook runs when the peer task panics"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_peer_task_skips_disconnect_on_normal_exit() {
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let teardown_flag = torn_down.clone();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnect_flag = disconnected.clone();
+
+        let handle = spawn_supervised_peer_task(
+            peer_id(),
+            move || teardown_flag.store(true, Ordering::SeqCst),
+            move || disconnect_flag.store(true, Ordering::SeqCst),
+            async {},
+        );
+
+        handle
+            .await
+            .expect("a normal peer task exit does not panic");
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown runs on a normal exit"
+        );
+        // A clean exit (e.g. one service's stream ends) must NOT trip the
+        // panic-only disconnect — that would tear down peers that rode on the
+        // same connection.
+        assert!(
+            !disconnected.load(Ordering::SeqCst),
+            "the panic-only disconnect hook must not fire on a normal exit"
+        );
     }
 }

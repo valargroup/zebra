@@ -3239,6 +3239,11 @@ mod tests {
     > {
         let (pushed_tx, pushed_rx) = tokio::sync::mpsc::unbounded_channel();
         let node = ZakuraTestNode::builder(seed)
+            // Multi-node gossip topologies dial several loopback peers from one
+            // node, so opt out of the production per-IP cap (1) that the default
+            // test node now enforces; these tests exercise gossip routing, not
+            // the per-IP admission gate.
+            .max_connections_per_ip(8)
             .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(
                     NormalNetworkResponder {
@@ -3862,7 +3867,13 @@ mod tests {
         let (advertiser, mut advertiser_rx) = recording_inventory_node(65, None).await?;
         let (fallback, mut fallback_rx) =
             recording_inventory_node(66, Some(transaction.clone())).await?;
-        let requester = ZakuraTestNode::builder(67).spawn().await?;
+        // The requester dials two loopback peers (advertiser + fallback), so it
+        // opts out of the production per-IP cap (1) that the default test node
+        // now enforces; this test exercises service routing, not per-IP admission.
+        let requester = ZakuraTestNode::builder(67)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
         requester
             .connect_native(&advertiser, Duration::from_secs(5))
             .await?;
