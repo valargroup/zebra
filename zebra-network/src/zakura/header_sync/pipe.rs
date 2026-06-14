@@ -22,7 +22,7 @@ use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, service::HeaderSyncPeerCommand, wire::*, *};
+use super::{events::*, scheduler::*, service::HeaderSyncPeerCommand, wire::*, *};
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };
@@ -32,15 +32,35 @@ pub(super) struct HsLocal {
     expected_headers: VecDeque<ExpectedHeadersResponse>,
     /// Commands from shared scheduling state into this peer-local pipe.
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+    /// Pre-decode rate gate for inbound `NewBlock` floods.
+    ///
+    /// `NewBlock` is the only stream-5 message that deserializes a full
+    /// `Arc<Block>` (up to `MAX_HS_MESSAGE_BYTES`) directly from the wire. The
+    /// reactor's semantic `inbound_new_block` meter only fires *after* that
+    /// decode, so an authenticated peer could otherwise force one full-block
+    /// deserialization per frame before being metered. This gate enforces the
+    /// same minimum interval *before* decode so excess `NewBlock` frames are
+    /// dropped without ever reaching `Block::zcash_deserialize`.
+    new_block_meter: RateMeter,
 }
 
 impl HsLocal {
     /// Build per-peer local state around this peer's stream-5 session.
-    pub(super) fn new(commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>) -> Self {
+    pub(super) fn new(
+        commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+        new_block_min_interval: Duration,
+    ) -> Self {
         Self {
             expected_headers: VecDeque::new(),
             commands,
+            new_block_meter: RateMeter::new(new_block_min_interval),
         }
+    }
+
+    /// Take one pre-decode `NewBlock` token. `false` means this frame arrived
+    /// faster than the minimum interval and must be dropped before decode.
+    fn admit_new_block(&mut self) -> bool {
+        self.new_block_meter.try_take(Instant::now())
     }
 
     fn pop_expected_headers_response(&mut self) -> Option<ExpectedHeadersResponse> {
@@ -139,6 +159,20 @@ pub(super) const PIPE_SHAPE: PipeShape = PipeShape {
 /// one case to a debug log plus [`Flow::Done`] (which [`run_peer`] treats as
 /// "continue"). Protocol rejects pass straight through and tear the peer down.
 pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> Flow<()> {
+    // Pre-decode `NewBlock` rate gate: a `NewBlock` frame that arrives inside the
+    // per-peer minimum interval is dropped *before* the full `Arc<Block>` is
+    // deserialized, so a flood cannot force repeated full-block decode ahead of
+    // the reactor's semantic meter. Throttling (drop, keep the peer) matches the
+    // session guard's back-pressure outcome and the reactor's cheap
+    // dedup-without-scoring policy, so honest re-floods are not penalized; the
+    // first frame in each window still reaches the reactor, preserving
+    // first-offense malformed/spam disconnects.
+    if u8::try_from(frame.message_type).ok() == Some(MSG_HS_NEW_BLOCK) && !cx.local.admit_new_block()
+    {
+        metrics::counter!("sync.header.tip.new_block.predecode_throttled").increment(1);
+        return Flow::Done;
+    }
+
     let expected = (u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS))
         .then(|| cx.local.pop_expected_headers_response())
         .flatten();
@@ -400,7 +434,7 @@ mod tests {
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let mut local = HsLocal::new(commands_rx);
+        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
 
         let first = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
         let second = ExpectedHeadersResponse::new(block::Height(2), 2).expect("count is valid");
@@ -418,6 +452,66 @@ mod tests {
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
         assert_eq!(local.pop_expected_headers_response(), None);
+    }
+
+    /// A `NewBlock` flood is throttled *before* full-block decode: the first
+    /// frame in a window is decoded and forwarded to the reactor, but a second
+    /// distinct frame inside the per-peer minimum interval is dropped before
+    /// `Block::zcash_deserialize` runs, so nothing reaches the reactor and the
+    /// peer is kept (`Flow::Done`). This proves the amplification gap is closed —
+    /// without the pre-decode gate the second full block is deserialized and
+    /// forwarded too.
+    #[test]
+    fn new_block_flood_is_throttled_before_decode() {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+        let (handle, mut events) = test_handle();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+
+        let block_one: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        let block_two: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_2_BYTES
+                .zcash_deserialize_into()
+                .expect("block 2 vector parses"),
+        );
+        let frame_one = HeaderSyncMessage::NewBlock(block_one.clone())
+            .encode_frame()
+            .expect("new block frame encodes");
+        let frame_two = HeaderSyncMessage::NewBlock(block_two.clone())
+            .encode_frame()
+            .expect("new block frame encodes");
+
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+
+        // First flood frame: admitted, decoded, and forwarded to the reactor.
+        assert!(matches!(pipe.run_one(frame_one), Flow::Continue(())));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireMessage {
+                msg: HeaderSyncMessage::NewBlock(block),
+                ..
+            }) => assert_eq!(block.hash(), block_one.hash()),
+            other => panic!("expected first NewBlock to be forwarded, got {other:?}"),
+        }
+
+        // Second distinct flood frame inside the interval is dropped before
+        // decode: the peer is kept and nothing reaches the reactor.
+        assert!(matches!(pipe.run_one(frame_two), Flow::Done));
+        assert!(
+            matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "second NewBlock must be throttled before decode, not forwarded"
+        );
     }
 
     #[test]
