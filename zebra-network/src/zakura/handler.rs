@@ -2637,6 +2637,7 @@ async fn request_stream_worker(
             prelude.stream_kind,
             request_id,
             app_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
+            context.limits.max_message_bytes,
             frame,
         )
         .await
@@ -2822,6 +2823,20 @@ async fn write_ordered_frame(
     limits: ZakuraConnectionLimits,
     stream_kind: u16,
 ) -> Result<(), BoxError> {
+    // Mirror `write_response_frame`: a persistent ordered-stream frame whose
+    // payload exceeds the peer's negotiated `max_message_bytes` would be
+    // rejected by the peer as oversize, so reject it locally before wasting
+    // encode/write work rather than writing a frame the peer cannot accept. The
+    // handshake clamps `max_frame_bytes` and `max_message_bytes` independently,
+    // so the frame cap alone does not bound this.
+    if frame.payload.len() > limits.max_message_bytes as usize {
+        return Err(format!(
+            "Zakura outbound ordered frame payload {} exceeds negotiated max_message_bytes {}",
+            frame.payload.len(),
+            limits.max_message_bytes,
+        )
+        .into());
+    }
     let frame = frame.encode(app_frame_cap_for_stream_kind(&limits, stream_kind))?;
     timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
         .await
@@ -4139,6 +4154,7 @@ mod tests {
                 HEADER_SYNC_STREAM_KIND,
                 99,
                 LOCAL_MAX_CONTROL_FRAME_BYTES,
+                LOCAL_MAX_CONTROL_FRAME_BYTES,
                 Frame {
                     message_type: 1,
                     flags: 0,
@@ -4743,6 +4759,88 @@ mod tests {
             .await
             .expect("server accepts the sibling stream")
             .expect("capture handler sends the sibling stream");
+
+        client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    /// Regression for `claude-outbound-write-ignores-message-cap` (persistent
+    /// ordered-stream facet).
+    ///
+    /// `write_ordered_frame` sized outbound persistent-stream frames against the
+    /// negotiated frame cap only. The handshake clamps `max_frame_bytes` and
+    /// `max_message_bytes` independently, so a peer can negotiate a small message
+    /// cap with a large frame cap. A persistent service that queues a frame
+    /// larger than that message cap then has it encoded and written, and the peer
+    /// rejects it as oversize and disconnects us, wasting the encode/write.
+    /// `write_ordered_frame` must mirror `write_response_frame` and reject an
+    /// over-message-cap frame locally before encoding/writing it, while still
+    /// writing frames within the cap.
+    #[tokio::test]
+    async fn write_ordered_frame_rejects_payload_over_message_cap() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/ordered-message-cap/0";
+
+        let _guard = zebra_test::init();
+        let server = LocalEndpointFactory::new().endpoint(74).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(75).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+
+        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects to the ordered-message-cap endpoint")?;
+        let (mut send, _recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
+            .await
+            .expect("client opens an ordered stream")?;
+
+        // A small negotiated message cap with a large frame cap, as the handshake
+        // permits.
+        let mut limits = test_connection_limits();
+        limits.max_message_bytes = 256;
+        let stream_kind = DISCOVERY_STREAM_KIND;
+
+        // A payload above the message cap but well within the frame cap, so only
+        // the message cap can reject it.
+        let oversized = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![0xab; 4096],
+        };
+        assert!(
+            oversized.payload.len()
+                <= app_frame_cap_for_stream_kind(&limits, stream_kind) as usize,
+            "test payload must fit the frame cap so only the message cap can reject it"
+        );
+
+        let result = write_ordered_frame(&mut send, oversized, limits, stream_kind).await;
+        assert!(
+            result.is_err(),
+            "write_ordered_frame must reject a payload over the negotiated max_message_bytes \
+             before encoding/writing it, mirroring write_response_frame; got {result:?}"
+        );
+
+        // A payload within the negotiated message cap must still be written.
+        let within_cap = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![0xcd; 128],
+        };
+        write_ordered_frame(&mut send, within_cap, limits, stream_kind)
+            .await
+            .expect("a frame within the negotiated message cap must still be written");
 
         client_conn.close(0u32.into(), b"done");
         client.close().await;
@@ -5431,8 +5529,12 @@ mod tests {
             limits,
         )
         .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
-        let frames =
-            LegacyResponseCodec::encode_response(request_id, response, limits.max_frame_bytes)?;
+        let frames = LegacyResponseCodec::encode_response(
+            request_id,
+            response,
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
         LegacyResponseCodec::decode_response(request_id, request_kind, frames.clone())?;
 
         let mut state = LegacyResponseReadState::new(budget);
@@ -5640,6 +5742,7 @@ mod tests {
                 request_id,
                 Response::Nil,
                 limits.max_frame_bytes,
+                limits.max_message_bytes,
             )
             .expect("nil response encodes");
 

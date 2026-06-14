@@ -483,6 +483,7 @@ impl LegacyResponseCodec {
         request_id: u64,
         response: Response,
         max_frame_bytes: u32,
+        max_message_bytes: u32,
     ) -> Result<Vec<Frame>, LegacyGossipError> {
         let mut frames = Vec::new();
         // Bound the cumulative response so a peer that requests many available
@@ -502,6 +503,7 @@ impl LegacyResponseCodec {
                                 MSG_RESPONSE_BLOCK,
                                 request_id,
                                 max_frame_bytes,
+                                max_message_bytes,
                                 block.zcash_serialize_to_vec()?,
                             )?;
                         }
@@ -527,6 +529,7 @@ impl LegacyResponseCodec {
                                 MSG_RESPONSE_TRANSACTION,
                                 request_id,
                                 max_frame_bytes,
+                                max_message_bytes,
                                 transaction.transaction.zcash_serialize_to_vec()?,
                             )?;
                         }
@@ -933,13 +936,22 @@ fn push_chunked_response(
     message_type: u16,
     request_id: u64,
     max_frame_bytes: u32,
+    max_message_bytes: u32,
     bytes: Vec<u8>,
 ) -> Result<(), LegacyGossipError> {
     if bytes.len() > MAX_PROTOCOL_MESSAGE_LEN {
         return Err(LegacyGossipError::OversizedResponse(bytes.len()));
     }
 
-    let max_payload_bytes = usize::try_from(max_frame_bytes)?.saturating_sub(FRAME_HEADER_BYTES);
+    // Size each chunk frame against the *effective* outbound cap: the smaller of
+    // the negotiated frame payload cap (`max_frame_bytes - FRAME_HEADER_BYTES`)
+    // and the peer's negotiated `max_message_bytes`. The handshake clamps the two
+    // caps independently, so sizing against the frame cap alone produces chunk
+    // frames whose payload exceeds the peer's accepted message cap, which the
+    // peer (and our own `write_response_frame`) reject as oversize.
+    let max_payload_bytes = usize::try_from(max_frame_bytes)?
+        .saturating_sub(FRAME_HEADER_BYTES)
+        .min(usize::try_from(max_message_bytes)?);
     let max_chunk_bytes = max_payload_bytes
         .checked_sub(RESPONSE_CHUNK_HEADER_BYTES)
         .ok_or(LegacyGossipError::OversizedResponse(bytes.len()))?;
@@ -2142,6 +2154,7 @@ impl LegacyGossipSink {
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
+        max_message_bytes: u32,
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
@@ -2183,8 +2196,13 @@ impl LegacyGossipSink {
                 response.command(),
                 &response,
             );
-            LegacyResponseCodec::encode_response(request_id, response, max_frame_bytes)
-                .map_err(SinkReject::local)
+            LegacyResponseCodec::encode_response(
+                request_id,
+                response,
+                max_frame_bytes,
+                max_message_bytes,
+            )
+            .map_err(SinkReject::local)
         })
     }
 }
@@ -2281,9 +2299,17 @@ impl RequestResponseService for LegacyGossipSink {
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
+        max_message_bytes: u32,
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
-        self.request(peer_id, stream_kind, request_id, max_frame_bytes, frame)
+        self.request(
+            peer_id,
+            stream_kind,
+            request_id,
+            max_frame_bytes,
+            max_message_bytes,
+            frame,
+        )
     }
 }
 
@@ -4117,6 +4143,7 @@ mod tests {
             7,
             Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
             max_frame_bytes,
+            max_frame_bytes,
         )?;
 
         assert!(frames.len() > 1, "large block response must be chunked");
@@ -4124,6 +4151,67 @@ mod tests {
             frame.encode(max_frame_bytes)?;
         }
 
+        let response = LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames)?;
+        let Response::Blocks(blocks) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
+        ));
+
+        Ok(())
+    }
+
+    /// Regression test for `claude-outbound-write-ignores-message-cap` (legacy
+    /// response chunking facet).
+    ///
+    /// The handshake clamps `max_frame_bytes` and `max_message_bytes`
+    /// independently, so a peer can negotiate a message cap well below the frame
+    /// cap. `push_chunked_response` sized chunk frames against the frame cap
+    /// alone, so each chunk frame's payload could exceed the peer's accepted
+    /// `max_message_bytes`. The request-response writer (`write_response_frame`)
+    /// and the peer both reject such a frame as oversize, wasting the encode and
+    /// causing avoidable disconnects/interop loss. Chunking must size against the
+    /// effective cap `min(frame cap, message cap)` so every emitted chunk frame
+    /// fits the negotiated message cap while still round-tripping.
+    #[test]
+    fn encode_response_chunks_respect_message_cap() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+
+        // Large frame cap, small message cap: the divergence the handshake
+        // permits. The message cap allows a 256-byte chunk payload plus the
+        // per-chunk response header.
+        let max_frame_bytes = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let max_message_bytes = u32::try_from(RESPONSE_CHUNK_HEADER_BYTES + 256)?;
+
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            max_frame_bytes,
+            max_message_bytes,
+        )?;
+
+        assert!(
+            frames.len() > 1,
+            "a block larger than the negotiated message cap must be chunked, not emitted as one \
+             over-cap frame"
+        );
+        for frame in &frames {
+            assert!(
+                frame.payload.len() <= max_message_bytes as usize,
+                "chunk frame payload {} exceeds the negotiated max_message_bytes {}; the peer \
+                 (and write_response_frame) would reject it as oversize",
+                frame.payload.len(),
+                max_message_bytes,
+            );
+            // Each chunk must still fit the frame cap so the transport encodes it.
+            frame.encode(max_frame_bytes)?;
+        }
+
+        // The smaller chunking must still round-trip back to the original block.
         let response = LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames)?;
         let Response::Blocks(blocks) = response else {
             panic!("unexpected response: {response:?}");
@@ -4159,6 +4247,7 @@ mod tests {
             1,
             Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
             frame_cap,
+            frame_cap,
         )
         .expect("a single block response is within the responder aggregate budget");
 
@@ -4172,7 +4261,7 @@ mod tests {
         );
         assert!(
             matches!(
-                LegacyResponseCodec::encode_response(2, many_blocks, frame_cap),
+                LegacyResponseCodec::encode_response(2, many_blocks, frame_cap, frame_cap),
                 Err(LegacyGossipError::ResponseAggregateBudget(_)),
             ),
             "an over-budget BlocksByHash response must abort encoding early",
@@ -4193,7 +4282,7 @@ mod tests {
         );
         assert!(
             matches!(
-                LegacyResponseCodec::encode_response(3, many_transactions, frame_cap),
+                LegacyResponseCodec::encode_response(3, many_transactions, frame_cap, frame_cap),
                 Err(LegacyGossipError::ResponseAggregateBudget(_)),
             ),
             "an over-budget TransactionsById response must abort encoding early",
@@ -4216,6 +4305,7 @@ mod tests {
             8,
             block_hash_response.clone(),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
             LegacyResponseCodec::decode_response(8, LegacyRequestKind::FindBlocks, frames)?,
@@ -4227,6 +4317,7 @@ mod tests {
             9,
             header_response.clone(),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
             LegacyResponseCodec::decode_response(9, LegacyRequestKind::FindHeaders, frames)?,
@@ -4237,6 +4328,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             10,
             tx_ids_response.clone(),
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
@@ -4252,6 +4344,7 @@ mod tests {
             11,
             Response::Pong(Duration::ZERO),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert!(matches!(
             LegacyResponseCodec::decode_response(11, LegacyRequestKind::Ping, frames)?,
@@ -4261,6 +4354,7 @@ mod tests {
         let frames = LegacyResponseCodec::encode_response(
             12,
             Response::Nil,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
