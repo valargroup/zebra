@@ -40,10 +40,11 @@ use crate::{
 };
 
 use super::{
-    trace::peer_label as trace_peer_label, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
-    RequestResponseService, Service as ZakuraService, SinkReject, Stream, StreamMode,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
-    LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
+    spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
+    FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
+    SinkReject, Stream, StreamMode, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
+    ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES,
+    ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -1281,6 +1282,14 @@ impl LegacyGossipOutbound {
             .remove(peer);
     }
 
+    #[cfg(test)]
+    fn contains(&self, peer: &ZakuraPeerId) -> bool {
+        self.sessions
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .contains_key(peer)
+    }
+
     fn remember_latest_block(&self, frame: &LegacyGossipFrame) {
         if let LegacyGossipFrame::AdvertiseBlock(hash) = frame {
             *self
@@ -1323,6 +1332,32 @@ impl LegacyGossipOutbound {
         };
 
         send_to_sessions(sessions, frame)
+    }
+}
+
+#[cfg(test)]
+fn legacy_gossip_recv_loop_panic_target() -> &'static StdMutex<Option<ZakuraPeerId>> {
+    static TARGET: OnceLock<StdMutex<Option<ZakuraPeerId>>> = OnceLock::new();
+    TARGET.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn arm_legacy_gossip_recv_loop_panic(peer: ZakuraPeerId) {
+    *legacy_gossip_recv_loop_panic_target()
+        .lock()
+        .expect("legacy gossip recv-loop panic target mutex is never poisoned") = Some(peer);
+}
+
+#[cfg(test)]
+fn should_panic_legacy_gossip_recv_loop(peer: &ZakuraPeerId) -> bool {
+    let mut target = legacy_gossip_recv_loop_panic_target()
+        .lock()
+        .expect("legacy gossip recv-loop panic target mutex is never poisoned");
+    if target.as_ref() == Some(peer) {
+        *target = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -2263,51 +2298,80 @@ impl ZakuraService for LegacyGossipSink {
         let session = LegacyGossipPeerSession::new(peer_id.clone(), send);
 
         outbound.insert(session.clone());
-        tokio::spawn({
-            let outbound = outbound.clone();
-            let session = session.clone();
-            async move {
-                if let Err(error) = outbound.replay_latest_block_to_peer(session).await {
-                    debug!(?error, "latest Zakura block gossip replay failed");
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            loop {
-                let frame = tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        outbound.remove(&peer_id);
-                        return;
+        let replay_task_peer_id = peer_id.clone();
+        let replay_panic_peer_id = replay_task_peer_id.clone();
+        let replay_panic_outbound = outbound.clone();
+        let replay_panic_cancel = cancel_token.clone();
+        spawn_supervised_peer_task(
+            replay_task_peer_id,
+            || {},
+            move || {
+                replay_panic_cancel.cancel();
+                replay_panic_outbound.remove(&replay_panic_peer_id);
+            },
+            {
+                let outbound = outbound.clone();
+                let session = session.clone();
+                async move {
+                    if let Err(error) = outbound.replay_latest_block_to_peer(session).await {
+                        debug!(?error, "latest Zakura block gossip replay failed");
                     }
-                    frame = recv.recv() => {
-                        let Some(frame) = frame else {
+                }
+            },
+        );
+
+        let recv_task_peer_id = peer_id.clone();
+        let recv_panic_peer_id = recv_task_peer_id.clone();
+        let recv_panic_outbound = outbound.clone();
+        let recv_panic_cancel = cancel_token.clone();
+        spawn_supervised_peer_task(
+            recv_task_peer_id,
+            || {},
+            move || {
+                recv_panic_cancel.cancel();
+                recv_panic_outbound.remove(&recv_panic_peer_id);
+            },
+            async move {
+                loop {
+                    let frame = tokio::select! {
+                        _ = cancel_token.cancelled() => {
                             outbound.remove(&peer_id);
                             return;
-                        };
-                        frame
-                    }
-                };
+                        }
+                        frame = recv.recv() => {
+                            let Some(frame) = frame else {
+                                outbound.remove(&peer_id);
+                                return;
+                            };
+                            frame
+                        }
+                    };
 
-                match Self::enqueue_gossip_frame(&inbound_tx, peer_id.clone(), frame) {
-                    Ok(()) => {}
-                    Err(SinkReject::Protocol(error)) => {
-                        debug!(
-                            ?error,
-                            ?peer_id,
-                            "legacy gossip stream rejected protocol-invalid frame"
-                        );
-                        cancel_token.cancel();
-                        outbound.remove(&peer_id);
-                        return;
+                    #[cfg(test)]
+                    if should_panic_legacy_gossip_recv_loop(&peer_id) {
+                        panic!("injected legacy gossip recv-loop panic after state registration");
                     }
-                    Err(SinkReject::Local(error)) => {
-                        debug!(?error, ?peer_id, "legacy gossip inbound queue closed");
-                        return;
+
+                    match Self::enqueue_gossip_frame(&inbound_tx, peer_id.clone(), frame) {
+                        Ok(()) => {}
+                        Err(SinkReject::Protocol(error)) => {
+                            debug!(
+                                ?error,
+                                ?peer_id,
+                                "legacy gossip stream rejected protocol-invalid frame"
+                            );
+                            cancel_token.cancel();
+                            outbound.remove(&peer_id);
+                            return;
+                        }
+                        Err(SinkReject::Local(error)) => {
+                            debug!(?error, ?peer_id, "legacy gossip inbound queue closed");
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId) {
@@ -2534,8 +2598,7 @@ async fn handle_legacy_request<Inbound>(
     if response_tx.send(result).is_err() {
         debug!(
             ?peer_id,
-            request_id,
-            "legacy request response receiver dropped before service completed"
+            request_id, "legacy request response receiver dropped before service completed"
         );
     }
 }
@@ -3279,6 +3342,39 @@ mod tests {
             .await
             .map_err(|_| -> BoxError { "timed out waiting for pushed transaction".into() })?
             .ok_or_else(|| "pushed transaction recorder closed".into())
+    }
+
+    fn legacy_gossip_peer(
+        peer_id: ZakuraPeerId,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> (Peer, FramedSend) {
+        let (peer_send, service_recv) = framed_channel(8);
+        let (service_send, _peer_recv) = framed_channel(8);
+        let peer = Peer::new(
+            peer_id,
+            None,
+            ZAKURA_CAP_LEGACY_GOSSIP,
+            HashMap::from([(ZAKURA_STREAM_GOSSIP, (service_recv, service_send))]),
+            cancel_token,
+        );
+        (peer, peer_send)
+    }
+
+    async fn wait_for_legacy_gossip_panic_cleanup(
+        outbound: &LegacyGossipOutbound,
+        peer_id: &ZakuraPeerId,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), BoxError> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cancel_token.is_cancelled() && !outbound.contains(peer_id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for legacy gossip panic cleanup".into() })
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
@@ -4079,6 +4175,56 @@ mod tests {
             LegacyGossipFrame::AdvertiseBlock(block_hash)
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_gossip_replay_panic_cancels_peer_and_removes_outbound_session(
+    ) -> Result<(), BoxError> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![92; 32]).expect("test peer id is within bounds");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (peer, _peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
+
+        let poisoned_latest_block = outbound.latest_block.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_latest_block
+                .lock()
+                .expect("latest-block mutex starts unpoisoned");
+            panic!("poison latest-block mutex before replay");
+        });
+
+        sink.add_peer(peer);
+        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
+    }
+
+    #[tokio::test]
+    async fn legacy_gossip_recv_loop_panic_cancels_peer_and_removes_outbound_session(
+    ) -> Result<(), BoxError> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![93; 32]).expect("test peer id is within bounds");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
+
+        arm_legacy_gossip_recv_loop_panic(peer_id.clone());
+        sink.add_peer(peer);
+        peer_send
+            .send(LegacyGossipFrame::AdvertiseBlock(block_hash(93)).encode_frame()?)
+            .await
+            .map_err(|_| -> BoxError { "failed to send test gossip frame".into() })?;
+
+        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
     }
 
     #[tokio::test]
