@@ -2269,6 +2269,130 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
     reactor_task.abort();
 }
 
+// SECURITY AUDIT (candidate claude-block-sync-source-task-unwired /
+// trace-block-sync-source-task-unwired-source-task /
+// subset-panic-runtime-containment-block-sync-idle-source-task): SR-4
+// cleanup/anti-drift for the outbound block-sync send path.
+//
+// Production block-sync scheduling sends outbound `GetBlocks` *directly* through
+// `BlockSyncPeerSession` (`reactor::schedule` -> `try_send_get_blocks`). The
+// per-peer `BlockSyncSource` action pump (`BlockSyncPeerRecord::actions`) is
+// test-only scaffolding with no production producer, and
+// `drive_block_sync_actions` deliberately ignores the reactor's duplicate
+// `SendMessage` action to avoid double-sending. The audit flagged the risk that
+// the per-peer source is dead production scaffolding (per-peer overhead) and a
+// latent double-send footgun if it were ever wired naively.
+//
+// This production-shaped scheduling test locks in the single-sourced outbound
+// contract: one scheduled request yields EXACTLY ONE outbound `GetBlocks` frame
+// (the authoritative direct session send), never a second copy from a per-peer
+// source pump. It proves the outbound behavior is unchanged by the source task
+// being idle/test-only, and guards against a future double-send regression.
+#[tokio::test]
+async fn scheduled_get_blocks_is_sent_once_via_session_not_duplicated_by_source() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    // Admit a peer through the production `add_peer` path with an observable
+    // outbound transport channel.
+    let peer = peer(57);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+
+    // The peer can serve exactly one block above our tip; publish the header tip
+    // and the needed metadata so the reactor schedules exactly one request.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([9; 32]),
+                max_blocks_per_response: 4,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status queues");
+    tip_tx
+        .send((block::Height(1), block::Hash([9; 32])))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([9; 32]),
+            size: BlockSizeEstimate::Advertised(1),
+        }]))
+        .await
+        .expect("needed metadata queues");
+    // The reactor emits the duplicate `SendMessage` action on the global channel
+    // (which the production driver ignores). Wait for it so we know the
+    // authoritative direct send through `BlockSyncPeerSession` already happened.
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::SendMessage {
+            msg: BlockSyncMessage::GetBlocks { .. },
+            ..
+        }
+    ) {}
+
+    // Drain the outbound stream for a bounded idle window and count `GetBlocks`
+    // frames. A single scheduled request must produce exactly one outbound
+    // `GetBlocks` (the direct session send); a second copy would mean the
+    // per-peer source action pump is also (double-)sending on the wire.
+    let mut get_blocks = 0usize;
+    let mut frames = 0usize;
+    while frames < 16 {
+        match tokio::time::timeout(Duration::from_millis(300), outbound_rx.recv()).await {
+            Ok(Some(frame)) => {
+                frames += 1;
+                if matches!(
+                    BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes"),
+                    BlockSyncMessage::GetBlocks { .. }
+                ) {
+                    get_blocks += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        get_blocks, 1,
+        "one scheduled request must produce exactly one outbound GetBlocks via \
+         BlockSyncPeerSession; a different count means the per-peer source pump is \
+         (double-)sending in addition to the authoritative direct path",
+    );
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_scores_header_valid_merkle_invalid_body_and_accepts_clean_peer() {
     let request_bytes: u32 = 10_000;
