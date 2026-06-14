@@ -569,15 +569,21 @@ impl BlockSyncReactor {
                 .await;
             return;
         };
-        if let Some(index) = peer_state
+        let Some(index) = peer_state
             .outstanding
             .iter()
             .position(|outstanding| outstanding.request.start_height == start_height)
-        {
-            let outstanding = peer_state.outstanding.remove(index);
-            self.state.budget.release(outstanding.reserved_bytes());
-            self.state.schedule.clear_assignment(&outstanding.request);
-        }
+        else {
+            // A known, active peer sent a response terminator that correlates to no
+            // outstanding range. Fail closed: report `UnsolicitedDone` (a hard
+            // block-sync misbehavior) instead of silently rescheduling.
+            self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedDone)
+                .await;
+            return;
+        };
+        let outstanding = peer_state.outstanding.remove(index);
+        self.state.budget.release(outstanding.reserved_bytes());
+        self.state.schedule.clear_assignment(&outstanding.request);
         self.schedule().await;
     }
 
