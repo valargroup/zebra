@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     future,
     io::{Cursor, Read},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -211,12 +211,14 @@ pub struct ZakuraConfig {
     pub bootstrap_peers: Vec<String>,
     /// Address the native Zakura QUIC endpoint binds to.
     ///
-    /// When unset the endpoint binds an OS-assigned ephemeral port on the
-    /// unspecified address, which is fine for a node that only dials out. Set a
-    /// fixed address to give this node a stable, advertisable Zakura endpoint so
-    /// other nodes can list it in their [`bootstrap_peers`](Self::bootstrap_peers)
-    /// — required for a node that acts as a Zakura seed, since relays and
-    /// discovery are disabled.
+    /// When unset the endpoint binds an OS-assigned ephemeral port on loopback
+    /// only (`127.0.0.1` and `::1`), which is fine for a node that only dials
+    /// out and keeps the experimental native P2P_V2_ALPN surface off all
+    /// non-loopback interfaces. Set a fixed address to give this node a stable,
+    /// advertisable Zakura endpoint so other nodes can list it in their
+    /// [`bootstrap_peers`](Self::bootstrap_peers) — required for a node that acts
+    /// as a Zakura seed or otherwise accepts inbound native connections, since
+    /// relays and discovery are disabled.
     pub listen_addr: Option<SocketAddr>,
     /// Total concurrent Zakura connections, inbound plus outbound.
     pub max_connections: usize,
@@ -2086,6 +2088,35 @@ impl ProtocolHandler for ZakuraProtocolHandler {
     }
 }
 
+/// Loopback IPv4 address the native Zakura endpoint binds to when no
+/// `zakura.listen_addr` is configured, so the unset (dial-out-only) state does
+/// not expose the P2P_V2_ALPN surface on all interfaces.
+const ZAKURA_LOOPBACK_BIND_V4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+/// Loopback IPv6 counterpart of [`ZAKURA_LOOPBACK_BIND_V4`].
+const ZAKURA_LOOPBACK_BIND_V6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0);
+
+/// Applies the native endpoint bind-address selection to `builder`.
+///
+/// When `listen_addr` is set, the endpoint binds exactly that address so the
+/// node has a stable, advertisable Zakura endpoint. When it is unset, the
+/// endpoint binds loopback-only for **both** IPv4 and IPv6 rather than relying
+/// on iroh's default unspecified bind (`0.0.0.0:0` / `[::]:0`). Without the
+/// explicit loopback bind the unconfigured / dial-out-only case silently exposes
+/// the experimental native P2P_V2_ALPN handshake/session surface on every
+/// interface on an OS-assigned ephemeral port.
+fn bind_native_endpoint(
+    builder: iroh::endpoint::Builder,
+    listen_addr: Option<SocketAddr>,
+) -> iroh::endpoint::Builder {
+    match listen_addr {
+        Some(SocketAddr::V4(addr)) => builder.bind_addr_v4(addr),
+        Some(SocketAddr::V6(addr)) => builder.bind_addr_v6(addr),
+        None => builder
+            .bind_addr_v4(ZAKURA_LOOPBACK_BIND_V4)
+            .bind_addr_v6(ZAKURA_LOOPBACK_BIND_V6),
+    }
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -2108,15 +2139,12 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
     let discovery_secret_key = secret_key.clone();
-    let mut builder =
+    let builder =
         direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
-    // Zakura endpoint; otherwise iroh assigns an ephemeral port (dial-out only).
-    match config.zakura.listen_addr {
-        Some(SocketAddr::V4(addr)) => builder = builder.bind_addr_v4(addr),
-        Some(SocketAddr::V6(addr)) => builder = builder.bind_addr_v6(addr),
-        None => {}
-    }
+    // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
+    // case does not expose the native P2P_V2_ALPN surface on all interfaces.
+    let builder = bind_native_endpoint(builder, config.zakura.listen_addr);
     let endpoint = builder.bind().await?;
     let supervisor = ZakuraSupervisorHandle::new(config.max_connections_per_ip);
     let tracer = config
@@ -3683,6 +3711,33 @@ mod tests {
         transaction::{self, UnminedTxId},
     };
     use zebra_test::vectors::BLOCK_TESTNET_141042_BYTES;
+
+    /// With no configured `zakura.listen_addr`, the native endpoint must bind
+    /// loopback-only. Otherwise iroh's default bind (`0.0.0.0:0` / `[::]:0`)
+    /// exposes the experimental P2P_V2_ALPN handshake/session surface on every
+    /// interface on an OS-assigned ephemeral port, even though the unset state is
+    /// documented as dial-out only.
+    #[tokio::test]
+    async fn unset_listen_addr_binds_loopback_not_unspecified() {
+        let builder = direct_endpoint_builder(SecretKey::generate(OsRng));
+        let builder = bind_native_endpoint(builder, None);
+        let endpoint = builder.bind().await.expect("loopback bind should succeed");
+
+        let sockets = endpoint.bound_sockets();
+        assert!(
+            !sockets.is_empty(),
+            "endpoint should bind at least one socket"
+        );
+        for socket in &sockets {
+            assert!(
+                socket.ip().is_loopback(),
+                "unset listen_addr must bind loopback only, but bound {socket} \
+                 (exposes P2P_V2_ALPN on all interfaces)"
+            );
+        }
+
+        endpoint.close().await;
+    }
 
     #[derive(Debug, Clone)]
     struct CaptureConnection {
