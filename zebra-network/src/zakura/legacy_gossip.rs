@@ -94,6 +94,18 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_FIRST_SEEN_CAPACITY: usize = 50_000;
+/// A failed gossip inbound attempt that consumed at least this long is treated as
+/// "expensive" (a slow/backpressured/timed-out service), and the same inventory is
+/// placed in a short cooldown. The first-seen cache is only updated after a
+/// *successful* call, so without this an authenticated peer could replay the same
+/// valid advertisement while the inbound service is slow/erroring and make the
+/// serial gossip worker re-pay the full 30s readiness/call budget for every
+/// duplicate. Fast failures stay below this threshold and remain immediately
+/// retryable, so a transient blip does not drop the advertisement.
+const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
+/// How long an expensive failed attempt suppresses duplicate copies of the same
+/// inventory before a genuine re-advertisement may retry.
+const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -2043,17 +2055,41 @@ fn bounded_u64(value: usize) -> u64 {
 #[derive(Clone, Debug)]
 struct LegacyGossipForwarder {
     broadcast: ZakuraGossipBroadcast,
+    /// Short-lived dedup of inventory already handed to the inbound service but not
+    /// yet confirmed `mark_seen`. Bounds duplicate work when the service is slow,
+    /// not ready, or erroring (see [`LEGACY_GOSSIP_DUPLICATE_COOLDOWN`]).
+    attempt_cooldown: FirstSeenCache,
 }
 
 impl LegacyGossipForwarder {
     fn new(supervisor: ZakuraSupervisorHandle) -> Self {
         Self {
             broadcast: ZakuraGossipBroadcast::new(supervisor),
+            attempt_cooldown: FirstSeenCache::new(
+                DEFAULT_FIRST_SEEN_CAPACITY,
+                LEGACY_GOSSIP_DUPLICATE_COOLDOWN,
+            ),
         }
     }
 
     async fn unseen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
         self.broadcast.unseen(frame).await
+    }
+
+    /// Return the subset of `frame`'s inventory not currently suppressed by a recent
+    /// expensive failed attempt. Read-only: the cooldown is populated only by
+    /// [`Self::note_failed_attempt`], so fast failures remain immediately retryable.
+    async fn fresh_attempt(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
+        self.attempt_cooldown.unseen(frame).await
+    }
+
+    /// Record `frame`'s inventory in the cooldown when a failed attempt consumed at
+    /// least [`LEGACY_GOSSIP_EXPENSIVE_ATTEMPT`], so queued duplicates skip re-paying
+    /// a slow readiness/call. Cheap failures are left immediately retryable.
+    async fn note_failed_attempt(&self, frame: &LegacyGossipFrame, elapsed: Duration) {
+        if elapsed >= LEGACY_GOSSIP_EXPENSIVE_ATTEMPT {
+            self.attempt_cooldown.record_seen(frame).await;
+        }
     }
 
     async fn mark_seen(&self, frame: &LegacyGossipFrame) {
@@ -2378,11 +2414,25 @@ async fn handle_legacy_gossip<Inbound>(
     let Some(unseen_frame) = forwarder.unseen(&gossip.frame).await else {
         return;
     };
+    // Skip inventory whose recent service attempt was expensive but did not succeed.
+    // The not-ready, call-error, and call-timeout paths below all return without
+    // `mark_seen`, so without this an authenticated peer could replay the same valid
+    // advertisement while the inbound service is slow/erroring and make the serial
+    // worker re-pay the full 30s+30s readiness/call budget for every queued
+    // duplicate. Fast failures are not recorded, so a transient blip stays retryable.
+    let Some(unseen_frame) = forwarder.fresh_attempt(&unseen_frame).await else {
+        debug!("legacy gossip duplicate suppressed after recent expensive attempt");
+        return;
+    };
     let request = unseen_frame.clone().into_request(gossip.peer_id.clone());
 
+    let started = Instant::now();
     let ready = timeout(LEGACY_GOSSIP_SERVICE_TIMEOUT, inbound.ready()).await;
     let Ok(Ok(service)) = ready else {
         debug!("legacy gossip inbound service was not ready");
+        forwarder
+            .note_failed_attempt(&unseen_frame, started.elapsed())
+            .await;
         return;
     };
 
@@ -2390,10 +2440,16 @@ async fn handle_legacy_gossip<Inbound>(
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             debug!(?error, "legacy gossip inbound service call failed");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
         Err(_) => {
             debug!("legacy gossip inbound service call timed out");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
     }
@@ -2415,28 +2471,53 @@ async fn handle_legacy_request<Inbound>(
 {
     let command = request.frame.to_string();
     let peer_id = request.peer_id.clone();
+    let request_id = request.request_id;
     let request_kind = request.frame.kind();
+    let mut response_tx = request.response_tx;
     let Some(legacy_request) = request.frame.into_service_request() else {
         // Inbound legacy Ping is handled locally; the requester measures round-trip time.
-        let _ = request.response_tx.send(Ok(Response::Pong(Duration::ZERO)));
+        let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
     };
     trace_legacy_request_start(
         &trace,
         "inbound.request",
         Some(&peer_id),
-        request.request_id,
+        request_id,
         request_kind,
         request_kind.message_type(),
     );
-    let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
-    let result = match ready {
-        Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
-            .await
-            .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
-            .and_then(|response| response),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+
+    let service_work = async move {
+        let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
+        match ready {
+            Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
+                .await
+                .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
+                .and_then(|response| response),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+        }
+    };
+
+    // Tie the spawned handler's lifetime to the request stream. The request-stream
+    // side (`LegacyGossipSink::request`) waits only LEGACY_REQUEST_TIMEOUT for the
+    // oneshot result and then drops the receiver; the peer/connection going away
+    // drops it too. In either case `closed()` resolves, so abort the in-flight
+    // service work and release the permit instead of letting this orphaned handler
+    // keep one of LEGACY_REQUEST_IN_FLIGHT_LIMIT permits (and keep doing backend
+    // work) for up to another full readiness + service-call timeout.
+    let result = tokio::select! {
+        biased;
+        () = response_tx.closed() => {
+            debug!(
+                ?peer_id,
+                request_id,
+                "legacy request handler aborted: response receiver dropped before service completed"
+            );
+            return;
+        }
+        result = service_work => result,
     };
 
     if let Err(error) = &result {
@@ -2444,15 +2525,16 @@ async fn handle_legacy_request<Inbound>(
             &trace,
             "inbound.error",
             Some(&peer_id),
-            request.request_id,
+            request_id,
             request_kind.command(),
             error.to_string(),
         );
     }
 
-    if request.response_tx.send(result).is_err() {
+    if response_tx.send(result).is_err() {
         debug!(
-            peer_id = ?request.peer_id,
+            ?peer_id,
+            request_id,
             "legacy request response receiver dropped before service completed"
         );
     }
@@ -2932,6 +3014,50 @@ mod tests {
         }
     }
 
+    /// Always ready, but every `call` future is pending forever. Models a slow or
+    /// backpressured inbound service whose work outlives the request-stream timeout.
+    #[derive(Clone, Debug)]
+    struct NeverCompletesService;
+
+    impl Service<Request> for NeverCompletesService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::pending().boxed()
+        }
+    }
+
+    /// Always ready, but every `call` future is pending forever and counts
+    /// invocations. Models a slow/backpressured inbound service whose calls hit
+    /// `LEGACY_GOSSIP_SERVICE_TIMEOUT`, so `handle_legacy_gossip` returns without
+    /// `mark_seen`, exposing how many times duplicate gossip frames reach the
+    /// expensive readiness/call path.
+    #[derive(Clone, Debug)]
+    struct CountingPendingService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingPendingService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().boxed()
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct RecordingInventoryResponder {
         transaction: Option<UnminedTx>,
@@ -3161,6 +3287,64 @@ mod tests {
         })
         .await
         .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+    }
+
+    /// Regression for `claude-legacy-request-orphaned-handler-permits`.
+    ///
+    /// The request-stream side (`LegacyGossipSink::request`) waits only
+    /// `LEGACY_REQUEST_TIMEOUT` for the oneshot result and then drops the receiver;
+    /// the peer disconnecting drops it too. The spawned `handle_legacy_request` task
+    /// must not keep its in-flight permit (one of `LEGACY_REQUEST_IN_FLIGHT_LIMIT`)
+    /// or its backend service work alive after that. Before the fix it stayed blocked
+    /// in `service.call` for up to another full `LEGACY_REQUEST_TIMEOUT`, so an
+    /// attacker driving slow inbound work could occupy all 64 permits.
+    #[tokio::test(start_paused = true)]
+    async fn legacy_request_handler_releases_permit_when_request_stream_drops_receiver() {
+        let permits = Arc::new(Semaphore::new(LEGACY_REQUEST_IN_FLIGHT_LIMIT));
+        let permit = permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a permit is available");
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT - 1,
+            "one permit is held while the handler runs"
+        );
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = LegacyRequestInbound {
+            peer_id: ZakuraPeerId::new(vec![7u8; 32]).expect("valid peer id"),
+            request_id: 1,
+            // A non-Ping request so the handler drives the inbound service.
+            frame: LegacyRequestFrame::MempoolTransactionIds,
+            response_tx,
+        };
+
+        let handler = tokio::spawn(handle_legacy_request(
+            NeverCompletesService,
+            request,
+            permit,
+            ZakuraTrace::noop(),
+        ));
+
+        // Let the handler enter the (never-completing) service call, then model the
+        // request-stream side giving up: it drops the oneshot receiver.
+        tokio::task::yield_now().await;
+        drop(response_rx);
+
+        // The handler must observe the dropped receiver, abort the service work, and
+        // release the permit promptly. Without the fix this times out because the
+        // handler stays blocked in `service.call` until `LEGACY_REQUEST_TIMEOUT`.
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("handler aborts promptly after the request stream drops the receiver")
+            .expect("handler task does not panic");
+
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT,
+            "the in-flight permit must be released once the handler aborts"
+        );
     }
 
     #[test]
@@ -3615,6 +3799,57 @@ mod tests {
 
         drop(inbound_tx);
         worker.await?;
+        Ok(())
+    }
+
+    /// Regression: while the legacy inbound service is slow/timing out,
+    /// `handle_legacy_gossip` returns without `mark_seen`, so an authenticated peer
+    /// could replay the same valid advertisement and make the serial worker re-pay
+    /// the full readiness/call timeout for every queued duplicate. After one
+    /// expensive failed attempt the cooldown must suppress identical duplicates.
+    ///
+    /// Paused time auto-advances the `LEGACY_GOSSIP_SERVICE_TIMEOUT` so the first
+    /// call's timeout fires without a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_gossip_does_not_repeat_expensive_attempts_while_service_is_slow(
+    ) -> Result<(), BoxError> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+
+        let worker = tokio::spawn(legacy_gossip_worker(
+            CountingPendingService {
+                calls: calls.clone(),
+            },
+            inbound_rx,
+            LegacyGossipForwarder::new(supervisor),
+            ZakuraTrace::noop(),
+        ));
+
+        // The call never completes, so the permanent first-seen cache is never
+        // updated; only the post-timeout cooldown can suppress these duplicates.
+        let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(99));
+        for _ in 0..4 {
+            inbound_tx
+                .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    peer_id: peer_id.clone(),
+                    frame: frame.clone(),
+                }))
+                .await?;
+        }
+
+        drop(inbound_tx);
+        worker.await?;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate gossip frames must not each re-pay the inbound readiness/call \
+             timeout while the service is slow; expected one expensive attempt with \
+             the rest suppressed by the cooldown"
+        );
+
         Ok(())
     }
 
