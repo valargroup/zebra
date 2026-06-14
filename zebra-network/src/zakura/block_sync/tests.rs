@@ -3104,3 +3104,97 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
 
     reactor_task.abort();
 }
+
+/// Regression for `claude-sync-reactor-action-backpressure-stalls-disconnect` in
+/// the block-sync reactor: when the bounded 128-slot action channel is saturated
+/// and the action driver is stalled, awaiting `actions.send` for `Misbehavior`
+/// wedged the reactor, so it could no longer reach its own disconnect path. The
+/// reactor must instead enqueue misbehavior non-blockingly and stay live — here,
+/// live enough to still tear down a soft offender once it crosses the
+/// disconnect threshold.
+#[tokio::test]
+async fn misbehaving_peer_is_disconnected_even_when_action_channel_is_saturated() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config,
+    );
+    // `_actions` is held but never drained: the production action driver is
+    // "stalled".
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    // Connect the probe peer with a session whose cancellation token we keep, so
+    // we can observe the local disconnect. A bare session (no supervised pipe)
+    // means the cancel is observable without removing the peer from the reactor.
+    let probe = peer(7);
+    let probe_cancel = CancellationToken::new();
+    let (_inbound_tx, inbound_rx) = framed_channel(4);
+    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let session = PeerStreamSession::new(
+        probe.clone(),
+        ZAKURA_STREAM_BLOCK_SYNC,
+        inbound_rx,
+        outbound_tx,
+        probe_cancel.clone(),
+    );
+    handle
+        .send(BlockSyncEvent::PeerConnected(BlockSyncPeerSession::new(
+            &session,
+            ServicePeerDirection::Outbound,
+        )))
+        .await
+        .expect("probe peer connects");
+
+    // Saturate the bounded 128-slot action channel. Malformed-frame events from
+    // an unknown filler peer enqueue `Misbehavior` actions until the channel is
+    // full. A per-send timeout keeps the test from hanging if the (unfixed)
+    // reactor wedges on a blocking `actions.send` and stops draining events.
+    let filler = peer(200);
+    let decode_error = Arc::new(BlockSyncWireError::TrailingBytes);
+    for _ in 0..400 {
+        let send = handle.send(BlockSyncEvent::WireDecodeFailed {
+            peer: filler.clone(),
+            error: decode_error.clone(),
+        });
+        if tokio::time::timeout(Duration::from_millis(200), send)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    // Drive the connected probe peer past the soft-misbehavior disconnect
+    // threshold (3) while the action channel is saturated. A reactor wedged on a
+    // blocking misbehavior send can never process these events, so it never
+    // reaches the threshold cancel; a non-blocking reactor does.
+    for _ in 0..4 {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle.send(BlockSyncEvent::WireMessage {
+                peer: probe.clone(),
+                msg: BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(1),
+                    count: 1,
+                },
+            }),
+        )
+        .await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), probe_cancel.cancelled())
+        .await
+        .expect(
+            "a repeatedly-misbehaving block-sync peer must still be disconnected when the action \
+             channel is saturated and the action driver is stalled",
+        );
+
+    reactor_task.abort();
+}
