@@ -6,7 +6,6 @@ use std::{
     io::{Cursor, Read},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
@@ -3445,12 +3444,11 @@ fn validate_idle_invariant(limits: &ZakuraLocalLimits) -> Result<(), ZakuraHandl
 }
 
 fn zakura_secret_key(config: &Config) -> Result<SecretKey, ZakuraHandlerError> {
-    if let Some(secret) = &config.zakura_node_secret_key {
-        return SecretKey::from_str(secret.expose_secret())
-            .map_err(|_| ZakuraHandlerError::InvalidSecretKey);
-    }
-
-    Ok(SecretKey::generate(OsRng))
+    // Loads the configured key, or loads/generates+persists a stable key under the
+    // cache dir so the node keeps a consistent NodeId across restarts.
+    config
+        .zakura_secret_key()
+        .map_err(|_| ZakuraHandlerError::InvalidSecretKey)
 }
 
 fn stream_kind_label(stream_kind: u16) -> &'static str {
