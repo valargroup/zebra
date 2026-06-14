@@ -25,7 +25,7 @@ use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
-    task::{JoinHandle, JoinSet},
+    task::{AbortHandle, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -399,7 +399,11 @@ pub struct ZakuraEndpoint {
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
-    upgrade_dials: Arc<StdMutex<HashSet<ZakuraPeerId>>>,
+    /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
+    /// keyed by the advertised peer id. The [`AbortHandle`] lets a failed
+    /// hand-off cancel its maintain-forever dial instead of leaking it; see
+    /// [`Self::ensure_upgrade_native_dial`] and [`Self::cancel_upgrade_native_dial`].
+    upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, AbortHandle>>>,
 }
 
 #[derive(Debug)]
@@ -538,14 +542,17 @@ impl ZakuraEndpoint {
             return false;
         };
 
-        {
-            let mut upgrade_dials = self
-                .upgrade_dials
-                .lock()
-                .expect("Zakura upgrade dial registry mutex is never poisoned");
-            if !upgrade_dials.insert(peer_id.clone()) {
-                return true;
-            }
+        // Hold the registry lock across the spawn so the dedup check and the
+        // abort-handle insert are atomic against a concurrent upgrade to the
+        // same peer. `tokio::spawn` does not await, and the spawned task only
+        // re-locks after its (non-instant) dial returns, so this cannot
+        // deadlock or `.await` under the lock.
+        let mut upgrade_dials = self
+            .upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned");
+        if upgrade_dials.contains_key(&peer_id) {
+            return true;
         }
 
         let endpoint = self.clone();
@@ -554,15 +561,39 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        tokio::spawn(async move {
+        let task_peer_id = peer_id.clone();
+        let dial = tokio::spawn(async move {
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
             endpoint
                 .upgrade_dials
                 .lock()
                 .expect("Zakura upgrade dial registry mutex is never poisoned")
-                .remove(&peer_id);
+                .remove(&task_peer_id);
         });
+        upgrade_dials.insert(peer_id, dial.abort_handle());
         true
+    }
+
+    /// Cancel and forget the maintained native dial started by the legacy
+    /// upgrade hand-off for `peer_id`, if this node still owns one.
+    ///
+    /// Called when the upgrade hand-off wait times out without the peer
+    /// registering: the maintained dial uses [`RedialPolicy::maintain`], so it
+    /// would otherwise redial a peer-supplied, possibly unreachable address
+    /// forever and keep its `upgrade_dials` entry. Repeating the failed upgrade
+    /// with distinct node ids would then grow maintained dial tasks and
+    /// outbound QUIC traffic without bound. A no-op if the peer already
+    /// registered (its entry is reclaimed only when the maintained dial ends on
+    /// shutdown) or if another upgrade owns the dedup slot.
+    pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
+        let handle = self
+            .upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned")
+            .remove(peer_id);
+        if let Some(handle) = handle {
+            handle.abort();
+        }
     }
 
     /// Returns whether the local admission semaphore has a free permit, i.e.
@@ -604,7 +635,7 @@ impl ZakuraEndpoint {
             header_sync_tasks: None,
             header_sync_actions: None,
             block_sync_actions: None,
-            upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
+            upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -630,7 +661,7 @@ impl ZakuraEndpoint {
             })),
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
-            upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
+            upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -2236,7 +2267,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         header_sync_tasks: Some(header_sync_tasks),
         header_sync_actions,
         block_sync_actions,
-        upgrade_dials: Arc::new(StdMutex::new(HashSet::new())),
+        upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
 
     // Log our own dial address once iroh has resolved it, so operators can hand
@@ -3953,6 +3984,58 @@ mod tests {
         .expect("send returns promptly after header-sync shutdown");
         assert!(send_result.is_err());
 
+        Ok(())
+    }
+
+    /// A malicious legacy responder can return a syntactically valid
+    /// `P2pV2UpgradeAccept` (a unique, real iroh node id with a parseable but
+    /// unreachable direct address) that never completes native Zakura
+    /// registration. After the upgrade hand-off wait times out, no
+    /// maintain-forever native dial task or `upgrade_dials` entry may survive;
+    /// otherwise repeating the failed upgrade with distinct node ids grows
+    /// maintained dials and outbound QUIC traffic without bound.
+    ///
+    /// Regression test for `claude-legacy-upgrade-maintained-dial-leak`. Uses a
+    /// paused clock so the 15s appear-timeout elapses without real waiting; the
+    /// dial target is RFC 5737 TEST-NET-1, which never connects.
+    #[tokio::test(start_paused = true)]
+    async fn failed_legacy_upgrade_does_not_leak_maintained_dial() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let endpoint = spawn_zakura_endpoint(&Config::default(), |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled by default");
+
+        // The Accept the attacker would advertise: a real 32-byte iroh node id
+        // (so `node_addr_from_hints` builds a `NodeAddr` and the dial spawns)
+        // pointing at an unreachable address that never registers.
+        let node_id = LocalEndpointFactory::secret_key(0x0BAD_C0DE)
+            .public()
+            .as_bytes()
+            .to_vec();
+        let peer_id = ZakuraPeerId::new(node_id.clone()).expect("32-byte node id is valid");
+        let direct_addresses = vec![b"192.0.2.1:1".to_vec()];
+
+        let connector = crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
+        let upgraded = connector
+            .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
+            .await;
+
+        assert!(
+            !upgraded,
+            "an unreachable upgrade peer must not report a completed hand-off",
+        );
+        assert!(
+            endpoint
+                .upgrade_dials
+                .lock()
+                .expect("Zakura upgrade dial registry mutex is never poisoned")
+                .is_empty(),
+            "a failed legacy upgrade leaked a maintained native dial / upgrade_dials entry",
+        );
+
+        endpoint.shutdown().await;
         Ok(())
     }
 

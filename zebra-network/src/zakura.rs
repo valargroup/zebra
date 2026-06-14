@@ -291,7 +291,22 @@ impl ZakuraHandshakeConnector {
         if !endpoint.ensure_upgrade_native_dial(node_addr) {
             return false;
         }
-        wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await
+        if wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await {
+            return true;
+        }
+
+        // The hand-off did not complete within the wait window. The dial spawned
+        // by `ensure_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
+        // would keep redialing this peer-supplied address forever and retain its
+        // `upgrade_dials` entry. Unless the peer registered in the meantime
+        // (keep its maintained dial as the recovery path), cancel the dial and
+        // drop the entry so a malicious legacy responder cannot leak unbounded
+        // maintained dials and outbound QUIC traffic by repeating failed
+        // upgrades with distinct node ids.
+        if !registered.borrow().iter().any(|id| id == peer_id) {
+            endpoint.cancel_upgrade_native_dial(peer_id);
+        }
+        false
     }
 
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime
