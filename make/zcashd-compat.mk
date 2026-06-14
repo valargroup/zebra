@@ -17,6 +17,7 @@ ZEBRAD_BIN ?= $(CURDIR)/target/release/zebrad
 ZCASHD_BIN ?= /root/unity/zcash/src/zcashd
 ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 
+# TODO: make more general
 NETWORK ?= Mainnet
 ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state
 ZCASHD_DATADIR ?= /mnt/data/zcashd-mainnet
