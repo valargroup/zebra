@@ -4349,8 +4349,7 @@ mod tests {
         let peer_id = ZakuraPeerId::new(node_id.clone()).expect("32-byte node id is valid");
         let direct_addresses = vec![b"192.0.2.1:1".to_vec()];
 
-        let connector =
-            crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
+        let connector = crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
         let upgraded = connector
             .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
             .await;

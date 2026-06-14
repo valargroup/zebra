@@ -199,8 +199,19 @@ impl ZakuraService for DropSink {
 }
 
 /// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.
+///
+/// The cache dir is disabled so each call resolves a fresh ephemeral iroh
+/// identity via `Config::zakura_secret_key`. With the default (enabled) cache
+/// dir, every endpoint would load the *same* persisted key for the default
+/// network and so share one `NodeId`; iroh then refuses the upgrade dial as a
+/// self-connect. Disabling the cache also keeps these tests from writing a
+/// secret-key file into the real user cache directory.
 async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
-    crate::zakura::spawn_zakura_endpoint(&test_config(true), |_supervisor, _trace| {
+    let config = Config {
+        cache_dir: crate::config::CacheDir::disabled(),
+        ..test_config(true)
+    };
+    crate::zakura::spawn_zakura_endpoint(&config, |_supervisor, _trace| {
         Arc::new(DropSink) as Arc<dyn ZakuraService>
     })
     .await
