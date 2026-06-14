@@ -497,6 +497,22 @@ impl ZakuraEndpoint {
             .map(|tasks| tasks.shutdown.clone())
     }
 
+    /// The endpoint-wide background-task shutdown token, cancelled by
+    /// [`ZakuraEndpoint::shutdown`].
+    ///
+    /// Detached dial/discovery loops observe this so they stop promptly at
+    /// teardown instead of running on against a torn-down router. They each hold
+    /// an endpoint clone, which keeps the supervisor registration watch open, so
+    /// watch closure is *not* a reliable exit signal for them; this token is.
+    /// Falls back to an un-cancelled token for endpoints built without a
+    /// background-task owner (recorder-only test nodes).
+    pub(crate) fn background_shutdown_token(&self) -> CancellationToken {
+        self.header_sync_tasks
+            .as_ref()
+            .map(|tasks| tasks.shutdown.clone())
+            .unwrap_or_default()
+    }
+
     /// Track a header-sync integration task under the endpoint shutdown owner.
     pub async fn push_header_sync_task(&self, task: JoinHandle<()>) {
         if let Some(tasks) = self.header_sync_tasks.as_ref() {
@@ -2288,20 +2304,29 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
 
     // Log our own dial address once iroh has resolved it, so operators can hand
     // out `<node_id>@<direct_addr>` for other nodes' `zakura.bootstrap_peers`.
+    // Tracked under the endpoint shutdown owner and shutdown-aware so it cannot
+    // outlive endpoint teardown while awaiting address resolution.
     {
-        let endpoint = endpoint.clone();
-        tokio::spawn(async move {
-            let node_addr = endpoint.node_addr().await;
-            let direct_addresses: Vec<String> = node_addr
-                .direct_addresses()
-                .map(|addr| addr.to_string())
-                .collect();
-            info!(
-                node_id = %node_addr.node_id,
-                ?direct_addresses,
-                "Zakura P2P endpoint ready; advertise <node_id>@<direct_addr> as a bootstrap peer",
-            );
+        let shutdown = endpoint.background_shutdown_token();
+        let log_endpoint = endpoint.clone();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                node_addr = log_endpoint.node_addr() => {
+                    let direct_addresses: Vec<String> = node_addr
+                        .direct_addresses()
+                        .map(|addr| addr.to_string())
+                        .collect();
+                    info!(
+                        node_id = %node_addr.node_id,
+                        ?direct_addresses,
+                        "Zakura P2P endpoint ready; advertise <node_id>@<direct_addr> as a bootstrap peer",
+                    );
+                }
+            }
         });
+        endpoint.push_header_sync_task(task).await;
     }
 
     super::discovery::insert_static_bootstrap_candidates(
@@ -2309,12 +2334,21 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         &config.zakura.bootstrap_peers,
     )
     .await;
-    spawn_native_bootstrap_dialer(
+    // Track the maintained bootstrap redial tasks and the discovery candidate
+    // dialer under the endpoint shutdown owner so `ZakuraEndpoint::shutdown`
+    // drains them. Previously their handles were dropped, leaving detached loops
+    // that kept retrying dials against a torn-down router while holding endpoint
+    // clones past teardown.
+    for task in spawn_native_bootstrap_dialer(
         endpoint.clone(),
         config.zakura.bootstrap_peers.clone(),
         limits.clone(),
-    );
-    super::discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
+    ) {
+        endpoint.push_header_sync_task(task).await;
+    }
+    let discovery_dialer =
+        super::discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
+    endpoint.push_header_sync_task(discovery_dialer).await;
     Ok(Some(endpoint))
 }
 
@@ -4080,6 +4114,92 @@ mod tests {
         .expect("send returns promptly after header-sync shutdown");
         assert!(send_result.is_err());
 
+        Ok(())
+    }
+
+    /// A maintained native dial loop (shared by configured bootstrap peers, the
+    /// legacy->Zakura upgrade hand-off, and `spawn_native_dial`) targets an
+    /// unreachable peer, so its `maintain` policy retries forever and never
+    /// exits on its own. `ZakuraEndpoint::shutdown` must still stop it: the task
+    /// holds an endpoint clone, so the supervisor registration watch stays open
+    /// and only the endpoint shutdown token can end the loop. Without that
+    /// signal the detached loop outlives shutdown and keeps dialing.
+    #[tokio::test]
+    async fn endpoint_shutdown_stops_maintained_native_dial_loop() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let endpoint = spawn_zakura_endpoint(&Config::default(), |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled by default");
+
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
+        // maintained loop stays in connect/backoff and never finishes on its own.
+        let unreachable_addr: SocketAddr = "192.0.2.1:65535".parse().expect("valid test address");
+        let unreachable = NodeAddr::new(LocalEndpointFactory::secret_key(987_654).public())
+            .with_direct_addresses([unreachable_addr]);
+        let dial = endpoint.spawn_native_dial(unreachable);
+
+        // Let the maintained loop start before tearing the endpoint down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dial.is_finished(),
+            "maintained dial loop to an unreachable peer should still be running"
+        );
+
+        endpoint.shutdown().await;
+
+        tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .expect("maintained native dial loop must exit after endpoint shutdown")
+            .expect("native dial task must not panic");
+        Ok(())
+    }
+
+    /// The discovery candidate dialer is a long-lived loop that holds an
+    /// endpoint clone, so its supervisor registration watch never closes on its
+    /// own. `ZakuraEndpoint::shutdown` must still stop it via the endpoint
+    /// shutdown token; otherwise it outlives teardown, polling the discovery
+    /// book and attempting dials against a torn-down router.
+    #[tokio::test]
+    async fn endpoint_shutdown_stops_discovery_candidate_dialer() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let config = Config::default();
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled by default");
+
+        let limits = ZakuraLocalLimits::from_config(&config);
+        let handshake = ZakuraHandshakeConfig::for_network(&config.network);
+        let discovery = crate::zakura::discovery::build_discovery_handle(
+            SecretKey::generate(OsRng),
+            Vec::new(),
+            crate::zakura::discovery::default_advertised_services(),
+            &handshake,
+            limits.max_connections,
+            0,
+            endpoint.supervisor().subscribe(),
+        )?;
+        let dialer = crate::zakura::discovery::spawn_native_discovery_dialer(
+            endpoint.clone(),
+            discovery,
+            limits,
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dialer.is_finished(),
+            "discovery candidate dialer should still be running"
+        );
+
+        endpoint.shutdown().await;
+
+        tokio::time::timeout(Duration::from_secs(5), dialer)
+            .await
+            .expect("discovery candidate dialer must exit after endpoint shutdown")
+            .expect("discovery dialer task must not panic");
         Ok(())
     }
 
