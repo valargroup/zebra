@@ -881,9 +881,9 @@ pub struct ZakuraDiscoveryPersistedEntry {
 
 /// A locally dialable discovery candidate.
 ///
-/// Candidates may come from signed discovery records or from trusted static bootstrap
-/// configuration. Only signed records are eligible for peer samples; unsigned static candidates are
-/// local dial hints.
+/// Candidates may come from first-party confirmed signed discovery records or from trusted static
+/// bootstrap configuration. Only signed records are eligible for peer samples; unsigned static
+/// candidates are local dial hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryDialCandidate {
     /// Candidate iroh node id.
@@ -2625,6 +2625,7 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.0,
                         dial_backoff.1,
                     )
+                    && entry_has_confirmed_dial_authority(entry)
                     && has_wanted_services(&entry.record, wanted_services)
                     && has_discovery_usable_direct_addrs(entry)
             })
@@ -3098,7 +3099,13 @@ fn update_existing_entry(
         return ImportOutcome::IgnoredOlder;
     }
 
-    entry.source = metadata.source;
+    let preserve_first_party_source = incoming_sequence == stored_sequence
+        && entry.source == Some(entry.record.body.node_id)
+        && metadata.source != Some(entry.record.body.node_id);
+
+    if !preserve_first_party_source {
+        entry.source = metadata.source;
+    }
     entry.is_static |= metadata.is_static;
     entry.last_seen = metadata.last_seen;
 
@@ -3330,6 +3337,10 @@ fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {
                 is_discovery_dialable_addr(addr)
             }
         })
+}
+
+fn entry_has_confirmed_dial_authority(entry: &ZakuraDiscoveryEntry) -> bool {
+    entry.is_static || entry.source == Some(entry.record.body.node_id)
 }
 
 /// Returns true only for addresses that are safe to dial from untrusted discovery gossip.
@@ -4435,6 +4446,14 @@ mod tests {
             direct_addrs: record.body.direct_addrs.clone(),
             is_static,
         }
+    }
+
+    fn import_confirmed_record(
+        book: &mut ZakuraDiscoveryBook,
+        record: ZakuraNodeRecord,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
+        let source = record.body.node_id;
+        book.import_record(record, Some(source), NOW, &context())
     }
 
     fn small_book(max_records: usize) -> ZakuraDiscoveryBook {
@@ -5551,7 +5570,10 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 8233),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), 8233),
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)), 8233),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfd12, 0x3456, 0, 0, 0, 0, 0, 1)),
+                8233,
+            ),
         ];
 
         for (index, bad_addr) in bad_addrs.into_iter().enumerate() {
@@ -5589,13 +5611,83 @@ mod tests {
         let private_static = signed_record_with_addrs(
             1,
             service(1),
-            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8233)],
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                8233,
+            )],
         );
         assert_eq!(
             static_book
                 .import_static_record(private_static, NOW, &context())
                 .expect("configured static private record imports"),
             ImportOutcome::Added
+        );
+    }
+
+    #[test]
+    fn discovery_book_gossiped_public_third_party_record_is_not_dialable() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let gossip_source = secret_key().public();
+        let public_target = signed_record_with_addrs(
+            1,
+            service(1),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                8233,
+            )],
+        );
+        let target_id = public_target.body.node_id;
+
+        assert_eq!(
+            book.import_record(public_target.clone(), Some(gossip_source), NOW, &context())
+                .expect("valid public third-party gossip record still imports"),
+            ImportOutcome::Added
+        );
+        assert_eq!(
+            book.get(&target_id).expect("entry is stored").record(),
+            &public_target
+        );
+
+        assert!(
+            book.dial_candidates(
+                10,
+                &[service(1)],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                NOW,
+                (
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+                ),
+                &mut StdRng::seed_from_u64(7),
+            )
+            .is_empty(),
+            "unconfirmed third-party public gossip must not drive native dials"
+        );
+
+        assert_eq!(
+            book.import_record(public_target.clone(), Some(target_id), NOW + 1, &context())
+                .expect("first-party self-record confirmation imports"),
+            ImportOutcome::MetadataUpdated
+        );
+        assert_eq!(
+            book.dial_candidates(
+                10,
+                &[service(1)],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                NOW + 1,
+                (
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+                ),
+                &mut StdRng::seed_from_u64(7),
+            ),
+            vec![candidate_for(&public_target, false)]
         );
     }
 
@@ -5940,10 +6032,8 @@ mod tests {
         let failed_id = failed.body.node_id;
         let preferred_id = preferred.body.node_id;
 
-        book.import_record(failed.clone(), None, NOW, &context())
-            .unwrap();
-        book.import_record(preferred.clone(), None, NOW, &context())
-            .unwrap();
+        import_confirmed_record(&mut book, failed.clone()).unwrap();
+        import_confirmed_record(&mut book, preferred.clone()).unwrap();
         book.mark_dial_attempt(&failed_id, NOW);
         book.mark_dial_failure(&failed_id, NOW);
         book.mark_dial_success(&preferred_id, NOW + 1);
@@ -5997,8 +6087,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for record in &records {
-            book.import_record(record.clone(), None, NOW, &context())
-                .expect("test record imports");
+            import_confirmed_record(&mut book, record.clone()).expect("test record imports");
         }
 
         let mut deterministic = records
@@ -6057,8 +6146,7 @@ mod tests {
         let failed = signed_record_with(1, service(1), test_addr(1));
         let failed_id = failed.body.node_id;
 
-        book.import_record(failed.clone(), None, NOW, &context())
-            .unwrap();
+        import_confirmed_record(&mut book, failed.clone()).unwrap();
         book.mark_dial_attempt(&failed_id, NOW);
         book.mark_dial_failure(&failed_id, NOW);
 
@@ -6098,8 +6186,7 @@ mod tests {
         let exchanged = signed_record_with(1, service(1), test_addr(1));
         let exchanged_id = exchanged.body.node_id;
 
-        book.import_record(exchanged.clone(), None, NOW, &context())
-            .unwrap();
+        import_confirmed_record(&mut book, exchanged.clone()).unwrap();
         book.mark_dial_success(&exchanged_id, NOW);
         book.mark_short_lived_exchange(&exchanged_id, NOW);
 
@@ -6141,8 +6228,7 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let record = signed_record_with(1, service(9), test_addr(9));
         let node_id = record.body.node_id;
-        book.import_record(record.clone(), None, NOW, &context())
-            .unwrap();
+        import_confirmed_record(&mut book, record.clone()).unwrap();
         book.mark_dial_attempt(&node_id, NOW + 1);
         book.mark_dial_failure(&node_id, NOW + 1);
 
@@ -6702,8 +6788,13 @@ mod tests {
             .await
             .expect("connected self-record imports");
         handle
-            .import_peer_records([discovered.clone(), general.clone()], None)
-            .await;
+            .import_peer_record(discovered.clone(), Some(discovered.body.node_id))
+            .await
+            .expect("discovered first-party record imports");
+        handle
+            .import_peer_record(general.clone(), Some(general.body.node_id))
+            .await
+            .expect("general first-party record imports");
         connected_tx.send_replace(vec![peer_id_for(active_id)]);
 
         let matching = handle.service_candidates(&service(1), true, &[]).await;
@@ -7476,8 +7567,7 @@ mod tests {
             .map(|index| signed_record_with(index.into(), service(1), test_addr(index)))
             .collect::<Vec<_>>();
         for record in &records {
-            book.import_record(record.clone(), None, NOW, &context())
-                .expect("test record imports");
+            import_confirmed_record(&mut book, record.clone()).expect("test record imports");
         }
 
         // Three candidates get strictly increasing last-success times, so dial priority is
@@ -7568,9 +7658,15 @@ mod tests {
         let candidate = runtime_record_with(1, service(1), test_addr(1));
         let connected = runtime_record_with(2, service(1), test_addr(2));
         let connected_id = connected.body.node_id;
+        let candidate_id = candidate.body.node_id;
         handle
-            .import_peer_records([candidate.clone(), connected], None)
-            .await;
+            .import_peer_record(candidate.clone(), Some(candidate_id))
+            .await
+            .expect("candidate first-party record imports");
+        handle
+            .import_connected_peer_record(connected, connected_id)
+            .await
+            .expect("connected self-record imports");
 
         connected_tx.send_replace(vec![peer_id_for(connected_id)]);
         assert!(handle.dial_candidates(&[service(1)], &[]).await.is_empty());
@@ -7588,9 +7684,15 @@ mod tests {
         );
         let connected = runtime_record_with(2, service(1), test_addr(2));
         let connected_id = connected.body.node_id;
+        let candidate_id = candidate.body.node_id;
         handle
-            .import_peer_records([candidate.clone(), connected], None)
-            .await;
+            .import_peer_record(candidate.clone(), Some(candidate_id))
+            .await
+            .expect("candidate first-party record imports");
+        handle
+            .import_connected_peer_record(connected, connected_id)
+            .await
+            .expect("connected self-record imports");
 
         connected_tx.send_replace(vec![peer_id_for(connected_id)]);
         assert_eq!(
