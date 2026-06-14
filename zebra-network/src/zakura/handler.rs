@@ -17,9 +17,11 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use iroh::Watcher as _;
 use iroh::{
-    endpoint::{Connection, RecvStream, SendStream, TransportConfig, VarInt},
+    endpoint::{
+        Connection, ConnectionType, Endpoint, RecvStream, SendStream, TransportConfig, VarInt,
+    },
     protocol::{AcceptError, ProtocolHandler, Router},
-    NodeAddr, SecretKey,
+    NodeAddr, NodeId, SecretKey,
 };
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
@@ -1190,6 +1192,45 @@ pub struct ZakuraProtocolHandler {
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
+    // Bound iroh endpoint, used to recover the inbound peer's UDP source IP so
+    // the per-IP admission cap applies to Router-accepted connections. Iroh's
+    // Router consumes the `Incoming` (which carries the address) before
+    // `ProtocolHandler::accept` hands us the established `Connection`, so the
+    // address is looked up from the endpoint's node map instead. `None` for
+    // unit tests that drive the handler without a bound endpoint, in which case
+    // inbound accepts fall back to the previous `remote_ip = None` behaviour.
+    endpoint: Option<Endpoint>,
+}
+
+/// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
+/// per-IP connection cap can be enforced for Router-accepted connections.
+///
+/// Iroh exposes the peer address on `Incoming`, which the Router consumes before
+/// `ProtocolHandler::accept`. After the native control handshake the connection
+/// has exchanged real QUIC payload over its direct path, so the endpoint's node
+/// map knows the peer's UDP address: prefer the connection's confirmed current
+/// path (`conn_type`), then fall back to the direct address that most recently
+/// delivered payload from this peer. Relay-only paths have no single
+/// attributable source IP, so they correctly yield `None` (the global
+/// connection cap still bounds them).
+fn inbound_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
+    if let Some(mut conn_type) = endpoint.conn_type(node_id) {
+        match conn_type.get() {
+            ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => {
+                return Some(addr.ip())
+            }
+            ConnectionType::Relay(_) | ConnectionType::None => {}
+        }
+    }
+    endpoint.remote_info(node_id).and_then(|info| {
+        info.addrs
+            .into_iter()
+            .filter(|addr| addr.last_payload.is_some())
+            // Smallest elapsed-since-last-payload is the path actively carrying
+            // this connection's traffic, i.e. the real inbound source address.
+            .min_by_key(|addr| addr.last_payload)
+            .map(|addr| addr.addr.ip())
+    })
 }
 
 impl ZakuraProtocolHandler {
@@ -1249,7 +1290,15 @@ impl ZakuraProtocolHandler {
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),
             limits,
+            endpoint: None,
         }
+    }
+
+    /// Attach the bound iroh endpoint so inbound Router-accepted connections can
+    /// resolve the peer's UDP source IP and enforce the per-IP connection cap.
+    pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
     }
 
     async fn accept_connection(&self, connection: Connection) -> Result<(), AcceptError> {
@@ -1286,12 +1335,18 @@ impl ZakuraProtocolHandler {
         };
 
         let conn_limits = self.limits.clamp(&negotiated.limits);
-        // Iroh's Router hands ProtocolHandler only the established Connection.
-        // In iroh 0.92.0 the peer UDP address is exposed on Incoming, which the
-        // Router consumes before this point, not on Connection/Connecting. The
-        // inbound per-IP cap therefore remains deferred while 01.a keeps Router
-        // ownership. Native outbound dials still pass the configured direct IP.
-        let remote_ip = None;
+        // Iroh's Router hands ProtocolHandler only the established Connection;
+        // the peer UDP address lives on Incoming, which the Router consumes
+        // before this point. Recover it from the endpoint's node map so the
+        // per-IP admission cap applies to inbound accepts and a single source
+        // IP cannot fill the global connection budget with distinct node ids.
+        // The handshake above has already exchanged QUIC payload over the
+        // direct path, so the node map knows the peer's address. Native
+        // outbound dials still pass the configured direct IP.
+        let remote_ip = self
+            .endpoint
+            .as_ref()
+            .and_then(|endpoint| inbound_remote_ip(endpoint, remote_node_id));
         self.register_and_serve(
             connection,
             remote_peer_id,
@@ -2298,7 +2353,10 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         limits.clone(),
         registry,
         trace,
-    );
+    )
+    // Give the handler the bound endpoint so inbound accepts can resolve the
+    // peer's source IP and enforce the per-IP connection cap.
+    .with_endpoint(endpoint.clone());
     let router = Router::builder(endpoint)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
@@ -6086,22 +6144,30 @@ mod tests {
     // SECURITY AUDIT (candidate claude-inbound-per-ip-cap-bypassed /
     // codex-inbound-per-ip-cap-bypass): SR-4 admission.
     //
-    // `accept_connection` registers every inbound peer with `remote_ip = None`
-    // (handler.rs accept path), and `register` only consults `active_by_ip` when
-    // `remote_ip` is `Some`. So the per-IP connection cap is enforced for native
+    // `accept_connection` used to register every inbound peer with
+    // `remote_ip = None`, and `register` only consults `active_by_ip` when
+    // `remote_ip` is `Some`, so the per-IP connection cap was enforced for native
     // outbound dials (which pass a real IP) but entirely bypassed for inbound
-    // accepts: one source IP can authenticate as many distinct node ids and fill
-    // the global connection budget (default per-IP cap is 1).
+    // Router accepts: one source IP could authenticate as many distinct iroh node
+    // ids and fill the global connection budget despite `max_connections_per_ip`
+    // (default 1). The fix resolves the inbound peer's UDP source IP from the
+    // endpoint's node map at the accept site and passes it into `register`, so the
+    // per-IP cap now applies to Router-accepted connections too.
     //
-    // This is a characterization test driving the real supervisor `register` with
-    // the exact `remote_ip` arguments the two production paths supply. It PASSES,
-    // documenting both the working Some(ip) cap and the None-path bypass. The fix
-    // belongs at the accept site (plumb the real inbound peer IP into register),
-    // not in `register` itself -- so we do NOT assert that register(None) should
-    // reject, which would wrongly cap all distinct inbound peers to one global
-    // slot.
+    // This guard drives the real production `ProtocolHandler::accept` over a
+    // loopback iroh transport: two distinct authenticated identities dial from the
+    // same source IP (127.0.0.1) through the full native handshake. The per-IP cap
+    // is 1 while global admission keeps its default (well above 1), so the second
+    // identity can only be turned away by the per-IP cap, not the global gate.
+    // Before the fix both identities registered; now the second is rejected and
+    // its connection is closed, leaving exactly one registered peer.
     #[tokio::test]
-    async fn inbound_accept_remote_ip_none_bypasses_per_ip_cap() {
+    async fn inbound_accept_enforces_per_ip_cap() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+
+        // The register-level invariant the accept path now relies on: with a real
+        // source IP, the per-IP cap rejects a second distinct identity with
+        // `ResourceLimit`.
         async fn try_register(
             supervisor: &ZakuraSupervisorHandle,
             peer: &ZakuraPeerId,
@@ -6120,11 +6186,7 @@ mod tests {
                 )
                 .await
         }
-
         let ip: IpAddr = "203.0.113.7".parse().expect("test ip parses");
-
-        // Control: native outbound dials supply the real source IP, so the per-IP
-        // cap rejects a second distinct identity claiming to come from that IP.
         let supervisor = ZakuraSupervisorHandle::new(1);
         assert!(
             matches!(
@@ -6136,29 +6198,136 @@ mod tests {
         assert!(
             matches!(
                 try_register(&supervisor, &test_peer(2), Some(ip)).await,
-                ZakuraRegistration::Rejected(_)
+                ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit)
             ),
-            "a second distinct identity from the same IP must be rejected at per-IP cap 1",
+            "a second distinct identity from the same IP must be Rejected(ResourceLimit) at cap 1",
         );
 
-        // Inbound shape: accept_connection passes remote_ip = None. Three distinct
-        // node ids -- which an attacker can mint from one source IP -- all register
-        // despite cap 1, because the per-IP gate is skipped when remote_ip is None.
+        // End-to-end: drive the production accept path with a per-IP cap of 1 and a
+        // strictly larger global cap so per-IP admission is what turns away the
+        // second same-IP identity. Wire the bound endpoint so the accept path can
+        // resolve the inbound source IP.
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        assert!(
+            limits.max_connections > 1,
+            "global admission cap must exceed the per-IP cap so the second same-IP identity is \
+             turned away by the per-IP cap rather than the global gate",
+        );
+        let server_ep = LocalEndpointFactory::with_transport_config(limits.transport_config())
+            .endpoint(880)
+            .await?;
         let supervisor = ZakuraSupervisorHandle::new(1);
-        for byte in [10u8, 11, 12] {
-            assert!(
-                matches!(
-                    try_register(&supervisor, &test_peer(byte), None).await,
-                    ZakuraRegistration::Registered { .. }
-                ),
-                "inbound (remote_ip=None) registration {byte} succeeds despite per-IP cap 1, \
-                 demonstrating the inbound per-IP admission bypass",
-            );
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        )
+        .with_endpoint(server_ep.clone());
+        let router = Router::builder(server_ep)
+            .accept(P2P_V2_ALPN, handler)
+            .spawn();
+        // Iroh also binds a default IPv6 socket, so an unrestricted node address
+        // lets the two clients reach the server over different paths (e.g. one
+        // IPv4 loopback, one global IPv6) and therefore present different source
+        // IPs. Pin both dials to the server's IPv4 loopback address so they share
+        // one source IP (127.0.0.1) -- the single-source-IP shape of the finding.
+        let full_addr = router.endpoint().node_addr().initialized().await;
+        let loopback_addr = NodeAddr::new(full_addr.node_id).with_direct_addresses(
+            full_addr
+                .direct_addresses()
+                .copied()
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+        );
+        assert!(
+            loopback_addr.direct_addresses().next().is_some(),
+            "server must advertise an IPv4 loopback direct address",
+        );
+        let server_addr = loopback_addr;
+
+        // Establish the QUIC connection only; the native handshake is driven
+        // separately so a per-IP rejection mid-handshake (the second identity)
+        // can be observed instead of aborting the test.
+        async fn connect_native(
+            server_addr: &NodeAddr,
+            seed: u64,
+            limits: &ZakuraLocalLimits,
+        ) -> Result<(Endpoint, Connection), BoxError> {
+            let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
+                .endpoint(seed)
+                .await?;
+            endpoint.add_node_addr(server_addr.clone())?;
+            let connection = endpoint.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            Ok((endpoint, connection))
+        }
+        async fn run_handshake(
+            endpoint: &Endpoint,
+            connection: &Connection,
+            limits: &ZakuraLocalLimits,
+        ) -> Result<(), BoxError> {
+            let config = ZakuraHandshakeConfig::for_network(&Config::default().network);
+            let local_peer_id = ZakuraPeerId::new(endpoint.node_id().as_bytes().to_vec())?;
+            run_native_initiator_handshake_without_trace(
+                connection,
+                limits,
+                &config,
+                &local_peer_id,
+            )
+            .await?;
+            Ok(())
+        }
+
+        // First identity registers and claims the only per-IP slot. Hold the
+        // endpoint/connection so the peer stays registered for the second dial.
+        let (_ep1, _conn1) = connect_native(&server_addr, 881, &limits).await?;
+        run_handshake(&_ep1, &_conn1, &limits).await?;
+        let mut first_registered = 0;
+        for _ in 0..200 {
+            first_registered = supervisor.registered_ids().await.len();
+            if first_registered >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(
-            supervisor.registered_ids().await.len(),
-            3,
-            "all three same-source inbound identities occupy admission slots past the cap",
+            first_registered, 1,
+            "the first inbound identity from the source IP must register (a real source IP was \
+             resolved from the endpoint and counted against the per-IP cap)",
         );
+
+        // Second distinct identity from the same source IP: the per-IP cap must
+        // reject its registration. The handshake may complete and then be closed,
+        // or be torn down mid-handshake by the rejection -- either way the server
+        // closes the connection with the resource-limit code and never registers a
+        // second peer. (Before the fix the accept passed remote_ip = None, so this
+        // identity registered and one source IP could exhaust the global budget.)
+        let (_ep2, conn2) = connect_native(&server_addr, 882, &limits).await?;
+        let _ = run_handshake(&_ep2, &conn2, &limits).await;
+        let mut rejected_close = false;
+        for _ in 0..400 {
+            if supervisor.registered_ids().await.len() >= 2 {
+                break;
+            }
+            if matches!(
+                conn2.close_reason(),
+                Some(iroh::endpoint::ConnectionError::ApplicationClosed(ref close))
+                    if close.error_code == VarInt::from_u32(ZAKURA_CLOSE_RESOURCE)
+            ) {
+                rejected_close = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let registered = supervisor.registered_ids().await.len();
+        assert!(
+            rejected_close && registered == 1,
+            "a second distinct identity from the same source IP must be rejected by the per-IP \
+             cap with a resource-limit close (resource_close={rejected_close}, \
+             registered={registered}); before the fix the inbound accept passed remote_ip = None, \
+             so both identities registered and one source IP could exhaust the connection budget",
+        );
+
+        router.shutdown().await?;
+        Ok(())
     }
 }
