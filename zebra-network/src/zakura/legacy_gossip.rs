@@ -2306,28 +2306,53 @@ async fn handle_legacy_request<Inbound>(
 {
     let command = request.frame.to_string();
     let peer_id = request.peer_id.clone();
+    let request_id = request.request_id;
     let request_kind = request.frame.kind();
+    let mut response_tx = request.response_tx;
     let Some(legacy_request) = request.frame.into_service_request() else {
         // Inbound legacy Ping is handled locally; the requester measures round-trip time.
-        let _ = request.response_tx.send(Ok(Response::Pong(Duration::ZERO)));
+        let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
     };
     trace_legacy_request_start(
         &trace,
         "inbound.request",
         Some(&peer_id),
-        request.request_id,
+        request_id,
         request_kind,
         request_kind.message_type(),
     );
-    let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
-    let result = match ready {
-        Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
-            .await
-            .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
-            .and_then(|response| response),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+
+    let service_work = async move {
+        let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
+        match ready {
+            Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
+                .await
+                .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
+                .and_then(|response| response),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+        }
+    };
+
+    // Tie the spawned handler's lifetime to the request stream. The request-stream
+    // side (`LegacyGossipSink::request`) waits only LEGACY_REQUEST_TIMEOUT for the
+    // oneshot result and then drops the receiver; the peer/connection going away
+    // drops it too. In either case `closed()` resolves, so abort the in-flight
+    // service work and release the permit instead of letting this orphaned handler
+    // keep one of LEGACY_REQUEST_IN_FLIGHT_LIMIT permits (and keep doing backend
+    // work) for up to another full readiness + service-call timeout.
+    let result = tokio::select! {
+        biased;
+        () = response_tx.closed() => {
+            debug!(
+                ?peer_id,
+                request_id,
+                "legacy request handler aborted: response receiver dropped before service completed"
+            );
+            return;
+        }
+        result = service_work => result,
     };
 
     if let Err(error) = &result {
@@ -2335,15 +2360,16 @@ async fn handle_legacy_request<Inbound>(
             &trace,
             "inbound.error",
             Some(&peer_id),
-            request.request_id,
+            request_id,
             request_kind.command(),
             error.to_string(),
         );
     }
 
-    if request.response_tx.send(result).is_err() {
+    if response_tx.send(result).is_err() {
         debug!(
-            peer_id = ?request.peer_id,
+            ?peer_id,
+            request_id,
             "legacy request response receiver dropped before service completed"
         );
     }
@@ -2820,6 +2846,25 @@ mod tests {
         }
     }
 
+    /// Always ready, but every `call` future is pending forever. Models a slow or
+    /// backpressured inbound service whose work outlives the request-stream timeout.
+    #[derive(Clone, Debug)]
+    struct NeverCompletesService;
+
+    impl Service<Request> for NeverCompletesService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::pending().boxed()
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct RecordingInventoryResponder {
         transaction: Option<UnminedTx>,
@@ -3049,6 +3094,64 @@ mod tests {
         })
         .await
         .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+    }
+
+    /// Regression for `claude-legacy-request-orphaned-handler-permits`.
+    ///
+    /// The request-stream side (`LegacyGossipSink::request`) waits only
+    /// `LEGACY_REQUEST_TIMEOUT` for the oneshot result and then drops the receiver;
+    /// the peer disconnecting drops it too. The spawned `handle_legacy_request` task
+    /// must not keep its in-flight permit (one of `LEGACY_REQUEST_IN_FLIGHT_LIMIT`)
+    /// or its backend service work alive after that. Before the fix it stayed blocked
+    /// in `service.call` for up to another full `LEGACY_REQUEST_TIMEOUT`, so an
+    /// attacker driving slow inbound work could occupy all 64 permits.
+    #[tokio::test(start_paused = true)]
+    async fn legacy_request_handler_releases_permit_when_request_stream_drops_receiver() {
+        let permits = Arc::new(Semaphore::new(LEGACY_REQUEST_IN_FLIGHT_LIMIT));
+        let permit = permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a permit is available");
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT - 1,
+            "one permit is held while the handler runs"
+        );
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = LegacyRequestInbound {
+            peer_id: ZakuraPeerId::new(vec![7u8; 32]).expect("valid peer id"),
+            request_id: 1,
+            // A non-Ping request so the handler drives the inbound service.
+            frame: LegacyRequestFrame::MempoolTransactionIds,
+            response_tx,
+        };
+
+        let handler = tokio::spawn(handle_legacy_request(
+            NeverCompletesService,
+            request,
+            permit,
+            ZakuraTrace::noop(),
+        ));
+
+        // Let the handler enter the (never-completing) service call, then model the
+        // request-stream side giving up: it drops the oneshot receiver.
+        tokio::task::yield_now().await;
+        drop(response_rx);
+
+        // The handler must observe the dropped receiver, abort the service work, and
+        // release the permit promptly. Without the fix this times out because the
+        // handler stays blocked in `service.call` until `LEGACY_REQUEST_TIMEOUT`.
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("handler aborts promptly after the request stream drops the receiver")
+            .expect("handler task does not panic");
+
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT,
+            "the in-flight permit must be released once the handler aborts"
+        );
     }
 
     #[test]
