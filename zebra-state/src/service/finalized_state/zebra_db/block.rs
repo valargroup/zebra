@@ -425,9 +425,8 @@ impl ZebraDb {
     /// older pre-boundary raw transactions are intentionally left intact.
     /// Returns `None` if the database has never pruned any data (it is
     /// effectively an archive database).
-    #[allow(clippy::unwrap_in_result)]
     pub fn lowest_retained_height(&self) -> Option<Height> {
-        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA).unwrap();
+        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
         self.db.zs_get(&pruning_metadata, &())
     }
 
