@@ -2346,7 +2346,7 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
+async fn rapid_redundant_status_is_rate_limited_and_new_block_spam_disconnects() {
     let network = Network::Mainnet;
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2358,7 +2358,11 @@ async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
     connect_peer(&fixture, status_peer.clone()).await;
     connect_peer(&fixture, block_peer.clone()).await;
 
-    for _ in 0..2 {
+    // Re-advertising the same (non-advancing) tip rapidly is benign: it must be
+    // rate-limited (dropped), not punished with a disconnect. A frozen/snapshot
+    // serving peer does exactly this, and tearing it down caused a reconnect
+    // storm. NewBlock flooding (below) is still a disconnect.
+    for _ in 0..3 {
         advertise_tip(
             &fixture,
             status_peer.clone(),
@@ -2368,16 +2372,6 @@ async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
             1,
         )
         .await;
-    }
-
-    loop {
-        if let HeaderSyncAction::Misbehavior { peer, reason } =
-            next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, status_peer);
-            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
-            break;
-        }
     }
 
     for bytes in [
@@ -2448,7 +2442,7 @@ async fn rapid_advancing_status_updates_are_not_spam() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn same_height_hash_churn_is_status_spam() {
+async fn same_height_hash_churn_is_rate_limited_not_disconnect() {
     let network = Network::Mainnet;
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2458,6 +2452,10 @@ async fn same_height_hash_churn_is_status_spam() {
     let status_peer = peer(59);
     connect_peer(&fixture, status_peer.clone()).await;
 
+    // Same-height hash churn does not advance the peer's tip, so the second
+    // update is rate-limited (dropped) rather than treated as misbehavior: a
+    // non-advancing status can never harm us, and disconnecting for it tore down
+    // healthy serving peers.
     advertise_tip_with_hash(
         &fixture,
         status_peer.clone(),
@@ -2479,13 +2477,14 @@ async fn same_height_hash_churn_is_status_spam() {
     )
     .await;
 
-    loop {
-        if let HeaderSyncAction::Misbehavior { peer, reason } =
-            next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, status_peer);
-            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
-            break;
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if let HeaderSyncAction::Misbehavior { reason, .. } = action {
+            panic!("redundant same-height status was reported as {reason:?}");
         }
     }
 }

@@ -641,8 +641,19 @@ impl HeaderSyncReactor {
                 let status_token_available =
                     peer_state.meters.inbound_status.try_take(Instant::now());
                 if !advances_advertised_tip && !status_token_available {
-                    self.report_misbehavior(peer, HeaderSyncMisbehavior::StatusSpam)
-                        .await;
+                    // A peer re-advertising a tip that does not advance our view of
+                    // its best header is harmless: it is normal for peers parked at
+                    // a frozen/snapshot tip, and for status "mirror" replies that a
+                    // peer sends after receiving our own status refreshes. When our
+                    // local frontier advances in bursts during active sync, those
+                    // mirror replies cluster inside the inbound-status interval.
+                    //
+                    // Rate-limit such redundant statuses by dropping the update,
+                    // rather than reporting `StatusSpam` and disconnecting. Hard
+                    // disconnecting here tore down the most valuable serving peers
+                    // in a reconnect storm. Genuine status flooding is still bounded
+                    // by the transport-level message rate limiter.
+                    metrics::counter!("sync.header.peer.status.rate_limited").increment(1);
                     return;
                 }
                 peer_state.advertised_tip = status.tip_height;

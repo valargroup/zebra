@@ -2703,25 +2703,9 @@ mod tests {
             .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::GetHeadersTooLong)
             .await?;
 
-        let status_spam = e2e_peer(92);
-        cluster.connect_peer(victim, status_spam.clone()).await;
-        cluster
-            .inject(
-                victim,
-                status_spam.clone(),
-                HeaderSyncMessage::Status(Default::default()),
-            )
-            .await;
-        cluster
-            .inject(
-                victim,
-                status_spam,
-                HeaderSyncMessage::Status(Default::default()),
-            )
-            .await;
-        cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::StatusSpam)
-            .await?;
+        // Redundant (non-advancing) status re-advertisement is rate-limited, not
+        // a disconnect: see `same_height_hash_churn_is_rate_limited_not_disconnect`.
+        // It is therefore intentionally absent from this hostile-disconnect matrix.
 
         let new_block_spam = e2e_peer(93);
         cluster.connect_peer(victim, new_block_spam.clone()).await;
@@ -2766,7 +2750,7 @@ mod tests {
         trace.assert_header_disconnect("get_headers_spam");
         trace.assert_header_disconnect("response_too_long");
         trace.assert_header_disconnect("get_headers_too_long");
-        trace.assert_header_disconnect("status_spam");
+        // Redundant non-advancing status is rate-limited, not a disconnect.
         trace.assert_header_disconnect("new_block_spam");
         trace.assert_header_disconnect("malformed_message");
         for node in ["03", "04", "05", "06"] {
