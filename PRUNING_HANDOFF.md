@@ -16,6 +16,41 @@ What works today:
 - One-way enforcement: a pruned DB refuses to open in archive mode.
 - Tests pass; `cargo build --workspace` passes; clippy/fmt clean for `zebra-state`.
 
+## Storage mode semantics
+
+Current design has two storage modes:
+
+- `archive`: the node is expected to retain and serve all historical raw
+  transaction data.
+- `pruned`: the node may delete historical raw transaction data below the
+  configured retention window.
+
+The transition is intentionally one-way once data has actually been pruned:
+
+- `archive -> archive`: allowed.
+- `archive -> pruned`: allowed.
+- `pruned -> pruned`: allowed.
+- `pruned -> archive`: rejected after pruning has deleted data.
+
+The reason is semantic, not just mechanical: once raw transaction data is missing,
+the database can no longer honestly satisfy the archive-mode contract. Reopening
+that same DB as archive would make RPC/history behavior look archive-capable even
+though older raw transaction bytes may be gone.
+
+This one-way marker is `pruning_metadata[()] = lowest_retained_height`. If the
+marker is absent, the DB is treated as not-yet-pruned and can still open as
+archive. This covers both regular archive DBs and pruned-configured DBs that have
+not reached the retention boundary yet. For compatibility with older DBs, a
+missing `pruning_metadata` column family also means "not pruned".
+
+Alternative design worth discussing: a Cosmos-like mode switch could allow
+`pruned -> archive` by changing the meaning to "stop pruning from this height
+forward." In that model, the DB would remain non-archive for historical heights
+below the old pruning boundary, but it would retain all data from the switch-back
+height onward. That would need a different user-facing contract than today's
+binary `archive`/`pruned` modes, probably including an explicit "archive from
+height N" marker and clearer RPC errors for requests below that boundary.
+
 ## The one gotcha that matters most
 
 **`tx_loc_by_hash` is consensus-load-bearing — do NOT prune it.**
@@ -61,12 +96,13 @@ transactions whose outputs are all spent — i.e. track spentness, not height.
    `format_upgrades()` — required so the upgrade framework reconciles the version
    cleanly. Bump minor again (and add another `NoMigration`) if you add more CFs.
 
-6. **New CF is created on ALL databases**, archive included (empty there). It's
-   created lazily via `create_missing_column_families(true)`. The marker
-   (`lowest_retained_height` under unit key `()`) is only *written* once pruning
-   actually deletes something — so an archive DB, or a pruned-configured DB that
-   hasn't hit the retention height yet, has no marker and can still be opened as
-   archive.
+6. **New CF is created on upgraded writable databases**, archive included (empty
+   there). It's created lazily via `create_missing_column_families(true)`. The
+   marker (`lowest_retained_height` under unit key `()`) is only *written* once
+   pruning actually deletes something — so an archive DB, or a pruned-configured
+   DB that hasn't hit the retention height yet, has no marker and can still be
+   opened as archive. Old/read-only DB opens may not have the CF yet; treat a
+   missing `pruning_metadata` CF the same as a missing marker: not pruned.
 
 7. **Backlog drain is bounded.** `MAX_PRUNE_HEIGHTS_PER_COMMIT = 100`. In steady
    state each commit makes exactly 1 height prunable. The cap only matters when
