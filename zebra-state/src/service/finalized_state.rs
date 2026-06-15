@@ -123,6 +123,12 @@ pub struct FinalizedState {
     /// Commit blocks to the finalized state up to this height, then exit Zebra.
     debug_stop_at_height: Option<block::Height>,
 
+    /// Whether checkpoint-verified blocks may be written without a write-ahead
+    /// log. Defaults to `true`. This is an in-memory toggle (not persisted in
+    /// the config) used to A/B the WAL-relaxation in benchmarks; setting it to
+    /// `false` restores fully WAL-durable commits for every block.
+    checkpoint_skip_wal: bool,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -215,6 +221,7 @@ impl FinalizedState {
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
+            checkpoint_skip_wal: true,
             db,
             elastic_db,
             elastic_blocks: vec![],
@@ -223,6 +230,7 @@ impl FinalizedState {
         #[cfg(not(feature = "elasticsearch"))]
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
+            checkpoint_skip_wal: true,
             db,
         };
 
@@ -269,6 +277,17 @@ impl FinalizedState {
     /// Returns the configured network for this database.
     pub fn network(&self) -> Network {
         self.db.network()
+    }
+
+    /// Sets whether checkpoint-verified blocks may be committed without a
+    /// write-ahead log.
+    ///
+    /// Defaults to `true`. This override exists only for benchmarks that A/B the
+    /// WAL-relaxation; setting it to `false` makes every block commit fully
+    /// WAL-durable. It is not exposed in production builds.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn set_checkpoint_skip_wal(&mut self, enabled: bool) {
+        self.checkpoint_skip_wal = enabled;
     }
 
     /// Commit a checkpoint-verified block to the state.
@@ -329,6 +348,14 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        // Checkpoint-verified blocks are reproducible from the hard-coded
+        // checkpoint hashes, so they can be written without a write-ahead log: a
+        // crash just discards any unflushed blocks and sync resumes from the
+        // recovered finalized tip. Contextually (semantically) verified blocks
+        // are not reproducible, so they keep WAL durability.
+        let disable_wal = self.checkpoint_skip_wal
+            && matches!(&finalizable_block, FinalizableBlock::Checkpoint { .. });
+
         let (height, hash, finalized, prev_note_commitment_trees) = match finalizable_block {
             FinalizableBlock::Checkpoint {
                 checkpoint_verified,
@@ -444,6 +471,7 @@ impl FinalizedState {
             prev_note_commitment_trees,
             &self.network(),
             source,
+            disable_wal,
         );
 
         if result.is_ok() {

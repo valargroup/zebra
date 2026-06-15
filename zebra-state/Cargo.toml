@@ -112,5 +112,13 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 zebra-chain = { path = "../zebra-chain", version = "9.0.0", features = ["proptest-impl"] }
 zebra-test = { path = "../zebra-test/", version = "3.0.0" }
 
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[bench]]
+name = "checkpoint_commit"
+harness = false
+# Uses the block-generation strategies from the `arbitrary` module.
+required-features = ["proptest-impl"]
+
 [lints]
 workspace = true

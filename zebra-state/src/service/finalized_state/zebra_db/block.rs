@@ -435,6 +435,7 @@ impl ZebraDb {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         network: &Network,
         source: &str,
+        disable_wal: bool,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -570,7 +571,7 @@ impl ZebraDb {
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db
-            .write(batch)
+            .write_finalized_block(batch, disable_wal)
             .expect("unexpected rocksdb error while writing block");
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());

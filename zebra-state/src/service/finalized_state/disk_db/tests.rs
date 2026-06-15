@@ -26,6 +26,64 @@ impl DiskDb {
     }
 }
 
+/// Checkpoint-style (WAL-less) writes are durable in the memtable and readable,
+/// mark a flush as pending, and the next WAL-backed write flushes them first
+/// (clearing the pending flag) while keeping all earlier data readable.
+#[test]
+fn write_finalized_block_skips_wal_and_flushes_at_boundary() {
+    use std::sync::atomic::Ordering;
+
+    use zebra_chain::{block::Height, parameters::Network};
+
+    use crate::{
+        constants::state_database_format_version_in_code,
+        service::finalized_state::disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
+        Config,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let column_families = ["default".to_string(), "wal_test".to_string()];
+
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "wal_test_db",
+        &state_database_format_version_in_code(),
+        &network,
+        column_families,
+        false,
+    );
+
+    let cf = db.cf_handle("wal_test").expect("test column family exists");
+
+    // A WAL-less (checkpoint-verified) write marks a flush as pending and is readable.
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&cf, Height(1), Height(10));
+    db.write_finalized_block(batch, true)
+        .expect("wal-less write succeeds");
+
+    assert!(
+        db.wal_flush_pending.load(Ordering::Acquire),
+        "a wal-less write must mark a flush as pending",
+    );
+    assert_eq!(db.zs_get(&cf, &Height(1)), Some(Height(10)));
+
+    // A WAL-backed (semantically-verified) write flushes the earlier WAL-less
+    // write to SST files first, clearing the pending flag, and is itself readable.
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&cf, Height(2), Height(20));
+    db.write_finalized_block(batch, false)
+        .expect("wal-backed write succeeds");
+
+    assert!(
+        !db.wal_flush_pending.load(Ordering::Acquire),
+        "a wal-backed write must flush pending wal-less writes and clear the flag",
+    );
+    assert_eq!(db.zs_get(&cf, &Height(1)), Some(Height(10)));
+    assert_eq!(db.zs_get(&cf, &Height(2)), Some(Height(20)));
+}
+
 /// Check that zs_iter_opts returns an upper bound one greater than provided inclusive end bounds.
 #[test]
 fn zs_iter_opts_increments_key_by_one() {
