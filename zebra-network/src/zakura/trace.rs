@@ -131,6 +131,18 @@ pub mod block_sync_trace {
     pub const PEERS: &str = "peers";
     /// Connected block-sync peers whose status we have received (schedulable).
     pub const PEERS_WITH_STATUS: &str = "peers_with_status";
+    /// Lowest height still in the body-sync `needed` set (the gap to fetch next).
+    pub const NEEDED_MIN: &str = "needed_min";
+    /// Number of heights in the body-sync `needed` set after buffer filtering.
+    pub const NEEDED_COUNT: &str = "needed_count";
+    /// Number of ranges queued in the scheduler.
+    pub const QUEUE_LEN: &str = "queue_len";
+    /// Lowest start height across queued scheduler ranges.
+    pub const QUEUE_MIN_START: &str = "queue_min_start";
+    /// Number of distinct assigned range keys in the scheduler.
+    pub const ASSIGNED_LEN: &str = "assigned_len";
+    /// Highest end height across the scheduler's covered intervals.
+    pub const COVERED_MAX_END: &str = "covered_max_end";
 
     /// Peer status received (servable body range advertised by the peer).
     pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
@@ -286,6 +298,9 @@ pub struct ZakuraTraceEvent<'a> {
     event: &'static str,
     conn: Option<u64>,
     stream: Option<u64>,
+    payload_len: Option<u64>,
+    frame_len: Option<u64>,
+    max_frame_bytes: Option<u64>,
     peer: Option<&'a str>,
     role: Option<&'static str>,
     phase: Option<&'static str>,
@@ -303,6 +318,9 @@ impl<'a> ZakuraTraceEvent<'a> {
             event,
             conn: None,
             stream: None,
+            payload_len: None,
+            frame_len: None,
+            max_frame_bytes: None,
             peer: None,
             role: None,
             phase: None,
@@ -323,6 +341,24 @@ impl<'a> ZakuraTraceEvent<'a> {
     /// Attach a local stream id.
     pub fn stream(mut self, stream: u64) -> Self {
         self.stream = Some(stream);
+        self
+    }
+
+    /// Attach a declared frame payload length.
+    pub fn payload_len(mut self, payload_len: u64) -> Self {
+        self.payload_len = Some(payload_len);
+        self
+    }
+
+    /// Attach an encoded frame length.
+    pub fn frame_len(mut self, frame_len: u64) -> Self {
+        self.frame_len = Some(frame_len);
+        self
+    }
+
+    /// Attach the effective frame byte cap used by the receiver.
+    pub fn max_frame_bytes(mut self, max_frame_bytes: u64) -> Self {
+        self.max_frame_bytes = Some(max_frame_bytes);
         self
     }
 
@@ -384,6 +420,9 @@ impl<'a> ZakuraTraceEvent<'a> {
         row.insert("event".to_string(), Value::String(self.event.to_string()));
         insert_optional_u64(row, "conn", self.conn);
         insert_optional_u64(row, "stream", self.stream);
+        insert_optional_u64(row, "payload_len", self.payload_len);
+        insert_optional_u64(row, "frame_len", self.frame_len);
+        insert_optional_u64(row, "max_frame_bytes", self.max_frame_bytes);
         insert_optional_str(row, "peer", self.peer);
         insert_optional_str(row, "role", self.role);
         insert_optional_str(row, "phase", self.phase);

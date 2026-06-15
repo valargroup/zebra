@@ -605,7 +605,26 @@ impl BlockSyncReactor {
             .reorder
             .insert(height, block, serialized_bytes, &mut self.state.budget)
         {
-            ReorderInsertResult::Inserted | ReorderInsertResult::Duplicate => {}
+            ReorderInsertResult::Inserted => {
+                // A received body is now held in memory. Mark it covered so the
+                // retry path stops re-requesting it. `refresh_needed` already
+                // drops buffered heights from `needed`, but the retry path
+                // (`handle_timeouts` / `handle_blocks_done` -> `retry`) bypasses
+                // that filter and re-queues buffered heights via `push_front`.
+                // A run buffered above an open gap was otherwise re-fetched
+                // indefinitely (in production a single height was re-requested
+                // thousands of times), pinning the queue front and every peer
+                // slot so the gap below the run never got a request and the
+                // download floor never advanced. `retry`, `ensure`, and
+                // `prune_covered` all skip covered heights, so this stops the
+                // churn and lets the gap be scheduled. Covered is cleared if the
+                // block is later rolled back (apply `Rejected`/`TimedOut` ->
+                // `clear_covered_from`) or the chain tip resets, both of which
+                // also drop the buffer, so a dropped body becomes requestable
+                // again.
+                self.state.schedule.mark_height_covered(height);
+            }
+            ReorderInsertResult::Duplicate => {}
             ReorderInsertResult::BudgetFull => {
                 if let Some(request) = retry_request {
                     self.state.schedule.retry(request);
@@ -1320,6 +1339,33 @@ impl BlockSyncReactor {
             bs_insert_u64(row, bs_trace::BUDGET_RESERVED, self.state.budget.reserved());
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
             bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+            // Scheduling visibility: distinguishes "gap not in `needed`"
+            // (state/filter) from "gap in `needed` but never queued" (`ensure`
+            // rejected it) from "queued but never requested" (starvation).
+            if let Some(min) = self.state.needed_heights.first() {
+                bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+            }
+            bs_insert_u64(
+                row,
+                bs_trace::NEEDED_COUNT,
+                self.state.needed_heights.len() as u64,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::QUEUE_LEN,
+                self.state.schedule.queued_range_count() as u64,
+            );
+            if let Some(start) = self.state.schedule.queued_min_start() {
+                bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+            }
+            bs_insert_u64(
+                row,
+                bs_trace::ASSIGNED_LEN,
+                self.state.schedule.assigned_key_count() as u64,
+            );
+            if let Some(end) = self.state.schedule.covered_max_end() {
+                bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+            }
         });
     }
 

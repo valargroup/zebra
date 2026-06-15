@@ -3847,18 +3847,28 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         .await
         .expect("block frame queues");
 
-    // Height 3 is now buffered; the scheduler re-requests it (the held range
-    // lingers in the queue). Waiting for that re-request also confirms the
-    // body has been processed into the reorder buffer.
-    assert_eq!(
-        wait_for_getblocks(&mut actions).await,
-        (peer_id.clone(), block::Height(3), 1),
-        "buffered-but-uncommitted height 3 is re-requested while it lingers queued",
-    );
+    // Height 3 is now buffered in the reorder buffer and marked covered. Drain
+    // to quiescence: this both lets the reactor finish processing the body and
+    // asserts the core fix — a buffered (covered) height is NEVER re-requested.
+    // The production deadlock re-requested the held run thousands of times via
+    // the retry path (which bypasses the `needed`-set filter), pinning the queue
+    // and every peer slot so the gap below the run never got a request.
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(50), actions.recv()).await
+    {
+        match action {
+            BlockSyncAction::SendMessage {
+                msg: BlockSyncMessage::GetBlocks { start_height, .. },
+                ..
+            } => panic!("buffered (covered) height {start_height:?} must not be re-requested"),
+            BlockSyncAction::SendMessage { .. } | BlockSyncAction::QueryNeededBlocks { .. } => {}
+            other => panic!("unexpected action after buffering block: {other:?}"),
+        }
+    }
 
-    // The state still reports both 2 and 3 as body-missing, because the reorder
-    // buffer is invisible to it. The reactor must now schedule the gap at height
-    // 2 instead of staying trapped re-requesting the already-buffered height 3.
+    // The state still reports both 2 and 3 as body-missing because the reorder
+    // buffer is invisible to it. With height 3 covered, the reactor must schedule
+    // the gap at height 2 rather than staying trapped on the buffered run.
     handle
         .send(BlockSyncEvent::NeededBlocks(vec![
             block_meta(&blocks[1]),
@@ -3867,9 +3877,11 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         .await
         .expect("needed metadata queues");
 
+    let (got_peer, got_start, _count) = wait_for_getblocks(&mut actions).await;
+    assert_eq!(got_peer, peer_id);
     assert_eq!(
-        wait_for_getblocks(&mut actions).await,
-        (peer_id, block::Height(2), 1),
+        got_start,
+        block::Height(2),
         "reactor must schedule the gap at height 2 below the buffered reorder run",
     );
 

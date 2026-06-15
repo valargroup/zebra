@@ -2705,12 +2705,17 @@ async fn persistent_stream_worker(
                         break;
                     }
                     Err(error) => {
-                        if matches!(error, ZakuraHandlerError::Oversize) {
+                        if let Some((payload_len, frame_len, max_frame_bytes)) =
+                            error.oversize_frame_details()
+                        {
                             context.trace.emit(
                                 RATELIMIT_TABLE,
                                 context
                                     .event("frame.oversize")
-                                    .stream_kind(stream_kind_label(prelude.stream_kind)),
+                                    .stream_kind(stream_kind_label(prelude.stream_kind))
+                                    .payload_len(payload_len)
+                                    .frame_len(frame_len)
+                                    .max_frame_bytes(max_frame_bytes),
                             );
                         }
                         debug!(?error, "closing Zakura stream worker");
@@ -2908,7 +2913,11 @@ async fn read_frame(
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
-        return Err(ZakuraHandlerError::Oversize);
+        return Err(ZakuraHandlerError::OversizeFrame {
+            payload_len,
+            frame_len,
+            max_frame_bytes,
+        });
     }
     let mut payload = vec![0; payload_len];
     timeout(read_timeout, recv.read_exact(&mut payload))
@@ -3087,10 +3096,9 @@ async fn write_outbound_request_frame_inner(
                     ZakuraHandlerError::Timeout("outbound response"),
                 )));
             }
-            Err(ZakuraHandlerError::Oversize) => {
-                return Err(OutboundRequestError::Fatal(Box::new(
-                    ZakuraHandlerError::Oversize,
-                )));
+            Err(error @ ZakuraHandlerError::OversizeFrame { .. })
+            | Err(error @ ZakuraHandlerError::Oversize) => {
+                return Err(OutboundRequestError::Fatal(Box::new(error)));
             }
             Err(error) => return Err(OutboundRequestError::Fatal(Box::new(error))),
         }
@@ -3834,6 +3842,19 @@ pub enum ZakuraHandlerError {
     /// A peer-controlled payload exceeded its cap.
     #[error("Zakura payload exceeded its cap")]
     Oversize,
+    /// A peer declared a frame larger than the effective receiver cap.
+    #[error(
+        "Zakura frame length {frame_len} exceeded cap {max_frame_bytes} \
+         (payload length {payload_len})"
+    )]
+    OversizeFrame {
+        /// Declared frame payload length.
+        payload_len: usize,
+        /// Full frame length including the fixed header.
+        frame_len: usize,
+        /// Effective frame cap used before reading the payload.
+        max_frame_bytes: usize,
+    },
     /// The peer closed the stream or connection.
     #[error("Zakura stream closed")]
     Closed,
@@ -3876,6 +3897,25 @@ pub enum ZakuraHandlerError {
     /// I/O error while encoding or decoding local buffers.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl ZakuraHandlerError {
+    fn oversize_frame_details(&self) -> Option<(u64, u64, u64)> {
+        let Self::OversizeFrame {
+            payload_len,
+            frame_len,
+            max_frame_bytes,
+        } = self
+        else {
+            return None;
+        };
+
+        Some((
+            u64::try_from(*payload_len).unwrap_or(u64::MAX),
+            u64::try_from(*frame_len).unwrap_or(u64::MAX),
+            u64::try_from(*max_frame_bytes).unwrap_or(u64::MAX),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -5438,7 +5478,7 @@ mod tests {
             .expect("capture handler forwards the oversized inbound-cap stream");
         let rejected = read_frame(&mut s1_recv, inbound_cap, Duration::from_secs(2)).await;
         assert!(
-            matches!(rejected, Err(ZakuraHandlerError::Oversize)),
+            matches!(rejected, Err(ZakuraHandlerError::OversizeFrame { .. })),
             "a frame whose payload exceeds max_message_bytes must be rejected as Oversize \
              on the header alone with the inbound (message-limited) cap, before the payload \
              is allocated and read; got {rejected:?}"
@@ -5465,7 +5505,11 @@ mod tests {
             .expect("capture handler forwards the oversized raw-cap stream");
         let allocated = read_frame(&mut s2_recv, raw_cap, Duration::from_secs(2)).await;
         assert!(
-            allocated.is_err() && !matches!(allocated, Err(ZakuraHandlerError::Oversize)),
+            allocated.is_err()
+                && !matches!(
+                    allocated,
+                    Err(ZakuraHandlerError::Oversize | ZakuraHandlerError::OversizeFrame { .. })
+                ),
             "with the raw frame cap the same oversized frame passes the size check and \
              read_frame proceeds to allocate/read the payload (it is not rejected as \
              Oversize), proving the message cap is enforced too late; got {allocated:?}"
