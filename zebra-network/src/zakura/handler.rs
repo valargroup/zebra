@@ -2335,6 +2335,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                 config.zakura.block_sync.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();
+            startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
             (Some(handle), Some(actions), Some(task))
         } else {

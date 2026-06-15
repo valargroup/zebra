@@ -138,6 +138,7 @@ mod tests {
     use crate::{
         zakura::trace::header_sync_trace as hs_trace,
         zakura::{
+            block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             spawn_header_sync_reactor, DiscoveryMessage, Frame, FramedRecv, FramedSend,
             HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers,
             HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
@@ -1240,6 +1241,132 @@ mod tests {
         assert!(reader.node("01").table("stream").count("accepted") >= 1);
         assert!(reader.node("01").table("ratelimit").count("frame.oversize") >= 1);
 
+        assert!(capture.finish().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_stream6_oversize_frame_is_traceable_over_real_connection(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let mut capture = TraceCapture::for_test_with_keep_override(
+            "native_stream6_oversize_frame_is_traceable_over_real_connection",
+            false,
+        )?;
+        let mut cluster = ZakuraTestCluster::new();
+        let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
+        let victim = cluster.node(victim_idx);
+        let hostile =
+            HostilePeer::connect_native_with_capabilities(victim, 2, ZAKURA_CAP_BLOCK_SYNC).await?;
+        let hostile_peer = hostile.id()?;
+        let peer_set = victim.supervisor().subscribe();
+
+        await_until("block-sync peer registered", Duration::from_secs(5), || {
+            peer_set.borrow().contains(&hostile_peer)
+        })
+        .await?;
+        assert!(
+            MAX_BS_FRAME_BYTES < victim.limits().max_frame_bytes,
+            "test payload must fit the negotiated connection cap but exceed stream-6's cap"
+        );
+        hostile
+            .send_frame_header_with_declared_payload_len(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                MAX_BS_FRAME_BYTES,
+            )
+            .await?;
+
+        await_until("stream-6 oversize trace", Duration::from_secs(5), || {
+            capture.reader().is_ok_and(|reader| {
+                reader
+                    .node("01")
+                    .table("ratelimit")
+                    .rows()
+                    .iter()
+                    .any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some("frame.oversize")
+                            && row.get("stream_kind").and_then(serde_json::Value::as_str)
+                                == Some("block_sync")
+                    })
+            })
+        })
+        .await?;
+        await_until(
+            "oversized stream-6 frame disconnects peer",
+            Duration::from_secs(5),
+            || !peer_set.borrow().contains(&hostile_peer),
+        )
+        .await?;
+
+        hostile.shutdown().await;
+        cluster.shutdown().await;
+        assert!(capture.finish().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_stream6_declared_payload_above_old_cap_is_not_raw_oversize(
+    ) -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let mut capture = TraceCapture::for_test_with_keep_override(
+            "native_stream6_declared_payload_above_old_cap_is_not_raw_oversize",
+            false,
+        )?;
+        let mut cluster = ZakuraTestCluster::new();
+        let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
+        let victim = cluster.node(victim_idx);
+        let hostile =
+            HostilePeer::connect_native_with_capabilities(victim, 2, ZAKURA_CAP_BLOCK_SYNC).await?;
+        let hostile_peer = hostile.id()?;
+        let peer_set = victim.supervisor().subscribe();
+
+        await_until("block-sync peer registered", Duration::from_secs(5), || {
+            peer_set.borrow().contains(&hostile_peer)
+        })
+        .await?;
+
+        let old_max_bs_message_bytes =
+            u32::try_from(block::MAX_BLOCK_BYTES).expect("max block bytes fits in u32") + 1;
+        let regression_payload_len = old_max_bs_message_bytes + 1;
+        assert!(
+            regression_payload_len < MAX_BS_FRAME_BYTES,
+            "test payload must exceed the old stream-6 cap but fit the new one"
+        );
+
+        hostile
+            .send_frame_header_with_declared_payload_len(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                regression_payload_len,
+            )
+            .await?;
+
+        await_until(
+            "incomplete stream-6 frame disconnects peer",
+            Duration::from_secs(5),
+            || !peer_set.borrow().contains(&hostile_peer),
+        )
+        .await?;
+
+        let reader = capture.reader()?;
+        let raw_oversize = reader
+            .node("01")
+            .table("ratelimit")
+            .rows()
+            .iter()
+            .any(|row| {
+                row.get("event").and_then(serde_json::Value::as_str) == Some("frame.oversize")
+                    && row.get("stream_kind").and_then(serde_json::Value::as_str)
+                        == Some("block_sync")
+            });
+        assert!(
+            !raw_oversize,
+            "payloads above the old stream-6 cap but below the new cap must reach \
+             the stream payload reader instead of being dropped as raw frame.oversize"
+        );
+
+        hostile.shutdown().await;
+        cluster.shutdown().await;
         assert!(capture.finish().await?.is_none());
         Ok(())
     }

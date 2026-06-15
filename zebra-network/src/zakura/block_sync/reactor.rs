@@ -90,6 +90,7 @@ impl BlockSyncReactor {
         }
         self.release_caught_up_block_sync_peers();
         self.publish_metrics();
+        self.trace_sync_state();
         loop {
             tokio::select! {
                 biased;
@@ -115,6 +116,7 @@ impl BlockSyncReactor {
                 _ = ticks.tick() => {
                     self.handle_timeouts().await;
                     self.publish_metrics();
+                    self.trace_sync_state();
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
             }
@@ -294,6 +296,7 @@ impl BlockSyncReactor {
             self.release_applied_blocks_through(frontiers.verified_block_tip);
             self.drop_outstanding_through(frontiers.verified_block_tip);
             self.state.verified_block_tip = frontiers.verified_block_tip;
+            self.trace_frontiers_changed(frontiers.verified_block_tip);
             self.release_contiguous_blocks().await;
         }
         self.queue_status_refresh_if_changed(old_serving_tip);
@@ -306,6 +309,7 @@ impl BlockSyncReactor {
 
     async fn handle_chain_tip_reset(&mut self, frontiers: BlockSyncFrontiers) {
         metrics::counter!("sync.block.reorg.reset").increment(1);
+        self.trace_chain_tip_reset(frontiers.verified_block_tip);
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
@@ -472,6 +476,7 @@ impl BlockSyncReactor {
         peer_state.max_inflight_requests = clamp_advertised_inflight(status.max_inflight_requests);
         peer_state.max_response_bytes = clamp_advertised_response_bytes(status.max_response_bytes);
         peer_state.received_status = true;
+        self.trace_status_received(&peer, status);
         self.schedule().await;
     }
 
@@ -552,6 +557,7 @@ impl BlockSyncReactor {
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
+        self.trace_body_received(&peer, height, serialized_bytes);
         self.state.budget.release(estimated_bytes);
         let mut completed = None;
         if let Some(peer_state) = self.state.peers.get_mut(&peer) {
@@ -710,6 +716,7 @@ impl BlockSyncReactor {
             return;
         };
 
+        self.trace_range_unavailable(&peer, start_height);
         self.finish_peer_outstanding_at(&peer, index, OutstandingRangeDisposition::RetryMissing);
         self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
             .await;
@@ -857,6 +864,7 @@ impl BlockSyncReactor {
         }
 
         self.state.budget.release(applying.bytes);
+        self.trace_apply_finished(height, result);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
@@ -965,6 +973,14 @@ impl BlockSyncReactor {
         self.submit_pending_blocks().await;
 
         if self.should_pause_new_body_downloads() {
+            let reason = if self.body_lag() == 0 {
+                "lag_zero"
+            } else if self.body_lag() <= self.startup.config.near_tip_body_download_pause_blocks {
+                "near_tip"
+            } else {
+                "budget_full"
+            };
+            self.trace_downloads_paused(reason);
             return;
         }
 
@@ -1006,6 +1022,12 @@ impl BlockSyncReactor {
             }
 
             metrics::counter!("sync.block.request.sent").increment(1);
+            self.trace_get_blocks_sent(
+                &peer_id,
+                request.start_height,
+                request.count,
+                request.estimated_bytes,
+            );
             let deadline = Instant::now() + self.startup.config.request_timeout;
             if let Some(peer) = self.state.peers.get_mut(&peer_id) {
                 peer.outstanding.push(OutstandingBlockRange {
@@ -1074,6 +1096,7 @@ impl BlockSyncReactor {
             {
                 return;
             }
+            self.trace_body_submitted(height);
             if let Some(applying) = self.state.applying.get_mut(&height) {
                 applying.submitted = true;
             }
@@ -1219,6 +1242,150 @@ impl BlockSyncReactor {
         }
     }
 
+    fn emit_trace(
+        &self,
+        event: &'static str,
+        build: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        self.startup.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(event.to_string()),
+            );
+            build(row);
+        });
+    }
+
+    /// Emit the periodic reactor snapshot used to diagnose body-sync stalls.
+    ///
+    /// This is the highest-signal row: a stall shows up as `body_download_floor`
+    /// and `verified_block_tip` frozen while `best_header_tip` climbs, plus
+    /// whichever resource is pinned (`budget_available == 0`, `applying`/`reorder`
+    /// growing, or `peers_with_status == 0`).
+    fn trace_sync_state(&self) {
+        if !self.startup.trace.is_enabled() {
+            return;
+        }
+        let outstanding: usize = self
+            .state
+            .peers
+            .values()
+            .map(|peer| peer.outstanding.len())
+            .sum();
+        let peers_with_status = self
+            .state
+            .peers
+            .values()
+            .filter(|peer| peer.received_status)
+            .count();
+        self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
+            bs_insert_height(
+                row,
+                bs_trace::BODY_DOWNLOAD_FLOOR,
+                self.state.body_download_floor,
+            );
+            bs_insert_height(
+                row,
+                bs_trace::VERIFIED_BLOCK_TIP,
+                self.state.verified_block_tip,
+            );
+            bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
+            bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
+            bs_insert_u64(row, bs_trace::APPLYING, self.state.applying.len() as u64);
+            bs_insert_u64(row, bs_trace::REORDER, self.state.reorder.len() as u64);
+            bs_insert_u64(row, bs_trace::OUTSTANDING, outstanding as u64);
+            bs_insert_u64(
+                row,
+                bs_trace::BUDGET_AVAILABLE,
+                self.state.budget.available(),
+            );
+            bs_insert_u64(row, bs_trace::BUDGET_RESERVED, self.state.budget.reserved());
+            bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
+            bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+        });
+    }
+
+    fn trace_status_received(&self, peer: &ZakuraPeerId, status: BlockSyncStatus) {
+        self.emit_trace(bs_trace::BLOCK_STATUS_RECEIVED, |row| {
+            bs_insert_peer(row, bs_trace::PEER, peer);
+            bs_insert_height(row, bs_trace::RANGE_START, status.servable_low);
+            bs_insert_height(row, bs_trace::HEIGHT, status.servable_high);
+        });
+    }
+
+    fn trace_get_blocks_sent(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        count: u32,
+        estimated_bytes: u64,
+    ) {
+        self.emit_trace(bs_trace::BLOCK_GET_BLOCKS_SENT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, peer);
+            bs_insert_height(row, bs_trace::RANGE_START, start_height);
+            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(count));
+            bs_insert_u64(row, bs_trace::ESTIMATED_BYTES, estimated_bytes);
+        });
+    }
+
+    fn trace_body_received(
+        &self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+        serialized_bytes: u64,
+    ) {
+        self.emit_trace(bs_trace::BLOCK_BODY_RECEIVED, |row| {
+            bs_insert_peer(row, bs_trace::PEER, peer);
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, serialized_bytes);
+        });
+    }
+
+    fn trace_body_submitted(&self, height: block::Height) {
+        self.emit_trace(bs_trace::BLOCK_BODY_SUBMITTED, |row| {
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+        });
+    }
+
+    fn trace_apply_finished(&self, height: block::Height, result: BlockApplyResult) {
+        self.emit_trace(bs_trace::BLOCK_APPLY_FINISHED, |row| {
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(result));
+        });
+    }
+
+    fn trace_range_unavailable(&self, peer: &ZakuraPeerId, start_height: block::Height) {
+        self.emit_trace(bs_trace::BLOCK_RANGE_UNAVAILABLE, |row| {
+            bs_insert_peer(row, bs_trace::PEER, peer);
+            bs_insert_height(row, bs_trace::RANGE_START, start_height);
+        });
+    }
+
+    fn trace_downloads_paused(&self, reason: &'static str) {
+        self.emit_trace(bs_trace::BLOCK_DOWNLOADS_PAUSED, |row| {
+            bs_insert_str(row, bs_trace::REASON, reason);
+            bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
+            bs_insert_u64(
+                row,
+                bs_trace::BUDGET_AVAILABLE,
+                self.state.budget.available(),
+            );
+        });
+    }
+
+    fn trace_frontiers_changed(&self, verified_block_tip: block::Height) {
+        self.emit_trace(bs_trace::BLOCK_FRONTIERS_CHANGED, |row| {
+            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
+            bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
+        });
+    }
+
+    fn trace_chain_tip_reset(&self, verified_block_tip: block::Height) {
+        self.emit_trace(bs_trace::BLOCK_CHAIN_TIP_RESET, |row| {
+            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
+        });
+    }
+
     fn publish_metrics(&self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
@@ -1313,6 +1480,50 @@ impl BlockSyncReactor {
 fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
+}
+
+fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
+    match result {
+        BlockApplyResult::Committed => "committed",
+        BlockApplyResult::Duplicate => "duplicate",
+        BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::TimedOut => "timed_out",
+    }
+}
+
+fn bs_insert_peer(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    peer: &ZakuraPeerId,
+) {
+    row.insert(
+        key.to_string(),
+        serde_json::Value::String(trace_peer_label(peer)),
+    );
+}
+
+fn bs_insert_height(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    height: block::Height,
+) {
+    bs_insert_u64(row, key, u64::from(height.0));
+}
+
+fn bs_insert_u64(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    value: u64,
+) {
+    row.insert(key.to_string(), serde_json::Value::from(value));
+}
+
+fn bs_insert_str(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    value: &str,
+) {
+    row.insert(key.to_string(), serde_json::Value::from(value.to_string()));
 }
 
 fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {

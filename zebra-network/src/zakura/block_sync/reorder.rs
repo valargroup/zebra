@@ -18,6 +18,10 @@ impl ReorderBuffer {
         self.buffered_bytes
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }

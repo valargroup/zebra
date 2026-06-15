@@ -21,7 +21,10 @@ use zebra_chain::{
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
-use super::{Frame, ServicePeerDirection, ServicePeerLimits, ZakuraPeerId};
+use super::{
+    trace::{block_sync_trace as bs_trace, peer_label as trace_peer_label, BLOCK_SYNC_TABLE},
+    Frame, ServicePeerDirection, ServicePeerLimits, ZakuraPeerId, ZakuraTrace,
+};
 
 mod config;
 mod error;

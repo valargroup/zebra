@@ -388,6 +388,19 @@ fn codec_rejects_malformed_discriminator_and_truncated_payload() {
 }
 
 #[test]
+fn codec_classifies_payloads_above_old_raw_stream6_cap() {
+    let old_max_bs_message_bytes =
+        usize::try_from(block::MAX_BLOCK_BYTES).expect("max block bytes fits in usize") + 1;
+    let payload = vec![99; old_max_bs_message_bytes + 1];
+
+    assert!(payload.len() <= MAX_BS_MESSAGE_BYTES);
+    assert!(matches!(
+        BlockSyncMessage::decode(&payload),
+        Err(BlockSyncWireError::UnknownMessageType(99))
+    ));
+}
+
+#[test]
 fn codec_rejects_oversized_frame_and_oversized_block() {
     let oversized_payload = vec![0; MAX_BS_MESSAGE_BYTES + 1];
     assert!(matches!(

@@ -74,6 +74,86 @@ pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     file_name: "legacy_request.jsonl",
 };
 
+/// Block-sync (stream-6) scheduling, download, submit, and commit events.
+pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable {
+    table: "block_sync",
+    file_name: "block_sync.jsonl",
+};
+
+/// Shared block-sync trace event names and field keys.
+///
+/// The block-sync body pipeline has no `tracing`-macro coverage in release
+/// builds (the binary is compiled with `release_max_level_info`, which strips
+/// the `debug!` sites), so these JSONL rows are the only runtime visibility into
+/// scheduling, download, submit, and commit progress. The periodic
+/// [`BLOCK_SYNC_STATE`] snapshot is the single most useful row for diagnosing a
+/// stall: it reports where the body floor, verified tip, and header tip are, how
+/// much is buffered/applying, and whether the byte budget or peer status is
+/// blocking new downloads.
+pub mod block_sync_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Estimated byte reservation for a requested range.
+    pub const ESTIMATED_BYTES: &str = "estimated_bytes";
+    /// Serialized byte size of a received body.
+    pub const SERIALIZED_BYTES: &str = "serialized_bytes";
+    /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
+    pub const RESULT: &str = "result";
+    /// Bounded reason field.
+    pub const REASON: &str = "reason";
+    /// Highest contiguous body height already submitted for apply.
+    pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
+    /// Highest verified (committed) block-body height.
+    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
+    /// Best header tip driving the body-download target.
+    pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Header tip minus verified body tip.
+    pub const BODY_LAG: &str = "body_lag";
+    /// Count of blocks submitted-but-not-yet-committed (held against budget).
+    pub const APPLYING: &str = "applying";
+    /// Count of out-of-order bodies buffered awaiting a contiguous prefix.
+    pub const REORDER: &str = "reorder";
+    /// Count of outstanding (in-flight) range requests across peers.
+    pub const OUTSTANDING: &str = "outstanding";
+    /// Remaining in-flight body byte budget.
+    pub const BUDGET_AVAILABLE: &str = "budget_available";
+    /// Reserved in-flight body byte budget.
+    pub const BUDGET_RESERVED: &str = "budget_reserved";
+    /// Connected block-sync peers.
+    pub const PEERS: &str = "peers";
+    /// Connected block-sync peers whose status we have received (schedulable).
+    pub const PEERS_WITH_STATUS: &str = "peers_with_status";
+
+    /// Peer status received (servable body range advertised by the peer).
+    pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
+    /// Body range request sent to a peer.
+    pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
+    /// Body received from a peer.
+    pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
+    /// Body submitted to the verifier for commit.
+    pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
+    /// Verifier finished applying a submitted body.
+    pub const BLOCK_APPLY_FINISHED: &str = "block_apply_finished";
+    /// Peer reported a requested range as unavailable.
+    pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
+    /// New body downloads were paused (lag, near-tip, or budget).
+    pub const BLOCK_DOWNLOADS_PAUSED: &str = "block_downloads_paused";
+    /// Verified body frontier advanced from state.
+    pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
+    /// Chain tip reset rolled the body frontier back.
+    pub const BLOCK_CHAIN_TIP_RESET: &str = "block_chain_tip_reset";
+    /// Periodic reactor state snapshot (the key stall-diagnosis row).
+    pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
+}
+
 /// Shared header-sync trace event names and field keys.
 pub mod header_sync_trace {
     /// Trace row event field.

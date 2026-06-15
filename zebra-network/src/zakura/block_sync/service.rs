@@ -12,9 +12,10 @@ use crate::zakura::{BoxRunFuture, Source};
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
-/// A block body is one frame and may be up to Zebra's `MAX_BLOCK_BYTES`; the
-/// stream also carries the inherited inner message discriminator and outer
-/// Zakura frame header, so it is intentionally larger than control frames.
+/// A block body is still decoded and validated against Zebra's
+/// `MAX_BLOCK_BYTES`; this frame cap has extra slack so stream-6 can classify
+/// oversized or incompatible block-sync payloads in the codec instead of
+/// dropping them at the raw transport gate.
 pub const MAX_BS_FRAME_BYTES: u32 = {
     // This cast is safe: MAX_BS_MESSAGE_BYTES is asserted below 4 MiB.
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
