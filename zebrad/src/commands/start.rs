@@ -74,12 +74,21 @@
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
 use std::{
-    collections::HashMap, future::Future, net::SocketAddr, path::Path, sync::Arc, time::Duration,
+    collections::{HashMap, VecDeque},
+    future::Future,
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::Duration,
 };
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
-use futures::FutureExt;
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesUnordered, StreamExt},
+    FutureExt,
+};
 use tokio::{
     pin, select,
     sync::{mpsc, oneshot, watch},
@@ -90,10 +99,10 @@ use tracing_futures::Instrument;
 use zebra_chain::block::{self, genesis::regtest_genesis_block};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_network::zakura::{
-    BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers,
-    BlockSyncHandle, BlockSyncMisbehavior, HeaderSyncAction, HeaderSyncCommitFailureKind,
-    HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup,
-    DEFAULT_HS_RANGE,
+    BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
+    BlockSyncFrontiers, BlockSyncHandle, BlockSyncMisbehavior, HeaderSyncAction,
+    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
+    ZakuraHeaderSyncDriverStartup, DEFAULT_HS_RANGE,
 };
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
@@ -535,12 +544,27 @@ async fn notify_block_sync_header_tip(
 
 const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BlockApplyClass {
+    Checkpoint,
+    Full,
+}
+
+#[derive(Clone, Debug)]
+struct PendingBlockApply {
+    class: BlockApplyClass,
+    block: Arc<block::Block>,
+}
+
 async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
     block_sync: BlockSyncHandle,
     read_state: ReadState,
     block_verifier: BlockVerifier,
+    max_checkpoint_height: block::Height,
+    checkpoint_apply_limit: usize,
+    full_apply_limit: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -557,9 +581,41 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
+    let checkpoint_apply_limit = checkpoint_apply_limit.max(sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT);
+    let full_apply_limit = full_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
+    let mut pending_applies = VecDeque::new();
+    let mut in_flight_applies = FuturesUnordered::new();
+    let mut checkpoint_in_flight = 0usize;
+    let mut full_in_flight = 0usize;
+
     loop {
         let action = select! {
             _ = &mut shutdown => return,
+            completed = in_flight_applies.next(), if !in_flight_applies.is_empty() => {
+                let Some(completed) = completed else {
+                    continue;
+                };
+                match completed {
+                    BlockApplyClass::Checkpoint => {
+                        checkpoint_in_flight = checkpoint_in_flight.saturating_sub(1);
+                    }
+                    BlockApplyClass::Full => {
+                        full_in_flight = full_in_flight.saturating_sub(1);
+                    }
+                }
+                drain_pending_block_applies(
+                    &mut pending_applies,
+                    &mut in_flight_applies,
+                    &mut checkpoint_in_flight,
+                    &mut full_in_flight,
+                    checkpoint_apply_limit,
+                    full_apply_limit,
+                    read_state.clone(),
+                    block_verifier.clone(),
+                    block_sync.clone(),
+                );
+                continue;
+            }
             action = actions.recv() => {
                 let Some(action) = action else {
                     return;
@@ -672,15 +728,138 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
             }
             BlockSyncAction::SubmitBlock { block } => {
-                commit_block_sync_body(
-                    block_verifier.clone(),
-                    read_state.clone(),
-                    &block_sync,
+                pending_applies.push_back(PendingBlockApply {
+                    class: block_apply_class(block.as_ref(), max_checkpoint_height),
                     block,
-                )
-                .await;
+                });
+                drain_pending_block_applies(
+                    &mut pending_applies,
+                    &mut in_flight_applies,
+                    &mut checkpoint_in_flight,
+                    &mut full_in_flight,
+                    checkpoint_apply_limit,
+                    full_apply_limit,
+                    read_state.clone(),
+                    block_verifier.clone(),
+                    block_sync.clone(),
+                );
             }
         }
+    }
+}
+
+fn drain_pending_block_applies<ReadState, BlockVerifier>(
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+    in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyClass>>,
+    checkpoint_in_flight: &mut usize,
+    full_in_flight: &mut usize,
+    checkpoint_apply_limit: usize,
+    full_apply_limit: usize,
+    read_state: ReadState,
+    block_verifier: BlockVerifier,
+    block_sync: BlockSyncHandle,
+) where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+    BlockVerifier:
+        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+    BlockVerifier::Future: Send + 'static,
+{
+    while let Some(index) = pending_applies
+        .iter()
+        .position(|pending| match pending.class {
+            BlockApplyClass::Checkpoint => *checkpoint_in_flight < checkpoint_apply_limit,
+            BlockApplyClass::Full => *full_in_flight < full_apply_limit,
+        })
+    {
+        let pending = pending_applies
+            .remove(index)
+            .expect("pending apply index was found in queue");
+
+        match pending.class {
+            BlockApplyClass::Checkpoint => {
+                *checkpoint_in_flight = checkpoint_in_flight.saturating_add(1);
+            }
+            BlockApplyClass::Full => {
+                *full_in_flight = full_in_flight.saturating_add(1);
+            }
+        }
+
+        let class = pending.class;
+        in_flight_applies.push(
+            apply_block_sync_body(
+                block_verifier.clone(),
+                read_state.clone(),
+                block_sync.clone(),
+                pending.block,
+            )
+            .map(move |_| class)
+            .boxed(),
+        );
+    }
+}
+
+fn block_apply_class(
+    block: &block::Block,
+    max_checkpoint_height: block::Height,
+) -> BlockApplyClass {
+    if block
+        .coinbase_height()
+        .is_some_and(|height| height <= max_checkpoint_height)
+    {
+        BlockApplyClass::Checkpoint
+    } else {
+        BlockApplyClass::Full
+    }
+}
+
+async fn apply_block_sync_body<BlockVerifier, ReadState>(
+    block_verifier: BlockVerifier,
+    read_state: ReadState,
+    block_sync: BlockSyncHandle,
+    block: Arc<block::Block>,
+) where
+    BlockVerifier:
+        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+    BlockVerifier::Future: Send + 'static,
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let expected_hash = block.hash();
+    let Some(height) = block.coinbase_height() else {
+        warn!(
+            ?expected_hash,
+            "Zakura block sync cannot apply body without coinbase height"
+        );
+        return;
+    };
+
+    let result = commit_block_sync_body(block_verifier.clone(), block).await;
+
+    let _ = block_sync
+        .send(BlockSyncEvent::BlockApplyFinished {
+            height,
+            hash: expected_hash,
+            result,
+        })
+        .await;
+
+    if result != BlockApplyResult::Committed {
+        refresh_block_sync_frontiers(read_state, &block_sync).await;
     }
 }
 
@@ -697,24 +876,15 @@ fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bool {
     )
 }
 
-async fn commit_block_sync_body<BlockVerifier, ReadState>(
+async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
-    read_state: ReadState,
-    block_sync: &BlockSyncHandle,
     block: Arc<block::Block>,
-) where
+) -> BlockApplyResult
+where
     BlockVerifier:
         Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
 {
     let expected_hash = block.hash();
     let height = block.coinbase_height();
@@ -732,6 +902,7 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                 ?committed_hash,
                 "Zakura block sync committed block body through verifier"
             );
+            BlockApplyResult::Committed
         }
         Ok(Ok(committed_hash)) => {
             warn!(
@@ -740,7 +911,7 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                 ?committed_hash,
                 "Zakura block-sync verifier returned an unexpected hash"
             );
-            refresh_block_sync_frontiers(read_state, block_sync).await;
+            BlockApplyResult::Rejected
         }
         Ok(Err(error)) => {
             if block_verify_error_is_duplicate(&error) {
@@ -750,6 +921,7 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                     ?error,
                     "Zakura block-sync body was already known by the block verifier"
                 );
+                BlockApplyResult::Duplicate
             } else {
                 debug!(
                     ?height,
@@ -757,8 +929,8 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                     ?error,
                     "Zakura block-sync body rejected by block verifier"
                 );
+                BlockApplyResult::Rejected
             }
-            refresh_block_sync_frontiers(read_state, block_sync).await;
         }
         Err(_elapsed) => {
             warn!(
@@ -766,7 +938,7 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                 ?expected_hash,
                 "timed out committing Zakura block-sync body"
             );
-            refresh_block_sync_frontiers(read_state, block_sync).await;
+            BlockApplyResult::TimedOut
         }
     }
 }
@@ -1054,6 +1226,7 @@ fn header_range_commit_failure_kind(
 
     match error {
         zebra_state::CommitHeaderRangeError::StorageWriteError { .. }
+        | zebra_state::CommitHeaderRangeError::MissingGenesisAnchor { .. }
         | zebra_state::CommitHeaderRangeError::SendCommitRequestFailed
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
@@ -1176,8 +1349,8 @@ fn block_sync_chain_tip_event(
     }
 }
 
-fn replace_legacy_syncer_on_zakura_path(config: &zebra_network::Config) -> bool {
-    config.v2_p2p && config.zakura.block_sync.replace_legacy_syncer
+fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
+    config.v2_p2p
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1384,6 +1557,9 @@ impl StartCmd {
                             block_sync.clone(),
                             read_only_state_service.clone(),
                             block_verifier_router.clone(),
+                            max_checkpoint_height,
+                            config.sync.checkpoint_verify_concurrency_limit,
+                            config.sync.full_verify_concurrency_limit,
                             shutdown.clone().cancelled_owned(),
                         )
                         .in_current_span(),
@@ -1629,7 +1805,12 @@ impl StartCmd {
         // that multi-hop block propagation works: gossiped blocks that arrive out of
         // order (e.g. only the latest tip hash was gossiped) will be recovered by the
         // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
+        //
+        // `debug_skip_regtest_genesis_self_seed` opts a node out of this shortcut so it
+        // downloads genesis from a peer instead, exercising the production
+        // genesis-bootstrap path (e.g. a Zakura-only node fetching genesis over Zakura).
         if is_regtest
+            && !config.sync.debug_skip_regtest_genesis_self_seed
             && !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
@@ -1646,10 +1827,9 @@ impl StartCmd {
                 "validated block hash should match network genesis hash"
             )
         }
-        let replace_legacy_syncer = replace_legacy_syncer_on_zakura_path(&config.network);
-        let syncer_task_handle = if replace_legacy_syncer {
+        let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!("Zakura block sync is replacing the legacy ChainSync body downloader");
-            tokio::spawn(std::future::pending::<Result<(), Report>>().in_current_span())
+            tokio::spawn(syncer.bootstrap_genesis_then_pause().in_current_span())
         } else {
             tokio::spawn(syncer.sync().in_current_span())
         };
@@ -2300,16 +2480,25 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn replace_legacy_syncer_gate_is_zakura_only_and_default_safe() {
+    fn zakura_block_sync_replaces_chain_sync_when_v2_p2p_is_enabled() {
         let mut config = zebra_network::Config::default();
 
-        assert!(!replace_legacy_syncer_on_zakura_path(&config));
-
-        config.zakura.block_sync.replace_legacy_syncer = true;
-        assert!(replace_legacy_syncer_on_zakura_path(&config));
+        assert!(use_zakura_block_sync(&config));
 
         config.v2_p2p = false;
-        assert!(!replace_legacy_syncer_on_zakura_path(&config));
+        assert!(!use_zakura_block_sync(&config));
+    }
+
+    #[test]
+    fn missing_genesis_anchor_is_local_header_sync_commit_failure() {
+        let error = zebra_state::CommitHeaderRangeError::MissingGenesisAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
     }
 
     #[test]
@@ -2576,6 +2765,9 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             read_state,
             verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2683,6 +2875,9 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             read_state,
             verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2725,6 +2920,94 @@ mod zakura_header_sync_driver_tests {
             Some(block2.hash())
         );
 
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_submits_checkpoint_blocks_without_waiting_for_first_commit() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let verifier = {
+            let release_first = release_first.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            let hash = block.hash();
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(hash)
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
+            panic!("read_state should not be called for successful commit: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<zebra_state::ReadResponse, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(
+                None,
+            ))
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            block_sync,
+            read_state,
+            verifier,
+            block::Height(2),
+            2,
+            sync::MIN_CONCURRENCY_LIMIT,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first checkpoint commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second checkpoint commit starts while first is pending"),
+            Some(block::Height(2))
+        );
+
+        release_first.notify_waiters();
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         reactor_task.abort();
@@ -2796,6 +3079,9 @@ mod zakura_header_sync_driver_tests {
             block_sync,
             read_state,
             verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
             async move {
                 let _ = shutdown_rx.await;
             },

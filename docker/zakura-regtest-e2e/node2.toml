@@ -31,6 +31,13 @@ trace_dir = "/traces/node2"
 [state]
 ephemeral = true
 
+[sync]
+# Force the from-scratch genesis-bootstrap path: skip the Regtest direct genesis
+# self-seed so this pure-Zakura node must download and verify genesis from node1
+# over Zakura before native header/body sync can advance. This is the exact path
+# a Mainnet/Testnet Zakura-only node takes from an empty state.
+debug_skip_regtest_genesis_self_seed = true
+
 [rpc]
 listen_addr = "127.0.0.1:18332"
 enable_cookie_auth = false

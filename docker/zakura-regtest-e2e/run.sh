@@ -13,20 +13,23 @@
 #
 # Asserts:
 #   1. all four nodes come up on a fresh Regtest chain,
-#   2. legacy TCP coexistence: node3 peers with node1 (getpeerinfo),
+#   2. legacy TCP compatibility: node3 peers with node1 (getpeerinfo),
 #   3. the legacy->Zakura upgrade ran (zakura_p2p_handshake_upgraded on node1/node4),
 #   4. the pure Zakura-only node2 has zero legacy peers (no legacy stack at all),
+#   4b. the pure Zakura-only node2 bootstraps the genesis block over Zakura: with
+#      the Regtest genesis self-seed disabled (sync.debug_skip_regtest_genesis_self_seed)
+#      and no legacy stack, node2 can only reach genesis by downloading it from
+#      node1 over Zakura — the production Mainnet/Testnet bootstrap path,
 #   5. blocks generated on node1 propagate to the pure-Zakura node2 AND the
 #      legacy-only node3 — so node2, which has no legacy stack, proves
 #      pure-Zakura propagation,
 #   6. Zakura v2 nodes reach sync.block.verified_tip.height ==
-#      sync.block.best_header_tip.height using kind-6 block sync,
-#   7. a behind upgraded node catches up via peer-served kind-6 bodies,
+#      sync.block.best_header_tip.height after gossip propagation,
+#   7. after a from-scratch reset of the pure-Zakura node2 (empty state while
+#      node1 sits idle at the tip), node2 re-downloads the whole chain over
+#      kind-6 block sync — gossip cannot help because node1 re-advertises
+#      nothing, so this exercises the production Mainnet-from-0 / catch-up path,
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
-#
-# Set ZAKURA_BLOCK_SYNC_REPLACE_LEGACY=1 to inject
-# [network.zakura.block_sync].replace_legacy_syncer = true into the v2 nodes and
-# prove the block-sync-only Zakura body path.
 #
 # No image is built: each container runs the HOST-built zebrad binary
 # bind-mounted into debian:trixie-slim. If the binary is missing it is built
@@ -50,8 +53,7 @@ READY_TIMEOUT="${READY_TIMEOUT:-120}"
 # few times before the connection settles. The loop exits as soon as the block
 # arrives, so a generous ceiling only matters on failure.
 PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-150}"
-REPLACE_LEGACY_SYNCER="${ZAKURA_BLOCK_SYNC_REPLACE_LEGACY:-0}"
-RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-$([[ "${REPLACE_LEGACY_SYNCER}" == "1" ]] && printf block-sync-only || printf coexistence)}"
+RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-block-sync}"
 
 log()  { printf '\n=== %s ===\n' "$*"; }
 fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
@@ -78,24 +80,17 @@ CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zakura-regtest-e2e-configs.XXXXXX")"
 for node in 1 2 3 4; do
   cp "${SCRIPT_DIR}/node${node}.toml" "${CONFIG_DIR}/node${node}.toml"
 done
-if [[ "${REPLACE_LEGACY_SYNCER}" == "1" ]]; then
-  for node in 1 2 4; do
-    {
-      printf '\n[network.zakura.block_sync]\n'
-      printf 'replace_legacy_syncer = true\n'
-    } >> "${CONFIG_DIR}/node${node}.toml"
-  done
-  {
-    printf '\n[network.zakura.header_sync]\n'
-    printf 'accept_new_blocks = false\n'
-  } >> "${CONFIG_DIR}/node2.toml"
-fi
+# node2 runs with the default header-sync config (accept_new_blocks = true). We no
+# longer try to force a body gap by suppressing tip-flood acceptance — that never
+# worked, because node2 still fills bodies via the inbound advertisement -> download
+# path regardless of that flag. kind-6 block sync is instead exercised by the
+# from-scratch reset phase below, which removes gossip as a source entirely.
 export ZAKURA_NODE1_CONFIG="${CONFIG_DIR}/node1.toml"
 export ZAKURA_NODE2_CONFIG="${CONFIG_DIR}/node2.toml"
 export ZAKURA_NODE3_CONFIG="${CONFIG_DIR}/node3.toml"
 export ZAKURA_NODE4_CONFIG="${CONFIG_DIR}/node4.toml"
 
-log "run mode: ${RUN_LABEL} (replace legacy syncer=${REPLACE_LEGACY_SYNCER})"
+log "run mode: ${RUN_LABEL}"
 log "using zebrad binary: ${ZEBRAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
@@ -313,13 +308,42 @@ wait_metric_at_least 19002 zakura_p2p_conn_active 1 node2
 if strict_upgrade; then
   wait_metric_at_least 19004 zakura_p2p_conn_active 1 node4
 fi
-if [[ "${REPLACE_LEGACY_SYNCER}" == "1" ]]; then
-  before_node2_requests=$(metric 19002 sync_block_request_sent)
-  before_node2_received=$(metric 19002 sync_block_body_received)
-  before_node1_served=$(metric 19001 sync_block_body_served)
-  before_node4_served=$(metric 19004 sync_block_body_served)
-  before_served_total=$(awk "BEGIN{print ${before_node1_served} + ${before_node4_served}}")
-fi
+
+# Prove the pure-Zakura node bootstrapped genesis over Zakura.
+#
+# node2 sets sync.debug_skip_regtest_genesis_self_seed, so it does NOT commit the
+# Regtest genesis locally. With no legacy stack, its only way to obtain genesis is
+# to download and verify it from node1 over Zakura (the bootstrap_genesis_then_pause
+# path). Until that succeeds, native header sync cannot anchor at genesis and the
+# node stays stuck at height 0 -- the exact Mainnet Zakura-only bug this guards
+# against. This assertion runs before any block is mined, so node1 is still at the
+# genesis-only tip and node2 must reach height 0 purely by fetching genesis.
+log "asserting pure-Zakura node2 bootstrapped genesis over Zakura (self-seed disabled)"
+genesis_hash=$(block_hash 18232 0)
+[[ -n "${genesis_hash}" ]] || fail "could not read Regtest genesis hash from node1"
+deadline=$((SECONDS + READY_TIMEOUT)); n2_genesis=""
+while (( SECONDS < deadline )); do
+  n2_genesis=$(block_hash 18332 0)
+  printf '  node2 genesis(height 0)=%s (want %s)\n' "${n2_genesis:-<none>}" "${genesis_hash}"
+  [[ "${n2_genesis}" == "${genesis_hash}" ]] && break
+  sleep 3
+done
+[[ "${n2_genesis}" == "${genesis_hash}" ]] || fail \
+  "pure-Zakura node2 never committed genesis over Zakura (self-seed disabled); genesis bootstrap is broken"
+# Confirm genesis arrived via a real download+verify, not a self-seed that silently
+# ignored the flag. `request_genesis` only logs the download-start line when genesis
+# is ABSENT at startup, so this line cannot appear on a self-seeding node -- it
+# proves node2 fetched genesis from a peer over Zakura.
+deadline=$((SECONDS + READY_TIMEOUT)); n2_bootstrapped=0
+while (( SECONDS < deadline )); do
+  if docker compose -f "${COMPOSE_FILE}" logs zakura-node-2 2>/dev/null \
+    | grep -q "starting genesis block download and verify"; then
+    n2_bootstrapped=1; break
+  fi
+  sleep 2
+done
+[[ "${n2_bootstrapped}" -eq 1 ]] || fail \
+  "node2 committed genesis but never logged a genesis download; the self-seed shortcut may have run instead of a real over-Zakura fetch"
 
 log "generating ${GENERATE_BLOCKS} block(s) on node1"
 for ((i = 1; i <= GENERATE_BLOCKS; i++)); do
@@ -386,38 +410,51 @@ else
   printf '  node4 upgraded-Zakura propagation reached height=%s\n' "${h4}"
 fi
 
-log "asserting kind-6 block sync body frontier reached the header tip"
+log "asserting Zakura body frontier reached the header tip after gossip propagation"
 wait_zakura_body_frontiers_at_tip "${target}" "post-generate"
-if [[ "${REPLACE_LEGACY_SYNCER}" == "1" ]]; then
-  want_node2_requests=$(awk "BEGIN{print ${before_node2_requests} + 1}")
-  want_node2_received=$(awk "BEGIN{print ${before_node2_received} + 1}")
-  wait_metric_at_least 19002 sync_block_request_sent "${want_node2_requests}" "node2 forced-gap"
-  wait_metric_at_least 19002 sync_block_body_received "${want_node2_received}" "node2 forced-gap"
-
-  after_node2_requests=$(metric 19002 sync_block_request_sent)
-  after_node2_received=$(metric 19002 sync_block_body_received)
-  after_node1_served=$(metric 19001 sync_block_body_served)
-  after_node4_served=$(metric 19004 sync_block_body_served)
-  after_served_total=$(awk "BEGIN{print ${after_node1_served} + ${after_node4_served}}")
-  printf '  node2 kind-6 requests=%s (before %s) received=%s (before %s)\n' \
-    "${after_node2_requests}" "${before_node2_requests}" \
-    "${after_node2_received}" "${before_node2_received}"
-  printf '  serving peers kind-6 bodies: node1=%s (before %s) node4=%s (before %s)\n' \
-    "${after_node1_served}" "${before_node1_served}" \
-    "${after_node4_served}" "${before_node4_served}"
-  if ! awk "BEGIN{exit !(${after_served_total} > ${before_served_total})}"; then
-    fail "node2 reached the frontier without any serving peer's kind-6 body-served metric increasing during the forced body-gap scenario"
-  fi
-fi
 assert_block_sync_budget_empty "post-generate"
 
-if [[ "${REPLACE_LEGACY_SYNCER}" == "1" ]]; then
-  log "deterministic peer-to-peer block-sync serving was asserted during post-generate"
-  assert_block_sync_budget_empty "peer-serving"
-else
-  log "coexistence body frontier already asserted; leaving duplicate-fetch race to the replacement gate"
-  assert_block_sync_budget_empty "coexistence"
+# ---------------------------------------------------------------------------
+# Exercise kind-6 block sync via a from-scratch reset of the pure-Zakura node.
+#
+# Above, node2 reached the tip while connected — but it got there through inbound
+# gossip (advertisement -> download), not kind-6 block sync: in this tiny topology
+# gossip delivers every body the instant it is mined, so no body gap ever forms.
+# The only way to force kind-6 is to remove gossip as a source. node2 has ephemeral
+# state, so stopping its container discards its chain; node1 keeps the chain and
+# mines nothing more. On reconnect node2 has a real, gossip-unfillable gap (node1
+# re-advertises nothing), so it must re-download every existing block over the
+# dedicated block-sync stream. This is the production Mainnet-from-0 /
+# restart-catch-up path.
+log "resetting pure-Zakura node2 to force a from-scratch kind-6 catch-up"
+catchup_target=$(block_count 18232)
+[[ "${catchup_target}" -ge 1 ]] || fail \
+  "node1 has no chain for node2 to catch up to (height ${catchup_target})"
+before_node1_served=$(metric 19001 sync_block_body_served)
+
+docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
+  || fail "could not stop node2 for the from-scratch catch-up"
+docker compose -f "${COMPOSE_FILE}" start zakura-node-2 \
+  || fail "could not restart node2 for the from-scratch catch-up"
+wait_ready 18332 "node2 (post-reset)"
+
+# node2's own counters restart from zero, so assert absolute kind-6 activity, not a
+# delta. With node1 idle at the tip, reaching catchup_target from an empty state is
+# only possible by downloading every body over block sync.
+wait_metric_at_least 19002 sync_block_request_sent 1 "node2 catch-up"
+wait_metric_at_least 19002 sync_block_body_received 1 "node2 catch-up"
+wait_block_count_at_least 18332 "${catchup_target}" "node2 catch-up"
+wait_zakura_body_frontier_at_tip 19002 18332 "${catchup_target}" "node2 catch-up"
+
+# node2 dials only node1, so node1 must have served the catch-up bodies over kind-6.
+after_node1_served=$(metric 19001 sync_block_body_served)
+printf '  node1 kind-6 bodies served=%s (before reset %s)\n' \
+  "${after_node1_served}" "${before_node1_served}"
+if ! awk "BEGIN{exit !(${after_node1_served} > ${before_node1_served})}"; then
+  fail "node2 caught up from scratch but node1's kind-6 body-served metric did not increase — bodies did not flow over block sync"
 fi
+assert_block_sync_budget_empty "post-catch-up"
+log "node2 re-downloaded ${catchup_target} block(s) from scratch over kind-6 block sync"
 
 log "asserting non-finalized reorg survival with no block-sync budget leak"
 old_tip_hash=$(block_hash 18232 "${target}")
@@ -445,4 +482,4 @@ wait_metric_at_least 19001 sync_block_reorg_reset 1 node1
 wait_metric_at_least 19002 sync_block_reorg_reset 1 node2
 assert_block_sync_budget_empty "post-reorg"
 
-log "PASS (${RUN_LABEL}): Zakura body frontier, peer serving, reorg survival, and legacy coexistence/cutover verified"
+log "PASS (${RUN_LABEL}): Zakura body frontier, peer serving, reorg survival, and legacy compatibility verified"

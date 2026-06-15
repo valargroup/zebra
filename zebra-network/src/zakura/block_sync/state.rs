@@ -143,6 +143,7 @@ pub(super) struct BlockSyncState {
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) schedule: BlockRangeScheduler,
     pub(super) reorder: ReorderBuffer,
+    pub(super) applying: BTreeMap<block::Height, ApplyingBlock>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
@@ -173,6 +174,7 @@ impl BlockSyncState {
             parked_peers: HashSet::new(),
             schedule: BlockRangeScheduler::new(startup.config.fanout),
             reorder: ReorderBuffer::new(),
+            applying: BTreeMap::new(),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
@@ -194,6 +196,14 @@ impl BlockSyncState {
             .count();
         ServicePeerSnapshot::new(inbound, outbound, limits)
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ApplyingBlock {
+    pub(super) hash: block::Hash,
+    pub(super) block: Arc<block::Block>,
+    pub(super) bytes: u64,
+    pub(super) submitted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +254,12 @@ impl PeerBlockState {
         self.outstanding
             .iter()
             .position(|outstanding| outstanding.request.contains(height))
+    }
+
+    pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
+        self.outstanding
+            .iter()
+            .position(|outstanding| outstanding.request.start_height == start_height)
     }
 
     pub(super) fn try_start_serving_blocks(&mut self, local_inflight_cap: u16) -> bool {
@@ -298,6 +314,21 @@ impl OutstandingBlockRange {
             .iter()
             .filter_map(|(height, _)| {
                 (!self.received.contains(height))
+                    .then(|| self.request.single_height_retry(*height))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    pub(super) fn missing_retry_requests_after(
+        &self,
+        tip: block::Height,
+    ) -> Vec<BlockRangeRequest> {
+        self.request
+            .expected_hashes
+            .iter()
+            .filter_map(|(height, _)| {
+                (*height > tip && !self.received.contains(height))
                     .then(|| self.request.single_height_retry(*height))
                     .flatten()
             })

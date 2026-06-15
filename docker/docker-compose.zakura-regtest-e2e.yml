@@ -13,7 +13,7 @@
 #     docker compose -f docker/docker-compose.zakura-regtest-e2e.yml up -d
 #
 # Or just run docker/zakura-regtest-e2e/run.sh, which does all of the above and
-# asserts coexistence + propagation.
+# asserts legacy compatibility, Zakura propagation, and block sync.
 #
 # Host networking is required: Regtest only accepts localhost initial peers
 # (zebra-network/src/config.rs: initial_peers filters to is_localhost), so the

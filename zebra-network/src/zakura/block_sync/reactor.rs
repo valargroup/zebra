@@ -15,6 +15,13 @@ const SOFT_MISBEHAVIOR_DISCONNECT_THRESHOLD: u32 = 3;
 /// request timeouts, and above all misbehavior disconnects.
 const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum OutstandingRangeDisposition {
+    Satisfied,
+    RetryOriginal,
+    RetryMissing,
+}
+
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
     startup: BlockSyncStartup,
@@ -137,6 +144,11 @@ impl BlockSyncReactor {
             BlockSyncEvent::NeededBlocks(blocks) => {
                 self.handle_needed_blocks(blocks).await;
             }
+            BlockSyncEvent::BlockApplyFinished {
+                height,
+                hash,
+                result,
+            } => self.handle_block_apply_finished(height, hash, result).await,
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
                 start_height,
@@ -247,8 +259,10 @@ impl BlockSyncReactor {
     fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
         if let Some(peer_state) = self.state.peers.remove(&peer) {
             for outstanding in peer_state.outstanding {
-                self.state.budget.release(outstanding.reserved_bytes());
-                self.state.schedule.retry(outstanding.request);
+                self.finish_detached_outstanding(
+                    outstanding,
+                    OutstandingRangeDisposition::RetryOriginal,
+                );
             }
         }
         self.state.parked_peers.remove(&peer);
@@ -273,6 +287,8 @@ impl BlockSyncReactor {
         self.state.servable_hash = frontiers.verified_block_hash;
         self.state.verified_block_hash = frontiers.verified_block_hash;
         if frontiers.verified_block_tip != self.state.verified_block_tip {
+            self.release_applied_blocks_through(frontiers.verified_block_tip);
+            self.drop_outstanding_through(frontiers.verified_block_tip);
             self.state.verified_block_tip = frontiers.verified_block_tip;
             self.release_contiguous_blocks().await;
         }
@@ -294,6 +310,8 @@ impl BlockSyncReactor {
         self.state.servable_hash = frontiers.verified_block_hash;
 
         self.state.reorder.clear(&mut self.state.budget);
+        self.release_all_applying_blocks();
+        self.state.schedule.clear_covered_from(block::Height::MIN);
         self.drop_ranges_not_in_needed(&HashMap::new());
         self.state.schedule.retain_matching_needed(&HashMap::new());
 
@@ -306,12 +324,6 @@ impl BlockSyncReactor {
     }
 
     async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
-        if self.should_pause_new_body_downloads() {
-            self.pause_new_body_downloads();
-            self.release_caught_up_block_sync_peers();
-            return;
-        }
-
         self.state.needed_heights = blocks.iter().map(|block| block.height).collect();
         self.state.needed_heights.sort_unstable();
         self.state.needed_heights.dedup();
@@ -332,6 +344,11 @@ impl BlockSyncReactor {
         self.drop_ranges_not_in_needed(&needed_hashes);
         self.state.schedule.retain_matching_needed(&needed_hashes);
         self.state.schedule.refresh_needed(needed);
+        if self.should_pause_new_body_downloads() {
+            self.pause_new_body_downloads();
+            self.release_caught_up_block_sync_peers();
+            return;
+        }
         self.schedule().await;
     }
 
@@ -357,7 +374,9 @@ impl BlockSyncReactor {
 
     fn should_pause_new_body_downloads(&self) -> bool {
         let lag = self.body_lag();
-        lag == 0 || lag <= self.startup.config.near_tip_body_download_pause_blocks
+        lag == 0
+            || lag <= self.startup.config.near_tip_body_download_pause_blocks
+            || self.state.budget.available() == 0
     }
 
     fn has_outstanding_requests(&self) -> bool {
@@ -493,7 +512,11 @@ impl BlockSyncReactor {
         let retry_request = outstanding.request.single_height_retry(height);
 
         if !block_merkle_root_matches_header(block.clone()).await {
-            self.drop_invalid_outstanding(&peer, index);
+            self.finish_peer_outstanding_at(
+                &peer,
+                index,
+                OutstandingRangeDisposition::RetryOriginal,
+            );
             self.report_misbehavior(peer, BlockSyncMisbehavior::InvalidBlock)
                 .await;
             return;
@@ -503,7 +526,11 @@ impl BlockSyncReactor {
             Ok(bytes) => bytes.len() as u64,
             Err(error) => {
                 tracing::debug!(?error, "failed to serialize decoded block-sync body");
-                self.drop_invalid_outstanding(&peer, index);
+                self.finish_peer_outstanding_at(
+                    &peer,
+                    index,
+                    OutstandingRangeDisposition::RetryOriginal,
+                );
                 self.report_misbehavior(peer, BlockSyncMisbehavior::InvalidBlock)
                     .await;
                 return;
@@ -526,15 +553,18 @@ impl BlockSyncReactor {
             if let Some(outstanding) = peer_state.outstanding.get_mut(index) {
                 outstanding.mark_received(height);
                 if outstanding.is_complete() {
-                    completed = Some(peer_state.outstanding.remove(index).request);
+                    completed = Some(peer_state.outstanding.remove(index));
                 }
             }
         }
-        if let Some(request) = completed {
-            self.state.schedule.clear_assignment(&request);
+        if let Some(outstanding) = completed {
+            self.finish_detached_outstanding(outstanding, OutstandingRangeDisposition::Satisfied);
         }
 
-        if height <= self.state.verified_block_tip || self.state.reorder.contains(height) {
+        if height <= self.state.verified_block_tip
+            || self.state.reorder.contains(height)
+            || self.state.applying.contains_key(&height)
+        {
             self.release_contiguous_blocks().await;
             self.schedule().await;
             self.release_caught_up_block_sync_peers();
@@ -617,7 +647,12 @@ impl BlockSyncReactor {
         }
     }
 
-    fn drop_invalid_outstanding(&mut self, peer: &ZakuraPeerId, index: usize) {
+    fn finish_peer_outstanding_at(
+        &mut self,
+        peer: &ZakuraPeerId,
+        index: usize,
+        disposition: OutstandingRangeDisposition,
+    ) {
         let Some(peer_state) = self.state.peers.get_mut(peer) else {
             return;
         };
@@ -626,8 +661,29 @@ impl BlockSyncReactor {
         }
 
         let outstanding = peer_state.outstanding.remove(index);
+        self.finish_detached_outstanding(outstanding, disposition);
+    }
+
+    fn finish_detached_outstanding(
+        &mut self,
+        outstanding: OutstandingBlockRange,
+        disposition: OutstandingRangeDisposition,
+    ) {
         self.state.budget.release(outstanding.reserved_bytes());
-        self.state.schedule.retry(outstanding.request);
+        match disposition {
+            OutstandingRangeDisposition::Satisfied => {
+                self.state.schedule.clear_assignment(&outstanding.request);
+            }
+            OutstandingRangeDisposition::RetryOriginal => {
+                self.state.schedule.retry(outstanding.request);
+            }
+            OutstandingRangeDisposition::RetryMissing => {
+                self.state.schedule.clear_assignment(&outstanding.request);
+                for request in outstanding.missing_retry_requests().into_iter().rev() {
+                    self.state.schedule.retry(request);
+                }
+            }
+        }
     }
 
     async fn handle_range_unavailable(
@@ -649,7 +705,7 @@ impl BlockSyncReactor {
             return;
         };
 
-        self.retry_missing_from_outstanding(&peer, index);
+        self.finish_peer_outstanding_at(&peer, index, OutstandingRangeDisposition::RetryMissing);
         self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
             .await;
         self.schedule().await;
@@ -664,13 +720,13 @@ impl BlockSyncReactor {
         self.state
             .peers
             .get(peer)?
-            .outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+            .outstanding_index_for_start(start_height)
     }
 
     fn is_stale_response_height(&self, height: block::Height) -> bool {
-        height <= self.state.verified_block_tip || self.state.reorder.contains(height)
+        height <= self.state.verified_block_tip
+            || self.state.reorder.contains(height)
+            || self.state.applying.contains_key(&height)
     }
 
     async fn ignore_stale_response(
@@ -693,23 +749,6 @@ impl BlockSyncReactor {
         self.schedule().await;
         self.release_caught_up_block_sync_peers();
         true
-    }
-
-    fn retry_missing_from_outstanding(&mut self, peer: &ZakuraPeerId, index: usize) {
-        let Some(peer_state) = self.state.peers.get_mut(peer) else {
-            return;
-        };
-        if index >= peer_state.outstanding.len() {
-            return;
-        }
-
-        let outstanding = peer_state.outstanding.remove(index);
-        let missing = outstanding.missing_retry_requests();
-        self.state.budget.release(outstanding.reserved_bytes());
-        self.state.schedule.clear_assignment(&outstanding.request);
-        for request in missing.into_iter().rev() {
-            self.state.schedule.retry(request);
-        }
     }
 
     async fn handle_blocks_done(&mut self, peer: ZakuraPeerId, start_height: block::Height) {
@@ -740,7 +779,7 @@ impl BlockSyncReactor {
                 .await;
             return;
         };
-        self.retry_missing_from_outstanding(&peer, index);
+        self.finish_peer_outstanding_at(&peer, index, OutstandingRangeDisposition::RetryMissing);
         self.schedule().await;
         self.release_caught_up_block_sync_peers();
     }
@@ -798,6 +837,37 @@ impl BlockSyncReactor {
         self.finish_serving_blocks(&peer);
     }
 
+    async fn handle_block_apply_finished(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        result: BlockApplyResult,
+    ) {
+        let Some(applying) = self.state.applying.remove(&height) else {
+            return;
+        };
+        if applying.hash != hash {
+            self.state.applying.insert(height, applying);
+            return;
+        }
+
+        self.state.budget.release(applying.bytes);
+        match result {
+            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
+            BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
+                self.state.schedule.clear_covered_from(height);
+                self.state.reorder.drop_from(height, &mut self.state.budget);
+            }
+        }
+
+        self.release_contiguous_blocks().await;
+        if !self.query_needed_blocks().await {
+            self.pause_new_body_downloads();
+        }
+        self.schedule().await;
+        self.release_caught_up_block_sync_peers();
+    }
+
     fn finish_serving_blocks(&mut self, peer: &ZakuraPeerId) {
         if let Some(peer_state) = self.state.peers.get_mut(peer) {
             peer_state.finish_serving_blocks();
@@ -819,8 +889,10 @@ impl BlockSyncReactor {
         }
 
         for outstanding in timed_out {
-            self.state.budget.release(outstanding.reserved_bytes());
-            self.state.schedule.retry(outstanding.request);
+            self.finish_detached_outstanding(
+                outstanding,
+                OutstandingRangeDisposition::RetryOriginal,
+            );
         }
         self.schedule().await;
         self.release_caught_up_block_sync_peers();
@@ -840,21 +912,49 @@ impl BlockSyncReactor {
     }
 
     fn drop_ranges_not_in_needed(&mut self, needed: &HashMap<block::Height, block::Hash>) {
+        let mut dropped = Vec::new();
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if peer.outstanding[index].request.matches_needed(needed) {
                     index += 1;
                 } else {
-                    let outstanding = peer.outstanding.remove(index);
-                    self.state.budget.release(outstanding.reserved_bytes());
-                    self.state.schedule.clear_assignment(&outstanding.request);
+                    dropped.push(peer.outstanding.remove(index));
                 }
+            }
+        }
+
+        for outstanding in dropped {
+            self.finish_detached_outstanding(outstanding, OutstandingRangeDisposition::Satisfied);
+        }
+    }
+
+    fn drop_outstanding_through(&mut self, tip: block::Height) {
+        let mut dropped = Vec::new();
+        for peer in self.state.peers.values_mut() {
+            let mut index = 0;
+            while index < peer.outstanding.len() {
+                if peer.outstanding[index].request.start_height <= tip {
+                    dropped.push(peer.outstanding.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+
+        for outstanding in dropped {
+            let retry = outstanding.missing_retry_requests_after(tip);
+            self.state.budget.release(outstanding.reserved_bytes());
+            self.state.schedule.clear_assignment(&outstanding.request);
+            for request in retry.into_iter().rev() {
+                self.state.schedule.retry(request);
             }
         }
     }
 
     async fn schedule(&mut self) {
+        self.submit_pending_blocks().await;
+
         if self.should_pause_new_body_downloads() {
             return;
         }
@@ -918,19 +1018,85 @@ impl BlockSyncReactor {
     }
 
     async fn release_contiguous_blocks(&mut self) {
-        let released = self
-            .state
-            .reorder
-            .drain_contiguous_prefix(self.state.verified_block_tip, &mut self.state.budget);
-        for (height, block) in released {
-            self.state.verified_block_tip = height;
-            self.state.verified_block_hash = block.hash();
-            self.state.schedule.mark_height_covered(height);
-            metrics::counter!("sync.block.submit.sent").increment(1);
-            let _ = self
-                .dispatch_action(BlockSyncAction::SubmitBlock { block })
-                .await;
+        let mut submitted_tip = self.state.verified_block_tip;
+        while next_height(submitted_tip)
+            .is_some_and(|height| self.state.applying.contains_key(&height))
+        {
+            submitted_tip = next_height(submitted_tip).expect("checked above");
         }
+
+        let released = self.state.reorder.drain_contiguous_prefix(submitted_tip);
+        for (height, block, bytes) in released {
+            let hash = block.hash();
+            self.state.schedule.mark_height_covered(height);
+            self.state.applying.insert(
+                height,
+                ApplyingBlock {
+                    hash,
+                    block,
+                    bytes,
+                    submitted: false,
+                },
+            );
+        }
+
+        self.submit_pending_blocks().await;
+    }
+
+    async fn submit_pending_blocks(&mut self) {
+        let pending: Vec<_> = self
+            .state
+            .applying
+            .iter()
+            .filter_map(|(height, applying)| (!applying.submitted).then_some(*height))
+            .collect();
+
+        for height in pending {
+            let Some(block) = self
+                .state
+                .applying
+                .get(&height)
+                .map(|applying| applying.block.clone())
+            else {
+                continue;
+            };
+
+            metrics::counter!("sync.block.submit.sent").increment(1);
+            if !self
+                .dispatch_action(BlockSyncAction::SubmitBlock { block })
+                .await
+            {
+                return;
+            }
+            if let Some(applying) = self.state.applying.get_mut(&height) {
+                applying.submitted = true;
+            }
+        }
+    }
+
+    fn release_applied_blocks_through(&mut self, tip: block::Height) {
+        let applied: Vec<_> = self
+            .state
+            .applying
+            .range(..=tip)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in applied {
+            if let Some(applying) = self.state.applying.remove(&height) {
+                self.state.budget.release(applying.bytes);
+            }
+        }
+    }
+
+    fn release_all_applying_blocks(&mut self) {
+        let bytes = self
+            .state
+            .applying
+            .values()
+            .map(|applying| applying.bytes)
+            .sum();
+        self.state.budget.release(bytes);
+        self.state.applying.clear();
     }
 
     async fn send_status(&self, peer: &ZakuraPeerId) {

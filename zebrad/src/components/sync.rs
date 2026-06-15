@@ -278,6 +278,25 @@ pub struct Config {
     /// If the number of logical cores can't be detected, Zebra uses one thread.
     /// For details, see [the `rayon` documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
     pub parallel_cpu_threads: usize,
+
+    /// Skip the Regtest direct genesis self-seed at startup, forcing this node to
+    /// obtain the genesis block from peers like a Mainnet/Testnet node.
+    ///
+    /// On Regtest, zebrad normally commits the genesis block directly at startup
+    /// (the genesis block is a known constant and there may be no peer to download
+    /// it from). When this is `true`, that shortcut is skipped and genesis must be
+    /// downloaded and verified from a peer instead. This exercises the production
+    /// genesis-bootstrap path — in particular a Zakura-only node
+    /// (`legacy_p2p = false`) that must fetch genesis over Zakura before native
+    /// header/body sync can advance from an empty state.
+    ///
+    /// Defaults to `false`, so standalone Regtest nodes keep self-seeding genesis.
+    ///
+    /// Skipped when serializing so `zebrad generate` output (and the stored config
+    /// compatibility snapshot) stays stable; it is only ever set by hand in
+    /// test/bootstrap configs.
+    #[serde(skip_serializing)]
+    pub debug_skip_regtest_genesis_self_seed: bool,
 }
 
 impl Default for Config {
@@ -306,6 +325,10 @@ impl Default for Config {
             // If this causes tokio executor starvation, move CPU-intensive tasks to rayon threads,
             // or reserve a few cores for tokio threads, based on `num_cpus()`.
             parallel_cpu_threads: 0,
+
+            // Standalone Regtest nodes self-seed genesis; only opt-in test/bootstrap
+            // setups download it from peers.
+            debug_skip_regtest_genesis_self_seed: false,
         }
     }
 }
@@ -568,6 +591,20 @@ where
             );
             sleep(restart_delay).await;
         }
+    }
+
+    /// Downloads and verifies genesis, then parks this legacy syncer.
+    ///
+    /// Zakura block sync uses this bootstrap path because header range validation needs the
+    /// committed genesis header before native Zakura header/body sync can advance from scratch.
+    #[instrument(skip(self))]
+    pub async fn bootstrap_genesis_then_pause(mut self) -> Result<(), Report> {
+        self.request_genesis().await?;
+        info!(
+            "Zakura block sync replacement completed genesis bootstrap; parking legacy ChainSync"
+        );
+        std::future::pending::<()>().await;
+        Ok(())
     }
 
     /// Tries to synchronize the chain as far as it can.

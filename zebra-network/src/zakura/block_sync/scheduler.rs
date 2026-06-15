@@ -229,6 +229,23 @@ impl BlockRangeScheduler {
         self.prune_covered();
     }
 
+    pub(super) fn clear_covered_from(&mut self, from: block::Height) {
+        let previous = previous_height(from);
+        self.covered.retain_mut(|covered| {
+            if covered.start >= from {
+                return false;
+            }
+            if covered.end >= from {
+                if let Some(previous) = previous {
+                    covered.end = previous;
+                } else {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
     #[cfg(test)]
     pub(super) fn release_cancelled(&mut self, budget: &mut ByteBudget) {
         self.assigned.clear();

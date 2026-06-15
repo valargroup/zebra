@@ -53,8 +53,7 @@ impl ReorderBuffer {
     pub(super) fn drain_contiguous_prefix(
         &mut self,
         verified_block_tip: block::Height,
-        budget: &mut ByteBudget,
-    ) -> Vec<(block::Height, Arc<block::Block>)> {
+    ) -> Vec<(block::Height, Arc<block::Block>, u64)> {
         let mut released = Vec::new();
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
@@ -63,8 +62,7 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-            budget.release(buffered.bytes);
-            released.push((next, buffered.block));
+            released.push((next, buffered.block, buffered.bytes));
             let Some(after) = next_height(next) else {
                 break;
             };

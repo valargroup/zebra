@@ -47,6 +47,15 @@ pub enum BlockSyncEvent {
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
+    /// Node wiring finished applying a submitted block body.
+    BlockApplyFinished {
+        /// Submitted block height.
+        height: block::Height,
+        /// Submitted block hash.
+        hash: block::Hash,
+        /// Apply result from the verifier driver.
+        result: BlockApplyResult,
+    },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {
         /// Peer whose served-response slot can be released.
@@ -69,6 +78,19 @@ pub enum BlockSyncEvent {
         /// Bounded committed blocks returned by state.
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     },
+}
+
+/// Result of applying a block-sync body through the verifier driver.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BlockApplyResult {
+    /// The block was verified and committed.
+    Committed,
+    /// The verifier reported the block was already committed.
+    Duplicate,
+    /// The verifier rejected the block.
+    Rejected,
+    /// The verifier did not answer before the driver timeout.
+    TimedOut,
 }
 
 /// Actions emitted by the future block-sync reactor for the service seam.

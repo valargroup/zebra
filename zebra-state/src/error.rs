@@ -196,6 +196,14 @@ pub enum CommitHeaderRangeError {
         anchor: block::Hash,
     },
 
+    /// The supplied anchor is the network genesis hash, but the genesis block has not been
+    /// committed to state yet.
+    #[error("header range genesis anchor {anchor} is not committed to state yet")]
+    MissingGenesisAnchor {
+        /// The supplied genesis anchor hash.
+        anchor: block::Hash,
+    },
+
     /// The inferred header height overflowed the valid block height range.
     #[error("header height overflow")]
     HeightOverflow,

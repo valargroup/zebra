@@ -1468,3 +1468,24 @@ fn setup_chain_sync() -> (
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(Vec::new())).into()
 }
+
+#[test]
+fn debug_skip_regtest_genesis_self_seed_defaults_off_and_is_opt_in() {
+    use crate::components::sync::Config;
+
+    // Default is off, so standalone Regtest nodes keep self-seeding genesis.
+    assert!(!Config::default().debug_skip_regtest_genesis_self_seed);
+
+    // Opt-in still parses despite `deny_unknown_fields`.
+    let config: Config = toml::from_str("debug_skip_regtest_genesis_self_seed = true")
+        .expect("sync config with the genesis-bootstrap flag parses");
+    assert!(config.debug_skip_regtest_genesis_self_seed);
+
+    // Skipped on serialize, so `zebrad generate` output (and the stored-config
+    // compatibility snapshot) stays stable.
+    let serialized = toml::to_string(&Config::default()).expect("sync config serializes");
+    assert!(
+        !serialized.contains("debug_skip_regtest_genesis_self_seed"),
+        "debug bootstrap flag must not appear in generated config output"
+    );
+}

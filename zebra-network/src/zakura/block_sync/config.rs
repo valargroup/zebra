@@ -81,10 +81,16 @@ impl Default for BlockSyncStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuraBlockSyncConfig {
-    /// Disable the legacy `ChainSync` body downloader on Zakura-enabled nodes.
+    /// Deprecated compatibility key for older rollout configs.
     ///
-    /// This leaves the legacy syncer available for non-Zakura nodes and as the
-    /// default-safe fallback when the gate is unset.
+    /// Zakura block sync is now selected by the top-level `v2_p2p` flag. This
+    /// field is accepted but ignored so older configs keep parsing.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_ignored_replace_legacy_syncer"
+    )]
     pub replace_legacy_syncer: bool,
     /// Maximum blocks this node advertises per `GetBlocks` response.
     pub max_blocks_per_response: u32,
@@ -108,6 +114,14 @@ pub struct ZakuraBlockSyncConfig {
     pub near_tip_body_download_pause_blocks: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+}
+
+fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = bool::deserialize(deserializer)?;
+    Ok(false)
 }
 
 impl Default for ZakuraBlockSyncConfig {

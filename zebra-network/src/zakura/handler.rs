@@ -2268,8 +2268,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
     let discovery_secret_key = secret_key.clone();
-    let builder =
-        direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
+    let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
@@ -4351,7 +4350,8 @@ mod tests {
         let peer_id = ZakuraPeerId::new(node_id.clone()).expect("32-byte node id is valid");
         let direct_addresses = vec![b"192.0.2.1:1".to_vec()];
 
-        let connector = crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
+        let connector =
+            crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
         let upgraded = connector
             .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
             .await;
@@ -4938,8 +4938,8 @@ mod tests {
     // rejects it first, a dead incumbent keeps its own peer blocked until the QUIC
     // idle timeout (~150s) instead of being evicted in milliseconds.
     #[tokio::test(start_paused = true)]
-    async fn same_peer_duplicate_at_per_ip_cap_still_evicts_stale_incumbent(
-    ) -> Result<(), BoxError> {
+    async fn same_peer_duplicate_at_per_ip_cap_still_evicts_stale_incumbent() -> Result<(), BoxError>
+    {
         async fn register_from_ip(
             supervisor: &ZakuraSupervisorHandle,
             peer: &ZakuraPeerId,
@@ -5209,8 +5209,7 @@ mod tests {
             payload: vec![0xab; 4096],
         };
         assert!(
-            oversized.payload.len()
-                <= app_frame_cap_for_stream_kind(&limits, stream_kind) as usize,
+            oversized.payload.len() <= app_frame_cap_for_stream_kind(&limits, stream_kind) as usize,
             "test payload must fit the frame cap so only the message cap can reject it"
         );
 
