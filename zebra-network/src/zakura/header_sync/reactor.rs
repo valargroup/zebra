@@ -354,6 +354,9 @@ impl HeaderSyncReactor {
             .and_modify(|peer_state| {
                 peer_state.session = session.clone();
                 peer_state.direction = direction;
+                // A new transport replaces the old one; its remote has received
+                // no status yet, so the initial status below must always be sent.
+                peer_state.reset_sent_status();
             })
             .or_insert_with(|| {
                 PeerHeaderState::new(
@@ -1105,15 +1108,27 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn send_status(&self, peer: &ZakuraPeerId) {
-        let Some(peer_state) = self.state.peers.get(peer) else {
-            return;
-        };
-        metrics::counter!("sync.header.peer.status.sent").increment(1);
+    fn send_status(&mut self, peer: &ZakuraPeerId) {
         let status = self.local_status();
+        // Suppress a status identical to the last one we sent this peer over its
+        // current session: it advances nothing and the peer's inbound status
+        // rate limiter would treat the redundant message as spam.
+        match self.state.peers.get_mut(peer) {
+            Some(peer_state) if peer_state.status_differs_from_last_sent(status) => {
+                peer_state.record_sent_status(status);
+            }
+            Some(_) => {
+                metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
+                return;
+            }
+            None => return,
+        }
+        metrics::counter!("sync.header.peer.status.sent").increment(1);
         self.trace_status_sent(peer, status);
-        if let Err(error) = peer_state.session.try_send_status(status) {
-            tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
+        if let Some(peer_state) = self.state.peers.get(peer) {
+            if let Err(error) = peer_state.session.try_send_status(status) {
+                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
+            }
         }
         #[cfg(test)]
         let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
@@ -1140,10 +1155,18 @@ impl HeaderSyncReactor {
             .peers
             .iter_mut()
             .filter_map(|(peer_id, peer)| {
-                peer.meters
-                    .unsolicited
-                    .try_take(now)
-                    .then(|| peer_id.clone())
+                // Never re-send a peer a status identical to its last one: the
+                // peer's inbound rate limiter would treat it as spam. A redundant
+                // refresh is dropped without spending the peer's status budget.
+                if !peer.status_differs_from_last_sent(status) {
+                    metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
+                    return None;
+                }
+                if !peer.meters.unsolicited.try_take(now) {
+                    return None;
+                }
+                peer.record_sent_status(status);
+                Some(peer_id.clone())
             })
             .collect();
 

@@ -1920,6 +1920,91 @@ async fn material_tip_advance_sends_rate_limited_unsolicited_status() {
     assert_eq!(status_count, 1);
 }
 
+#[test]
+fn peer_state_suppresses_redundant_status_until_session_reset() {
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer(80),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        (block::Height(0), block::Hash([0; 32])),
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+
+    let status = HeaderSyncStatus {
+        tip_height: block::Height(5),
+        tip_hash: block::Hash([5; 32]),
+        ..HeaderSyncStatus::default()
+    };
+
+    // Nothing has been sent yet, so the first status is always new.
+    assert!(peer_state.status_differs_from_last_sent(status));
+    peer_state.record_sent_status(status);
+
+    // An identical status is redundant and must be suppressed.
+    assert!(!peer_state.status_differs_from_last_sent(status));
+
+    // A tip-advancing status differs and is sent.
+    let advanced = HeaderSyncStatus {
+        tip_height: block::Height(6),
+        ..status
+    };
+    assert!(peer_state.status_differs_from_last_sent(advanced));
+
+    // A same-height hash change (e.g. a reorg at the tip) also differs.
+    let reorged = HeaderSyncStatus {
+        tip_hash: block::Hash([9; 32]),
+        ..status
+    };
+    assert!(peer_state.status_differs_from_last_sent(reorged));
+
+    // Replacing the session forgets the last status, so an identical status is
+    // resent — a fresh channel's remote has not received it and gates serving on it.
+    peer_state.reset_sent_status();
+    assert!(peer_state.status_differs_from_last_sent(status));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconnect_resends_initial_status_after_session_reset() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(72);
+
+    // First connect: the peer receives its initial status.
+    connect_peer(&fixture, peer_id.clone()).await;
+    assert!(matches!(
+        next_non_query_action(&mut fixture.actions).await,
+        HeaderSyncAction::SendMessage {
+            msg: HeaderSyncMessage::Status(_),
+            ..
+        }
+    ));
+
+    // Reconnecting installs a fresh session at the same frontier. Even though the
+    // status is byte-identical to the one already sent, the new channel's remote
+    // has not received it, so it must be resent rather than suppressed.
+    connect_peer(&fixture, peer_id.clone()).await;
+    assert!(matches!(
+        next_non_query_action(&mut fixture.actions).await,
+        HeaderSyncAction::SendMessage {
+            msg: HeaderSyncMessage::Status(_),
+            ..
+        }
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn full_block_committed_covers_outstanding_height() {
     let network = regtest_network();

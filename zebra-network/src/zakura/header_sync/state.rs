@@ -173,6 +173,10 @@ pub(super) struct PeerHeaderState {
     pub(super) max_headers_per_response: u32,
     pub(super) max_inflight_requests: u16,
     pub(super) received_status: bool,
+    /// The most recent status sent to this peer over its current session, if
+    /// any. Used to suppress re-sending an identical, non-tip-advancing status,
+    /// which the peer's inbound rate limiter would otherwise treat as spam.
+    pub(super) last_sent_status: Option<HeaderSyncStatus>,
     pub(super) outstanding: Vec<OutstandingRange>,
     pub(super) late_covered_responses: usize,
     pub(super) meters: HeaderSyncPeerMeters,
@@ -199,6 +203,7 @@ impl PeerHeaderState {
             max_headers_per_response: clamp_advertised_range(local_range),
             max_inflight_requests: local_inflight.clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER),
             received_status: false,
+            last_sent_status: None,
             outstanding: Vec::new(),
             late_covered_responses: 0,
             meters: HeaderSyncPeerMeters::new(
@@ -227,6 +232,28 @@ impl PeerHeaderState {
         }
         self.late_covered_responses -= 1;
         true
+    }
+
+    /// Whether `status` differs from the most recent status sent to this peer
+    /// over its current session. A status identical to the last one we sent is
+    /// redundant — the peer cannot learn anything from it and its inbound status
+    /// rate limiter would treat it as spam — so callers suppress it.
+    pub(super) fn status_differs_from_last_sent(&self, status: HeaderSyncStatus) -> bool {
+        self.last_sent_status != Some(status)
+    }
+
+    /// Records `status` as the most recent status sent to this peer, so a later
+    /// identical status can be suppressed by [`Self::status_differs_from_last_sent`].
+    pub(super) fn record_sent_status(&mut self, status: HeaderSyncStatus) {
+        self.last_sent_status = Some(status);
+    }
+
+    /// Forgets the last status sent to this peer so the next one is always sent.
+    /// Called when a fresh session replaces the peer's transport: the new
+    /// channel's remote has received no status yet and gates serving us on it,
+    /// so the initial status must go out regardless of its contents.
+    pub(super) fn reset_sent_status(&mut self) {
+        self.last_sent_status = None;
     }
 
     pub(super) fn try_start_serving_headers(&mut self, local_inflight_cap: u16) -> bool {

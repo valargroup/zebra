@@ -1403,6 +1403,137 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
 }
 
 #[tokio::test]
+async fn reactor_queries_needed_blocks_above_submitted_floor() {
+    let blocks = mainnet_blocks_1_to_3();
+    let block1_size = block_size(&blocks[0]);
+    let block2_size = block_size(&blocks[1]);
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes = u64::from(block1_size) + u64::from(block2_size);
+
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer_id = peer(43);
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, _outbound_rx) = framed_channel(8);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+
+    service.add_peer(Peer::new_with_direction(
+        peer_id.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(3),
+                tip_hash: blocks[2].hash(),
+                max_blocks_per_response: 2,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(1),
+                hash: blocks[0].hash(),
+                size: BlockSizeEstimate::Advertised(block1_size),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: blocks[1].hash(),
+                size: BlockSizeEstimate::Advertised(block2_size),
+            },
+        ]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id, block::Height(1), 2)
+    );
+
+    for block in blocks.iter().take(2) {
+        inbound_tx
+            .send(
+                BlockSyncMessage::Block(block.clone())
+                    .encode_frame()
+                    .expect("block encodes"),
+            )
+            .await
+            .expect("block queues");
+    }
+
+    let mut submitted = Vec::new();
+    while submitted.len() < 2 {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block } => {
+                submitted.push(block.coinbase_height().expect("test block has height"));
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before checkpoint submissions: {action:?}"),
+        }
+    }
+    assert_eq!(submitted, vec![block::Height(1), block::Height(2)]);
+
+    handle
+        .send(BlockSyncEvent::BlockApplyFinished {
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            result: BlockApplyResult::Committed,
+        })
+        .await
+        .expect("apply-finished event queues");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                assert_eq!(
+                    verified_block_tip,
+                    block::Height(2),
+                    "missing-body query must skip already submitted contiguous bodies",
+                );
+                assert_eq!(best_header_tip, block::Height(3));
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before needed-block query: {action:?}"),
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_retries_submitted_body_after_apply_rejection() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);

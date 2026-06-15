@@ -286,6 +286,10 @@ impl BlockSyncReactor {
         self.state.servable_high = frontiers.verified_block_tip;
         self.state.servable_hash = frontiers.verified_block_hash;
         self.state.verified_block_hash = frontiers.verified_block_hash;
+        self.state.body_download_floor = self
+            .state
+            .body_download_floor
+            .max(frontiers.verified_block_tip);
         if frontiers.verified_block_tip != self.state.verified_block_tip {
             self.release_applied_blocks_through(frontiers.verified_block_tip);
             self.drop_outstanding_through(frontiers.verified_block_tip);
@@ -305,6 +309,7 @@ impl BlockSyncReactor {
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
+        self.state.body_download_floor = frontiers.verified_block_tip;
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
         self.state.servable_high = frontiers.verified_block_tip;
         self.state.servable_hash = frontiers.verified_block_hash;
@@ -855,6 +860,10 @@ impl BlockSyncReactor {
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
+                self.release_applying_blocks_from(height);
+                self.state.body_download_floor = previous_height(height)
+                    .unwrap_or(block::Height::MIN)
+                    .max(self.state.verified_block_tip);
                 self.state.schedule.clear_covered_from(height);
                 self.state.reorder.drop_from(height, &mut self.state.budget);
             }
@@ -904,7 +913,7 @@ impl BlockSyncReactor {
         }
         let _ = self
             .dispatch_action(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: self.state.verified_block_tip,
+                verified_block_tip: self.state.body_download_floor,
                 best_header_tip: self.state.best_header_tip,
             })
             .await;
@@ -1018,16 +1027,13 @@ impl BlockSyncReactor {
     }
 
     async fn release_contiguous_blocks(&mut self) {
-        let mut submitted_tip = self.state.verified_block_tip;
-        while next_height(submitted_tip)
-            .is_some_and(|height| self.state.applying.contains_key(&height))
-        {
-            submitted_tip = next_height(submitted_tip).expect("checked above");
-        }
-
-        let released = self.state.reorder.drain_contiguous_prefix(submitted_tip);
+        let released = self
+            .state
+            .reorder
+            .drain_contiguous_prefix(self.state.body_download_floor);
         for (height, block, bytes) in released {
             let hash = block.hash();
+            self.state.body_download_floor = height;
             self.state.schedule.mark_height_covered(height);
             self.state.applying.insert(
                 height,
@@ -1097,6 +1103,20 @@ impl BlockSyncReactor {
             .sum();
         self.state.budget.release(bytes);
         self.state.applying.clear();
+    }
+
+    fn release_applying_blocks_from(&mut self, from: block::Height) {
+        let heights: Vec<_> = self
+            .state
+            .applying
+            .range(from..)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in heights {
+            if let Some(applying) = self.state.applying.remove(&height) {
+                self.state.budget.release(applying.bytes);
+            }
+        }
     }
 
     async fn send_status(&self, peer: &ZakuraPeerId) {
