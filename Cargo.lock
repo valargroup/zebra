@@ -7763,6 +7763,7 @@ dependencies = [
  "bincode",
  "chrono",
  "color-eyre",
+ "criterion",
  "crossbeam-channel",
  "derive-getters",
  "derive-new",

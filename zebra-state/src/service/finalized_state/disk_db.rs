@@ -97,6 +97,14 @@ pub struct DiskDb {
     /// applying any format changes that may have been required.
     finished_format_upgrades: Arc<AtomicBool>,
 
+    /// Set when one or more blocks have been written without a write-ahead log
+    /// (checkpoint-verified blocks, see [`DiskDb::write_finalized_block`]).
+    ///
+    /// The next WAL-backed write flushes the memtables to SST files first, so a
+    /// non-reproducible (semantically-verified) block never relies on a WAL
+    /// entry layered on top of unflushed, WAL-less checkpoint blocks.
+    wal_flush_pending: Arc<AtomicBool>,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -1023,6 +1031,7 @@ impl DiskDb {
                     ephemeral: config.ephemeral,
                     db: Arc::new(db),
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    wal_flush_pending: Arc::new(AtomicBool::new(false)),
                 };
 
                 db.assert_default_cf_is_empty();
@@ -1093,6 +1102,58 @@ impl DiskDb {
     /// Writes `batch` to the database.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch.batch)
+    }
+
+    /// Writes a finalized-block `batch` to the database, skipping the
+    /// write-ahead log (WAL) when `disable_wal` is set.
+    ///
+    /// # Durability
+    ///
+    /// Skipping the WAL is only safe for blocks that can be regenerated after a
+    /// crash. Checkpoint-verified blocks qualify: they are reproducible from the
+    /// hard-coded checkpoint hashes, so if a crash discards memtable contents
+    /// that have not yet been flushed to SST files, sync simply resumes from the
+    /// recovered finalized tip. Semantically-verified blocks are *not*
+    /// reproducible and must always be written with the WAL.
+    ///
+    /// Each batch is atomic, and RocksDB flushes memtables in write order with
+    /// [`set_atomic_flush`](rocksdb::Options::set_atomic_flush) enabled (see
+    /// [`DiskDb::options`]), so the recovered state is always a consistent prefix
+    /// of committed blocks across every column family — never a torn write.
+    ///
+    /// Before the first WAL-backed write that follows any WAL-less writes, the
+    /// memtables are flushed to SST files. This makes the earlier checkpoint
+    /// blocks durable before a non-reproducible block (and its WAL entry) starts
+    /// depending on them, so a later crash cannot replay the WAL on top of a
+    /// state that is missing those checkpoint blocks.
+    pub(crate) fn write_finalized_block(
+        &self,
+        batch: DiskWriteBatch,
+        disable_wal: bool,
+    ) -> Result<(), rocksdb::Error> {
+        if disable_wal {
+            let mut write_options = rocksdb::WriteOptions::default();
+            write_options.disable_wal(true);
+            self.db.write_opt(batch.batch, &write_options)?;
+            self.wal_flush_pending
+                .store(true, atomic::Ordering::Release);
+            Ok(())
+        } else {
+            // Persist any earlier WAL-less checkpoint writes before this
+            // WAL-backed block starts relying on the WAL for durability.
+            if self.wal_flush_pending.swap(false, atomic::Ordering::AcqRel) {
+                if let Err(error) = self.db.flush() {
+                    // The flush failed, so the earlier WAL-less writes are still
+                    // only in the memtable. Restore the flag so a later commit
+                    // retries the flush instead of silently skipping it.
+                    self.wal_flush_pending
+                        .store(true, atomic::Ordering::Release);
+                    return Err(error);
+                }
+            }
+
+            self.db.write(batch.batch)
+        }
     }
 
     // Private methods
@@ -1246,6 +1307,16 @@ impl DiskDb {
 
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+
+        // Flush all column families together, so the on-disk state is always a
+        // consistent prefix across every column family after a crash.
+        //
+        // This is required because checkpoint-verified blocks are written
+        // without a write-ahead log (see [`DiskDb::write_finalized_block`]).
+        // Without atomic flush, RocksDB could persist different column families
+        // to different heights and recover into an inconsistent state, since
+        // there is no WAL to replay the missing per-family writes.
+        opts.set_atomic_flush(true);
 
         // Use the recommended Ribbon filter setting for all column families.
         //

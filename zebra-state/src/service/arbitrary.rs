@@ -65,6 +65,8 @@ impl ValueTree for PreparedChainTree {
     }
 }
 
+/// A proptest [`Strategy`] that generates a chain of committable blocks,
+/// starting at genesis, for use in tests and benchmarks.
 #[derive(Debug, Default)]
 pub struct PreparedChain {
     // the proptests are threaded (not async), so we want to use a threaded mutex here
