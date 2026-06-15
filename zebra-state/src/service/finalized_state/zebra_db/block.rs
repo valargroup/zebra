@@ -231,12 +231,23 @@ impl ZebraDb {
             .map(|(_, tx)| tx)
             .collect();
 
-        let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
-        if transactions.len() != transaction_hashes.len() {
-            return None;
+        if self.raw_block_transactions_may_be_pruned(height) {
+            let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
+            if transactions.len() != transaction_hashes.len() {
+                return None;
+            }
         }
 
         Some((header, transactions))
+    }
+
+    /// Returns `true` if `height` is in the range where raw transactions may
+    /// have been pruned from `tx_by_loc`.
+    fn raw_block_transactions_may_be_pruned(&self, height: Height) -> bool {
+        height.0 != 0
+            && self
+                .lowest_retained_height()
+                .is_some_and(|lowest| height < lowest)
     }
 
     /// Returns the Sapling [`note commitment tree`](sapling::tree::NoteCommitmentTree) specified by

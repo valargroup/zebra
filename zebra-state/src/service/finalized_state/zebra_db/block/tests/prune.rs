@@ -165,8 +165,27 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         "raw transaction before the online pruning boundary is preserved"
     );
     assert!(
+        state.db.block(Height(prune_from - 1).into()).is_some(),
+        "preserved block below the pruning marker is still reconstructed"
+    );
+    assert!(
+        state
+            .db
+            .block_and_size(Height(prune_from - 1).into())
+            .is_some(),
+        "preserved block and size below the pruning marker is still available"
+    );
+    assert!(
         state.db.transaction(pruned_tx_hash).is_none(),
         "raw transaction at the online pruning boundary is pruned"
+    );
+    assert!(
+        state.db.block(Height(prune_from).into()).is_none(),
+        "pruned block at the online pruning boundary is not reconstructed"
+    );
+    assert!(
+        state.db.block_and_size(Height(prune_from).into()).is_none(),
+        "pruned block and size at the online pruning boundary is unavailable"
     );
     assert_eq!(
         state.db.lowest_retained_height(),
