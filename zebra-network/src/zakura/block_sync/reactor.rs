@@ -333,6 +333,24 @@ impl BlockSyncReactor {
     }
 
     async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
+        // The state reports every header-known, body-missing height above the
+        // download floor, but it has no visibility into our in-memory buffers.
+        // Heights already held in the reorder buffer (received, waiting for a
+        // lower gap to fill) or in `applying` (submitted, awaiting commit) must
+        // not be scheduled again: `refresh_needed` builds one maximal contiguous
+        // range and `ensure` rejects any range overlapping a queued/assigned
+        // one, so a held run sitting above an open gap would otherwise block the
+        // gap below it from ever being queued, freezing `body_download_floor`
+        // and re-requesting already-held blocks forever. Only schedule heights
+        // we do not already hold in memory.
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|block| {
+                !self.state.reorder.contains(block.height)
+                    && !self.state.applying.contains_key(&block.height)
+            })
+            .collect();
+
         self.state.needed_heights = blocks.iter().map(|block| block.height).collect();
         self.state.needed_heights.sort_unstable();
         self.state.needed_heights.dedup();

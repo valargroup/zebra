@@ -3786,6 +3786,97 @@ async fn reactor_never_serves_reorder_buffer_bodies() {
 }
 
 #[tokio::test]
+async fn reactor_schedules_gap_below_buffered_reorder_run() {
+    // Regression for the mainnet stuck-at-0 deadlock: a body run received above
+    // an open gap must not starve the gap below it. The state reports every
+    // header-known, body-missing height (it cannot see our in-memory reorder
+    // buffer), so a re-query returns already-buffered heights too. With the
+    // default fanout > 1 the held range lingers in the scheduler queue. Because
+    // `refresh_needed` builds one maximal contiguous range and `ensure` rejects
+    // any range overlapping a queued one, the gap below the held run would never
+    // be scheduled and `body_download_floor` would freeze forever while we
+    // re-requested the already-held blocks. The reactor must drop already-held
+    // heights from the needed set so the gap gets scheduled.
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    assert!(
+        config.fanout > 1,
+        "held range must linger across fanout peers to reproduce the deadlock",
+    );
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(3), blocks[2].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        63,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    // Height 2 is momentarily not offered, so we fetch and buffer height 3 in
+    // the reorder buffer above the open height-2 gap.
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[2])]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(3), 1)
+    );
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[2].clone())
+                .encode_frame()
+                .expect("block frame encodes"),
+        )
+        .await
+        .expect("block frame queues");
+
+    // Height 3 is now buffered; the scheduler re-requests it (the held range
+    // lingers in the queue). Waiting for that re-request also confirms the
+    // body has been processed into the reorder buffer.
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(3), 1),
+        "buffered-but-uncommitted height 3 is re-requested while it lingers queued",
+    );
+
+    // The state still reports both 2 and 3 as body-missing, because the reorder
+    // buffer is invisible to it. The reactor must now schedule the gap at height
+    // 2 instead of staying trapped re-requesting the already-buffered height 3.
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[1]),
+            block_meta(&blocks[2]),
+        ]))
+        .await
+        .expect("needed metadata queues");
+
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id, block::Height(2), 1),
+        "reactor must schedule the gap at height 2 below the buffered reorder run",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_secs(60),
