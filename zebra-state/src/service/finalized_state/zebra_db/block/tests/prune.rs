@@ -23,7 +23,7 @@ use crate::{
     Config, PruningConfig,
 };
 
-use super::super::prune_height_range_inner;
+use super::super::{prune_height_range_inner, should_log_prune_progress};
 
 /// The number of leading blocks committed by the database-backed prune tests.
 const TEST_BLOCKS: u32 = 9;
@@ -107,6 +107,34 @@ fn prune_height_range_arithmetic() {
         until - from,
         MAX_PRUNE_HEIGHTS_PER_COMMIT,
         "per-commit work is capped"
+    );
+}
+
+#[test]
+fn prune_progress_logging_is_chunked() {
+    assert!(
+        should_log_prune_progress(false, Height(5001), Height(1), Height(2)),
+        "first prune is logged so operators can see destructive pruning started"
+    );
+
+    assert!(
+        should_log_prune_progress(
+            true,
+            Height(5001),
+            Height(1),
+            Height(1 + MAX_PRUNE_HEIGHTS_PER_COMMIT),
+        ),
+        "full backlog chunks are logged"
+    );
+
+    assert!(
+        should_log_prune_progress(true, Height(5100), Height(99), Height(100)),
+        "steady-state pruning logs on 100-block tip boundaries"
+    );
+
+    assert!(
+        !should_log_prune_progress(true, Height(5101), Height(100), Height(101)),
+        "steady-state pruning does not log every block"
     );
 }
 
