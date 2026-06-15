@@ -74,6 +74,9 @@ pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 8;
 pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
 /// Conservative default for per-kind message rate per connection.
 pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 128;
+/// Default native Zakura QUIC listen address.
+pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
 /// Default maximum bytes read before the peer's stream prelude is decoded.
 pub const DEFAULT_ZAKURA_PRELUDE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default timeout for one control-handshake read or write.
@@ -226,14 +229,13 @@ pub struct ZakuraConfig {
     pub bootstrap_peers: Vec<String>,
     /// Address the native Zakura QUIC endpoint binds to.
     ///
-    /// When unset the endpoint binds an OS-assigned ephemeral port on loopback
+    /// Defaults to `0.0.0.0:8234`, giving the node a stable, advertisable
+    /// Zakura endpoint so other nodes can list it in their
+    /// [`bootstrap_peers`](Self::bootstrap_peers). If code constructs this as
+    /// `None`, the endpoint binds an OS-assigned ephemeral port on loopback
     /// only (`127.0.0.1` and `::1`), which is fine for a node that only dials
     /// out and keeps the experimental native P2P_V2_ALPN surface off all
-    /// non-loopback interfaces. Set a fixed address to give this node a stable,
-    /// advertisable Zakura endpoint so other nodes can list it in their
-    /// [`bootstrap_peers`](Self::bootstrap_peers) — required for a node that acts
-    /// as a Zakura seed or otherwise accepts inbound native connections, since
-    /// relays and discovery are disabled.
+    /// non-loopback interfaces.
     pub listen_addr: Option<SocketAddr>,
     /// Total concurrent Zakura connections, inbound plus outbound.
     pub max_connections: usize,
@@ -258,7 +260,7 @@ impl Default for ZakuraConfig {
     fn default() -> Self {
         Self {
             bootstrap_peers: Vec::new(),
-            listen_addr: None,
+            listen_addr: Some(DEFAULT_ZAKURA_LISTEN_ADDR),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,

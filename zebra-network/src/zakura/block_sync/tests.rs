@@ -144,6 +144,7 @@ async fn wait_for_connect_status(actions: &mut mpsc::Receiver<BlockSyncAction>) 
                 msg: BlockSyncMessage::Status(_),
             } => return peer,
             BlockSyncAction::SendMessage { .. } => {}
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::Misbehavior { .. } => {}
             action => panic!("unexpected action before connect status: {action:?}"),
         }
@@ -1682,6 +1683,260 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
     assert_eq!(
         submitted,
         vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change() {
+    let config = immediate_body_download_config();
+    let blocks = mainnet_blocks_1_to_3();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(3), blocks[2].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    match next_action(&mut actions).await {
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip,
+            best_header_tip,
+        } => {
+            assert_eq!(verified_block_tip, block::Height(0));
+            assert_eq!(best_header_tip, block::Height(3));
+        }
+        action => panic!("restart from genesis must query missing bodies, got {action:?}"),
+    }
+
+    let (peer, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        67,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer, block::Height(1), 3),
+        "restart from genesis must schedule scratch body sync from height 1"
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("block queues");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block } => {
+                assert_eq!(block.hash(), blocks[0].hash());
+                assert_eq!(block.coinbase_height(), Some(block::Height(1)));
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before first scratch submit: {action:?}"),
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_accepts_blocks_done_after_completed_range() {
+    let config = immediate_body_download_config();
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        68,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(2), blocks[1].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer.clone(), block::Height(1), 1)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("block queues");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block } => {
+                assert_eq!(block.hash(), blocks[0].hash());
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before submit: {action:?}"),
+        }
+    }
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            }
+            .encode_frame()
+            .expect("BlocksDone encodes"),
+        )
+        .await
+        .expect("BlocksDone queues");
+
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(200), actions.recv()).await
+    {
+        if let BlockSyncAction::Misbehavior {
+            peer: action_peer,
+            reason,
+        } = action
+        {
+            assert_ne!(
+                (action_peer, reason),
+                (peer.clone(), BlockSyncMisbehavior::UnsolicitedDone),
+                "a valid terminator after a completed block response must not be scored"
+            );
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_retries_missing_heights_after_partial_blocks_done() {
+    let config = immediate_body_download_config();
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        69,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer.clone(), block::Height(1), 3)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("block queues");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block } => {
+                assert_eq!(block.hash(), blocks[0].hash());
+                break;
+            }
+            BlockSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action before first submit: {action:?}"),
+        }
+    }
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            }
+            .encode_frame()
+            .expect("BlocksDone encodes"),
+        )
+        .await
+        .expect("BlocksDone queues");
+
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer, block::Height(2), 1),
+        "partial responses must retry the first missing height"
     );
 
     reactor_task.abort();
@@ -3267,7 +3522,7 @@ async fn reactor_limits_serving_slots_and_disconnects_repeated_soft_misbehavior(
     inbound_tx
         .send(
             BlockSyncMessage::RangeUnavailable {
-                start_height: block::Height(1),
+                start_height: block::Height(2),
                 count: 1,
             }
             .encode_frame()
@@ -3292,7 +3547,7 @@ async fn reactor_limits_serving_slots_and_disconnects_repeated_soft_misbehavior(
         inbound_tx
             .send(
                 BlockSyncMessage::RangeUnavailable {
-                    start_height: block::Height(1),
+                    start_height: block::Height(2),
                     count: 1,
                 }
                 .encode_frame()

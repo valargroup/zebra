@@ -13,7 +13,7 @@ use zebra_chain::{
 
 use crate::{
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
-    zakura::{DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE},
+    zakura::{DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_LISTEN_ADDR},
     CacheDir, Config,
 };
 
@@ -310,6 +310,7 @@ fn default_config_uses_ipv6() {
 
     assert_eq!(config.listen_addr.to_string(), "[::]:8233");
     assert!(config.listen_addr.is_ipv6());
+    assert_eq!(config.zakura.listen_addr, Some(DEFAULT_ZAKURA_LISTEN_ADDR));
 }
 
 #[test]

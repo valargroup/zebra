@@ -291,6 +291,18 @@ impl OutstandingBlockRange {
     pub(super) fn is_complete(&self) -> bool {
         self.received.len() == self.request.expected_hashes.len()
     }
+
+    pub(super) fn missing_retry_requests(&self) -> Vec<BlockRangeRequest> {
+        self.request
+            .expected_hashes
+            .iter()
+            .filter_map(|(height, _)| {
+                (!self.received.contains(height))
+                    .then(|| self.request.single_height_retry(*height))
+                    .flatten()
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -1083,10 +1083,14 @@ where
             } => {
                 *height == Height(0)
                     && *hash == self.genesis_hash
-                    && error.duplicate_location() == Some(&zs::KnownBlock::Finalized)
+                    && Self::is_duplicate_finalized_error(error)
             }
             _ => false,
         }
+    }
+
+    fn is_duplicate_finalized_error(error: &zebra_consensus::RouterError) -> bool {
+        error.duplicate_location() == Some(&zs::KnownBlock::Finalized)
     }
 
     /// Try to download and verify the genesis block once.
@@ -1329,6 +1333,15 @@ where
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
                 debug!(error = ?e, "block was already verified or committed, possibly from a previous sync run, continuing");
+                false
+            }
+            BlockDownloadVerifyError::Invalid { error, .. }
+                if Self::is_duplicate_finalized_error(error) =>
+            {
+                debug!(
+                    error = ?e,
+                    "block was already finalized, possibly from a previous sync run, continuing"
+                );
                 false
             }
 

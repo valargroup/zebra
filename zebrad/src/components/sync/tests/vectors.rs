@@ -1128,6 +1128,41 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
     Ok(())
 }
 
+/// In-flight checkpoint downloads can finish after a later contiguous range has
+/// already reached finalized state. Those duplicate/finalized responses are
+/// stale work, not a reason to restart the whole sync loop.
+#[test]
+fn duplicate_finalized_checkpoint_block_does_not_restart_sync() -> Result<(), crate::BoxError> {
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+
+    let duplicate = zs::CommitBlockError::Duplicate {
+        hash_or_height: None,
+        location: zs::KnownBlock::Finalized,
+    };
+    let duplicate = zs::CommitCheckpointVerifiedError::from(duplicate);
+    let router_error = RouterError::Checkpoint {
+        source: Box::new(VerifyCheckpointError::CommitCheckpointVerified(Box::new(
+            duplicate,
+        ))),
+    };
+    let err = BlockDownloadVerifyError::Invalid {
+        error: router_error,
+        height: Height(1),
+        hash: block1_hash,
+        advertiser_addr: None,
+    };
+
+    let restart = TestChainSync::should_restart_sync(&err);
+
+    assert!(
+        !restart,
+        "duplicate finalized checkpoint blocks are stale in-flight work, not sync restarts"
+    );
+
+    Ok(())
+}
+
 /// Verifies fix for GHSA-gvjc-3w7c-92jx: `AboveLookaheadHeightLimit` now has
 /// an explicit match arm in `should_restart_sync` that returns `false`.
 #[tokio::test]

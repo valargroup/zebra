@@ -78,6 +78,10 @@ impl BlockSyncReactor {
                 .max(Duration::from_millis(1)),
         );
 
+        if !self.query_needed_blocks().await {
+            self.pause_new_body_downloads();
+        }
+        self.release_caught_up_block_sync_peers();
         self.publish_metrics();
         loop {
             tokio::select! {
@@ -405,8 +409,11 @@ impl BlockSyncReactor {
                 start_height,
                 returned: _,
             } => self.handle_blocks_done(peer, start_height).await,
-            BlockSyncMessage::RangeUnavailable { .. } => {
-                self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
+            BlockSyncMessage::RangeUnavailable {
+                start_height,
+                count,
+            } => {
+                self.handle_range_unavailable(peer, start_height, count)
                     .await;
             }
             BlockSyncMessage::GetBlocks {
@@ -453,11 +460,20 @@ impl BlockSyncReactor {
         };
 
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+            if self
+                .ignore_stale_response(&peer, height, "body from inactive peer")
+                .await
+            {
+                return;
+            }
             self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedBlock)
                 .await;
             return;
         };
         let Some(index) = peer_state.outstanding_index_for_height(height) else {
+            if self.ignore_stale_response(&peer, height, "body").await {
+                return;
+            }
             self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedBlock)
                 .await;
             return;
@@ -614,17 +630,109 @@ impl BlockSyncReactor {
         self.state.schedule.retry(outstanding.request);
     }
 
-    async fn handle_blocks_done(&mut self, peer: ZakuraPeerId, start_height: block::Height) {
-        let Some(peer_state) = self.state.peers.get_mut(&peer) else {
-            self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedDone)
+    async fn handle_range_unavailable(
+        &mut self,
+        peer: ZakuraPeerId,
+        start_height: block::Height,
+        _count: u32,
+    ) {
+        let Some(index) = self.outstanding_index_for_start(&peer, start_height) else {
+            if self
+                .ignore_stale_response(&peer, start_height, "unavailable range")
+                .await
+            {
+                return;
+            }
+
+            self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
                 .await;
             return;
         };
-        let Some(index) = peer_state
+
+        self.retry_missing_from_outstanding(&peer, index);
+        self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
+            .await;
+        self.schedule().await;
+        self.release_caught_up_block_sync_peers();
+    }
+
+    fn outstanding_index_for_start(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+    ) -> Option<usize> {
+        self.state
+            .peers
+            .get(peer)?
             .outstanding
             .iter()
             .position(|outstanding| outstanding.request.start_height == start_height)
-        else {
+    }
+
+    fn is_stale_response_height(&self, height: block::Height) -> bool {
+        height <= self.state.verified_block_tip || self.state.reorder.contains(height)
+    }
+
+    async fn ignore_stale_response(
+        &mut self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+        response_kind: &'static str,
+    ) -> bool {
+        if !self.is_stale_response_height(height) {
+            return false;
+        }
+
+        tracing::debug!(
+            ?peer,
+            ?height,
+            response_kind,
+            "ignoring stale block-sync response"
+        );
+        self.release_contiguous_blocks().await;
+        self.schedule().await;
+        self.release_caught_up_block_sync_peers();
+        true
+    }
+
+    fn retry_missing_from_outstanding(&mut self, peer: &ZakuraPeerId, index: usize) {
+        let Some(peer_state) = self.state.peers.get_mut(peer) else {
+            return;
+        };
+        if index >= peer_state.outstanding.len() {
+            return;
+        }
+
+        let outstanding = peer_state.outstanding.remove(index);
+        let missing = outstanding.missing_retry_requests();
+        self.state.budget.release(outstanding.reserved_bytes());
+        self.state.schedule.clear_assignment(&outstanding.request);
+        for request in missing.into_iter().rev() {
+            self.state.schedule.retry(request);
+        }
+    }
+
+    async fn handle_blocks_done(&mut self, peer: ZakuraPeerId, start_height: block::Height) {
+        if !self.state.peers.contains_key(&peer) {
+            if self
+                .ignore_stale_response(&peer, start_height, "terminator from inactive peer")
+                .await
+            {
+                return;
+            }
+
+            self.report_misbehavior(peer, BlockSyncMisbehavior::UnsolicitedDone)
+                .await;
+            return;
+        }
+
+        let Some(index) = self.outstanding_index_for_start(&peer, start_height) else {
+            if self
+                .ignore_stale_response(&peer, start_height, "terminator")
+                .await
+            {
+                return;
+            }
             // A known, active peer sent a response terminator that correlates to no
             // outstanding range. Fail closed: report `UnsolicitedDone` (a hard
             // block-sync misbehavior) instead of silently rescheduling.
@@ -632,9 +740,7 @@ impl BlockSyncReactor {
                 .await;
             return;
         };
-        let outstanding = peer_state.outstanding.remove(index);
-        self.state.budget.release(outstanding.reserved_bytes());
-        self.state.schedule.clear_assignment(&outstanding.request);
+        self.retry_missing_from_outstanding(&peer, index);
         self.schedule().await;
         self.release_caught_up_block_sync_peers();
     }

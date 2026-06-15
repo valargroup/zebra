@@ -1203,13 +1203,6 @@ impl Service<Request> for StateService {
                 headers,
                 body_sizes,
             } => {
-                // A header range commit is processed by the block write task's
-                // non-finalized loop, which only runs after the finalized
-                // block-write channel closes. End the checkpoint-sync finalized
-                // write phase now (idempotent) so the commit is not blocked
-                // behind a finalized channel that, for a Zakura node catching up
-                // to a static tip, would otherwise never close.
-                self.finish_checkpoint_finalized_writes();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
                 });
