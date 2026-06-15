@@ -80,6 +80,20 @@ impl ReorderBuffer {
         self.drop_from(block::Height::MIN, budget);
     }
 
+    pub(crate) fn drop_through(&mut self, through: block::Height, budget: &mut ByteBudget) {
+        let heights: Vec<_> = self
+            .blocks
+            .range(..=through)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in heights {
+            if let Some(buffered) = self.blocks.remove(&height) {
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                budget.release(buffered.bytes);
+            }
+        }
+    }
+
     pub(crate) fn drop_from(&mut self, from: block::Height, budget: &mut ByteBudget) {
         let heights: Vec<_> = self
             .blocks

@@ -98,6 +98,14 @@ impl BlockRangeScheduler {
         self.queue.clear();
     }
 
+    pub(super) fn drop_through(&mut self, tip: block::Height) {
+        for range in &mut self.queue {
+            range.blocks.retain(|block| block.height > tip);
+        }
+        self.queue.retain(|range| !range.blocks.is_empty());
+        self.assigned.retain(|range, _| range.start > tip);
+    }
+
     pub(super) fn next_for_peer(
         &mut self,
         peer_id: &ZakuraPeerId,

@@ -47,6 +47,13 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # the Zakura request path is working. Three blocks also avoids leaving a
 # one-block remainder if the tiny regtest topology drops an early response.
 GENERATE_BLOCKS="${GENERATE_BLOCKS:-3}"
+# Extra blocks mined on node1 after the propagation assertions and before the
+# from-scratch reset, so the kind-6 catch-up re-downloads a real burst of bodies
+# rather than a handful. Hundreds of blocks is what fills the inbound wire queue
+# and exercises the body-flood path that wedged in production; a 3-block catch-up
+# never gets near it. Set to 0 to skip the deepening and keep the legacy 3-block
+# catch-up.
+CATCHUP_BLOCKS="${CATCHUP_BLOCKS:-200}"
 READY_TIMEOUT="${READY_TIMEOUT:-120}"
 # Propagation to the Zakura peer can take a little while: the dual-stack tries
 # the (empty) legacy peer set first, and the legacy->Zakura upgrade re-dials a
@@ -103,10 +110,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# rpc <port> <method> [json-params] -> raw JSON-RPC response
+# rpc <port> <method> [json-params] [max-time-seconds] -> raw JSON-RPC response
 rpc() {
-  local port="$1" method="$2" params="${3:-[]}"
-  curl -s --max-time 10 -H 'content-type: application/json' \
+  local port="$1" method="$2" params="${3:-[]}" max_time="${4:-10}"
+  curl -s --max-time "${max_time}" -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
     "http://127.0.0.1:${port}/"
 }
@@ -415,6 +422,37 @@ wait_zakura_body_frontiers_at_tip "${target}" "post-generate"
 assert_block_sync_budget_empty "post-generate"
 
 # ---------------------------------------------------------------------------
+# Deepen the chain before the from-scratch reset so the kind-6 catch-up below
+# re-downloads many bodies in a burst. Crossing hundreds of blocks is what fills
+# the inbound block-sync wire queue and exercises the body-flood path that
+# wedged in production (a full queue silently dropping solicited bodies, then a
+# checkpoint-range commit waiting forever on the gap). A 3-block catch-up never
+# fills that queue, so the earlier topology could not reproduce the stall. node2
+# is still connected and tracks these via gossip, but it is wiped by the reset
+# below, forcing a real kind-6 re-download of the whole deepened chain.
+if (( CATCHUP_BLOCKS > 0 )); then
+  log "deepening node1 chain by ${CATCHUP_BLOCKS} block(s) before the reset catch-up"
+  remaining=${CATCHUP_BLOCKS}
+  while (( remaining > 0 )); do
+    batch=$(( remaining < 50 ? remaining : 50 ))
+    # `generate` mines sequentially (~0.25s/block on a debug build), so a 50-block batch can
+    # exceed the default 10s RPC deadline — give it a generous, batch-scaled timeout.
+    rpc 18232 generate "[${batch}]" "$(( batch * 4 + 30 ))" \
+      | jq -e ".result | length == ${batch}" >/dev/null \
+      || fail "bulk generate of ${batch} block(s) failed on node1"
+    remaining=$(( remaining - batch ))
+    printf '  mined batch of %s; node1 height=%s (%s remaining)\n' \
+      "${batch}" "$(block_count 18232)" "${remaining}"
+  done
+  # Make the deepened tip the working target so the from-scratch catch-up spans
+  # the whole chain and the trailing reorg stays a cheap one-block tip reorg
+  # rather than unwinding everything mined here.
+  target=$(block_count 18232)
+  log "waiting for node1 body frontier to settle at the deepened tip ${target}"
+  wait_zakura_body_frontier_at_tip 19001 18232 "${target}" "node1 deepened"
+fi
+
+# ---------------------------------------------------------------------------
 # Exercise kind-6 block sync via a from-scratch reset of the pure-Zakura node.
 #
 # Above, node2 reached the tip while connected — but it got there through inbound
@@ -431,6 +469,58 @@ catchup_target=$(block_count 18232)
 [[ "${catchup_target}" -ge 1 ]] || fail \
   "node1 has no chain for node2 to catch up to (height ${catchup_target})"
 before_node1_served=$(metric 19001 sync_block_body_served)
+
+# ---------------------------------------------------------------------------
+# Derive a Regtest checkpoint list from node1's chain and rewrite node2's config before the
+# restart, so the from-scratch catch-up below verifies through real checkpoint ranges
+# (batch-commit). That is the production path Regtest's genesis-only checkpoint list cannot
+# exercise, and the exact shape of the "drop-through" wedge: a body missing inside a
+# checkpoint range stalls that range's indefinite-wait commit. Hashes are only known once
+# mined, so this runs after the deepening. Only `checkpoints` is overridden — Regtest
+# genesis/magic/PoW are preserved (see build_regtest_params in zebra-network), so node2 still
+# peers with node1; checkpoint_sync defaults to true, so node2 verifies the whole range. The
+# config shape is locked by zebra-network's
+# `configured_regtest_checkpoints_preserve_regtest_identity` unit test.
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-100}"
+# Keep the highest checkpoint strictly below the tip so the trailing tip reorg later is never
+# blocked by a final (immutable) checkpoint.
+checkpoint_ceiling=$(( catchup_target - 2 ))
+if (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL )); then
+  # block::Hash deserializes as a 32-byte array in internal (display-reversed) order, so
+  # convert each getblockhash hex into a reversed decimal byte array, e.g.
+  # "029f..e327" -> [39, 227, ..., 2].
+  hash_to_internal_bytes() {
+    local hex="$1" out="" i
+    (( ${#hex} == 64 )) || fail "unexpected block hash length for '${hex}'"
+    for (( i = 62; i >= 0; i -= 2 )); do
+      out+="$(( 16#${hex:i:2} )), "
+    done
+    printf '[%s]' "${out%, }"
+  }
+
+  cp_entries=""
+  cp_count=0
+  h=0
+  while (( h <= checkpoint_ceiling )); do
+    cp_hash=$(block_hash 18232 "${h}")
+    [[ -n "${cp_hash}" ]] || fail "could not read node1 block hash at checkpoint height ${h}"
+    [[ -n "${cp_entries}" ]] && cp_entries+=", "
+    cp_entries+="[${h}, $(hash_to_internal_bytes "${cp_hash}")]"
+    cp_count=$(( cp_count + 1 ))
+    h=$(( h + CHECKPOINT_INTERVAL ))
+  done
+
+  # Replace node2's plain `network = "Regtest"` with a ConfiguredRegtest inline table carrying
+  # the derived checkpoints (the deserializer matches ConfiguredRegtest by the `params` key).
+  sed -i \
+    "s|^network = \"Regtest\"\$|network = { params = { checkpoints = [${cp_entries}] } }|" \
+    "${CONFIG_DIR}/node2.toml"
+  grep -q '^network = { params = ' "${CONFIG_DIR}/node2.toml" \
+    || fail "failed to inject derived checkpoints into node2 config"
+  log "node2 will checkpoint-verify its kind-6 catch-up against ${cp_count} derived checkpoint(s) up to height ${checkpoint_ceiling}"
+else
+  log "chain too short (tip ${catchup_target}, interval ${CHECKPOINT_INTERVAL}); node2 catches up with the genesis-only checkpoint list"
+fi
 
 docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
   || fail "could not stop node2 for the from-scratch catch-up"

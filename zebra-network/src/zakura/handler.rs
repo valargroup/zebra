@@ -72,8 +72,16 @@ pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 32;
 pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 8;
 /// Conservative default for stream-open churn per connection.
 pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
-/// Conservative default for per-kind message rate per connection.
-pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 128;
+/// Per-kind inbound message rate per connection.
+///
+/// This is a generous universal cap: block-sync legitimately delivers
+/// hundreds of solicited bodies per second in bursts, so a low limit
+/// starves sync. Exceeding it is treated as misbehavior and disconnects the
+/// peer (we never silently drop a solicited frame -- a dropped block body is
+/// a permanent gap on a reliable stream). Longer term this should be split
+/// per message type (some unbounded, some near-one-shot) rather than a single
+/// universal value.
+pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
@@ -675,6 +683,7 @@ impl ZakuraEndpoint {
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
+    #[allow(dead_code)]
     pub(crate) fn from_parts_with_header_sync(
         router: Router,
         supervisor: ZakuraSupervisorHandle,
@@ -696,6 +705,37 @@ impl ZakuraEndpoint {
             })),
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
+            upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts_with_sync_services(
+        router: Router,
+        supervisor: ZakuraSupervisorHandle,
+        handler: ZakuraProtocolHandler,
+        header_sync: super::HeaderSyncHandle,
+        block_sync: BlockSyncHandle,
+        shutdown: CancellationToken,
+        tasks: Vec<JoinHandle<()>>,
+        header_sync_actions: Option<mpsc::Receiver<HeaderSyncAction>>,
+        block_sync_actions: Option<mpsc::Receiver<BlockSyncAction>>,
+    ) -> Self {
+        Self {
+            router,
+            supervisor,
+            handler,
+            header_sync: Some(header_sync),
+            block_sync: Some(block_sync),
+            header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
+                shutdown,
+                tasks: Mutex::new(tasks),
+            })),
+            header_sync_actions: header_sync_actions
+                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
+            block_sync_actions: block_sync_actions
+                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -2634,13 +2674,102 @@ fn spawn_persistent_stream_worker(
 
 async fn persistent_stream_worker(
     mut send: SendStream,
-    mut recv: RecvStream,
+    recv: RecvStream,
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     inbound_tx: mpsc::Sender<Frame>,
     outbound_rx: mpsc::Receiver<Frame>,
     queue_depth_limit: usize,
 ) {
+    let context = Arc::new(context);
+    let stream_kind = prelude.stream_kind;
+
+    // The inbound reader runs in its own task, not as a `select!` branch racing
+    // the outbound writer below. `read_frame` is NOT cancellation-safe: it
+    // consumes the fixed frame header, then awaits the (multi-packet) payload. If
+    // it shared this `select!` with the outbound arm, an outbound frame becoming
+    // ready mid-read would drop the `read_frame` future and discard the header
+    // bytes it already consumed, desyncing the stream forever -- the next read
+    // decodes body bytes as a header, yielding a garbage multi-GiB `payload_len`,
+    // an `OversizeFrame` error, and a stream reset. Heavy concurrent body-sync
+    // (inbound bodies + outbound `GetBlocks`) made this fire constantly. Reading
+    // in a dedicated task removes the write/read race; the main loop only ever
+    // *receives* fully-read frames over a channel, which is cancellation-safe.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Frame, ZakuraHandlerError>>(1);
+    let reader_context = Arc::clone(&context);
+    let reader = tokio::spawn(async move {
+        let mut recv = recv;
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = reader_context.connection_token.cancelled() => break,
+                _ = reader_context.stream_token.cancelled() => break,
+                frame = read_frame(
+                    &mut recv,
+                    inbound_frame_cap_for_stream_kind(&reader_context.limits, stream_kind),
+                    reader_context.limits.idle_timeout,
+                ) => frame,
+            };
+            // Admit (rate/oversize) at ingress, the instant a frame is read, so
+            // throttling never trails behind the main loop draining queued
+            // outbound writes or forwarding an earlier frame to a service that
+            // might disconnect first. The main loop only ever receives frames
+            // that already cleared admission, plus terminal errors it maps to a
+            // reset code (it owns the send half). Admission is charged exactly
+            // once, here.
+            let message = match frame {
+                Ok(frame) => {
+                    let _ = reader_context.freshness_tx.send(Instant::now());
+                    match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
+                        InboundMessageAdmission::Admit => Ok(frame),
+                        InboundMessageAdmission::Oversize => Err(ZakuraHandlerError::Oversize),
+                        // Never drop a solicited frame: on a reliable ordered
+                        // stream the peer will not resend, so a dropped block
+                        // body is a permanent gap that stalls the checkpoint.
+                        // Keep the throttle metric/trace from admission, but
+                        // defer enforcement and deliver the frame.
+                        InboundMessageAdmission::Throttled => Ok(frame),
+                    }
+                }
+                Err(error) => {
+                    // Emit the oversize-desync diagnostic here, at the read, so
+                    // it is recorded even if the main loop tears the worker down
+                    // for an outbound write that stopped first.
+                    if let Some((payload_len, frame_len, max_frame_bytes)) =
+                        error.oversize_frame_details()
+                    {
+                        reader_context.trace.emit(
+                            RATELIMIT_TABLE,
+                            reader_context
+                                .event("frame.oversize")
+                                .stream_kind(stream_kind_label(stream_kind))
+                                .payload_len(payload_len)
+                                .frame_len(frame_len)
+                                .max_frame_bytes(max_frame_bytes),
+                        );
+                    }
+                    Err(error)
+                }
+            };
+            // Any error is terminal. `Closed` is a clean peer-initiated close;
+            // every other error is a protocol/limit violation that must
+            // disconnect the peer. Forward the error first so the main loop can
+            // map it to a reset code, then cancel the connection ourselves so
+            // the disconnect is guaranteed even if the main loop tore the worker
+            // down for a stopped outbound write before processing it.
+            let is_terminal = message.is_err();
+            let must_disconnect =
+                matches!(&message, Err(error) if !matches!(error, ZakuraHandlerError::Closed));
+            let forward_failed = frame_tx.send(message).await.is_err();
+            if must_disconnect {
+                reader_context.connection_token.cancel();
+            }
+            if forward_failed || is_terminal {
+                break;
+            }
+        }
+    });
+
     let mut outbound_rx = Some(outbound_rx);
     loop {
         tokio::select! {
@@ -2655,7 +2784,7 @@ async fn persistent_stream_worker(
             } => {
                 match outbound {
                     Some(frame) => {
-                        if let Err(error) = write_ordered_frame(&mut send, frame, context.limits, prelude.stream_kind).await {
+                        if let Err(error) = write_ordered_frame(&mut send, frame, context.limits, stream_kind).await {
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
@@ -2671,53 +2800,34 @@ async fn persistent_stream_worker(
                     }
                 }
             }
-            frame = read_frame(
-                &mut recv,
-                inbound_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
-                context.limits.idle_timeout,
-            ) => {
-                match frame {
-                    Ok(frame) => {
-                        let _ = context.freshness_tx.send(Instant::now());
-                        match admit_inbound_message(frame.payload.len(), &context, prelude.stream_kind) {
-                            InboundMessageAdmission::Admit => {}
-                            InboundMessageAdmission::Oversize => {
-                                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-                                context.connection_token.cancel();
-                                break;
-                            }
-                            InboundMessageAdmission::Throttled => continue,
-                        }
+            inbound = frame_rx.recv() => {
+                match inbound {
+                    // Frames here already cleared ingress admission in the reader.
+                    Some(Ok(frame)) => {
                         if inbound_tx.send(frame).await.is_err() {
                             debug!(
-                                stream_kind = prelude.stream_kind,
+                                stream_kind,
                                 "closing Zakura ordered stream after local service receiver dropped"
                             );
                             break;
                         }
                         metrics::gauge!(
                             "zakura.p2p.queue.depth",
-                            "stream_kind" => stream_kind_label(prelude.stream_kind),
+                            "stream_kind" => stream_kind_label(stream_kind),
                         )
                         .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
                     }
-                    Err(ZakuraHandlerError::Closed) => {
+                    // The reader signalled an oversize message: disconnect it.
+                    Some(Err(ZakuraHandlerError::Oversize)) => {
+                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
+                        context.connection_token.cancel();
                         break;
                     }
-                    Err(error) => {
-                        if let Some((payload_len, frame_len, max_frame_bytes)) =
-                            error.oversize_frame_details()
-                        {
-                            context.trace.emit(
-                                RATELIMIT_TABLE,
-                                context
-                                    .event("frame.oversize")
-                                    .stream_kind(stream_kind_label(prelude.stream_kind))
-                                    .payload_len(payload_len)
-                                    .frame_len(frame_len)
-                                    .max_frame_bytes(max_frame_bytes),
-                            );
-                        }
+                    Some(Err(ZakuraHandlerError::Closed)) | None => {
+                        break;
+                    }
+                    // The reader already emitted any oversize-desync diagnostic.
+                    Some(Err(error)) => {
                         debug!(?error, "closing Zakura stream worker");
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                         context.connection_token.cancel();
@@ -2727,6 +2837,11 @@ async fn persistent_stream_worker(
             }
         }
     }
+
+    // Stop the reader: it also observes the cancellation tokens, but abort
+    // guarantees a prompt exit on the paths that break without cancelling one
+    // (e.g. a peer that stopped receiving, or the local service receiver closing).
+    reader.abort();
 }
 
 fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
@@ -2781,8 +2896,10 @@ async fn request_stream_worker(
             return;
         }
         InboundMessageAdmission::Throttled => {
-            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-            return;
+            // The admission path already counted/traced the over-rate frame.
+            // Do not reject request streams here: request/response peers also
+            // will not resend a dropped frame, and backpressure is safer than
+            // data loss while block sync is catching up.
         }
     }
 

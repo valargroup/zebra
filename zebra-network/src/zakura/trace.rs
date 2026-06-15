@@ -107,6 +107,8 @@ pub mod block_sync_trace {
     pub const SERIALIZED_BYTES: &str = "serialized_bytes";
     /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
     pub const RESULT: &str = "result";
+    /// Reactor-local verifier submission token.
+    pub const APPLY_TOKEN: &str = "apply_token";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
     /// Highest contiguous body height already submitted for apply.

@@ -43,12 +43,15 @@ pub enum BlockSyncEvent {
     StateFrontiersChanged(BlockSyncFrontiers),
     /// State grew the verified body chain tip.
     ChainTipGrow(BlockSyncFrontiers),
-    /// State reset the verified body chain tip after a rollback or best-chain switch.
+    /// State reset the verified body chain tip after a rollback, best-chain switch,
+    /// activation boundary, or coalesced multi-block tip update.
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
     /// Node wiring finished applying a submitted block body.
     BlockApplyFinished {
+        /// Submission token from the matching [`BlockSyncAction::SubmitBlock`].
+        token: BlockApplyToken,
         /// Submitted block height.
         height: block::Height,
         /// Submitted block hash.
@@ -93,6 +96,13 @@ pub enum BlockApplyResult {
     TimedOut,
 }
 
+/// Monotonic token assigned by the reactor to each verifier submission.
+///
+/// The verifier can return stale duplicate completions after a reset and
+/// resubmission of the same height/hash. Echoing this token lets the reactor
+/// ignore those stale completions instead of releasing a newer in-flight body.
+pub type BlockApplyToken = u64;
+
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]
 pub enum BlockSyncAction {
@@ -121,6 +131,8 @@ pub enum BlockSyncAction {
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
+        /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
+        token: BlockApplyToken,
         /// Block body that is contiguous above `verified_block_tip`.
         block: Arc<block::Block>,
     },

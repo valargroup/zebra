@@ -281,6 +281,60 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 }
 
 #[test]
+fn configured_regtest_checkpoints_preserve_regtest_identity() {
+    let _init_guard = zebra_test::init();
+
+    // Mirrors the per-node config the zakura-regtest-e2e harness writes for the from-scratch
+    // catch-up node: a Regtest node that overrides only the checkpoint list (derived at
+    // runtime from the miner's chain). Regtest identity — genesis hash and network magic —
+    // must be preserved so the node still peers with a plain-Regtest miner; only checkpoint
+    // verification is added.
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let checkpoint = zebra_chain::block::Hash([7; 32]);
+
+    // The exact minimal `[network.params]` table the harness writes: it overrides only the
+    // checkpoint list and lets every other Regtest parameter default. `block::Hash`
+    // serializes as a 32-byte array in internal (display-reversed) order, so the harness must
+    // emit byte arrays, not hex — this asserts that exact form parses.
+    let bytes_csv = |hash: zebra_chain::block::Hash| {
+        hash.0
+            .iter()
+            .map(|byte| byte.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // The harness rewrites node2's `network = "Regtest"` line in place with this inline table
+    // (a single-line `sed` replacement), so verify exactly that form.
+    let inline = format!(
+        "network = {{ params = {{ checkpoints = [[0, [{}]], [10, [{}]]] }} }}\n",
+        bytes_csv(genesis),
+        bytes_csv(checkpoint),
+    );
+
+    let config: Config = toml::from_str(&inline)
+        .expect("the harness's inline ConfiguredRegtest checkpoint TOML deserializes");
+
+    assert!(
+        config.network.is_regtest(),
+        "a checkpoint-only override must stay Regtest",
+    );
+    assert_eq!(
+        config.network.genesis_hash(),
+        genesis,
+        "Regtest genesis hash is preserved, so the node still peers with a plain-Regtest miner",
+    );
+
+    let checkpoints = config.network.checkpoint_list();
+    assert_eq!(
+        checkpoints.max_height(),
+        Height(10),
+        "the derived checkpoint list replaces the genesis-only Regtest default",
+    );
+    assert_eq!(checkpoints.hash(Height(0)), Some(genesis));
+    assert_eq!(checkpoints.hash(Height(10)), Some(checkpoint));
+}
+
+#[test]
 fn zakura_bootstrap_peers_parse_in_nested_config() {
     let _init_guard = zebra_test::init();
 

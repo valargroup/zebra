@@ -42,7 +42,8 @@ mod wire;
 pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyResult, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
+    BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use scheduler::BlockSizeEstimate;

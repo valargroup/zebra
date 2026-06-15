@@ -1,4 +1,4 @@
-use super::{config::*, reorder::*, scheduler::*, *};
+use super::{config::*, events::BlockApplyToken, reorder::*, scheduler::*, *};
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 8;
@@ -149,6 +149,7 @@ pub(super) struct BlockSyncState {
     pub(super) schedule: BlockRangeScheduler,
     pub(super) reorder: ReorderBuffer,
     pub(super) applying: BTreeMap<block::Height, ApplyingBlock>,
+    pub(super) next_apply_token: BlockApplyToken,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
@@ -181,6 +182,7 @@ impl BlockSyncState {
             schedule: BlockRangeScheduler::new(startup.config.fanout),
             reorder: ReorderBuffer::new(),
             applying: BTreeMap::new(),
+            next_apply_token: 1,
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
@@ -206,6 +208,7 @@ impl BlockSyncState {
 
 #[derive(Clone, Debug)]
 pub(super) struct ApplyingBlock {
+    pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
     pub(super) block: Arc<block::Block>,
     pub(super) bytes: u64,

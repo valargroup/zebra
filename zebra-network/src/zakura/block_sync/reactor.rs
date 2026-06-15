@@ -147,10 +147,14 @@ impl BlockSyncReactor {
                 self.handle_needed_blocks(blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
+                token,
                 height,
                 hash,
                 result,
-            } => self.handle_block_apply_finished(height, hash, result).await,
+            } => {
+                self.handle_block_apply_finished(token, height, hash, result)
+                    .await
+            }
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
                 start_height,
@@ -260,10 +264,10 @@ impl BlockSyncReactor {
 
     fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
         if let Some(peer_state) = self.state.peers.remove(&peer) {
-            for outstanding in peer_state.outstanding {
+            for outstanding in peer_state.outstanding.into_iter().rev() {
                 self.finish_detached_outstanding(
                     outstanding,
-                    OutstandingRangeDisposition::RetryOriginal,
+                    OutstandingRangeDisposition::RetryMissing,
                 );
             }
         }
@@ -293,6 +297,12 @@ impl BlockSyncReactor {
             .body_download_floor
             .max(frontiers.verified_block_tip);
         if frontiers.verified_block_tip != self.state.verified_block_tip {
+            self.state
+                .reorder
+                .drop_through(frontiers.verified_block_tip, &mut self.state.budget);
+            self.state
+                .schedule
+                .drop_through(frontiers.verified_block_tip);
             self.release_applied_blocks_through(frontiers.verified_block_tip);
             self.drop_outstanding_through(frontiers.verified_block_tip);
             self.state.verified_block_tip = frontiers.verified_block_tip;
@@ -310,6 +320,26 @@ impl BlockSyncReactor {
     async fn handle_chain_tip_reset(&mut self, frontiers: BlockSyncFrontiers) {
         metrics::counter!("sync.block.reorg.reset").increment(1);
         self.trace_chain_tip_reset(frontiers.verified_block_tip);
+
+        let reset_tip_matches_submitted_body = self
+            .state
+            .applying
+            .get(&frontiers.verified_block_tip)
+            .is_none_or(|applying| applying.hash == frontiers.verified_block_hash);
+
+        // A `Reset` can also be a coalesced forward state update. Preserve
+        // successor bodies only if the new tip is within our contiguous
+        // submitted/downloaded body floor and does not conflict with a submitted
+        // body at the reset height. Otherwise a forward reset can still be a
+        // fork switch, so old-fork bodies must be discarded.
+        if frontiers.verified_block_tip > self.state.verified_block_tip
+            && frontiers.verified_block_tip <= self.state.body_download_floor
+            && reset_tip_matches_submitted_body
+        {
+            self.handle_state_frontiers_changed(frontiers).await;
+            return;
+        }
+
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
@@ -888,20 +918,25 @@ impl BlockSyncReactor {
 
     async fn handle_block_apply_finished(
         &mut self,
+        token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
         result: BlockApplyResult,
     ) {
-        let Some(applying) = self.state.applying.remove(&height) else {
+        let Some(applying) = self.state.applying.get(&height) else {
             return;
         };
-        if applying.hash != hash {
-            self.state.applying.insert(height, applying);
+        if applying.hash != hash || applying.token != token {
             return;
         }
+        let applying = self
+            .state
+            .applying
+            .remove(&height)
+            .expect("applying entry exists because it was just checked");
 
         self.state.budget.release(applying.bytes);
-        self.trace_apply_finished(height, result);
+        self.trace_apply_finished(height, token, result);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
@@ -1097,6 +1132,7 @@ impl BlockSyncReactor {
             self.state.applying.insert(
                 height,
                 ApplyingBlock {
+                    token: 0,
                     hash,
                     block,
                     bytes,
@@ -1126,18 +1162,33 @@ impl BlockSyncReactor {
                 continue;
             };
 
-            metrics::counter!("sync.block.submit.sent").increment(1);
-            if !self
-                .dispatch_action(BlockSyncAction::SubmitBlock { block })
-                .await
-            {
-                return;
-            }
-            self.trace_body_submitted(height);
+            let token = self.next_apply_token();
             if let Some(applying) = self.state.applying.get_mut(&height) {
+                applying.token = token;
                 applying.submitted = true;
             }
+
+            metrics::counter!("sync.block.submit.sent").increment(1);
+            if !self
+                .dispatch_action(BlockSyncAction::SubmitBlock { token, block })
+                .await
+            {
+                if let Some(applying) = self.state.applying.get_mut(&height) {
+                    if applying.token == token {
+                        applying.token = 0;
+                        applying.submitted = false;
+                    }
+                }
+                return;
+            }
+            self.trace_body_submitted(height, token);
         }
+    }
+
+    fn next_apply_token(&mut self) -> BlockApplyToken {
+        let token = self.state.next_apply_token;
+        self.state.next_apply_token = self.state.next_apply_token.checked_add(1).unwrap_or(1);
+        token
     }
 
     fn release_applied_blocks_through(&mut self, tip: block::Height) {
@@ -1405,15 +1456,22 @@ impl BlockSyncReactor {
         });
     }
 
-    fn trace_body_submitted(&self, height: block::Height) {
+    fn trace_body_submitted(&self, height: block::Height, token: BlockApplyToken) {
         self.emit_trace(bs_trace::BLOCK_BODY_SUBMITTED, |row| {
             bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
         });
     }
 
-    fn trace_apply_finished(&self, height: block::Height, result: BlockApplyResult) {
+    fn trace_apply_finished(
+        &self,
+        height: block::Height,
+        token: BlockApplyToken,
+        result: BlockApplyResult,
+    ) {
         self.emit_trace(bs_trace::BLOCK_APPLY_FINISHED, |row| {
             bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
             bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(result));
         });
     }

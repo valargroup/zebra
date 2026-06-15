@@ -116,6 +116,11 @@ jobs:
 
   zakura-regtest-e2e:
     name: Zakura regtest e2e
+    # The reactor/apply-driver/checkpoint-batch paths this exercises are now covered per-PR by
+    # fast, deterministic tests (zebra-network block-sync reactor tests + zebrad's
+    # real-verifier checkpoint-recovery test), so the heavy four-node docker stack runs only
+    # on the nightly schedule and on demand, keeping it off the PR / merge-queue critical path.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -159,4 +164,6 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: check-no-git-dependencies
+          # zakura-regtest-e2e runs only on the nightly schedule / manual dispatch, so it is
+          # skipped (and allowed) on PR and merge-queue runs; it still gates nightly runs.
+          allowed-skips: check-no-git-dependencies, zakura-regtest-e2e

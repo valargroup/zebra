@@ -99,8 +99,8 @@ use tracing_futures::Instrument;
 use zebra_chain::block::{self, genesis::regtest_genesis_block};
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_network::zakura::{
-    BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-    BlockSyncFrontiers, BlockSyncHandle, BlockSyncMisbehavior, HeaderSyncAction,
+    BlockApplyResult, BlockApplyToken, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle, BlockSyncMisbehavior, HeaderSyncAction,
     HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
     ZakuraHeaderSyncDriverStartup, DEFAULT_HS_RANGE,
 };
@@ -552,10 +552,15 @@ enum BlockApplyClass {
 
 #[derive(Clone, Debug)]
 struct PendingBlockApply {
+    token: BlockApplyToken,
     class: BlockApplyClass,
     block: Arc<block::Block>,
 }
 
+// The driver wires together many independent dependencies (actions, supervisor, block-sync
+// handle, read state, verifier, checkpoint height, two apply limits, shutdown); grouping them
+// into a struct would not make the apply loop clearer.
+#[allow(clippy::too_many_arguments)]
 async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
@@ -727,8 +732,9 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
-            BlockSyncAction::SubmitBlock { block } => {
+            BlockSyncAction::SubmitBlock { token, block } => {
                 pending_applies.push_back(PendingBlockApply {
+                    token,
                     class: block_apply_class(block.as_ref(), max_checkpoint_height),
                     block,
                 });
@@ -748,6 +754,7 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pending_block_applies<ReadState, BlockVerifier>(
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyClass>>,
@@ -798,6 +805,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 block_verifier.clone(),
                 read_state.clone(),
                 block_sync.clone(),
+                pending.token,
                 pending.block,
                 class,
             )
@@ -825,6 +833,7 @@ async fn apply_block_sync_body<BlockVerifier, ReadState>(
     block_verifier: BlockVerifier,
     read_state: ReadState,
     block_sync: BlockSyncHandle,
+    token: BlockApplyToken,
     block: Arc<block::Block>,
     class: BlockApplyClass,
 ) where
@@ -854,6 +863,7 @@ async fn apply_block_sync_body<BlockVerifier, ReadState>(
 
     let _ = block_sync
         .send(BlockSyncEvent::BlockApplyFinished {
+            token,
             height,
             hash: expected_hash,
             result,
@@ -2833,6 +2843,7 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 1,
                 block: block1.clone(),
             })
             .await
@@ -2909,12 +2920,14 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 1,
                 block: block1.clone(),
             })
             .await
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 2,
                 block: block2.clone(),
             })
             .await
@@ -2996,6 +3009,7 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 1,
                 block: block1.clone(),
             })
             .await
@@ -3009,6 +3023,7 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 2,
                 block: block2.clone(),
             })
             .await
@@ -3150,12 +3165,14 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 1,
                 block: block.clone(),
             })
             .await
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::SubmitBlock {
+                token: 2,
                 block: block.clone(),
             })
             .await
@@ -3176,6 +3193,164 @@ mod zakura_header_sync_driver_tests {
                 .any(|request| matches!(request, zebra_state::ReadRequest::Tip)),
             "duplicate commit should refresh block-sync frontiers from state"
         );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    /// Drives the block-sync apply loop against the *real* checkpoint verifier and a *real*
+    /// ephemeral state, reproducing the checkpoint-range batch-commit that Regtest (genesis
+    /// checkpoint only) cannot exercise.
+    ///
+    /// A checkpoint is placed at height 10 so an 11-block range covers a full checkpoint gap
+    /// without 400 real blocks. The whole range is submitted except one mid-range body, which
+    /// the verifier holds the entire range for (it commits nothing until the range is
+    /// contiguous to the next checkpoint). Delivering the withheld body must let the whole
+    /// range commit — i.e. a transiently-missing body recovers instead of wedging the floor,
+    /// which is the production "drop-through" failure mode.
+    #[tokio::test]
+    async fn block_sync_driver_recovers_checkpoint_range_after_withheld_body() {
+        const CHECKPOINT_HEIGHT: u32 = 10;
+        const WITHHELD: u32 = 5;
+
+        // Real, contiguous mainnet blocks 0..=10 (valid PoW, merkle roots, and parent
+        // linkage), so the real checkpoint verifier accepts them with no synthesis.
+        let chain: Vec<(block::Height, Arc<block::Block>)> = (0..=CHECKPOINT_HEIGHT)
+            .map(|height| {
+                let bytes: &[u8] = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+                    .get(&height)
+                    .copied()
+                    .expect("a contiguous mainnet block vector exists for heights 0..=10");
+                let block = mainnet_block(bytes);
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(height)),
+                    "mainnet block vector height matches its coinbase height",
+                );
+                (block::Height(height), block)
+            })
+            .collect();
+        let genesis_hash = chain[0].1.hash();
+        let checkpoint_hash = chain[CHECKPOINT_HEIGHT as usize].1.hash();
+
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (write_state, read_state, _latest_tip, _tip_change) =
+            zebra_state::init_test_services(&network).await;
+
+        // A low checkpoint at height 10 turns the 11-block range into one checkpoint batch.
+        let checkpoint_verifier = zebra_consensus::CheckpointVerifier::from_list(
+            [
+                (block::Height(0), genesis_hash),
+                (block::Height(CHECKPOINT_HEIGHT), checkpoint_hash),
+            ],
+            &network,
+            None,
+            write_state,
+        )
+        .expect("a checkpoint list with genesis and one mid-chain checkpoint is valid");
+
+        // Adapt the checkpoint verifier (`Service<Arc<Block>>`) to the driver's
+        // `Service<zebra_consensus::Request, Response = block::Hash>` bound.
+        let checkpoint_verifier =
+            tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let checkpoint_verifier = checkpoint_verifier.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        checkpoint_verifier.oneshot(block).await
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+
+        let (action_tx, action_rx) = mpsc::channel(64);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            block_sync,
+            read_state.clone(),
+            verifier,
+            // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
+            // (indefinite-wait) commits — the path that wedges in production.
+            block::Height(CHECKPOINT_HEIGHT),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let finalized_tip = || {
+            let read_state = read_state.clone();
+            async move {
+                match read_state
+                    .oneshot(zebra_state::ReadRequest::FinalizedTip)
+                    .await
+                    .expect("finalized tip read succeeds")
+                {
+                    zebra_state::ReadResponse::FinalizedTip(tip) => {
+                        tip.map(|(height, _hash)| height)
+                    }
+                    response => panic!("unexpected FinalizedTip response: {response:?}"),
+                }
+            }
+        };
+
+        // Submit the whole checkpoint range except the withheld mid-range body.
+        for (height, block) in &chain {
+            if height.0 == WITHHELD {
+                continue;
+            }
+            action_tx
+                .send(BlockSyncAction::SubmitBlock {
+                    token: u64::from(height.0),
+                    block: block.clone(),
+                })
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        // While the body is missing the range cannot commit, and the driver must keep the
+        // checkpoint-class commits pending (not time them out): the tip never reaches the
+        // checkpoint.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_ne!(
+            finalized_tip().await,
+            Some(block::Height(CHECKPOINT_HEIGHT)),
+            "checkpoint range must not commit while a mid-range body is missing",
+        );
+
+        // Deliver the withheld body; the verifier can now commit the whole range.
+        let (withheld_height, withheld_block) = chain
+            .iter()
+            .find(|(height, _)| height.0 == WITHHELD)
+            .expect("withheld block is part of the test chain");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: u64::from(withheld_height.0),
+                block: withheld_block.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        // Recovery: the entire range commits, so the finalized tip reaches the checkpoint.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if finalized_tip().await == Some(block::Height(CHECKPOINT_HEIGHT)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("delivering the withheld body must let the checkpoint range commit to the tip");
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
