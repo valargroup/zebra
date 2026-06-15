@@ -626,19 +626,28 @@ impl ZebraDb {
         // tip advance, so the prune and the tip advance are always consistent, and
         // it reuses the single-writer block commit path.
         if let Some(pruning) = self.config().pruning_config() {
+            let already_pruned = self.lowest_retained_height().is_some();
+
             if let Some((prune_from, prune_until)) =
                 self.prune_height_range(finalized.height, pruning.tx_retention)
             {
-                // This is a destructive operation, so make it visible to operators.
-                // It is low-frequency: in steady state at most one height is pruned
-                // per committed block.
-                tracing::info!(
-                    ?prune_from,
-                    ?prune_until,
-                    tip = ?finalized.height,
-                    retention = pruning.tx_retention,
-                    "pruning raw transaction history outside the retention window",
-                );
+                // Log every MAX_PRUNE_HEIGHTS_PER_COMMIT block boundaries and the first prune
+                // to avoid noise.
+                if should_log_prune_progress(
+                    already_pruned,
+                    finalized.height,
+                    prune_from,
+                    prune_until,
+                ) {
+                    tracing::info!(
+                        ?prune_from,
+                        ?prune_until,
+                        tip = ?finalized.height,
+                        retention = pruning.tx_retention,
+                        "pruning raw transaction history outside the retention window",
+                    );
+                }
+
                 batch.prepare_prune_batch(self, prune_from, prune_until);
             }
         }
@@ -712,6 +721,18 @@ fn prune_height_range_inner(
     let prune_until = (max_prunable + 1).min(prune_from + MAX_PRUNE_HEIGHTS_PER_COMMIT);
 
     Some((prune_from, prune_until))
+}
+
+/// Returns true when pruning progress should be logged for operators.
+fn should_log_prune_progress(
+    already_pruned: bool,
+    new_tip: Height,
+    prune_from: Height,
+    prune_until: Height,
+) -> bool {
+    !already_pruned
+        || prune_until.0 - prune_from.0 >= MAX_PRUNE_HEIGHTS_PER_COMMIT
+        || new_tip.0 % MAX_PRUNE_HEIGHTS_PER_COMMIT == 0
 }
 
 impl DiskWriteBatch {
