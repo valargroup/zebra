@@ -16,7 +16,7 @@ pruning an existing database.
 Storage is controlled by the `state.storage_mode` configuration field, which has
 two modes:
 
-- **`archive`** (default) — the node retains and can serve *all* historical raw
+- **`archive`** (default) — the node retains and can serve _all_ historical raw
   transaction data. This is required to answer historical RPC queries such as
   `getrawtransaction` for arbitrary past transactions.
 - **`pruned`** — the node may delete historical raw transaction bytes for blocks
@@ -58,7 +58,7 @@ out-of-range value before the database is opened. The default is
 ### What is pruned and what is retained
 
 Only the raw transaction bytes (`tx_by_loc`) are pruned — and that is where
-essentially all of the disk savings come from. The transaction *location*
+essentially all of the disk savings come from. The transaction _location_
 indexes are deliberately **retained**:
 
 | Column family | Pruned? | Why |
@@ -97,7 +97,7 @@ The one-way transition is tracked by a single progress marker stored in the
 - If the marker is **absent**, the database is treated as not-yet-pruned and can
   still be opened as archive. This covers both ordinary archive databases and
   pruned-configured databases that have not yet reached the retention boundary.
-- For compatibility with older databases, a *missing* `pruning_metadata` column
+- For compatibility with older databases, a _missing_ `pruning_metadata` column
   family is treated the same as a missing marker: not pruned.
 - The marker is **written only when pruning actually deletes data** — not when
   pruned mode is merely configured. A node configured as `pruned` that has not yet
