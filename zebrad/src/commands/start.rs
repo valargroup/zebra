@@ -79,10 +79,11 @@ use std::{
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::{
     pin, select,
     sync::{mpsc, oneshot, watch},
+    time::MissedTickBehavior,
 };
 use tower::{builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
 use tracing_futures::Instrument;
@@ -535,6 +536,25 @@ async fn notify_block_sync_header_tip(
 
 const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on the number of block-sync body commits the driver keeps in
+/// flight at once.
+///
+/// Block bodies below the checkpoint height are committed through the checkpoint
+/// verifier, which only finalizes a block once it holds a *contiguous* range of
+/// blocks reaching the next checkpoint. Committing bodies one at a time and
+/// awaiting each in turn therefore cannot make progress: a block's commit never
+/// resolves until later blocks in its checkpoint range are also submitted. The
+/// driver instead pipelines commits so the verifier can assemble whole ranges.
+/// This cap bounds the resulting memory and task fan-out; the reactor's byte
+/// budget already bounds how many bodies are downloaded ahead of the tip.
+const ZAKURA_BLOCK_SYNC_MAX_INFLIGHT_COMMITS: usize = 1000;
+
+/// How often the driver refreshes the reactor's view of the committed state tip
+/// while body commits are in flight. Commits resolve in bursts as the checkpoint
+/// verifier finalizes a range, so a single coalesced refresh per interval keeps
+/// the reactor's scheduling tip current without issuing one state read per block.
+const ZAKURA_BLOCK_SYNC_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
@@ -557,9 +577,34 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
+
+    // Body commits are pipelined rather than awaited one at a time: blocks below
+    // the checkpoint height are finalized in whole-range batches by the
+    // checkpoint verifier, so a single body's commit cannot resolve until later
+    // bodies in its range are also in flight. See
+    // `ZAKURA_BLOCK_SYNC_MAX_INFLIGHT_COMMITS`.
+    let mut commits = FuturesUnordered::new();
+    let mut commits_since_refresh = false;
+    let mut refresh_ticks = tokio::time::interval(ZAKURA_BLOCK_SYNC_FRONTIER_REFRESH_INTERVAL);
+    refresh_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
         let action = select! {
             _ = &mut shutdown => return,
+            // Drain finished commits. They resolve in bursts as the checkpoint
+            // verifier finalizes a range; the coalesced refresh below then
+            // advances the reactor's scheduling tip to the new committed tip.
+            Some(()) = commits.next(), if !commits.is_empty() => {
+                commits_since_refresh = true;
+                continue;
+            }
+            _ = refresh_ticks.tick() => {
+                if commits_since_refresh {
+                    commits_since_refresh = false;
+                    refresh_block_sync_frontiers(read_state.clone(), &block_sync).await;
+                }
+                continue;
+            }
             action = actions.recv() => {
                 let Some(action) = action else {
                     return;
@@ -672,13 +717,16 @@ async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
             }
             BlockSyncAction::SubmitBlock { block } => {
-                commit_block_sync_body(
-                    block_verifier.clone(),
-                    read_state.clone(),
-                    &block_sync,
-                    block,
-                )
-                .await;
+                // Backpressure: if the in-flight commit set is full, wait for the
+                // oldest commit to drain before accepting another body. The
+                // reactor re-requests any body whose request times out, so
+                // dropping back-pressured work here is safe.
+                if commits.len() >= ZAKURA_BLOCK_SYNC_MAX_INFLIGHT_COMMITS
+                    && commits.next().await.is_some()
+                {
+                    commits_since_refresh = true;
+                }
+                commits.push(commit_block_sync_body(block_verifier.clone(), block));
             }
         }
     }
@@ -697,24 +745,27 @@ fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bool {
     )
 }
 
-async fn commit_block_sync_body<BlockVerifier, ReadState>(
+/// Commit a single block-sync body through the verifier.
+///
+/// This is `'static` and side-effect free beyond the verifier call so the driver
+/// can keep many commits in flight at once (see
+/// [`ZAKURA_BLOCK_SYNC_MAX_INFLIGHT_COMMITS`]). The reactor's view of the
+/// committed tip is refreshed separately by the driver once commits drain, so
+/// this function only logs the per-body outcome.
+///
+/// A timeout here is *not* a failure: bodies below the checkpoint height resolve
+/// only once the checkpoint verifier has assembled the rest of their range, and
+/// the verifier commits the range from a detached task even if this response
+/// future is dropped. The driver's frontier refresh observes the resulting tip
+/// advance regardless.
+async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
-    read_state: ReadState,
-    block_sync: &BlockSyncHandle,
     block: Arc<block::Block>,
 ) where
     BlockVerifier:
         Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
 {
     let expected_hash = block.hash();
     let height = block.coinbase_height();
@@ -740,7 +791,6 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                 ?committed_hash,
                 "Zakura block-sync verifier returned an unexpected hash"
             );
-            refresh_block_sync_frontiers(read_state, block_sync).await;
         }
         Ok(Err(error)) => {
             if block_verify_error_is_duplicate(&error) {
@@ -758,15 +808,15 @@ async fn commit_block_sync_body<BlockVerifier, ReadState>(
                     "Zakura block-sync body rejected by block verifier"
                 );
             }
-            refresh_block_sync_frontiers(read_state, block_sync).await;
         }
         Err(_elapsed) => {
-            warn!(
+            // Expected while the checkpoint verifier is still assembling this
+            // body's range; the detached commit task finalizes it later.
+            debug!(
                 ?height,
                 ?expected_hash,
-                "timed out committing Zakura block-sync body"
+                "Zakura block-sync body commit still pending after timeout"
             );
-            refresh_block_sync_frontiers(read_state, block_sync).await;
         }
     }
 }
@@ -2275,6 +2325,8 @@ mod zakura_header_sync_driver_tests {
         Mutex,
     };
 
+    use std::collections::HashSet;
+
     use tower::service_fn;
     use zebra_chain::serialization::ZcashDeserializeInto;
     use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
@@ -2547,6 +2599,12 @@ mod zakura_header_sync_driver_tests {
                             (*read_hints).clone(),
                         ))
                     }
+                    // Tolerated: the driver refreshes its committed-tip view after
+                    // bodies commit. These reads are observed but not asserted here.
+                    zebra_state::ReadRequest::FinalizedTip => {
+                        Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                    }
+                    zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(None)),
                     request => panic!("unexpected read request: {request:?}"),
                 }
             }
@@ -2645,7 +2703,7 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
-    async fn block_sync_driver_commits_parent_first_and_ignores_outbound_actions() {
+    async fn block_sync_driver_pipelines_commits_and_ignores_outbound_actions() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
         let (action_tx, action_rx) = mpsc::channel(8);
@@ -2669,12 +2727,16 @@ mod zakura_header_sync_driver_tests {
                 }
             }
         });
+        // The driver refreshes its committed-tip view after bodies commit, so the
+        // read service must answer the frontier reads rather than panic.
         let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
-            panic!("read_state should not be called for successful commit: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<zebra_state::ReadResponse, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(
-                None,
-            ))
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(None)),
+                request => panic!("unexpected read request: {request:?}"),
+            }
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
@@ -2712,17 +2774,119 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("driver action channel stays open");
 
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+        // Both bodies are committed. Commits are pipelined, so the order is not
+        // guaranteed; the outbound `SendMessage` action never reaches the verifier.
+        let mut committed = HashSet::new();
+        for _ in 0..2 {
+            let hash = tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
                 .await
-                .expect("first commit arrives"),
-            Some(block1.hash())
+                .expect("commit arrives")
+                .expect("commit channel stays open");
+            committed.insert(hash);
+        }
+        assert_eq!(
+            committed,
+            HashSet::from([block1.hash(), block2.hash()]),
+            "both submitted bodies are committed through the verifier"
         );
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    /// A serial driver would deadlock against a batch-oriented verifier (such as
+    /// the checkpoint verifier) that only resolves a body's commit once a later
+    /// body in its range has also been submitted. The pipelined driver must keep
+    /// both commits in flight so the batch can complete.
+    #[tokio::test]
+    async fn block_sync_driver_pipelines_commits_for_batched_verifier() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+
+        // `block1`'s commit only resolves once `block2` has been submitted,
+        // emulating checkpoint-range batching.
+        let (seen_tx, seen_rx) = watch::channel(false);
+        let block2_hash = block2.hash();
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let commit_tx = commit_tx.clone();
+            let mut seen_rx = seen_rx.clone();
+            let seen_tx = seen_tx.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        let hash = block.hash();
+                        if hash == block2_hash {
+                            let _ = seen_tx.send(true);
+                        } else {
+                            while !*seen_rx.borrow_and_update() {
+                                seen_rx
+                                    .changed()
+                                    .await
+                                    .expect("later body submission is observed");
+                            }
+                        }
+                        commit_tx
+                            .send(hash)
+                            .await
+                            .expect("test commit receiver stays open");
+                        Ok::<_, zebra_consensus::BoxError>(hash)
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(None)),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            block_sync,
+            read_state,
+            verifier,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        let mut committed = HashSet::new();
+        for _ in 0..2 {
+            let hash = tokio::time::timeout(Duration::from_secs(5), commit_rx.recv())
                 .await
-                .expect("second commit arrives"),
-            Some(block2.hash())
+                .expect("pipelined commits complete without deadlock")
+                .expect("commit channel stays open");
+            committed.insert(hash);
+        }
+        assert_eq!(
+            committed,
+            HashSet::from([block1.hash(), block2.hash()]),
+            "the batch completes once both bodies are in flight"
         );
 
         let _ = shutdown_tx.send(());
@@ -2821,14 +2985,23 @@ mod zakura_header_sync_driver_tests {
             Some(block.hash())
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(
-            read_requests
-                .lock()
-                .expect("test read request log is not poisoned")
-                .iter()
-                .any(|request| matches!(request, zebra_state::ReadRequest::Tip)),
-            "duplicate commit should refresh block-sync frontiers from state"
-        );
+        // Once bodies commit, the driver refreshes its committed-tip view from
+        // state on its coalescing tick. Poll for the resulting `Tip` read.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let saw_tip = read_requests
+                    .lock()
+                    .expect("test read request log is not poisoned")
+                    .iter()
+                    .any(|request| matches!(request, zebra_state::ReadRequest::Tip));
+                if saw_tip {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("committed bodies refresh block-sync frontiers from state");
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");

@@ -269,11 +269,22 @@ impl BlockSyncReactor {
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
         self.state.finalized_height = frontiers.finalized_height;
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
+        // We can only serve bodies that are actually committed to our state, so
+        // the servable range always tracks the real committed tip.
         self.state.servable_high = frontiers.verified_block_tip;
         self.state.servable_hash = frontiers.verified_block_hash;
-        self.state.verified_block_hash = frontiers.verified_block_hash;
-        if frontiers.verified_block_tip != self.state.verified_block_tip {
+        // The scheduling tip only moves forward here. Bodies are submitted to the
+        // verifier ahead of the committed state tip — the checkpoint verifier
+        // finalizes them in whole-range batches — so `verified_block_tip` is
+        // advanced optimistically in `release_contiguous_blocks` as bodies are
+        // dispatched. A committed-tip refresh that still lags those in-flight
+        // submissions must not drag the scheduling tip backward, or we would
+        // redundantly re-download bodies that are already on their way to the
+        // verifier. Genuine rollbacks arrive via `ChainTipReset`, which is
+        // handled by `handle_chain_tip_reset`.
+        if frontiers.verified_block_tip > self.state.verified_block_tip {
             self.state.verified_block_tip = frontiers.verified_block_tip;
+            self.state.verified_block_hash = frontiers.verified_block_hash;
             self.release_contiguous_blocks().await;
         }
         self.queue_status_refresh_if_changed(old_serving_tip);
