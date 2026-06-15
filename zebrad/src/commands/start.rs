@@ -2476,9 +2476,9 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, mut reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
-        let header_hash = block::Hash([2; 32]);
+        let header_hash = block::Hash([3; 32]);
 
-        notify_block_sync_header_tip(Some(&block_sync), block::Height(2), header_hash).await;
+        notify_block_sync_header_tip(Some(&block_sync), block::Height(3), header_hash).await;
 
         let action = tokio::time::timeout(Duration::from_secs(5), reactor_actions.recv())
             .await
@@ -2489,7 +2489,7 @@ mod zakura_header_sync_driver_tests {
             action,
             BlockSyncAction::QueryNeededBlocks {
                 verified_block_tip: block::Height(0),
-                best_header_tip: block::Height(2),
+                best_header_tip: block::Height(3),
             }
         ));
 

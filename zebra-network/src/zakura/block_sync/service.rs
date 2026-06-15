@@ -358,7 +358,11 @@ impl Service for BlockSyncService {
         let on_teardown = {
             let lifecycle = self.inner.lifecycle.clone();
             let peer_id = peer_id.clone();
+            let inner = self.inner.clone();
             move || {
+                if let Ok(mut peers) = inner.peers.lock() {
+                    peers.remove(&peer_id);
+                }
                 let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
             }
         };

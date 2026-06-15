@@ -94,6 +94,10 @@ impl BlockRangeScheduler {
         });
     }
 
+    pub(super) fn clear_queued(&mut self) {
+        self.queue.clear();
+    }
+
     pub(super) fn next_for_peer(
         &mut self,
         peer_id: &ZakuraPeerId,

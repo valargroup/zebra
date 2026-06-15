@@ -257,10 +257,9 @@ impl BlockSyncReactor {
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         if !self.query_needed_blocks().await {
-            self.clear_needed_heights();
-            self.drop_ranges_not_in_needed(&HashMap::new());
-            self.state.schedule.retain_matching_needed(&HashMap::new());
+            self.pause_new_body_downloads();
         }
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
@@ -276,10 +275,9 @@ impl BlockSyncReactor {
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
         if !self.query_needed_blocks().await {
-            self.clear_needed_heights();
-            self.drop_ranges_not_in_needed(&HashMap::new());
-            self.state.schedule.retain_matching_needed(&HashMap::new());
+            self.pause_new_body_downloads();
         }
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn handle_chain_tip_reset(&mut self, frontiers: BlockSyncFrontiers) {
@@ -298,11 +296,18 @@ impl BlockSyncReactor {
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
         if !self.query_needed_blocks().await {
-            self.clear_needed_heights();
+            self.pause_new_body_downloads();
         }
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
+        if self.should_pause_new_body_downloads() {
+            self.pause_new_body_downloads();
+            self.release_caught_up_block_sync_peers();
+            return;
+        }
+
         self.state.needed_heights = blocks.iter().map(|block| block.height).collect();
         self.state.needed_heights.sort_unstable();
         self.state.needed_heights.dedup();
@@ -332,6 +337,50 @@ impl BlockSyncReactor {
         }
         self.state.needed_heights.clear();
         self.publish_candidate_state();
+    }
+
+    fn pause_new_body_downloads(&mut self) {
+        self.clear_needed_heights();
+        self.state.schedule.clear_queued();
+    }
+
+    fn body_lag(&self) -> u32 {
+        self.state
+            .best_header_tip
+            .0
+            .saturating_sub(self.state.verified_block_tip.0)
+    }
+
+    fn should_pause_new_body_downloads(&self) -> bool {
+        let lag = self.body_lag();
+        lag == 0 || lag <= self.startup.config.near_tip_body_download_pause_blocks
+    }
+
+    fn has_outstanding_requests(&self) -> bool {
+        self.state
+            .peers
+            .values()
+            .any(|peer| !peer.outstanding.is_empty())
+    }
+
+    fn release_caught_up_block_sync_peers(&mut self) {
+        if self.state.verified_block_tip < self.state.best_header_tip
+            || self.has_outstanding_requests()
+            || self.state.reorder.has_buffered_body_needed_to_advance(
+                self.state.verified_block_tip,
+                self.state.best_header_tip,
+            )
+        {
+            return;
+        }
+
+        let peer_ids: Vec<_> = self.state.peers.keys().cloned().collect();
+        for peer in peer_ids {
+            if let Some(peer_state) = self.state.peers.get(&peer) {
+                peer_state.session.cancel_token().cancel();
+            }
+            self.handle_peer_disconnected(peer);
+        }
     }
 
     async fn handle_wire_decode_failed(
@@ -472,6 +521,7 @@ impl BlockSyncReactor {
         if height <= self.state.verified_block_tip || self.state.reorder.contains(height) {
             self.release_contiguous_blocks().await;
             self.schedule().await;
+            self.release_caught_up_block_sync_peers();
             return;
         }
 
@@ -497,6 +547,7 @@ impl BlockSyncReactor {
         }
         self.release_contiguous_blocks().await;
         self.schedule().await;
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn handle_get_blocks(
@@ -585,6 +636,7 @@ impl BlockSyncReactor {
         self.state.budget.release(outstanding.reserved_bytes());
         self.state.schedule.clear_assignment(&outstanding.request);
         self.schedule().await;
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn handle_block_range_response_ready(
@@ -665,12 +717,11 @@ impl BlockSyncReactor {
             self.state.schedule.retry(outstanding.request);
         }
         self.schedule().await;
+        self.release_caught_up_block_sync_peers();
     }
 
     async fn query_needed_blocks(&mut self) -> bool {
-        if !self.startup.state_queries_enabled
-            || self.state.best_header_tip <= self.state.verified_block_tip
-        {
+        if !self.startup.state_queries_enabled || self.should_pause_new_body_downloads() {
             return false;
         }
         let _ = self
@@ -698,6 +749,10 @@ impl BlockSyncReactor {
     }
 
     async fn schedule(&mut self) {
+        if self.should_pause_new_body_downloads() {
+            return;
+        }
+
         let mut peer_ids: Vec<_> = self.state.peers.keys().cloned().collect();
         peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
