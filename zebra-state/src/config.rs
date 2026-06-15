@@ -1,6 +1,7 @@
 //! Cached state configuration for Zebra.
 
 use std::{
+    fmt,
     fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -8,7 +9,10 @@ use std::{
 };
 
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, IgnoredAny, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::Span;
 
@@ -262,7 +266,7 @@ impl Config {
 
 /// Selects whether Zebra keeps all historical block data, or stores only the data
 /// required to validate future blocks.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageMode {
     /// Keep all historical data, including raw transactions and lookup indexes.
@@ -278,6 +282,82 @@ pub enum StorageMode {
     /// retained. This is a one-way mode: a pruned database cannot be reopened in
     /// [`StorageMode::Archive`].
     Pruned(PruningConfig),
+}
+
+impl<'de> Deserialize<'de> for StorageMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(StorageModeVisitor)
+        } else {
+            StorageModeSerde::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StorageModeSerde {
+    Archive,
+    Pruned(PruningConfig),
+}
+
+impl From<StorageModeSerde> for StorageMode {
+    fn from(storage_mode: StorageModeSerde) -> Self {
+        match storage_mode {
+            StorageModeSerde::Archive => StorageMode::Archive,
+            StorageModeSerde::Pruned(pruning) => StorageMode::Pruned(pruning),
+        }
+    }
+}
+
+struct StorageModeVisitor;
+
+impl<'de> Visitor<'de> for StorageModeVisitor {
+    type Value = StorageMode;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(r#"`"archive"`, `"pruned"`, or a storage mode table"#)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "archive" => Ok(StorageMode::Archive),
+            "pruned" => Ok(StorageMode::Pruned(PruningConfig::default())),
+            _ => Err(de::Error::unknown_variant(value, &["archive", "pruned"])),
+        }
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let Some(key) = map.next_key::<String>()? else {
+            return Err(de::Error::invalid_length(0, &self));
+        };
+
+        let storage_mode = match key.as_str() {
+            "archive" => {
+                map.next_value::<IgnoredAny>()?;
+                StorageMode::Archive
+            }
+            "pruned" => StorageMode::Pruned(map.next_value()?),
+            _ => return Err(de::Error::unknown_variant(&key, &["archive", "pruned"])),
+        };
+
+        if let Some(key) = map.next_key::<String>()? {
+            return Err(de::Error::custom(format!(
+                "multiple storage mode variants configured, including `{key}`"
+            )));
+        }
+
+        Ok(storage_mode)
+    }
 }
 
 /// Configuration for [`StorageMode::Pruned`].
@@ -321,6 +401,37 @@ impl Default for Config {
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: "".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_mode_deserializes_from_documented_toml() {
+        let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
+            .expect("archive storage mode deserializes from a string");
+        assert_eq!(archive.storage_mode, StorageMode::Archive);
+
+        let pruned: Config = toml::from_str(r#"storage_mode = "pruned""#)
+            .expect("pruned storage mode deserializes from a string");
+        assert_eq!(
+            pruned.storage_mode,
+            StorageMode::Pruned(PruningConfig::default())
+        );
+
+        let pruned_with_retention: Config = toml::from_str(
+            r#"
+            [storage_mode.pruned]
+            tx_retention = 6000
+            "#,
+        )
+        .expect("pruned storage mode deserializes from a table");
+        assert_eq!(
+            pruned_with_retention.storage_mode,
+            StorageMode::Pruned(PruningConfig { tx_retention: 6000 })
+        );
     }
 }
 
