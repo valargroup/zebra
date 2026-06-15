@@ -7,7 +7,7 @@ pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 4;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Default block-sync request timeout reserved for later scheduling.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default block-sync status refresh interval reserved for later advertisement.

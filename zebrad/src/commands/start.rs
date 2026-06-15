@@ -799,6 +799,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 read_state.clone(),
                 block_sync.clone(),
                 pending.block,
+                class,
             )
             .map(move |_| class)
             .boxed(),
@@ -825,6 +826,7 @@ async fn apply_block_sync_body<BlockVerifier, ReadState>(
     read_state: ReadState,
     block_sync: BlockSyncHandle,
     block: Arc<block::Block>,
+    class: BlockApplyClass,
 ) where
     BlockVerifier:
         Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
@@ -848,7 +850,7 @@ async fn apply_block_sync_body<BlockVerifier, ReadState>(
         return;
     };
 
-    let result = commit_block_sync_body(block_verifier.clone(), block).await;
+    let result = commit_block_sync_body(block_verifier.clone(), block, class).await;
 
     let _ = block_sync
         .send(BlockSyncEvent::BlockApplyFinished {
@@ -879,6 +881,7 @@ fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bool {
 async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: Arc<block::Block>,
+    class: BlockApplyClass,
 ) -> BlockApplyResult
 where
     BlockVerifier:
@@ -888,14 +891,24 @@ where
 {
     let expected_hash = block.hash();
     let height = block.coinbase_height();
-    match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        block_verifier
-            .clone()
-            .oneshot(zebra_consensus::Request::Commit(block)),
-    )
-    .await
-    {
+    let commit = block_verifier
+        .clone()
+        .oneshot(zebra_consensus::Request::Commit(block));
+    // Checkpoint-range commits do not resolve until the checkpoint verifier has
+    // buffered the whole contiguous range up to the next checkpoint, which can
+    // take far longer than a single block. A wall-clock timeout here would tear
+    // down a partial range and stall sync, so checkpoint commits wait
+    // indefinitely; any missing lower block is re-requested by the per-range
+    // download timeout (`request_timeout`). Full (post-checkpoint) commits
+    // resolve per block, so a stuck commit there is a real fault worth timing
+    // out.
+    let outcome = match class {
+        BlockApplyClass::Checkpoint => Ok(commit.await),
+        BlockApplyClass::Full => {
+            tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await
+        }
+    };
+    match outcome {
         Ok(Ok(committed_hash)) if committed_hash == expected_hash => {
             debug!(
                 ?height,
@@ -3011,6 +3024,54 @@ mod zakura_header_sync_driver_tests {
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         reactor_task.abort();
+    }
+
+    /// A checkpoint-class commit must wait for the checkpoint verifier to
+    /// assemble a full contiguous range and must never be torn down by the
+    /// driver timeout, while a full (post-checkpoint) commit still times out.
+    ///
+    /// Regression test for the from-scratch mainnet stall: the checkpoint
+    /// verifier buffers every body below the first checkpoint (height 400) until
+    /// the whole range arrives, so a per-block commit timeout fired before
+    /// height 400 was reached and rolled the partial range back, freezing sync
+    /// at genesis.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn checkpoint_commit_waits_past_driver_timeout_unlike_full_commit() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+
+        // A verifier that never answers a commit, mimicking the checkpoint
+        // verifier buffering a block until its range completes.
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(_) => {
+                    std::future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+
+        // A full-class commit gives up after the driver timeout. (`verifier` is
+        // a capture-free `service_fn`, so it is `Copy` and reused below as-is.)
+        assert_eq!(
+            commit_block_sync_body(verifier, block.clone(), BlockApplyClass::Full).await,
+            BlockApplyResult::TimedOut,
+            "full commit should time out when the verifier never answers"
+        );
+
+        // A checkpoint-class commit keeps waiting: an outer timeout several times
+        // longer than the driver timeout must elapse with the commit still
+        // unresolved. If the driver timeout still applied to checkpoint commits,
+        // this would instead resolve to Ok(TimedOut) long before the outer
+        // timeout fired.
+        let waited = tokio::time::timeout(
+            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 4,
+            commit_block_sync_body(verifier, block, BlockApplyClass::Checkpoint),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "checkpoint commit must keep waiting past the driver timeout, got {waited:?}"
+        );
     }
 
     #[tokio::test]
