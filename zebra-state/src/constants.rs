@@ -4,6 +4,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use semver::Version;
 
+use zebra_chain::parameters::{Network, NetworkKind};
+
 // For doc comment links
 #[allow(unused_imports)]
 use crate::{
@@ -37,7 +39,26 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// This floor is sized well above the reorg window (5x) to also cover coinbase
 /// maturity ([`MIN_TRANSPARENT_COINBASE_MATURITY`]) and leave operational
 /// headroom. Configs below this value are rejected at startup.
+///
+/// This is the floor for Mainnet and Testnet; use [`min_pruning_retention`] to
+/// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 5 * MAX_BLOCK_REORG_HEIGHT;
+
+/// The minimum retention window allowed in pruned storage mode on `network`.
+///
+/// Every network's floor stays strictly greater than [`MAX_BLOCK_REORG_HEIGHT`],
+/// so pruning can never delete data that a reorg or rollback could still read.
+///
+/// Mainnet and Testnet use [`MIN_PRUNING_RETENTION`], which adds operational
+/// headroom above the reorg window. Regtest drops that headroom (but still covers
+/// the reorg window) so tests can cross the retention boundary without committing
+/// a 5000+ block chain.
+pub fn min_pruning_retention(network: &Network) -> u32 {
+    match network.kind() {
+        NetworkKind::Regtest => MAX_BLOCK_REORG_HEIGHT + 1,
+        NetworkKind::Mainnet | NetworkKind::Testnet => MIN_PRUNING_RETENTION,
+    }
+}
 
 /// The maximum number of block heights pruned in a single block commit.
 ///

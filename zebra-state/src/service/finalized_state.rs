@@ -187,7 +187,7 @@ impl FinalizedState {
         read_only: bool,
     ) -> Self {
         // Fail fast on an invalid storage configuration, before opening the database.
-        if let Err(error) = config.validate_storage_mode() {
+        if let Err(error) = config.validate_storage_mode(network) {
             panic!("{error}");
         }
 

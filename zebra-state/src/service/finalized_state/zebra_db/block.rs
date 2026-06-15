@@ -150,26 +150,21 @@ impl ZebraDb {
     }
 
     /// Returns the [`Block`] with [`block::Hash`] or
-    /// [`Height`], if it exists in the finalized chain.
+    /// [`Height`], if it exists in the finalized chain and its raw transaction
+    /// data is available.
+    ///
+    /// Returns `None` if the block does not exist, or if its transaction bodies
+    /// are missing because they have been pruned.
     //
     // TODO: move this method to the start of the section
     #[allow(clippy::unwrap_in_result)]
     pub fn block(&self, hash_or_height: HashOrHeight) -> Option<Arc<Block>> {
-        // Block
-        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
-        let header = self.block_header(height.into())?;
+        let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
-        // Transactions
-
-        // TODO:
-        // - split disk reads from deserialization, and run deserialization in parallel,
-        //   this improves performance for blocks with multiple large shielded transactions
-        // - is this loop more efficient if we store the number of transactions?
-        // - is the difference large enough to matter?
-        let transactions = self
-            .transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .map(Arc::new)
+        let header = Arc::<block::Header>::from_bytes(raw_header.raw_bytes());
+        let transactions = raw_txs
+            .iter()
+            .map(|raw_tx| Arc::<Transaction>::from_bytes(raw_tx.raw_bytes()))
             .collect();
 
         Some(Arc::new(Block {
@@ -179,7 +174,11 @@ impl ZebraDb {
     }
 
     /// Returns the [`Block`] with [`block::Hash`] or [`Height`], if it exists
-    /// in the finalized chain, and its serialized size.
+    /// in the finalized chain, and its serialized size, if its raw transaction
+    /// data is available.
+    ///
+    /// Returns `None` if the block does not exist, or if its transaction bodies
+    /// are missing because they have been pruned.
     #[allow(clippy::unwrap_in_result)]
     pub fn block_and_size(&self, hash_or_height: HashOrHeight) -> Option<(Arc<Block>, usize)> {
         let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
@@ -214,7 +213,11 @@ impl ZebraDb {
     }
 
     /// Returns the raw [`Block`] with [`block::Hash`] or
-    /// [`Height`], if it exists in the finalized chain.
+    /// [`Height`], if it exists in the finalized chain and its raw transaction
+    /// data is available.
+    ///
+    /// Returns `None` if the block does not exist, or if its transaction bodies
+    /// are missing because they have been pruned.
     #[allow(clippy::unwrap_in_result)]
     fn raw_block(&self, hash_or_height: HashOrHeight) -> Option<(RawBytes, Vec<RawBytes>)> {
         // Block
@@ -223,10 +226,15 @@ impl ZebraDb {
 
         // Transactions
 
-        let transactions = self
+        let transactions: Vec<RawBytes> = self
             .raw_transactions_by_height(height)
             .map(|(_, tx)| tx)
             .collect();
+
+        let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
+        if transactions.len() != transaction_hashes.len() {
+            return None;
+        }
 
         Some((header, transactions))
     }
@@ -621,6 +629,16 @@ impl ZebraDb {
             if let Some((prune_from, prune_until)) =
                 self.prune_height_range(finalized.height, pruning.tx_retention)
             {
+                // This is a destructive operation, so make it visible to operators.
+                // It is low-frequency: in steady state at most one height is pruned
+                // per committed block.
+                tracing::info!(
+                    ?prune_from,
+                    ?prune_until,
+                    tip = ?finalized.height,
+                    retention = pruning.tx_retention,
+                    "pruning raw transaction history outside the retention window",
+                );
                 batch.prepare_prune_batch(self, prune_from, prune_until);
             }
         }

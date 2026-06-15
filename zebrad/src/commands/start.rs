@@ -472,6 +472,14 @@ impl StartCmd {
         };
 
         info!("initializing node state");
+
+        // Surface a misconfigured storage mode as a clean startup error, before the
+        // (potentially slow) database open panics deep inside the state service.
+        config
+            .state
+            .validate_storage_mode(&config.network.network)
+            .map_err(|error| eyre!("invalid state storage configuration: {error}"))?;
+
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
             &config.network.network,

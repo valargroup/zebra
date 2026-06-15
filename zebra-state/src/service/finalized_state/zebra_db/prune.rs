@@ -60,6 +60,10 @@ pub enum PruneFinalizedStateError {
         in_code: Version,
     },
 
+    /// The on-disk state database format version file could not be read.
+    #[error("could not read the state database format version file")]
+    UnreadableFormatVersion(#[source] BoxError),
+
     /// The state database has no finalized tip.
     #[error("state database has no finalized tip")]
     EmptyDatabase,
@@ -88,7 +92,7 @@ pub fn preview_prune_finalized_state(
     network: &Network,
     options: PruneFinalizedStateOptions,
 ) -> Result<PruneFinalizedStateSummary, PruneFinalizedStateError> {
-    let config = pruning_config(config, options.tx_retention)?;
+    let config = pruning_config(config, network, options.tx_retention)?;
     check_format_version(&config, network)?;
 
     let db = open_pruning_db(&config, network, true);
@@ -101,7 +105,7 @@ pub fn prune_finalized_state(
     network: &Network,
     options: PruneFinalizedStateOptions,
 ) -> Result<PruneFinalizedStateSummary, PruneFinalizedStateError> {
-    let config = pruning_config(config, options.tx_retention)?;
+    let config = pruning_config(config, network, options.tx_retention)?;
     check_format_version(&config, network)?;
 
     let db = open_pruning_db(&config, network, false);
@@ -118,11 +122,12 @@ pub fn prune_finalized_state(
 
 fn pruning_config(
     mut config: Config,
+    network: &Network,
     tx_retention: u32,
 ) -> Result<Config, PruneFinalizedStateError> {
     config.storage_mode = StorageMode::Pruned(PruningConfig { tx_retention });
     config
-        .validate_storage_mode()
+        .validate_storage_mode(network)
         .map_err(PruneFinalizedStateError::InvalidConfig)?;
     Ok(config)
 }
@@ -134,7 +139,7 @@ fn check_format_version(
     let in_code = state_database_format_version_in_code();
     let on_disk =
         database_format_version_on_disk(config, STATE_DATABASE_KIND, in_code.major, network)
-            .expect("unable to read database format version file");
+            .map_err(PruneFinalizedStateError::UnreadableFormatVersion)?;
 
     if on_disk.as_ref() != Some(&in_code) {
         return Err(PruneFinalizedStateError::FormatMismatch { on_disk, in_code });
@@ -176,11 +181,7 @@ fn pruning_summary(
         }
     }
 
-    let pruned_height_range = prune_height_range_for_retention(
-        tip.0,
-        options.tx_retention,
-        previous_lowest_retained_height,
-    );
+    let pruned_height_range = prune_height_range_for_retention(tip.0, options.tx_retention);
     let new_lowest_retained_height =
         pruned_height_range.map_or(previous_lowest_retained_height, |(_, until)| Some(until));
     let pruned_height_count = pruned_height_range.map_or(0, |(from, until)| until.0 - from.0);
@@ -208,13 +209,24 @@ fn lowest_retained_height_for_retention(
     Some(block::Height(max_prunable + 1))
 }
 
+/// Returns the half-open range `[from, until)` of block heights the offline tool
+/// prunes for `retention`, or `None` if the retention window covers the whole
+/// chain.
+///
+/// Unlike online pruning (which, when first enabled on an existing archive
+/// database, starts at the current retention boundary), the offline tool always
+/// covers the full range below the boundary, starting just above genesis. This
+/// reclaims any historical raw transaction data left intact when pruning was
+/// first enabled online, which the online path and a marker-resuming offline pass
+/// would otherwise leave stranded forever. Re-deleting already-pruned heights is
+/// an idempotent no-op (a single range tombstone over absent keys).
 fn prune_height_range_for_retention(
     tip: block::Height,
     retention: u32,
-    lowest_retained: Option<block::Height>,
 ) -> Option<(block::Height, block::Height)> {
     let prune_until = lowest_retained_height_for_retention(tip, retention)?;
-    let prune_from = lowest_retained.unwrap_or(block::Height(1));
+    // Genesis (height 0) is never pruned, so the lowest prunable height is 1.
+    let prune_from = block::Height(1);
 
     if prune_from >= prune_until {
         return None;
@@ -263,6 +275,18 @@ mod tests {
         state
     }
 
+    /// Returns the coinbase transaction hash of the mainnet block at `height`.
+    fn coinbase_tx_hash(height: u32) -> zebra_chain::transaction::Hash {
+        let block: Arc<Block> = Mainnet
+            .blockchain_map()
+            .get(&height)
+            .expect("block height has test data")
+            .zcash_deserialize_into()
+            .expect("test data deserializes");
+
+        block.transactions[0].hash()
+    }
+
     #[test]
     fn retention_range_keeps_genesis_and_recent_window() {
         assert_eq!(
@@ -278,20 +302,20 @@ mod tests {
             Some(block::Height(2))
         );
 
+        // The offline tool always covers the full range below the boundary,
+        // starting just above genesis, regardless of any existing marker.
         assert_eq!(
-            prune_height_range_for_retention(block::Height(5001), 5000, None),
+            prune_height_range_for_retention(block::Height(5001), 5000),
             Some((block::Height(1), block::Height(2)))
         );
         assert_eq!(
-            prune_height_range_for_retention(block::Height(10_000), 5000, Some(block::Height(2))),
-            Some((block::Height(2), block::Height(5001)))
+            prune_height_range_for_retention(block::Height(10_000), 5000),
+            Some((block::Height(1), block::Height(5001)))
         );
+
+        // Retention covering the whole chain leaves nothing to prune.
         assert_eq!(
-            prune_height_range_for_retention(
-                block::Height(10_000),
-                5000,
-                Some(block::Height(5001))
-            ),
+            prune_height_range_for_retention(block::Height(5000), 5000),
             None
         );
     }
@@ -320,16 +344,24 @@ mod tests {
     }
 
     #[test]
-    fn pruning_summary_resumes_from_existing_marker() {
+    fn pruning_summary_reclaims_full_range_below_existing_marker() {
         let _init_guard = zebra_test::init();
         let state = new_state_with_blocks();
 
+        // Simulate online pruning having advanced the marker to height 3 while
+        // leaving height 1 intact below it — the state left behind when pruning is
+        // first enabled on an existing archive database.
         let mut batch = DiskWriteBatch::new();
-        batch.prepare_prune_batch(&state.db, block::Height(1), block::Height(3));
+        batch.prepare_prune_batch(&state.db, block::Height(2), block::Height(3));
         state.db.write_batch(batch).expect("prune batch writes");
+        assert_eq!(state.db.lowest_retained_height(), Some(block::Height(3)));
+        assert!(
+            state.db.transaction(coinbase_tx_hash(1)).is_some(),
+            "height 1 was left intact below the online pruning marker"
+        );
 
         let summary = pruning_summary(&state.db, &PruneFinalizedStateOptions { tx_retention: 5 })
-            .expect("summary should resume from marker");
+            .expect("summary should plan the full range below the boundary");
 
         assert_eq!(
             summary.previous_lowest_retained_height,
@@ -337,9 +369,11 @@ mod tests {
         );
         assert_eq!(
             summary.pruned_height_range,
-            Some((block::Height(3), block::Height(5)))
+            Some((block::Height(1), block::Height(5))),
+            "offline pruning reclaims the full range below the boundary, including \
+             heights left intact below the marker"
         );
-        assert_eq!(summary.pruned_height_count, 2);
+        assert_eq!(summary.pruned_height_count, 4);
     }
 
     #[test]
@@ -365,7 +399,7 @@ mod tests {
 
     #[test]
     fn pruning_config_rejects_retention_below_floor() {
-        let error = pruning_config(Config::ephemeral(), 1)
+        let error = pruning_config(Config::ephemeral(), &Mainnet, 1)
             .expect_err("retention below MIN_PRUNING_RETENTION is invalid");
 
         assert!(matches!(error, PruneFinalizedStateError::InvalidConfig(_)));

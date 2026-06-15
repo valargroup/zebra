@@ -19,7 +19,10 @@ use tracing::Span;
 use zebra_chain::{common::default_cache_dir, parameters::Network};
 
 use crate::{
-    constants::{DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION, STATE_DATABASE_KIND},
+    constants::{
+        min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION,
+        STATE_DATABASE_KIND,
+    },
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
 };
@@ -245,15 +248,16 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if pruned mode is selected with a `tx_retention` below
-    /// [`MIN_PRUNING_RETENTION`]. A retention window at or below the reorg depth
-    /// could let pruning delete data that a rollback needs to read.
-    pub fn validate_storage_mode(&self) -> Result<(), BoxError> {
+    /// the network-specific floor ([`min_pruning_retention`]). A retention window
+    /// at or below the reorg depth could let pruning delete data that a rollback
+    /// needs to read.
+    pub fn validate_storage_mode(&self, network: &Network) -> Result<(), BoxError> {
         if let Some(pruning) = self.pruning_config() {
-            if pruning.tx_retention < MIN_PRUNING_RETENTION {
+            let floor = min_pruning_retention(network);
+            if pruning.tx_retention < floor {
                 return Err(format!(
-                    "invalid pruning configuration: tx_retention ({}) must be at least \
-                     MIN_PRUNING_RETENTION ({MIN_PRUNING_RETENTION}) so pruning cannot delete \
-                     data within the reorg/rollback window",
+                    "invalid pruning configuration: tx_retention ({}) must be at least {floor} \
+                     on {network} so pruning cannot delete data within the reorg/rollback window",
                     pruning.tx_retention,
                 )
                 .into());

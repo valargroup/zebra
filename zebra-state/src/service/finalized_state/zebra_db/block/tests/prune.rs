@@ -18,7 +18,7 @@ use zebra_chain::{
 
 use crate::{
     config::StorageMode,
-    constants::{MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
+    constants::{MAX_BLOCK_REORG_HEIGHT, MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
     service::finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
     Config, PruningConfig,
 };
@@ -201,6 +201,14 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
             state.db.block_header(Height(height).into()).is_some(),
             "block header retained at height {height}"
         );
+        assert!(
+            state.db.block(Height(height).into()).is_none(),
+            "block reconstruction returns None when raw transaction data is pruned at height {height}"
+        );
+        assert!(
+            state.db.block_and_size(Height(height).into()).is_none(),
+            "block and size lookup returns None when raw transaction data is pruned at height {height}"
+        );
     }
 
     // Genesis and heights at/above the retention floor still have their tx data.
@@ -212,6 +220,18 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
         "genesis transaction retained"
     );
     for height in 4..=TEST_BLOCKS {
+        let block = state
+            .db
+            .block(Height(height).into())
+            .expect("retained block is available");
+        assert!(
+            !block.transactions.is_empty(),
+            "retained block has transactions at height {height}"
+        );
+        assert!(
+            state.db.block_and_size(Height(height).into()).is_some(),
+            "retained block and size is available at height {height}"
+        );
         assert!(
             state
                 .db
@@ -275,24 +295,37 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 
 #[test]
 fn validate_storage_mode_enforces_retention_floor() {
+    let pruned = |tx_retention| Config {
+        storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),
+        ..Config::default()
+    };
+
     // Archive mode is always valid.
-    assert!(Config::default().validate_storage_mode().is_ok());
+    assert!(Config::default().validate_storage_mode(&Mainnet).is_ok());
 
-    // Pruned mode below the floor is rejected.
-    let too_small = Config {
-        storage_mode: StorageMode::Pruned(PruningConfig {
-            tx_retention: MIN_PRUNING_RETENTION - 1,
-        }),
-        ..Config::default()
-    };
-    assert!(too_small.validate_storage_mode().is_err());
+    // On Mainnet/Testnet the floor is MIN_PRUNING_RETENTION.
+    assert!(pruned(MIN_PRUNING_RETENTION - 1)
+        .validate_storage_mode(&Mainnet)
+        .is_err());
+    assert!(pruned(MIN_PRUNING_RETENTION)
+        .validate_storage_mode(&Mainnet)
+        .is_ok());
 
-    // Pruned mode at the floor is accepted.
-    let at_floor = Config {
-        storage_mode: StorageMode::Pruned(PruningConfig {
-            tx_retention: MIN_PRUNING_RETENTION,
-        }),
-        ..Config::default()
-    };
-    assert!(at_floor.validate_storage_mode().is_ok());
+    // Regtest relaxes the floor to MAX_BLOCK_REORG_HEIGHT + 1, so it accepts
+    // retentions far below the Mainnet floor, but still rejects anything that
+    // does not cover the reorg window.
+    let regtest = Network::new_regtest(Default::default());
+    let regtest_floor = MAX_BLOCK_REORG_HEIGHT + 1;
+    assert!(pruned(regtest_floor - 1)
+        .validate_storage_mode(&regtest)
+        .is_err());
+    assert!(pruned(regtest_floor)
+        .validate_storage_mode(&regtest)
+        .is_ok());
+    assert!(
+        pruned(MIN_PRUNING_RETENTION - 1)
+            .validate_storage_mode(&regtest)
+            .is_ok(),
+        "Regtest accepts a retention below the Mainnet floor"
+    );
 }
