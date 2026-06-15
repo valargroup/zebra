@@ -112,9 +112,9 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
 /// The name of the column family that records pruning progress.
 ///
 /// In pruned storage mode this holds a single entry, keyed by the unit value
-/// `()`, mapping to the lowest block height whose raw transaction data is still
-/// retained. The presence of this entry marks the database as pruned, which is a
-/// one-way state: a pruned database cannot be reopened in archive mode.
+/// `()`, mapping to the next block height managed by online pruning. The
+/// presence of this entry marks the database as pruned, which is a one-way state:
+/// a pruned database cannot be reopened in archive mode.
 pub const PRUNING_METADATA: &str = "pruning_metadata";
 
 /// The finalized part of the chain state, stored in the db.

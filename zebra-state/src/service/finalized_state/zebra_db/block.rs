@@ -417,12 +417,14 @@ impl ZebraDb {
 
     // Pruning methods
 
-    /// Returns the lowest block height whose raw transaction data is retained, if
-    /// the database is in pruned storage mode.
+    /// Returns the next block height managed by online pruning, if the database is
+    /// in pruned storage mode.
     ///
-    /// Raw transactions in non-genesis blocks below this height have been pruned.
-    /// Returns `None` if the database has never pruned any data (it is effectively
-    /// an archive database).
+    /// Raw transactions in non-genesis blocks below this height may have been
+    /// pruned. When pruning is first enabled on an existing archive database,
+    /// older pre-boundary raw transactions are intentionally left intact.
+    /// Returns `None` if the database has never pruned any data (it is
+    /// effectively an archive database).
     #[allow(clippy::unwrap_in_result)]
     pub fn lowest_retained_height(&self) -> Option<Height> {
         let pruning_metadata = self.db.cf_handle(PRUNING_METADATA).unwrap();
@@ -440,10 +442,11 @@ impl ZebraDb {
     /// given the configured `retention` window. Returns `None` if there is
     /// nothing to prune in this commit.
     ///
-    /// The genesis block (height 0) is never pruned. Per-commit work is bounded
-    /// by [`MAX_PRUNE_HEIGHTS_PER_COMMIT`] so that draining a backlog (for example
-    /// after switching an archive database to pruned mode) does not produce a
-    /// single oversized write batch.
+    /// The genesis block (height 0) is never pruned. When pruning is first enabled
+    /// on an existing archive database, online pruning starts at the current
+    /// retention boundary rather than draining all historical raw transactions
+    /// from height 1. Per-commit work is still bounded by
+    /// [`MAX_PRUNE_HEIGHTS_PER_COMMIT`].
     ///
     /// # Correctness
     ///
@@ -661,8 +664,8 @@ fn lookup_out_loc(
 
 /// Computes the half-open range of block heights `[from, until)` to prune when a
 /// block is committed at `new_tip`, given the `retention` window and the
-/// `lowest_retained` height that still has transaction data (`None` if nothing
-/// has been pruned yet). Returns `None` if there is nothing to prune.
+/// `lowest_retained` pruning progress marker (`None` if nothing has been pruned
+/// yet). Returns `None` if there is nothing to prune.
 ///
 /// See [`ZebraDb::prune_height_range`] for the correctness invariant.
 fn prune_height_range_inner(
@@ -678,9 +681,10 @@ fn prune_height_range_inner(
         return None;
     }
 
-    // Resume pruning from the lowest height that still has data. Genesis is always
-    // retained, so the first prunable height is 1.
-    let prune_from = lowest_retained.unwrap_or(1);
+    // Resume pruning from the existing progress marker. If pruning is first enabled
+    // on an existing archive database, leave older history intact and start at the
+    // current retention boundary.
+    let prune_from = lowest_retained.unwrap_or(max_prunable);
     if prune_from > max_prunable {
         // Nothing new to prune yet.
         return None;

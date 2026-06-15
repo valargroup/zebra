@@ -75,12 +75,20 @@ fn prune_height_range_arithmetic() {
         "tip == retention: only genesis would be eligible, which is never pruned"
     );
 
-    // Steady state: each new block makes exactly one new height prunable.
+    // First online prune starts at the current retention boundary, preserving
+    // older archive history that was synced before pruning was enabled.
     assert_eq!(
         prune_height_range_inner(6, 5, None),
         Some((1, 2)),
         "first prunable height is 1, never genesis"
     );
+    assert_eq!(
+        prune_height_range_inner(10_000, 5000, None),
+        Some((5000, 5001)),
+        "first online prune starts at the retention boundary"
+    );
+
+    // Steady state: each new block makes exactly one new height prunable.
     assert_eq!(
         prune_height_range_inner(7, 5, Some(2)),
         Some((2, 3)),
@@ -90,7 +98,8 @@ fn prune_height_range_arithmetic() {
     // Nothing new to prune yet (already pruned up to the current eligible height).
     assert_eq!(prune_height_range_inner(6, 5, Some(2)), None, "nothing new");
 
-    // Backlog drain is bounded to MAX_PRUNE_HEIGHTS_PER_COMMIT heights per commit.
+    // Backlog drain after an existing marker is bounded to
+    // MAX_PRUNE_HEIGHTS_PER_COMMIT heights per commit.
     let (from, until) =
         prune_height_range_inner(100_000, 5000, Some(1)).expect("backlog should prune");
     assert_eq!(from, 1);
@@ -98,6 +107,43 @@ fn prune_height_range_arithmetic() {
         until - from,
         MAX_PRUNE_HEIGHTS_PER_COMMIT,
         "per-commit work is capped"
+    );
+}
+
+#[test]
+fn initial_online_prune_preserves_pre_boundary_history() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+    let (prune_from, prune_until) =
+        prune_height_range_inner(TEST_BLOCKS, 5, None).expect("initial prune range exists");
+
+    assert_eq!(
+        (prune_from, prune_until),
+        (TEST_BLOCKS - 5, TEST_BLOCKS - 5 + 1),
+        "initial online prune should only prune from the retention boundary"
+    );
+
+    let preserved_tx_hash = coinbase_tx_hash(&network, prune_from - 1);
+    let pruned_tx_hash = coinbase_tx_hash(&network, prune_from);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state.db, Height(prune_from), Height(prune_until));
+    state.db.write_batch(batch).expect("prune batch writes");
+
+    assert!(
+        state.db.transaction(preserved_tx_hash).is_some(),
+        "raw transaction before the online pruning boundary is preserved"
+    );
+    assert!(
+        state.db.transaction(pruned_tx_hash).is_none(),
+        "raw transaction at the online pruning boundary is pruned"
+    );
+    assert_eq!(
+        state.db.lowest_retained_height(),
+        Some(Height(prune_until)),
+        "pruning progress marker advances to the exclusive prune bound"
     );
 }
 

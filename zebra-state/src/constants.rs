@@ -42,9 +42,9 @@ pub const MIN_PRUNING_RETENTION: u32 = 5 * MAX_BLOCK_REORG_HEIGHT;
 /// The maximum number of block heights pruned in a single block commit.
 ///
 /// In steady state, each committed block makes exactly one new height eligible
-/// for pruning, so this limit is not reached. It only bounds the per-commit work
-/// when draining a backlog (for example, after switching an existing archive
-/// database to pruned mode), keeping individual write batches small.
+/// for pruning, so this limit is not reached. It bounds per-commit work if a
+/// pruning progress marker falls behind the retention boundary, keeping
+/// individual write batches small.
 pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 
 /// The database format major version, incremented each time the on-disk database format has a
