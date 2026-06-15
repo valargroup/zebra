@@ -87,6 +87,7 @@ use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
 use zebra_consensus::router::BackgroundTaskHandles;
+use zebra_network::types::PeerServices;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use crate::{
@@ -525,11 +526,20 @@ impl StartCmd {
                 setup_rx,
             ));
 
+        // Pruned nodes can still make outbound requests, but they cannot serve
+        // arbitrary historical blocks, so they must not advertise full-node service.
+        let advertised_services = if config.state.pruning_config().is_some() {
+            PeerServices::empty()
+        } else {
+            PeerServices::NODE_NETWORK
+        };
+
         let (peer_set, address_book, misbehavior_sender) = zebra_network::init(
             config.network.clone(),
             inbound,
             latest_chain_tip.clone(),
             user_agent(),
+            advertised_services,
         )
         .await;
 
