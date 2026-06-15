@@ -15,7 +15,7 @@ use tracing::Span;
 use zebra_chain::{common::default_cache_dir, parameters::Network};
 
 use crate::{
-    constants::{DATABASE_FORMAT_VERSION_FILE_NAME, STATE_DATABASE_KIND},
+    constants::{DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION, STATE_DATABASE_KIND},
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
 };
@@ -37,6 +37,8 @@ pub struct Config {
     /// You can delete the entire cached state directory, but it will impact your node's
     /// readiness and network usage. If you do, Zebra will re-sync from genesis the next
     /// time it is launched.
+    ///
+    /// Storage mode is controlled separately by [`storage_mode`](Config::storage_mode).
     ///
     /// The default directory is platform dependent, based on
     /// [`dirs::cache_dir()`](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
@@ -99,6 +101,21 @@ pub struct Config {
     /// no check for old database versions will be made and nothing will be
     /// deleted.
     pub delete_old_database: bool,
+
+    /// Selects whether Zebra keeps all historical block data, or stores only the
+    /// data required to validate future blocks.
+    ///
+    /// Set to [`StorageMode::Archive`] by default, which preserves all data and
+    /// is required to answer historical RPC queries.
+    ///
+    /// [`StorageMode::Pruned`] deletes historical raw transaction bytes outside a
+    /// retention window to reduce disk usage, while keeping all consensus-critical
+    /// state (the UTXO set, nullifiers, anchors, note commitment trees, history
+    /// tree, and value pools) as well as the transaction location indexes needed
+    /// to validate future spends. This is a one-way mode: once data has been
+    /// pruned, the database cannot be reopened in [`StorageMode::Archive`] without
+    /// re-syncing from genesis.
+    pub storage_mode: StorageMode,
 
     // Debug configs
     //
@@ -207,6 +224,83 @@ impl Config {
             ..Config::default()
         }
     }
+
+    /// Returns the [`PruningConfig`] if this config selects pruned storage mode.
+    pub fn pruning_config(&self) -> Option<&PruningConfig> {
+        match &self.storage_mode {
+            StorageMode::Archive => None,
+            StorageMode::Pruned(pruning) => Some(pruning),
+        }
+    }
+
+    /// Validates the configured [`StorageMode`].
+    ///
+    /// This must be called before opening the database, so that a misconfigured
+    /// retention window fails fast at startup rather than mid-run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pruned mode is selected with a `tx_retention` below
+    /// [`MIN_PRUNING_RETENTION`]. A retention window at or below the reorg depth
+    /// could let pruning delete data that a rollback needs to read.
+    pub fn validate_storage_mode(&self) -> Result<(), BoxError> {
+        if let Some(pruning) = self.pruning_config() {
+            if pruning.tx_retention < MIN_PRUNING_RETENTION {
+                return Err(format!(
+                    "invalid pruning configuration: tx_retention ({}) must be at least \
+                     MIN_PRUNING_RETENTION ({MIN_PRUNING_RETENTION}) so pruning cannot delete \
+                     data within the reorg/rollback window",
+                    pruning.tx_retention,
+                )
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Selects whether Zebra keeps all historical block data, or stores only the data
+/// required to validate future blocks.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    /// Keep all historical data, including raw transactions and lookup indexes.
+    ///
+    /// This is the default and is required to answer historical RPC queries such
+    /// as `getrawtransaction` for old transactions.
+    #[default]
+    Archive,
+
+    /// Prune historical raw transaction bytes outside the retention window.
+    ///
+    /// Consensus-critical state and transaction location indexes are always
+    /// retained. This is a one-way mode: a pruned database cannot be reopened in
+    /// [`StorageMode::Archive`].
+    Pruned(PruningConfig),
+}
+
+/// Configuration for [`StorageMode::Pruned`].
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PruningConfig {
+    /// Number of recent finalized blocks below the tip whose raw transaction data
+    /// is retained.
+    ///
+    /// Blocks older than this window have their raw transaction bytes (`tx_by_loc`)
+    /// deleted. Transaction lookup indexes (`tx_loc_by_hash`, `hash_by_tx_loc`) are
+    /// retained, because they are needed to resolve spends of UTXOs created in old
+    /// blocks. Must be at least [`MIN_PRUNING_RETENTION`]; this is enforced by
+    /// [`Config::validate_storage_mode`].
+    pub tx_retention: u32,
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }
+    }
 }
 
 impl Default for Config {
@@ -216,6 +310,7 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             delete_old_database: true,
+            storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
             debug_skip_non_finalized_state_backup_task: false,

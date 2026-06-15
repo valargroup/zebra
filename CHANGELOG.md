@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Pruned storage mode (`state.storage_mode`). When set to `pruned`, Zebra deletes
+  historical raw transaction bytes (`tx_by_loc`) outside a configurable retention
+  window (`tx_retention`, minimum 5000 blocks), reducing disk usage while keeping
+  all consensus-critical state and the indexes needed to validate future blocks.
+  This is a one-way mode: a pruned database cannot be reopened in archive mode.
+  Historical RPC queries such as `getrawtransaction` for pruned transactions
+  return a not-found error. The default remains `archive` (keep all data).
 - Include the `zebra-rollback-state` utility alongside `zebrad` in release
   Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.

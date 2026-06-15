@@ -32,6 +32,7 @@ use zebra_chain::{
 };
 
 use crate::{
+    constants::MAX_PRUNE_HEIGHTS_PER_COMMIT,
     error::CommitCheckpointVerifiedError,
     request::FinalizedBlock,
     service::finalized_state::{
@@ -41,7 +42,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, RawBytes,
+        FromDisk, RawBytes, PRUNING_METADATA,
     },
     HashOrHeight,
 };
@@ -414,6 +415,49 @@ impl ZebraDb {
         Some(transaction_hashes.into())
     }
 
+    // Pruning methods
+
+    /// Returns the lowest block height whose raw transaction data is retained, if
+    /// the database is in pruned storage mode.
+    ///
+    /// Raw transactions in non-genesis blocks below this height have been pruned.
+    /// Returns `None` if the database has never pruned any data (it is effectively
+    /// an archive database).
+    #[allow(clippy::unwrap_in_result)]
+    pub fn lowest_retained_height(&self) -> Option<Height> {
+        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA).unwrap();
+        self.db.zs_get(&pruning_metadata, &())
+    }
+
+    /// Returns `true` if the database has pruned historical data, and therefore
+    /// cannot be reopened in [`StorageMode::Archive`](crate::StorageMode::Archive).
+    pub fn is_pruned(&self) -> bool {
+        self.lowest_retained_height().is_some()
+    }
+
+    /// Returns the half-open range of block heights `[from, until)` whose raw
+    /// transaction data should be pruned when committing a block at `new_tip`,
+    /// given the configured `retention` window. Returns `None` if there is
+    /// nothing to prune in this commit.
+    ///
+    /// The genesis block (height 0) is never pruned. Per-commit work is bounded
+    /// by [`MAX_PRUNE_HEIGHTS_PER_COMMIT`] so that draining a backlog (for example
+    /// after switching an archive database to pruned mode) does not produce a
+    /// single oversized write batch.
+    ///
+    /// # Correctness
+    ///
+    /// `retention` is always at least [`MIN_PRUNING_RETENTION`], which is strictly
+    /// greater than [`MAX_BLOCK_REORG_HEIGHT`](crate::constants::MAX_BLOCK_REORG_HEIGHT).
+    /// Since the returned range only ever covers heights at or below
+    /// `new_tip - retention`, pruning can never delete data that a reorg or
+    /// rollback could read.
+    fn prune_height_range(&self, new_tip: Height, retention: u32) -> Option<(Height, Height)> {
+        let lowest_retained = self.lowest_retained_height().map(|height| height.0);
+        let (from, until) = prune_height_range_inner(new_tip.0, retention, lowest_retained)?;
+        Some((Height(from), Height(until)))
+    }
+
     // Write block methods
 
     /// Write `finalized` to the finalized state.
@@ -567,6 +611,18 @@ impl ZebraDb {
             prev_note_commitment_trees,
         )?;
 
+        // In pruned storage mode, delete raw transaction history that has fallen
+        // outside the retention window. This goes in the same atomic batch as the
+        // tip advance, so the prune and the tip advance are always consistent, and
+        // it reuses the single-writer block commit path.
+        if let Some(pruning) = self.config().pruning_config() {
+            if let Some((prune_from, prune_until)) =
+                self.prune_height_range(finalized.height, pruning.tx_retention)
+            {
+                batch.prepare_prune_batch(self, prune_from, prune_until);
+            }
+        }
+
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db
@@ -601,6 +657,40 @@ fn lookup_out_loc(
     let tx_loc = TransactionLocation::from_usize(height, *tx_index);
 
     OutputLocation::from_outpoint(tx_loc, outpoint)
+}
+
+/// Computes the half-open range of block heights `[from, until)` to prune when a
+/// block is committed at `new_tip`, given the `retention` window and the
+/// `lowest_retained` height that still has transaction data (`None` if nothing
+/// has been pruned yet). Returns `None` if there is nothing to prune.
+///
+/// See [`ZebraDb::prune_height_range`] for the correctness invariant.
+fn prune_height_range_inner(
+    new_tip: u32,
+    retention: u32,
+    lowest_retained: Option<u32>,
+) -> Option<(u32, u32)> {
+    // Highest height eligible for pruning: keep `retention` blocks below the tip.
+    let max_prunable = new_tip.checked_sub(retention)?;
+
+    // Never prune the genesis block (height 0); it is special-cased throughout.
+    if max_prunable == 0 {
+        return None;
+    }
+
+    // Resume pruning from the lowest height that still has data. Genesis is always
+    // retained, so the first prunable height is 1.
+    let prune_from = lowest_retained.unwrap_or(1);
+    if prune_from > max_prunable {
+        // Nothing new to prune yet.
+        return None;
+    }
+
+    // Bound the per-commit work when draining a backlog. `prune_until` is the
+    // exclusive upper bound on the pruned heights.
+    let prune_until = (max_prunable + 1).min(prune_from + MAX_PRUNE_HEIGHTS_PER_COMMIT);
+
+    Some((prune_from, prune_until))
 }
 
 impl DiskWriteBatch {
@@ -684,6 +774,53 @@ impl DiskWriteBatch {
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
 
         Ok(())
+    }
+
+    /// Adds deletes for pruned raw transaction data to this batch, for the
+    /// half-open height range `[prune_from, prune_until_strictly_before)`, and
+    /// records the new pruning progress marker.
+    ///
+    /// This prunes only the raw transaction bytes in `tx_by_loc`, which is the
+    /// largest historical column family. Everything else is retained, including:
+    ///
+    /// - consensus-critical state (the UTXO set, nullifiers, anchors, note
+    ///   commitment trees, history tree, and value pools), and
+    /// - the transaction location indexes `tx_loc_by_hash` and `hash_by_tx_loc`.
+    ///
+    /// # Correctness
+    ///
+    /// `tx_loc_by_hash` must be retained even though it is historical lookup data:
+    /// spending a UTXO resolves its outpoint to an [`OutputLocation`] via
+    /// [`ZebraDb::transaction_location`], which reads `tx_loc_by_hash`. A UTXO
+    /// created in an old block can be spent at any later height, so pruning that
+    /// index would break validation of those spends. Only the raw transaction
+    /// bytes (needed for historical RPC queries, not for validating future blocks)
+    /// are safe to prune.
+    ///
+    /// The range to prune must satisfy the retention invariant documented on
+    /// [`ZebraDb::prune_height_range`].
+    pub fn prepare_prune_batch(
+        &mut self,
+        zebra_db: &ZebraDb,
+        prune_from: Height,
+        prune_until_strictly_before: Height,
+    ) {
+        let db = &zebra_db.db;
+
+        let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
+        let pruning_metadata = db.cf_handle(PRUNING_METADATA).unwrap();
+
+        // Range-delete the height-keyed raw transaction column family with a
+        // single tombstone over the pruned height span, which is cheap for RocksDB
+        // to compact (unlike a tombstone per key).
+        let range_start = TransactionLocation::min_for_height(prune_from);
+        let range_end = TransactionLocation::min_for_height(prune_until_strictly_before);
+        self.zs_delete_range(&tx_by_loc, range_start, range_end);
+
+        // Record pruning progress: raw transactions below `prune_until_strictly_before`
+        // (except genesis) are now pruned. Writing this entry also marks the
+        // database as pruned, which is a one-way state.
+        self.zs_insert(&pruning_metadata, (), prune_until_strictly_before);
     }
 
     /// Prepare a database batch containing the block header and transaction data

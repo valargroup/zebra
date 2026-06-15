@@ -28,6 +28,25 @@ pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
 
+/// The minimum retention window allowed in pruned storage mode.
+///
+/// Pruned mode deletes historical raw transaction data at `tip - retention`. The
+/// retention window must be strictly greater than [`MAX_BLOCK_REORG_HEIGHT`], so
+/// that pruning can never delete data that a reorg or rollback could still read.
+///
+/// This floor is sized well above the reorg window (5x) to also cover coinbase
+/// maturity ([`MIN_TRANSPARENT_COINBASE_MATURITY`]) and leave operational
+/// headroom. Configs below this value are rejected at startup.
+pub const MIN_PRUNING_RETENTION: u32 = 5 * MAX_BLOCK_REORG_HEIGHT;
+
+/// The maximum number of block heights pruned in a single block commit.
+///
+/// In steady state, each committed block makes exactly one new height eligible
+/// for pruning, so this limit is not reached. It only bounds the per-commit work
+/// when draining a backlog (for example, after switching an existing archive
+/// database to pruned mode), keeping individual write batches small.
+pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
+
 /// The database format major version, incremented each time the on-disk database format has a
 /// breaking data format change.
 ///
@@ -50,7 +69,7 @@ const DATABASE_FORMAT_VERSION: u64 = 27;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
