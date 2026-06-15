@@ -60,6 +60,10 @@ pub use zebra_db::ZebraDb;
 pub use disk_format::KV;
 
 pub use disk_format::upgrade::restorable_db_versions;
+pub use zebra_db::prune::{
+    preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
+    PruneFinalizedStateOptions, PruneFinalizedStateSummary,
+};
 pub use zebra_db::rollback::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,

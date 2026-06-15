@@ -73,6 +73,10 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
+    preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
+    PruneFinalizedStateOptions, PruneFinalizedStateSummary,
+};
+pub use service::finalized_state::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
 };
