@@ -1,6 +1,6 @@
 use super::{config::*, error::*, validation::*, wire::*, *};
 use crate::zakura::{
-    HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
+    FrontierUpdate, HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
     ZakuraHeaderSyncCandidateState,
 };
 
@@ -26,6 +26,8 @@ pub struct HeaderSyncStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Shared sync exchange frontier stream.
+    pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local stream-5 advertisement.
     pub config: ZakuraHeaderSyncConfig,
     /// Negotiated or local application frame cap for header-sync responses.
@@ -59,6 +61,7 @@ impl HeaderSyncStartup {
             anchor,
             frontiers,
             best_header_tip,
+            frontier_updates: None,
             config,
             max_frame_bytes,
             request_timeout: DEFAULT_HS_REQUEST_TIMEOUT,

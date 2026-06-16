@@ -350,7 +350,6 @@ impl StartCmd {
                         ZakuraHeaderSyncDriverHandles {
                             endpoint: endpoint.clone(),
                             header_sync: header_sync.clone(),
-                            block_sync: endpoint.block_sync(),
                         },
                         state.clone(),
                         read_only_state_service.clone(),
@@ -370,6 +369,7 @@ impl StartCmd {
                         drive_block_sync_actions(
                             block_actions,
                             endpoint.supervisor(),
+                            Some(endpoint.clone()),
                             block_sync.clone(),
                             latest_chain_tip.clone(),
                             read_only_state_service.clone(),
@@ -391,7 +391,7 @@ impl StartCmd {
                         latest_chain_tip.clone(),
                         read_only_state_service.clone(),
                         header_sync,
-                        endpoint.block_sync(),
+                        endpoint.clone(),
                         trace,
                         shutdown.cancelled_owned(),
                     )
@@ -1633,6 +1633,7 @@ mod zakura_header_sync_driver_tests {
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             block_sync,
             zebra_chain::chain_tip::NoChainTip,
             read_state,
@@ -1752,6 +1753,7 @@ mod zakura_header_sync_driver_tests {
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             block_sync,
             zebra_chain::chain_tip::NoChainTip,
             read_state,
@@ -1860,6 +1862,7 @@ mod zakura_header_sync_driver_tests {
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             block_sync,
             zebra_chain::chain_tip::NoChainTip,
             read_state,
@@ -2017,6 +2020,7 @@ mod zakura_header_sync_driver_tests {
         apply_block_sync_body(
             verifier,
             zebra_chain::chain_tip::NoChainTip,
+            None,
             read_state,
             block_sync.clone(),
             1,
@@ -2080,6 +2084,7 @@ mod zakura_header_sync_driver_tests {
         apply_block_sync_body(
             verifier,
             zebra_chain::chain_tip::NoChainTip,
+            None,
             read_state,
             block_sync,
             77,
@@ -2187,6 +2192,7 @@ mod zakura_header_sync_driver_tests {
         apply_block_sync_body(
             verifier,
             latest_chain_tip,
+            None,
             read_state,
             block_sync.clone(),
             1,
@@ -2294,6 +2300,7 @@ mod zakura_header_sync_driver_tests {
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             block_sync,
             zebra_chain::chain_tip::NoChainTip,
             read_state,
@@ -2418,6 +2425,7 @@ mod zakura_header_sync_driver_tests {
         let driver = tokio::spawn(drive_block_sync_actions(
             action_rx,
             zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
             block_sync,
             _latest_tip,
             read_state.clone(),

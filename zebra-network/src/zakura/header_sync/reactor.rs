@@ -1,7 +1,7 @@
 use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
-    HeaderSyncServiceSummary, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
-    ZakuraHeaderSyncCandidateState,
+    FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
+    ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
 };
 
 /// Upper bound on how long the reactor will wait to enqueue a data-plane action
@@ -71,6 +71,8 @@ pub(super) struct HeaderSyncReactor {
 
 impl HeaderSyncReactor {
     async fn run(mut self) {
+        let mut frontier_updates = self.startup.frontier_updates.clone();
+        let mut frontier_updates_open = frontier_updates.is_some();
         if self.startup.range_state_actions_enabled {
             let _ = self
                 .dispatch_action(HeaderSyncAction::QueryBestHeaderTip)
@@ -102,6 +104,23 @@ impl HeaderSyncReactor {
                         break;
                     };
                     self.handle_event(event).await;
+                }
+                changed = async {
+                    match frontier_updates.as_mut() {
+                        Some(frontier_updates) => frontier_updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if frontier_updates_open => {
+                    match changed {
+                        Ok(()) => {
+                            let frontier_updates = frontier_updates
+                                .as_mut()
+                                .expect("frontier update receiver exists while frontier_updates_open is true");
+                            let update = *frontier_updates.borrow_and_update();
+                            self.handle_frontier_update(update).await;
+                        }
+                        Err(_) => frontier_updates_open = false,
+                    }
                 }
                 _ = ticks.tick() => {
                     self.handle_timeouts().await;
@@ -218,6 +237,23 @@ impl HeaderSyncReactor {
             ServiceAdmissionDecision::RejectFull
         } else {
             ServiceAdmissionDecision::Admit
+        }
+    }
+
+    async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
+        match update.change {
+            FrontierChange::Snapshot
+            | FrontierChange::VerifiedGrow
+            | FrontierChange::VerifiedReset => {
+                let frontier = update.frontier;
+                self.handle_state_frontiers_changed(HeaderSyncFrontiers {
+                    finalized_height: frontier.finalized.height,
+                    verified_block_tip: frontier.verified_body.height,
+                    verified_block_hash: frontier.verified_body.hash,
+                })
+                .await;
+            }
+            FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {}
         }
     }
 

@@ -1,7 +1,7 @@
 use super::{config::*, events::*, reorder::*, scheduler::*, state::*, wire::*, *};
 use crate::zakura::{
-    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
-    ZakuraBlockSyncCandidateState,
+    FrontierChange, FrontierUpdate, ServiceAdmissionDecision, ServicePeerDirection,
+    ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
 
@@ -76,7 +76,9 @@ pub(super) struct BlockSyncReactor {
 impl BlockSyncReactor {
     async fn run(mut self) {
         let mut header_tip = self.startup.header_tip.clone();
-        let mut header_tip_open = true;
+        let mut header_tip_open = header_tip.is_some();
+        let mut frontier_updates = self.startup.frontier_updates.clone();
+        let mut frontier_updates_open = frontier_updates.is_some();
         let mut ticks = time::interval(self.startup.config.request_timeout);
         let mut status_ticks = time::interval(
             self.startup
@@ -103,14 +105,40 @@ impl BlockSyncReactor {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
                 }
-                changed = header_tip.changed(), if header_tip_open => {
+                changed = async {
+                    match header_tip.as_mut() {
+                        Some(header_tip) => header_tip.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if header_tip_open => {
                     match changed {
                         Ok(()) => {
+                            let header_tip = header_tip
+                                .as_mut()
+                                .expect("header tip receiver exists while header_tip_open is true");
                             let (height, hash) = *header_tip.borrow_and_update();
                             self.handle_header_tip_changed(height, hash).await;
                             self.publish_metrics();
                         }
                         Err(_) => header_tip_open = false,
+                    }
+                }
+                changed = async {
+                    match frontier_updates.as_mut() {
+                        Some(frontier_updates) => frontier_updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if frontier_updates_open => {
+                    match changed {
+                        Ok(()) => {
+                            let frontier_updates = frontier_updates
+                                .as_mut()
+                                .expect("frontier update receiver exists while frontier_updates_open is true");
+                            let update = *frontier_updates.borrow_and_update();
+                            self.handle_frontier_update(update).await;
+                            self.publish_metrics();
+                        }
+                        Err(_) => frontier_updates_open = false,
                     }
                 }
                 _ = ticks.tick() => {
@@ -293,6 +321,48 @@ impl BlockSyncReactor {
             self.pause_new_body_downloads();
         }
         self.release_caught_up_block_sync_peers();
+    }
+
+    async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
+        let frontier = update.frontier;
+        match update.change {
+            FrontierChange::Snapshot => {
+                self.handle_header_tip_changed(
+                    frontier.best_header.height,
+                    frontier.best_header.hash,
+                )
+                .await;
+                self.handle_state_frontiers_changed(BlockSyncFrontiers {
+                    finalized_height: frontier.finalized.height,
+                    verified_block_tip: frontier.verified_body.height,
+                    verified_block_hash: frontier.verified_body.hash,
+                })
+                .await;
+            }
+            FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {
+                self.handle_header_tip_changed(
+                    frontier.best_header.height,
+                    frontier.best_header.hash,
+                )
+                .await;
+            }
+            FrontierChange::VerifiedGrow => {
+                self.handle_state_frontiers_changed(BlockSyncFrontiers {
+                    finalized_height: frontier.finalized.height,
+                    verified_block_tip: frontier.verified_body.height,
+                    verified_block_hash: frontier.verified_body.hash,
+                })
+                .await;
+            }
+            FrontierChange::VerifiedReset => {
+                self.handle_chain_tip_reset(BlockSyncFrontiers {
+                    finalized_height: frontier.finalized.height,
+                    verified_block_tip: frontier.verified_body.height,
+                    verified_block_hash: frontier.verified_body.hash,
+                })
+                .await;
+            }
+        }
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {

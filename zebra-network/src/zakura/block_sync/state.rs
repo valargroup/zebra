@@ -1,5 +1,8 @@
 use super::{config::*, events::BlockApplyToken, reorder::*, scheduler::*, *};
-use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
+use crate::zakura::{
+    chain_frontier_from_parts, Frontier, FrontierUpdate, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraBlockSyncCandidateState,
+};
 
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 8;
 
@@ -22,7 +25,9 @@ pub struct BlockSyncStartup {
     /// Durable best header tip at startup.
     pub best_header_tip: (block::Height, block::Hash),
     /// Header-sync best-tip watch used as the moving body-download target.
-    pub header_tip: watch::Receiver<(block::Height, block::Hash)>,
+    pub header_tip: Option<watch::Receiver<(block::Height, block::Hash)>>,
+    /// Shared sync exchange frontier stream used as the moving body-download target.
+    pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local stream-6 configuration.
     pub config: ZakuraBlockSyncConfig,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
@@ -44,7 +49,8 @@ impl BlockSyncStartup {
         Self {
             frontiers,
             best_header_tip,
-            header_tip,
+            header_tip: Some(header_tip),
+            frontier_updates: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -52,9 +58,41 @@ impl BlockSyncStartup {
         }
     }
 
+    /// Build block-sync startup config from shared sync exchange frontiers.
+    pub fn new_with_exchange(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        frontier_updates: watch::Receiver<FrontierUpdate>,
+        config: ZakuraBlockSyncConfig,
+    ) -> Self {
+        Self {
+            frontiers,
+            best_header_tip,
+            header_tip: None,
+            frontier_updates: Some(frontier_updates),
+            config,
+            shutdown: CancellationToken::new(),
+            state_queries_enabled: true,
+            trace: ZakuraTrace::noop(),
+        }
+    }
+
+    /// Build a latest-value frontier update stream from legacy startup pieces.
+    pub fn frontier_update_from_parts(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+    ) -> FrontierUpdate {
+        FrontierUpdate {
+            frontier: chain_frontier_from_parts(
+                frontiers.finalized_height,
+                Frontier::new(frontiers.verified_block_tip, frontiers.verified_block_hash),
+                Frontier::new(best_header_tip.0, best_header_tip.1),
+            ),
+            change: crate::zakura::FrontierChange::Snapshot,
+        }
+    }
+
     pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
-        let (tip_tx, header_tip) = watch::channel((block::Height::MIN, block::Hash([0; 32])));
-        drop(tip_tx);
         Self {
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
@@ -62,7 +100,8 @@ impl BlockSyncStartup {
                 verified_block_hash: block::Hash([0; 32]),
             },
             best_header_tip: (block::Height::MIN, block::Hash([0; 32])),
-            header_tip,
+            header_tip: None,
+            frontier_updates: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,

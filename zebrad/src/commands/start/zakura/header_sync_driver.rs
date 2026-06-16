@@ -10,10 +10,13 @@ use zebra_chain::{
     chain_tip::ChainTip,
 };
 use zebra_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle,
-    HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers,
-    ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
+    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
+    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
+
+#[cfg(test)]
+use zebra_network::zakura::{BlockSyncEvent, BlockSyncHandle};
 
 use super::{
     block_verify_error_is_duplicate, emit_commit_state, insert_cs_frontiers, insert_cs_hash,
@@ -72,7 +75,6 @@ pub(crate) async fn zakura_header_sync_driver_startup(
 pub(crate) struct ZakuraHeaderSyncDriverHandles {
     pub(crate) endpoint: ZakuraEndpoint,
     pub(crate) header_sync: zebra_network::zakura::HeaderSyncHandle,
-    pub(crate) block_sync: Option<BlockSyncHandle>,
 }
 
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
@@ -489,13 +491,13 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             tip_hash,
                             count,
                         );
-                        notify_block_sync_header_tip(
-                            handles.block_sync.as_ref(),
+                        publish_header_frontier(
+                            &handles.endpoint,
                             tip_height,
                             tip_hash,
+                            FrontierChange::HeaderAdvanced,
                             &trace,
-                        )
-                        .await;
+                        );
                     }
                     Ok(response) => {
                         emit_commit_state(
@@ -610,13 +612,13 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 tip_hash,
                             })
                             .await;
-                        notify_block_sync_header_tip(
-                            handles.block_sync.as_ref(),
+                        publish_header_frontier(
+                            &handles.endpoint,
                             tip_height,
                             tip_hash,
+                            FrontierChange::HeaderAdvanced,
                             &trace,
-                        )
-                        .await;
+                        );
                     }
                     Ok(zebra_state::ReadResponse::BestHeaderTip(None)) => {}
                     Ok(response) => {
@@ -659,6 +661,32 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     }
 }
 
+pub(crate) fn publish_header_frontier(
+    endpoint: &ZakuraEndpoint,
+    height: block::Height,
+    hash: block::Hash,
+    change: FrontierChange,
+    trace: &ZakuraTrace,
+) {
+    let Some(mut update) = endpoint.current_sync_frontier() else {
+        return;
+    };
+
+    update.frontier.best_header = Frontier::new(height, hash);
+    update.change = change;
+    endpoint.publish_sync_frontier(update);
+    emit_commit_state(
+        trace,
+        cs_trace::BLOCK_SYNC_NOTIFY_SENT,
+        "header_sync_driver",
+        |row| {
+            insert_cs_height(row, cs_trace::HEIGHT, height);
+            insert_cs_hash(row, cs_trace::HASH, hash);
+        },
+    );
+}
+
+#[cfg(test)]
 pub(crate) async fn notify_block_sync_header_tip(
     block_sync: Option<&BlockSyncHandle>,
     height: block::Height,
@@ -808,7 +836,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
     latest_chain_tip: zebra_state::LatestChainTip,
     read_state: ReadState,
     header_sync: zebra_network::zakura::HeaderSyncHandle,
-    block_sync: Option<BlockSyncHandle>,
+    endpoint: ZakuraEndpoint,
     trace: ZakuraTrace,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
@@ -879,41 +907,37 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             verified_block_tip,
         );
 
-        let _ = header_sync
-            .send(HeaderSyncEvent::StateFrontiersChanged(
-                HeaderSyncFrontiers {
-                    finalized_height,
-                    verified_block_tip: verified_block_tip.0,
-                    verified_block_hash: verified_block_tip.1,
-                },
-            ))
-            .await;
         emit_commit_state(
             &trace,
             cs_trace::FRONTIER_DERIVED,
             "chain_tip_mirror",
             |row| {
-                insert_cs_str(row, cs_trace::ACTION, "header_sync_frontier_sent");
+                insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_derived");
                 insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
                 insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, verified_block_tip.0);
                 insert_cs_hash(row, cs_trace::VERIFIED_BLOCK_HASH, verified_block_tip.1);
             },
         );
-        if let Some(block_sync) = &block_sync {
-            let frontiers = BlockSyncFrontiers {
-                finalized_height,
-                verified_block_tip: verified_block_tip.0,
-                verified_block_hash: verified_block_tip.1,
+        if let Some(mut update) = endpoint.current_sync_frontier() {
+            update.frontier.finalized.height = finalized_height;
+            update.frontier.verified_body =
+                Frontier::new(verified_block_tip.0, verified_block_tip.1);
+            update.change = match action {
+                zebra_state::TipAction::Grow { .. } => FrontierChange::VerifiedGrow,
+                zebra_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
             };
-            let _ = block_sync
-                .send(block_sync_chain_tip_event(&action, frontiers))
-                .await;
+            endpoint.publish_sync_frontier(update);
             emit_commit_state(
                 &trace,
                 cs_trace::FRONTIER_DERIVED,
                 "chain_tip_mirror",
                 |row| {
-                    insert_cs_str(row, cs_trace::ACTION, "block_sync_frontier_sent");
+                    let frontiers = BlockSyncFrontiers {
+                        finalized_height,
+                        verified_block_tip: verified_block_tip.0,
+                        verified_block_hash: verified_block_tip.1,
+                    };
+                    insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_sent");
                     insert_cs_frontiers(row, &frontiers);
                 },
             );
@@ -1010,6 +1034,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn block_sync_chain_tip_event(
     action: &zebra_state::TipAction,
     frontiers: BlockSyncFrontiers,
