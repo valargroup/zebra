@@ -192,7 +192,7 @@ fn pruning_summary(
         lowest_retained_height_for_retention(tip.0, options.tx_retention);
 
     if let Some(current) = previous_lowest_retained_height {
-        if requested_lowest_retained_height.is_none_or(|requested| {
+        if requested_lowest_retained_height.is_some_and(|requested| {
             current > requested && !raw_transaction_data_available(db, requested, current)
         }) {
             return Err(PruneFinalizedStateError::AlreadyPrunedBeyondRetention {
@@ -202,7 +202,8 @@ fn pruning_summary(
         }
     }
 
-    let new_lowest_retained_height = requested_lowest_retained_height;
+    let new_lowest_retained_height =
+        requested_lowest_retained_height.or(previous_lowest_retained_height);
     let pruned_height_ranges =
         unpruned_raw_transaction_ranges(db, requested_lowest_retained_height);
     let pruned_height_count = pruned_height_ranges
@@ -502,6 +503,33 @@ mod tests {
             summary.compacted_height_range,
             Some((block::Height(1), block::Height(4)))
         );
+    }
+
+    #[test]
+    fn pruning_summary_allows_existing_marker_when_retention_exceeds_tip() {
+        let _init_guard = zebra_test::init();
+        let state = new_state_with_blocks();
+
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_pruning_marker_batch(&state.db, block::Height(5));
+        state.db.write_batch(batch).expect("marker writes");
+
+        let summary = pruning_summary(
+            &state.db,
+            &PruneFinalizedStateOptions {
+                tx_retention: TEST_BLOCKS + 1,
+            },
+        )
+        .expect("existing pruning marker should not fail when no heights are prunable");
+
+        assert_eq!(
+            summary.previous_lowest_retained_height,
+            Some(block::Height(5))
+        );
+        assert_eq!(summary.new_lowest_retained_height, Some(block::Height(5)));
+        assert_eq!(summary.pruned_height_ranges, Vec::new());
+        assert_eq!(summary.pruned_height_count, 0);
+        assert_eq!(summary.compacted_height_range, None);
     }
 
     #[test]
