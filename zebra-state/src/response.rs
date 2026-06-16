@@ -8,7 +8,7 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
     block_info::BlockInfo,
-    orchard,
+    ironwood, orchard,
     parameters::Network,
     sapling,
     serialization::DateTime32,
@@ -395,6 +395,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::OrchardTree`] with the specified Orchard note commitment tree.
     OrchardTree(Option<Arc<orchard::tree::NoteCommitmentTree>>),
 
+    /// Response to [`ReadRequest::IronwoodTree`] with the specified Ironwood note commitment tree.
+    IronwoodTree(Option<Arc<ironwood::tree::NoteCommitmentTree>>),
+
     /// Response to [`ReadRequest::SaplingSubtrees`] with the specified Sapling note commitment
     /// subtrees.
     SaplingSubtrees(
@@ -405,6 +408,12 @@ pub enum ReadResponse {
     /// subtrees.
     OrchardSubtrees(
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+    ),
+
+    /// Response to [`ReadRequest::IronwoodSubtrees`] with the specified
+    /// Ironwood note commitment subtrees.
+    IronwoodSubtrees(
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
     ),
 
     /// Response to [`ReadRequest::AddressBalance`] with the total balance of the addresses,
@@ -541,8 +550,10 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)
             | ReadResponse::OrchardTree(_)
+            | ReadResponse::IronwoodTree(_)
             | ReadResponse::SaplingSubtrees(_)
             | ReadResponse::OrchardSubtrees(_)
+            | ReadResponse::IronwoodSubtrees(_)
             | ReadResponse::AddressBalance { .. }
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)

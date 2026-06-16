@@ -21,7 +21,7 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
@@ -254,6 +254,18 @@ impl ZebraDb {
         self.orchard_tree_by_height(&height)
     }
 
+    /// Returns the Ironwood [`note commitment tree`](ironwood::tree::NoteCommitmentTree)
+    /// specified by a hash or height, if it exists in the finalized state.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn ironwood_tree_by_hash_or_height(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+
+        self.ironwood_tree_by_height(&height)
+    }
+
     // Read tip block methods
 
     /// Returns the hash of the current finalized tip block.
@@ -376,6 +388,7 @@ impl ZebraDb {
             Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier)?,
             Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier)?,
             Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier)?,
+            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier)?,
         };
 
         self.transaction_hash(tx_loc)
@@ -572,6 +585,10 @@ impl ZebraDb {
         self.db
             .write(batch)
             .expect("unexpected rocksdb error while writing block");
+        self.cache_rebuilt_history_tree(
+            (finalized.height, finalized.hash),
+            finalized.treestate.history_tree.clone(),
+        );
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
@@ -583,6 +600,15 @@ impl ZebraDb {
     /// Writes the given batch to the database.
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
+    }
+
+    /// Writes the given batch only if the finalized tip still matches `expected_tip`.
+    pub(crate) fn write_batch_if_finalized_tip(
+        &self,
+        batch: DiskWriteBatch,
+        expected_tip: (Height, block::Hash),
+    ) -> Result<bool, rocksdb::Error> {
+        self.db.write_if(batch, || self.tip() == Some(expected_tip))
     }
 }
 

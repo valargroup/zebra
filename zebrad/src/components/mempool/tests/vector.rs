@@ -612,7 +612,7 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> {
+async fn mempool_cancel_downloads_after_chain_reset() -> Result<(), Report> {
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -654,11 +654,15 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
     assert!(queued_responses[0].is_ok());
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
-    // Query the mempool to make it poll chain_tip_change
+    // Query the mempool to make it poll chain_tip_change.
     mempool.dummy_call().await;
 
-    // Push block 1 to the state. This is considered a network upgrade,
-    // and thus must cancel all pending transaction downloads.
+    // Make the next tip update look like a chain reset without building a fork.
+    mempool
+        .chain_tip_change
+        .mark_last_change_hash(block2.hash());
+
+    // Push block 1 to the state, forcing a reset in the mempool's tip tracker.
     state_service
         .ready()
         .await
@@ -684,11 +688,17 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         );
     }
 
-    // Ignore all the previous network requests.
-    while let Some(_request) = peer_set.try_next_request().await {}
+    let mut cancelled_requests = Vec::new();
+    while let Some(request) = peer_set.try_next_request().await {
+        cancelled_requests.push(request);
+    }
 
     // Query the mempool to make it poll chain_tip_change
     mempool.dummy_call().await;
+
+    for request in cancelled_requests {
+        request.respond(zn::Response::Transactions(vec![]));
+    }
 
     // Check if download was cancelled and transaction was retried.
     let request = peer_set
@@ -701,6 +711,14 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         &zebra_network::Request::TransactionsById(iter::once(txid).collect()),
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    request.respond(zn::Response::Transactions(vec![]));
+
+    for _ in 0..2 {
+        mempool.dummy_call().await;
+        time::sleep(time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
     Ok(())
 }
@@ -959,8 +977,12 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         })
         .await;
 
-    // Push block 1 to the state. This is considered a network upgrade,
-    // and must cancel all pending transaction downloads with a `TipAction::Reset`.
+    // Make the next tip update look like a chain reset without building a fork.
+    mempool
+        .chain_tip_change
+        .mark_last_change_hash(block3.hash());
+
+    // Push block 1 to the state, forcing a reset in the mempool's tip tracker.
     state_service
         .ready()
         .await
@@ -978,7 +1000,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
         .await
         .expect("unexpected chain tip update failure");
 
-    // Query the mempool to make it poll chain_tip_change and try reverifying its state for the `TipAction::Reset`
+    // Query the mempool to make it poll chain_tip_change and reverify its state after the reset.
     mempool.dummy_call().await;
 
     // Check that there is still an in-flight tx_download and that
@@ -1048,6 +1070,19 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
+
+    tx_verifier
+        .expect_request_that(|_| true)
+        .map(|responder| {
+            responder.respond(Err(TransactionError::BadBalance));
+        })
+        .await;
+
+    for _ in 0..2 {
+        mempool.dummy_call().await;
+        time::sleep(time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
     Ok(())
 }

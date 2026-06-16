@@ -18,7 +18,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{self, AtomicBool},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -96,6 +96,9 @@ pub struct DiskDb {
     /// A boolean flag indicating whether the db format change task has finished
     /// applying any format changes that may have been required.
     finished_format_upgrades: Arc<AtomicBool>,
+
+    /// Serializes all RocksDB batch writes through this database handle.
+    write_lock: Arc<Mutex<()>>,
 
     // Owned State
     //
@@ -1023,6 +1026,7 @@ impl DiskDb {
                     ephemeral: config.ephemeral,
                     db: Arc::new(db),
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    write_lock: Arc::new(Mutex::new(())),
                 };
 
                 db.assert_default_cf_is_empty();
@@ -1091,8 +1095,28 @@ impl DiskDb {
     // Low-level write methods are located in the WriteDisk trait
 
     /// Writes `batch` to the database.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        let _write_lock = self.write_lock.lock().expect("write lock is not poisoned");
+
         self.db.write(batch.batch)
+    }
+
+    /// Writes `batch` to the database if `condition` is true while holding the write lock.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn write_if(
+        &self,
+        batch: DiskWriteBatch,
+        condition: impl FnOnce() -> bool,
+    ) -> Result<bool, rocksdb::Error> {
+        let _write_lock = self.write_lock.lock().expect("write lock is not poisoned");
+
+        if condition() {
+            self.db.write(batch.batch)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // Private methods
