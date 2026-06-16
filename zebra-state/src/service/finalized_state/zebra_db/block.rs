@@ -680,6 +680,25 @@ impl ZebraDb {
     pub fn write_batch(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch)
     }
+
+    /// Flushes pending writes to SST files.
+    pub fn flush(&self) -> Result<(), rocksdb::Error> {
+        self.db.flush()
+    }
+
+    /// Compact raw transaction data in the half-open height range
+    /// `[prune_from, prune_until_strictly_before)`.
+    pub fn compact_raw_transaction_range(
+        &self,
+        prune_from: Height,
+        prune_until_strictly_before: Height,
+    ) {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let range_start = TransactionLocation::min_for_height(prune_from);
+        let range_end = TransactionLocation::min_for_height(prune_until_strictly_before);
+
+        self.db.zs_compact_range(&tx_by_loc, range_start, range_end);
+    }
 }
 
 /// Lookup the output location for an outpoint.
@@ -874,6 +893,19 @@ impl DiskWriteBatch {
         // (except genesis) are now pruned. Writing this entry also marks the
         // database as pruned, which is a one-way state.
         self.zs_insert(&pruning_metadata, (), prune_until_strictly_before);
+    }
+
+    /// Adds a write for the pruning progress marker to this batch.
+    pub fn prepare_pruning_marker_batch(
+        &mut self,
+        zebra_db: &ZebraDb,
+        lowest_retained_height: Height,
+    ) {
+        let pruning_metadata = zebra_db.db.cf_handle(PRUNING_METADATA).unwrap();
+
+        // Writing this entry also marks the database as pruned, which is a
+        // one-way state.
+        self.zs_insert(&pruning_metadata, (), lowest_retained_height);
     }
 
     /// Prepare a database batch containing the block header and transaction data

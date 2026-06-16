@@ -97,13 +97,24 @@ fn print_summary(label: &str, summary: &PruneFinalizedStateSummary) {
         optional_height(summary.new_lowest_retained_height)
     );
 
-    if let Some((from, until)) = summary.pruned_height_range {
-        println!(
-            "  pruned height range: [{}..{}) ({} heights)",
-            from.0, until.0, summary.pruned_height_count
-        );
+    if summary.pruned_height_ranges.is_empty() {
+        println!("  pruned height ranges: none");
     } else {
-        println!("  pruned height range: none");
+        println!(
+            "  pruned height ranges: {} ({} heights)",
+            summary.pruned_height_ranges.len(),
+            summary.pruned_height_count
+        );
+
+        for (from, until) in &summary.pruned_height_ranges {
+            println!("    [{}..{})", from.0, until.0);
+        }
+    }
+
+    if let Some((from, until)) = summary.compacted_height_range {
+        println!("  compacted raw tx range: [{}..{})", from.0, until.0);
+    } else {
+        println!("  compacted raw tx range: none");
     }
 }
 

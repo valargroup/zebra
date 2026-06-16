@@ -7,7 +7,8 @@ use crate::{
     config::{database_format_version_on_disk, PruningConfig, StorageMode},
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::finalized_state::{
-        disk_db::DiskWriteBatch, zebra_db::ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+        disk_db::DiskWriteBatch, disk_format::TransactionLocation, zebra_db::ZebraDb,
+        STATE_COLUMN_FAMILIES_IN_CODE,
     },
     BoxError, Config,
 };
@@ -34,11 +35,14 @@ pub struct PruneFinalizedStateSummary {
     /// Lowest retained height after this pruning operation.
     pub new_lowest_retained_height: Option<block::Height>,
 
-    /// Half-open height range whose raw transaction data is pruned.
-    pub pruned_height_range: Option<(block::Height, block::Height)>,
+    /// Half-open height ranges whose raw transaction data is pruned.
+    pub pruned_height_ranges: Vec<(block::Height, block::Height)>,
 
     /// Number of block heights pruned by this operation.
     pub pruned_height_count: u32,
+
+    /// Half-open height range where RocksDB compaction is run to reclaim space.
+    pub compacted_height_range: Option<(block::Height, block::Height)>,
 }
 
 /// Errors returned by finalized-state pruning.
@@ -111,10 +115,25 @@ pub fn prune_finalized_state(
     let db = open_pruning_db(&config, network, false);
     let summary = pruning_summary(&db, &options)?;
 
-    if let Some((prune_from, prune_until)) = summary.pruned_height_range {
+    let needs_marker_update =
+        summary.previous_lowest_retained_height != summary.new_lowest_retained_height;
+
+    if !summary.pruned_height_ranges.is_empty() || needs_marker_update {
         let mut batch = DiskWriteBatch::new();
-        batch.prepare_prune_batch(&db, prune_from, prune_until);
+        for (prune_from, prune_until) in summary.pruned_height_ranges.iter().copied() {
+            batch.prepare_prune_batch(&db, prune_from, prune_until);
+        }
+
+        if let Some(new_lowest_retained_height) = summary.new_lowest_retained_height {
+            batch.prepare_pruning_marker_batch(&db, new_lowest_retained_height);
+        }
+
         db.write_batch(batch)?;
+    }
+
+    if let Some((compact_from, compact_until)) = summary.compacted_height_range {
+        db.flush()?;
+        db.compact_raw_transaction_range(compact_from, compact_until);
     }
 
     Ok(summary)
@@ -173,7 +192,9 @@ fn pruning_summary(
         lowest_retained_height_for_retention(tip.0, options.tx_retention);
 
     if let Some(current) = previous_lowest_retained_height {
-        if requested_lowest_retained_height.is_none_or(|requested| current > requested) {
+        if requested_lowest_retained_height.is_none_or(|requested| {
+            current > requested && !raw_transaction_data_available(db, requested, current)
+        }) {
             return Err(PruneFinalizedStateError::AlreadyPrunedBeyondRetention {
                 current,
                 requested: requested_lowest_retained_height,
@@ -181,18 +202,24 @@ fn pruning_summary(
         }
     }
 
-    let pruned_height_range = prune_height_range_for_retention(tip.0, options.tx_retention);
-    let new_lowest_retained_height =
-        pruned_height_range.map_or(previous_lowest_retained_height, |(_, until)| Some(until));
-    let pruned_height_count = pruned_height_range.map_or(0, |(from, until)| until.0 - from.0);
+    let new_lowest_retained_height = requested_lowest_retained_height;
+    let pruned_height_ranges =
+        unpruned_raw_transaction_ranges(db, requested_lowest_retained_height);
+    let pruned_height_count = pruned_height_ranges
+        .iter()
+        .map(|(from, until)| until.0 - from.0)
+        .sum();
+    let compacted_height_range =
+        compact_height_range_for_retention(requested_lowest_retained_height);
 
     Ok(PruneFinalizedStateSummary {
         tip,
         tx_retention: options.tx_retention,
         previous_lowest_retained_height,
         new_lowest_retained_height,
-        pruned_height_range,
+        pruned_height_ranges,
         pruned_height_count,
+        compacted_height_range,
     })
 }
 
@@ -209,30 +236,89 @@ fn lowest_retained_height_for_retention(
     Some(block::Height(max_prunable + 1))
 }
 
-/// Returns the half-open range `[from, until)` of block heights the offline tool
-/// prunes for `retention`, or `None` if the retention window covers the whole
-/// chain.
-///
-/// Unlike online pruning (which, when first enabled on an existing archive
-/// database, starts at the current retention boundary), the offline tool always
-/// covers the full range below the boundary, starting just above genesis. This
-/// reclaims any historical raw transaction data left intact when pruning was
-/// first enabled online, which the online path and a marker-resuming offline pass
-/// would otherwise leave stranded forever. Re-deleting already-pruned heights is
-/// an idempotent no-op (a single range tombstone over absent keys).
-fn prune_height_range_for_retention(
-    tip: block::Height,
-    retention: u32,
+fn compact_height_range_for_retention(
+    prune_until: Option<block::Height>,
 ) -> Option<(block::Height, block::Height)> {
-    let prune_until = lowest_retained_height_for_retention(tip, retention)?;
+    let prune_until = prune_until?;
+    let prune_from = block::Height(1);
+
+    (prune_from < prune_until).then_some((prune_from, prune_until))
+}
+
+/// Returns the half-open ranges of block heights below `prune_until` that still
+/// have raw transaction entries on disk.
+///
+/// Unlike online pruning (which uses the marker to resume bounded per-block
+/// work), the offline tool scans the raw transaction column. This detects
+/// historical data left below an already-advanced marker when pruning was first
+/// enabled on an existing archive database.
+fn unpruned_raw_transaction_ranges(
+    db: &ZebraDb,
+    prune_until: Option<block::Height>,
+) -> Vec<(block::Height, block::Height)> {
+    let Some(prune_until) = prune_until else {
+        return Vec::new();
+    };
+
     // Genesis (height 0) is never pruned, so the lowest prunable height is 1.
     let prune_from = block::Height(1);
 
     if prune_from >= prune_until {
-        return None;
+        return Vec::new();
     }
 
-    Some((prune_from, prune_until))
+    raw_transaction_height_ranges(db, prune_from, prune_until)
+}
+
+fn raw_transaction_data_available(db: &ZebraDb, from: block::Height, until: block::Height) -> bool {
+    matches!(
+        raw_transaction_height_ranges(db, from, until).as_slice(),
+        [range] if *range == (from, until)
+    )
+}
+
+fn raw_transaction_height_ranges(
+    db: &ZebraDb,
+    from: block::Height,
+    until: block::Height,
+) -> Vec<(block::Height, block::Height)> {
+    if from >= until {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut current_start = None;
+    let mut previous_height = None;
+
+    let location_range =
+        TransactionLocation::min_for_height(from)..TransactionLocation::min_for_height(until);
+
+    for (location, _) in db.raw_transactions_by_location_range(location_range) {
+        let height = location.height;
+
+        if previous_height == Some(height) {
+            continue;
+        }
+
+        match (current_start, previous_height) {
+            (Some(_), Some(previous)) if height.0 == previous.0 + 1 => {}
+            (Some(start), Some(previous)) => {
+                ranges.push((start, block::Height(previous.0 + 1)));
+                current_start = Some(height);
+            }
+            _ => {
+                current_start = Some(height);
+            }
+        }
+
+        previous_height = Some(height);
+    }
+
+    if let (Some(start), Some(previous)) = (current_start, previous_height) {
+        ranges.push((start, block::Height(previous.0 + 1)));
+    }
+
+    ranges
 }
 
 #[cfg(test)]
@@ -302,21 +388,19 @@ mod tests {
             Some(block::Height(2))
         );
 
-        // The offline tool always covers the full range below the boundary,
-        // starting just above genesis, regardless of any existing marker.
         assert_eq!(
-            prune_height_range_for_retention(block::Height(5001), 5000),
-            Some((block::Height(1), block::Height(2)))
-        );
-        assert_eq!(
-            prune_height_range_for_retention(block::Height(10_000), 5000),
-            Some((block::Height(1), block::Height(5001)))
+            lowest_retained_height_for_retention(block::Height(10_000), 5000),
+            Some(block::Height(5001))
         );
 
-        // Retention covering the whole chain leaves nothing to prune.
+        assert_eq!(compact_height_range_for_retention(None), None);
         assert_eq!(
-            prune_height_range_for_retention(block::Height(5000), 5000),
+            compact_height_range_for_retention(Some(block::Height(1))),
             None
+        );
+        assert_eq!(
+            compact_height_range_for_retention(Some(block::Height(5001))),
+            Some((block::Height(1), block::Height(5001)))
         );
     }
 
@@ -336,11 +420,15 @@ mod tests {
             "height 5 is the first retained non-genesis height"
         );
         assert_eq!(
-            summary.pruned_height_range,
-            Some((block::Height(1), block::Height(5))),
-            "offline pruning plans the entire eligible range in one batch"
+            summary.pruned_height_ranges,
+            vec![(block::Height(1), block::Height(5))],
+            "offline pruning plans the unpruned eligible range in one batch"
         );
         assert_eq!(summary.pruned_height_count, 4);
+        assert_eq!(
+            summary.compacted_height_range,
+            Some((block::Height(1), block::Height(5)))
+        );
     }
 
     #[test]
@@ -368,12 +456,52 @@ mod tests {
             Some(block::Height(3))
         );
         assert_eq!(
-            summary.pruned_height_range,
-            Some((block::Height(1), block::Height(5))),
-            "offline pruning reclaims the full range below the boundary, including \
-             heights left intact below the marker"
+            summary.pruned_height_ranges,
+            vec![
+                (block::Height(1), block::Height(2)),
+                (block::Height(3), block::Height(5))
+            ],
+            "offline pruning detects only the raw transaction ranges left below the boundary"
         );
-        assert_eq!(summary.pruned_height_count, 4);
+        assert_eq!(summary.pruned_height_count, 3);
+        assert_eq!(
+            summary.compacted_height_range,
+            Some((block::Height(1), block::Height(5)))
+        );
+    }
+
+    #[test]
+    fn pruning_summary_uses_raw_transactions_to_correct_marker() {
+        let _init_guard = zebra_test::init();
+        let state = new_state_with_blocks();
+
+        // Simulate a marker that is ahead of the requested retention boundary,
+        // while the corresponding raw transaction data is still present.
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_pruning_marker_batch(&state.db, block::Height(5));
+        state.db.write_batch(batch).expect("marker writes");
+        assert_eq!(state.db.lowest_retained_height(), Some(block::Height(5)));
+        assert!(
+            state.db.transaction(coinbase_tx_hash(4)).is_some(),
+            "height 4 raw transaction data is still present despite the marker"
+        );
+
+        let summary = pruning_summary(&state.db, &PruneFinalizedStateOptions { tx_retention: 6 })
+            .expect("present raw transaction data should override the stale marker");
+
+        assert_eq!(
+            summary.previous_lowest_retained_height,
+            Some(block::Height(5))
+        );
+        assert_eq!(summary.new_lowest_retained_height, Some(block::Height(4)));
+        assert_eq!(
+            summary.pruned_height_ranges,
+            vec![(block::Height(1), block::Height(4))]
+        );
+        assert_eq!(
+            summary.compacted_height_range,
+            Some((block::Height(1), block::Height(4)))
+        );
     }
 
     #[test]
