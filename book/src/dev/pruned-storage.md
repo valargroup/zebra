@@ -84,10 +84,6 @@ intentionally **one-way**:
 | `pruned → pruned` | Yes |
 | `pruned → archive` | **Rejected** once data has been pruned |
 
-The reason is semantic, not merely mechanical. Once raw transaction bytes are
-missing, the database can no longer honestly satisfy the archive-mode contract.
-Reopening it as archive would make RPC and history behavior appear
-archive-capable even though older raw transaction data is gone.
 
 ### The pruning marker
 
