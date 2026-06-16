@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
+  historical raw transaction data, matching the node's storage mode instead of
+  always reporting archive behavior.
 - Pruned storage mode (`state.storage_mode`). When set to `pruned`, Zebra deletes
   historical raw transaction bytes (`tx_by_loc`) outside a configurable retention
   window (`tx_retention`), reducing disk usage while keeping all consensus-critical
