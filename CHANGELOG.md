@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   historical raw transaction bytes (`tx_by_loc`) outside a configurable retention
   window (`tx_retention`), reducing disk usage while keeping all consensus-critical
   state and the indexes needed to validate future blocks. The retention floor is
-  5000 blocks on Mainnet/Testnet, and the reorg window + 1 on Regtest so tests can
-  exercise pruning without a 5000-block chain. This is a one-way mode: a pruned
+  10_000 blocks on Mainnet/Testnet, and the reorg window + 1 on Regtest so tests can
+  exercise pruning without a 10_000-block chain. This is a one-way mode: a pruned
   database cannot be reopened in archive mode.
   Historical RPC queries such as `getrawtransaction` for pruned transactions
   return a not-found error. The default remains `archive` (keep all data).

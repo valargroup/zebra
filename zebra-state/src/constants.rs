@@ -36,13 +36,14 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// retention window must be strictly greater than [`MAX_BLOCK_REORG_HEIGHT`], so
 /// that pruning can never delete data that a reorg or rollback could still read.
 ///
-/// This floor is sized well above the reorg window (5x) to also cover coinbase
+/// This floor is sized well above the reorg window (10x) to also cover coinbase
 /// maturity ([`MIN_TRANSPARENT_COINBASE_MATURITY`]) and leave operational
-/// headroom. Configs below this value are rejected at startup.
+/// headroom. At the current 75-second block target, it retains more than a week
+/// of raw transaction data. Configs below this value are rejected at startup.
 ///
 /// This is the floor for Mainnet and Testnet; use [`min_pruning_retention`] to
 /// get the network-specific floor.
-pub const MIN_PRUNING_RETENTION: u32 = 5 * MAX_BLOCK_REORG_HEIGHT;
+pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
 /// The minimum retention window allowed in pruned storage mode on `network`.
 ///
@@ -52,7 +53,7 @@ pub const MIN_PRUNING_RETENTION: u32 = 5 * MAX_BLOCK_REORG_HEIGHT;
 /// Mainnet and Testnet use [`MIN_PRUNING_RETENTION`], which adds operational
 /// headroom above the reorg window. Regtest drops that headroom (but still covers
 /// the reorg window) so tests can cross the retention boundary without committing
-/// a 5000+ block chain.
+/// a 10_000+ block chain.
 pub fn min_pruning_retention(network: &Network) -> u32 {
     match network.kind() {
         NetworkKind::Regtest => MAX_BLOCK_REORG_HEIGHT + 1,

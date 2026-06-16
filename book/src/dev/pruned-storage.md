@@ -53,7 +53,7 @@ transaction data is retained. It must be at least the network's minimum retentio
 floor (see [Retention height](#retention-height-and-per-block-pruning) below);
 this is enforced at startup by `Config::validate_storage_mode`, which rejects an
 out-of-range value before the database is opened. The default is
-`MIN_PRUNING_RETENTION` (5000 blocks on Mainnet and Testnet).
+`MIN_PRUNING_RETENTION` (10_000 blocks on Mainnet and Testnet).
 
 ### What is pruned and what is retained
 
@@ -153,8 +153,10 @@ arithmetic lives in the pure, unit-tested `prune_height_range_inner` function.
 
 ### The retention floor is load-bearing
 
-`MIN_PRUNING_RETENTION` (5000) is deliberately greater than
-`MAX_BLOCK_REORG_HEIGHT` (1000). The correctness argument:
+`MIN_PRUNING_RETENTION` (10_000) is deliberately much greater than
+`MAX_BLOCK_REORG_HEIGHT` (1000). At the current 75-second block target, this
+retains about 8.7 days of raw transaction data, which is more than a week. The
+correctness argument:
 
 > We only ever delete at `tip - retention`, and a reorg only ever rewinds the
 > last ≤1000 finalized blocks. Because `retention > MAX_BLOCK_REORG_HEIGHT`,
@@ -198,13 +200,13 @@ pruning the wrong (or an empty) state directory.
 zebrad prune-state \
     --network Mainnet \
     --cache-dir /path/to/state \
-    --tx-retention 5000
+    --tx-retention 10000
 
 # Apply the plan.
 zebrad prune-state \
     --network Mainnet \
     --cache-dir /path/to/state \
-    --tx-retention 5000 \
+    --tx-retention 10000 \
     --confirm
 ```
 
@@ -244,4 +246,4 @@ gracefully:
 
 No consensus path reads raw transactions below the retained window: reorgs are
 bounded to `MAX_BLOCK_REORG_HEIGHT` (1000) blocks, well within any valid retention
-window (≥5000), so the data a reorg needs is always retained.
+window (≥10_000), so the data a reorg needs is always retained.

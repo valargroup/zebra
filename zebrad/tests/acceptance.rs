@@ -3090,7 +3090,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
 /// - and the on-disk database records that pruning happened.
 ///
 /// Regtest uses a lower retention floor ([`min_pruning_retention`]) than
-/// Mainnet/Testnet so the test can cross the window without a 5000+ block chain.
+/// Mainnet/Testnet so the test can cross the window without a 10_000+ block chain.
 /// Even so, blocks only finalize once they are [`MAX_BLOCK_REORG_HEIGHT`] deep, so
 /// this test mines `tx_retention + MAX_BLOCK_REORG_HEIGHT + margin` blocks and is
 /// correspondingly slow.
