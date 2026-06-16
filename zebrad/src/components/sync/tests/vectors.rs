@@ -13,7 +13,7 @@ use std::{
 };
 
 use color_eyre::Report;
-use futures::{Future, FutureExt};
+use futures::{Future, FutureExt, StreamExt};
 
 use zebra_chain::{
     block::{self, Block, Height},
@@ -32,7 +32,11 @@ use zebra_state as zs;
 
 use crate::{
     components::{
-        sync::{self, downloads::BlockDownloadVerifyError, SyncStatus},
+        sync::{
+            self,
+            downloads::{BlockDownloadVerifyError, Downloads},
+            SyncStatus,
+        },
         ChainSync,
     },
     config::ZebradConfig,
@@ -1487,5 +1491,61 @@ fn debug_skip_regtest_genesis_self_seed_defaults_off_and_is_opt_in() {
     assert!(
         !serialized.contains("debug_skip_regtest_genesis_self_seed"),
         "debug bootstrap flag must not appear in generated config output"
+    );
+}
+
+/// A peer that returns *zero* blocks for a single-hash download request must be
+/// treated as a retryable download failure, not crash the whole node.
+///
+/// Regression for a `downloads.rs` `assert_eq!(blocks.len(), 1)` panic: a
+/// gossiped single-hash fetch that raced an empty response took down a Zakura
+/// node mid catch-up (`thread 'tokio-rt-worker' panicked ... wrong number of
+/// blocks in response to a single hash`, propagated to a fatal syncer panic). A
+/// misbehaving or racing peer must not be able to kill the node, so an
+/// unexpected block count is surfaced as a `DownloadFailed` the syncer retries.
+#[tokio::test]
+async fn empty_block_response_is_retryable_download_failure() {
+    let _init_guard = zebra_test::init();
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let verifier =
+        MockService::build().for_unit_tests::<zebra_consensus::Request, block::Hash, _>();
+    let (chain_tip, _chain_tip_sender) = MockChainTip::new();
+    let (past_lookahead_limit_sender, _past_lookahead_limit_receiver) =
+        tokio::sync::watch::channel(false);
+
+    let mut downloads = Downloads::new(
+        peer_set.clone(),
+        verifier,
+        chain_tip,
+        past_lookahead_limit_sender,
+        sync::MIN_CONCURRENCY_LIMIT,
+        Height(0),
+    );
+
+    let block0: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let hash = block0.hash();
+
+    downloads
+        .download_and_verify(hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+
+    // The peer responds to the single-hash request with an empty block list.
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![]));
+
+    let result = downloads
+        .next()
+        .await
+        .expect("the download task produces a result instead of panicking");
+
+    assert!(
+        matches!(result, Err(BlockDownloadVerifyError::DownloadFailed { .. })),
+        "an empty block response must be a retryable DownloadFailed, got {result:?}",
     );
 }

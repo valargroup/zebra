@@ -60,6 +60,15 @@ READY_TIMEOUT="${READY_TIMEOUT:-120}"
 # few times before the connection settles. The loop exits as soon as the block
 # arrives, so a generous ceiling only matters on failure.
 PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-150}"
+# The from-scratch reset catch-up is given its own, larger ceiling. After a
+# restart the reconnecting node returns under the same identity but reuses its
+# stable loopback endpoint, so the seed briefly holds the dead pre-reset
+# connection; re-establishing the kind-6 block-sync peer can take until the
+# Zakura app idle reaper releases that stale connection (bounded by the ~150s
+# idle window, but variable). Recovery is reliable but not fast, so the 120s
+# READY_TIMEOUT used for the (fast) startup assertions is too tight here. This
+# ceiling only matters on failure: the waits exit as soon as catch-up starts.
+CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-300}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-block-sync}"
 
 log()  { printf '\n=== %s ===\n' "$*"; }
@@ -140,8 +149,8 @@ wait_metric_zero() {
 }
 
 wait_metric_at_least() {
-  local port="$1" name="$2" want="$3" label="$4" deadline=$((SECONDS + READY_TIMEOUT))
-  local value
+  local port="$1" name="$2" want="$3" label="$4" timeout="${5:-${READY_TIMEOUT}}"
+  local deadline=$((SECONDS + timeout)) value
   while (( SECONDS < deadline )); do
     value=$(metric "${port}" "${name}")
     printf '  %s %s=%s (want >= %s)\n' "${label}" "${name}" "${value}" "${want}"
@@ -150,7 +159,7 @@ wait_metric_at_least() {
     fi
     sleep 3
   done
-  fail "${label} ${name} stayed below ${want} within ${READY_TIMEOUT}s"
+  fail "${label} ${name} stayed below ${want} within ${timeout}s"
 }
 
 wait_ready() {
@@ -192,8 +201,8 @@ invalidate_block_if_present() {
 }
 
 wait_block_count_at_least() {
-  local port="$1" want="$2" label="$3" deadline=$((SECONDS + PROPAGATE_TIMEOUT))
-  local height
+  local port="$1" want="$2" label="$3" timeout="${4:-${PROPAGATE_TIMEOUT}}"
+  local deadline=$((SECONDS + timeout)) height
   while (( SECONDS < deadline )); do
     height=$(block_count "${port}")
     printf '  %s height=%s (want >= %s)\n' "${label}" "${height}" "${want}"
@@ -216,8 +225,8 @@ wait_block_count_equal() {
 }
 
 wait_zakura_body_frontier_at_tip() {
-  local metrics_port="$1" rpc_port="$2" target="$3" label="$4" deadline=$((SECONDS + PROPAGATE_TIMEOUT))
-  local header body rpc_height
+  local metrics_port="$1" rpc_port="$2" target="$3" label="$4" timeout="${5:-${PROPAGATE_TIMEOUT}}"
+  local deadline=$((SECONDS + timeout)) header body rpc_height
   while (( SECONDS < deadline )); do
     header=$(metric "${metrics_port}" sync_block_best_header_tip_height)
     body=$(metric "${metrics_port}" sync_block_verified_tip_height)
@@ -531,10 +540,10 @@ wait_ready 18332 "node2 (post-reset)"
 # node2's own counters restart from zero, so assert absolute kind-6 activity, not a
 # delta. With node1 idle at the tip, reaching catchup_target from an empty state is
 # only possible by downloading every body over block sync.
-wait_metric_at_least 19002 sync_block_request_sent 1 "node2 catch-up"
-wait_metric_at_least 19002 sync_block_body_received 1 "node2 catch-up"
-wait_block_count_at_least 18332 "${catchup_target}" "node2 catch-up"
-wait_zakura_body_frontier_at_tip 19002 18332 "${catchup_target}" "node2 catch-up"
+wait_metric_at_least 19002 sync_block_request_sent 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
+wait_metric_at_least 19002 sync_block_body_received 1 "node2 catch-up" "${CATCHUP_TIMEOUT}"
+wait_block_count_at_least 18332 "${catchup_target}" "node2 catch-up" "${CATCHUP_TIMEOUT}"
+wait_zakura_body_frontier_at_tip 19002 18332 "${catchup_target}" "node2 catch-up" "${CATCHUP_TIMEOUT}"
 
 # node2 dials only node1, so node1 must have served the catch-up bodies over kind-6.
 after_node1_served=$(metric 19001 sync_block_body_served)
