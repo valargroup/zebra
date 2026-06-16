@@ -119,7 +119,7 @@ where
         address_book_updater,
         address_metrics,
         address_book_updater_guard,
-    ) = AddressBookUpdater::spawn(&config, listen_addr);
+    ) = AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
 
     let (misbehavior_tx, mut misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection

@@ -237,8 +237,14 @@ gracefully:
   error. A per-txid "pruned vs never-existed" distinction is impossible once the
   bytes are gone — only a node-level hint ("this node is pruned; lowest retained
   height = N") is achievable, and is not currently surfaced.
-- `getblock` (verbose) for a pruned height returns partial or absent transaction
-  data rather than failing.
+- `getblock` for a pruned height depends on the verbosity:
+  - `getblock <hash|height> 1` (the default; returns the header and the list of
+    transaction IDs) does **not** read raw transaction bytes — it resolves the
+    transaction IDs from the retained `hash_by_tx_loc` index — so it continues to
+    work for pruned heights.
+  - `getblock <hash|height> 0` (raw block) and `getblock <hash|height> 2` (full
+    transaction objects) both require the raw transaction bytes, so they return
+    the not-found error once those bytes have been pruned.
 
 No consensus path reads raw transactions below the retained window: reorgs are
 bounded to `MAX_BLOCK_REORG_HEIGHT` (1000) blocks, well within any valid retention
