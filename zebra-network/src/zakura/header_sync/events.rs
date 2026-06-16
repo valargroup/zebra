@@ -11,6 +11,8 @@ pub struct HeaderSyncFrontiers {
     pub finalized_height: block::Height,
     /// Highest verified block body height, supplied by state.
     pub verified_block_tip: block::Height,
+    /// Hash at the highest verified block body height, supplied by state.
+    pub verified_block_hash: block::Hash,
 }
 
 /// Startup inputs for the dependency-neutral header-sync reactor.

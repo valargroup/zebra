@@ -388,7 +388,7 @@ impl HeaderSyncReactor {
     async fn handle_full_block_committed(&mut self, height: block::Height, hash: block::Hash) {
         self.state.pending_new_blocks.remove(&hash);
         let _ = self.state.seen.insert(hash);
-        self.state.verified_block_tip = self.state.verified_block_tip.max(height);
+        self.update_verified_block_tip(height, hash);
         self.state.schedule.mark_height_covered(height);
         self.cancel_covered_outstanding();
         if height > self.state.best_header_tip {
@@ -412,7 +412,7 @@ impl HeaderSyncReactor {
             return;
         }
 
-        self.state.verified_block_tip = self.state.verified_block_tip.max(height);
+        self.update_verified_block_tip(height, hash);
         self.state.schedule.mark_height_covered(height);
         self.cancel_covered_outstanding();
         if height > self.state.best_header_tip {
@@ -508,6 +508,10 @@ impl HeaderSyncReactor {
     async fn handle_state_frontiers_changed(&mut self, frontiers: HeaderSyncFrontiers) {
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
+        self.state.verified_block_hash = frontiers.verified_block_hash;
+        if self.state.best_header_tip <= self.state.verified_block_tip {
+            self.state.stale_anchor.reset();
+        }
         self.schedule().await;
     }
 
@@ -939,6 +943,20 @@ impl HeaderSyncReactor {
                 count = ?header_count,
                 "Zakura header-sync rejected header range links"
             );
+            self.trace_range_validation_rejected(
+                &peer,
+                outstanding.range,
+                header_count,
+                "link",
+                header_sync_wire_error_kind(&error),
+            );
+            if self
+                .handle_possible_stale_anchor_link_failure(&peer, outstanding.range, &error)
+                .await
+            {
+                self.schedule().await;
+                return;
+            }
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                 .await;
             self.state.schedule.retry(outstanding.range);
@@ -952,6 +970,13 @@ impl HeaderSyncReactor {
                 start_height = ?outstanding.range.start_height,
                 count = ?header_count,
                 "Zakura header-sync rejected stateless header range"
+            );
+            self.trace_range_validation_rejected(
+                &peer,
+                outstanding.range,
+                header_count,
+                "stateless",
+                header_sync_wire_error_kind(&error),
             );
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                 .await;
@@ -971,6 +996,13 @@ impl HeaderSyncReactor {
             if end_height != outstanding.range.end_height()
                 || self.startup.network.checkpoint_list().hash(end_height) != Some(last_hash)
             {
+                self.trace_range_validation_rejected(
+                    &peer,
+                    outstanding.range,
+                    header_count,
+                    "checkpoint",
+                    "checkpoint_hash_mismatch",
+                );
                 self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                     .await;
                 self.state.schedule.retry(outstanding.range);
@@ -997,6 +1029,48 @@ impl HeaderSyncReactor {
                 finalized: outstanding.range.finalized,
             })
             .await;
+    }
+
+    async fn handle_possible_stale_anchor_link_failure(
+        &mut self,
+        peer: &ZakuraPeerId,
+        range: RangeRequest,
+        error: &HeaderSyncWireError,
+    ) -> bool {
+        if !matches!(error, HeaderSyncWireError::FirstHeaderDoesNotLink)
+            || range.priority != RangePriority::Forward
+            || range.finalized
+            || self.state.best_header_tip <= self.state.verified_block_tip
+        {
+            self.state.stale_anchor.reset();
+            return false;
+        }
+
+        self.state.stale_anchor.record(peer.clone());
+        metrics::counter!("sync.header.stale_anchor.link_failure").increment(1);
+
+        if !self.state.stale_anchor.should_reanchor() {
+            self.state.schedule.clear_assignment(range);
+            self.state.schedule.retry(range);
+            return true;
+        }
+
+        self.reanchor_to_verified_block_tip().await;
+        true
+    }
+
+    async fn reanchor_to_verified_block_tip(&mut self) {
+        let height = self.state.verified_block_tip;
+        let hash = self.state.verified_block_hash;
+        metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
+
+        self.state.stale_anchor.reset();
+        self.state.schedule.clear_forward();
+        self.state
+            .pending_commits
+            .retain(|_, range| range.priority != RangePriority::Forward);
+        self.cancel_forward_outstanding();
+        self.publish_best_tip_reanchored(height, hash).await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -1146,6 +1220,26 @@ impl HeaderSyncReactor {
         let _ = self.tip.send((height, hash));
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
+    }
+
+    async fn publish_best_tip_reanchored(&mut self, height: block::Height, hash: block::Hash) {
+        self.state.best_header_tip = height;
+        self.state.best_header_hash = hash;
+        metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
+        self.trace_frontier_reanchored(height, hash);
+        let _ = self.tip.send((height, hash));
+        self.publish_candidate_state();
+        self.broadcast_status_refresh().await;
+    }
+
+    fn update_verified_block_tip(&mut self, height: block::Height, hash: block::Hash) {
+        if height > self.state.verified_block_tip {
+            self.state.verified_block_tip = height;
+            self.state.verified_block_hash = hash;
+        }
+        if self.state.best_header_tip <= self.state.verified_block_tip {
+            self.state.stale_anchor.reset();
+        }
     }
 
     async fn broadcast_status_refresh(&mut self) {
@@ -1554,6 +1648,31 @@ impl HeaderSyncReactor {
         });
     }
 
+    fn trace_range_validation_rejected(
+        &self,
+        peer: &ZakuraPeerId,
+        range: RangeRequest,
+        count: u32,
+        validation_stage: &'static str,
+        error_kind: &'static str,
+    ) {
+        self.emit_trace(hs_trace::HEADER_RANGE_REJECTED, |row| {
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_height(row, hs_trace::RANGE_START, range.start_height);
+            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
+            insert_hash(row, hs_trace::ANCHOR_HASH, range.anchor_hash);
+            insert_optional_str(row, hs_trace::VALIDATION_STAGE, Some(validation_stage));
+            insert_optional_str(row, hs_trace::ERROR_KIND, Some(error_kind));
+            insert_optional_str(
+                row,
+                hs_trace::REASON,
+                Some(misbehavior_reason_label(
+                    HeaderSyncMisbehavior::InvalidRange,
+                )),
+            );
+        });
+    }
+
     fn trace_new_block_received(
         &self,
         peer: &ZakuraPeerId,
@@ -1632,6 +1751,13 @@ impl HeaderSyncReactor {
         });
     }
 
+    fn trace_frontier_reanchored(&self, height: block::Height, hash: block::Hash) {
+        self.emit_trace(hs_trace::HEADER_FRONTIER_REANCHORED, |row| {
+            insert_height(row, hs_trace::HEIGHT, height);
+            insert_hash(row, hs_trace::HASH, hash);
+        });
+    }
+
     fn trace_missing_bodies(&self, from: block::Height, to: block::Height) {
         self.emit_trace(hs_trace::HEADER_MISSING_BODIES_REPORTED, |row| {
             insert_height(row, hs_trace::RANGE_START, from);
@@ -1683,6 +1809,47 @@ impl HeaderSyncReactor {
                 }
             }
         }
+    }
+
+    fn cancel_forward_outstanding(&mut self) {
+        for peer in self.state.peers.values_mut() {
+            let mut index = 0;
+            while index < peer.outstanding.len() {
+                if peer.outstanding[index].range.priority == RangePriority::Forward {
+                    peer.outstanding.remove(index);
+                    peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+}
+
+fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'static str {
+    match error {
+        HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
+        HeaderSyncWireError::HeaderCountLimit { .. } => "header_count_limit",
+        HeaderSyncWireError::BodySizeCountMismatch { .. } => "body_size_count_mismatch",
+        HeaderSyncWireError::UnsolicitedHeaders => "unsolicited_headers",
+        HeaderSyncWireError::ZeroHeaderRequestCount => "zero_header_request_count",
+        HeaderSyncWireError::HeightOutOfRange(_) => "height_out_of_range",
+        HeaderSyncWireError::UnknownMessageType(_) => "unknown_message_type",
+        HeaderSyncWireError::UnknownFrameMessageType(_) => "unknown_frame_message_type",
+        HeaderSyncWireError::UnsupportedFlags(_) => "unsupported_flags",
+        HeaderSyncWireError::MismatchedFrameMessageType { .. } => "mismatched_frame_message_type",
+        HeaderSyncWireError::TrailingBytes => "trailing_bytes",
+        HeaderSyncWireError::NonContiguousHeaders => "non_contiguous_headers",
+        HeaderSyncWireError::FirstHeaderDoesNotLink => "first_header_does_not_link",
+        HeaderSyncWireError::WrongEquihashSolutionSize => "wrong_equihash_solution_size",
+        HeaderSyncWireError::InvalidDifficultyThreshold => "invalid_difficulty_threshold",
+        HeaderSyncWireError::DifficultyFilter { .. } => "difficulty_filter",
+        HeaderSyncWireError::NumericOverflow(_) => "numeric_overflow",
+        HeaderSyncWireError::Io(_) => "io",
+        HeaderSyncWireError::Serialization(_) => "serialization",
+        HeaderSyncWireError::Time(_) => "time",
+        HeaderSyncWireError::Equihash(_) => "equihash",
+        HeaderSyncWireError::BlockingTask(_) => "blocking_task",
     }
 }
 

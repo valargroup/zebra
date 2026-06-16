@@ -1,7 +1,8 @@
 use super::*;
 use super::{config::*, error::*, events::*, reactor::*, validation::*, wire::*};
 use crate::zakura::{
-    testkit::TraceCapture, HeaderSyncServiceSummary, ServicePeerDirection, ServicePeerLimits,
+    testkit::{TraceCapture, TraceValue},
+    HeaderSyncServiceSummary, ServicePeerDirection, ServicePeerLimits,
 };
 use chrono::Duration;
 use metrics::{
@@ -265,6 +266,7 @@ fn startup_for(
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         best_header_tip,
         ZakuraHeaderSyncConfig::default(),
@@ -285,6 +287,7 @@ fn startup_new_is_passive_until_local_hooks_are_wired() {
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         Some(anchor),
         ZakuraHeaderSyncConfig::default(),
@@ -315,6 +318,7 @@ async fn peer_caps_reject_full_without_status_or_misbehavior_and_free_on_remove(
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         Some(anchor),
         ZakuraHeaderSyncConfig {
@@ -565,6 +569,7 @@ async fn admission_failure_after_advisory_selection_creates_no_outstanding_range
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         Some(anchor),
         ZakuraHeaderSyncConfig {
@@ -665,6 +670,27 @@ async fn next_query_headers_action(
         let action = next_action(actions).await;
         if matches!(action, HeaderSyncAction::QueryHeadersByHeightRange { .. }) {
             return action;
+        }
+    }
+}
+
+async fn next_outbound_get_headers(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+) -> (ZakuraPeerId, block::Height, u32) {
+    loop {
+        match next_non_query_action(actions).await {
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                    },
+            } => return (peer, start_height, count),
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
         }
     }
 }
@@ -1027,6 +1053,7 @@ async fn reactor_starts_from_storage_frontiers_and_publishes_watch() {
         HeaderSyncFrontiers {
             finalized_height: block::Height(2),
             verified_block_tip: block::Height(5),
+            verified_block_hash: block::Hash([5; 32]),
         },
         Some(best),
         ZakuraHeaderSyncConfig::default(),
@@ -2953,6 +2980,71 @@ async fn inbound_get_headers_over_cap_disconnects_without_state_read() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut capture =
+        TraceCapture::for_test("rejected_non_linking_range_traces_link_stage_and_error_kind")
+            .unwrap();
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(64);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        anchor.0,
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    let anchor_hash = format!("{}", anchor.1);
+    header_sync.assert_row(
+        hs_trace::HEADER_RANGE_REJECTED,
+        &[
+            (hs_trace::RANGE_START, TraceValue::U64(1)),
+            (hs_trace::RANGE_COUNT, TraceValue::U64(1)),
+            (hs_trace::ANCHOR_HASH, TraceValue::Str(&anchor_hash)),
+            (hs_trace::VALIDATION_STAGE, TraceValue::Str("link")),
+            (
+                hs_trace::ERROR_KIND,
+                TraceValue::Str("first_header_does_not_link"),
+            ),
+        ],
+    );
+
+    let _ = capture.finish().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
     let network = Network::Mainnet;
     let mut capture = TraceCapture::for_test(
@@ -3243,6 +3335,130 @@ async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() 
     tip.changed().await.unwrap();
     assert_eq!(*tip.borrow(), (block::Height(1), tip_hash));
     assert_ne!(fixture.handle.best_header_tip().0, block::Height(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
+    let network = regtest_network();
+    let verified = (block::Height(0), network.genesis_hash());
+    let stranded_tip = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        verified,
+        HeaderSyncFrontiers {
+            finalized_height: verified.0,
+            verified_block_tip: verified.0,
+            verified_block_hash: verified.1,
+        },
+        Some(stranded_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let mut tip = fixture.handle.subscribe_tip();
+    let peers = [peer(61), peer(62)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            verified.0,
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    for _ in 0..3 {
+        let (served_peer, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, block::Height(4));
+        assert_eq!(count, 1);
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer,
+                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            })
+            .await
+            .unwrap();
+    }
+
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), verified);
+    assert_eq!(fixture.handle.best_header_tip(), verified);
+
+    let expected_start = verified.0.next().expect("genesis has a successor");
+    for _ in 0..4 {
+        let (_served_peer, start_height, _count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        if start_height == expected_start {
+            assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+            return;
+        }
+    }
+    panic!("after re-anchor, header sync did not request forward from the verified tip");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
+    let network = regtest_network();
+    let verified = (block::Height(0), network.genesis_hash());
+    let stranded_tip = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        verified,
+        HeaderSyncFrontiers {
+            finalized_height: verified.0,
+            verified_block_tip: verified.0,
+            verified_block_hash: verified.1,
+        },
+        Some(stranded_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(63);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id,
+        verified.0,
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    for _ in 0..3 {
+        let (served_peer, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, block::Height(4));
+        assert_eq!(count, 1);
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer,
+                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            })
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), tip.changed())
+            .await
+            .is_err(),
+        "one peer alone must not lower the global header frontier"
+    );
+    assert_eq!(fixture.handle.best_header_tip(), stranded_tip);
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3873,6 +4089,7 @@ async fn misbehavior_disconnect_is_prompt_when_action_channel_is_saturated() {
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         Some(anchor),
         ZakuraHeaderSyncConfig::default(),

@@ -61,6 +61,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         frontiers: HeaderSyncFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
+            verified_block_hash: verified_block_tip.1,
         },
         best_header_tip: Some(best_header_tip.unwrap_or(empty_state_tip)),
         verified_block_tip_hash: verified_block_tip.1,
@@ -883,6 +884,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 HeaderSyncFrontiers {
                     finalized_height,
                     verified_block_tip: verified_block_tip.0,
+                    verified_block_hash: verified_block_tip.1,
                 },
             ))
             .await;

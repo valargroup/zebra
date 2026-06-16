@@ -2337,6 +2337,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         HeaderSyncFrontiers {
             finalized_height: anchor.0,
             verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
         },
         |startup| startup.frontiers,
     );
@@ -4240,6 +4241,7 @@ mod tests {
             HeaderSyncFrontiers {
                 finalized_height: anchor.0,
                 verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
             },
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),

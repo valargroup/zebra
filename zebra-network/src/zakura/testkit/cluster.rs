@@ -398,9 +398,15 @@ mod tests {
         }
 
         fn frontiers(&self) -> HeaderSyncFrontiers {
+            let verified_block_hash = self
+                .headers
+                .get(&self.verified_block_tip)
+                .map(|(hash, _)| *hash)
+                .expect("verified test frontier has a known header");
             HeaderSyncFrontiers {
                 finalized_height: self.finalized_height,
                 verified_block_tip: self.verified_block_tip,
+                verified_block_hash,
             }
         }
 
@@ -1195,6 +1201,7 @@ mod tests {
                 HeaderSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
+                    verified_block_hash: anchor.1,
                 },
                 Some(anchor),
             )
@@ -1511,6 +1518,7 @@ mod tests {
                 HeaderSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
+                    verified_block_hash: anchor.1,
                 },
                 Some((block::Height(3), blocks[2].hash())),
             )

@@ -198,10 +198,16 @@ pub mod header_sync_trace {
     pub const HEIGHT: &str = "height";
     /// Hash field.
     pub const HASH: &str = "hash";
+    /// Header anchor hash field.
+    pub const ANCHOR_HASH: &str = "anchor_hash";
     /// Range start height field.
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
+    /// Header validation stage field.
+    pub const VALIDATION_STAGE: &str = "validation_stage";
+    /// Concrete validation error kind field.
+    pub const ERROR_KIND: &str = "error_kind";
     /// Advertised peer range cap field.
     pub const ADVERTISED_CAP: &str = "advertised_cap";
     /// Expected header count field.
@@ -243,6 +249,8 @@ pub mod header_sync_trace {
     pub const HEADER_PEER_DISCONNECT_REQUESTED: &str = "header_peer_disconnect_requested";
     /// Header frontier advanced.
     pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
+    /// Header frontier re-anchored down to the verified block frontier.
+    pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
 }
