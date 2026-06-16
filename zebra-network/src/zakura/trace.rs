@@ -80,6 +80,12 @@ pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     file_name: "block_sync.jsonl",
 };
 
+/// Zebrad adapter boundary events for commits, state reads, and frontier mirrors.
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable {
+    table: "commit_state",
+    file_name: "commit_state.jsonl",
+};
+
 /// Shared block-sync trace event names and field keys.
 ///
 /// The block-sync body pipeline has no `tracing`-macro coverage in release
@@ -95,12 +101,18 @@ pub mod block_sync_trace {
     pub const EVENT: &str = "event";
     /// Peer field.
     pub const PEER: &str = "peer";
+    /// Action/event/message kind field.
+    pub const KIND: &str = "kind";
     /// Height field.
     pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
     /// Range start height field.
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
+    /// Expected/requested count field.
+    pub const EXPECTED_COUNT: &str = "expected_count";
     /// Estimated byte reservation for a requested range.
     pub const ESTIMATED_BYTES: &str = "estimated_bytes";
     /// Serialized byte size of a received body.
@@ -150,6 +162,10 @@ pub mod block_sync_trace {
     pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
+    /// Reactor accepted an inbound event.
+    pub const BLOCK_EVENT_RECEIVED: &str = "block_event_received";
+    /// Reactor queued an outbound driver action.
+    pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
     /// Body received from a peer.
     pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
     /// Body submitted to the verifier for commit.
@@ -174,6 +190,8 @@ pub mod header_sync_trace {
     pub const EVENT: &str = "event";
     /// Peer field.
     pub const PEER: &str = "peer";
+    /// Action/event/message kind field.
+    pub const KIND: &str = "kind";
     /// Source peer field for forwarded full-block floods.
     pub const SOURCE_PEER: &str = "source_peer";
     /// Height field.
@@ -195,6 +213,10 @@ pub mod header_sync_trace {
     /// Bounded reason field.
     pub const REASON: &str = "reason";
 
+    /// Reactor accepted an inbound event.
+    pub const HEADER_EVENT_RECEIVED: &str = "header_event_received";
+    /// Reactor queued an outbound driver action.
+    pub const HEADER_ACTION_DISPATCHED: &str = "header_action_dispatched";
     /// Local status sent to a peer.
     pub const HEADER_STATUS_SENT: &str = "header_status_sent";
     /// Peer status received.
@@ -223,6 +245,83 @@ pub mod header_sync_trace {
     pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
+}
+
+/// Shared commit/frontier adapter trace event names and field keys.
+pub mod commit_state_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Source driver/subsystem field.
+    pub const SOURCE: &str = "source";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Result label field.
+    pub const RESULT: &str = "result";
+    /// Bounded reason field.
+    pub const REASON: &str = "reason";
+    /// Reactor-local block apply token field.
+    pub const APPLY_TOKEN: &str = "apply_token";
+    /// Apply class field (`checkpoint` or `full`).
+    pub const APPLY_CLASS: &str = "apply_class";
+    /// Finalized height observed from state.
+    pub const FINALIZED_HEIGHT: &str = "finalized_height";
+    /// Verified full-block/body tip height.
+    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
+    /// Verified full-block/body tip hash.
+    pub const VERIFIED_BLOCK_HASH: &str = "verified_block_hash";
+    /// Best header tip height.
+    pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Elapsed milliseconds field.
+    pub const ELAPSED_MS: &str = "elapsed_ms";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Queue length field.
+    pub const QUEUE_LEN: &str = "queue_len";
+    /// In-flight count field.
+    pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
+    /// Action kind field.
+    pub const ACTION: &str = "action";
+    /// Whether an optional frontier was present.
+    pub const LOCAL_FRONTIER: &str = "local_frontier";
+
+    /// Driver received a reactor action.
+    pub const ACTION_RECEIVED: &str = "action_received";
+    /// State read started.
+    pub const STATE_READ_START: &str = "state_read_start";
+    /// State read completed successfully.
+    pub const STATE_READ_SUCCESS: &str = "state_read_success";
+    /// State read failed or returned an unexpected response.
+    pub const STATE_READ_ERROR: &str = "state_read_error";
+    /// State read timed out.
+    pub const STATE_READ_TIMEOUT: &str = "state_read_timeout";
+    /// Block submit was queued in the driver.
+    pub const BLOCK_SUBMIT_QUEUED: &str = "block_submit_queued";
+    /// Verifier commit started.
+    pub const COMMIT_START: &str = "commit_start";
+    /// Verifier commit finished.
+    pub const COMMIT_FINISH: &str = "commit_finish";
+    /// Post-commit frontier query started.
+    pub const FRONTIER_QUERY_START: &str = "frontier_query_start";
+    /// Post-commit frontier query finished.
+    pub const FRONTIER_QUERY_FINISH: &str = "frontier_query_finish";
+    /// Driver sent an event back to a reactor.
+    pub const REACTOR_EVENT_SENT: &str = "reactor_event_sent";
+    /// Delayed checkpoint frontier refresh attempted.
+    pub const CHECKPOINT_REFRESH_ATTEMPT: &str = "checkpoint_refresh_attempt";
+    /// Delayed checkpoint frontier refresh sent a frontier event.
+    pub const CHECKPOINT_REFRESH_SENT: &str = "checkpoint_refresh_sent";
+    /// Header-sync driver notified block sync about a header tip.
+    pub const BLOCK_SYNC_NOTIFY_SENT: &str = "block_sync_notify_sent";
+    /// Chain-tip mirror observed a watch action.
+    pub const CHAIN_TIP_ACTION: &str = "chain_tip_action";
+    /// Chain-tip mirror derived local frontiers.
+    pub const FRONTIER_DERIVED: &str = "frontier_derived";
 }
 
 /// Cloneable Zakura trace emitter.

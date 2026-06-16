@@ -124,6 +124,7 @@ impl BlockSyncReactor {
     }
 
     async fn handle_event(&mut self, event: BlockSyncEvent) {
+        self.trace_event_received(&event);
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
@@ -1621,6 +1622,7 @@ impl BlockSyncReactor {
     /// keeps draining peer-lifecycle events, request timeouts, and misbehavior
     /// disconnects. Returns `true` only if the action was accepted.
     async fn dispatch_action(&self, action: BlockSyncAction) -> bool {
+        self.trace_action_dispatched(&action);
         match time::timeout(ACTION_SEND_TIMEOUT, self.actions.send(action)).await {
             Ok(Ok(())) => true,
             // Receiver dropped: the driver is gone, treat like a send failure.
@@ -1653,13 +1655,136 @@ impl BlockSyncReactor {
         // whenever the action driver was slow. `try_send` keeps the reactor live
         // so it can promptly tear down soft offenders at threshold and deliver
         // the next disconnect as soon as the driver drains a slot.
-        if self
-            .actions
-            .try_send(BlockSyncAction::Misbehavior { peer, reason })
-            .is_err()
-        {
+        let action = BlockSyncAction::Misbehavior { peer, reason };
+        self.trace_action_dispatched(&action);
+        if self.actions.try_send(action).is_err() {
             metrics::counter!("sync.block.peer.disconnect.action_dropped").increment(1);
         }
+    }
+
+    fn trace_event_received(&self, event: &BlockSyncEvent) {
+        self.emit_trace(bs_trace::BLOCK_EVENT_RECEIVED, |row| match event {
+            BlockSyncEvent::PeerConnected(session) => {
+                bs_insert_str(row, bs_trace::KIND, "peer_connected");
+                bs_insert_peer(row, bs_trace::PEER, session.peer_id());
+            }
+            BlockSyncEvent::PeerDisconnected(peer) => {
+                bs_insert_str(row, bs_trace::KIND, "peer_disconnected");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+            }
+            BlockSyncEvent::WireMessage { peer, msg } => {
+                bs_insert_str(row, bs_trace::KIND, "wire_message");
+                bs_insert_str(row, bs_trace::REASON, block_sync_message_label(msg));
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                trace_block_sync_message_fields(row, msg);
+            }
+            BlockSyncEvent::WireDecodeFailed { peer, .. } => {
+                bs_insert_str(row, bs_trace::KIND, "wire_decode_failed");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+            }
+            BlockSyncEvent::HeaderTipChanged { height, hash } => {
+                bs_insert_str(row, bs_trace::KIND, "header_tip_changed");
+                bs_insert_height(row, bs_trace::HEIGHT, *height);
+                bs_insert_hash(row, bs_trace::HASH, *hash);
+            }
+            BlockSyncEvent::StateFrontiersChanged(frontiers) => {
+                bs_insert_str(row, bs_trace::KIND, "state_frontiers_changed");
+                bs_insert_frontiers(row, frontiers);
+            }
+            BlockSyncEvent::ChainTipGrow(frontiers) => {
+                bs_insert_str(row, bs_trace::KIND, "chain_tip_grow");
+                bs_insert_frontiers(row, frontiers);
+            }
+            BlockSyncEvent::ChainTipReset(frontiers) => {
+                bs_insert_str(row, bs_trace::KIND, "chain_tip_reset");
+                bs_insert_frontiers(row, frontiers);
+            }
+            BlockSyncEvent::NeededBlocks(blocks) => {
+                bs_insert_str(row, bs_trace::KIND, "needed_blocks");
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
+                if let Some(first) = blocks.first() {
+                    bs_insert_height(row, bs_trace::RANGE_START, first.height);
+                }
+            }
+            BlockSyncEvent::BlockApplyFinished {
+                token,
+                height,
+                hash,
+                result,
+                local_frontier,
+            } => {
+                bs_insert_str(row, bs_trace::KIND, "block_apply_finished");
+                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
+                bs_insert_height(row, bs_trace::HEIGHT, *height);
+                bs_insert_hash(row, bs_trace::HASH, *hash);
+                bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(*result));
+                if let Some(frontiers) = local_frontier {
+                    bs_insert_frontiers(row, frontiers);
+                }
+            }
+            BlockSyncEvent::BlockRangeResponseFinished {
+                peer,
+                start_height,
+                requested_count,
+                returned_count,
+            } => {
+                bs_insert_str(row, bs_trace::KIND, "block_range_response_finished");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                bs_insert_height(row, bs_trace::RANGE_START, *start_height);
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*returned_count));
+                bs_insert_u64(row, bs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            }
+            BlockSyncEvent::BlockRangeResponseReady {
+                peer,
+                start_height,
+                requested_count,
+                blocks,
+            } => {
+                bs_insert_str(row, bs_trace::KIND, "block_range_response_ready");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                bs_insert_height(row, bs_trace::RANGE_START, *start_height);
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
+                bs_insert_u64(row, bs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            }
+        });
+    }
+
+    fn trace_action_dispatched(&self, action: &BlockSyncAction) {
+        self.emit_trace(bs_trace::BLOCK_ACTION_DISPATCHED, |row| match action {
+            BlockSyncAction::SendMessage { peer, msg } => {
+                bs_insert_str(row, bs_trace::KIND, "send_message");
+                bs_insert_str(row, bs_trace::REASON, block_sync_message_label(msg));
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                trace_block_sync_message_fields(row, msg);
+            }
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                bs_insert_str(row, bs_trace::KIND, "query_needed_blocks");
+                bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
+                bs_insert_height(row, bs_trace::BEST_HEADER_TIP, *best_header_tip);
+            }
+            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                bs_insert_str(row, bs_trace::KIND, "query_blocks_by_height_range");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                bs_insert_height(row, bs_trace::RANGE_START, *start);
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
+            }
+            BlockSyncAction::SubmitBlock { token, block } => {
+                bs_insert_str(row, bs_trace::KIND, "submit_block");
+                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
+                bs_insert_hash(row, bs_trace::HASH, block.hash());
+                if let Some(height) = block.coinbase_height() {
+                    bs_insert_height(row, bs_trace::HEIGHT, height);
+                }
+            }
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                bs_insert_str(row, bs_trace::KIND, "misbehavior");
+                bs_insert_peer(row, bs_trace::PEER, peer);
+                bs_insert_str(row, bs_trace::REASON, block_misbehavior_label(*reason));
+            }
+        });
     }
 }
 
@@ -1696,12 +1821,96 @@ fn bs_insert_height(
     bs_insert_u64(row, key, u64::from(height.0));
 }
 
+fn bs_insert_hash(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    hash: block::Hash,
+) {
+    row.insert(
+        key.to_string(),
+        serde_json::Value::String(format!("{hash}")),
+    );
+}
+
 fn bs_insert_u64(
     row: &mut serde_json::Map<String, serde_json::Value>,
     key: &'static str,
     value: u64,
 ) {
     row.insert(key.to_string(), serde_json::Value::from(value));
+}
+
+fn bs_insert_frontiers(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    frontiers: &BlockSyncFrontiers,
+) {
+    bs_insert_height(
+        row,
+        bs_trace::VERIFIED_BLOCK_TIP,
+        frontiers.verified_block_tip,
+    );
+    bs_insert_hash(row, bs_trace::HASH, frontiers.verified_block_hash);
+}
+
+fn trace_block_sync_message_fields(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    msg: &BlockSyncMessage,
+) {
+    match msg {
+        BlockSyncMessage::Status(status) => {
+            bs_insert_height(row, bs_trace::RANGE_START, status.servable_low);
+            bs_insert_height(row, bs_trace::HEIGHT, status.servable_high);
+        }
+        BlockSyncMessage::Block(block) => {
+            bs_insert_hash(row, bs_trace::HASH, block.hash());
+            if let Some(height) = block.coinbase_height() {
+                bs_insert_height(row, bs_trace::HEIGHT, height);
+            }
+        }
+        BlockSyncMessage::BlocksDone {
+            start_height,
+            returned,
+        } => {
+            bs_insert_height(row, bs_trace::RANGE_START, *start_height);
+            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*returned));
+        }
+        BlockSyncMessage::RangeUnavailable {
+            start_height,
+            count,
+        }
+        | BlockSyncMessage::GetBlocks {
+            start_height,
+            count,
+        } => {
+            bs_insert_height(row, bs_trace::RANGE_START, *start_height);
+            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
+        }
+    }
+}
+
+fn block_sync_message_label(msg: &BlockSyncMessage) -> &'static str {
+    match msg {
+        BlockSyncMessage::Status(_) => "status",
+        BlockSyncMessage::Block(_) => "block",
+        BlockSyncMessage::BlocksDone { .. } => "blocks_done",
+        BlockSyncMessage::RangeUnavailable { .. } => "range_unavailable",
+        BlockSyncMessage::GetBlocks { .. } => "get_blocks",
+    }
+}
+
+fn block_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
+    match reason {
+        BlockSyncMisbehavior::MalformedMessage => "malformed_message",
+        BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
+        BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
+        BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
+        BlockSyncMisbehavior::InvalidBlock => "invalid_block",
+        BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
+        BlockSyncMisbehavior::InvalidStatus => "invalid_status",
+        BlockSyncMisbehavior::UnsolicitedDone => "unsolicited_done",
+        BlockSyncMisbehavior::RangeUnavailable => "range_unavailable",
+        BlockSyncMisbehavior::StatusSpam => "status_spam",
+    }
 }
 
 fn bs_insert_str(

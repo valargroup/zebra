@@ -338,6 +338,7 @@ impl StartCmd {
             .await;
 
         if let Some(endpoint) = zakura_endpoint.clone() {
+            let trace = endpoint.trace();
             if let (Some(header_sync), Some(shutdown), Some(actions)) = (
                 endpoint.header_sync(),
                 endpoint.header_sync_shutdown(),
@@ -354,6 +355,7 @@ impl StartCmd {
                         state.clone(),
                         read_only_state_service.clone(),
                         block_verifier_router.clone(),
+                        trace.clone(),
                         shutdown.clone().cancelled_owned(),
                     )
                     .in_current_span(),
@@ -375,6 +377,7 @@ impl StartCmd {
                             max_checkpoint_height,
                             config.sync.checkpoint_verify_concurrency_limit,
                             config.sync.full_verify_concurrency_limit,
+                            trace.clone(),
                             shutdown.clone().cancelled_owned(),
                         )
                         .in_current_span(),
@@ -389,6 +392,7 @@ impl StartCmd {
                         read_only_state_service.clone(),
                         header_sync,
                         endpoint.block_sync(),
+                        trace,
                         shutdown.cancelled_owned(),
                     )
                     .in_current_span(),
@@ -1279,9 +1283,11 @@ mod zakura_header_sync_driver_tests {
     use tower::{service_fn, util::BoxService, ServiceExt};
     use zebra_chain::block;
     use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
     use zebra_network::zakura::{
-        BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, BlockSyncMisbehavior, HeaderSyncCommitFailureKind,
+        commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
+        BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMisbehavior,
+        HeaderSyncCommitFailureKind, COMMIT_STATE_TABLE,
     };
     use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
@@ -1526,7 +1532,13 @@ mod zakura_header_sync_driver_tests {
             zebra_network::zakura::spawn_block_sync_reactor(startup);
         let header_hash = block::Hash([3; 32]);
 
-        notify_block_sync_header_tip(Some(&block_sync), block::Height(3), header_hash).await;
+        notify_block_sync_header_tip(
+            Some(&block_sync),
+            block::Height(3),
+            header_hash,
+            &zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
 
         let action = tokio::time::timeout(Duration::from_secs(5), reactor_actions.recv())
             .await
@@ -1628,6 +1640,7 @@ mod zakura_header_sync_driver_tests {
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -1746,6 +1759,7 @@ mod zakura_header_sync_driver_tests {
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -1853,6 +1867,7 @@ mod zakura_header_sync_driver_tests {
             block::Height(2),
             2,
             sync::MIN_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2007,6 +2022,7 @@ mod zakura_header_sync_driver_tests {
             1,
             block,
             BlockApplyClass::Checkpoint,
+            zebra_network::zakura::ZakuraTrace::noop(),
         )
         .await;
 
@@ -2025,6 +2041,80 @@ mod zakura_header_sync_driver_tests {
             "checkpoint commit success must refresh state frontiers and query the next body window, got {action:?}"
         );
 
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_apply_emits_commit_state_trace_rows() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let block_height = block.coinbase_height().expect("test block has height");
+        let mut capture =
+            TraceCapture::for_test("block_sync_apply_emits_commit_state_trace_rows").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::FinalizedTip(None))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block_height,
+                    block_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+
+        apply_block_sync_body(
+            verifier,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            block_sync,
+            77,
+            block,
+            BlockApplyClass::Full,
+            trace,
+        )
+        .await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let hash_label = format!("{block_hash}");
+        let common = [
+            (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+            (cs_trace::HEIGHT, TraceValue::U64(u64::from(block_height.0))),
+            (cs_trace::HASH, TraceValue::Str(&hash_label)),
+        ];
+        commit_state.assert_row(cs_trace::COMMIT_START, &common);
+        commit_state.assert_row(
+            cs_trace::COMMIT_FINISH,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+
+        let _ = capture.finish().await.unwrap();
         reactor_task.abort();
     }
 
@@ -2102,6 +2192,7 @@ mod zakura_header_sync_driver_tests {
             1,
             block,
             BlockApplyClass::Checkpoint,
+            zebra_network::zakura::ZakuraTrace::noop(),
         )
         .await;
 
@@ -2210,6 +2301,7 @@ mod zakura_header_sync_driver_tests {
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2335,6 +2427,7 @@ mod zakura_header_sync_driver_tests {
             block::Height(CHECKPOINT_HEIGHT),
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2531,6 +2624,7 @@ mod zakura_header_sync_driver_tests {
             Some(&stale_block_sync),
             best_header_tip.0,
             best_header_tip.1,
+            &zebra_network::zakura::ZakuraTrace::noop(),
         )
         .await;
         let stale_nudge = tokio::time::timeout(Duration::from_secs(1), stale_actions.recv())

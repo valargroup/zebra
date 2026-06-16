@@ -111,6 +111,7 @@ impl HeaderSyncReactor {
     }
 
     async fn handle_event(&mut self, event: HeaderSyncEvent) {
+        self.trace_event_received(&event);
         match event {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
@@ -1211,6 +1212,7 @@ impl HeaderSyncReactor {
     /// keeps draining peer-lifecycle events, request timeouts, and misbehavior
     /// disconnects. Returns `true` only if the action was accepted.
     async fn dispatch_action(&self, action: HeaderSyncAction) -> bool {
+        self.trace_action_dispatched(&action);
         match time::timeout(ACTION_SEND_TIMEOUT, self.actions.send(action)).await {
             Ok(Ok(())) => true,
             // Receiver dropped: the driver is gone, treat like a send failure.
@@ -1239,13 +1241,212 @@ impl HeaderSyncReactor {
         // Best-effort supervisor notification for cross-service scoring/full
         // disconnect. Never block the reactor waiting for channel capacity: the
         // local session cancel above already removed the peer from this service.
-        if self
-            .actions
-            .try_send(HeaderSyncAction::Misbehavior { peer, reason })
-            .is_err()
-        {
+        let action = HeaderSyncAction::Misbehavior { peer, reason };
+        self.trace_action_dispatched(&action);
+        if self.actions.try_send(action).is_err() {
             metrics::counter!("sync.header.peer.disconnect.action_dropped").increment(1);
         }
+    }
+
+    fn trace_event_received(&self, event: &HeaderSyncEvent) {
+        self.emit_trace(hs_trace::HEADER_EVENT_RECEIVED, |row| match event {
+            HeaderSyncEvent::PeerConnected(session) => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_connected"));
+                insert_peer(row, hs_trace::PEER, session.peer_id());
+            }
+            HeaderSyncEvent::PeerDisconnected(peer) => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_disconnected"));
+                insert_peer(row, hs_trace::PEER, peer);
+            }
+            HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
+                insert_optional_str(row, hs_trace::KIND, Some("advisory_header_summary"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::HEIGHT, summary.best_height);
+            }
+            HeaderSyncEvent::FullBlockCommitted { height, hash, .. } => {
+                insert_optional_str(row, hs_trace::KIND, Some("full_block_committed"));
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncEvent::NewBlockAccepted {
+                peer, height, hash, ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("new_block_accepted"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncEvent::NewBlockDuplicate { peer, height, hash } => {
+                insert_optional_str(row, hs_trace::KIND, Some("new_block_duplicate"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncEvent::NewBlockRejected { peer, hash } => {
+                insert_optional_str(row, hs_trace::KIND, Some("new_block_rejected"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncEvent::WireMessage { peer, msg } => {
+                insert_optional_str(row, hs_trace::KIND, Some("wire_message"));
+                insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
+                insert_peer(row, hs_trace::PEER, peer);
+                trace_header_sync_message_fields(row, msg);
+            }
+            HeaderSyncEvent::WireDecodeFailed { peer, .. } => {
+                insert_optional_str(row, hs_trace::KIND, Some("wire_decode_failed"));
+                insert_peer(row, hs_trace::PEER, peer);
+            }
+            HeaderSyncEvent::WireProtocolFailure { peer, reason, .. } => {
+                insert_optional_str(row, hs_trace::KIND, Some("wire_protocol_failure"));
+                insert_optional_str(
+                    row,
+                    hs_trace::REASON,
+                    Some(misbehavior_reason_label(*reason)),
+                );
+                insert_peer(row, hs_trace::PEER, peer);
+            }
+            HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
+                insert_optional_str(row, hs_trace::KIND, Some("state_frontiers_changed"));
+                insert_height(row, "finalized_height", frontiers.finalized_height);
+                insert_height(row, "verified_block_tip", frontiers.verified_block_tip);
+            }
+            HeaderSyncEvent::HeaderRangeCommitted {
+                start_height,
+                tip_height,
+                tip_hash,
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_range_committed"));
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(
+                    row,
+                    hs_trace::RANGE_COUNT,
+                    u64::from(count_between(*start_height, *tip_height)),
+                );
+                insert_height(row, hs_trace::HEIGHT, *tip_height);
+                insert_hash(row, hs_trace::HASH, *tip_hash);
+            }
+            HeaderSyncEvent::HeaderRangeCommitFailed {
+                peer,
+                start_height,
+                count,
+                kind,
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_range_commit_failed"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+                insert_optional_str(
+                    row,
+                    hs_trace::REASON,
+                    Some(commit_failure_reason_label(*kind)),
+                );
+            }
+            HeaderSyncEvent::HeaderRangeResponseFinished {
+                peer,
+                start_height,
+                requested_count,
+                returned_count,
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_range_response_finished"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*returned_count));
+                insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            }
+            HeaderSyncEvent::HeaderRangeResponseReady {
+                peer,
+                start_height,
+                requested_count,
+                headers,
+                ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_range_response_ready"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+                insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            }
+        });
+    }
+
+    fn trace_action_dispatched(&self, action: &HeaderSyncAction) {
+        self.emit_trace(hs_trace::HEADER_ACTION_DISPATCHED, |row| match action {
+            #[cfg(test)]
+            HeaderSyncAction::SendMessage { peer, msg } => {
+                insert_optional_str(row, hs_trace::KIND, Some("send_message"));
+                insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
+                insert_peer(row, hs_trace::PEER, peer);
+                trace_header_sync_message_fields(row, msg);
+            }
+            #[cfg(test)]
+            HeaderSyncAction::ForwardNewBlock {
+                source,
+                peer,
+                height,
+                hash,
+                ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("forward_new_block"));
+                if let Some(source) = source {
+                    insert_peer(row, hs_trace::SOURCE_PEER, source);
+                }
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                insert_optional_str(row, hs_trace::KIND, Some("misbehavior"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_optional_str(
+                    row,
+                    hs_trace::REASON,
+                    Some(misbehavior_reason_label(*reason)),
+                );
+            }
+            HeaderSyncAction::NewBlockReceived {
+                peer, height, hash, ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("new_block_received"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                insert_optional_str(row, hs_trace::KIND, Some("query_headers_by_height_range"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+            }
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("commit_header_range"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+            }
+            HeaderSyncAction::QueryBestHeaderTip => {
+                insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
+            }
+            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
+                insert_optional_str(row, hs_trace::KIND, Some("query_missing_block_bodies"));
+                insert_height(row, hs_trace::RANGE_START, *from);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*limit));
+            }
+            HeaderSyncAction::BodyGaps { from, to } => {
+                insert_optional_str(row, hs_trace::KIND, Some("body_gaps"));
+                insert_height(row, hs_trace::RANGE_START, *from);
+                insert_u64(
+                    row,
+                    hs_trace::RANGE_COUNT,
+                    u64::from(count_between(*from, *to)),
+                );
+            }
+        });
     }
 
     fn trace_status_sent(&self, peer: &ZakuraPeerId, status: HeaderSyncStatus) {
@@ -1501,4 +1702,52 @@ fn header_summary_is_useful(
 fn node_id_from_header_peer_id(peer: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
+}
+
+fn trace_header_sync_message_fields(
+    row: &mut serde_json::Map<String, Value>,
+    msg: &HeaderSyncMessage,
+) {
+    match msg {
+        HeaderSyncMessage::Status(status) => {
+            insert_height(row, hs_trace::HEIGHT, status.tip_height);
+            insert_hash(row, hs_trace::HASH, status.tip_hash);
+            insert_height(row, hs_trace::RANGE_START, status.anchor_height);
+            insert_u64(
+                row,
+                hs_trace::ADVERTISED_CAP,
+                u64::from(status.max_headers_per_response),
+            );
+            insert_u64(
+                row,
+                hs_trace::IN_FLIGHT_COUNT,
+                u64::from(status.max_inflight_requests),
+            );
+        }
+        HeaderSyncMessage::Headers { headers, .. } => {
+            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+        }
+        HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+        } => {
+            insert_height(row, hs_trace::RANGE_START, *start_height);
+            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+        }
+        HeaderSyncMessage::NewBlock(block) => {
+            insert_hash(row, hs_trace::HASH, block.hash());
+            if let Some(height) = block.coinbase_height() {
+                insert_height(row, hs_trace::HEIGHT, height);
+            }
+        }
+    }
+}
+
+fn header_sync_message_label(msg: &HeaderSyncMessage) -> &'static str {
+    match msg {
+        HeaderSyncMessage::Status(_) => "status",
+        HeaderSyncMessage::Headers { .. } => "headers",
+        HeaderSyncMessage::GetHeaders { .. } => "get_headers",
+        HeaderSyncMessage::NewBlock(_) => "new_block",
+    }
 }
