@@ -702,7 +702,7 @@ impl Arbitrary for orchard::ShieldedData {
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         (
-            any::<orchard::shielded_data::Flags>(),
+            orchard_flags_pre_nu6_3_strategy(),
             any::<Amount>(),
             any::<orchard::tree::Root>(),
             vec(
@@ -746,6 +746,18 @@ impl Arbitrary for orchard::ShieldedData {
     }
 
     type Strategy = BoxedStrategy<Self>;
+}
+
+fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<orchard::shielded_data::Flags> {
+    use orchard::shielded_data::Flags;
+
+    prop_oneof![
+        Just(Flags::empty()),
+        Just(Flags::ENABLE_SPENDS),
+        Just(Flags::ENABLE_OUTPUTS),
+        Just(Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS),
+    ]
+    .boxed()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -800,6 +812,7 @@ impl Arbitrary for Transaction {
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => prop_oneof![
                 Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state)
