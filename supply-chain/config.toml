@@ -28,10 +28,43 @@ url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/
 [imports.zcashd]
 url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
+[policy.equihash]
+audit-as-crates-io = true
+
+[policy.f4jumble]
+audit-as-crates-io = true
+
+[policy.orchard]
+audit-as-crates-io = true
+
 [policy.tower-batch-control]
 audit-as-crates-io = true
 
 [policy.tower-fallback]
+audit-as-crates-io = true
+
+[policy.zcash_address]
+audit-as-crates-io = true
+
+[policy.zcash_encoding]
+audit-as-crates-io = true
+
+[policy.zcash_history]
+audit-as-crates-io = true
+
+[policy.zcash_keys]
+audit-as-crates-io = true
+
+[policy.zcash_primitives]
+audit-as-crates-io = true
+
+[policy.zcash_proofs]
+audit-as-crates-io = true
+
+[policy.zcash_protocol]
+audit-as-crates-io = true
+
+[policy.zcash_transparent]
 audit-as-crates-io = true
 
 [policy.zebra-chain]
@@ -508,7 +541,7 @@ version = "0.7.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.equihash]]
-version = "0.3.0"
+version = "0.3.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.erased-serde]]
@@ -520,7 +553,7 @@ version = "0.6.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.f4jumble]]
-version = "0.1.1"
+version = "0.1.1@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
@@ -529,6 +562,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ff]]
 version = "0.13.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.filetime]]
+version = "0.2.29"
 criteria = "safe-to-deploy"
 
 [[exemptions.find-msvc-tools]]
@@ -564,10 +601,6 @@ version = "1.3.0"
 criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
-
-[[exemptions.filetime]]
-version = "0.2.29"
-criteria = "safe-to-deploy"
 
 [[exemptions.funty]]
 version = "2.0.0"
@@ -1092,7 +1125,7 @@ version = "0.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.orchard]]
-version = "0.14.0"
+version = "0.14.0@git:4cdd4991eb014a2831718969a12506347ff2a6ea"
 criteria = "safe-to-deploy"
 
 [[exemptions.ordered-map]]
@@ -1680,7 +1713,7 @@ version = "0.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tar]]
-version = "0.4.46"
+version = "0.4.45"
 criteria = "safe-to-deploy"
 
 [[exemptions.tempfile]]
@@ -2024,10 +2057,6 @@ version = "0.52.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows-sys]]
-version = "0.60.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-sys]]
 version = "0.61.2"
 criteria = "safe-to-deploy"
 
@@ -2035,72 +2064,36 @@ criteria = "safe-to-deploy"
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows-targets]]
-version = "0.53.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows_aarch64_gnullvm]]
 version = "0.52.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_aarch64_gnullvm]]
-version = "0.53.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows_aarch64_msvc]]
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows_aarch64_msvc]]
-version = "0.53.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows_i686_gnu]]
 version = "0.52.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_i686_gnu]]
-version = "0.53.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows_i686_gnullvm]]
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows_i686_gnullvm]]
-version = "0.53.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows_i686_msvc]]
 version = "0.52.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_i686_msvc]]
-version = "0.53.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.windows_x86_64_gnu]]
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows_x86_64_gnu]]
-version = "0.53.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows_x86_64_gnullvm]]
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.windows_x86_64_gnullvm]]
-version = "0.53.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.windows_x86_64_msvc]]
 version = "0.52.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows_x86_64_msvc]]
-version = "0.53.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.winnow]]
@@ -2124,31 +2117,31 @@ version = "0.10.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_address]]
-version = "0.12.0"
+version = "0.12.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_encoding]]
-version = "0.4.0"
+version = "0.4.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_history]]
-version = "0.4.0"
+version = "0.4.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_keys]]
-version = "0.14.0"
+version = "0.14.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_primitives]]
-version = "0.28.0"
+version = "0.28.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_proofs]]
-version = "0.28.0"
+version = "0.28.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_protocol]]
-version = "0.9.0"
+version = "0.9.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_script]]
@@ -2160,7 +2153,7 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.zcash_transparent]]
-version = "0.8.0"
+version = "0.8.0@git:288bc4e2b12fd720f972ad913bea441978380951"
 criteria = "safe-to-deploy"
 
 [[exemptions.zebra-chain]]
@@ -2200,11 +2193,7 @@ version = "7.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.zebrad]]
-version = "5.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebrad]]
-version = "5.0.0-rc.3"
+version = "4.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
