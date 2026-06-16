@@ -1061,14 +1061,6 @@ impl Service<Request> for StateService {
 
         // Hand off from finalized to non-finalized writes as soon as the final checkpoint block is
         // durably written, without waiting for a semantically verified block to arrive.
-        //
-        // The handoff is otherwise only checked when a new block is queued. Re-checking here lets
-        // the state service observe that the finalized tip has reached the maximum checkpoint height
-        // and switch the block write task promptly, so the first semantically verified block isn't
-        // stalled at the checkpoint boundary.
-        //
-        // This is cheap: once the handoff has happened the sender is `None`, so the call
-        // short-circuits before touching the database. See `try_handoff_to_non_finalized_write()`.
         self.try_handoff_to_non_finalized_write();
 
         // Prune outdated UTXO requests
