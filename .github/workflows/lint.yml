@@ -2,7 +2,7 @@ name: Lint
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, ironwood-main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -13,7 +13,7 @@ on:
       - supply-chain/**
 
   push:
-    branches: [main]
+    branches: [main, ironwood-main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

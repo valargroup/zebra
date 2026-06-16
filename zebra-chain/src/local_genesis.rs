@@ -522,7 +522,7 @@ mod tests {
         );
         assert_eq!(
             NetworkUpgrade::target_spacing_for_height(network, activation_height).num_seconds(),
-            25
+            i64::from(crate::parameters::POST_BLOSSOM_POW_TARGET_SPACING)
         );
     }
 

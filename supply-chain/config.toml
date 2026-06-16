@@ -565,6 +565,10 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
+[[exemptions.filetime]]
+version = "0.2.29"
+criteria = "safe-to-deploy"
+
 [[exemptions.funty]]
 version = "2.0.0"
 criteria = "safe-to-deploy"
@@ -1433,6 +1437,10 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade"
 
+[[exemptions.rustls-pemfile]]
+version = "2.2.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.rustls-pki-types]]
 version = "1.14.1"
 criteria = "safe-to-deploy"
@@ -1669,6 +1677,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.sync_wrapper]]
 version = "0.1.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.tar]]
+version = "0.4.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.tempfile]]
@@ -2189,6 +2201,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zebrad]]
 version = "5.0.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.zebrad]]
+version = "5.0.0-rc.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
