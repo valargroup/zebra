@@ -39,7 +39,7 @@ pub enum BlockSyncEvent {
         /// Current best header hash.
         hash: block::Hash,
     },
-    /// State finalized or verified-body frontiers changed.
+    /// Locally observed finalized or verified-body frontiers changed.
     StateFrontiersChanged(BlockSyncFrontiers),
     /// State grew the verified body chain tip.
     ChainTipGrow(BlockSyncFrontiers),
@@ -58,6 +58,8 @@ pub enum BlockSyncEvent {
         hash: block::Hash,
         /// Apply result from the verifier driver.
         result: BlockApplyResult,
+        /// Locally observed chain frontier after the apply attempt completed.
+        local_frontier: Option<BlockSyncFrontiers>,
     },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {

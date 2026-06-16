@@ -259,6 +259,13 @@ impl PeerBlockState {
             .saturating_sub(self.outstanding.len())
     }
 
+    pub(super) fn can_serve_any(&self, heights: &[block::Height]) -> bool {
+        self.received_status
+            && heights
+                .iter()
+                .any(|height| self.servable_low <= *height && *height <= self.servable_high)
+    }
+
     pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
         self.outstanding
             .iter()

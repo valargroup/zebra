@@ -151,8 +151,9 @@ impl BlockSyncReactor {
                 height,
                 hash,
                 result,
+                local_frontier,
             } => {
-                self.handle_block_apply_finished(token, height, hash, result)
+                self.handle_block_apply_finished(token, height, hash, result, local_frontier)
                     .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
@@ -220,11 +221,18 @@ impl BlockSyncReactor {
     }
 
     fn publish_candidate_state(&self) {
+        let has_body_gaps = !self.state.needed_heights.is_empty();
         let mut admitted_node_ids: Vec<_> = self
             .state
             .peers
-            .keys()
-            .filter_map(node_id_from_block_peer_id)
+            .iter()
+            .filter_map(|(peer_id, peer)| {
+                if has_body_gaps && !peer.can_serve_any(&self.state.needed_heights) {
+                    return None;
+                }
+
+                node_id_from_block_peer_id(peer_id)
+            })
             .collect();
         admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         admitted_node_ids.dedup();
@@ -287,7 +295,26 @@ impl BlockSyncReactor {
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
-        self.state.finalized_height = frontiers.finalized_height;
+        if let Some(old_serving_tip) = self.apply_state_frontiers_changed(frontiers, true).await {
+            self.finish_frontier_update(old_serving_tip).await;
+        }
+    }
+
+    async fn apply_state_frontiers_changed(
+        &mut self,
+        frontiers: BlockSyncFrontiers,
+        release_applied: bool,
+    ) -> Option<(block::Height, block::Hash)> {
+        self.state.finalized_height = self.state.finalized_height.max(frontiers.finalized_height);
+        if frontiers.verified_block_tip < self.state.verified_block_tip {
+            tracing::debug!(
+                current = ?self.state.verified_block_tip,
+                stale = ?frontiers.verified_block_tip,
+                "ignoring stale Zakura block-sync frontier update"
+            );
+            return None;
+        }
+
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
         self.state.servable_high = frontiers.verified_block_tip;
         self.state.servable_hash = frontiers.verified_block_hash;
@@ -303,12 +330,18 @@ impl BlockSyncReactor {
             self.state
                 .schedule
                 .drop_through(frontiers.verified_block_tip);
-            self.release_applied_blocks_through(frontiers.verified_block_tip);
+            if release_applied {
+                self.release_applied_blocks_through(frontiers.verified_block_tip);
+            }
             self.drop_outstanding_through(frontiers.verified_block_tip);
             self.state.verified_block_tip = frontiers.verified_block_tip;
             self.trace_frontiers_changed(frontiers.verified_block_tip);
             self.release_contiguous_blocks().await;
         }
+        Some(old_serving_tip)
+    }
+
+    async fn finish_frontier_update(&mut self, old_serving_tip: (block::Height, block::Hash)) {
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
         if !self.query_needed_blocks().await {
@@ -525,6 +558,7 @@ impl BlockSyncReactor {
         peer_state.max_response_bytes = clamp_advertised_response_bytes(status.max_response_bytes);
         peer_state.received_status = true;
         self.trace_status_received(&peer, status);
+        self.publish_candidate_state();
         self.schedule().await;
     }
 
@@ -922,11 +956,31 @@ impl BlockSyncReactor {
         height: block::Height,
         hash: block::Hash,
         result: BlockApplyResult,
+        local_frontier: Option<BlockSyncFrontiers>,
     ) {
+        let (accepted_local_frontier, old_serving_tip) = if let Some(frontiers) = local_frontier {
+            let old_serving_tip = self.apply_state_frontiers_changed(frontiers, false).await;
+            (old_serving_tip.map(|_| frontiers), old_serving_tip)
+        } else {
+            (None, None)
+        };
+
         let Some(applying) = self.state.applying.get(&height) else {
+            if let Some(frontiers) = accepted_local_frontier {
+                self.release_applied_blocks_through(frontiers.verified_block_tip);
+            }
+            if let Some(old_serving_tip) = old_serving_tip {
+                self.finish_frontier_update(old_serving_tip).await;
+            }
             return;
         };
         if applying.hash != hash || applying.token != token {
+            if let Some(frontiers) = accepted_local_frontier {
+                self.release_applied_blocks_through(frontiers.verified_block_tip);
+            }
+            if let Some(old_serving_tip) = old_serving_tip {
+                self.finish_frontier_update(old_serving_tip).await;
+            }
             return;
         }
         let applying = self
@@ -939,7 +993,9 @@ impl BlockSyncReactor {
         self.trace_apply_finished(height, token, result);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
-            BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
+            BlockApplyResult::Rejected | BlockApplyResult::TimedOut
+                if height > self.state.verified_block_tip =>
+            {
                 self.release_applying_blocks_from(height);
                 self.state.body_download_floor = previous_height(height)
                     .unwrap_or(block::Height::MIN)
@@ -947,9 +1003,17 @@ impl BlockSyncReactor {
                 self.state.schedule.clear_covered_from(height);
                 self.state.reorder.drop_from(height, &mut self.state.budget);
             }
+            BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {}
+        }
+        if let Some(frontiers) = accepted_local_frontier {
+            self.release_applied_blocks_through(frontiers.verified_block_tip);
         }
 
         self.release_contiguous_blocks().await;
+        if let Some(old_serving_tip) = old_serving_tip {
+            self.queue_status_refresh_if_changed(old_serving_tip);
+            self.flush_status_refresh().await;
+        }
         if !self.query_needed_blocks().await {
             self.pause_new_body_downloads();
         }
@@ -1599,7 +1663,7 @@ impl BlockSyncReactor {
     }
 }
 
-fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
+pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
 }

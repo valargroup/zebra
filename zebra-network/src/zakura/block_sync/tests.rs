@@ -3,6 +3,7 @@ use std::{collections::HashMap, future};
 use super::*;
 use super::{
     config::{DEFAULT_BS_MAX_INFLIGHT, MAX_BS_RESPONSE_BYTES},
+    reactor::node_id_from_block_peer_id,
     reorder::*,
     scheduler::*,
     state::*,
@@ -1495,21 +1496,14 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: blocks[0].hash(),
+            }),
         })
         .await
         .expect("apply-finished event queues");
-    let (_request_peer, start_height, count) = wait_for_getblocks(&mut actions).await;
-    assert_eq!(start_height, block::Height(2));
-    assert_eq!(count, 1);
-
-    handle
-        .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        }))
-        .await
-        .expect("frontier event queues");
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if handle.local_status().servable_high == block::Height(1) {
@@ -1519,7 +1513,11 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
         }
     })
     .await
-    .expect("state frontier advances advertised status");
+    .expect("apply completion frontier advances advertised status");
+
+    let (_request_peer, start_height, count) = wait_for_getblocks(&mut actions).await;
+    assert_eq!(start_height, block::Height(2));
+    assert_eq!(count, 1);
 
     reactor_task.abort();
 }
@@ -1639,6 +1637,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             result: BlockApplyResult::Committed,
+            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -1762,6 +1761,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
             height: block::Height(1),
             hash: block.hash(),
             result: BlockApplyResult::Rejected,
+            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -3105,6 +3105,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
             height: block::Height(3),
             hash: blocks[2].hash(),
             result: BlockApplyResult::Committed,
+            local_frontier: None,
         })
         .await
         .expect("successor apply result queues");
@@ -3257,6 +3258,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             result: BlockApplyResult::Duplicate,
+            local_frontier: None,
         })
         .await
         .expect("stale apply-finished event queues");
@@ -3279,6 +3281,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             height: block::Height(1),
             hash: block_hash,
             result: BlockApplyResult::Committed,
+            local_frontier: None,
         })
         .await
         .expect("current apply-finished event queues");
@@ -4387,6 +4390,7 @@ async fn reactor_scores_header_valid_merkle_invalid_body_and_accepts_clean_peer(
             height: block::Height(1),
             hash: blocks[0].hash(),
             result: BlockApplyResult::Committed,
+            local_frontier: None,
         })
         .await
         .expect("apply-finished event queues");
@@ -4784,6 +4788,49 @@ async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
 }
 
 #[tokio::test]
+async fn reactor_ignores_stale_non_reset_frontier_updates() {
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3600), block::Hash([36; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(3200),
+            verified_block_tip: block::Height(3200),
+            verified_block_hash: block::Hash([32; 32]),
+        },
+        (block::Height(3600), block::Hash([36; 32])),
+        tip_rx,
+        immediate_body_download_config(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            verified_block_tip: block::Height(3200),
+            best_header_tip: block::Height(3600),
+        }
+    ));
+
+    handle
+        .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+            finalized_height: block::Height(3200),
+            verified_block_tip: block::Height(2913),
+            verified_block_hash: block::Hash([29; 32]),
+        }))
+        .await
+        .expect("stale grow event queues");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "stale lower grow frontier must not query from the lower height"
+    );
+    assert_eq!(handle.local_status().servable_high, block::Height(3200));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_limits_serving_slots_and_disconnects_repeated_soft_misbehavior() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_requests: 1,
@@ -4947,7 +4994,6 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         streams,
         CancellationToken::new(),
     ));
-    drop(inbound_tx);
     assert_eq!(wait_for_connect_status(&mut actions).await, peer_id);
 
     tip_tx
@@ -4992,6 +5038,42 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         observed.missing_block_bodies,
         vec![block::Height(1), block::Height(2)]
     );
+    assert!(
+        observed.admitted_node_ids.is_empty(),
+        "a peer without block-sync status must not satisfy body-sync demand"
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(2),
+                tip_hash: block::Hash([2; 32]),
+                max_blocks_per_response: 4,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status queues");
+
+    let peer_node_id =
+        node_id_from_block_peer_id(&peer_id).expect("test peer id is a valid node id");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            candidates
+                .changed()
+                .await
+                .expect("candidate watch remains open");
+            if candidates.borrow().admitted_node_ids == vec![peer_node_id] {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("status-bearing peer is published as an admitted candidate");
 
     handle
         .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {

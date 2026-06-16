@@ -140,8 +140,8 @@ mod tests {
         zakura::{
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
-            BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+            BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
+            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
             HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
@@ -1046,6 +1046,11 @@ mod tests {
                                 height,
                                 hash: block.hash(),
                                 result: BlockApplyResult::Committed,
+                                local_frontier: Some(BlockSyncFrontiers {
+                                    finalized_height: height,
+                                    verified_block_tip: height,
+                                    verified_block_hash: block.hash(),
+                                }),
                             })
                             .await;
                     }
