@@ -312,3 +312,35 @@ impl From<tokio::time::error::Elapsed> for HandshakeError {
         HandshakeError::Timeout
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{NotFoundClass, PeerError, SharedPeerError};
+    use crate::protocol::external::InventoryHash;
+    use zebra_chain::block;
+
+    fn block_inv() -> Vec<InventoryHash> {
+        vec![InventoryHash::Block(block::Hash([0; 32]))]
+    }
+
+    /// The `notfound` classification is computed from the `PeerError` variant at construction, so
+    /// `not_found_class()` must stay in lock-step with the variants and never fall back to
+    /// `Debug`-string matching (which a rename would silently break, disabling the syncer's retry
+    /// paths).
+    #[test]
+    fn not_found_class_matches_peer_error_variant() {
+        assert_eq!(
+            SharedPeerError::from(PeerError::NotFoundResponse(block_inv())).not_found_class(),
+            Some(NotFoundClass::Response),
+        );
+        assert_eq!(
+            SharedPeerError::from(PeerError::NotFoundRegistry(block_inv())).not_found_class(),
+            Some(NotFoundClass::Registry),
+        );
+        // An unrelated peer error is not a `notfound`-style failure.
+        assert_eq!(
+            SharedPeerError::from(PeerError::NoReadyPeers).not_found_class(),
+            None,
+        );
+    }
+}

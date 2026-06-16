@@ -311,8 +311,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // 1/2 of the default outbound peer limit, to keep the deeper checkpoint
-            // lookahead buffer fed while staying within the connected peer set.
+            // 1/3 of the default outbound peer limit.
             download_concurrency_limit: 100,
 
             // A few max-length checkpoints.
