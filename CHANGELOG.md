@@ -68,6 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
+  historical raw transaction data, matching the node's storage mode instead of
+  always reporting archive behavior.
 - The zcashd-compat supervisor no longer force-kills `zcashd` outside its own
   SIGTERM → grace period → SIGKILL sequence. The child is spawned without
   `kill_on_drop` and in its own process group, so zebrad panics, supervisor

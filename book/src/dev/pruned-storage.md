@@ -84,7 +84,6 @@ intentionally **one-way**:
 | `pruned → pruned` | Yes |
 | `pruned → archive` | **Rejected** once data has been pruned |
 
-
 ### The pruning marker
 
 The one-way transition is tracked by a single progress marker stored in the
