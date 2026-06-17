@@ -137,11 +137,11 @@ The genesis block (height 0) is never pruned.
 ### Archive-to-pruned checkpoint sync
 
 Checkpoint sync in pruned mode can skip writing raw transaction bytes below the
-checkpoint retention floor, because those blocks are already outside the retained
+checkpoint retention start, because those blocks are already outside the retained
 window relative to the known final checkpoint target.
 
 If an archive database is reopened in pruned mode partway through checkpoint
-sync, older archive-era raw transactions can still exist below that floor. In
+sync, older archive-era raw transactions can still exist below that start. In
 that case Zebra temporarily keeps writing raw transaction bytes for new
 checkpoint blocks and uses the per-block write batch to drain the archive-era
 backlog in bounded chunks. Once no raw transaction bytes remain below the skipped

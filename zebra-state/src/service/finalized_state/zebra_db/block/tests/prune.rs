@@ -56,7 +56,7 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
     state
 }
 
-/// Opens a fresh finalized state with a checkpoint retention floor and commits
+/// Opens a fresh finalized state with a checkpoint retention start and commits
 /// blocks `0..=TEST_BLOCKS` for `network`.
 fn new_state_with_checkpoint_retention(
     config: &Config,
@@ -131,7 +131,7 @@ fn coinbase_tx_hash(network: &Network, height: u32) -> zebra_chain::transaction:
 }
 
 #[test]
-fn checkpoint_retention_hands_off_to_online_pruning_at_floor() {
+fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
     let tx_retention = 5;
@@ -160,7 +160,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_floor() {
     assert_eq!(
         state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
-        "checkpoint skipping advances the marker to the retained floor"
+        "checkpoint skipping advances the marker to the retention start"
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -169,7 +169,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_floor() {
                 .db
                 .transaction(coinbase_tx_hash(&network, height))
                 .is_none(),
-            "raw transaction is skipped below the checkpoint retention floor"
+            "raw transaction is skipped below the checkpoint retention start"
         );
     }
     assert!(
@@ -177,7 +177,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_floor() {
             .db
             .transaction(coinbase_tx_hash(&network, checkpoint_lowest_retained.0))
             .is_some(),
-        "raw transaction is retained at the checkpoint retention floor before handoff"
+        "raw transaction is retained at the checkpoint retention start before handoff"
     );
 
     let handoff_tip = (max_checkpoint_height + 1).expect("max checkpoint height plus one is valid");
@@ -192,18 +192,18 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_floor() {
         .expect("handoff block is valid");
 
     let online_prune_until =
-        (checkpoint_lowest_retained + 1).expect("checkpoint retention floor plus one is valid");
+        (checkpoint_lowest_retained + 1).expect("checkpoint retention start plus one is valid");
     assert_eq!(
         state.db.lowest_retained_height(),
         Some(online_prune_until),
-        "online pruning resumes exactly at the checkpoint retention floor"
+        "online pruning resumes exactly at the checkpoint retention start"
     );
     assert!(
         state
             .db
             .transaction(coinbase_tx_hash(&network, checkpoint_lowest_retained.0))
             .is_none(),
-        "online pruning deletes the first retained-floor height after the checkpoint target"
+        "online pruning deletes the checkpoint retention start height after the checkpoint target"
     );
     assert!(
         state
@@ -364,12 +364,12 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
 
         assert!(
             state.db.transaction(tx_hash).is_none(),
-            "checkpoint raw transaction is skipped below the checkpoint retention floor"
+            "checkpoint raw transaction is skipped below the checkpoint retention start"
         );
         assert_eq!(
             state.db.transactions_by_height(Height(height)).count(),
             0,
-            "tx_by_loc has no raw transactions below the checkpoint retention floor"
+            "tx_by_loc has no raw transactions below the checkpoint retention start"
         );
         assert!(
             state.db.transaction_location(tx_hash).is_some(),
@@ -390,7 +390,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
 
         assert!(
             state.db.transaction(tx_hash).is_some(),
-            "checkpoint raw transaction is retained at or above the checkpoint retention floor"
+            "checkpoint raw transaction is retained at or above the checkpoint retention start"
         );
         assert!(
             state.db.block(Height(height).into()).is_some(),
@@ -446,7 +446,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
             .db
             .transaction(coinbase_tx_hash(&network, TEST_BLOCKS - 1))
             .is_some(),
-        "archive phase stores raw transactions below the future checkpoint floor"
+        "archive phase stores raw transactions below the future checkpoint retention start"
     );
     std::mem::drop(archive_state);
 
@@ -478,7 +478,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
     assert_eq!(
         pruned_state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
-        "archive backlog is pruned up to the checkpoint retention floor"
+        "archive backlog is pruned up to the checkpoint retention start"
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -515,7 +515,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
     let blocks = network.blockchain_map();
 
     // Archive phase: store raw transactions for every block below the future
-    // checkpoint retention floor.
+    // checkpoint retention start.
     let mut archive_state = FinalizedState::new(
         &archive_config,
         &network,
@@ -545,7 +545,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
         ..Config::ephemeral()
     };
 
-    // First pruned open: the archive backlog below the floor must be detected.
+    // First pruned open: the archive backlog below the start must be detected.
     let mut pruned_state = new_unvalidated_state_with_checkpoint_retention(
         &pruned_config,
         &network,
@@ -568,7 +568,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
     assert_eq!(
         pruned_state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
-        "archive backlog is pruned up to the checkpoint retention floor"
+        "archive backlog is pruned up to the checkpoint retention start"
     );
     assert!(
         !pruned_state.has_checkpoint_raw_tx_archive_backlog(),
@@ -595,7 +595,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
 }
 
 #[test]
-fn archive_mode_keeps_checkpoint_raw_transactions_below_checkpoint_retention_floor() {
+fn archive_mode_keeps_checkpoint_raw_transactions_below_checkpoint_retention_start() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
     let config = Config::ephemeral();
@@ -624,7 +624,7 @@ fn archive_mode_keeps_checkpoint_raw_transactions_below_checkpoint_retention_flo
 }
 
 #[test]
-fn contextual_commits_keep_raw_transactions_below_checkpoint_retention_floor() {
+fn contextual_commits_keep_raw_transactions_below_checkpoint_retention_start() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
     let config = pruned_config();
@@ -668,12 +668,12 @@ fn contextual_commits_keep_raw_transactions_below_checkpoint_retention_floor() {
             .db
             .transaction(coinbase_tx_hash(&network, 1))
             .is_some(),
-        "contextual finalized commits keep raw transaction data even below the checkpoint floor"
+        "contextual finalized commits keep raw transaction data even below the checkpoint retention start"
     );
     assert_eq!(
         state.db.lowest_retained_height(),
         None,
-        "contextual commit below checkpoint floor does not advance pruning marker"
+        "contextual commit below checkpoint retention start does not advance pruning marker"
     );
 }
 

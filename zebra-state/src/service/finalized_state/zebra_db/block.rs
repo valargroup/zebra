@@ -42,7 +42,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, RawBytes, PRUNING_METADATA,
+        FromDisk, RawBytes, RawTransactionStorage, PRUNING_METADATA,
     },
     HashOrHeight,
 };
@@ -554,8 +554,7 @@ impl ZebraDb {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         network: &Network,
         source: &str,
-        store_raw_transactions: bool,
-        checkpoint_prune_range: Option<(Height, Height)>,
+        raw_transaction_storage: RawTransactionStorage,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -686,7 +685,7 @@ impl ZebraDb {
             address_balances,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
-            store_raw_transactions,
+            raw_transaction_storage.stores_raw_transactions(),
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -694,72 +693,12 @@ impl ZebraDb {
         // tip advance, so the prune and the tip advance are always consistent, and
         // it reuses the single-writer block commit path.
         if let Some(pruning) = self.config().pruning_config() {
-            let lowest_retained_in_db = self.lowest_retained_height();
-            let already_pruned = lowest_retained_in_db.is_some();
-
-            if let Some((prune_from, prune_until)) = checkpoint_prune_range {
-                // Log every MAX_PRUNE_HEIGHTS_PER_COMMIT block boundaries and the first prune
-                // to avoid noise.
-                if should_log_prune_progress(
-                    already_pruned,
-                    finalized.height,
-                    prune_from,
-                    prune_until,
-                ) {
-                    tracing::info!(
-                        ?prune_from,
-                        ?prune_until,
-                        tip = ?finalized.height,
-                        retention = pruning.tx_retention,
-                        "pruning archive raw transaction history before checkpoint skipping",
-                    );
-                }
-
-                batch.prepare_prune_batch(self, prune_from, prune_until);
-            } else if !store_raw_transactions {
-                // This checkpoint block's raw transactions were intentionally
-                // not written. Mark them as pruned immediately, so readers know
-                // raw transaction data below this height may be unavailable.
-                let lowest_retained_height =
-                    (finalized.height + 1).expect("committed block height plus one is valid");
-
-                if lowest_retained_in_db < Some(lowest_retained_height) {
-                    batch.prepare_pruning_marker_batch(self, lowest_retained_height);
-                }
-
-                debug_assert!(
-                    Self::prune_height_range(
-                        finalized.height,
-                        pruning.tx_retention,
-                        lowest_retained_in_db.max(Some(lowest_retained_height)),
-                    )
-                    .is_none(),
-                    "checkpoint raw transaction skipping should keep the pruning marker ahead of online pruning"
-                );
-            } else if let Some((prune_from, prune_until)) = Self::prune_height_range(
+            self.prepare_raw_transaction_pruning_batch(
+                &mut batch,
                 finalized.height,
                 pruning.tx_retention,
-                lowest_retained_in_db,
-            ) {
-                // Log every MAX_PRUNE_HEIGHTS_PER_COMMIT block boundaries and the first prune
-                // to avoid noise.
-                if should_log_prune_progress(
-                    already_pruned,
-                    finalized.height,
-                    prune_from,
-                    prune_until,
-                ) {
-                    tracing::info!(
-                        ?prune_from,
-                        ?prune_until,
-                        tip = ?finalized.height,
-                        retention = pruning.tx_retention,
-                        "pruning raw transaction history outside the retention window",
-                    );
-                }
-
-                batch.prepare_prune_batch(self, prune_from, prune_until);
-            }
+                raw_transaction_storage,
+            );
         }
 
         // Track batch commit latency for observability
@@ -773,6 +712,72 @@ impl ZebraDb {
         tracing::trace!(?source, "committed block from");
 
         Ok(finalized.hash)
+    }
+
+    /// Adds raw transaction pruning updates for the committed block to `batch`.
+    fn prepare_raw_transaction_pruning_batch(
+        &mut self,
+        batch: &mut DiskWriteBatch,
+        finalized_height: Height,
+        tx_retention: u32,
+        raw_transaction_storage: RawTransactionStorage,
+    ) {
+        let lowest_retained_in_db = self.lowest_retained_height();
+        let already_pruned = lowest_retained_in_db.is_some();
+
+        if let Some((prune_from, prune_until)) = raw_transaction_storage.checkpoint_prune_range() {
+            // Log every MAX_PRUNE_HEIGHTS_PER_COMMIT block boundaries and the first prune
+            // to avoid noise.
+            if should_log_prune_progress(already_pruned, finalized_height, prune_from, prune_until)
+            {
+                tracing::info!(
+                    ?prune_from,
+                    ?prune_until,
+                    tip = ?finalized_height,
+                    retention = tx_retention,
+                    "pruning archive raw transaction history before checkpoint skipping",
+                );
+            }
+
+            batch.prepare_prune_batch(self, prune_from, prune_until);
+        } else if !raw_transaction_storage.stores_raw_transactions() {
+            // This checkpoint block's raw transactions were intentionally not
+            // written. Mark them as pruned immediately, so readers know raw
+            // transaction data below this height may be unavailable.
+            let lowest_retained_height =
+                (finalized_height + 1).expect("committed block height plus one is valid");
+
+            if lowest_retained_in_db < Some(lowest_retained_height) {
+                batch.prepare_pruning_marker_batch(self, lowest_retained_height);
+            }
+
+            debug_assert!(
+                Self::prune_height_range(
+                    finalized_height,
+                    tx_retention,
+                    lowest_retained_in_db.max(Some(lowest_retained_height)),
+                )
+                .is_none(),
+                "checkpoint raw transaction skipping should keep the pruning marker ahead of online pruning"
+            );
+        } else if let Some((prune_from, prune_until)) =
+            Self::prune_height_range(finalized_height, tx_retention, lowest_retained_in_db)
+        {
+            // Log every MAX_PRUNE_HEIGHTS_PER_COMMIT block boundaries and the first prune
+            // to avoid noise.
+            if should_log_prune_progress(already_pruned, finalized_height, prune_from, prune_until)
+            {
+                tracing::info!(
+                    ?prune_from,
+                    ?prune_until,
+                    tip = ?finalized_height,
+                    retention = tx_retention,
+                    "pruning raw transaction history outside the retention window",
+                );
+            }
+
+            batch.prepare_prune_batch(self, prune_from, prune_until);
+        }
     }
 
     /// Writes the given batch to the database.
