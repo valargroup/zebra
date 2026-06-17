@@ -1,7 +1,11 @@
 use super::{error::*, wire::*, *};
 
 /// Default number of blocks advertised per response.
-pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 16;
+///
+/// Set to the wire ceiling so block-body requests batch as many blocks as the
+/// per-response byte cap ([`MAX_BS_RESPONSE_BYTES`]) allows. Small early-chain
+/// blocks ride in large counts; large near-tip blocks are byte-capped to fewer.
+pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 128;
 /// Default number of in-flight block requests advertised per peer.
 pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 4;
 /// Default total response byte target advertised per range response.
