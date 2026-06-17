@@ -252,7 +252,26 @@ impl Block {
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
     pub fn auth_data_root(&self) -> AuthDataRoot {
-        self.transactions.iter().collect::<AuthDataRoot>()
+        use rayon::prelude::*;
+
+        // Computing each transaction's authorizing-data digest dominates this
+        // function for blocks with many (or large) shielded transactions: each
+        // `auth_digest` re-serializes the transaction and BLAKE2b-hashes its
+        // authorizing data, scaling with the transaction's shielded I/O. The
+        // digests are independent, so compute them across the rayon pool.
+        //
+        // `collect` into a `Vec` preserves transaction order, so the Merkle root
+        // built from these digests is byte-identical to the sequential version
+        // (asserted by a differential proptest in `block::tests::prop`).
+        self.transactions
+            .par_iter()
+            .map(|tx| {
+                tx.auth_digest()
+                    .unwrap_or(crate::block::merkle::AUTH_DIGEST_PLACEHOLDER)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<AuthDataRoot>()
     }
 }
 

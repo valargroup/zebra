@@ -141,6 +141,20 @@ proptest! {
             }
         }
     }
+
+    /// `Block::auth_data_root` computes per-transaction auth digests across the
+    /// rayon pool; this asserts the parallel result is byte-identical to the
+    /// sequential computation (same digests, same transaction order, same root).
+    #[test]
+    fn auth_data_root_parallel_matches_sequential(block in any::<Block>()) {
+        let _init_guard = zebra_test::init();
+
+        let sequential: crate::block::merkle::AuthDataRoot =
+            block.transactions.iter().collect();
+        let parallel = block.auth_data_root();
+
+        prop_assert_eq!(sequential, parallel);
+    }
 }
 
 /// Test [`Block::coinbase_height`].
