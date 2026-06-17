@@ -162,6 +162,7 @@ mod peer_cache_updater;
 mod peer_set;
 mod policies;
 mod protocol;
+pub mod zakura;
 
 #[allow(unused)]
 pub(crate) use peer_set::PeerSet;
@@ -191,7 +192,7 @@ pub use crate::{
     policies::RetryLimit,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
-        internal::{InventoryResponse, Request, Response},
+        internal::{InventoryResponse, PeerSource, Request, Response},
     },
 };
 
