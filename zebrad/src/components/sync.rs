@@ -659,7 +659,7 @@ where
 
     /// Drives one sync round to completion: dispatches downloads, drains completed blocks, and
     /// continuously refills the hash reserve by extending tips *concurrently* with draining and
-    /// dispatch — instead of pausing the whole pipeline for each FindBlocks round-trip.
+    /// dispatch.
     ///
     /// `reserve` is the set of discovered-but-not-yet-dispatched block hashes (initially the
     /// leftovers from `obtain_tips`).
@@ -668,8 +668,7 @@ where
     /// left to extend. Returns `Err` if an unrecoverable error means the sync should restart.
     #[instrument(skip(self, reserve))]
     async fn sync_round(&mut self, mut reserve: IndexSet<block::Hash>) -> Result<(), Report> {
-        // The type of the in-flight tip-extension future. Boxed so it can live across `select!`
-        // iterations without borrowing `self`.
+        // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
 
         // A single in-flight tip extension, run concurrently with draining and dispatch. The
@@ -680,8 +679,7 @@ where
 
         // Freshness tracking for hang detection: the last time a block completed, a tip extension
         // resolved, or we dispatched new downloads. If nothing makes progress within
-        // `BLOCK_VERIFY_TIMEOUT`, the round is stalled and we restart. (CLAUDE.md: prefer "time
-        // since last change" over a per-step timeout.)
+        // `BLOCK_VERIFY_TIMEOUT`, the round is stalled and we restart.
         let mut last_progress = Instant::now();
 
         loop {
@@ -752,9 +750,9 @@ where
                 break;
             }
 
-            // Wait for the next bit of progress — a completed block or a finished tip extension —
+            // Wait for the next bit of progress: a completed block or a finished tip extension
             // overlapping the two. At least one arm is always enabled here: if nothing is in
-            // flight, then (given the dispatch and termination checks above) an extension must be
+            // flight, then, given the dispatch and termination checks above, an extension must be
             // running. A stall (neither arm makes progress within the timeout) restarts the round.
             let has_inflight = self.downloads.in_flight() > 0;
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
@@ -768,9 +766,6 @@ where
                         self.update_metrics();
                     }
 
-                    // `OptionFuture` constructs harmlessly from `None` (unlike `.expect()`), so it
-                    // is safe even though `select!` evaluates this expression while `extend` is
-                    // `None`. The precondition still gates polling; when enabled it yields `Some`.
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
                         let (download_set, new_tips, discovered) =
                             extended.expect("only polled while an extension is in flight")?;
