@@ -144,6 +144,10 @@ where
     // Decompose [size, size + body.len()) into maximal position-aligned dyadic
     // blocks, then compute each block's root in parallel.
     // Dyadic block means that the block is aligned to the power of 2: 1, 2, 4 ...
+    // It splits the new leaves, except the final frontier tip,
+    // into the largest globally aligned power-of-two
+    // chunks so each chunk can be hashed independently
+    // without changing the Merkle tree shape.
     let mut blocks: Vec<(usize, &[H])> = Vec::new();
     {
         let mut pos = size;
@@ -187,11 +191,64 @@ where
     Frontier::from_parts(position, leaf, ommers)
 }
 
+/// Appends `nodes` to `frontier` tracking the single subtree boundary that a block
+/// may cross, returning the updated frontier and the completed subtree's
+/// `(index_value, root)` if the boundary was crossed.
+///
+/// This is the shared implementation for [`crate::sapling::tree::NoteCommitmentTree::append_batch`]
+/// and [`crate::orchard::tree::NoteCommitmentTree::append_batch`]. Callers convert their
+/// commitment type to `H` before calling and wrap the returned index value in
+/// `NoteCommitmentSubtreeIndex`.
+///
+/// Returns [`FrontierError`] if appending would overflow the tree's capacity.
+pub fn append_batch_with_subtree<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    nodes: Vec<H>,
+) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), FrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    use crate::subtree::TRACKED_SUBTREE_HEIGHT;
+
+    if nodes.is_empty() {
+        return Ok((frontier, None));
+    }
+
+    // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions,
+    // which is far below u64::MAX.
+    let old_size = frontier.tree_size();
+    let new_size = old_size + nodes.len() as u64;
+
+    // A block crosses at most one tracked-subtree (2^TRACKED_SUBTREE_HEIGHT leaf) boundary
+    // because block size is bounded by the same consensus rule.
+    let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+    let boundary = (old_size / subtree_size + 1) * subtree_size;
+
+    if boundary <= new_size {
+        let head_len = (boundary - old_size) as usize;
+        let (head, tail) = nodes.split_at(head_len);
+
+        let f1 = parallel_append(frontier, head.to_vec())?;
+
+        // index = (boundary / subtree_size) - 1; fits in u16 by tree depth.
+        let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
+        let root = f1
+            .value()
+            .expect("just appended at least one leaf")
+            .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
+
+        let f2 = parallel_append(f1, tail.to_vec())?;
+        Ok((f2, Some((index_value, root))))
+    } else {
+        let f = parallel_append(frontier, nodes)?;
+        Ok((f, None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::hash::{Hash, Hasher};
 
     const DEPTH: u8 = 32;
 
@@ -199,8 +256,26 @@ mod tests {
     /// left/right swap changes the result) and **level-sensitive** (so a wrong
     /// `combine` level argument changes the result). This lets the differential
     /// tests catch ordering and level bugs in the parallel append.
+    ///
+    /// Uses a hand-rolled FNV-style mix rather than `DefaultHasher` so the output
+    /// is stable across Rust releases and proptest regression seeds stay valid.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     struct TestNode(u64);
+
+    /// Stable, order- and level-sensitive mix of three u64 values.
+    /// Based on FNV-1a with domain separation by argument position.
+    fn mix3(level: u64, a: u64, b: u64) -> u64 {
+        const FNV_PRIME: u64 = 0x00000100000001B3;
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        let mut h = FNV_OFFSET;
+        h ^= level;
+        h = h.wrapping_mul(FNV_PRIME);
+        h ^= a;
+        h = h.wrapping_mul(FNV_PRIME);
+        h ^= b;
+        h = h.wrapping_mul(FNV_PRIME);
+        h
+    }
 
     impl Hashable for TestNode {
         fn empty_leaf() -> Self {
@@ -208,12 +283,7 @@ mod tests {
         }
 
         fn combine(level: Level, a: &Self, b: &Self) -> Self {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            u8::from(level).hash(&mut hasher);
-            a.0.hash(&mut hasher);
-            b.0.hash(&mut hasher);
-            // Keep it non-zero-ish and order/level sensitive.
-            Self(hasher.finish())
+            Self(mix3(u8::from(level) as u64, a.0, b.0))
         }
     }
 

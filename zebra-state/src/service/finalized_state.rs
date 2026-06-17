@@ -43,11 +43,11 @@ use crate::{
 macro_rules! timed_commit_phase {
     ($name:expr, $body:expr) => {{
         #[cfg(feature = "commit-metrics")]
-        let _phase_start = std::time::Instant::now();
-        let _phase_result = $body;
+        let _start = std::time::Instant::now();
+        let result = $body;
         #[cfg(feature = "commit-metrics")]
-        metrics::histogram!($name).record(_phase_start.elapsed().as_secs_f64());
-        _phase_result
+        metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
+        result
     }};
 }
 
