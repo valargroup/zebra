@@ -734,7 +734,12 @@ where
                     "requesting more blocks",
                 );
 
-                let response = self.request_blocks(std::mem::take(&mut reserve)).await;
+                let response = timeout(
+                    BLOCK_VERIFY_TIMEOUT,
+                    self.request_blocks(std::mem::take(&mut reserve)),
+                )
+                .await
+                .map_err(Report::from)?;
                 reserve = Self::handle_hash_response(response)?;
                 last_progress = Instant::now();
                 continue;
