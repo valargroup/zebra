@@ -401,6 +401,77 @@ impl NoteCommitmentTree {
         }
     }
 
+    /// Appends a batch of note commitment x-coordinates to the tree in parallel,
+    /// returning the index and root of any [`TRACKED_SUBTREE_HEIGHT`] subtree
+    /// completed by the batch.
+    ///
+    /// The result is identical to calling [`Self::append`] for each commitment in
+    /// order — and capturing the last completed subtree — but the Merkle hashing
+    /// is parallelized across the rayon pool. This equivalence is enforced by the
+    /// differential property tests in [`crate::parallel::batch_frontier`].
+    ///
+    /// Returns an error if the tree would overflow its capacity.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn append_batch(
+        &mut self,
+        cms: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
+        use crate::parallel::batch_frontier::parallel_append;
+        use incrementalmerkletree::frontier::Frontier;
+
+        if cms.is_empty() {
+            return Ok(None);
+        }
+
+        let nodes: Vec<Node> = cms.iter().map(|cm_x| (*cm_x).into()).collect();
+
+        let old_size = self.inner.tree_size();
+        let new_size = old_size + nodes.len() as u64;
+
+        // A block has fewer than 2^16 actions (consensus rule), so the batch
+        // crosses at most one tracked-subtree (2^TRACKED_SUBTREE_HEIGHT) boundary.
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let boundary = (old_size / subtree_size + 1) * subtree_size;
+
+        let frontier = std::mem::replace(&mut self.inner, Frontier::empty());
+
+        let (frontier, completed) = if boundary <= new_size {
+            let head_len = (boundary - old_size) as usize;
+            let (head, tail) = nodes.split_at(head_len);
+
+            let f1 = parallel_append(frontier, head.to_vec())
+                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+
+            let index = NoteCommitmentSubtreeIndex(
+                ((boundary >> TRACKED_SUBTREE_HEIGHT) - 1)
+                    .try_into()
+                    .expect("subtree index fits in u16"),
+            );
+            let root = f1
+                .value()
+                .expect("just appended at least one leaf")
+                .root(Some(incrementalmerkletree::Level::from(
+                    TRACKED_SUBTREE_HEIGHT,
+                )));
+
+            let f2 = parallel_append(f1, tail.to_vec())
+                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+            (f2, Some((index, root)))
+        } else {
+            let f =
+                parallel_append(frontier, nodes).map_err(|_| NoteCommitmentTreeError::FullTree)?;
+            (f, None)
+        };
+
+        self.inner = frontier;
+        *self
+            .cached_root
+            .get_mut()
+            .expect("a thread that previously held exclusive lock access panicked") = None;
+
+        Ok(completed)
+    }
+
     /// Returns frontier of non-empty tree, or `None` if the tree is empty.
     fn frontier(&self) -> Option<&NonEmptyFrontier<Node>> {
         self.inner.value()
