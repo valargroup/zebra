@@ -446,9 +446,8 @@ where
     /// While this is non-empty, new speculative downloads are gated in [`Self::sync_round`] so the
     /// in-flight pipeline drains and frees ready-peer slots for the critical head-of-line block.
     /// The retries themselves are never gated: they fire from the `select!` timer arm so draining
-    /// and tip extension continue concurrently during the backoff (instead of a blocking inline
-    /// `sleep`). A map (not a single slot) so that a second block missing while the first is still
-    /// backing off isn't dropped — every registry-missed required block stays scheduled.
+    /// and tip extension continue concurrently during the backoff. A map so that a second block missing while the first is still
+    /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
     /// Receiver that is `true` when the downloader is past the lookahead limit.
@@ -741,7 +740,7 @@ where
             // waiting on its registry-miss backoff, pause *new* speculative dispatch so the in-flight
             // downloads drain and free up ready-peer slots. Otherwise the look-ahead keeps every peer
             // busy and the critical block's retry can never reach a peer that has it. This is inert in
-            // healthy sync (no registry miss is pending), so steady-state throughput is unchanged.
+            // healthy sync (no registry miss is pending), so steady-state throughput is unaffected.
             let head_of_line_starved = !self.registry_miss_retry.is_empty();
 
             if !past_lookahead && !head_of_line_starved && !reserve.is_empty() {
