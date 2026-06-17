@@ -231,7 +231,19 @@ const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: HeightDiff = 100;
 /// This should be long enough for peers to respond to tip requests on a thin or
 /// flaky peer set. Shorter values can cause Zebra to loop on `obtain_tips`
 /// timeouts without making progress.
-const SYNC_RESTART_DELAY: Duration = Duration::from_secs(45);
+///
+/// Must stay within the window enforced by `ensure_timeouts_consistent`: longer than
+/// [`INVENTORY_ROTATION_INTERVAL`] (53s, so a restart expires some inventory) and longer than
+/// [`DEFAULT_CRAWL_NEW_PEER_INTERVAL`] + [`HANDSHAKE_TIMEOUT`] (64s, so new peers can connect
+/// first), but shorter than [`POST_BLOSSOM_POW_TARGET_SPACING`] (75s, so a tip crawl finishes
+/// before most new blocks). It was inadvertently reduced below this window during release-defaults
+/// churn (down to 2s, then partially restored to 30s/45s); 67s is the original consistent value.
+///
+/// [`INVENTORY_ROTATION_INTERVAL`]: zebra_network::constants::INVENTORY_ROTATION_INTERVAL
+/// [`DEFAULT_CRAWL_NEW_PEER_INTERVAL`]: zebra_network::constants::DEFAULT_CRAWL_NEW_PEER_INTERVAL
+/// [`HANDSHAKE_TIMEOUT`]: zebra_network::constants::HANDSHAKE_TIMEOUT
+/// [`POST_BLOSSOM_POW_TARGET_SPACING`]: zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING
+const SYNC_RESTART_DELAY: Duration = Duration::from_secs(67);
 
 /// Controls how long the syncer sleeps between sync runs before obtaining new
 /// tips and restarting downloads.
