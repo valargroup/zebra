@@ -803,10 +803,7 @@ fn should_log_prune_progress(
 ///
 /// Computed once per block by
 /// [`FinalizedState::retention_plan`](super::super::FinalizedState::retention_plan)
-/// and applied by [`ZebraDb::write_block`] without re-derivation. This replaces
-/// the previous pair of `store_raw_transactions` / `checkpoint_prune_range`
-/// flags, which encoded the same small state machine in a form that had to be
-/// re-interpreted at each use site.
+/// and applied by [`ZebraDb::write_block`] without re-derivation.
 ///
 /// Only [`RetentionPlan::Store`] occurs in archive mode; the other variants are
 /// only produced in pruned storage mode.
