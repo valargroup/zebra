@@ -905,15 +905,12 @@ impl BlockSyncReactor {
                 return;
             }
 
-            self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
-                .await;
+            self.trace_range_unavailable(&peer, start_height);
             return;
         };
 
         self.trace_range_unavailable(&peer, start_height);
         self.finish_peer_outstanding_at(&peer, index, OutstandingRangeDisposition::RetryMissing);
-        self.report_misbehavior(peer, BlockSyncMisbehavior::RangeUnavailable)
-            .await;
         self.schedule().await;
         self.release_caught_up_block_sync_peers();
     }

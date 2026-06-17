@@ -5449,7 +5449,87 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
 }
 
 #[tokio::test]
-async fn reactor_backpressures_serving_slots_and_disconnects_repeated_soft_misbehavior() {
+async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(2), blocks[1].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        63,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(1), 1)
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .expect("RangeUnavailable frame encodes"),
+        )
+        .await
+        .expect("RangeUnavailable frame queues");
+
+    assert_eq!(
+        wait_for_getblocks(&mut actions).await,
+        (peer_id.clone(), block::Height(1), 1),
+        "matched RangeUnavailable should retry without scoring the serving peer",
+    );
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(2),
+                count: 1,
+            }
+            .encode_frame()
+            .expect("RangeUnavailable frame encodes"),
+        )
+        .await
+        .expect("unmatched RangeUnavailable frame queues");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "unmatched RangeUnavailable should be treated as advisory backpressure"
+    );
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_backpressures_serving_slots_without_scoring_peer() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_requests: 1,
         ..ZakuraBlockSyncConfig::default()
@@ -5515,67 +5595,6 @@ async fn reactor_backpressures_serving_slots_and_disconnects_repeated_soft_misbe
         })
         .await
         .expect("serving slot release queues");
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::RangeUnavailable {
-                start_height: block::Height(2),
-                count: 1,
-            }
-            .encode_frame()
-            .expect("RangeUnavailable frame encodes"),
-        )
-        .await
-        .expect("single soft report queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, BlockSyncMisbehavior::RangeUnavailable);
-                break;
-            }
-            BlockSyncAction::SendMessage { .. } => {}
-            action => panic!("unexpected action before first soft report: {action:?}"),
-        }
-    }
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
-    for _ in 0..2 {
-        inbound_tx
-            .send(
-                BlockSyncMessage::RangeUnavailable {
-                    start_height: block::Height(2),
-                    count: 1,
-                }
-                .encode_frame()
-                .expect("RangeUnavailable frame encodes"),
-            )
-            .await
-            .expect("soft report queues");
-    }
-    let mut soft_reports = 0;
-    while soft_reports < 2 {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, BlockSyncMisbehavior::RangeUnavailable);
-                soft_reports += 1;
-            }
-            BlockSyncAction::SendMessage { .. } => {}
-            action => panic!("unexpected action during repeated soft reports: {action:?}"),
-        }
-    }
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if handle.peer_snapshot().outbound_peers == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("repeated soft misbehavior disconnects the peer");
 
     reactor_task.abort();
 }
@@ -6197,7 +6216,7 @@ async fn misbehaving_peer_is_disconnected_even_when_action_channel_is_saturated(
             Duration::from_millis(200),
             handle.send(BlockSyncEvent::WireMessage {
                 peer: probe.clone(),
-                msg: BlockSyncMessage::RangeUnavailable {
+                msg: BlockSyncMessage::GetBlocks {
                     start_height: block::Height(1),
                     count: 1,
                 },
