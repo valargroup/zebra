@@ -142,6 +142,13 @@ pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
 pub const MAX_TIPS_RESPONSE_HASH_COUNT: usize = 500;
 
+/// The hash-reserve depth below which the syncer prefetches the next batch of tip hashes.
+///
+/// Set to one ExtendTips response worth of hashes, so a fresh round completes before the reserve
+/// empties at typical drain rates, overlapping the FindBlocks round-trip with the draining download
+/// buffer instead of stalling the pipeline once the reserve hits zero.
+const EXTEND_PREFETCH_WATERMARK: usize = MAX_TIPS_RESPONSE_HASH_COUNT;
+
 /// Controls how long we wait for a tips response to return.
 ///
 /// ## Correctness
@@ -702,7 +709,28 @@ where
             self.update_metrics();
         }
 
-        // Once we're below the lookahead limit, we can request more blocks or hashes.
+        // Prefetch: top up the hash reserve before it drains to empty, so the in-flight downloads
+        // keep the buffer busy while the FindBlocks round-trip is in progress, instead of the
+        // pipeline stalling once the reserve hits zero. We extend whenever the reserve is below a
+        // watermark (not only when empty) and we still have tips to extend.
+        if extra_hashes.len() < EXTEND_PREFETCH_WATERMARK && !self.prospective_tips.is_empty() {
+            debug!(
+                tips.len = self.prospective_tips.len(),
+                in_flight = self.downloads.in_flight(),
+                extra_hashes = extra_hashes.len(),
+                "prefetching more tip hashes",
+            );
+
+            match self.discover_extend_hashes().await {
+                Ok(new_hashes) => extra_hashes.extend(new_hashes),
+                Err(e) => {
+                    info!("temporary error extending tips: {:#}", e);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Dispatch from the reserve, keeping any hashes beyond the lookahead limit for next time.
         if !extra_hashes.is_empty() {
             debug!(
                 tips.len = self.prospective_tips.len(),
@@ -715,20 +743,6 @@ where
 
             let response = self.request_blocks(extra_hashes).await;
             extra_hashes = Self::handle_hash_response(response)?;
-        } else {
-            info!(
-                tips.len = self.prospective_tips.len(),
-                in_flight = self.downloads.in_flight(),
-                extra_hashes = extra_hashes.len(),
-                lookahead_limit = self.lookahead_limit(extra_hashes.len()),
-                state_tip = ?self.latest_chain_tip.best_tip_height(),
-                "extending tips",
-            );
-
-            extra_hashes = self.extend_tips().await.map_err(|e| {
-                info!("temporary error extending tips: {:#}", e);
-                e
-            })?;
         }
         metrics::gauge!("sync.reserve.depth").set(extra_hashes.len() as f64);
         self.update_metrics();
@@ -917,8 +931,10 @@ where
         Self::handle_hash_response(response).map_err(Into::into)
     }
 
+    /// Asks peers to extend the current prospective tips, returning the newly discovered block
+    /// hashes in download order *without* dispatching them, and updating `prospective_tips`.
     #[instrument(skip(self))]
-    async fn extend_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+    async fn discover_extend_hashes(&mut self) -> Result<IndexSet<block::Hash>, Report> {
         let stage_start = std::time::Instant::now();
 
         let tips = std::mem::take(&mut self.prospective_tips);
@@ -1045,18 +1061,25 @@ where
         }
 
         let new_downloads = download_set.len();
-        debug!(new_downloads, "queueing new downloads");
+        debug!(new_downloads, "discovered new hashes to download");
         metrics::gauge!("sync.extend.queued.hash.count").set(new_downloads as f64);
 
         // security: use the actual number of new downloads from all peers,
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_extend_tips_length(new_downloads);
 
-        let response = self.request_blocks(download_set).await;
-
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
+        Ok(download_set)
+    }
+
+    /// Extends the current prospective tips and dispatches the newly discovered blocks for
+    /// download, returning any hashes beyond the lookahead limit.
+    #[instrument(skip(self))]
+    async fn extend_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+        let download_set = self.discover_extend_hashes().await?;
+        let response = self.request_blocks(download_set).await;
         Self::handle_hash_response(response).map_err(Into::into)
     }
 
