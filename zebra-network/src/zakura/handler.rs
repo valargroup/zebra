@@ -2778,12 +2778,7 @@ async fn persistent_stream_worker(
                     match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => Ok(frame),
                         InboundMessageAdmission::Oversize => Err(ZakuraHandlerError::Oversize),
-                        // Never drop a solicited frame: on a reliable ordered
-                        // stream the peer will not resend, so a dropped block
-                        // body is a permanent gap that stalls the checkpoint.
-                        // Keep the throttle metric/trace from admission, but
-                        // defer enforcement and deliver the frame.
-                        InboundMessageAdmission::Throttled => Ok(frame),
+                        InboundMessageAdmission::Throttled => Err(ZakuraHandlerError::RateLimited),
                     }
                 }
                 Err(error) => {
@@ -2875,6 +2870,11 @@ async fn persistent_stream_worker(
                     // The reader signalled an oversize message: disconnect it.
                     Some(Err(ZakuraHandlerError::Oversize)) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
+                        context.connection_token.cancel();
+                        break;
+                    }
+                    Some(Err(ZakuraHandlerError::RateLimited)) => {
+                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
                         context.connection_token.cancel();
                         break;
                     }
@@ -4042,6 +4042,9 @@ pub enum ZakuraHandlerError {
     /// A local resource cap rejected the operation.
     #[error("Zakura resource limit exceeded: {0}")]
     ResourceLimit(&'static str),
+    /// The peer exceeded its per-kind inbound message rate.
+    #[error("Zakura message rate exceeded")]
+    RateLimited,
     /// Iroh connection error.
     #[error(transparent)]
     IrohConnection(#[from] iroh::endpoint::ConnectionError),
