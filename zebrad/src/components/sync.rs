@@ -146,12 +146,13 @@ pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
 pub const MAX_TIPS_RESPONSE_HASH_COUNT: usize = 500;
 
-/// The hash-reserve depth below which the syncer prefetches the next batch of tip hashes.
+/// Start asking peers for more block hashes before we run out of hashes to download.
 ///
-/// Set to one ExtendTips response worth of hashes, so a fresh round completes before the reserve
-/// empties at typical drain rates, overlapping the FindBlocks round-trip with the draining download
-/// buffer instead of stalling the pipeline once the reserve hits zero.
-const EXTEND_PREFETCH_WATERMARK: usize = MAX_TIPS_RESPONSE_HASH_COUNT;
+/// The syncer keeps a list of block hashes it has learned from `FindBlocks`
+/// responses but has not yet requested as full blocks. When that list drops
+/// below one typical `FindBlocks` response, start one background extension
+/// request so downloads can continue without waiting for another peer round trip.
+const MIN_UNREQUESTED_HASHES_BEFORE_EXTEND: usize = MAX_TIPS_RESPONSE_HASH_COUNT;
 
 /// Controls how long we wait for a tips response to return.
 ///
@@ -671,35 +672,40 @@ where
         // The type of the in-flight tip-extension future.
         type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
 
-        // A single in-flight tip extension, run concurrently with draining and dispatch. The
-        // FindBlocks fan-out it performs is spawned internally, so it keeps making progress
-        // regardless of which `select!` arm fires. At most one runs at a time, which bounds the
-        // reserve.
+        // The currently running request for more block hashes, if any.
+        //
+        // This future only asks peers for hashes. It does not request or verify
+        // full blocks. We keep at most one extension request in flight so the
+        // syncer cannot build up an unbounded backlog of undispatched hashes.
         let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
 
-        // Freshness tracking for hang detection: the last time a block completed, a tip extension
-        // resolved, or we dispatched new downloads. If nothing makes progress within
-        // `BLOCK_VERIFY_TIMEOUT`, the round is stalled and we restart.
+        // The last time this sync round made observable progress.
+        //
+        // Progress means a block finished verification, a background hash
+        // extension finished, or more full-block downloads were queued. If none
+        // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
 
         loop {
             // Opportunistically handle any block tasks that are already finished, without blocking.
             while let Poll::Ready(Some(rsp)) = futures::poll!(self.downloads.next()) {
-                // Some temporary errors are ignored, and syncing continues with other blocks. If it
-                // turns out they were actually important, syncing will run out of blocks, and the
-                // syncer will reset itself.
+                // Handle completed block tasks. Missing blocks may be requeued; duplicate,
+                // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
+                // non-fatal. Other download or verification errors restart this sync round.
                 self.handle_block_response_with_missing_retry(rsp).await?;
                 last_progress = Instant::now();
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
 
-            // Refill: kick off a tip extension before the reserve drains to empty, so discovery
-            // overlaps the still-draining download buffer instead of stalling the pipeline once the
-            // reserve hits zero. Extend whenever the reserve is below the watermark (not only when
-            // empty) and there are still tips to extend.
+            // Ask for more block hashes while we still have some left to download.
+            //
+            // Waiting until the undispatched hash list is empty would leave the
+            // downloader idle while peers respond to `FindBlocks`. Starting the
+            // next extension early lets downloads keep running during that round
+            // trip.
             if extend.is_none()
-                && reserve.len() < EXTEND_PREFETCH_WATERMARK
+                && reserve.len() < MIN_UNREQUESTED_HASHES_BEFORE_EXTEND
                 && !self.prospective_tips.is_empty()
             {
                 debug!(
