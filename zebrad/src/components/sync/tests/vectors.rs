@@ -1469,6 +1469,196 @@ async fn registry_miss_schedules_multiple_blocks() {
     peer_set.expect_no_requests().await;
 }
 
+/// A successful block response clears that block's registry-miss retry schedule and budget, so the
+/// head-of-line gate (which pauses speculative dispatch while a retry is pending) lifts and the round
+/// resumes once the missing block finally arrives.
+#[tokio::test]
+async fn registry_miss_retry_clears_on_successful_block() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAB; 32]);
+
+    // A registry miss schedules the block for a backoff retry.
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
+            error: not_found_registry_error(block_hash),
+            hash: block_hash,
+        }))
+        .await
+        .expect("a registry miss within budget should not restart");
+    assert!(chain_sync.registry_miss_retry.contains_key(&block_hash));
+
+    // The block then downloads successfully (a peer connected, or the inventory marker expired).
+    chain_sync
+        .handle_block_response_with_missing_retry(Ok((Height(42), block_hash)))
+        .await
+        .expect("a successful response should not restart");
+
+    assert!(
+        !chain_sync.registry_miss_retry.contains_key(&block_hash),
+        "a successful block should clear its scheduled registry-miss retry"
+    );
+    assert!(
+        !chain_sync
+            .registry_miss_retry_counts
+            .contains_key(&block_hash),
+        "a successful block should clear its consumed registry-miss budget"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// A successful response clears only the responded block's retry state, leaving other registry-missed
+/// blocks scheduled — the retry state is keyed per-hash, so one block arriving must not drop another.
+#[tokio::test]
+async fn registry_miss_retry_clears_only_the_responded_block() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let kept_hash = block::Hash::from([0x11; 32]);
+    let arrived_hash = block::Hash::from([0x22; 32]);
+
+    for hash in [kept_hash, arrived_hash] {
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(
+                BlockDownloadVerifyError::DownloadFailed {
+                    error: not_found_registry_error(hash),
+                    hash,
+                },
+            ))
+            .await
+            .expect("a registry miss within budget should not restart");
+    }
+
+    // One of the two missing blocks arrives; the other is still missing.
+    chain_sync
+        .handle_block_response_with_missing_retry(Ok((Height(7), arrived_hash)))
+        .await
+        .expect("a successful response should not restart");
+
+    assert!(
+        !chain_sync.registry_miss_retry.contains_key(&arrived_hash),
+        "the arrived block's retry should be cleared"
+    );
+    assert!(
+        chain_sync.registry_miss_retry.contains_key(&kept_hash),
+        "a different block's retry must not be cleared by an unrelated success"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// The scheduled retry is deferred by the backoff rather than run inline: the recorded deadline is one
+/// [`REGISTRY_MISS_RETRY_BACKOFF`] in the future. This is what lets `sync_round` keep draining peers
+/// during the wait (the whole point of moving the backoff off the inline blocking `sleep`).
+///
+/// [`REGISTRY_MISS_RETRY_BACKOFF`]: sync::REGISTRY_MISS_RETRY_BACKOFF
+#[tokio::test]
+async fn registry_miss_retry_is_deferred_by_the_backoff() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAB; 32]);
+
+    let before = tokio::time::Instant::now();
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
+            error: not_found_registry_error(block_hash),
+            hash: block_hash,
+        }))
+        .await
+        .expect("a registry miss within budget should not restart");
+    let after = tokio::time::Instant::now();
+
+    let deadline = chain_sync
+        .registry_miss_retry
+        .get(&block_hash)
+        .copied()
+        .expect("the missing block should be scheduled");
+
+    // deadline == insert_time + backoff, and before <= insert_time <= after, so the deadline lands
+    // exactly one backoff interval ahead — strictly in the future, never immediate.
+    assert!(
+        deadline >= before + sync::REGISTRY_MISS_RETRY_BACKOFF
+            && deadline <= after + sync::REGISTRY_MISS_RETRY_BACKOFF,
+        "the retry deadline should be one backoff interval in the future, not immediate"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Repeated registry misses for the same block accumulate its retry budget and re-arm the backoff
+/// deadline each time, so a persistently-missing block keeps head-of-line priority until its budget
+/// is exhausted (at which point [`registry_miss_restarts_after_retry_limit`] takes over).
+#[tokio::test]
+async fn registry_miss_retry_accumulates_budget_for_the_same_block() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xAB; 32]);
+    let miss = || BlockDownloadVerifyError::DownloadFailed {
+        error: not_found_registry_error(block_hash),
+        hash: block_hash,
+    };
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(miss()))
+        .await
+        .expect("a registry miss within budget should not restart");
+    let first_deadline = chain_sync
+        .registry_miss_retry
+        .get(&block_hash)
+        .copied()
+        .expect("the missing block should be scheduled");
+
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(miss()))
+        .await
+        .expect("a second registry miss within budget should not restart");
+    let second_deadline = chain_sync
+        .registry_miss_retry
+        .get(&block_hash)
+        .copied()
+        .expect("the missing block should still be scheduled");
+
+    assert_eq!(
+        chain_sync.registry_miss_retry_counts.get(&block_hash),
+        Some(&2),
+        "each registry miss for the same block should consume one more retry from its budget"
+    );
+    assert!(
+        second_deadline >= first_deadline,
+        "each miss should re-arm the backoff deadline"
+    );
+
+    peer_set.expect_no_requests().await;
+}
+
 fn setup() -> (
     // ChainSync
     impl Future<Output = Result<(), Report>> + Send,
