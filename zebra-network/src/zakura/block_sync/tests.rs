@@ -680,26 +680,26 @@ fn scheduler_assigns_needed_ranges_with_fanout_slots_and_dedup() {
     let (peer3, state3) = peer_state(33);
 
     let first = scheduler
-        .next_for_peer(&peer1, &state1, &mut budget)
+        .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
         .expect("first peer gets the range");
     assert_eq!(first.start_height, block::Height(1));
     assert_eq!(first.count, 3);
 
     let second = scheduler
-        .next_for_peer(&peer2, &state2, &mut budget)
+        .next_for_peer(&peer2, &state2, &mut budget, u64::MAX)
         .expect("fanout allows a second peer");
     assert_eq!(second.start_height, block::Height(1));
     assert_eq!(second.count, 3);
 
     assert!(
         scheduler
-            .next_for_peer(&peer1, &state1, &mut budget)
+            .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
             .is_none(),
         "same peer must not receive overlapping duplicate assignment"
     );
     assert!(
         scheduler
-            .next_for_peer(&peer3, &state3, &mut budget)
+            .next_for_peer(&peer3, &state3, &mut budget, u64::MAX)
             .is_none(),
         "fanout cap must deduplicate the covered range"
     );
@@ -720,7 +720,7 @@ fn scheduler_byte_budget_sizing_shrinks_or_defers_requests() {
     let mut budget = ByteBudget::new(1_000);
 
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("one block fits the peer response-byte cap");
     assert_eq!(request.start_height, block::Height(10));
     assert_eq!(request.count, 1);
@@ -732,11 +732,164 @@ fn scheduler_byte_budget_sizing_shrinks_or_defers_requests() {
     let mut small_budget = ByteBudget::new(50);
     assert!(
         scheduler
-            .next_for_peer(&peer, &state, &mut small_budget)
+            .next_for_peer(&peer, &state, &mut small_budget, u64::MAX)
             .is_none(),
         "a first block that does not fit is deferred"
     );
     assert_eq!(small_budget.reserved(), 0);
+}
+
+#[test]
+fn scheduler_per_peer_byte_cap_limits_request_below_global_budget() {
+    let mut scheduler = BlockRangeScheduler::new(1);
+    scheduler.set_estimator_for_tests(750, 1);
+    scheduler.refresh_needed(vec![
+        needed(1, BlockSizeEstimate::Advertised(100)),
+        needed(2, BlockSizeEstimate::Advertised(100)),
+        needed(3, BlockSizeEstimate::Advertised(100)),
+    ]);
+    let (peer, mut state) = peer_state(50);
+    state.max_response_bytes = 10_000; // peer response cap not binding
+    state.max_blocks_per_response = 10; // count cap not binding
+    let mut budget = ByteBudget::new(1_000_000); // global budget ample
+
+    // A 150-byte per-peer cap admits only the first 100-byte block, even though
+    // the count cap, peer response cap, and global budget all have ample room.
+    let request = scheduler
+        .next_for_peer(&peer, &state, &mut budget, 150)
+        .expect("first block fits the per-peer byte cap");
+    assert_eq!(request.count, 1);
+    assert_eq!(request.estimated_bytes, 100);
+    assert_eq!(budget.reserved(), 100);
+
+    // A fresh peer with a 1_000-byte cap batches the whole three-block range.
+    let mut scheduler2 = BlockRangeScheduler::new(1);
+    scheduler2.set_estimator_for_tests(750, 1);
+    scheduler2.refresh_needed(vec![
+        needed(1, BlockSizeEstimate::Advertised(100)),
+        needed(2, BlockSizeEstimate::Advertised(100)),
+        needed(3, BlockSizeEstimate::Advertised(100)),
+    ]);
+    let (peer2, mut state2) = peer_state(51);
+    state2.max_response_bytes = 10_000;
+    state2.max_blocks_per_response = 10;
+    let mut budget2 = ByteBudget::new(1_000_000);
+    let request2 = scheduler2
+        .next_for_peer(&peer2, &state2, &mut budget2, 1_000)
+        .expect("higher per-peer cap admits the whole range");
+    assert_eq!(request2.count, 3);
+    assert_eq!(request2.estimated_bytes, 300);
+}
+
+#[test]
+fn block_sync_per_peer_byte_cap_shares_budget_and_floors_at_one_response() {
+    // Ample budget: each of `expected_peers` gets an even share of the budget.
+    let config = ZakuraBlockSyncConfig::default();
+    assert_eq!(
+        config.per_peer_byte_cap(),
+        config.max_inflight_block_bytes / config.expected_peers as u64,
+    );
+
+    // Tiny budget: the per-peer share would starve peers, so the cap floors at
+    // one advertised response so a peer can always make progress.
+    let tiny = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 4_096,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert_eq!(
+        tiny.per_peer_byte_cap(),
+        u64::from(tiny.advertised_max_response_bytes()),
+    );
+
+    // `expected_peers == 0` disables per-peer byte fairness entirely.
+    let disabled = ZakuraBlockSyncConfig {
+        expected_peers: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert_eq!(disabled.per_peer_byte_cap(), u64::MAX);
+}
+
+#[tokio::test]
+async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
+    let config = immediate_body_download_config();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    // Peer serves heights 1..=4 and accepts four concurrent single-block requests.
+    let (peer_id, _inbound, _outbound) = connect_peer_with_status_message(
+        &service,
+        &mut actions,
+        41,
+        BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(4),
+            tip_hash: block::Hash([4; 32]),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 4,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        },
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(4), block::Hash([4; 32])))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(1),
+                hash: block::Hash([1; 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: block::Hash([2; 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(3),
+                hash: block::Hash([3; 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(4),
+                hash: block::Hash([4; 32]),
+                size: BlockSizeEstimate::Advertised(1_000),
+            },
+        ]))
+        .await
+        .expect("needed metadata queues");
+
+    // The fill-loop opens all four slots from the single NeededBlocks event.
+    // Pre-fill-loop scheduling issued only one GetBlocks per scheduling event,
+    // so this would time out on the second request.
+    let mut heights = Vec::new();
+    for _ in 0..4 {
+        let (peer, start_height, count) = wait_for_getblocks(&mut actions).await;
+        assert_eq!(peer, peer_id);
+        assert_eq!(count, 1);
+        heights.push(start_height.0);
+    }
+    heights.sort_unstable();
+    assert_eq!(heights, vec![1, 2, 3, 4]);
+
+    reactor_task.abort();
 }
 
 #[test]
@@ -754,7 +907,7 @@ fn scheduler_partial_requests_clear_the_issued_assignment_key() {
     let mut budget = ByteBudget::new(1_000);
 
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("response-byte cap drains a prefix of the queued range");
     assert_eq!(request.start_height, block::Height(10));
     assert_eq!(request.count, 2);
@@ -782,20 +935,20 @@ fn scheduler_drops_verified_prefix_from_queued_ranges() {
     let mut budget = ByteBudget::new(1_000);
 
     let first = scheduler
-        .next_for_peer(&peer1, &state1, &mut budget)
+        .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
         .expect("first fanout assignment queues");
     assert_eq!(first.start_height, block::Height(10));
 
     scheduler.drop_through(block::Height(10));
     assert!(
         scheduler
-            .next_for_peer(&peer1, &state1, &mut budget)
+            .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
             .is_none(),
         "verified-prefix trimming must not let the same peer bypass its overlapping assignment",
     );
 
     let second = scheduler
-        .next_for_peer(&peer2, &state2, &mut budget)
+        .next_for_peer(&peer2, &state2, &mut budget, u64::MAX)
         .expect("queued suffix remains requestable by another fanout peer");
     assert_eq!(second.start_height, block::Height(11));
     assert_eq!(second.count, 2);
@@ -815,7 +968,7 @@ fn scheduler_drops_covered_prefix_from_partially_queued_range() {
     let mut budget = ByteBudget::new(1_000);
 
     let first = scheduler
-        .next_for_peer(&peer1, &state1, &mut budget)
+        .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
         .expect("first fanout assignment leaves the queued range for another peer");
     assert_eq!(first.start_height, block::Height(10));
     assert_eq!(first.count, 3);
@@ -824,13 +977,13 @@ fn scheduler_drops_covered_prefix_from_partially_queued_range() {
 
     assert!(
         scheduler
-            .next_for_peer(&peer1, &state1, &mut budget)
+            .next_for_peer(&peer1, &state1, &mut budget, u64::MAX)
             .is_none(),
         "trimming a covered prefix must not let the same peer bypass its overlapping assignment",
     );
 
     let second = scheduler
-        .next_for_peer(&peer2, &state2, &mut budget)
+        .next_for_peer(&peer2, &state2, &mut budget, u64::MAX)
         .expect("uncovered suffix remains requestable");
     assert_eq!(
         second.start_height,
@@ -858,13 +1011,13 @@ fn scheduler_splits_queued_range_around_covered_heights() {
     scheduler.mark_height_covered(block::Height(12));
 
     let first = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("uncovered prefix remains requestable");
     assert_eq!(first.start_height, block::Height(10));
     assert_eq!(first.count, 2);
 
     let second = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("uncovered suffix remains requestable");
     assert_eq!(second.start_height, block::Height(13));
     assert_eq!(second.count, 2);
@@ -883,7 +1036,7 @@ fn scheduler_retries_only_uncovered_suffix() {
     let mut budget = ByteBudget::new(1_000);
 
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("range fits");
     assert_eq!(request.start_height, block::Height(20));
     assert_eq!(request.count, 3);
@@ -892,7 +1045,7 @@ fn scheduler_retries_only_uncovered_suffix() {
     scheduler.timeout(request, &mut budget);
 
     let retry = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("uncovered retry suffix remains requestable");
     assert_eq!(
         retry.start_height,
@@ -910,7 +1063,7 @@ fn scheduler_releases_budget_on_completion_timeout_and_cancel() {
     scheduler.refresh_needed(vec![needed(20, BlockSizeEstimate::Advertised(1_000))]);
     let mut budget = ByteBudget::new(10_000);
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("range fits");
     assert_eq!(budget.reserved(), 1_000);
     scheduler.complete(&request, &mut budget);
@@ -918,13 +1071,13 @@ fn scheduler_releases_budget_on_completion_timeout_and_cancel() {
 
     scheduler.refresh_needed(vec![needed(21, BlockSizeEstimate::Advertised(2_000))]);
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("range fits");
     scheduler.timeout(request, &mut budget);
     assert_eq!(budget.reserved(), 0);
 
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("retried range fits");
     assert_eq!(budget.reserved(), 2_000);
     assert_eq!(request.count, 1);
@@ -951,7 +1104,7 @@ fn scheduler_drops_queued_ranges_whose_anchor_left_current_header_spine() {
     let mut budget = ByteBudget::new(10_000);
     assert!(
         scheduler
-            .next_for_peer(&peer, &state, &mut budget)
+            .next_for_peer(&peer, &state, &mut budget, u64::MAX)
             .is_none(),
         "stale queued anchors must not survive a re-derived needed set"
     );
@@ -972,7 +1125,7 @@ fn scheduler_uses_ewma_for_unknown_and_confirmed_size_values() {
     let mut budget = ByteBudget::new(100_000);
 
     let request = scheduler
-        .next_for_peer(&peer, &state, &mut budget)
+        .next_for_peer(&peer, &state, &mut budget, u64::MAX)
         .expect("range fits");
     assert_eq!(request.count, 3);
     assert_eq!(request.estimated_bytes, 52_000);

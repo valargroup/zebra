@@ -4,7 +4,13 @@ use crate::zakura::{
     ZakuraBlockSyncCandidateState,
 };
 
-pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 8;
+/// Hard ceiling on outbound block-range requests kept in flight to one peer.
+///
+/// A safety bound only; the binding per-peer concurrency is the peer's advertised
+/// `max_inflight_requests` (config `max_inflight_requests`, clamped to
+/// [`DEFAULT_BS_MAX_INFLIGHT`]). Set well above the configured cap so the byte
+/// budget and per-peer byte cap, not this ceiling, govern in-flight depth.
+pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 64;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

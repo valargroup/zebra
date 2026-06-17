@@ -111,6 +111,7 @@ impl BlockRangeScheduler {
         peer_id: &ZakuraPeerId,
         peer: &PeerBlockState,
         budget: &mut ByteBudget,
+        per_peer_byte_cap: u64,
     ) -> Option<BlockRangeRequest> {
         self.prune_covered();
         let index = self.queue.iter().position(|range| {
@@ -120,9 +121,18 @@ impl BlockRangeScheduler {
         })?;
 
         let range = self.queue[index].clone();
+        // Bound this peer's share of the global byte budget so one fast peer
+        // cannot reserve the whole window and starve the others.
+        let peer_reserved: u64 = peer
+            .outstanding
+            .iter()
+            .map(|outstanding| outstanding.reserved_bytes())
+            .sum();
+        let peer_headroom = per_peer_byte_cap.saturating_sub(peer_reserved);
         let max_bytes = budget
             .available()
-            .min(u64::from(peer.max_response_bytes.max(1)));
+            .min(u64::from(peer.max_response_bytes.max(1)))
+            .min(peer_headroom);
         let max_count = peer.max_blocks_per_response.max(1);
         let mut estimated_bytes = 0u64;
         let mut selected = Vec::new();

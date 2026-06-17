@@ -1280,64 +1280,76 @@ impl BlockSyncReactor {
         let mut peer_ids: Vec<_> = self.state.peers.keys().cloned().collect();
         peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
+        let per_peer_byte_cap = self.startup.config.per_peer_byte_cap();
+
         for peer_id in peer_ids {
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
-            };
-            if !peer.received_status || peer.available_slots() == 0 {
-                continue;
-            }
-            let Some(request) =
-                self.state
-                    .schedule
-                    .next_for_peer(&peer_id, peer, &mut self.state.budget)
-            else {
-                continue;
-            };
+            // Fill this peer's available slots in one pass, letting the byte
+            // budget (re-checked each iteration) be the congestion window. A
+            // raised slot cap is only useful if we can open the window promptly
+            // rather than one slot per scheduling event.
+            loop {
+                if self.should_pause_new_body_downloads() {
+                    return;
+                }
+                let Some(peer) = self.state.peers.get(&peer_id) else {
+                    break;
+                };
+                if !peer.received_status || peer.available_slots() == 0 {
+                    break;
+                }
+                let Some(request) = self.state.schedule.next_for_peer(
+                    &peer_id,
+                    peer,
+                    &mut self.state.budget,
+                    per_peer_byte_cap,
+                ) else {
+                    break;
+                };
 
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
-            };
-            if let Err(error) = peer
-                .session
-                .try_send_get_blocks(request.start_height, request.count)
-            {
-                tracing::debug!(
-                    peer = ?peer_id,
-                    start_height = ?request.start_height,
-                    count = request.count,
-                    ?error,
-                    "failed to queue Zakura block-sync GetBlocks"
+                let Some(peer) = self.state.peers.get(&peer_id) else {
+                    break;
+                };
+                if let Err(error) = peer
+                    .session
+                    .try_send_get_blocks(request.start_height, request.count)
+                {
+                    tracing::debug!(
+                        peer = ?peer_id,
+                        start_height = ?request.start_height,
+                        count = request.count,
+                        ?error,
+                        "failed to queue Zakura block-sync GetBlocks"
+                    );
+                    self.state.budget.release(request.estimated_bytes);
+                    self.state.schedule.retry(request);
+                    break;
+                }
+
+                metrics::counter!("sync.block.request.sent").increment(1);
+                self.trace_get_blocks_sent(
+                    &peer_id,
+                    request.start_height,
+                    request.count,
+                    request.estimated_bytes,
                 );
-                self.state.budget.release(request.estimated_bytes);
-                self.state.schedule.retry(request);
-                continue;
+                let deadline = Instant::now() + self.startup.config.request_timeout;
+                if let Some(peer) = self.state.peers.get_mut(&peer_id) {
+                    peer.outstanding.push(OutstandingBlockRange {
+                        request: request.clone(),
+                        deadline,
+                        received: HashSet::new(),
+                    });
+                }
+                let _ = self
+                    .dispatch_action(BlockSyncAction::SendMessage {
+                        peer: peer_id.clone(),
+                        msg: BlockSyncMessage::GetBlocks {
+                            start_height: request.start_height,
+                            count: request.count,
+                        },
+                    })
+                    .await;
             }
-
-            metrics::counter!("sync.block.request.sent").increment(1);
-            self.trace_get_blocks_sent(
-                &peer_id,
-                request.start_height,
-                request.count,
-                request.estimated_bytes,
-            );
-            let deadline = Instant::now() + self.startup.config.request_timeout;
-            if let Some(peer) = self.state.peers.get_mut(&peer_id) {
-                peer.outstanding.push(OutstandingBlockRange {
-                    request: request.clone(),
-                    deadline,
-                    received: HashSet::new(),
-                });
-            }
-            let _ = self
-                .dispatch_action(BlockSyncAction::SendMessage {
-                    peer: peer_id,
-                    msg: BlockSyncMessage::GetBlocks {
-                        start_height: request.start_height,
-                        count: request.count,
-                    },
-                })
-                .await;
         }
     }
 
