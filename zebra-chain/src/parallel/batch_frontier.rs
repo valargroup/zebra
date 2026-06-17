@@ -191,14 +191,20 @@ where
     Frontier::from_parts(position, leaf, ommers)
 }
 
-/// Appends `nodes` to `frontier` tracking the single subtree boundary that a block
-/// may cross, returning the updated frontier and the completed subtree's
-/// `(index_value, root)` if the boundary was crossed.
+/// Appends `nodes` to `frontier` and returns the completed subtree's
+/// `(index_value, root)` if the batch crosses a [`TRACKED_SUBTREE_HEIGHT`] boundary.
 ///
 /// This is the shared implementation for [`crate::sapling::tree::NoteCommitmentTree::append_batch`]
 /// and [`crate::orchard::tree::NoteCommitmentTree::append_batch`]. Callers convert their
 /// commitment type to `H` before calling and wrap the returned index value in
 /// `NoteCommitmentSubtreeIndex`.
+///
+/// # Precondition
+///
+/// `nodes` must contain the commitments from a single block. The consensus block-size
+/// cap bounds a block to far fewer than `2^TRACKED_SUBTREE_HEIGHT` (65,536) outputs or
+/// actions, so a batch can cross **at most one** subtree boundary. Passing a batch that
+/// spans two or more boundaries will silently drop all but the first completed subtree.
 ///
 /// Returns [`FrontierError`] if appending would overflow the tree's capacity.
 pub fn append_batch_with_subtree<H, const DEPTH: u8>(

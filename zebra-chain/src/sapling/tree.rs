@@ -217,14 +217,18 @@ impl NoteCommitmentTree {
         }
     }
 
-    /// Appends a batch of note commitment u-coordinates to the tree in parallel,
-    /// returning the index and root of any [`TRACKED_SUBTREE_HEIGHT`] subtree
-    /// completed by the batch.
+    /// Appends a batch of note commitment u-coordinates from a single block to the
+    /// tree in parallel, returning the index and root of the [`TRACKED_SUBTREE_HEIGHT`]
+    /// subtree completed by the batch, if any.
     ///
-    /// The result is identical to calling [`Self::append`] for each commitment in
-    /// order — and capturing the last completed subtree — but the Merkle hashing
-    /// is parallelized across the rayon pool. This equivalence is enforced by the
-    /// differential property tests in [`crate::parallel::batch_frontier`].
+    /// The Merkle hashing is parallelized across the rayon pool; the frontier and
+    /// subtree result are identical to calling [`Self::append`] for each commitment
+    /// in order. This equivalence is enforced by the differential property tests in
+    /// [`crate::parallel::batch_frontier`].
+    ///
+    /// `cms` must contain the outputs of a single block. The consensus block-size cap
+    /// bounds a block to far fewer than `2^TRACKED_SUBTREE_HEIGHT` (65,536) outputs,
+    /// so at most one subtree boundary can be crossed per call.
     ///
     /// Returns an error if the tree would overflow its capacity.
     #[allow(clippy::unwrap_in_result)]
