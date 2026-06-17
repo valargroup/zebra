@@ -321,6 +321,20 @@ pub enum HeaderSyncAction {
         /// Last missing height.
         to: block::Height,
     },
+    /// Notify production wiring that header sync advanced its best header target.
+    HeaderAdvanced {
+        /// New best-header target height.
+        height: block::Height,
+        /// New best-header target hash.
+        hash: block::Hash,
+    },
+    /// Notify production wiring that header sync re-anchored its best header target.
+    HeaderReanchored {
+        /// Previous best-header target.
+        old: (block::Height, block::Hash),
+        /// New best-header target.
+        new: (block::Height, block::Hash),
+    },
     /// Inform later block-pipeline wiring that a validated tip block arrived.
     NewBlockReceived {
         /// Source peer.

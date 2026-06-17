@@ -935,6 +935,8 @@ mod tests {
                 HeaderSyncAction::BodyGaps { from, to } => {
                     local.observed_gaps.lock().await.push((from, to));
                 }
+                HeaderSyncAction::HeaderAdvanced { .. } => {}
+                HeaderSyncAction::HeaderReanchored { .. } => {}
                 HeaderSyncAction::NewBlockReceived {
                     peer,
                     height,
@@ -1274,7 +1276,9 @@ mod tests {
                     }
                     HeaderSyncAction::QueryBestHeaderTip
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
-                    | HeaderSyncAction::BodyGaps { .. } => {}
+                    | HeaderSyncAction::BodyGaps { .. }
+                    | HeaderSyncAction::HeaderAdvanced { .. }
+                    | HeaderSyncAction::HeaderReanchored { .. } => {}
                 }
             }
         })

@@ -657,6 +657,7 @@ async fn next_non_query_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -
             HeaderSyncAction::QueryBestHeaderTip
                 | HeaderSyncAction::QueryMissingBlockBodies { .. }
                 | HeaderSyncAction::QueryHeadersByHeightRange { .. }
+                | HeaderSyncAction::HeaderAdvanced { .. }
         ) {
             return action;
         }
@@ -2073,6 +2074,13 @@ async fn full_block_committed_covers_outstanding_height() {
         })
         .await
         .unwrap();
+    match next_action(&mut fixture.actions).await {
+        HeaderSyncAction::HeaderAdvanced { height, hash } => {
+            assert_eq!(height, block::Height(1));
+            assert_eq!(hash, block::Hash([1; 32]));
+        }
+        action => panic!("full block commit must publish a header advance, got {action:?}"),
+    }
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
@@ -3392,15 +3400,32 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
     assert_eq!(fixture.handle.best_header_tip(), verified);
 
     let expected_start = verified.0.next().expect("genesis has a successor");
-    for _ in 0..4 {
-        let (_served_peer, start_height, _count) =
-            next_outbound_get_headers(&mut fixture.actions).await;
-        if start_height == expected_start {
-            assert_no_commit_or_misbehavior(&mut fixture.actions).await;
-            return;
+    let mut saw_reanchor_action = false;
+    for _ in 0..8 {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                assert_eq!(old, stranded_tip);
+                assert_eq!(new, verified);
+                saw_reanchor_action = true;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count: _,
+                    },
+                ..
+            } if saw_reanchor_action && start_height == expected_start => {
+                assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+                return;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
         }
     }
-    panic!("after re-anchor, header sync did not request forward from the verified tip");
+    panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
 }
 
 #[tokio::test(flavor = "current_thread")]

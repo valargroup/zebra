@@ -30,6 +30,12 @@ pub fn spawn_block_sync_reactor(
     mpsc::Receiver<BlockSyncAction>,
     JoinHandle<()>,
 ) {
+    debug_assert!(
+        !startup.state_queries_enabled
+            || (startup.header_tip.is_some() ^ startup.frontier_updates.is_some()),
+        "state-backed block sync must have exactly one frontier source",
+    );
+
     let state = BlockSyncState::new(&startup);
     let (events_tx, events_rx) =
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
@@ -325,6 +331,11 @@ impl BlockSyncReactor {
 
     async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
         let frontier = update.frontier;
+        let state_frontiers = BlockSyncFrontiers {
+            finalized_height: frontier.finalized.height,
+            verified_block_tip: frontier.verified_body.height,
+            verified_block_hash: frontier.verified_body.hash,
+        };
         match update.change {
             FrontierChange::Snapshot => {
                 self.handle_header_tip_changed(
@@ -332,12 +343,7 @@ impl BlockSyncReactor {
                     frontier.best_header.hash,
                 )
                 .await;
-                self.handle_state_frontiers_changed(BlockSyncFrontiers {
-                    finalized_height: frontier.finalized.height,
-                    verified_block_tip: frontier.verified_body.height,
-                    verified_block_hash: frontier.verified_body.hash,
-                })
-                .await;
+                self.handle_state_frontiers_changed(state_frontiers).await;
             }
             FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {
                 self.handle_header_tip_changed(
@@ -345,22 +351,29 @@ impl BlockSyncReactor {
                     frontier.best_header.hash,
                 )
                 .await;
+                if frontier.verified_body.height > self.state.verified_block_tip {
+                    self.handle_state_frontiers_changed(state_frontiers).await;
+                }
             }
             FrontierChange::VerifiedGrow => {
-                self.handle_state_frontiers_changed(BlockSyncFrontiers {
-                    finalized_height: frontier.finalized.height,
-                    verified_block_tip: frontier.verified_body.height,
-                    verified_block_hash: frontier.verified_body.hash,
-                })
-                .await;
+                self.handle_state_frontiers_changed(state_frontiers).await;
+                if frontier.best_header.height > self.state.best_header_tip {
+                    self.handle_header_tip_changed(
+                        frontier.best_header.height,
+                        frontier.best_header.hash,
+                    )
+                    .await;
+                }
             }
             FrontierChange::VerifiedReset => {
-                self.handle_chain_tip_reset(BlockSyncFrontiers {
-                    finalized_height: frontier.finalized.height,
-                    verified_block_tip: frontier.verified_body.height,
-                    verified_block_hash: frontier.verified_body.hash,
-                })
-                .await;
+                self.handle_chain_tip_reset(state_frontiers).await;
+                if frontier.best_header.height > self.state.best_header_tip {
+                    self.handle_header_tip_changed(
+                        frontier.best_header.height,
+                        frontier.best_header.hash,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1655,6 +1668,14 @@ impl BlockSyncReactor {
             .set(self.state.budget.reserved() as f64);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.state.reorder.buffered_bytes() as f64);
+        metrics::gauge!("sync.block.applying").set(self.state.applying.len() as f64);
+        metrics::gauge!("sync.block.outstanding").set(
+            self.state
+                .peers
+                .values()
+                .map(|peer| peer.outstanding.len())
+                .sum::<usize>() as f64,
+        );
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {

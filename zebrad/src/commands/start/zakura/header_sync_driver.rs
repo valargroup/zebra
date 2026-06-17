@@ -657,6 +657,24 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         .min(DEFAULT_HS_RANGE);
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
             }
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                publish_header_frontier(
+                    &handles.endpoint,
+                    height,
+                    hash,
+                    FrontierChange::HeaderAdvanced,
+                    &trace,
+                );
+            }
+            HeaderSyncAction::HeaderReanchored { old: _, new } => {
+                publish_header_frontier(
+                    &handles.endpoint,
+                    new.0,
+                    new.1,
+                    FrontierChange::HeaderReanchored,
+                    &trace,
+                );
+            }
         }
     }
 }
@@ -674,7 +692,7 @@ pub(crate) fn publish_header_frontier(
 
     update.frontier.best_header = Frontier::new(height, hash);
     update.change = change;
-    endpoint.publish_sync_frontier(update);
+    endpoint.publish_sync_frontier_from(update, "header_sync_driver");
     emit_commit_state(
         trace,
         cs_trace::BLOCK_SYNC_NOTIFY_SENT,
@@ -919,14 +937,16 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             },
         );
         if let Some(mut update) = endpoint.current_sync_frontier() {
-            update.frontier.finalized.height = finalized_height;
+            if let Some((finalized_height, finalized_hash)) = finalized_tip {
+                update.frontier.finalized = Frontier::new(finalized_height, finalized_hash);
+            }
             update.frontier.verified_body =
                 Frontier::new(verified_block_tip.0, verified_block_tip.1);
             update.change = match action {
                 zebra_state::TipAction::Grow { .. } => FrontierChange::VerifiedGrow,
                 zebra_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
             };
-            endpoint.publish_sync_frontier(update);
+            endpoint.publish_sync_frontier_from(update, "chain_tip_mirror");
             emit_commit_state(
                 &trace,
                 cs_trace::FRONTIER_DERIVED,
@@ -1089,6 +1109,17 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                     cs_trace::RANGE_COUNT,
                     u64::from(to.0.saturating_sub(from.0).saturating_add(1)),
                 );
+            }
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                insert_cs_str(row, cs_trace::ACTION, "header_advanced");
+                insert_cs_height(row, cs_trace::HEIGHT, *height);
+                insert_cs_hash(row, cs_trace::HASH, *hash);
+            }
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                insert_cs_str(row, cs_trace::ACTION, "header_reanchored");
+                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, old.0);
+                insert_cs_height(row, cs_trace::HEIGHT, new.0);
+                insert_cs_hash(row, cs_trace::HASH, new.1);
             }
             HeaderSyncAction::NewBlockReceived {
                 peer, height, hash, ..

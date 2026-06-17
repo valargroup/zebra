@@ -1254,16 +1254,26 @@ impl HeaderSyncReactor {
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_advanced(height, hash);
         let _ = self.tip.send((height, hash));
+        let _ = self
+            .dispatch_action(HeaderSyncAction::HeaderAdvanced { height, hash })
+            .await;
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
 
     async fn publish_best_tip_reanchored(&mut self, height: block::Height, hash: block::Hash) {
+        let old = (self.state.best_header_tip, self.state.best_header_hash);
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_reanchored(height, hash);
         let _ = self.tip.send((height, hash));
+        let _ = self
+            .dispatch_action(HeaderSyncAction::HeaderReanchored {
+                old,
+                new: (height, hash),
+            })
+            .await;
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
@@ -1575,6 +1585,17 @@ impl HeaderSyncReactor {
                     hs_trace::RANGE_COUNT,
                     u64::from(count_between(*from, *to)),
                 );
+            }
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_advanced"));
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *hash);
+            }
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_reanchored"));
+                insert_height(row, hs_trace::HEIGHT, new.0);
+                insert_hash(row, hs_trace::HASH, new.1);
+                insert_height(row, hs_trace::RANGE_START, old.0);
             }
         });
     }

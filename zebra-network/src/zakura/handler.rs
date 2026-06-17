@@ -48,18 +48,18 @@ use super::{
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        apply_frontier_update, direct_endpoint_builder, drive_header_sync_actions,
-        spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers,
-        BlockSyncHandle, BlockSyncService, BlockSyncStartup, Clock, Frame, FramedRecv, FramedSend,
-        Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
+        direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
+        spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
+        BlockSyncService, BlockSyncStartup, Clock, Frame, FramedRecv, FramedSend, Frontier,
+        FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
         Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
         StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraControlAck,
         ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
         ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
         ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
-        FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
+        ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
+        CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
         ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
@@ -424,7 +424,7 @@ pub struct ZakuraEndpoint {
     handler: ZakuraProtocolHandler,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    sync_frontier: Option<watch::Sender<FrontierUpdate>>,
+    sync_frontier: Option<ZakuraSyncExchange>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
@@ -497,23 +497,27 @@ impl ZakuraEndpoint {
 
     /// Subscribe to the shared Zakura sync frontier stream.
     pub fn subscribe_sync_frontier(&self) -> Option<watch::Receiver<FrontierUpdate>> {
-        self.sync_frontier.as_ref().map(watch::Sender::subscribe)
+        self.sync_frontier
+            .as_ref()
+            .map(ZakuraSyncExchange::subscribe_frontier)
     }
 
     /// Return the currently cached shared Zakura sync frontier update.
     pub fn current_sync_frontier(&self) -> Option<FrontierUpdate> {
         self.sync_frontier
             .as_ref()
-            .map(|sync_frontier| *sync_frontier.borrow())
+            .map(ZakuraSyncExchange::current_frontier)
     }
 
     /// Publish a shared Zakura sync frontier update.
     pub fn publish_sync_frontier(&self, update: FrontierUpdate) {
+        self.publish_sync_frontier_from(update, "unknown");
+    }
+
+    /// Publish a shared Zakura sync frontier update with a trace source.
+    pub fn publish_sync_frontier_from(&self, update: FrontierUpdate, source: &'static str) {
         if let Some(sync_frontier) = &self.sync_frontier {
-            let current = *sync_frontier.borrow();
-            if let Some(update) = apply_frontier_update(current, update) {
-                let _ = sync_frontier.send(update);
-            }
+            sync_frontier.publish_frontier(update, source);
         }
     }
 
@@ -2384,7 +2388,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
             ),
             change: FrontierChange::Snapshot,
         };
-        watch::channel(initial)
+        ZakuraSyncExchange::new(initial, trace.clone())
     });
     let mut startup = HeaderSyncStartup::new(
         config.network.clone(),
@@ -2398,7 +2402,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     startup.trace = trace.clone();
     startup.frontier_updates = sync_frontier
         .as_ref()
-        .map(|(sender, _receiver)| sender.subscribe());
+        .map(ZakuraSyncExchange::subscribe_frontier);
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
     if header_sync_driver_startup.is_some() {
@@ -2413,8 +2417,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
             let frontier_updates = sync_frontier
                 .as_ref()
                 .expect("sync frontier is initialized when block sync driver is enabled")
-                .0
-                .subscribe();
+                .subscribe_frontier();
             let mut startup = BlockSyncStartup::new_with_exchange(
                 BlockSyncFrontiers {
                     finalized_height: driver_startup.frontiers.finalized_height,
@@ -2489,7 +2492,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         handler,
         header_sync: Some(header_sync),
         block_sync,
-        sync_frontier: sync_frontier.map(|(sender, _receiver)| sender),
+        sync_frontier,
         header_sync_tasks: Some(header_sync_tasks),
         header_sync_actions,
         block_sync_actions,

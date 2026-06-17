@@ -14,6 +14,22 @@
 //!
 //! To force it in any CI environment, set `ZAKURA_REGTEST_E2E=1`.
 //!
+//! `ZAKURA_E2E_MODE` selects the shell harness mode:
+//!
+//! - `smoke` (default): the existing four-node flow with a short chain, reset
+//!   catch-up, and non-finalized reorg.
+//! - `pr-gate`: a trimmed PR/merge-queue confidence gate that derives a short
+//!   checkpoint list, forces a from-zero kind-6 catch-up across a checkpoint to
+//!   full-verifier handoff, runs the trace oracle as a primary assertion layer,
+//!   and writes a compact `timeline.jsonl` artifact.
+//! - `checkpoint-long`: mines a 4,000-block Regtest chain and derives
+//!   checkpoints every 400 blocks before node2's from-zero catch-up.
+//! - `no-checkpoint-long`: mines the same long chain but configures node2 with
+//!   `checkpoints = false`, leaving only genesis before full verification.
+//! - `restart-matrix`: uses the long checkpoint chain and restarts node2 around
+//!   height 0, 399/400/401, 2,000, near tip with a 1,000-block gap, and after
+//!   the non-finalized reorg.
+//!
 //! It shells out to `docker/zakura-regtest-e2e/run.sh`, which builds `zebrad`
 //! (debug) if needed, brings up four Regtest nodes sharing the host network — a
 //! dual-stack seed, a pure Zakura-only node (`legacy_p2p = false`) that joins

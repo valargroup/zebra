@@ -76,7 +76,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
-    let checkpoint_apply_limit = checkpoint_apply_limit.max(sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT);
+    let checkpoint_apply_limit = checkpoint_apply_limit
+        .max(sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT)
+        .min(zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP);
     let full_apply_limit = full_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
     let mut pending_applies = VecDeque::new();
     let mut in_flight_applies = FuturesUnordered::new();
@@ -503,7 +505,16 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
         insert_cs_hash(row, cs_trace::HASH, expected_hash);
     });
     let started = Instant::now();
-    let result = commit_block_sync_body(block_verifier.clone(), block, class).await;
+    let result = commit_block_sync_body_with_stall_trace(
+        block_verifier.clone(),
+        block,
+        class,
+        &trace,
+        token,
+        height,
+        expected_hash,
+    )
+    .await;
     emit_commit_state(
         &trace,
         cs_trace::COMMIT_FINISH,
@@ -582,6 +593,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
                 read_state,
                 latest_chain_tip,
                 endpoint,
+                Some(block_sync),
                 trace,
                 local_frontier
                     .map(|frontiers| frontiers.verified_block_tip)
@@ -605,6 +617,7 @@ pub(crate) fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bo
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: Arc<block::Block>,
@@ -621,14 +634,82 @@ where
     let commit = block_verifier
         .clone()
         .oneshot(zebra_consensus::Request::Commit(block));
-    let outcome = match class {
-        BlockApplyClass::Checkpoint => Ok(commit.await),
+    match class {
+        BlockApplyClass::Checkpoint => block_commit_result(height, expected_hash, commit.await),
         BlockApplyClass::Full => {
-            tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await
+            match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
+                Ok(outcome) => block_commit_result(height, expected_hash, outcome),
+                Err(_elapsed) => block_commit_timed_out(height, expected_hash),
+            }
         }
-    };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
+    block_verifier: BlockVerifier,
+    block: Arc<block::Block>,
+    class: BlockApplyClass,
+    trace: &ZakuraTrace,
+    token: BlockApplyToken,
+    height: block::Height,
+    expected_hash: block::Hash,
+) -> BlockApplyResult
+where
+    BlockVerifier:
+        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+    BlockVerifier::Future: Send + 'static,
+{
+    let commit = block_verifier
+        .clone()
+        .oneshot(zebra_consensus::Request::Commit(block));
+
+    match class {
+        BlockApplyClass::Checkpoint => {
+            tokio::pin!(commit);
+            tokio::select! {
+                outcome = &mut commit => block_commit_result(Some(height), expected_hash, outcome),
+                _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
+                    emit_commit_state(
+                        trace,
+                        cs_trace::COMMIT_STALLED,
+                        "block_sync_driver",
+                        |row| {
+                            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+                            insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
+                            insert_cs_height(row, cs_trace::HEIGHT, height);
+                            insert_cs_hash(row, cs_trace::HASH, expected_hash);
+                            insert_cs_u64(
+                                row,
+                                cs_trace::ELAPSED_MS,
+                                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT.as_millis().try_into().unwrap_or(u64::MAX),
+                            );
+                        },
+                    );
+                    block_commit_result(Some(height), expected_hash, commit.await)
+                }
+            }
+        }
+        BlockApplyClass::Full => {
+            match tokio::time::timeout(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, commit).await {
+                Ok(outcome) => block_commit_result(Some(height), expected_hash, outcome),
+                Err(_elapsed) => block_commit_timed_out(Some(height), expected_hash),
+            }
+        }
+    }
+}
+
+fn block_commit_result<E>(
+    height: Option<block::Height>,
+    expected_hash: block::Hash,
+    outcome: Result<block::Hash, E>,
+) -> BlockApplyResult
+where
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
     match outcome {
-        Ok(Ok(committed_hash)) if committed_hash == expected_hash => {
+        Ok(committed_hash) if committed_hash == expected_hash => {
             debug!(
                 ?height,
                 ?committed_hash,
@@ -636,7 +717,7 @@ where
             );
             BlockApplyResult::Committed
         }
-        Ok(Ok(committed_hash)) => {
+        Ok(committed_hash) => {
             warn!(
                 ?height,
                 ?expected_hash,
@@ -645,7 +726,7 @@ where
             );
             BlockApplyResult::Rejected
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             if block_verify_error_is_duplicate(&error) {
                 debug!(
                     ?height,
@@ -664,21 +745,26 @@ where
                 BlockApplyResult::Rejected
             }
         }
-        Err(_elapsed) => {
-            warn!(
-                ?height,
-                ?expected_hash,
-                "timed out committing Zakura block-sync body"
-            );
-            BlockApplyResult::TimedOut
-        }
     }
+}
+
+fn block_commit_timed_out(
+    height: Option<block::Height>,
+    expected_hash: block::Hash,
+) -> BlockApplyResult {
+    warn!(
+        ?height,
+        ?expected_hash,
+        "timed out committing Zakura block-sync body"
+    );
+    BlockApplyResult::TimedOut
 }
 
 async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
     read_state: ReadState,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     endpoint: Option<ZakuraEndpoint>,
+    block_sync: Option<BlockSyncHandle>,
     trace: ZakuraTrace,
     highest_observed_at_apply: block::Height,
 ) where
@@ -716,6 +802,11 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
 
         highest_sent = frontiers.verified_block_tip;
         publish_body_frontier(endpoint.as_ref(), frontiers, FrontierChange::VerifiedGrow);
+        if let Some(block_sync) = &block_sync {
+            let _ = block_sync
+                .send(BlockSyncEvent::ChainTipGrow(frontiers))
+                .await;
+        }
         emit_commit_state(
             &trace,
             cs_trace::CHECKPOINT_REFRESH_SENT,
@@ -738,11 +829,14 @@ fn publish_body_frontier(
     let Some(mut update) = endpoint.current_sync_frontier() else {
         return;
     };
-    update.frontier.finalized.height = frontiers.finalized_height;
+    if frontiers.finalized_height == frontiers.verified_block_tip {
+        update.frontier.finalized =
+            Frontier::new(frontiers.finalized_height, frontiers.verified_block_hash);
+    }
     update.frontier.verified_body =
         Frontier::new(frontiers.verified_block_tip, frontiers.verified_block_hash);
     update.change = change;
-    endpoint.publish_sync_frontier(update);
+    endpoint.publish_sync_frontier_from(update, "block_sync_driver");
 }
 
 async fn query_block_sync_needed_blocks<ReadState>(
