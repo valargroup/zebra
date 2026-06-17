@@ -143,6 +143,7 @@ where
 
     // Decompose [size, size + body.len()) into maximal position-aligned dyadic
     // blocks, then compute each block's root in parallel.
+    // Dyadic block means that the block is aligned to the power of 2: 1, 2, 4 ...
     let mut blocks: Vec<(usize, &[H])> = Vec::new();
     {
         let mut pos = size;
@@ -217,7 +218,7 @@ mod tests {
     }
 
     /// Append `leaves` to `start` one at a time using the sequential crate API.
-    fn sequential_append(
+    fn sequential_append<const DEPTH: u8>(
         start: Frontier<TestNode, DEPTH>,
         leaves: &[TestNode],
     ) -> Frontier<TestNode, DEPTH> {
@@ -228,7 +229,7 @@ mod tests {
         f
     }
 
-    fn build_frontier(prefix: &[TestNode]) -> Frontier<TestNode, DEPTH> {
+    fn build_frontier<const DEPTH: u8>(prefix: &[TestNode]) -> Frontier<TestNode, DEPTH> {
         let mut f = Frontier::<TestNode, DEPTH>::empty();
         for leaf in prefix {
             assert!(f.append(*leaf));
@@ -248,9 +249,9 @@ mod tests {
             batch in proptest::collection::vec(any::<u64>().prop_map(TestNode), 0..300),
         ) {
             let prefix: Vec<TestNode> = (0..prefix_len as u64).map(TestNode).collect();
-            let start = build_frontier(&prefix);
+            let start = build_frontier::<DEPTH>(&prefix);
 
-            let seq = sequential_append(start.clone(), &batch);
+            let seq = sequential_append::<DEPTH>(start.clone(), &batch);
             let par = parallel_append(start, batch.clone()).expect("no overflow in tests");
 
             prop_assert_eq!(seq.root(), par.root(), "root mismatch");
@@ -267,11 +268,108 @@ mod tests {
     fn exhaustive_small() {
         for prefix_len in 0u64..40 {
             let prefix: Vec<TestNode> = (0..prefix_len).map(TestNode).collect();
-            let start = build_frontier(&prefix);
+            let start = build_frontier::<DEPTH>(&prefix);
             for batch_len in 0u64..40 {
                 let batch: Vec<TestNode> = (1000..1000 + batch_len).map(TestNode).collect();
-                let seq = sequential_append(start.clone(), &batch);
+                let seq = sequential_append::<DEPTH>(start.clone(), &batch);
                 let par = parallel_append(start.clone(), batch).expect("no overflow");
+                assert_eq!(
+                    seq.root(),
+                    par.root(),
+                    "root mismatch p={prefix_len} b={batch_len}"
+                );
+                assert_eq!(
+                    seq.value().map(|f| f.clone().into_parts()),
+                    par.value().map(|f| f.clone().into_parts()),
+                    "parts mismatch p={prefix_len} b={batch_len}"
+                );
+            }
+        }
+    }
+
+    /// A full batch append should either succeed completely or report overflow.
+    #[test]
+    fn overflow_is_reported() {
+        const SMALL_DEPTH: u8 = 3;
+
+        let prefix: Vec<TestNode> = (0..7).map(TestNode).collect();
+        let start = build_frontier::<SMALL_DEPTH>(&prefix);
+        let exact_capacity_batch = [TestNode(100)];
+
+        let seq = sequential_append::<SMALL_DEPTH>(start.clone(), &exact_capacity_batch);
+        let par = parallel_append(start.clone(), exact_capacity_batch.to_vec())
+            .expect("one remaining leaf fits");
+
+        assert_eq!(seq.root(), par.root(), "root mismatch at exact capacity");
+        assert_eq!(
+            seq.value().map(|f| f.clone().into_parts()),
+            par.value().map(|f| f.clone().into_parts()),
+            "parts mismatch at exact capacity"
+        );
+
+        let empty_append = parallel_append(par.clone(), Vec::new()).expect("empty append succeeds");
+        assert_eq!(
+            par.value().map(|f| f.clone().into_parts()),
+            empty_append.value().map(|f| f.clone().into_parts()),
+            "empty append changed a full frontier"
+        );
+
+        let full_tree_overflow = parallel_append(par, vec![TestNode(101)]);
+        assert!(
+            full_tree_overflow.is_err(),
+            "appending to a full tree overflows"
+        );
+
+        let partial_batch_overflow = parallel_append(start, vec![TestNode(100), TestNode(101)]);
+        assert!(
+            partial_batch_overflow.is_err(),
+            "batch crossing tree capacity overflows"
+        );
+    }
+
+    /// Deterministic positions around powers of two exercise carry propagation and
+    /// globally aligned dyadic block decomposition beyond the small exhaustive range.
+    #[test]
+    fn matches_sequential_at_alignment_boundaries() {
+        let interesting_prefix_lengths = [
+            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 255, 256, 257, 65_535, 65_536, 65_537,
+        ];
+        let interesting_batch_lengths = [0usize, 1, 2, 3, 4, 5, 31, 32, 33];
+        let max_prefix_len = *interesting_prefix_lengths
+            .last()
+            .expect("interesting prefixes are non-empty");
+
+        let mut frontier = Frontier::<TestNode, DEPTH>::empty();
+        let mut snapshots = Vec::new();
+
+        for prefix_len in 0..=max_prefix_len {
+            if interesting_prefix_lengths.contains(&prefix_len) {
+                snapshots.push((prefix_len, frontier.clone()));
+            }
+
+            if prefix_len < max_prefix_len {
+                assert!(frontier.append(TestNode(
+                    u64::try_from(prefix_len).expect("test prefix length fits in u64")
+                )));
+            }
+        }
+
+        for (prefix_len, start) in snapshots {
+            for batch_len in interesting_batch_lengths {
+                let prefix_len = u64::try_from(prefix_len).expect("test prefix length fits in u64");
+                let batch: Vec<TestNode> = (0..batch_len)
+                    .map(|leaf| {
+                        TestNode(
+                            1_000_000
+                                + prefix_len
+                                + u64::try_from(leaf).expect("test batch length fits in u64"),
+                        )
+                    })
+                    .collect();
+
+                let seq = sequential_append::<DEPTH>(start.clone(), &batch);
+                let par = parallel_append(start.clone(), batch).expect("no overflow");
+
                 assert_eq!(
                     seq.root(),
                     par.root(),
