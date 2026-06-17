@@ -417,7 +417,6 @@ impl NoteCommitmentTree {
         cms: &[NoteCommitmentUpdate],
     ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
         use crate::parallel::batch_frontier::parallel_append;
-        use incrementalmerkletree::frontier::Frontier;
 
         if cms.is_empty() {
             return Ok(None);
@@ -433,7 +432,7 @@ impl NoteCommitmentTree {
         let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
         let boundary = (old_size / subtree_size + 1) * subtree_size;
 
-        let frontier = std::mem::replace(&mut self.inner, Frontier::empty());
+        let frontier = self.inner.clone();
 
         let (frontier, completed) = if boundary <= new_size {
             let head_len = (boundary - old_size) as usize;
@@ -778,5 +777,42 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
         }
 
         tree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use incrementalmerkletree::{frontier::Frontier, Position};
+
+    use super::*;
+
+    fn note_commitment(value: u64) -> NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .expect("small little-endian integers are canonical field elements")
+    }
+
+    #[test]
+    fn append_batch_overflow_preserves_tree_and_cached_root() {
+        let max_position = (1u64 << MERKLE_DEPTH) - 1;
+        let leaf = Node(note_commitment(1));
+        let ommers = vec![Node(note_commitment(2)); usize::from(MERKLE_DEPTH)];
+        let inner = Frontier::from_parts(Position::from(max_position), leaf, ommers)
+            .expect("max-depth frontier is valid");
+        let mut tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let result = tree.append_batch(&[note_commitment(3)]);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
     }
 }
