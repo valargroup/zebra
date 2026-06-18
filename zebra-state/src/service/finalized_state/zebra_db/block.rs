@@ -556,6 +556,11 @@ impl ZebraDb {
         source: &str,
         retention: RetentionPlan,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        // Time the DB reads + setup done before building the write batch (UTXO
+        // and address-balance lookups), to separate them from batch construction.
+        #[cfg(feature = "commit-metrics")]
+        let _reads_start = std::time::Instant::now();
+
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -670,9 +675,15 @@ impl ZebraDb {
             }))
         };
 
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.batch_reads.duration_seconds")
+            .record(_reads_start.elapsed().as_secs_f64());
+
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
+        #[cfg(feature = "commit-metrics")]
+        let _prepare_start = std::time::Instant::now();
         batch.prepare_block_batch(
             self,
             network,
@@ -687,6 +698,9 @@ impl ZebraDb {
             prev_note_commitment_trees,
             retention.stores_raw_transactions(),
         )?;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.prepare_batch.duration_seconds")
+            .record(_prepare_start.elapsed().as_secs_f64());
 
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
@@ -970,8 +984,29 @@ impl DiskWriteBatch {
     ) -> Result<(), CommitCheckpointVerifiedError> {
         let db = &zebra_db.db;
 
+        // Per-sub-batch timing: build the RocksDB write batch (in memory) for each
+        // category of data. These scale with block weight and run serially on the
+        // single writer thread. Gated behind `commit-metrics` (zero prod overhead).
+        macro_rules! timed_subbatch {
+            ($name:expr, $body:expr) => {{
+                #[cfg(feature = "commit-metrics")]
+                let _t = std::time::Instant::now();
+                let _r = $body;
+                #[cfg(feature = "commit-metrics")]
+                metrics::histogram!($name).record(_t.elapsed().as_secs_f64());
+                _r
+            }};
+        }
+
         // Commit block, transaction, and note commitment tree data.
-        self.prepare_block_header_and_transaction_data_batch(db, finalized, store_raw_transactions);
+        timed_subbatch!(
+            "zebra.state.write.batch.header_tx.duration_seconds",
+            self.prepare_block_header_and_transaction_data_batch(
+                db,
+                finalized,
+                store_raw_transactions
+            )
+        );
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -979,8 +1014,14 @@ impl DiskWriteBatch {
         // which is already present from height 1 to the first shielded transaction.
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
-        self.prepare_shielded_transaction_batch(zebra_db, finalized);
-        self.prepare_trees_batch(zebra_db, finalized, prev_note_commitment_trees);
+        timed_subbatch!(
+            "zebra.state.write.batch.shielded.duration_seconds",
+            self.prepare_shielded_transaction_batch(zebra_db, finalized)
+        );
+        timed_subbatch!(
+            "zebra.state.write.batch.trees.duration_seconds",
+            self.prepare_trees_batch(zebra_db, finalized, prev_note_commitment_trees)
+        );
 
         // # Consensus
         //
@@ -994,16 +1035,19 @@ impl DiskWriteBatch {
         // aren't any of those on mainnet or testnet.
         if !finalized.height.is_min() {
             // Commit transaction indexes
-            self.prepare_transparent_transaction_batch(
-                zebra_db,
-                network,
-                finalized,
-                &new_outputs_by_out_loc,
-                &spent_utxos_by_outpoint,
-                &spent_utxos_by_out_loc,
-                #[cfg(feature = "indexer")]
-                &out_loc_by_outpoint,
-                address_balances,
+            timed_subbatch!(
+                "zebra.state.write.batch.transparent.duration_seconds",
+                self.prepare_transparent_transaction_batch(
+                    zebra_db,
+                    network,
+                    finalized,
+                    &new_outputs_by_out_loc,
+                    &spent_utxos_by_outpoint,
+                    &spent_utxos_by_out_loc,
+                    #[cfg(feature = "indexer")]
+                    &out_loc_by_outpoint,
+                    address_balances,
+                )
             );
         }
 
