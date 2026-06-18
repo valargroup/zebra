@@ -50,6 +50,7 @@ OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
 SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
 SAMPLE_INTERVAL=5
+ZEBRAD_BIN=""
 
 log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
@@ -149,11 +150,12 @@ ensure_snapshot() {
 }
 
 # ---- 2. release binary (download once per tag, cached) -----------------------
-# echoes the path to the zebrad binary for $1=tag
+# sets ZEBRAD_BIN to the zebrad binary path for $1=tag (returns via global, not
+# stdout, so no subcommand chatter can ever pollute the path)
 ensure_binary() {
   local tag="$1" bindir="$BENCH_HOME/bins/$1" zebrad
   zebrad="$bindir/zebrad"
-  if [[ -x "$zebrad" ]]; then echo "$zebrad"; return; fi
+  if [[ -x "$zebrad" ]]; then ZEBRAD_BIN="$zebrad"; return; fi
   mkdir -p "$bindir"
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
@@ -163,7 +165,8 @@ ensure_binary() {
   local tgz; tgz="$(find "$dl" -name 'zebrad-*-linux-x86_64.tar.gz' | head -1)"
   [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
   if [[ -f "$dl/SHA256SUMS.txt" ]]; then
-    ( cd "$dl" && grep "$(basename "$tgz")" SHA256SUMS.txt | sha256sum -c - ) \
+    # NB: keep all output on stderr — this function's stdout is captured as the binary path
+    ( cd "$dl" && grep "$(basename "$tgz")" SHA256SUMS.txt | sha256sum -c - ) >&2 \
       || die "release tarball checksum mismatch for $tag"
   fi
   tar -xzf "$tgz" -C "$dl"
@@ -171,7 +174,7 @@ ensure_binary() {
   [[ -n "$found" ]] || die "zebrad binary not found in tarball for $tag"
   mv "$found" "$zebrad"; chmod +x "$zebrad"; rm -rf "$dl"
   log "zebrad $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
-  echo "$zebrad"
+  ZEBRAD_BIN="$zebrad"
 }
 
 # ---- height scraping ---------------------------------------------------------
@@ -190,7 +193,7 @@ scrape_height() {
 # usage: run_one TAG OUTPREFIX ; sets RESULT_* globals
 run_one() {
   local tag="$1" prefix="$2"
-  local zebrad; zebrad="$(ensure_binary "$tag")"
+  ensure_binary "$tag"; local zebrad="$ZEBRAD_BIN"
   local run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
   local logf="/dev/shm/zebra-bench-$run_id.log"
