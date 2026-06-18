@@ -118,10 +118,7 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
 ///
 /// Example: position 6 is the seventh leaf, because positions are zero-based.
 /// The six earlier leaves decompose as `6 == 0b110`: one complete 4-leaf
-/// subtree and one complete 2-leaf subtree, so levels 2 and 1 are present.
-/// Level 0 is absent until the tip leaf at position 6 is merged. After that,
-/// the tree has 7 leaves; appending position 7 completes the next 8-leaf
-/// subtree.
+/// subtree and one complete 2-leaf subtree, so only levels 2 and 1 are present.
 fn contains_complete_subtree(position: Position, level: u32) -> bool {
     u64::from(position) & (1u64 << level) != 0
 }
