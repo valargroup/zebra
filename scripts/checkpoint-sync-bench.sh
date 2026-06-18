@@ -178,15 +178,23 @@ ensure_binary() {
 }
 
 # ---- height scraping ---------------------------------------------------------
-# Prometheus first; fall back to parsing the node log for Height(N).
+# Prometheus first, trying several metric names across zebrad versions (the
+# checkpoint verifier exports checkpoint_verified_height; newer builds also export
+# a finalized-height gauge). Falls back to a *specific* committed/finalized/verified
+# log line — never a bare Height(N), which also appears for network-tip/target heights.
+HEIGHT_METRICS="state_finalized_block_height state_checkpoint_finalized_block_height checkpoint_finalized_block_height checkpoint_verified_height"
 scrape_height() {
-  local logf="$1" h=""
-  h="$(curl -fsS --max-time 3 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null \
-        | awk '/^state_finalized_block_height /{printf "%d", $2}')" || true
-  if [[ -z "$h" ]]; then
-    h="$(grep -oE 'Height\(([0-9]+)\)' "$logf" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1)" || true
+  local logf="$1" page m v
+  page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
+  if [[ -n "$page" ]]; then
+    for m in $HEIGHT_METRICS; do
+      v="$(awk -v n="$m" '$1==n {printf "%d", $2; exit}' <<<"$page")"
+      [[ -n "$v" && "$v" -gt 0 ]] && { echo "$v"; return; }
+    done
   fi
-  [[ -n "$h" ]] && echo "$h"
+  v="$(grep -aoiE '(finaliz|committed|checkpoint)[a-z_ ]*[Hh]eight[^0-9]*([0-9]{6,})' "$logf" 2>/dev/null \
+        | grep -oE '[0-9]{6,}' | sort -n | tail -1)" || true
+  [[ -n "$v" ]] && echo "$v"
 }
 
 # ---- 3-7. one benchmark run for a given tag ----------------------------------
