@@ -6,7 +6,7 @@ use halo2::pasta::pallas;
 
 use crate::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::merkle::AuthDataRoot,
+    block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
     orchard,
     parameters::{Network, NetworkUpgrade},
@@ -265,10 +265,7 @@ impl Block {
         // (asserted by a differential proptest in `block::tests::prop`).
         self.transactions
             .par_iter()
-            .map(|tx| {
-                tx.auth_digest()
-                    .unwrap_or(crate::block::merkle::AUTH_DIGEST_PLACEHOLDER)
-            })
+            .map(|tx| auth_digest_or_placeholder(tx))
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<AuthDataRoot>()
