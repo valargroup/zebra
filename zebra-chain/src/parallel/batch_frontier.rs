@@ -346,6 +346,15 @@ where
 }
 
 /// Simpler rewrite sketch for [`parallel_append`].
+/// Expectation: Caller has ensured that the tree will not overflow.
+///
+/// # Method
+///
+/// 1. Get the complete subtree roots for the existing frontier.
+/// 2. Split the new leaves into complete subtree chunks.
+/// 3. Compute the roots for each new_leaves-only chunk in parallel.
+/// 4. Merge the roots into the complete subtree roots.
+/// 5. Return the new frontier.
 #[allow(dead_code)]
 pub fn parallel_append2<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
