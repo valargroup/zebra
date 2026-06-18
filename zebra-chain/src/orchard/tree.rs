@@ -967,4 +967,22 @@ mod tests {
         tree.assert_frontier_eq(&original);
         assert_eq!(tree.root(), original.root());
     }
+
+    #[test]
+    fn append_batch_multiple_subtrees_preserves_tree_and_cached_root() {
+        let mut tree = NoteCommitmentTree::default();
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let subtree_size = 1usize << TRACKED_SUBTREE_HEIGHT;
+        let note_commitments: Vec<_> = (0..subtree_size * 2)
+            .map(|value| note_commitment(value as u64))
+            .collect();
+
+        let result = tree.append_batch(&note_commitments);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
+    }
 }
