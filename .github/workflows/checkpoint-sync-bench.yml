@@ -1,0 +1,86 @@
+name: Checkpoint-sync benchmark
+
+# Manual, on-demand checkpoint-zone sync benchmark.
+#
+# Picks a published release of this repo (no build in CI), runs zebrad forward from a
+# pre-synced ~1.7M mainnet state snapshot through the checkpoint zone pinned to a single
+# peer, and reports: time taken, blocks covered, blocks/s. Demonstrates the checkpoint-sync
+# throughput work (CHECKPOINT_SYNC_FINDINGS.md / PARALLEL_IDEA.md).
+#
+# Runs on the roman-zakura-3 self-hosted runner (label `zakura-bench`). One-time setup:
+# register the runner and set the BENCH_* repo Actions variables (see
+# scripts/checkpoint-sync-bench.sh header and the repo runbook).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to benchmark (GitHub release of this repo)"
+        required: true
+        default: "v5.0.0-test.7"
+      stop_height:
+        description: "Sync stops after committing this height (snapshot tip is 1,707,210)"
+        required: true
+        default: "1737210"
+      wall_cap_seconds:
+        description: "Hard wall-clock cap for a single run"
+        required: false
+        default: "3600"
+      feed_peer:
+        description: "Single peer to pin (ip:port); blank uses the BENCH_FEED_PEER variable"
+        required: false
+        default: ""
+      checkpoint_verify_concurrency_limit:
+        required: false
+        default: "1500"
+      download_concurrency_limit:
+        required: false
+        default: "150"
+      baseline_tag:
+        description: "Optional: also run this tag first and print a baseline -> release speedup"
+        required: false
+        default: ""
+
+concurrency:
+  group: checkpoint-sync-bench   # one bench at a time (single host, single snapshot)
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: "checkpoint sync ${{ inputs.release_tag }}"
+    runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout (for the bench script)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+
+      - name: Run checkpoint-sync benchmark
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          STOP_HEIGHT: ${{ inputs.stop_height }}
+          WALL_CAP: ${{ inputs.wall_cap_seconds }}
+          FEED_PEER: ${{ inputs.feed_peer || vars.BENCH_FEED_PEER || '167.99.162.47:8233' }}
+          CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
+          DL_LIMIT: ${{ inputs.download_concurrency_limit }}
+          SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
+          SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
+          START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
+          OUT_DIR: ${{ github.workspace }}/bench-out
+        run: bash scripts/checkpoint-sync-bench.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: checkpoint-sync-bench-${{ inputs.release_tag }}-${{ github.run_id }}
+          path: bench-out/
+          if-no-files-found: ignore
+          retention-days: 30

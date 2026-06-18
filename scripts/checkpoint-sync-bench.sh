@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+#
+# checkpoint-sync-bench.sh — repeatable checkpoint-zone sync benchmark.
+#
+# Downloads a pre-synced ~1.7M mainnet state snapshot once, hard-link-forks it per
+# run (cp -al), runs a prebuilt release zebrad forward through the checkpoint zone
+# pinned to a single peer, and prints: time taken, blocks covered, blocks/s.
+#
+# No build: the zebrad binary comes from a published GitHub release tarball.
+# Designed to run on the roman-zakura-3 self-hosted runner, but it is self-contained
+# and can be run by hand on any Linux box with enough disk.
+#
+# Inputs (environment variables; the workflow sets these from inputs/vars):
+#   RELEASE_TAG            release tag to benchmark            (e.g. v5.0.0-test.7)
+#   BASELINE_TAG          optional: also run this tag, print A/B comparison
+#   STOP_HEIGHT           debug_stop_at_height                (default 1737210, +30k)
+#   WALL_CAP              hard wall-clock cap, seconds         (default 3600)
+#   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
+#   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
+#   DL_LIMIT              download_concurrency_limit           (default 150)
+#   SNAPSHOT_URL          primary snapshot .tar.zst URL
+#   SNAPSHOT_SHA256       expected sha256 of the .tar.zst
+#   START_HEIGHT          snapshot tip height                  (default 1707210)
+#   BENCH_HOME            persistent cache root                (default /opt/zebra-bench)
+#   GH_REPO               releases repo                        (default valargroup/zebra)
+#   OUT_DIR               artifact output dir                  (default ./bench-out)
+#
+set -euo pipefail
+
+# ---- inputs / defaults -------------------------------------------------------
+RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required}"
+BASELINE_TAG="${BASELINE_TAG:-}"
+STOP_HEIGHT="${STOP_HEIGHT:-1737210}"
+WALL_CAP="${WALL_CAP:-3600}"
+FEED_PEER="${FEED_PEER:-167.99.162.47:8233}"
+CKPT_LIMIT="${CKPT_LIMIT:-1500}"
+DL_LIMIT="${DL_LIMIT:-150}"
+START_HEIGHT="${START_HEIGHT:-1707210}"
+SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
+SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra-snapshots.nyc3.cdn.digitaloceanspaces.com/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+BENCH_HOME="${BENCH_HOME:-/opt/zebra-bench}"
+GH_REPO="${GH_REPO:-valargroup/zebra}"
+OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
+
+SNAP_FILE="$(basename "$SNAPSHOT_URL")"
+MASTER="$BENCH_HOME/master-${START_HEIGHT}"
+SAMPLE_INTERVAL=5
+METRICS_PORT=9999
+
+log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
+die()  { log "FATAL: $*"; exit 1; }
+
+mkdir -p "$OUT_DIR"
+
+# ---- 0. dependencies + disk --------------------------------------------------
+ensure_deps() {
+  local missing=()
+  for t in aria2c zstd tar jq curl awk; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
+  if ((${#missing[@]})); then
+    log "installing missing tools: ${missing[*]}"
+    # map binary -> package name where they differ
+    local pkgs=() m
+    for m in "${missing[@]}"; do
+      case "$m" in aria2c) pkgs+=(aria2);; *) pkgs+=("$m");; esac
+    done
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq "${pkgs[@]}" \
+        || die "could not install: ${pkgs[*]} (install them on the runner)"
+    else
+      die "missing tools and no apt-get: ${missing[*]}"
+    fi
+  fi
+}
+
+ensure_bench_home() {
+  if [[ ! -d "$BENCH_HOME" ]]; then
+    sudo mkdir -p "$BENCH_HOME" && sudo chown "$(id -u):$(id -g)" "$BENCH_HOME" \
+      || die "cannot create $BENCH_HOME"
+  fi
+  [[ -w "$BENCH_HOME" ]] || die "$BENCH_HOME not writable"
+  mkdir -p "$BENCH_HOME/snapshots" "$BENCH_HOME/bins" "$BENCH_HOME/forks"
+  local avail_gib
+  avail_gib=$(df -B1G --output=avail "$BENCH_HOME" | tail -1 | tr -dc '0-9')
+  log "free space at $BENCH_HOME: ${avail_gib}GiB"
+  (( avail_gib >= 50 )) || die "need >=50GiB free at $BENCH_HOME, have ${avail_gib}GiB"
+}
+
+# ---- 1. snapshot (download + extract once, cached) ---------------------------
+ensure_snapshot() {
+  if [[ -f "$MASTER/state/v27/mainnet/version" ]]; then
+    log "snapshot master present: $MASTER (db v$(cat "$MASTER/state/v27/mainnet/version"))"
+    return
+  fi
+  local tarball="$BENCH_HOME/snapshots/$SNAP_FILE"
+  if [[ ! -f "$tarball" ]]; then
+    log "downloading snapshot $SNAP_FILE (~30GiB) ..."
+    aria2c -x16 -s16 -k1M --file-allocation=none --auto-file-renaming=false \
+      --checksum=sha-256="$SNAPSHOT_SHA256" \
+      -d "$BENCH_HOME/snapshots" -o "$SNAP_FILE" \
+      "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR" \
+      || die "snapshot download failed"
+  fi
+  log "verifying checksum ..."
+  echo "$SNAPSHOT_SHA256  $tarball" | sha256sum -c - || die "snapshot checksum mismatch"
+  log "extracting snapshot -> $MASTER ..."
+  local tmp="$MASTER.tmp.$$"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  zstd -dc --long=31 "$tarball" | tar -x -C "$tmp"
+  # the archive may contain a single top dir or the state/ tree directly; normalize
+  if [[ -d "$tmp/state" ]]; then
+    mv "$tmp" "$MASTER"
+  else
+    local inner
+    inner="$(find "$tmp" -maxdepth 2 -type d -name state -printf '%h\n' | head -1)"
+    [[ -n "$inner" ]] || die "could not locate state/ in extracted snapshot"
+    mv "$inner" "$MASTER"; rm -rf "$tmp"
+  fi
+  [[ -f "$MASTER/state/v27/mainnet/version" ]] || die "extracted snapshot missing state/v27/mainnet/version"
+  log "snapshot ready: db v$(cat "$MASTER/state/v27/mainnet/version")"
+}
+
+# ---- 2. release binary (download once per tag, cached) -----------------------
+# echoes the path to the zebrad binary for $1=tag
+ensure_binary() {
+  local tag="$1" bindir="$BENCH_HOME/bins/$1" zebrad
+  zebrad="$bindir/zebrad"
+  if [[ -x "$zebrad" ]]; then echo "$zebrad"; return; fi
+  mkdir -p "$bindir"
+  log "fetching release $tag from $GH_REPO ..." >&2
+  local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
+  gh release download "$tag" -R "$GH_REPO" \
+    -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
+    || die "gh release download failed for $tag"
+  local tgz; tgz="$(find "$dl" -name 'zebrad-*-linux-x86_64.tar.gz' | head -1)"
+  [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
+  if [[ -f "$dl/SHA256SUMS.txt" ]]; then
+    ( cd "$dl" && grep "$(basename "$tgz")" SHA256SUMS.txt | sha256sum -c - ) \
+      || die "release tarball checksum mismatch for $tag"
+  fi
+  tar -xzf "$tgz" -C "$dl"
+  local found; found="$(find "$dl" -type f -name zebrad | head -1)"
+  [[ -n "$found" ]] || die "zebrad binary not found in tarball for $tag"
+  mv "$found" "$zebrad"; chmod +x "$zebrad"; rm -rf "$dl"
+  log "zebrad $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
+  echo "$zebrad"
+}
+
+# ---- height scraping ---------------------------------------------------------
+# Prometheus first; fall back to parsing the node log for Height(N).
+scrape_height() {
+  local logf="$1" h=""
+  h="$(curl -fsS --max-time 3 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null \
+        | awk '/^state_finalized_block_height /{printf "%d", $2}')" || true
+  if [[ -z "$h" ]]; then
+    h="$(grep -oE 'Height\(([0-9]+)\)' "$logf" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1)" || true
+  fi
+  [[ -n "$h" ]] && echo "$h"
+}
+
+# ---- 3-7. one benchmark run for a given tag ----------------------------------
+# usage: run_one TAG OUTPREFIX ; sets RESULT_* globals
+run_one() {
+  local tag="$1" prefix="$2"
+  local zebrad; zebrad="$(ensure_binary "$tag")"
+  local run_id="${prefix}-$$-$(date +%s)"
+  local fork="$BENCH_HOME/forks/$run_id"
+  local logf="/dev/shm/zebra-bench-$run_id.log"
+  local csv="$OUT_DIR/samples-$prefix.csv"
+  local cfg="$fork.config.toml"
+
+  log "fork: cp -al master -> $fork"
+  rm -rf "$fork"; cp -al "$MASTER" "$fork"
+  find "$fork" -name LOCK -delete 2>/dev/null || true
+
+  # $1 = include the Zakura v2 P2P toggles (present only on v5.0.0+ "Zakura" releases)
+  write_config() {
+    {
+      echo '[network]'
+      echo 'network = "Mainnet"'
+      echo "cache_dir = \"$fork\""
+      echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
+      echo 'peerset_initial_target_size = 1'
+      if [[ "$1" == "with_zakura" ]]; then
+        echo 'legacy_p2p = true'
+        echo 'v2_p2p = false'   # ZAKURA off: legacy single-peer feed only
+      fi
+      echo ''
+      echo '[state]'
+      echo "cache_dir = \"$fork\""
+      echo "debug_stop_at_height = $STOP_HEIGHT"
+      echo ''
+      echo '[sync]'
+      echo "checkpoint_verify_concurrency_limit = $CKPT_LIMIT"
+      echo "download_concurrency_limit = $DL_LIMIT"
+      echo 'full_verify_concurrency_limit = 20'
+      echo ''
+      echo '[metrics]'
+      echo "endpoint_addr = \"127.0.0.1:$METRICS_PORT\""
+      echo ''
+      echo '[tracing]'
+      echo 'filter = "info"'
+    } > "$cfg"
+  }
+
+  local pid t0 mode="with_zakura"
+  log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=$FEED_PEER, cap=${WALL_CAP}s"
+  write_config "$mode"
+  "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
+  pid=$!; t0=$(date +%s); sleep 3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    # version-skew fallback: older tags lack v2_p2p/legacy_p2p -> deny_unknown_fields.
+    if grep -qiE 'unknown field|v2_p2p|legacy_p2p|deny_unknown|error parsing config|failed to parse' "$logf"; then
+      log "config rejected (likely pre-Zakura tag); retrying without v2_p2p/legacy_p2p"
+      write_config "no_zakura"
+      "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
+      pid=$!; t0=$(date +%s); sleep 3
+    fi
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "zebrad died on startup; last log lines:"; tail -20 "$logf" >&2
+    die "startup failure for $tag"
+  fi
+
+  echo "epoch,elapsed,height" > "$csv"
+  local t_escape="" end_height="$START_HEIGHT" h now elapsed
+  while :; do
+    now=$(date +%s); elapsed=$((now - t0))
+    h="$(scrape_height "$logf")" || true
+    if [[ -n "$h" ]]; then
+      echo "$now,$elapsed,$h" >> "$csv"
+      end_height="$h"
+      [[ -z "$t_escape" && "$h" -gt "$START_HEIGHT" ]] && { t_escape=$now; log "escaped cold-start at +${elapsed}s, height $h"; }
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      log "zebrad exited (clean stop) at +${elapsed}s, height ${end_height}"
+      break
+    fi
+    if (( elapsed >= WALL_CAP )); then
+      log "wall cap ${WALL_CAP}s reached; stopping zebrad"
+      kill "$pid" 2>/dev/null || true; sleep 5; kill -9 "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep "$SAMPLE_INTERVAL"
+  done
+  local t_end; t_end=$(date +%s)
+
+  # final authoritative height (log scan catches the very last commit)
+  h="$(scrape_height "$logf")" || true
+  [[ -n "$h" && "$h" -gt "$end_height" ]] && end_height="$h"
+
+  # quick error scan (ignore peer/network noise)
+  local errs
+  errs="$(grep -iE 'panic|ERROR committing|resetting state queue' "$logf" 2>/dev/null \
+            | grep -viE 'zebra_network|peer' | head -3 || true)"
+  cp "$logf" "$OUT_DIR/node-$prefix.log" 2>/dev/null || true
+
+  local blocks=$((end_height - START_HEIGHT))
+  local total=$((t_end - t0))
+  local post=$total
+  [[ -n "$t_escape" ]] && post=$((t_end - t_escape))
+  (( total > 0 )) || total=1
+  (( post  > 0 )) || post=1
+  local bps  pbps stalled="no"
+  bps="$(awk -v b="$blocks" -v t="$total" 'BEGIN{printf "%.2f", b/t}')"
+  pbps="$(awk -v b="$blocks" -v t="$post"  'BEGIN{printf "%.2f", b/t}')"
+  (( end_height < STOP_HEIGHT )) && stalled="yes (capped before stop_height)"
+
+  rm -rf "$fork" "$cfg"   # reclaim divergent SSTs; keep csv/log artifacts
+
+  RESULT_TAG="$tag"; RESULT_START="$START_HEIGHT"; RESULT_END="$end_height"
+  RESULT_BLOCKS="$blocks"; RESULT_TIME="$total"; RESULT_POST="$post"
+  RESULT_BPS="$bps"; RESULT_PBPS="$pbps"; RESULT_STALLED="$stalled"; RESULT_ERRS="$errs"
+}
+
+print_one() {
+  local title="$1"
+  cat <<EOF
+
+=== checkpoint-sync benchmark ${title} ===
+release:        $RESULT_TAG
+feed peer:      $FEED_PEER  (single-peer)
+start height:   $RESULT_START
+end height:     $RESULT_END
+blocks covered: $RESULT_BLOCKS
+time taken:     ${RESULT_TIME} s
+blocks/s:       $RESULT_BPS        (post-first-commit: $RESULT_PBPS blocks/s over ${RESULT_POST}s)
+reached stop:   $( [[ "$RESULT_STALLED" == no ]] && echo yes || echo "$RESULT_STALLED" )
+EOF
+  [[ -n "$RESULT_ERRS" ]] && printf 'WARNING — log errors:\n%s\n' "$RESULT_ERRS"
+}
+
+summary_row() { # markdown row -> step summary
+  printf '| %s | %s | %s | %s | %s | %s |\n' \
+    "$1" "$RESULT_END" "$RESULT_BLOCKS" "${RESULT_TIME}s" "$RESULT_BPS" "$RESULT_PBPS"
+}
+
+# ---- main --------------------------------------------------------------------
+ensure_deps
+ensure_bench_home
+ensure_snapshot
+
+SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
+{
+  echo "## Checkpoint-sync benchmark"
+  echo ""
+  echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, peer: \`$FEED_PEER\`"
+  echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
+  echo ""
+  echo "| tag | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
+  echo "|-----|-----------:|---------------:|-----------:|---------:|------------------:|"
+} >> "$SUMMARY"
+
+if [[ -n "$BASELINE_TAG" ]]; then
+  log "A/B mode: baseline=$BASELINE_TAG vs release=$RELEASE_TAG"
+  run_one "$BASELINE_TAG" "baseline"; print_one "(baseline)"; summary_row "$BASELINE_TAG (baseline)" >> "$SUMMARY"
+  B_BPS="$RESULT_BPS"; B_TIME="$RESULT_TIME"
+  run_one "$RELEASE_TAG" "release";  print_one "(release)";  summary_row "$RELEASE_TAG (release)"  >> "$SUMMARY"
+  R_BPS="$RESULT_BPS"
+  SPEEDUP="$(awk -v r="$R_BPS" -v b="$B_BPS" 'BEGIN{ if (b>0) printf "%.2f", r/b; else print "n/a" }')"
+  {
+    echo ""
+    echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"
+  } >> "$SUMMARY"
+  printf '\n=== A/B: %s -> %s = %s× faster ===\n' "$B_BPS" "$R_BPS" "$SPEEDUP"
+else
+  run_one "$RELEASE_TAG" "release"; print_one ""; summary_row "$RELEASE_TAG" >> "$SUMMARY"
+fi
+
+log "done. artifacts in $OUT_DIR"
