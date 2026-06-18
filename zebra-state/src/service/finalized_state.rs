@@ -55,18 +55,10 @@ macro_rules! timed_commit_phase {
 /// the note-commitment tree update and the ZIP-244 auth-data-root commitment
 /// check, which run on the single finalized-writer thread and dominate the
 /// per-block commit cost on heavy shielded blocks.
-///
-/// Both operations are internally parallel (rayon), but on the global rayon
-/// pool they contend with each other *and* with the block download/verification
-/// pipeline (equihash, batch signature/proof verification), which left the
-/// tree-update burst running at only ~1.6 effective cores in-node despite
-/// scaling ~7x in isolation. Running them inside a dedicated pool gives the
-/// commit-stage crypto its own workers, isolated from the verifier's global-pool
-/// work, so a commit burst can use the otherwise-idle cores.
-///
-/// Sized to all available cores: the commit burst and the download/verify feed
-/// alternate (when committing, the verifier is mostly idle), so the burst should
-/// claim the cores rather than permanently oversubscribing the verifier.
+/// 
+/// It allows to have a separate thread pool for the commmit-compute phase from
+/// the main thread pool. This way, if download/verify is busy, the commit-compute
+/// phase can still make progress.
 static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
