@@ -21,13 +21,23 @@ pub struct CommitmentRandomness(jubjub::Fr);
 ///
 /// The commitment is a Jubjub curve point. Recovering the point from its
 /// encoding requires a field square root (point decompression), which is
-/// expensive. The value commitment is only needed to verify the binding
-/// signature and value balance, which happens in the semantic verifier; the
-/// checkpoint verifier never needs it (it trusts block hashes and the
-/// note-commitment tree uses the note commitment `cm_u`, not `cv`). So the
-/// point is decompressed lazily, on demand, via [`ValueCommitment::commitment`],
+/// expensive, and the note-commitment tree uses the note commitment `cm_u`, not
+/// `cv`, so the point is decompressed lazily via [`ValueCommitment::commitment`]
 /// rather than eagerly at deserialization. This keeps the dominant per-block CPU
 /// cost of checkpoint sync (Jubjub point decompression) off the hot path.
+///
+/// # Consensus
+///
+/// The not-small-order check that this type used to perform at deserialization
+/// is deferred, but still enforced for every untrusted transaction. The
+/// checkpoint verifier trusts block hashes and does not need it. The semantic
+/// verifier and the mempool convert every transaction via `to_librustzcash`
+/// (`CachedFfiTransaction::new`), and librustzcash enforces the rule at *read*:
+/// `zcash_primitives`'s `read_value_commitment` uses
+/// `ValueCommitment::from_bytes_not_small_order`, so a small-order `cv` makes the
+/// conversion fail and the transaction is rejected. Validated by
+/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
+/// `transaction/tests/vectors.rs`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ValueCommitment(pub(crate) [u8; 32]);
 
@@ -35,13 +45,15 @@ impl ValueCommitment {
     /// Decompress and return the underlying `sapling_crypto` value commitment.
     ///
     /// This performs the Jubjub point decompression that deserialization defers.
+    /// It is only used by `ShieldedData::binding_verification_key`, a helper
+    /// that is not on the consensus hot path; consensus validation of the
+    /// encoding happens via `to_librustzcash` (see the type docs).
     ///
     /// # Panics
     ///
     /// If the stored bytes are not a valid, non-small-order value commitment.
-    /// Encodings are validated at this point of use (binding-signature
-    /// verification); the checkpoint verifier never calls this and instead
-    /// trusts the encoding via the block hash.
+    /// Callers must only use this once the encoding has been validated (e.g. by
+    /// the librustzcash conversion); the checkpoint verifier never calls it.
     pub fn commitment(&self) -> sapling_crypto::value::ValueCommitment {
         sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0)
             .into_option()
