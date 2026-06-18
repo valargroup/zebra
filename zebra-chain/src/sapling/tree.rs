@@ -595,6 +595,120 @@ mod tests {
             .expect("small little-endian integers are canonical field elements")
     }
 
+    fn build_tree(prefix_len: u64) -> NoteCommitmentTree {
+        let mut tree = NoteCommitmentTree::default();
+
+        for value in 0..prefix_len {
+            tree.append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        tree
+    }
+
+    fn pre_subtree_boundary_tree() -> NoteCommitmentTree {
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2;
+        let leaf = node(1);
+        let ommers: Vec<sapling_crypto::Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+
+        NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        }
+    }
+
+    fn sequential_append_batch(
+        tree: &mut NoteCommitmentTree,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, sapling_crypto::Node)>, NoteCommitmentTreeError>
+    {
+        let mut completed_subtree = None;
+
+        for note_commitment in note_commitments {
+            tree.append(*note_commitment)?;
+
+            if let Some(subtree) = tree.completed_subtree_index_and_root() {
+                assert!(
+                    completed_subtree.is_none(),
+                    "test batches must cross at most one subtree boundary"
+                );
+                completed_subtree = Some(subtree);
+            }
+        }
+
+        Ok(completed_subtree)
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_for_table_cases() {
+        let cases = [
+            ("empty tree, empty batch", 0, 0),
+            ("empty tree, one leaf", 0, 1),
+            ("empty tree, small batch", 0, 5),
+            ("one-leaf tree, empty batch", 1, 0),
+            ("one-leaf tree, one leaf", 1, 1),
+            ("odd tree, small batch", 3, 4),
+            ("power-of-two tree, small batch", 8, 7),
+            ("after power-of-two tree, empty batch", 9, 0),
+            ("after power-of-two tree, small batch", 9, 6),
+        ];
+
+        for (name, prefix_len, batch_len) in cases {
+            let start = build_tree(prefix_len);
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(1_000 + prefix_len + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_near_subtree_boundary() {
+        let cases = [
+            ("before subtree boundary, empty batch", 0),
+            ("complete subtree boundary", 1),
+            ("complete and start next subtree", 2),
+            ("complete and keep appending", 3),
+        ];
+
+        for (name, batch_len) in cases {
+            let start = pre_subtree_boundary_tree();
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(10_000 + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
     /// Verifies that `append_batch` returns the correct subtree index and root when
     /// the batch crosses a `TRACKED_SUBTREE_HEIGHT` boundary, and that the resulting
     /// frontier matches the sequential `append` path.
