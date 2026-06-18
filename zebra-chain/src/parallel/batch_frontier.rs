@@ -732,4 +732,77 @@ mod tests {
             }
         }
     }
+
+    /// `merge_complete_subtree` carry chain: inserting leaves 0–7 one at a time
+    /// must produce the same slot state as building the 8-leaf tree sequentially.
+    ///
+    /// This directly exercises the left/right argument order in `combine` and the
+    /// level-index increment during carry propagation.
+    #[test]
+    fn merge_complete_subtree_carry_chain() {
+        let leaves: Vec<TestNode> = (0u64..8).map(TestNode).collect();
+
+        // Build expected slots by appending leaves one at a time sequentially,
+        // then expanding the resulting frontier.
+        let frontier = build_frontier::<DEPTH>(&leaves);
+        let (expected_slots, expected_next) = frontier_complete_subtree_roots(&frontier);
+
+        // Build actual slots by calling merge_complete_subtree for each leaf.
+        let mut slots: CompleteSubtreeRoots<TestNode> = vec![None; usize::from(DEPTH)];
+        for leaf in &leaves {
+            merge_complete_subtree(&mut slots, 0, *leaf);
+        }
+
+        assert_eq!(
+            slots, expected_slots,
+            "slot state after merging 8 leaves must match frontier expansion"
+        );
+        assert_eq!(expected_next, 8, "frontier covering 8 leaves has next position 8");
+    }
+
+    /// `perfect_subtree_root` must produce the same root as sequential append
+    /// for power-of-two-sized leaf slices.
+    ///
+    /// After appending 2^k leaves the frontier expansion places their combined
+    /// root at `slots[k]`. We compare `perfect_subtree_root` against that slot.
+    #[test]
+    fn perfect_subtree_root_matches_sequential() {
+        for log2_len in 0usize..=4 {
+            let len = 1usize << log2_len;
+            let leaves: Vec<TestNode> = (0..len as u64).map(TestNode).collect();
+
+            let frontier = build_frontier::<DEPTH>(&leaves);
+            let (slots, _) = frontier_complete_subtree_roots(&frontier);
+            let sequential_root = slots[log2_len]
+                .expect("complete 2^k subtree fills exactly slot k after expansion");
+
+            let parallel_root = perfect_subtree_root(&leaves);
+
+            assert_eq!(
+                sequential_root, parallel_root,
+                "perfect_subtree_root mismatch for 2^{log2_len} leaves"
+            );
+        }
+    }
+
+    /// `parallel_append` must itself reject batches that would overflow the tree,
+    /// independently of `append_batch_with_subtree`.
+    #[test]
+    fn parallel_append_rejects_overflow_directly() {
+        const SMALL_DEPTH: u8 = 3;
+
+        let prefix: Vec<TestNode> = (0..7).map(TestNode).collect();
+        let full = build_frontier::<SMALL_DEPTH>(&prefix);
+        let full = parallel_append(full, vec![TestNode(100)]).expect("one leaf fits");
+
+        let result = parallel_append(full, vec![TestNode(101)]);
+        assert!(result.is_err(), "parallel_append must reject overflow of a full tree");
+
+        let partial_start = build_frontier::<SMALL_DEPTH>(&(0..6).map(TestNode).collect::<Vec<_>>());
+        let result = parallel_append(
+            partial_start,
+            vec![TestNode(100), TestNode(101), TestNode(102)],
+        );
+        assert!(result.is_err(), "parallel_append must reject a batch that overflows capacity");
+    }
 }
