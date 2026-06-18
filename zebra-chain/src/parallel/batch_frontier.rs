@@ -208,7 +208,8 @@ where
 }
 
 /// Appends `nodes` to `frontier` and returns the completed subtree's
-/// `(index_value, root)` if the batch crosses a [`TRACKED_SUBTREE_HEIGHT`] boundary.
+/// `(index_value, root)` if the batch crosses a
+/// [`TRACKED_SUBTREE_HEIGHT`](crate::subtree::TRACKED_SUBTREE_HEIGHT) boundary.
 ///
 /// This is the shared implementation for [`crate::sapling::tree::NoteCommitmentTree::append_batch`]
 /// and [`crate::orchard::tree::NoteCommitmentTree::append_batch`]. Callers convert their
