@@ -10,7 +10,11 @@ use std::{
 use tower::{BoxError, Service, ServiceExt};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::{self, merkle::AuthDataRoot, Block, HeightDiff},
+    block::{
+        self,
+        merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
+        Block, HeightDiff,
+    },
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
     orchard,
@@ -551,7 +555,25 @@ impl SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        // Compute each transaction's txid and ZIP-244 auth digest together,
+        // sharing the single (expensive) librustzcash conversion that dominates
+        // the cost on heavy shielded transactions, instead of computing the txid
+        // here and re-converting the same transactions for the auth data root
+        // later on the commit path. The auth digest is nearly free once the txid
+        // has been computed.
+        let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = {
+            use rayon::prelude::*;
+            block
+                .transactions
+                .par_iter()
+                .map(|tx| tx.txid_and_auth_digest())
+                .unzip()
+        };
+        let transaction_hashes: Arc<[_]> = transaction_hashes.into();
+        let auth_data_root = auth_digests
+            .into_iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect::<AuthDataRoot>();
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
         Self {
@@ -561,7 +583,7 @@ impl SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
-            auth_data_root: None,
+            auth_data_root: Some(auth_data_root),
         }
     }
 
@@ -587,7 +609,25 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        // Compute each transaction's txid and ZIP-244 auth digest together,
+        // sharing the single (expensive) librustzcash conversion that dominates
+        // the cost on heavy shielded transactions, instead of computing the txid
+        // here and re-converting the same transactions for the auth data root
+        // later on the commit path. The auth digest is nearly free once the txid
+        // has been computed.
+        let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = {
+            use rayon::prelude::*;
+            block
+                .transactions
+                .par_iter()
+                .map(|tx| tx.txid_and_auth_digest())
+                .unzip()
+        };
+        let transaction_hashes: Arc<[_]> = transaction_hashes.into();
+        let auth_data_root = auth_digests
+            .into_iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect::<AuthDataRoot>();
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
         Self {
@@ -597,7 +637,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
-            auth_data_root: None,
+            auth_data_root: Some(auth_data_root),
         }
     }
 }
