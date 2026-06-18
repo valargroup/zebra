@@ -24,12 +24,44 @@ use incrementalmerkletree::{
     Hashable, Level, Position,
 };
 use rayon::prelude::*;
+use std::{error::Error, fmt};
 
 /// A pure binary-counter forest of a contiguous run of leaves, indexed by level:
 /// `slots[L] == Some(root)` iff bit `L` of the run length is set, in which case
 /// `root` is the root of the complete `2^L`-leaf subtree covering that aligned
 /// block. Higher set bits (older subtrees) are further left in leaf order.
 type LevelSlots<H> = Vec<Option<H>>;
+
+/// Errors from batch frontier updates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchFrontierError {
+    /// A frontier reconstruction error.
+    Frontier(FrontierError),
+
+    /// The batch would complete more than one tracked subtree.
+    BatchSpansMultipleSubtrees,
+}
+
+impl fmt::Display for BatchFrontierError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BatchFrontierError::Frontier(error) => {
+                write!(f, "frontier reconstruction error: {error:?}")
+            }
+            BatchFrontierError::BatchSpansMultipleSubtrees => {
+                write!(f, "batch spans more than one tracked subtree boundary")
+            }
+        }
+    }
+}
+
+impl Error for BatchFrontierError {}
+
+impl From<FrontierError> for BatchFrontierError {
+    fn from(error: FrontierError) -> Self {
+        BatchFrontierError::Frontier(error)
+    }
+}
 
 /// Merges a complete subtree `node` at level `level` into the binary-counter
 /// `slots`, propagating carries upward.
@@ -228,18 +260,18 @@ where
 /// commitment type to `H` before calling and wrap the returned index value in
 /// `NoteCommitmentSubtreeIndex`.
 ///
-/// # Precondition
+/// # Batch Size
 ///
 /// `nodes` must contain the commitments from a single block. The consensus block-size
 /// cap bounds a block to far fewer than `2^TRACKED_SUBTREE_HEIGHT` (65,536) outputs or
-/// actions, so a batch can cross **at most one** subtree boundary. Passing a batch that
-/// spans two or more boundaries will silently drop all but the first completed subtree.
+/// actions, so a batch can cross **at most one** subtree boundary.
 ///
-/// Returns [`FrontierError`] if appending would overflow the tree's capacity.
+/// Returns [`BatchFrontierError`] if appending would overflow the tree's capacity,
+/// or if the batch spans more than one tracked subtree boundary.
 pub fn append_batch_with_subtree<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     nodes: Vec<H>,
-) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), FrontierError>
+) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), BatchFrontierError>
 where
     H: Hashable + Clone + Send + Sync,
 {
@@ -249,25 +281,24 @@ where
         return Ok((frontier, None));
     }
 
-    // A block cannot span two or more subtree boundaries, so the batch must be smaller than one subtree.
-    assert!(
-        nodes.len() < (1 << TRACKED_SUBTREE_HEIGHT),
-        "batch must come from a single block (got {} nodes, subtree size is 2^{})",
-        nodes.len(),
-        TRACKED_SUBTREE_HEIGHT,
-    );
-
     // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions
     let old_size = frontier.tree_size();
     let new_size = old_size + nodes.len() as u64;
 
-    // A block crosses at most one tracked-subtree (2^TRACKED_SUBTREE_HEIGHT leaf) boundary
-    // because block size is bounded by the same consensus rule.
+    // A consensus block crosses at most one tracked-subtree boundary. If a
+    // caller passes a larger batch, return an error instead of dropping later
+    // completed subtrees.
     let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
     // Round old_size up to the next subtree boundary.
     let boundary = (old_size / subtree_size)
         .checked_add(1)
         .and_then(|n| n.checked_mul(subtree_size));
+    if boundary
+        .and_then(|b| b.checked_add(subtree_size))
+        .is_some_and(|second_boundary| second_boundary <= new_size)
+    {
+        return Err(BatchFrontierError::BatchSpansMultipleSubtrees);
+    }
 
     if boundary.is_some_and(|b| b <= new_size) {
         let boundary = boundary.expect("checked above");
@@ -442,6 +473,21 @@ mod tests {
             partial_batch_overflow.is_err(),
             "batch crossing tree capacity overflows"
         );
+    }
+
+    /// Batches that would complete more than one tracked subtree are rejected,
+    /// because the return type can only report one completed subtree.
+    #[test]
+    fn append_batch_errors_on_multiple_subtree_boundaries() {
+        use crate::subtree::TRACKED_SUBTREE_HEIGHT;
+
+        let start = Frontier::<TestNode, DEPTH>::empty();
+        let subtree_size = 1usize << TRACKED_SUBTREE_HEIGHT;
+        let batch = vec![TestNode(0); subtree_size * 2];
+
+        let result = append_batch_with_subtree(start, batch);
+
+        assert_eq!(result, Err(BatchFrontierError::BatchSpansMultipleSubtrees));
     }
 
     /// Deterministic positions around powers of two exercise carry propagation and
