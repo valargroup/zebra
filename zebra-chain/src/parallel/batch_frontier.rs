@@ -244,9 +244,11 @@ where
     // A block crosses at most one tracked-subtree (2^TRACKED_SUBTREE_HEIGHT leaf) boundary
     // because block size is bounded by the same consensus rule.
     let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
-    let boundary = (old_size / subtree_size + 1) * subtree_size;
+    // Round old_size up to the next subtree boundary.
+    let boundary = (old_size / subtree_size).checked_add(1).and_then(|n| n.checked_mul(subtree_size));
 
-    if boundary <= new_size {
+    if boundary.is_some_and(|b| b <= new_size) {
+        let boundary = boundary.expect("checked above");
         let head_len = (boundary - old_size) as usize;
         let (head, tail) = nodes.split_at(head_len);
 
