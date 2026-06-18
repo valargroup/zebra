@@ -122,7 +122,7 @@ where
         });
     }
 
-    // Rebuild the pure forest of the existing tree, and the next free position.
+    // Pre-size one slot for each valid Merkle level.
     let empty_slots = || vec![None; usize::from(DEPTH)];
 
     let (mut slots, mut old_size): (LevelSlots<H>, u64) = match frontier.value() {
@@ -140,6 +140,7 @@ where
             }
             // Merge the old tip leaf (position `pos`) to get the pure forest of S leaves.
             merge_complete_subtree(&mut slots, 0, leaf);
+            // The next free position is one past the current tip.
             (slots, pos + 1)
         }
     };
