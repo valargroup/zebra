@@ -373,19 +373,38 @@ where
 
     // complete_subtree_roots[level] is the root of a complete 2^level-leaf
     // subtree, or None if no complete subtree exists at that level.
-    let (_complete_subtree_roots, old_size) = frontier_complete_subtree_roots(&frontier);
+    let (mut complete_subtree_roots, next_leaf_position) =
+        frontier_complete_subtree_roots(&frontier);
 
     // Frontier stores the newest leaf separately and does not hash it into the
     // tree. So the last incoming leaf becomes the new tip. Earlier incoming
     // leaves are merged into subtree roots.
-    let _new_tip_leaf = new_leaves
+    let new_tip_leaf = new_leaves
         .pop()
         .expect("new_leaves is not empty because it was checked above");
     let leaves_to_merge = new_leaves;
 
-    let _chunks = complete_subtree_chunks(old_size, &leaves_to_merge);
+    // Split the new leaves into the new subtree chunks.
+    let chunks = complete_subtree_chunks(next_leaf_position, &leaves_to_merge);
 
-    todo!("build simpler parallel append algorithm")
+    // Hash each new subtree chunk in parallel.
+    let new_subtree_roots: Vec<(usize, H)> = chunks
+        .into_par_iter()
+        .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
+        .collect();
+
+    // Merge the new roots in leaf order. The roots can be computed in parallel,
+    // but carries must be applied left-to-right. We accept the extra blocking
+    // from not merging lower-order roots as soon as they are available.
+    for (level, root) in new_subtree_roots {
+        merge_complete_subtree(&mut complete_subtree_roots, level, root);
+    }
+
+    // The new tip comes after every merged leaf.
+    let new_tip_position = next_leaf_position + leaves_to_merge.len() as u64;
+    let ommers = complete_subtree_roots.into_iter().flatten().collect();
+
+    Frontier::from_parts(Position::from(new_tip_position), new_tip_leaf, ommers)
 }
 
 /// Appends `nodes` to `frontier` and returns the completed subtree's
