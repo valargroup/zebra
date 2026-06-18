@@ -441,7 +441,8 @@ where
                     // `Missing` status, means the peer is misbehaving or raced us
                     // (e.g. the block was reorged away between advertisement and
                     // fetch). Treat it as a retryable download failure rather than
-                    // asserting and bringing the whole node down.
+                    // asserting and bringing the whole node down. A remote peer must
+                    // not be able to crash the node.
                     match blocks.first().and_then(|block| block.available()) {
                         Some(available) if blocks.len() == 1 => available,
                         _ => {
