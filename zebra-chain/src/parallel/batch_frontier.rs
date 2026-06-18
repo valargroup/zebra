@@ -114,7 +114,7 @@ where
     }
 
     // Rebuild the pure forest of the existing tree, and the next free position.
-    let (mut forest, mut size): (Forest<H>, u64) = match frontier.value() {
+    let (mut forest, mut old_size): (Forest<H>, u64) = match frontier.value() {
         None => (Vec::new(), 0),
         Some(f) => {
             let (position, leaf, ommers) = (f.position(), f.leaf().clone(), f.ommers().to_vec());
@@ -136,55 +136,72 @@ where
         }
     };
 
-    // The new last leaf stays raw; everything before it joins the forest as
-    // globally-aligned dyadic blocks.
+    // The new last leaf stays raw; everything before it joins the forest.
     let last = new_leaves.len() - 1;
     let body = &new_leaves[..last];
 
-    // Decompose [size, size + body.len()) into maximal position-aligned dyadic
-    // blocks, then compute each block's root in parallel.
-    // Dyadic block means that the block is aligned to the power of 2: 1, 2, 4 ...
-    // It splits the new leaves, except the final frontier tip,
-    // into the largest globally aligned power-of-two
-    // chunks so each chunk can be hashed independently
-    // without changing the Merkle tree shape.
-    let mut blocks: Vec<(usize, &[H])> = Vec::new();
+    // Format: Partition `body` (all new leaves except the last) into maximal power-of-two-sized blocks,
+    // aligned to powers-of-two with respect to the global leaf index (the current size).
+    //
+    // Each block has width 2^L, starts at an index divisible by 2^L, and doesn't extend past `end`.
+    // This ensures each block can be processed independently as a perfect subtree.
+    //
+    // Example: with a tree size of 6 and 7 new leaves (body indices 6–12):
+    //   Indices [6–7]   -> 2-leaf block (level=1, width=2, 6 is divisible by 2)
+    //   Indices [8–11]  -> 4-leaf block (level=2, width=4, 8 is divisible by 4)
+    //   Index  [12]     -> 1-leaf block (level=0, width=1, 12 is divisible by 1)
+    //
+    // Partitioning is done left to right, respecting block boundaries and maximal size.
+    let mut complete_subtree_blocks: Vec<(usize, &[H])> = Vec::new();
     {
-        let mut pos = size;
-        let end = size + body.len() as u64;
-        let mut offset = 0usize;
-        while pos < end {
-            // Largest level L with pos % 2^L == 0 and pos + 2^L <= end.
-            let align = if pos == 0 {
+        // global_pos and body_offset always move together. They track the same
+        // position in two different coordinate systems.
+        // cursor in the global leaf index space
+        let mut global_pos = old_size;
+        // cursor in the body-slice space
+        let mut body_offset = 0usize;
+        let body_end = old_size + body.len() as u64;
+
+        while global_pos < body_end {
+            // "How large a power-of-two block can start here, given alignment?"
+            // Find the largest level `L` such that:
+            //   1. global_pos % 2^L == 0 (align_level)
+            //   2. global_pos + 2^L <= body_end (block fits within remaining body leaves)
+            let align_level = if global_pos == 0 {
                 u64::BITS
             } else {
-                pos.trailing_zeros()
+                global_pos.trailing_zeros()
             };
-            let remaining = end - pos;
-            let span = u64::BITS - 1 - remaining.leading_zeros(); // floor(log2(remaining))
-            let level = align.min(span) as usize;
-            let width = 1usize << level;
-            blocks.push((level, &body[offset..offset + width]));
-            offset += width;
-            pos += width as u64;
+            // "How many leaves are left to be assigned to blocks?"
+            let leaves_left = body_end - global_pos;
+
+            // "How large a block fits in what's left?"
+            // floor(log2(leaves_left))
+            let fit_level = u64::BITS - 1 - leaves_left.leading_zeros(); 
+
+            let level = align_level.min(fit_level) as usize;
+            let block_width = 1usize << level; // 2^level
+            complete_subtree_blocks.push((level, &body[body_offset..body_offset + block_width]));
+            body_offset += block_width;
+            global_pos += block_width as u64;
         }
     }
 
     // Compute all block roots concurrently (and each reduction is itself
     // internally parallel). `par_iter().collect()` preserves order, so injection
     // below stays in ascending position order, keeping the carry order exact.
-    let roots: Vec<(usize, H)> = blocks
+    let roots: Vec<(usize, H)> = complete_subtree_blocks
         .into_par_iter()
         .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
         .collect();
     for (level, root) in roots {
         inject(&mut forest, level, root);
     }
-    size += body.len() as u64;
+    old_size += body.len() as u64;
 
     // The final frontier: raw last leaf at `position = size`, ommers = forest
     // (compacted low→high, matching the set bits of `position`).
-    let position = Position::from(size);
+    let position = Position::from(old_size);
     let leaf = new_leaves[last].clone();
     let ommers: Vec<H> = forest.into_iter().flatten().collect();
 
@@ -220,8 +237,7 @@ where
         return Ok((frontier, None));
     }
 
-    // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions,
-    // which is far below u64::MAX.
+    // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions
     let old_size = frontier.tree_size();
     let new_size = old_size + nodes.len() as u64;
 
