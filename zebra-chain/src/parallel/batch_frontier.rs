@@ -26,11 +26,11 @@ use incrementalmerkletree::{
 use rayon::prelude::*;
 use std::{error::Error, fmt};
 
-/// A pure binary-counter forest of a contiguous run of leaves, indexed by level:
-/// `slots[L] == Some(root)` iff bit `L` of the run length is set, in which case
+/// Complete subtree roots for a contiguous run of leaves, indexed by level:
+/// `roots[L] == Some(root)` iff bit `L` of the run length is set, in which case
 /// `root` is the root of the complete `2^L`-leaf subtree covering that aligned
 /// block. Higher set bits (older subtrees) are further left in leaf order.
-type LevelSlots<H> = Vec<Option<H>>;
+type CompleteSubtreeRoots<H> = Vec<Option<H>>;
 
 /// Errors from batch frontier updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +71,11 @@ impl From<FrontierError> for BatchFrontierError {
 /// value is always the left (older) argument of [`Hashable::combine`]. This holds
 /// because we only ever merge the old tip leaf and then the new leaves, in
 /// ascending position order.
-fn merge_complete_subtree<H: Hashable + Clone>(slots: &mut LevelSlots<H>, level: usize, node: H) {
+fn merge_complete_subtree<H: Hashable + Clone>(
+    slots: &mut CompleteSubtreeRoots<H>,
+    level: usize,
+    node: H,
+) {
     let mut idx = level;
     let mut carry = node;
     loop {
@@ -107,6 +111,96 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
         || perfect_subtree_root(right),
     );
     H::combine(child_level, &l, &r)
+}
+
+/// Returns true if the leaves before the frontier tip include a complete
+/// `2^level` subtree.
+///
+/// Example: position 6 is the seventh leaf, because positions are zero-based.
+/// The six earlier leaves decompose as `6 == 0b110`: one complete 4-leaf
+/// subtree and one complete 2-leaf subtree, so levels 2 and 1 are present.
+/// Level 0 is absent until the tip leaf at position 6 is merged. After that,
+/// the tree has 7 leaves; appending position 7 completes the next 8-leaf
+/// subtree.
+fn contains_complete_subtree(position: Position, level: u32) -> bool {
+    u64::from(position) & (1u64 << level) != 0
+}
+
+/// Expands a [`Frontier`] into complete subtree roots indexed by level.
+///
+/// `slots[level]` contains the root of a complete `2^level`-leaf subtree, if
+/// one exists. `None` means there is no complete subtree at that level. The
+/// returned position is the next leaf index to append.
+///
+/// Example: position 6 is the seventh leaf, because positions are zero-based.
+/// This includes that leaf, so the returned roots cover 7 leaves. Since
+/// `7 == 0b111`, roots are present at levels 0, 1, and 2.
+///
+/// To build a root at level `L + 1`, we first need sibling roots at level `L`;
+/// this is why merges only carry upward after combining two roots at the same
+/// level.
+fn frontier_complete_subtree_roots<H, const DEPTH: u8>(
+    frontier: &Frontier<H, DEPTH>,
+) -> (CompleteSubtreeRoots<H>, u64)
+where
+    H: Hashable + Clone,
+{
+    let empty_slots = || vec![None; usize::from(DEPTH)];
+
+    let Some(frontier) = frontier.value() else {
+        return (empty_slots(), 0);
+    };
+
+    let position = frontier.position();
+    let mut slots = empty_slots();
+    let mut sibling_roots = frontier.ommers().iter().cloned();
+
+    // `frontier.ommers()` are sibling roots for complete subtrees before the
+    // tip. So if tip is at position 6, we set this according to 6 leaves.
+    // We can read off roots by looking at the set bits in `position`.
+    for level in 0..u64::BITS {
+        if contains_complete_subtree(position, level) {
+            slots[level as usize] = Some(sibling_roots.next().expect("sibling root per set bit"));
+        }
+    }
+
+    // Now merge in the tip leaf, updating hashes and completeness conditions by
+    // carrying through occupied slots.
+    // So tip at position 6, would now make the new slots value be correct for 7 leaves.
+    // Importantly merging the tip can do hashing, hence this function may compute hashes!
+    merge_complete_subtree(&mut slots, 0, frontier.leaf().clone());
+
+    (slots, u64::from(position) + 1)
+}
+
+/// Splits `leaves` into complete subtree chunks at their global positions.
+///
+/// Each returned chunk has length `2^level` and starts at a position divisible
+/// by `2^level`, so it can be hashed independently as a complete subtree.
+fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, &[H])> {
+    let mut chunks = Vec::new();
+    let mut global_pos = start_position;
+    let mut leaf_offset = 0usize;
+    let end_position = start_position + leaves.len() as u64;
+
+    while global_pos < end_position {
+        let align_level = if global_pos == 0 {
+            u64::BITS
+        } else {
+            global_pos.trailing_zeros()
+        };
+        let leaves_left = end_position - global_pos;
+        let fit_level = u64::BITS - 1 - leaves_left.leading_zeros();
+
+        let level = align_level.min(fit_level) as usize;
+        let chunk_len = 1usize << level;
+        chunks.push((level, &leaves[leaf_offset..leaf_offset + chunk_len]));
+
+        leaf_offset += chunk_len;
+        global_pos += chunk_len as u64;
+    }
+
+    chunks
 }
 
 /// Appends `new_leaves` (in order) to `frontier`, returning the updated frontier.
@@ -157,7 +251,7 @@ where
     // Pre-size one slot for each valid Merkle level.
     let empty_slots = || vec![None; usize::from(DEPTH)];
 
-    let (mut slots, mut old_size): (LevelSlots<H>, u64) = match frontier.value() {
+    let (mut slots, mut old_size): (CompleteSubtreeRoots<H>, u64) = match frontier.value() {
         None => (empty_slots(), 0),
         Some(f) => {
             let (position, leaf, ommers) = (f.position(), f.leaf().clone(), f.ommers().to_vec());
@@ -249,6 +343,35 @@ where
     let ommers: Vec<H> = slots.into_iter().flatten().collect();
 
     Frontier::from_parts(position, leaf, ommers)
+}
+
+/// Simpler rewrite sketch for [`parallel_append`].
+#[allow(dead_code)]
+pub fn parallel_append2<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    mut new_leaves: Vec<H>,
+) -> Result<Frontier<H, DEPTH>, FrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    if new_leaves.is_empty() {
+        return Ok(frontier);
+    }
+
+    // complete_subtree_roots[level] is the root of a complete 2^level-leaf
+    // subtree, or None if no complete subtree exists at that level.
+    let (_complete_subtree_roots, old_size) = frontier_complete_subtree_roots(&frontier);
+
+    // Frontier stores the newest leaf separately, so the last incoming leaf
+    // becomes the new tip. Earlier incoming leaves are merged into subtree roots.
+    let _new_tip_leaf = new_leaves
+        .pop()
+        .expect("new_leaves is not empty because it was checked above");
+    let leaves_to_merge = new_leaves;
+
+    let _chunks = complete_subtree_chunks(old_size, &leaves_to_merge);
+
+    todo!("build simpler parallel append algorithm")
 }
 
 /// Appends `nodes` to `frontier` and returns the completed subtree's
