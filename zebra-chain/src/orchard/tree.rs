@@ -429,9 +429,8 @@ impl NoteCommitmentTree {
         // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions.
         let nodes: Vec<Node> = cms.iter().map(|cm_x| (*cm_x).into()).collect();
 
-        let (frontier, completed) =
-            append_batch_with_subtree(self.inner.clone(), nodes)
-                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+        let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
+            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
 
         self.inner = frontier;
         *self
@@ -441,9 +440,7 @@ impl NoteCommitmentTree {
 
         Ok(completed.map(|(index_value, root)| {
             let index = NoteCommitmentSubtreeIndex(
-                index_value
-                    .try_into()
-                    .expect("subtree index fits in u16"),
+                index_value.try_into().expect("subtree index fits in u16"),
             );
             (index, root)
         }))
@@ -767,8 +764,10 @@ mod tests {
     fn node(value: u64) -> Node {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&value.to_le_bytes());
-        Node(Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
-            .expect("small little-endian integers are canonical field elements"))
+        Node(
+            Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+                .expect("small little-endian integers are canonical field elements"),
+        )
     }
 
     fn note_commitment(value: u64) -> NoteCommitmentUpdate {
@@ -810,11 +809,23 @@ mod tests {
 
         // Batch must return the same subtree result and produce the same final tree.
         let mut batch_tree = tree;
-        let batch_result = batch_tree.append_batch(&cms).expect("batch append succeeds");
+        let batch_result = batch_tree
+            .append_batch(&cms)
+            .expect("batch append succeeds");
 
-        assert!(batch_result.is_some(), "batch crossing boundary must return a subtree");
-        assert_eq!(batch_result.unwrap().0, NoteCommitmentSubtreeIndex(0), "first subtree index");
-        assert_eq!(batch_result, expected_subtree, "subtree result matches sequential");
+        assert!(
+            batch_result.is_some(),
+            "batch crossing boundary must return a subtree"
+        );
+        assert_eq!(
+            batch_result.unwrap().0,
+            NoteCommitmentSubtreeIndex(0),
+            "first subtree index"
+        );
+        assert_eq!(
+            batch_result, expected_subtree,
+            "subtree result matches sequential"
+        );
         batch_tree.assert_frontier_eq(&seq_tree);
         assert_eq!(batch_tree.root(), seq_tree.root());
     }

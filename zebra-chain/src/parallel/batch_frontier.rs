@@ -26,29 +26,29 @@ use incrementalmerkletree::{
 use rayon::prelude::*;
 
 /// A pure binary-counter forest of a contiguous run of leaves, indexed by level:
-/// `forest[L] == Some(root)` iff bit `L` of the run length is set, in which case
+/// `slots[L] == Some(root)` iff bit `L` of the run length is set, in which case
 /// `root` is the root of the complete `2^L`-leaf subtree covering that aligned
 /// block. Higher set bits (older subtrees) are further left in leaf order.
-type Forest<H> = Vec<Option<H>>;
+type LevelSlots<H> = Vec<Option<H>>;
 
-/// Injects a complete subtree `node` at level `level` into the binary-counter
-/// `forest`, propagating carries upward.
+/// Merges a complete subtree `node` at level `level` into the binary-counter
+/// `slots`, propagating carries upward.
 ///
 /// `node` (and anything it carries into) must be **strictly newer** (further
 /// right in leaf order) than everything already in `forest`, so the existing slot
 /// value is always the left (older) argument of [`Hashable::combine`]. This holds
-/// because we only ever inject the old tip leaf and then the new leaves, in
+/// because we only ever merge the old tip leaf and then the new leaves, in
 /// ascending position order.
-fn inject<H: Hashable + Clone>(forest: &mut Forest<H>, level: usize, node: H) {
+fn merge_complete_subtree<H: Hashable + Clone>(slots: &mut LevelSlots<H>, level: usize, node: H) {
     let mut idx = level;
     let mut carry = node;
     loop {
-        if idx >= forest.len() {
-            forest.resize(idx + 1, None);
+        if idx >= slots.len() {
+            slots.resize(idx + 1, None);
         }
-        match forest[idx].take() {
+        match slots[idx].take() {
             None => {
-                forest[idx] = Some(carry);
+                slots[idx] = Some(carry);
                 break;
             }
             Some(existing) => {
@@ -90,9 +90,9 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
 /// A frontier of size `S` stores the last leaf raw plus `ommers` that are exactly
 /// the pure forest of the first `S - 1` leaves. We:
 /// 1. rebuild that forest from `ommers` (bit `L` of `position` set ⇒ one ommer);
-/// 2. inject the old tip leaf, giving the pure forest of all `S` leaves;
+/// 2. merge the old tip leaf, giving the pure forest of all `S` leaves;
 /// 3. append every new leaf except the last as **globally position-aligned
-///    dyadic blocks** — each block's root computed in parallel — injecting them
+///    dyadic blocks** — each block's root computed in parallel — merging them
 ///    in ascending position order (aligned blocks compose with no cross-boundary
 ///    re-pairing, which is what makes the parallel reduction exact);
 /// 4. the new last leaf becomes the frontier's raw leaf, and the resulting forest
@@ -111,25 +111,25 @@ where
     }
 
     // Rebuild the pure forest of the existing tree, and the next free position.
-    let (mut forest, mut old_size): (Forest<H>, u64) = match frontier.value() {
+    let (mut slots, mut old_size): (LevelSlots<H>, u64) = match frontier.value() {
         None => (Vec::new(), 0),
         Some(f) => {
             let (position, leaf, ommers) = (f.position(), f.leaf().clone(), f.ommers().to_vec());
             let pos = u64::from(position); // = S - 1
                                            // ommers (low→high) sit at the set bits of `pos`.
-            let mut forest: Forest<H> = Vec::new();
+            let mut slots: LevelSlots<H> = Vec::new();
             let mut ommers = ommers.into_iter();
             for level in 0..u64::BITS {
                 if pos & (1 << level) != 0 {
-                    if level as usize >= forest.len() {
-                        forest.resize(level as usize + 1, None);
+                    if level as usize >= slots.len() {
+                        slots.resize(level as usize + 1, None);
                     }
-                    forest[level as usize] = Some(ommers.next().expect("ommer per set bit"));
+                    slots[level as usize] = Some(ommers.next().expect("ommer per set bit"));
                 }
             }
-            // Inject the old tip leaf (position `pos`) to get the pure forest of S leaves.
-            inject(&mut forest, 0, leaf);
-            (forest, pos + 1)
+            // Merge the old tip leaf (position `pos`) to get the pure forest of S leaves.
+            merge_complete_subtree(&mut slots, 0, leaf);
+            (slots, pos + 1)
         }
     };
 
@@ -176,7 +176,7 @@ where
 
             // "How large a block fits in what's left?"
             // floor(log2(leaves_left))
-            let fit_level = u64::BITS - 1 - leaves_left.leading_zeros(); 
+            let fit_level = u64::BITS - 1 - leaves_left.leading_zeros();
 
             let level = align_level.min(fit_level) as usize;
             let block_width = 1usize << level; // 2^level
@@ -187,14 +187,14 @@ where
     }
 
     // Compute all block roots concurrently (and each reduction is itself
-    // internally parallel). `par_iter().collect()` preserves order, so injection
+    // internally parallel). `par_iter().collect()` preserves order, so merging
     // below stays in ascending position order, keeping the carry order exact.
     let roots: Vec<(usize, H)> = complete_subtree_blocks
         .into_par_iter()
         .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
         .collect();
     for (level, root) in roots {
-        inject(&mut forest, level, root);
+        merge_complete_subtree(&mut slots, level, root);
     }
     old_size += body.len() as u64;
 
@@ -202,7 +202,7 @@ where
     // (compacted low→high, matching the set bits of `position`).
     let position = Position::from(old_size);
     let leaf = new_leaves[last].clone();
-    let ommers: Vec<H> = forest.into_iter().flatten().collect();
+    let ommers: Vec<H> = slots.into_iter().flatten().collect();
 
     Frontier::from_parts(position, leaf, ommers)
 }
@@ -252,7 +252,9 @@ where
     // because block size is bounded by the same consensus rule.
     let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
     // Round old_size up to the next subtree boundary.
-    let boundary = (old_size / subtree_size).checked_add(1).and_then(|n| n.checked_mul(subtree_size));
+    let boundary = (old_size / subtree_size)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(subtree_size));
 
     if boundary.is_some_and(|b| b <= new_size) {
         let boundary = boundary.expect("checked above");

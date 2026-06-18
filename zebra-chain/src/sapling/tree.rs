@@ -247,9 +247,8 @@ impl NoteCommitmentTree {
         let nodes: Vec<sapling_crypto::Node> =
             cms.iter().map(sapling_crypto::Node::from_cmu).collect();
 
-        let (frontier, completed) =
-            append_batch_with_subtree(self.inner.clone(), nodes)
-                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+        let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
+            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
 
         self.inner = frontier;
         *self
@@ -259,9 +258,7 @@ impl NoteCommitmentTree {
 
         Ok(completed.map(|(index_value, root)| {
             let index = NoteCommitmentSubtreeIndex(
-                index_value
-                    .try_into()
-                    .expect("subtree index fits in u16"),
+                index_value.try_into().expect("subtree index fits in u16"),
             );
             (index, root)
         }))
@@ -632,11 +629,23 @@ mod tests {
 
         // Batch must return the same subtree result and produce the same final tree.
         let mut batch_tree = tree;
-        let batch_result = batch_tree.append_batch(&cms).expect("batch append succeeds");
+        let batch_result = batch_tree
+            .append_batch(&cms)
+            .expect("batch append succeeds");
 
-        assert!(batch_result.is_some(), "batch crossing boundary must return a subtree");
-        assert_eq!(batch_result.unwrap().0, NoteCommitmentSubtreeIndex(0), "first subtree index");
-        assert_eq!(batch_result, expected_subtree, "subtree result matches sequential");
+        assert!(
+            batch_result.is_some(),
+            "batch crossing boundary must return a subtree"
+        );
+        assert_eq!(
+            batch_result.unwrap().0,
+            NoteCommitmentSubtreeIndex(0),
+            "first subtree index"
+        );
+        assert_eq!(
+            batch_result, expected_subtree,
+            "subtree result matches sequential"
+        );
         batch_tree.assert_frontier_eq(&seq_tree);
         assert_eq!(batch_tree.root(), seq_tree.root());
     }
