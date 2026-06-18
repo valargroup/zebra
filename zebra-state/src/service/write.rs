@@ -275,7 +275,25 @@ impl WriteBlockWorkerTask {
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
-        while let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() {
+        loop {
+            // Time spent waiting for the next block to commit (writer idle).
+            // If this dominates the commit work below, the writer is starved by
+            // the verify->commit feed, not commit-bound.
+            #[cfg(feature = "commit-metrics")]
+            let _wait_start = std::time::Instant::now();
+            let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() else {
+                break;
+            };
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.state.write.wait.duration_seconds")
+                .record(_wait_start.elapsed().as_secs_f64());
+            // How many finalized blocks are still queued for the writer after we
+            // took this one: ~0 means the writer is starved by the feed; a large
+            // backlog means the writer itself is the bottleneck.
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.state.write.channel.depth")
+                .record(finalized_block_write_receiver.len() as f64);
+
             // TODO: split these checks into separate functions
 
             if invalid_block_reset_sender.is_closed() {
@@ -310,9 +328,14 @@ impl WriteBlockWorkerTask {
             }
 
             // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
-            {
+            #[cfg(feature = "commit-metrics")]
+            let _busy_start = std::time::Instant::now();
+            let commit_result = finalized_state
+                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take());
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.state.write.busy.duration_seconds")
+                .record(_busy_start.elapsed().as_secs_f64());
+            match commit_result {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
