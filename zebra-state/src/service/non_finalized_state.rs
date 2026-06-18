@@ -634,6 +634,8 @@ impl NonFinalizedState {
                     block,
                     &network,
                     &history_tree,
+                    // The non-finalized path doesn't precompute the auth data root.
+                    None,
                 ));
             });
 
