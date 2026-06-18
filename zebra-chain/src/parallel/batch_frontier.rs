@@ -43,9 +43,6 @@ fn merge_complete_subtree<H: Hashable + Clone>(slots: &mut LevelSlots<H>, level:
     let mut idx = level;
     let mut carry = node;
     loop {
-        if idx >= slots.len() {
-            slots.resize(idx + 1, None);
-        }
         match slots[idx].take() {
             None => {
                 slots[idx] = Some(carry);
@@ -110,20 +107,34 @@ where
         return Ok(frontier);
     }
 
+    let old_tree_size = frontier.tree_size();
+    let Some(new_tree_size) = old_tree_size.checked_add(new_leaves.len() as u64) else {
+        return Err(FrontierError::MaxDepthExceeded {
+            depth: DEPTH.saturating_add(1),
+        });
+    };
+    let max_tree_size = 1u64
+        .checked_shl(u32::from(DEPTH))
+        .expect("Zcash note commitment tree depth fits in u64");
+    if new_tree_size > max_tree_size {
+        return Err(FrontierError::MaxDepthExceeded {
+            depth: DEPTH.saturating_add(1),
+        });
+    }
+
     // Rebuild the pure forest of the existing tree, and the next free position.
+    let empty_slots = || vec![None; usize::from(DEPTH)];
+
     let (mut slots, mut old_size): (LevelSlots<H>, u64) = match frontier.value() {
-        None => (Vec::new(), 0),
+        None => (empty_slots(), 0),
         Some(f) => {
             let (position, leaf, ommers) = (f.position(), f.leaf().clone(), f.ommers().to_vec());
             let pos = u64::from(position); // = S - 1
                                            // ommers (low→high) sit at the set bits of `pos`.
-            let mut slots: LevelSlots<H> = Vec::new();
+            let mut slots = empty_slots();
             let mut ommers = ommers.into_iter();
             for level in 0..u64::BITS {
                 if pos & (1 << level) != 0 {
-                    if level as usize >= slots.len() {
-                        slots.resize(level as usize + 1, None);
-                    }
                     slots[level as usize] = Some(ommers.next().expect("ommer per set bit"));
                 }
             }
