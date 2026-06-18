@@ -146,6 +146,15 @@ fn contains_complete_subtree(position: Position, level: u32) -> bool {
 /// To build a root at level `L + 1`, we first need sibling roots at level `L`;
 /// this is why merges only carry upward after combining two roots at the same
 /// level.
+///
+/// The returned `complete_subtree_roots` remain indexed low-to-high by level.
+/// Flattening this vector produces the complete-subtree root order expected by
+/// [`Frontier::from_parts`]: from the leaf tip upward, also low-to-high by
+/// level.
+///
+/// Merging the frontier tip into these slots can compute a carry chain of
+/// hashes before the parallel batch work begins. That serial work is
+/// intentional and bounded by `DEPTH`.
 fn frontier_complete_subtree_roots<H, const DEPTH: u8>(
     frontier: &Frontier<H, DEPTH>,
 ) -> (CompleteSubtreeRoots<H>, u64)
@@ -162,9 +171,9 @@ where
     let mut slots = empty_slots();
     let mut sibling_roots = frontier.ommers().iter().cloned();
 
-    // `frontier.ommers()` are sibling roots for complete subtrees before the
-    // tip. So if tip is at position 6, we set this according to 6 leaves.
-    // We can read off roots by looking at the set bits in `position`.
+    // These sibling roots represent complete subtrees before the tip. So if
+    // tip is at position 6, we set this according to 6 leaves. We can read off
+    // roots by looking at the set bits in `position`.
     for level in 0..u64::BITS {
         if contains_complete_subtree(position, level) {
             slots[level as usize] = Some(sibling_roots.next().expect("sibling root per set bit"));
@@ -174,7 +183,7 @@ where
     // Now merge in the tip leaf, updating hashes and completeness conditions by
     // carrying through occupied slots.
     // So tip at position 6, would now make the new slots value be correct for 7 leaves.
-    // Importantly merging the tip can do hashing, hence this function may compute hashes!
+    // Merging the tip can drive a carry chain of hashes before the parallel batch hashing.
     merge_complete_subtree(&mut slots, 0, frontier.leaf().clone());
 
     (slots, u64::from(position) + 1)
@@ -285,9 +294,15 @@ where
 
     // The new tip comes after every merged leaf.
     let new_tip_position = next_leaf_position + leaves_to_merge.len() as u64;
-    let ommers = complete_subtree_roots.into_iter().flatten().collect();
+    // `complete_subtree_roots` is indexed by level, low-to-high; `from_parts`
+    // expects complete subtree roots in the same order, from the new tip upward.
+    let complete_subtree_roots = complete_subtree_roots.into_iter().flatten().collect();
 
-    Frontier::from_parts(Position::from(new_tip_position), new_tip_leaf, ommers)
+    Frontier::from_parts(
+        Position::from(new_tip_position),
+        new_tip_leaf,
+        complete_subtree_roots,
+    )
 }
 
 /// Appends `nodes` to `frontier` and returns the completed subtree's
@@ -485,6 +500,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn complete_subtree_roots_flatten_to_frontier_order() {
+        let interesting_prefix_lengths = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+        ];
+
+        for prefix_len in interesting_prefix_lengths {
+            let prefix_len = u64::try_from(prefix_len).expect("test prefix length fits in u64");
+            let prefix: Vec<TestNode> = (0..prefix_len).map(TestNode).collect();
+            let start = build_frontier::<DEPTH>(&prefix);
+            let new_tip_leaf = TestNode(10_000 + prefix_len);
+
+            let (complete_subtree_roots, next_leaf_position) =
+                frontier_complete_subtree_roots(&start);
+            assert_eq!(
+                next_leaf_position, prefix_len,
+                "next leaf position mismatch for prefix length {prefix_len}"
+            );
+
+            let complete_subtree_roots: Vec<TestNode> =
+                complete_subtree_roots.into_iter().flatten().collect();
+            let reconstructed = Frontier::<TestNode, DEPTH>::from_parts(
+                Position::from(next_leaf_position),
+                new_tip_leaf,
+                complete_subtree_roots,
+            )
+            .expect("test frontier reconstruction succeeds");
+            let sequential = sequential_append::<DEPTH>(start, &[new_tip_leaf]);
+
+            assert_eq!(
+                sequential.value().map(|f| f.clone().into_parts()),
+                reconstructed.value().map(|f| f.clone().into_parts()),
+                "flattened complete_subtree_roots must be ordered for Frontier::from_parts at prefix length {prefix_len}"
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
@@ -555,8 +607,7 @@ mod tests {
             "parts mismatch at exact capacity"
         );
 
-        let empty_append =
-            parallel_append(par.clone(), Vec::new()).expect("empty append succeeds");
+        let empty_append = parallel_append(par.clone(), Vec::new()).expect("empty append succeeds");
         assert_eq!(
             par.value().map(|f| f.clone().into_parts()),
             empty_append.value().map(|f| f.clone().into_parts()),
