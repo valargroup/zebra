@@ -237,7 +237,7 @@ where
     }
 
     // A block cannot span two or more subtree boundaries, so the batch must be smaller than one subtree.
-    debug_assert!(
+    assert!(
         nodes.len() < (1 << TRACKED_SUBTREE_HEIGHT),
         "batch must come from a single block (got {} nodes, subtree size is 2^{})",
         nodes.len(),
