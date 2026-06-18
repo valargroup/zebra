@@ -225,6 +225,16 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
     }
 }
 
+fn not_found_download_error(hash: block::Hash) -> BlockDownloadVerifyError {
+    BlockDownloadVerifyError::DownloadFailed {
+        error: zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(vec![
+            zn::InventoryHash::from(hash),
+        ]))
+        .into(),
+        hash,
+    }
+}
+
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
 #[pin_project]
 #[derive(Debug)]
@@ -451,20 +461,22 @@ where
                         None => {
                             // Use a typed SharedPeerError so not_found_download()
                             // can downcast it and route to the bounded retry path.
-                            return Err(BlockDownloadVerifyError::DownloadFailed {
-                                error: zn::SharedPeerError::from(
-                                    zn::PeerError::NotFoundResponse(vec![
-                                        zn::InventoryHash::from(hash),
-                                    ]),
-                                )
-                                .into(),
-                                hash,
-                            });
+                            return Err(not_found_download_error(hash));
                         }
                     }
                 } else {
                     unreachable!("wrong response to block request");
                 };
+                let received_hash = block.hash();
+                if received_hash != hash {
+                    debug!(
+                        ?hash,
+                        ?received_hash,
+                        "downloaded block hash did not match requested hash: dropped downloaded block"
+                    );
+
+                    return Err(not_found_download_error(hash));
+                }
                 metrics::counter!("sync.downloaded.block.count").increment(1);
                 metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
                     .record(download_start.elapsed().as_secs_f64());

@@ -1,7 +1,7 @@
 //! Legacy Zebra gossip compatibility over Zakura streams.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     io::Cursor,
@@ -1521,6 +1521,7 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        let requested_block_hashes = requested_block_hashes(&frame);
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let frame = frame.encode_frame()?;
         let started_at = Instant::now();
@@ -1544,6 +1545,7 @@ impl ZakuraRequestClient {
         })??;
         let mut response =
             LegacyResponseCodec::decode_response(request_id, request_kind, response)?;
+        retain_requested_blocks(&mut response, requested_block_hashes.as_ref());
         if request_kind == LegacyRequestKind::Ping {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
@@ -1594,6 +1596,32 @@ fn all_inventory_missing(response: &Response) -> bool {
             .all(|transaction| transaction.is_missing()),
         _ => false,
     }
+}
+
+fn requested_block_hashes(frame: &LegacyRequestFrame) -> Option<HashSet<block::Hash>> {
+    match frame {
+        LegacyRequestFrame::BlocksByHash(hashes) => Some(hashes.iter().copied().collect()),
+        _ => None,
+    }
+}
+
+/// Keep the Zakura `BlocksByHash` response bound to the hashes from the original request.
+///
+/// The legacy TCP handler only accepts returned blocks whose hashes are still pending for the
+/// request. Do the same here after decoding: a peer must not be able to complete a request for
+/// hash `H` by sending some other valid serialized block `X`.
+fn retain_requested_blocks(
+    response: &mut Response,
+    requested_hashes: Option<&HashSet<block::Hash>>,
+) {
+    let (Response::Blocks(blocks), Some(requested_hashes)) = (response, requested_hashes) else {
+        return;
+    };
+
+    blocks.retain(|block_response| match block_response {
+        InventoryResponse::Available((block, _)) => requested_hashes.contains(&block.hash()),
+        InventoryResponse::Missing(_) => true,
+    });
 }
 
 /// Returns the inventory hashes being requested by `frame`, or `None` for
@@ -3982,6 +4010,46 @@ mod tests {
 
         responder_result?;
         let error = request_result.expect_err("empty block response should be a typed notfound");
+        assert_not_found_response(&error);
+        wait_registered_count(&node, 1).await?;
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_outbound_block_response_becomes_typed_notfound() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node = ZakuraTestNode::builder(83).spawn().await?;
+        let hostile = HostilePeer::connect_native(&node, 84).await?;
+        wait_registered_count(&node, 1).await?;
+        let hostile_id = hostile.id()?;
+
+        let requested_hash = block_hash(1);
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        assert_ne!(block.hash(), requested_hash);
+
+        let adapter = LegacyRequestAdapter::new(node.supervisor());
+        let request = adapter.request_from_source(
+            Request::BlocksByHash(HashSet::from([requested_hash])),
+            Some(PeerSource::Zakura(hostile_id)),
+        );
+        let responder = hostile.respond_to_next_request_with(|request_id| {
+            LegacyResponseCodec::encode_response(
+                request_id,
+                Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+                u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
+                    .expect("max protocol message length fits in u32"),
+            )
+            .expect("test block response encodes")
+        });
+        let (request_result, responder_result) = futures::join!(request, responder);
+
+        responder_result?;
+        let error = request_result.expect_err("wrong block response should be a typed notfound");
         assert_not_found_response(&error);
         wait_registered_count(&node, 1).await?;
 

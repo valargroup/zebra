@@ -1982,6 +1982,43 @@ async fn missing_block_response_produces_typed_not_found() -> Result<(), crate::
     Ok(())
 }
 
+/// A peer response containing a real block for a different hash must be treated as a failed
+/// download of the requested block, and must not be submitted to the verifier.
+#[tokio::test]
+async fn mismatched_block_response_produces_typed_not_found() -> Result<(), crate::BoxError> {
+    let _guard = zebra_test::init();
+
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+    let block2: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    assert_ne!(block2.hash(), block1_hash);
+
+    let (mut downloads, mut peer_set, mut verifier) = setup_downloads();
+
+    downloads.download_and_verify(block1_hash).await?;
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![InventoryResponse::Available((
+            block2, None,
+        ))]));
+
+    let result = futures::StreamExt::next(&mut downloads)
+        .await
+        .expect("stream yields an item");
+
+    let err = result.expect_err("mismatched block response should be an error");
+    assert_eq!(
+        err.not_found_download(),
+        Some((block1_hash, NotFoundKind::Response)),
+        "mismatched block response must requeue the originally requested hash"
+    );
+
+    verifier.expect_no_requests().await;
+    Ok(())
+}
+
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(Vec::new())).into()
 }
