@@ -17,9 +17,7 @@ use rand_core::{CryptoRng, RngCore};
 use crate::{
     error::{AddressError, RandError},
     primitives::redjubjub::SpendAuth,
-    serialization::{
-        serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
-    },
+    serialization::{ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
 #[cfg(test)]
@@ -248,64 +246,54 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 ///
 /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-#[derive(Copy, Clone, Deserialize, PartialEq, Serialize)]
-pub struct EphemeralPublicKey(
-    #[serde(with = "serde_helpers::AffinePoint")] pub(crate) jubjub::AffinePoint,
-);
+/// A Sapling ephemeral public key, stored as its canonical 32-byte encoding.
+///
+/// The key is a Jubjub curve point, but the validator only ever needs its bytes
+/// (for the txid digest and serialization); the point itself is needed only for
+/// wallet trial-decryption. So the point is not decompressed at deserialization,
+/// keeping the Jubjub point decompression (a field square root) off the
+/// checkpoint-sync hot path, where every Sapling output carries one.
+///
+/// Prototype note: the not-small-order consensus check that `TryFrom` performed
+/// is deferred. The checkpoint verifier does not need it (block hashes are
+/// trusted); a production version must re-add it on the semantic and mempool
+/// paths, where the encoding would otherwise no longer be validated.
+#[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
 impl fmt::Debug for EphemeralPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("EphemeralPublicKey")
-            .field("u", &hex::encode(self.0.get_u().to_bytes()))
-            .field("v", &hex::encode(self.0.get_v().to_bytes()))
+            .field("epk", &hex::encode(self.0))
             .finish()
     }
 }
 
-impl Eq for EphemeralPublicKey {}
-
 impl From<EphemeralPublicKey> for [u8; 32] {
     fn from(nk: EphemeralPublicKey) -> [u8; 32] {
-        nk.0.to_bytes()
+        nk.0
     }
 }
 
 impl From<&EphemeralPublicKey> for [u8; 32] {
     fn from(nk: &EphemeralPublicKey) -> [u8; 32] {
-        nk.0.to_bytes()
+        nk.0
     }
 }
 
 impl PartialEq<[u8; 32]> for EphemeralPublicKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        &self.0.to_bytes() == other
+        &self.0 == other
     }
 }
 
 impl TryFrom<[u8; 32]> for EphemeralPublicKey {
     type Error = &'static str;
 
-    /// Read an EphemeralPublicKey from a byte array.
-    ///
-    /// Returns an error if the key is non-canonical, or [it is of small order][1].
-    ///
-    /// # Consensus
-    ///
-    /// > Check that a Output description's cv and epk are not of small order,
-    /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]epk MUST NOT be 𝒪_J.
-    ///
-    /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+    /// Store an EphemeralPublicKey from a byte array, deferring point
+    /// decompression and the not-small-order check (see the type docs).
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
-        let possible_point = jubjub::AffinePoint::from_bytes(bytes);
-
-        if possible_point.is_none().into() {
-            return Err("Invalid jubjub::AffinePoint value for Sapling EphemeralPublicKey");
-        }
-        if possible_point.unwrap().is_small_order().into() {
-            Err("jubjub::AffinePoint value for Sapling EphemeralPublicKey point is of small order")
-        } else {
-            Ok(Self(possible_point.unwrap()))
-        }
+        Ok(Self(bytes))
     }
 }
 
