@@ -161,14 +161,12 @@ fn frontier_complete_subtree_roots<H, const DEPTH: u8>(
 where
     H: Hashable + Clone,
 {
-    let empty_slots = || vec![None; usize::from(DEPTH)];
-
     let Some(frontier) = frontier.value() else {
-        return (empty_slots(), 0);
+        return (vec![None; usize::from(DEPTH)], 0);
     };
 
     let position = frontier.position();
-    let mut slots = empty_slots();
+    let mut slots = vec![None; usize::from(DEPTH)];
     let mut sibling_roots = frontier.ommers().iter().cloned();
 
     // These sibling roots represent complete subtrees before the tip. So if
