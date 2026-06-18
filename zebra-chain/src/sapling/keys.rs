@@ -254,10 +254,17 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 /// keeping the Jubjub point decompression (a field square root) off the
 /// checkpoint-sync hot path, where every Sapling output carries one.
 ///
-/// Prototype note: the not-small-order consensus check that `TryFrom` performed
-/// is deferred. The checkpoint verifier does not need it (block hashes are
-/// trusted); a production version must re-add it on the semantic and mempool
-/// paths, where the encoding would otherwise no longer be validated.
+/// # Consensus
+///
+/// The not-small-order check that this type used to perform at deserialization
+/// is deferred, but still enforced for every untrusted transaction. The
+/// checkpoint verifier trusts block hashes and does not need it. The semantic
+/// verifier and the mempool convert every transaction via `to_librustzcash`
+/// (`CachedFfiTransaction::new`) and verify the Sapling bundle, and
+/// librustzcash enforces the rule in `SaplingVerificationContext::check_output`
+/// (sapling-crypto `verifier.rs`, `epk.is_small_order()`). Validated by
+/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
+/// `transaction/tests/vectors.rs`.
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
