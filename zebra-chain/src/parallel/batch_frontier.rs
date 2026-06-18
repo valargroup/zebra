@@ -63,14 +63,10 @@ impl From<FrontierError> for BatchFrontierError {
     }
 }
 
-/// Merges a complete subtree `node` at level `level` into the binary-counter
-/// `slots`, propagating carries upward.
+/// Adds one complete subtree to the frontier's binary-counter forest.
 ///
-/// `node` (and anything it carries into) must be **strictly newer** (further
-/// right in leaf order) than everything already in `forest`, so the existing slot
-/// value is always the left (older) argument of [`Hashable::combine`]. This holds
-/// because we only ever merge the old tip leaf and then the new leaves, in
-/// ascending position order.
+/// Callers merge subtrees from left to right, so an occupied slot is always the
+/// older left child and the new carry is always the newer right child.
 fn merge_complete_subtree<H: Hashable + Clone>(slots: &mut LevelSlots<H>, level: usize, node: H) {
     let mut idx = level;
     let mut carry = node;
