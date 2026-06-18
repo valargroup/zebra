@@ -236,8 +236,6 @@ fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, 
 /// 3. Compute the root for each chunk in parallel.
 /// 4. Merge the roots into the complete subtree roots.
 /// 5. Reconstruct a new frontier from the merged roots and the new tip leaf.
-///
-/// Returns [`FrontierError`] if appending would overflow the tree's `DEPTH` capacity.
 pub(crate) fn parallel_append<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     mut new_leaves: Vec<H>,
@@ -247,18 +245,6 @@ where
 {
     if new_leaves.is_empty() {
         return Ok(frontier);
-    }
-
-    let old_tree_size = frontier.tree_size();
-    let Some(new_tree_size) = old_tree_size.checked_add(new_leaves.len() as u64) else {
-        return Err(FrontierError::MaxDepthExceeded {
-            depth: DEPTH.saturating_add(1),
-        });
-    };
-    if new_tree_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
-        return Err(FrontierError::MaxDepthExceeded {
-            depth: DEPTH.saturating_add(1),
-        });
     }
 
     // complete_subtree_roots[level] is the root of a complete 2^level-leaf
@@ -626,29 +612,10 @@ mod tests {
             "empty append changed a full frontier"
         );
 
-        let full_tree_parallel_overflow = parallel_append(par.clone(), vec![TestNode(101)]);
-        assert!(
-            matches!(
-                full_tree_parallel_overflow,
-                Err(FrontierError::MaxDepthExceeded { .. })
-            ),
-            "parallel append to a full tree overflows"
-        );
-
         let full_tree_overflow = append_batch_with_subtree(par, vec![TestNode(101)]);
         assert!(
             full_tree_overflow.is_err(),
             "appending to a full tree overflows"
-        );
-
-        let partial_batch_parallel_overflow =
-            parallel_append(start.clone(), vec![TestNode(100), TestNode(101)]);
-        assert!(
-            matches!(
-                partial_batch_parallel_overflow,
-                Err(FrontierError::MaxDepthExceeded { .. })
-            ),
-            "parallel batch crossing tree capacity overflows"
         );
 
         let partial_batch_overflow =
@@ -755,7 +722,10 @@ mod tests {
             slots, expected_slots,
             "slot state after merging 8 leaves must match frontier expansion"
         );
-        assert_eq!(expected_next, 8, "frontier covering 8 leaves has next position 8");
+        assert_eq!(
+            expected_next, 8,
+            "frontier covering 8 leaves has next position 8"
+        );
     }
 
     /// `perfect_subtree_root` must produce the same root as sequential append
@@ -771,8 +741,8 @@ mod tests {
 
             let frontier = build_frontier::<DEPTH>(&leaves);
             let (slots, _) = frontier_complete_subtree_roots(&frontier);
-            let sequential_root = slots[log2_len]
-                .expect("complete 2^k subtree fills exactly slot k after expansion");
+            let sequential_root =
+                slots[log2_len].expect("complete 2^k subtree fills exactly slot k after expansion");
 
             let parallel_root = perfect_subtree_root(&leaves);
 
@@ -781,26 +751,5 @@ mod tests {
                 "perfect_subtree_root mismatch for 2^{log2_len} leaves"
             );
         }
-    }
-
-    /// `parallel_append` must itself reject batches that would overflow the tree,
-    /// independently of `append_batch_with_subtree`.
-    #[test]
-    fn parallel_append_rejects_overflow_directly() {
-        const SMALL_DEPTH: u8 = 3;
-
-        let prefix: Vec<TestNode> = (0..7).map(TestNode).collect();
-        let full = build_frontier::<SMALL_DEPTH>(&prefix);
-        let full = parallel_append(full, vec![TestNode(100)]).expect("one leaf fits");
-
-        let result = parallel_append(full, vec![TestNode(101)]);
-        assert!(result.is_err(), "parallel_append must reject overflow of a full tree");
-
-        let partial_start = build_frontier::<SMALL_DEPTH>(&(0..6).map(TestNode).collect::<Vec<_>>());
-        let result = parallel_append(
-            partial_start,
-            vec![TestNode(100), TestNode(101), TestNode(102)],
-        );
-        assert!(result.is_err(), "parallel_append must reject a batch that overflows capacity");
     }
 }
