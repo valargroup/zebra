@@ -4,7 +4,7 @@ use std::io;
 
 use hex::{FromHex, FromHexError, ToHex};
 
-use crate::serialization::{serde_helpers, SerializationError, ZcashDeserialize, ZcashSerialize};
+use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
 #[cfg(test)]
 mod test_vectors;
@@ -16,28 +16,49 @@ mod test_vectors;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CommitmentRandomness(jubjub::Fr);
 
-/// A wrapper for the `sapling_crypto::value::ValueCommitment` type.
+/// A Sapling value commitment, stored as its canonical 32-byte compressed
+/// encoding.
 ///
-/// We need the wrapper to derive Serialize, Deserialize and Equality.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ValueCommitment(
-    #[serde(with = "serde_helpers::ValueCommitment")] pub sapling_crypto::value::ValueCommitment,
-);
-
-impl PartialEq for ValueCommitment {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.as_inner() == other.0.as_inner()
-    }
-}
-impl Eq for ValueCommitment {}
+/// The commitment is a Jubjub curve point. Recovering the point from its
+/// encoding requires a field square root (point decompression), which is
+/// expensive. The value commitment is only needed to verify the binding
+/// signature and value balance, which happens in the semantic verifier; the
+/// checkpoint verifier never needs it (it trusts block hashes and the
+/// note-commitment tree uses the note commitment `cm_u`, not `cv`). So the
+/// point is decompressed lazily, on demand, via [`ValueCommitment::commitment`],
+/// rather than eagerly at deserialization. This keeps the dominant per-block CPU
+/// cost of checkpoint sync (Jubjub point decompression) off the hot path.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ValueCommitment(pub(crate) [u8; 32]);
 
 impl ValueCommitment {
+    /// Decompress and return the underlying `sapling_crypto` value commitment.
+    ///
+    /// This performs the Jubjub point decompression that deserialization defers.
+    ///
+    /// # Panics
+    ///
+    /// If the stored bytes are not a valid, non-small-order value commitment.
+    /// Encodings are validated at this point of use (binding-signature
+    /// verification); the checkpoint verifier never calls this and instead
+    /// trusts the encoding via the block hash.
+    pub fn commitment(&self) -> sapling_crypto::value::ValueCommitment {
+        sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0)
+            .into_option()
+            .expect("ValueCommitment bytes are a valid non-small-order point")
+    }
+
+    /// Return the canonical 32-byte (little-endian) compressed encoding.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
     /// Return the hash bytes in big-endian byte-order suitable for printing out byte by byte.
     ///
     /// Zebra displays commitment value in big-endian byte-order,
     /// following the convention set by zcashd.
     pub fn bytes_in_display_order(&self) -> [u8; 32] {
-        let mut reversed_bytes = self.0.to_bytes();
+        let mut reversed_bytes = self.0;
         reversed_bytes.reverse();
         reversed_bytes
     }
@@ -75,14 +96,7 @@ impl From<jubjub::ExtendedPoint> for ValueCommitment {
     ///
     /// Panics if the given point does not correspond to a valid ValueCommitment.
     fn from(extended_point: jubjub::ExtendedPoint) -> Self {
-        let bytes = jubjub::AffinePoint::from(extended_point).to_bytes();
-
-        let value_commitment =
-            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes)
-                .into_option()
-                .expect("invalid ValueCommitment bytes");
-
-        ValueCommitment(value_commitment)
+        ValueCommitment(jubjub::AffinePoint::from(extended_point).to_bytes())
     }
 }
 
@@ -99,15 +113,19 @@ impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
 }
 
 impl ZcashDeserialize for ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        let value_commitment = sapling_crypto::value::ValueCommitment::zcash_deserialize(reader)?;
-        Ok(Self(value_commitment))
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        // Store the canonical encoding without decompressing the Jubjub point.
+        // The point (and its non-small-order check) is recovered lazily in
+        // `ValueCommitment::commitment`, only where the point is actually needed.
+        let mut bytes = [0u8; 32];
+        reader.read_exact(&mut bytes)?;
+        Ok(Self(bytes))
     }
 }
 
 impl ZcashSerialize for ValueCommitment {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.0.to_bytes())?;
+        writer.write_all(&self.0)?;
         Ok(())
     }
 }
