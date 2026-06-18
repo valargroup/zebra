@@ -582,6 +582,26 @@ where
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
 
+                // For checkpoint-height blocks, precompute the checkpoint-verified
+                // block (the per-transaction txids and auth data root, which
+                // dominate the cost on heavy shielded blocks) here, off the
+                // single-threaded checkpoint verifier. Each download task runs
+                // concurrently, so many blocks' precomputation overlaps instead of
+                // serializing on the verifier. Above the checkpoint height, the
+                // semantic verifier needs the raw block, so send it unchanged.
+                let request = if block_height <= max_checkpoint_height {
+                    let checkpoint_block = tokio::task::spawn_blocking(move || {
+                        let hash = block.hash();
+                        zs::CheckpointVerifiedBlock::with_hash(block, hash)
+                    })
+                    .await
+                    .expect("checkpoint block precomputation should not panic");
+
+                    zebra_consensus::Request::CommitCheckpointPrecomputed(checkpoint_block)
+                } else {
+                    zebra_consensus::Request::Commit(block)
+                };
+
                 // Wait for the verifier service to be ready.
                 let readiness = verifier.ready();
                 // Prefer the cancel handle if both are ready.
@@ -599,7 +619,7 @@ where
                 let verify_start = std::time::Instant::now();
                 let mut rsp = verifier
                     .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
-                    .call(zebra_consensus::Request::Commit(block)).boxed();
+                    .call(request).boxed();
 
                 // Add a shorter timeout to workaround a known bug (#5125)
                 let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
