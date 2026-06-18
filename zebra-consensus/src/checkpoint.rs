@@ -1100,7 +1100,7 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let mut req_block = match self.queue_block(block) {
+        let req_block = match self.queue_block(block) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };

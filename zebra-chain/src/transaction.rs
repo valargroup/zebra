@@ -288,9 +288,12 @@ impl Transaction {
     }
 
     /// Compute this transaction's ID (txid) and ZIP-244 authorizing-data digest
-    /// together, sharing the librustzcash conversion used by both computations.
+    /// together, sharing the single (expensive) librustzcash conversion that
+    /// both otherwise perform separately. Returns `None` for the auth digest of
+    /// pre-v5 transactions (as [`Self::auth_digest`] does).
     ///
-    /// Returns `None` for the auth digest of pre-v5 transactions.
+    /// The results are identical to calling [`Self::hash`] and
+    /// [`Self::auth_digest`] independently.
     pub fn txid_and_auth_digest(&self) -> (Hash, Option<AuthDigest>) {
         match self {
             Transaction::V1 { .. }

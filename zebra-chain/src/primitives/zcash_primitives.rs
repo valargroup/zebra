@@ -526,7 +526,13 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
 }
 
 /// Compute both the transaction ID (txid) and the ZIP-244 authorizing-data
-/// commitment of a v5+ transaction from a single librustzcash conversion.
+/// commitment of a v5+ transaction from a *single* librustzcash conversion.
+///
+/// Computing them separately ([`Transaction::hash`] and [`auth_digest`]) each
+/// re-serialize and re-parse the whole transaction, which dominates the cost on
+/// heavy shielded transactions. This shares that one conversion, so the auth
+/// digest is nearly free once the txid is computed. The results are byte-for-byte
+/// identical to the separate computations (same conversion, same accessors).
 ///
 /// # Panics
 ///
