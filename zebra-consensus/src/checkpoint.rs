@@ -33,7 +33,7 @@ use zebra_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
-        Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
+        Network, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
 };
@@ -1086,7 +1086,7 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let mut req_block = match self.queue_block(block) {
+        let req_block = match self.queue_block(block) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };
@@ -1120,25 +1120,7 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
-        let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
-            // Precompute the ZIP-244 authorizing-data commitment root here, off
-            // the single-threaded checkpoint-verifier buffer worker. This task
-            // is spawned per block, so the (CPU-heavy, per-transaction) auth
-            // digests for many blocks are computed concurrently, ahead of and
-            // overlapping with the single-threaded finalized committer, instead
-            // of on the committer's critical path. Only Nu5-onward blocks bind
-            // the auth data in their block commitment; the committer falls back
-            // to computing it when this is `None`.
-            if NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5 {
-                let block = req_block.block.block.clone();
-                if let Ok(auth_data_root) =
-                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
-                {
-                    req_block.block.auth_data_root = Some(auth_data_root);
-                }
-            }
-
             let hash = req_block
                 .rx
                 .await
