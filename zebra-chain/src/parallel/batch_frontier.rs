@@ -26,11 +26,17 @@ use incrementalmerkletree::{
 use rayon::prelude::*;
 use std::{error::Error, fmt};
 
-/// A pure binary-counter forest of a contiguous run of leaves, indexed by level:
-/// `slots[L] == Some(root)` iff bit `L` of the run length is set, in which case
+/// Complete subtree roots for a contiguous run of leaves, indexed by level:
+/// `roots[L] == Some(root)` iff bit `L` of the run length is set, in which case
 /// `root` is the root of the complete `2^L`-leaf subtree covering that aligned
 /// block. Higher set bits (older subtrees) are further left in leaf order.
-type LevelSlots<H> = Vec<Option<H>>;
+type CompleteSubtreeRoots<H> = Vec<Option<H>>;
+
+struct TreeCapacity<const DEPTH: u8>;
+
+impl<const DEPTH: u8> TreeCapacity<DEPTH> {
+    const MAX_LEAVES: u64 = 1u64 << DEPTH;
+}
 
 /// Errors from batch frontier updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,11 +69,23 @@ impl From<FrontierError> for BatchFrontierError {
     }
 }
 
-/// Adds one complete subtree to the frontier's binary-counter forest.
+/// Merges a complete subtree root into `slots`, carrying upward when a slot is
+/// already occupied.
 ///
-/// Callers merge subtrees from left to right, so an occupied slot is always the
-/// older left child and the new carry is always the newer right child.
-fn merge_complete_subtree<H: Hashable + Clone>(slots: &mut LevelSlots<H>, level: usize, node: H) {
+/// `node` must be strictly newer, further right in leaf order, than every root
+/// already in `slots`. This keeps the existing slot root as the left argument to
+/// [`Hashable::combine`] and the carried root as the right argument.
+///
+/// Example: if the existing tree has 7 leaves, `slots` has roots for leaves
+/// 0..3, 4..5, and 6. Merging new leaf 7 performs:
+/// - `combine(0, root(6), root(7)) -> root(6..7)`
+/// - `combine(1, root(4..5), root(6..7)) -> root(4..7)`
+/// - `combine(2, root(0..3), root(4..7)) -> root(0..7)`
+fn merge_complete_subtree<H: Hashable + Clone>(
+    slots: &mut CompleteSubtreeRoots<H>,
+    level: usize,
+    node: H,
+) {
     let mut idx = level;
     let mut carry = node;
     loop {
@@ -105,6 +123,109 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
     H::combine(child_level, &l, &r)
 }
 
+/// Returns true if the leaves before the frontier tip include a complete
+/// `2^level` subtree.
+///
+/// Example: position 6 is the seventh leaf, because positions are zero-based.
+/// The six earlier leaves decompose as `6 == 0b110`: one complete 4-leaf
+/// subtree and one complete 2-leaf subtree, so only levels 2 and 1 are present.
+fn contains_complete_subtree(position: Position, level: u32) -> bool {
+    u64::from(position) & (1u64 << level) != 0
+}
+
+/// Expands a [`Frontier`] into complete subtree roots indexed by level.
+///
+/// `slots[level]` contains the root of a complete `2^level`-leaf subtree, if
+/// one exists. `None` means there is no complete subtree at that level. The
+/// returned position is the next leaf index to append.
+///
+/// Example: position 6 is the seventh leaf, because positions are zero-based.
+/// This includes that leaf, so the returned roots cover 7 leaves. Since
+/// `7 == 0b111`, roots are present at levels 0, 1, and 2.
+///
+/// To build a root at level `L + 1`, we first need sibling roots at level `L`;
+/// this is why merges only carry upward after combining two roots at the same
+/// level.
+///
+/// The returned `complete_subtree_roots` remain indexed low-to-high by level.
+/// Flattening this vector produces the complete-subtree root order expected by
+/// [`Frontier::from_parts`]: from the leaf tip upward, also low-to-high by
+/// level.
+///
+/// Merging the frontier tip into these slots can compute a carry chain of
+/// hashes before the parallel batch work begins. That serial work is
+/// intentional and bounded by `DEPTH`.
+fn frontier_complete_subtree_roots<H, const DEPTH: u8>(
+    frontier: &Frontier<H, DEPTH>,
+) -> (CompleteSubtreeRoots<H>, u64)
+where
+    H: Hashable + Clone,
+{
+    let empty_slots = || vec![None; usize::from(DEPTH)];
+
+    let Some(frontier) = frontier.value() else {
+        return (empty_slots(), 0);
+    };
+
+    let position = frontier.position();
+    let mut slots = empty_slots();
+    let mut sibling_roots = frontier.ommers().iter().cloned();
+
+    // These sibling roots represent complete subtrees before the tip. So if
+    // tip is at position 6, we set this according to 6 leaves. We can read off
+    // roots by looking at the set bits in `position`.
+    for level in 0..u64::BITS {
+        if contains_complete_subtree(position, level) {
+            slots[level as usize] = Some(sibling_roots.next().expect("sibling root per set bit"));
+        }
+    }
+
+    // Now merge in the tip leaf, updating hashes and completeness conditions by
+    // carrying through occupied slots.
+    // So tip at position 6, would now make the new slots value be correct for 7 leaves.
+    // Merging the tip can drive a carry chain of hashes before the parallel batch hashing.
+    merge_complete_subtree(&mut slots, 0, frontier.leaf().clone());
+
+    (slots, u64::from(position) + 1)
+}
+
+/// Splits `leaves` into complete subtree chunks at their global positions.
+///
+/// Each returned chunk has length `2^level` and starts at a position divisible
+/// by `2^level`, so it can be hashed independently as a complete subtree.
+fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, &[H])> {
+    let mut chunks = Vec::new();
+    let mut global_pos = start_position;
+    let mut leaf_offset = 0usize;
+    let end_position = start_position + leaves.len() as u64;
+
+    while global_pos < end_position {
+        let leaves_left = end_position - global_pos;
+        // The chunk also has to fit inside the remaining leaves. This is the
+        // largest `level` with `2^level <= leaves_left`.
+        let max_available_level = u64::BITS - 1 - leaves_left.leading_zeros();
+
+        // A `2^level` subtree can start here only if `global_pos` is divisible
+        // by `2^level`. Position 0 has no alignment constraint, so only the
+        // remaining leaves limit the first chunk.
+        let max_aligned_level = if global_pos == 0 {
+            max_available_level
+        } else {
+            global_pos.trailing_zeros()
+        };
+
+        // Take the largest complete subtree that is both aligned and available.
+        let level = max_aligned_level.min(max_available_level) as usize;
+        let chunk_len = 1usize << level;
+        chunks.push((level, &leaves[leaf_offset..leaf_offset + chunk_len]));
+
+        leaf_offset += chunk_len;
+        global_pos += chunk_len as u64;
+    }
+
+    chunks
+}
+
 /// Appends `new_leaves` (in order) to `frontier`, returning the updated frontier.
 ///
 /// The result is identical to calling [`Frontier::append`] for each leaf in turn,
@@ -112,21 +233,16 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
 ///
 /// # Method
 ///
-/// A frontier of size `S` stores the last leaf raw plus `ommers` that are exactly
-/// the pure forest of the first `S - 1` leaves. We:
-/// 1. rebuild that forest from `ommers` (bit `L` of `position` set ⇒ one ommer);
-/// 2. merge the old tip leaf, giving the pure forest of all `S` leaves;
-/// 3. append every new leaf except the last as **globally position-aligned
-///    dyadic blocks** — each block's root computed in parallel — merging them
-///    in ascending position order (aligned blocks compose with no cross-boundary
-///    re-pairing, which is what makes the parallel reduction exact);
-/// 4. the new last leaf becomes the frontier's raw leaf, and the resulting forest
-///    becomes its ommers.
+/// 1. Expand the frontier into complete subtree roots indexed by level.
+/// 2. Split the new leaves into complete subtree chunks.
+/// 3. Compute the root for each chunk in parallel.
+/// 4. Merge the roots into the complete subtree roots.
+/// 5. Reconstruct a new frontier from the merged roots and the new tip leaf.
 ///
 /// Returns [`FrontierError`] if appending would overflow the tree's `DEPTH` capacity.
-pub fn parallel_append<H, const DEPTH: u8>(
+pub(crate) fn parallel_append<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
-    new_leaves: Vec<H>,
+    mut new_leaves: Vec<H>,
 ) -> Result<Frontier<H, DEPTH>, FrontierError>
 where
     H: Hashable + Clone + Send + Sync,
@@ -141,110 +257,52 @@ where
             depth: DEPTH.saturating_add(1),
         });
     };
-    let max_tree_size = 1u64
-        .checked_shl(u32::from(DEPTH))
-        .expect("Zcash note commitment tree depth fits in u64");
-    if new_tree_size > max_tree_size {
+    if new_tree_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
         return Err(FrontierError::MaxDepthExceeded {
             depth: DEPTH.saturating_add(1),
         });
     }
 
-    // Pre-size one slot for each valid Merkle level.
-    let empty_slots = || vec![None; usize::from(DEPTH)];
+    // complete_subtree_roots[level] is the root of a complete 2^level-leaf
+    // subtree, or None if no complete subtree exists at that level.
+    let (mut complete_subtree_roots, next_leaf_position) =
+        frontier_complete_subtree_roots(&frontier);
 
-    let (mut slots, mut old_size): (LevelSlots<H>, u64) = match frontier.value() {
-        None => (empty_slots(), 0),
-        Some(f) => {
-            let (position, leaf, ommers) = (f.position(), f.leaf().clone(), f.ommers().to_vec());
-            let pos = u64::from(position); // = S - 1
-                                           // ommers (low→high) sit at the set bits of `pos`.
-            let mut slots = empty_slots();
-            let mut ommers = ommers.into_iter();
-            for level in 0..u64::BITS {
-                if pos & (1 << level) != 0 {
-                    slots[level as usize] = Some(ommers.next().expect("ommer per set bit"));
-                }
-            }
-            // Merge the old tip leaf (position `pos`) to get the pure forest of S leaves.
-            merge_complete_subtree(&mut slots, 0, leaf);
-            // The next free position is one past the current tip.
-            (slots, pos + 1)
-        }
-    };
+    // Frontier stores the newest leaf separately and does not hash it into the
+    // tree. So the last incoming leaf becomes the new tip. Earlier incoming
+    // leaves are merged into subtree roots.
+    let new_tip_leaf = new_leaves
+        .pop()
+        .expect("new_leaves is not empty because it was checked above");
+    let leaves_to_merge = new_leaves;
 
-    // The new last leaf stays raw; everything before it joins the forest.
-    let last = new_leaves.len() - 1;
-    let body = &new_leaves[..last];
+    // Split the new leaves into the new subtree chunks.
+    let chunks = complete_subtree_chunks(next_leaf_position, &leaves_to_merge);
 
-    // Format: Partition `body` (all new leaves except the last) into maximal power-of-two-sized blocks,
-    // aligned to powers-of-two with respect to the global leaf index (the current size).
-    //
-    // Each block has width 2^L, starts at an index divisible by 2^L, and doesn't extend past `end`.
-    // This ensures each block can be processed independently as a perfect subtree.
-    //
-    // Example: with a tree size of 6 and 7 new leaves (body indices 6–12):
-    //   Indices [6–7]   -> 2-leaf block (level=1, width=2, 6 is divisible by 2)
-    //   Indices [8–11]  -> 4-leaf block (level=2, width=4, 8 is divisible by 4)
-    //   Index  [12]     -> 1-leaf block (level=0, width=1, 12 is divisible by 1)
-    //
-    // Partitioning is done left to right, respecting block boundaries and maximal size.
-    let mut complete_subtree_blocks: Vec<(usize, &[H])> = Vec::new();
-    {
-        // global_pos and body_offset always move together. They track the same
-        // position in two different coordinate systems.
-        // cursor in the global leaf index space
-        let mut global_pos = old_size;
-        // cursor in the body-slice space
-        let mut body_offset = 0usize;
-        let body_end = old_size + body.len() as u64;
-
-        while global_pos < body_end {
-            // "How large a power-of-two block can start here, given alignment?"
-            // Find the largest level `L` such that:
-            //   1. global_pos % 2^L == 0 (align_level)
-            //   2. global_pos + 2^L <= body_end (block fits within remaining body leaves)
-            // When global_pos == 0 any power-of-two size is aligned, so treat
-            // the alignment level as infinite (u64::BITS > any fit_level).
-            let align_level = if global_pos == 0 {
-                u64::BITS
-            } else {
-                global_pos.trailing_zeros()
-            };
-            // "How many leaves are left to be assigned to blocks?"
-            let leaves_left = body_end - global_pos;
-
-            // "How large a block fits in what's left?"
-            // floor(log2(leaves_left))
-            let fit_level = u64::BITS - 1 - leaves_left.leading_zeros();
-
-            let level = align_level.min(fit_level) as usize;
-            let block_width = 1usize << level; // 2^level
-            complete_subtree_blocks.push((level, &body[body_offset..body_offset + block_width]));
-            body_offset += block_width;
-            global_pos += block_width as u64;
-        }
-    }
-
-    // Compute all block roots concurrently (and each reduction is itself
-    // internally parallel). `par_iter().collect()` preserves order, so merging
-    // below stays in ascending position order, keeping the carry order exact.
-    let roots: Vec<(usize, H)> = complete_subtree_blocks
+    // Hash each new subtree chunk in parallel.
+    let new_subtree_roots: Vec<(usize, H)> = chunks
         .into_par_iter()
         .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
         .collect();
-    for (level, root) in roots {
-        merge_complete_subtree(&mut slots, level, root);
+
+    // Merge the new roots in leaf order. The roots can be computed in parallel,
+    // but carries must be applied left-to-right. We accept the extra blocking
+    // from not merging lower-order roots as soon as they are available.
+    for (level, root) in new_subtree_roots {
+        merge_complete_subtree(&mut complete_subtree_roots, level, root);
     }
-    old_size += body.len() as u64;
 
-    // The final frontier: raw last leaf at `position = size`, ommers = forest
-    // (compacted low→high, matching the set bits of `position`).
-    let position = Position::from(old_size);
-    let leaf = new_leaves[last].clone();
-    let ommers: Vec<H> = slots.into_iter().flatten().collect();
+    // The new tip comes after every merged leaf.
+    let new_tip_position = next_leaf_position + leaves_to_merge.len() as u64;
+    // `complete_subtree_roots` is indexed by level, low-to-high; `from_parts`
+    // expects complete subtree roots in the same order, from the new tip upward.
+    let complete_subtree_roots = complete_subtree_roots.into_iter().flatten().collect();
 
-    Frontier::from_parts(position, leaf, ommers)
+    Frontier::from_parts(
+        Position::from(new_tip_position),
+        new_tip_leaf,
+        complete_subtree_roots,
+    )
 }
 
 /// Appends `nodes` to `frontier` and returns the completed subtree's
@@ -277,9 +335,14 @@ where
         return Ok((frontier, None));
     }
 
-    // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions
     let old_size = frontier.tree_size();
     let new_size = old_size + nodes.len() as u64;
+    if new_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
+        return Err(FrontierError::MaxDepthExceeded {
+            depth: DEPTH.saturating_add(1),
+        }
+        .into());
+    }
 
     // A consensus block crosses at most one tracked-subtree boundary. If a
     // caller passes a larger batch, return an error instead of dropping later
@@ -381,6 +444,113 @@ mod tests {
         f
     }
 
+    fn chunk_levels_and_values(start_position: u64, leaves: &[u64]) -> Vec<(usize, Vec<u64>)> {
+        complete_subtree_chunks(start_position, leaves)
+            .into_iter()
+            .map(|(level, chunk)| (level, chunk.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn frontier_complete_subtree_roots_empty_frontier() {
+        let empty = Frontier::<TestNode, DEPTH>::empty();
+
+        let (complete_subtree_roots, next_leaf_position) = frontier_complete_subtree_roots(&empty);
+
+        assert_eq!(next_leaf_position, 0);
+        assert_eq!(
+            complete_subtree_roots,
+            vec![None; usize::from(DEPTH)],
+            "empty frontier has no complete subtree roots"
+        );
+    }
+
+    #[test]
+    fn complete_subtree_chunks_match_expected_decompositions() {
+        let cases = [
+            ("empty at zero", 0, vec![], vec![]),
+            ("empty after nonzero position", 17, vec![], vec![]),
+            (
+                "start at zero",
+                0,
+                vec![0, 1, 2, 3, 4, 5, 6],
+                vec![(2, vec![0, 1, 2, 3]), (1, vec![4, 5]), (0, vec![6])],
+            ),
+            (
+                "aligned start",
+                8,
+                vec![10, 11, 12, 13, 14, 15, 16, 17],
+                vec![(3, vec![10, 11, 12, 13, 14, 15, 16, 17])],
+            ),
+            (
+                "unaligned start",
+                6,
+                vec![100, 101, 102, 103, 104, 105, 106],
+                vec![
+                    (1, vec![100, 101]),
+                    (2, vec![102, 103, 104, 105]),
+                    (0, vec![106]),
+                ],
+            ),
+            (
+                "preserve global alignment",
+                5,
+                vec![20, 21, 22, 23, 24, 25],
+                vec![
+                    (0, vec![20]),
+                    (1, vec![21, 22]),
+                    (1, vec![23, 24]),
+                    (0, vec![25]),
+                ],
+            ),
+        ];
+
+        for (name, start_position, leaves, expected) in cases {
+            assert_eq!(
+                chunk_levels_and_values(start_position, &leaves),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_subtree_roots_flatten_to_frontier_order() {
+        let interesting_prefix_lengths = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+        ];
+
+        for prefix_len in interesting_prefix_lengths {
+            let prefix_len = u64::try_from(prefix_len).expect("test prefix length fits in u64");
+            let prefix: Vec<TestNode> = (0..prefix_len).map(TestNode).collect();
+            let start = build_frontier::<DEPTH>(&prefix);
+            let new_tip_leaf = TestNode(10_000 + prefix_len);
+
+            let (complete_subtree_roots, next_leaf_position) =
+                frontier_complete_subtree_roots(&start);
+            assert_eq!(
+                next_leaf_position, prefix_len,
+                "next leaf position mismatch for prefix length {prefix_len}"
+            );
+
+            let complete_subtree_roots: Vec<TestNode> =
+                complete_subtree_roots.into_iter().flatten().collect();
+            let reconstructed = Frontier::<TestNode, DEPTH>::from_parts(
+                Position::from(next_leaf_position),
+                new_tip_leaf,
+                complete_subtree_roots,
+            )
+            .expect("test frontier reconstruction succeeds");
+            let sequential = sequential_append::<DEPTH>(start, &[new_tip_leaf]);
+
+            assert_eq!(
+                sequential.value().map(|f| f.clone().into_parts()),
+                reconstructed.value().map(|f| f.clone().into_parts()),
+                "flattened complete_subtree_roots must be ordered for Frontier::from_parts at prefix length {prefix_len}"
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
 
@@ -458,13 +628,33 @@ mod tests {
             "empty append changed a full frontier"
         );
 
-        let full_tree_overflow = parallel_append(par, vec![TestNode(101)]);
+        let full_tree_parallel_overflow = parallel_append(par.clone(), vec![TestNode(101)]);
+        assert!(
+            matches!(
+                full_tree_parallel_overflow,
+                Err(FrontierError::MaxDepthExceeded { .. })
+            ),
+            "parallel append to a full tree overflows"
+        );
+
+        let full_tree_overflow = append_batch_with_subtree(par, vec![TestNode(101)]);
         assert!(
             full_tree_overflow.is_err(),
             "appending to a full tree overflows"
         );
 
-        let partial_batch_overflow = parallel_append(start, vec![TestNode(100), TestNode(101)]);
+        let partial_batch_parallel_overflow =
+            parallel_append(start.clone(), vec![TestNode(100), TestNode(101)]);
+        assert!(
+            matches!(
+                partial_batch_parallel_overflow,
+                Err(FrontierError::MaxDepthExceeded { .. })
+            ),
+            "parallel batch crossing tree capacity overflows"
+        );
+
+        let partial_batch_overflow =
+            append_batch_with_subtree(start, vec![TestNode(100), TestNode(101)]);
         assert!(
             partial_batch_overflow.is_err(),
             "batch crossing tree capacity overflows"
@@ -541,5 +731,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `merge_complete_subtree` carry chain: inserting leaves 0–7 one at a time
+    /// must produce the same slot state as building the 8-leaf tree sequentially.
+    ///
+    /// This directly exercises the left/right argument order in `combine` and the
+    /// level-index increment during carry propagation.
+    #[test]
+    fn merge_complete_subtree_carry_chain() {
+        let leaves: Vec<TestNode> = (0u64..8).map(TestNode).collect();
+
+        // Build expected slots by appending leaves one at a time sequentially,
+        // then expanding the resulting frontier.
+        let frontier = build_frontier::<DEPTH>(&leaves);
+        let (expected_slots, expected_next) = frontier_complete_subtree_roots(&frontier);
+
+        // Build actual slots by calling merge_complete_subtree for each leaf.
+        let mut slots: CompleteSubtreeRoots<TestNode> = vec![None; usize::from(DEPTH)];
+        for leaf in &leaves {
+            merge_complete_subtree(&mut slots, 0, *leaf);
+        }
+
+        assert_eq!(
+            slots, expected_slots,
+            "slot state after merging 8 leaves must match frontier expansion"
+        );
+        assert_eq!(expected_next, 8, "frontier covering 8 leaves has next position 8");
+    }
+
+    /// `perfect_subtree_root` must produce the same root as sequential append
+    /// for power-of-two-sized leaf slices.
+    ///
+    /// After appending 2^k leaves the frontier expansion places their combined
+    /// root at `slots[k]`. We compare `perfect_subtree_root` against that slot.
+    #[test]
+    fn perfect_subtree_root_matches_sequential() {
+        for log2_len in 0usize..=4 {
+            let len = 1usize << log2_len;
+            let leaves: Vec<TestNode> = (0..len as u64).map(TestNode).collect();
+
+            let frontier = build_frontier::<DEPTH>(&leaves);
+            let (slots, _) = frontier_complete_subtree_roots(&frontier);
+            let sequential_root = slots[log2_len]
+                .expect("complete 2^k subtree fills exactly slot k after expansion");
+
+            let parallel_root = perfect_subtree_root(&leaves);
+
+            assert_eq!(
+                sequential_root, parallel_root,
+                "perfect_subtree_root mismatch for 2^{log2_len} leaves"
+            );
+        }
+    }
+
+    /// `parallel_append` must itself reject batches that would overflow the tree,
+    /// independently of `append_batch_with_subtree`.
+    #[test]
+    fn parallel_append_rejects_overflow_directly() {
+        const SMALL_DEPTH: u8 = 3;
+
+        let prefix: Vec<TestNode> = (0..7).map(TestNode).collect();
+        let full = build_frontier::<SMALL_DEPTH>(&prefix);
+        let full = parallel_append(full, vec![TestNode(100)]).expect("one leaf fits");
+
+        let result = parallel_append(full, vec![TestNode(101)]);
+        assert!(result.is_err(), "parallel_append must reject overflow of a full tree");
+
+        let partial_start = build_frontier::<SMALL_DEPTH>(&(0..6).map(TestNode).collect::<Vec<_>>());
+        let result = parallel_append(
+            partial_start,
+            vec![TestNode(100), TestNode(101), TestNode(102)],
+        );
+        assert!(result.is_err(), "parallel_append must reject a batch that overflows capacity");
     }
 }
