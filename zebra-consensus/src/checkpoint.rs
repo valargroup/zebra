@@ -1141,13 +1141,7 @@ where
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
             // Precompute the ZIP-244 authorizing-data commitment root here, off
-            // the single-threaded checkpoint-verifier buffer worker. This task
-            // is spawned per block, so the (CPU-heavy, per-transaction) auth
-            // digests for many blocks are computed concurrently, ahead of and
-            // overlapping with the single-threaded finalized committer, instead
-            // of on the committer's critical path. Only Nu5-onward blocks bind
-            // the auth data in their block commitment; the committer falls back
-            // to computing it when this is `None`.
+            // the single-threaded checkpoint-verifier buffer worker.
             if NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5 {
                 let block = req_block.block.block.clone();
                 if let Ok(auth_data_root) =
