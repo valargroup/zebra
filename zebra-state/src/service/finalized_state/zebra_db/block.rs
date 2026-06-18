@@ -1052,15 +1052,21 @@ impl DiskWriteBatch {
         }
 
         // Commit UTXOs and value pools
-        self.prepare_chain_value_pools_batch(
-            zebra_db,
-            finalized,
-            spent_utxos_by_outpoint,
-            value_pool,
+        timed_subbatch!(
+            "zebra.state.write.batch.value_pools.duration_seconds",
+            self.prepare_chain_value_pools_batch(
+                zebra_db,
+                finalized,
+                spent_utxos_by_outpoint,
+                value_pool,
+            )
         )?;
 
         // The block has passed contextual validation, so update the metrics
-        block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
+        timed_subbatch!(
+            "zebra.state.write.batch.precommit_metrics.duration_seconds",
+            block_precommit_metrics(&finalized.block, finalized.hash, finalized.height)
+        );
 
         Ok(())
     }
