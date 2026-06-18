@@ -240,7 +240,7 @@ fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, 
 /// 5. Reconstruct a new frontier from the merged roots and the new tip leaf.
 ///
 /// Returns [`FrontierError`] if appending would overflow the tree's `DEPTH` capacity.
-pub fn parallel_append<H, const DEPTH: u8>(
+pub(crate) fn parallel_append<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     mut new_leaves: Vec<H>,
 ) -> Result<Frontier<H, DEPTH>, FrontierError>
@@ -452,6 +452,20 @@ mod tests {
     }
 
     #[test]
+    fn frontier_complete_subtree_roots_empty_frontier() {
+        let empty = Frontier::<TestNode, DEPTH>::empty();
+
+        let (complete_subtree_roots, next_leaf_position) = frontier_complete_subtree_roots(&empty);
+
+        assert_eq!(next_leaf_position, 0);
+        assert_eq!(
+            complete_subtree_roots,
+            vec![None; usize::from(DEPTH)],
+            "empty frontier has no complete subtree roots"
+        );
+    }
+
+    #[test]
     fn complete_subtree_chunks_match_expected_decompositions() {
         let cases = [
             ("empty at zero", 0, vec![], vec![]),
@@ -614,10 +628,29 @@ mod tests {
             "empty append changed a full frontier"
         );
 
+        let full_tree_parallel_overflow = parallel_append(par.clone(), vec![TestNode(101)]);
+        assert!(
+            matches!(
+                full_tree_parallel_overflow,
+                Err(FrontierError::MaxDepthExceeded { .. })
+            ),
+            "parallel append to a full tree overflows"
+        );
+
         let full_tree_overflow = append_batch_with_subtree(par, vec![TestNode(101)]);
         assert!(
             full_tree_overflow.is_err(),
             "appending to a full tree overflows"
+        );
+
+        let partial_batch_parallel_overflow =
+            parallel_append(start.clone(), vec![TestNode(100), TestNode(101)]);
+        assert!(
+            matches!(
+                partial_batch_parallel_overflow,
+                Err(FrontierError::MaxDepthExceeded { .. })
+            ),
+            "parallel batch crossing tree capacity overflows"
         );
 
         let partial_batch_overflow =
