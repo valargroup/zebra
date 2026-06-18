@@ -29,9 +29,6 @@ use rayon::prelude::*;
 /// `forest[L] == Some(root)` iff bit `L` of the run length is set, in which case
 /// `root` is the root of the complete `2^L`-leaf subtree covering that aligned
 /// block. Higher set bits (older subtrees) are further left in leaf order.
-///
-/// This is *pure*: unlike the crate's `CommitmentTree`, it has no lazy level-0
-/// staging, which makes the algebra below unambiguous.
 type Forest<H> = Vec<Option<H>>;
 
 /// Injects a complete subtree `node` at level `level` into the binary-counter
