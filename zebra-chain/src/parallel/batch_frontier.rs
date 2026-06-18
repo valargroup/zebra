@@ -32,6 +32,12 @@ use std::{error::Error, fmt};
 /// block. Higher set bits (older subtrees) are further left in leaf order.
 type CompleteSubtreeRoots<H> = Vec<Option<H>>;
 
+struct TreeCapacity<const DEPTH: u8>;
+
+impl<const DEPTH: u8> TreeCapacity<DEPTH> {
+    const MAX_LEAVES: u64 = 1u64 << DEPTH;
+}
+
 /// Errors from batch frontier updates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchFrontierError {
@@ -63,14 +69,18 @@ impl From<FrontierError> for BatchFrontierError {
     }
 }
 
-/// Merges a complete subtree `node` at level `level` into the binary-counter
-/// `slots`, propagating carries upward.
+/// Merges a complete subtree root into `slots`, carrying upward when a slot is
+/// already occupied.
 ///
-/// `node` (and anything it carries into) must be **strictly newer** (further
-/// right in leaf order) than everything already in `forest`, so the existing slot
-/// value is always the left (older) argument of [`Hashable::combine`]. This holds
-/// because we only ever merge the old tip leaf and then the new leaves, in
-/// ascending position order.
+/// `node` must be strictly newer, further right in leaf order, than every root
+/// already in `slots`. This keeps the existing slot root as the left argument to
+/// [`Hashable::combine`] and the carried root as the right argument.
+///
+/// Example: if the existing tree has 7 leaves, `slots` has roots for leaves
+/// 0..3, 4..5, and 6. Merging new leaf 7 performs:
+/// - `combine(0, root(6), root(7)) -> root(6..7)`
+/// - `combine(1, root(4..5), root(6..7)) -> root(4..7)`
+/// - `combine(2, root(0..3), root(4..7)) -> root(0..7)`
 fn merge_complete_subtree<H: Hashable + Clone>(
     slots: &mut CompleteSubtreeRoots<H>,
     level: usize,
@@ -243,10 +253,7 @@ where
             depth: DEPTH.saturating_add(1),
         });
     };
-    let max_tree_size = 1u64
-        .checked_shl(u32::from(DEPTH))
-        .expect("Zcash note commitment tree depth fits in u64");
-    if new_tree_size > max_tree_size {
+    if new_tree_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
         return Err(FrontierError::MaxDepthExceeded {
             depth: DEPTH.saturating_add(1),
         });
@@ -437,9 +444,14 @@ where
         return Ok((frontier, None));
     }
 
-    // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions
     let old_size = frontier.tree_size();
     let new_size = old_size + nodes.len() as u64;
+    if new_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
+        return Err(FrontierError::MaxDepthExceeded {
+            depth: DEPTH.saturating_add(1),
+        }
+        .into());
+    }
 
     // A consensus block crosses at most one tracked-subtree boundary. If a
     // caller passes a larger batch, return an error instead of dropping later
@@ -462,7 +474,7 @@ where
         let mut head = nodes;
         let tail = head.split_off(head_len);
 
-        let f1 = parallel_append(frontier, head)?;
+        let f1 = parallel_append2(frontier, head)?;
 
         // index = (boundary / subtree_size) - 1; fits in u16 by tree depth.
         let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
@@ -471,10 +483,10 @@ where
             .expect("just appended at least one leaf")
             .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
 
-        let f2 = parallel_append(f1, tail)?;
+        let f2 = parallel_append2(f1, tail)?;
         Ok((f2, Some((index_value, root))))
     } else {
-        let f = parallel_append(frontier, nodes)?;
+        let f = parallel_append2(frontier, nodes)?;
         Ok((f, None))
     }
 }
@@ -612,7 +624,7 @@ mod tests {
             let start = build_frontier::<DEPTH>(&prefix);
 
             let seq = sequential_append::<DEPTH>(start.clone(), &batch);
-            let par = parallel_append(start, batch.clone()).expect("no overflow in tests");
+            let par = parallel_append2(start, batch.clone()).expect("no overflow in tests");
 
             prop_assert_eq!(seq.root(), par.root(), "root mismatch");
             prop_assert_eq!(
@@ -632,7 +644,7 @@ mod tests {
             for batch_len in 0u64..40 {
                 let batch: Vec<TestNode> = (1000..1000 + batch_len).map(TestNode).collect();
                 let seq = sequential_append::<DEPTH>(start.clone(), &batch);
-                let par = parallel_append(start.clone(), batch).expect("no overflow");
+                let par = parallel_append2(start.clone(), batch).expect("no overflow");
                 assert_eq!(
                     seq.root(),
                     par.root(),
@@ -657,7 +669,7 @@ mod tests {
         let exact_capacity_batch = [TestNode(100)];
 
         let seq = sequential_append::<SMALL_DEPTH>(start.clone(), &exact_capacity_batch);
-        let par = parallel_append(start.clone(), exact_capacity_batch.to_vec())
+        let par = parallel_append2(start.clone(), exact_capacity_batch.to_vec())
             .expect("one remaining leaf fits");
 
         assert_eq!(seq.root(), par.root(), "root mismatch at exact capacity");
@@ -667,20 +679,22 @@ mod tests {
             "parts mismatch at exact capacity"
         );
 
-        let empty_append = parallel_append(par.clone(), Vec::new()).expect("empty append succeeds");
+        let empty_append =
+            parallel_append2(par.clone(), Vec::new()).expect("empty append succeeds");
         assert_eq!(
             par.value().map(|f| f.clone().into_parts()),
             empty_append.value().map(|f| f.clone().into_parts()),
             "empty append changed a full frontier"
         );
 
-        let full_tree_overflow = parallel_append(par, vec![TestNode(101)]);
+        let full_tree_overflow = append_batch_with_subtree(par, vec![TestNode(101)]);
         assert!(
             full_tree_overflow.is_err(),
             "appending to a full tree overflows"
         );
 
-        let partial_batch_overflow = parallel_append(start, vec![TestNode(100), TestNode(101)]);
+        let partial_batch_overflow =
+            append_batch_with_subtree(start, vec![TestNode(100), TestNode(101)]);
         assert!(
             partial_batch_overflow.is_err(),
             "batch crossing tree capacity overflows"
@@ -743,7 +757,7 @@ mod tests {
                     .collect();
 
                 let seq = sequential_append::<DEPTH>(start.clone(), &batch);
-                let par = parallel_append(start.clone(), batch).expect("no overflow");
+                let par = parallel_append2(start.clone(), batch).expect("no overflow");
 
                 assert_eq!(
                     seq.root(),
