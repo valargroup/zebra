@@ -24,7 +24,11 @@
 #   BENCH_HOME            persistent cache root                (default /opt/zebra-bench)
 #   GH_REPO               releases repo                        (default valargroup/zebra)
 #   OUT_DIR               artifact output dir                  (default ./bench-out)
+#   METRICS_PORT          Prometheus port (auto-bumps if busy) (default 19999)
+#   LISTEN_PORT           P2P listen port  (auto-bumps if busy)(default 18233)
 #
+# Ports default high and auto-skip busy ones so the bench can coexist with another
+# zebrad already running on the host (which typically holds 8233 / 9999).
 set -euo pipefail
 
 # ---- inputs / defaults -------------------------------------------------------
@@ -46,10 +50,20 @@ OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
 SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
 SAMPLE_INTERVAL=5
-METRICS_PORT=9999
 
 log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
+
+# pick a free TCP port starting at $1 (avoids colliding with another node on the host)
+pick_free_port() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    while ss -ltnH "sport = :$p" 2>/dev/null | grep -q LISTEN; do p=$((p+1)); done
+  fi
+  echo "$p"
+}
+METRICS_PORT="$(pick_free_port "${METRICS_PORT:-19999}")"
+LISTEN_PORT="$(pick_free_port "${LISTEN_PORT:-18233}")"
 
 mkdir -p "$OUT_DIR"
 
@@ -183,6 +197,7 @@ run_one() {
       echo '[network]'
       echo 'network = "Mainnet"'
       echo "cache_dir = \"$fork\""
+      echo "listen_addr = \"127.0.0.1:$LISTEN_PORT\""
       echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
       echo 'peerset_initial_target_size = 1'
       if [[ "$1" == "with_zakura" ]]; then
@@ -208,7 +223,7 @@ run_one() {
   }
 
   local pid t0 mode="with_zakura"
-  log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=$FEED_PEER, cap=${WALL_CAP}s"
+  log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=$FEED_PEER, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; t0=$(date +%s); sleep 3

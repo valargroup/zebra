@@ -73,6 +73,7 @@ jobs:
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
           SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
+          BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zebra-bench' }}
           OUT_DIR: ${{ github.workspace }}/bench-out
         run: bash scripts/checkpoint-sync-bench.sh
 
