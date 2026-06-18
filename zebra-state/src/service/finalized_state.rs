@@ -55,10 +55,9 @@ macro_rules! timed_commit_phase {
 /// the note-commitment tree update and the ZIP-244 auth-data-root commitment
 /// check, which run on the single finalized-writer thread and dominate the
 /// per-block commit cost on heavy shielded blocks.
-/// 
-/// It allows to have a separate thread pool for the commmit-compute phase from
-/// the main thread pool. This way, if download/verify is busy, the commit-compute
-/// phase can still make progress.
+///
+/// This isolates the commit-compute phase from the main thread pool, allowing it
+/// to keep making progress when download/verify work is busy.
 static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -611,8 +610,7 @@ impl FinalizedState {
                     let _ckpt_compute = std::time::Instant::now();
                     let mut commitment_result = None;
                     // Run the two CPU-intensive operations inside the dedicated
-                    // commit-compute pool (see `COMMIT_COMPUTE_POOL`) so their
-                    // nested rayon work uses isolated workers instead of
+                    // commit-compute pool so their nested rayon work uses isolated workers instead of
                     // contending with the verifier on the global pool.
                     let tree_result = COMMIT_COMPUTE_POOL.install(|| {
                         rayon::in_place_scope_fifo(|scope| {
@@ -627,8 +625,6 @@ impl FinalizedState {
                                 ));
                             });
 
-                            // Runs on the in-place thread so its own internal rayon scope
-                            // (one task per note commitment tree) uses the pool directly.
                             timed_commit_phase!(
                                 "zebra.state.write.update_trees.duration_seconds",
                                 note_commitment_trees.update_trees_parallel(&block)
