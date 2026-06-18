@@ -764,12 +764,59 @@ mod tests {
 
     use super::*;
 
+    fn node(value: u64) -> Node {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Node(Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .expect("small little-endian integers are canonical field elements"))
+    }
+
     fn note_commitment(value: u64) -> NoteCommitmentUpdate {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&value.to_le_bytes());
 
         Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
             .expect("small little-endian integers are canonical field elements")
+    }
+
+    /// Verifies that `append_batch` returns the correct subtree index and root when
+    /// the batch crosses a `TRACKED_SUBTREE_HEIGHT` boundary, and that the resulting
+    /// frontier matches the sequential `append` path.
+    ///
+    /// Uses `Frontier::from_parts` to place the tree just before the first subtree
+    /// boundary (position 65534 = `2^16 - 2`) without executing 65534 real appends.
+    #[test]
+    fn append_batch_crosses_subtree_boundary() {
+        // position 65534 = 0xFFFE: bits 1–15 are set → 15 ommers required.
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2; // = 65534
+        let leaf = node(1);
+        let ommers: Vec<Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+        let tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        // cms[0] fills position 65535, completing subtree 0; cms[1] starts subtree 1.
+        let cms = [note_commitment(100), note_commitment(200)];
+
+        // Sequential reference: append one at a time.
+        let mut seq_tree = tree.clone();
+        seq_tree.append(cms[0]).expect("sequential first append");
+        let expected_subtree = seq_tree.completed_subtree_index_and_root();
+        seq_tree.append(cms[1]).expect("sequential second append");
+
+        // Batch must return the same subtree result and produce the same final tree.
+        let mut batch_tree = tree;
+        let batch_result = batch_tree.append_batch(&cms).expect("batch append succeeds");
+
+        assert!(batch_result.is_some(), "batch crossing boundary must return a subtree");
+        assert_eq!(batch_result.unwrap().0, NoteCommitmentSubtreeIndex(0), "first subtree index");
+        assert_eq!(batch_result, expected_subtree, "subtree result matches sequential");
+        batch_tree.assert_frontier_eq(&seq_tree);
+        assert_eq!(batch_tree.root(), seq_tree.root());
     }
 
     #[test]

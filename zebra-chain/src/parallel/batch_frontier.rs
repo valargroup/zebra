@@ -164,6 +164,8 @@ where
             // Find the largest level `L` such that:
             //   1. global_pos % 2^L == 0 (align_level)
             //   2. global_pos + 2^L <= body_end (block fits within remaining body leaves)
+            // When global_pos == 0 any power-of-two size is aligned, so treat
+            // the alignment level as infinite (u64::BITS > any fit_level).
             let align_level = if global_pos == 0 {
                 u64::BITS
             } else {
@@ -234,6 +236,14 @@ where
         return Ok((frontier, None));
     }
 
+    // A block cannot span two or more subtree boundaries, so the batch must be smaller than one subtree.
+    debug_assert!(
+        nodes.len() < (1 << TRACKED_SUBTREE_HEIGHT),
+        "batch must come from a single block (got {} nodes, subtree size is 2^{})",
+        nodes.len(),
+        TRACKED_SUBTREE_HEIGHT,
+    );
+
     // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions
     let old_size = frontier.tree_size();
     let new_size = old_size + nodes.len() as u64;
@@ -247,9 +257,10 @@ where
     if boundary.is_some_and(|b| b <= new_size) {
         let boundary = boundary.expect("checked above");
         let head_len = (boundary - old_size) as usize;
-        let (head, tail) = nodes.split_at(head_len);
+        let mut head = nodes;
+        let tail = head.split_off(head_len);
 
-        let f1 = parallel_append(frontier, head.to_vec())?;
+        let f1 = parallel_append(frontier, head)?;
 
         // index = (boundary / subtree_size) - 1; fits in u16 by tree depth.
         let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
@@ -258,7 +269,7 @@ where
             .expect("just appended at least one leaf")
             .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
 
-        let f2 = parallel_append(f1, tail.to_vec())?;
+        let f2 = parallel_append(f1, tail)?;
         Ok((f2, Some((index_value, root))))
     } else {
         let f = parallel_append(frontier, nodes)?;

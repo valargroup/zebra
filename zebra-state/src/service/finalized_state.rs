@@ -606,6 +606,10 @@ impl FinalizedState {
                     // Surface the tree-update error first, preserving the error
                     // precedence of the previous sequential code.
                     tree_result.map_err(ValidateContextError::from)?;
+                    // `rayon::in_place_scope_fifo` guarantees all spawned tasks
+                    // complete before the scope returns, so `commitment_result` is
+                    // always `Some` here: the spawned closure wrote to it before
+                    // the scope exited.
                     commitment_result.expect("scope has already finished")?;
 
                     // Update the history tree (depends on both operations above).
