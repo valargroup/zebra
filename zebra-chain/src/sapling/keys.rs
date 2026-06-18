@@ -268,6 +268,22 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
+impl EphemeralPublicKey {
+    /// Returns true if the stored encoding is a canonical, non-small-order
+    /// Jubjub point, i.e. a valid ephemeral public key per the consensus rules.
+    ///
+    /// This performs the point decompression that deserialization defers; it is
+    /// called by the semantic verifier (not the checkpoint verifier) to enforce
+    /// the not-small-order rule on untrusted transactions. It matches the check
+    /// that `SaplingVerificationContext::check_output` performs in librustzcash.
+    pub fn is_valid_not_small_order(&self) -> bool {
+        match jubjub::AffinePoint::from_bytes(self.0).into_option() {
+            Some(point) => !bool::from(point.is_small_order()),
+            None => false,
+        }
+    }
+}
+
 impl fmt::Debug for EphemeralPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("EphemeralPublicKey")

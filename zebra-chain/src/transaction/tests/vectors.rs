@@ -1444,6 +1444,100 @@ fn sapling_lazy_cv_epk_edge_cases() {
     );
 }
 
+/// The explicit Sapling cv/epk not-small-order check used by the semantic
+/// verifier rejects bad points.
+///
+/// `Transaction::sapling_point_encodings_are_valid` is the deferred check,
+/// relocated from deserialization to the semantic verification path (it is what
+/// `Verifier::verify_v4_transaction` / `verify_v5_transaction` call, returning
+/// `TransactionError::SmallOrder` on failure). Unlike the proof/binding-signature
+/// verification, this check is isolated, so it can be exercised directly: it
+/// rejects a small-order or off-curve `cv` *and* a small-order or off-curve
+/// `epk`, and accepts valid points. The checkpoint verifier never calls it.
+#[test]
+fn sapling_point_encodings_check_rejects_bad_points() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::EphemeralPublicKey,
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
+    let off_curve = [0xffu8; 32];
+
+    let make = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+        let output = Output {
+            cv: ValueCommitment(cv),
+            cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
+            ephemeral_key: EphemeralPublicKey(epk),
+            enc_ciphertext: EncryptedNote([0u8; 580]),
+            out_ciphertext: WrappedNoteKey([0u8; 80]),
+            zkproof: Groth16Proof([0u8; 192]),
+        };
+        Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::JustOutputs {
+                    outputs: at_least_one![output],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+            orchard_shielded_data: None,
+        }
+    };
+
+    // Valid points pass (a dummy proof/binding sig does not affect this check).
+    assert!(
+        make(valid, valid).sapling_point_encodings_are_valid(),
+        "valid cv/epk must pass the encoding check",
+    );
+
+    // A small-order cv is rejected.
+    assert!(
+        !make(small_order, valid).sapling_point_encodings_are_valid(),
+        "small-order cv must be rejected",
+    );
+
+    // A small-order epk is rejected. This is the isolated, executable proof of
+    // the epk rejection: the check runs independently of proof verification.
+    assert!(
+        !make(valid, small_order).sapling_point_encodings_are_valid(),
+        "small-order epk must be rejected",
+    );
+
+    // Off-curve / non-canonical encodings are rejected for both fields.
+    assert!(
+        !make(off_curve, valid).sapling_point_encodings_are_valid(),
+        "off-curve cv must be rejected",
+    );
+    assert!(
+        !make(valid, off_curve).sapling_point_encodings_are_valid(),
+        "off-curve epk must be rejected",
+    );
+}
+
 /// Reproduction for GHSA-rgwx-8r98-p34c:
 /// Coinbase Sapling spend vectors allocate before zero-spend consensus rule.
 ///

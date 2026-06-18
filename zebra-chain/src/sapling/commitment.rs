@@ -65,6 +65,18 @@ impl ValueCommitment {
         self.0
     }
 
+    /// Returns true if the stored encoding is a canonical, non-small-order
+    /// Jubjub point, i.e. a valid value commitment per the consensus rules.
+    ///
+    /// This performs the point decompression that deserialization defers; it is
+    /// called by the semantic verifier (not the checkpoint verifier) to enforce
+    /// the not-small-order rule on untrusted transactions.
+    pub fn is_valid_not_small_order(&self) -> bool {
+        bool::from(
+            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).is_some(),
+        )
+    }
+
     /// Return the hash bytes in big-endian byte-order suitable for printing out byte by byte.
     ///
     /// Zebra displays commitment value in big-endian byte-order,
