@@ -40,6 +40,7 @@ use crate::{
         disk_format::{
             block::TransactionLocation,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, RawBytes, PRUNING_METADATA,
@@ -1165,18 +1166,30 @@ impl DiskWriteBatch {
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
 
-        for (transaction_index, (transaction, transaction_hash)) in block
-            .transactions
-            .iter()
-            .zip(transaction_hashes.iter())
-            .enumerate()
-        {
+        // Serialize the raw transaction bytes in parallel: on heavy shielded
+        // blocks this serialization dominates the per-block write cost, and each
+        // transaction serializes independently. The result is byte-identical to
+        // inserting the transactions directly, because `RawBytes` is stored
+        // verbatim. The serialized bytes are inserted in height/index order below.
+        let raw_transactions: Vec<RawBytes> = if store_raw_transactions {
+            use rayon::prelude::*;
+            block
+                .transactions
+                .par_iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        for (transaction_index, transaction_hash) in transaction_hashes.iter().enumerate() {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
-            // keeps historical transaction data for this height.
-            if store_raw_transactions {
-                self.zs_insert(&tx_by_loc, transaction_location, transaction);
+            // keeps historical transaction data for this height (then
+            // `raw_transactions` holds the pre-serialized bytes in order).
+            if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
+                self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
 
             // Index each transaction hash and location
