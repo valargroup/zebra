@@ -18,16 +18,19 @@ use futures::{
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zebra_chain::serialization::SerializationError;
+use zebra_chain::{block, serialization::SerializationError};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
     constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
     peer::{
-        connection::{overload_drop_connection_probability, Connection, State},
+        connection::{overload_drop_connection_probability, Connection, Handler, State},
         ClientRequest, ErrorSlot,
     },
-    protocol::external::Message,
+    protocol::{
+        external::{InventoryHash, Message},
+        internal::MAX_FIND_BLOCKS_RESPONSE_HASHES,
+    },
     types::Nonce,
     PeerError, Request, Response,
 };
@@ -187,6 +190,57 @@ async fn connection_run_loop_message_ok() {
     connection_join_handle.abort();
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+#[test]
+fn find_blocks_inv_response_is_accepted_at_abuse_limit() {
+    let hashes: Vec<_> = (0..MAX_FIND_BLOCKS_RESPONSE_HASHES)
+        .map(|index| {
+            let mut bytes = [0; 32];
+            bytes[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            block::Hash(bytes)
+        })
+        .collect();
+
+    let inv = hashes.iter().copied().map(InventoryHash::Block).collect();
+    let mut handler = Handler::FindBlocks;
+    let ignored = handler.process_message(Message::Inv(inv), &mut Vec::new(), None);
+
+    assert_eq!(ignored, None);
+    let Handler::Finished(Ok(Response::BlockHashes(received_hashes))) = handler else {
+        panic!("unexpected handler state");
+    };
+
+    assert_eq!(received_hashes, hashes);
+}
+
+#[test]
+fn find_blocks_inv_response_drops_hashes_beyond_abuse_limit() {
+    let hashes: Vec<_> = (0..(MAX_FIND_BLOCKS_RESPONSE_HASHES * 2))
+        .map(|index| {
+            let mut bytes = [0; 32];
+            bytes[..std::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            block::Hash(bytes)
+        })
+        .collect();
+
+    let inv = hashes.iter().copied().map(InventoryHash::Block).collect();
+    let mut handler = Handler::FindBlocks;
+    let ignored = handler.process_message(Message::Inv(inv), &mut Vec::new(), None);
+
+    assert_eq!(ignored, None);
+    let Handler::Finished(Ok(Response::BlockHashes(received_hashes))) = handler else {
+        panic!("unexpected handler state");
+    };
+    assert_ne!(
+        received_hashes, hashes,
+        "oversized FindBlocks responses must not pass through unchanged"
+    );
+    assert_eq!(received_hashes.len(), MAX_FIND_BLOCKS_RESPONSE_HASHES);
+    assert_eq!(
+        received_hashes,
+        hashes[..MAX_FIND_BLOCKS_RESPONSE_HASHES].to_vec()
+    );
 }
 
 /// Test that the connection run loop fails correctly when dropped

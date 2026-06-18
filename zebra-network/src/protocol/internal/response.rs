@@ -14,6 +14,15 @@ use proptest_derive::Arbitrary;
 
 use InventoryResponse::*;
 
+/// Defensive upper bound on block hashes accepted from a `FindBlocks` response.
+///
+/// Bitcoin and Zcash peers answer `getblocks` with at most 500 block inventory
+/// entries, but this higher cap allows some tolerance for non-standard peers
+/// while still bounding oversized inventory abuse.
+///
+///
+pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 5_000;
+
 /// A response to a network request, represented in internal format.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]

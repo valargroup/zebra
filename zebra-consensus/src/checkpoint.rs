@@ -25,7 +25,7 @@ use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tower::{Service, ServiceExt};
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use zebra_chain::{
     amount::{self, DeferredPoolBalanceChange},
@@ -1144,10 +1144,18 @@ where
             // the single-threaded checkpoint-verifier buffer worker.
             if NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5 {
                 let block = req_block.block.block.clone();
-                if let Ok(auth_data_root) =
-                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
-                {
-                    req_block.block.auth_data_root = Some(auth_data_root);
+                match tokio::task::spawn_blocking(move || block.auth_data_root()).await {
+                    Ok(auth_data_root) => {
+                        req_block.block.auth_data_root = Some(auth_data_root);
+                    }
+                    Err(join_error) => {
+                        warn!(
+                            ?join_error,
+                            height = ?req_block.block.height,
+                            "auth_data_root blocking task failed; \
+                             the state service will recompute it"
+                        );
+                    }
                 }
             }
 

@@ -1334,6 +1334,11 @@ where
             .try_into()
             .expect("fits in usize");
 
+        // Security: cap peer-controlled hash counts at the protocol-sized
+        // response expectation, so oversized responses don't inflate the
+        // checkpoint batch.
+        let new_hashes = new_hashes.min(MAX_TIPS_RESPONSE_HASH_COUNT);
+
         if verified_height >= max_checkpoint_height {
             self.full_verify_concurrency_limit
         } else if (verified_height + new_hashes) >= max_checkpoint_height {

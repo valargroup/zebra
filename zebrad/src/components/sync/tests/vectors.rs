@@ -56,6 +56,46 @@ type TestChainSync = ChainSync<
 /// Increasing this value causes the tests to take longer to complete, so it can't be too large.
 const MAX_SERVICE_REQUEST_DELAY: Duration = Duration::from_millis(1000);
 
+#[test]
+fn lookahead_limit_is_bounded_at_final_checkpoint_transition() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        _peer_set,
+        _state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync();
+    chain_sync.max_checkpoint_height = Height(1_000);
+
+    mock_chain_tip_sender.send_best_tip_height(Height(100));
+    assert_eq!(
+        chain_sync.lookahead_limit(50_000),
+        chain_sync.checkpoint_verify_concurrency_limit,
+        "oversized peer responses must not trigger the transition before a normal response would",
+    );
+
+    mock_chain_tip_sender.send_best_tip_height(Height(900));
+    let normal_response_limit = chain_sync.lookahead_limit(sync::MAX_TIPS_RESPONSE_HASH_COUNT);
+    assert_eq!(
+        normal_response_limit,
+        chain_sync.full_verify_concurrency_limit + sync::MAX_TIPS_RESPONSE_HASH_COUNT - 100,
+        "normal transition sizing is preserved",
+    );
+    assert_eq!(
+        chain_sync.lookahead_limit(50_000),
+        normal_response_limit,
+        "oversized peer responses are capped to the normal protocol response size",
+    );
+
+    mock_chain_tip_sender.send_best_tip_height(Height(1_000));
+    assert_eq!(
+        chain_sync.lookahead_limit(50_000),
+        chain_sync.full_verify_concurrency_limit,
+        "full verification uses only the configured full verify limit",
+    );
+}
+
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.

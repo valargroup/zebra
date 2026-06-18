@@ -35,7 +35,7 @@ use crate::{
     peer_set::ConnectionTracker,
     protocol::{
         external::{types::Nonce, InventoryHash, Message},
-        internal::{InventoryResponse, Request, Response},
+        internal::{InventoryResponse, Request, Response, MAX_FIND_BLOCKS_RESPONSE_HASHES},
     },
     BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
 };
@@ -405,7 +405,9 @@ impl Handler {
                     .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
                 Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
+                    block_hashes(&items[..])
+                        .take(MAX_FIND_BLOCKS_RESPONSE_HASHES)
+                        .collect(),
                 )))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
@@ -1535,9 +1537,23 @@ where
                 }
             }
             Response::BlockHashes(hashes) => {
+                if hashes.len() > MAX_FIND_BLOCKS_RESPONSE_HASHES {
+                    warn!(
+                        inv_count = ?hashes.len(),
+                        ?MAX_FIND_BLOCKS_RESPONSE_HASHES,
+                        "unusually large block hash response, taking the first {MAX_FIND_BLOCKS_RESPONSE_HASHES} hashes"
+                    );
+                }
+
                 if let Err(e) = self
                     .peer_tx
-                    .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))
+                    .send(Message::Inv(
+                        hashes
+                            .into_iter()
+                            .take(MAX_FIND_BLOCKS_RESPONSE_HASHES)
+                            .map(Into::into)
+                            .collect(),
+                    ))
                     .await
                 {
                     self.fail_with(e).await
