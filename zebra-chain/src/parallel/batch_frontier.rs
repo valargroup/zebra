@@ -181,15 +181,22 @@ fn complete_subtree_chunks<H>(start_position: u64, leaves: &[H]) -> Vec<(usize, 
     let end_position = start_position + leaves.len() as u64;
 
     while global_pos < end_position {
-        let align_level = if global_pos == 0 {
-            u64::BITS
+        let leaves_left = end_position - global_pos;
+        // The chunk also has to fit inside the remaining leaves. This is the
+        // largest `level` with `2^level <= leaves_left`.
+        let max_available_level = u64::BITS - 1 - leaves_left.leading_zeros();
+
+        // A `2^level` subtree can start here only if `global_pos` is divisible
+        // by `2^level`. Position 0 has no alignment constraint, so only the
+        // remaining leaves limit the first chunk.
+        let max_aligned_level = if global_pos == 0 {
+            max_available_level
         } else {
             global_pos.trailing_zeros()
         };
-        let leaves_left = end_position - global_pos;
-        let fit_level = u64::BITS - 1 - leaves_left.leading_zeros();
 
-        let level = align_level.min(fit_level) as usize;
+        // Take the largest complete subtree that is both aligned and available.
+        let level = max_aligned_level.min(max_available_level) as usize;
         let chunk_len = 1usize << level;
         chunks.push((level, &leaves[leaf_offset..leaf_offset + chunk_len]));
 
@@ -368,8 +375,9 @@ where
     // subtree, or None if no complete subtree exists at that level.
     let (_complete_subtree_roots, old_size) = frontier_complete_subtree_roots(&frontier);
 
-    // Frontier stores the newest leaf separately, so the last incoming leaf
-    // becomes the new tip. Earlier incoming leaves are merged into subtree roots.
+    // Frontier stores the newest leaf separately and does not hash it into the
+    // tree. So the last incoming leaf becomes the new tip. Earlier incoming
+    // leaves are merged into subtree roots.
     let _new_tip_leaf = new_leaves
         .pop()
         .expect("new_leaves is not empty because it was checked above");
@@ -512,6 +520,62 @@ mod tests {
             assert!(f.append(*leaf));
         }
         f
+    }
+
+    fn chunk_levels_and_values(start_position: u64, leaves: &[u64]) -> Vec<(usize, Vec<u64>)> {
+        complete_subtree_chunks(start_position, leaves)
+            .into_iter()
+            .map(|(level, chunk)| (level, chunk.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn complete_subtree_chunks_match_expected_decompositions() {
+        let cases = [
+            ("empty at zero", 0, vec![], vec![]),
+            ("empty after nonzero position", 17, vec![], vec![]),
+            (
+                "start at zero",
+                0,
+                vec![0, 1, 2, 3, 4, 5, 6],
+                vec![(2, vec![0, 1, 2, 3]), (1, vec![4, 5]), (0, vec![6])],
+            ),
+            (
+                "aligned start",
+                8,
+                vec![10, 11, 12, 13, 14, 15, 16, 17],
+                vec![(3, vec![10, 11, 12, 13, 14, 15, 16, 17])],
+            ),
+            (
+                "unaligned start",
+                6,
+                vec![100, 101, 102, 103, 104, 105, 106],
+                vec![
+                    (1, vec![100, 101]),
+                    (2, vec![102, 103, 104, 105]),
+                    (0, vec![106]),
+                ],
+            ),
+            (
+                "preserve global alignment",
+                5,
+                vec![20, 21, 22, 23, 24, 25],
+                vec![
+                    (0, vec![20]),
+                    (1, vec![21, 22]),
+                    (1, vec![23, 24]),
+                    (0, vec![25]),
+                ],
+            ),
+        ];
+
+        for (name, start_position, leaves, expected) in cases {
+            assert_eq!(
+                chunk_levels_and_values(start_position, &leaves),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     proptest! {
