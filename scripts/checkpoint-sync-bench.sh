@@ -56,17 +56,12 @@ mkdir -p "$OUT_DIR"
 # ---- 0. dependencies + disk --------------------------------------------------
 ensure_deps() {
   local missing=()
-  for t in aria2c zstd tar jq curl awk; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
+  for t in zstd tar jq curl awk sha256sum; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
   if ((${#missing[@]})); then
     log "installing missing tools: ${missing[*]}"
-    # map binary -> package name where they differ
-    local pkgs=() m
-    for m in "${missing[@]}"; do
-      case "$m" in aria2c) pkgs+=(aria2);; *) pkgs+=("$m");; esac
-    done
     if command -v apt-get >/dev/null 2>&1; then
-      sudo apt-get update -qq && sudo apt-get install -y -qq "${pkgs[@]}" \
-        || die "could not install: ${pkgs[*]} (install them on the runner)"
+      sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" \
+        || die "could not install: ${missing[*]} (install them on the runner)"
     else
       die "missing tools and no apt-get: ${missing[*]}"
     fi
@@ -83,31 +78,40 @@ ensure_bench_home() {
   local avail_gib
   avail_gib=$(df -B1G --output=avail "$BENCH_HOME" | tail -1 | tr -dc '0-9')
   log "free space at $BENCH_HOME: ${avail_gib}GiB"
-  (( avail_gib >= 50 )) || die "need >=50GiB free at $BENCH_HOME, have ${avail_gib}GiB"
+  # streaming extract needs room for the ~40GiB extracted master + per-run fork divergence
+  (( avail_gib >= 45 )) || die "need >=45GiB free at $BENCH_HOME, have ${avail_gib}GiB"
 }
 
-# ---- 1. snapshot (download + extract once, cached) ---------------------------
+# ---- 1. snapshot (stream download+extract once, cached) ----------------------
+# Streams the .tar.zst straight through zstd|tar so the compressed tarball is never
+# stored on disk (the box has only ~one disk and can't hold tarball + extracted state).
+# sha256 is computed over the compressed stream via tee and checked after extraction.
 ensure_snapshot() {
   if [[ -f "$MASTER/state/v27/mainnet/version" ]]; then
     log "snapshot master present: $MASTER (db v$(cat "$MASTER/state/v27/mainnet/version"))"
     return
   fi
-  local tarball="$BENCH_HOME/snapshots/$SNAP_FILE"
-  if [[ ! -f "$tarball" ]]; then
-    log "downloading snapshot $SNAP_FILE (~30GiB) ..."
-    aria2c -x16 -s16 -k1M --file-allocation=none --auto-file-renaming=false \
-      --checksum=sha-256="$SNAPSHOT_SHA256" \
-      -d "$BENCH_HOME/snapshots" -o "$SNAP_FILE" \
-      "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR" \
-      || die "snapshot download failed"
-  fi
-  log "verifying checksum ..."
-  echo "$SNAPSHOT_SHA256  $tarball" | sha256sum -c - || die "snapshot checksum mismatch"
-  log "extracting snapshot -> $MASTER ..."
-  local tmp="$MASTER.tmp.$$"
+  local tmp="$MASTER.tmp.$$" sumf; sumf="$BENCH_HOME/snapshots/.sha.$$"
   rm -rf "$tmp"; mkdir -p "$tmp"
-  zstd -dc --long=31 "$tarball" | tar -x -C "$tmp"
-  # the archive may contain a single top dir or the state/ tree directly; normalize
+  log "streaming snapshot download+extract (~30GiB compressed, no tarball kept) ..."
+  local ok=0 url
+  for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
+    [[ -n "$url" ]] || continue
+    log "source: $url"
+    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+         | tee >(sha256sum | awk '{print $1}' > "$sumf") \
+         | zstd -dc --long=31 | tar -x -C "$tmp"; then
+      ok=1; break
+    fi
+    log "source failed; cleaning and trying next"; rm -rf "$tmp"; mkdir -p "$tmp"
+  done
+  (( ok )) || { rm -rf "$tmp" "$sumf"; die "snapshot download failed from all sources"; }
+  local got; got="$(cat "$sumf" 2>/dev/null || true)"; rm -f "$sumf"
+  if [[ -n "$SNAPSHOT_SHA256" && "$got" != "$SNAPSHOT_SHA256" ]]; then
+    rm -rf "$tmp"; die "snapshot checksum mismatch: got '$got' want '$SNAPSHOT_SHA256'"
+  fi
+  log "snapshot checksum OK ($got)"
+  # the archive may contain the state/ tree at top level or under one parent dir; normalize
   if [[ -d "$tmp/state" ]]; then
     mv "$tmp" "$MASTER"
   else
