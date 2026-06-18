@@ -12,13 +12,18 @@ use tokio::sync::{
 };
 
 use tracing::Span;
-use zebra_chain::block::{self, Height};
+use zebra_chain::{
+    block::{self, Height},
+    history_tree::HistoryTree,
+    parallel::tree::NoteCommitmentTrees,
+};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
+    error::CommitCheckpointVerifiedError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZebraDb},
+        finalized_state::{ComputedFinalized, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -273,26 +278,137 @@ impl WriteBlockWorkerTask {
 
         let mut prev_finalized_note_commitment_trees = None;
 
-        // Write all the finalized blocks sent by the state,
-        // until the state closes the finalized block channel's sender.
+        // === Any-order commit pipeline (finalized / checkpoint phase) ===
+        //
+        // The per-block finalized commit splits into two halves (see
+        // `FinalizedState::compute_finalized` and `finish_pipelined`):
+        //
+        // * Stage A (compute) — the ordered, chained treestate computation:
+        //   note-commitment tree update, ZIP-244 commitment check, history-tree
+        //   push. Block N+1 needs block N's trees, so this stays strictly
+        //   ordered, but it does not depend on block N's *disk write*.
+        // * Stage B (write) — block batch construction + RocksDB write + chain
+        //   tip update (this thread).
+        //
+        // Running Stage A on its own thread lets it compute block N+1 while Stage
+        // B is still writing block N, overlapping the next block's tree chain with
+        // the previous block's serialization + write. The treestate (note +
+        // history trees) is threaded in memory from each Stage A iteration to the
+        // next, so the compute never reads a not-yet-written tip. Canonical tip
+        // advancement (`set_finalized_tip`) stays in Stage B, in height order.
+
+        // Take ownership of the finalized receiver for the compute thread. The
+        // non-finalized phase below does not use it, so a dummy is left in place.
+        let finalized_block_write_receiver = {
+            let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::unbounded_channel();
+            std::mem::replace(finalized_block_write_receiver, dummy_rx)
+        };
+
+        // Bounded so Stage A runs at most a few blocks ahead of Stage B: back
+        // pressure caps memory and keeps the two stages roughly in lockstep.
+        const FINALIZED_PIPELINE_DEPTH: usize = 3;
+        type PipelinedBlock = (
+            Result<ComputedFinalized, CommitCheckpointVerifiedError>,
+            QueuedCheckpointVerified,
+        );
+        let (computed_sender, computed_receiver) =
+            std::sync::mpsc::sync_channel::<PipelinedBlock>(FINALIZED_PIPELINE_DEPTH);
+
+        // Set by Stage B on a write error: tells Stage A to drop its in-memory
+        // threaded trees and re-seed from the (reset) finalized tip.
+        let reset_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // --- Stage A: compute thread ---
+        let stage_a_state = finalized_state.clone();
+        let stage_a_reset_flag = Arc::clone(&reset_flag);
+        let stage_a = std::thread::Builder::new()
+            .name("finalized-compute".to_string())
+            .spawn(move || {
+                let mut finalized_block_write_receiver = finalized_block_write_receiver;
+                let mut prev_note_commitment_trees: Option<NoteCommitmentTrees> = None;
+                let mut prev_history_tree: Option<Arc<HistoryTree>> = None;
+
+                // The next height we expect to compute. The db tip lags Stage B,
+                // so we track this in memory rather than reading the db tip.
+                let mut next_compute_height = stage_a_state
+                    .db
+                    .finalized_tip_height()
+                    .map(|height| (height + 1).expect("committed heights are valid"))
+                    .unwrap_or(Height(0));
+
+                loop {
+                    let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() else {
+                        break;
+                    };
+
+                    // A Stage B write error resets the finalized tip: drop stale
+                    // threaded trees and re-seed the expected height from the db.
+                    if stage_a_reset_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        prev_note_commitment_trees = None;
+                        prev_history_tree = None;
+                        next_compute_height = stage_a_state
+                            .db
+                            .finalized_tip_height()
+                            .map(|height| (height + 1).expect("committed heights are valid"))
+                            .unwrap_or(Height(0));
+                    }
+
+                    // Drop children of a failed block (wrong height). Stage B
+                    // re-checks the height against the real db tip before writing.
+                    if ordered_block.0.height != next_compute_height {
+                        std::mem::drop(ordered_block);
+                        continue;
+                    }
+
+                    #[cfg(feature = "commit-metrics")]
+                    let _compute_start = std::time::Instant::now();
+                    let computed_result = stage_a_state.compute_finalized(
+                        ordered_block.0.clone().into(),
+                        prev_note_commitment_trees.take(),
+                        prev_history_tree.take(),
+                    );
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.write.compute.duration_seconds")
+                        .record(_compute_start.elapsed().as_secs_f64());
+
+                    match &computed_result {
+                        Ok(computed) => {
+                            // Thread this block's trees to the next compute.
+                            prev_note_commitment_trees =
+                                Some(computed.threaded_note_commitment_trees());
+                            prev_history_tree = Some(computed.threaded_history_tree());
+                            next_compute_height =
+                                (next_compute_height + 1).expect("committed heights are valid");
+                        }
+                        Err(_) => {
+                            // Stop threading; Stage B sends a reset and we re-seed
+                            // from the db tip on the next iteration.
+                            prev_note_commitment_trees = None;
+                            prev_history_tree = None;
+                        }
+                    }
+
+                    if computed_sender.send((computed_result, ordered_block)).is_err() {
+                        // Stage B is gone (shutting down).
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn the finalized-compute thread");
+
+        // --- Stage B: write loop (this thread) ---
+        // Write all the finalized blocks computed by Stage A, until Stage A closes
+        // the channel (because the state closed the finalized block sender).
         loop {
-            // Time spent waiting for the next block to commit (writer idle).
-            // If this dominates the commit work below, the writer is starved by
-            // the verify->commit feed, not commit-bound.
+            // Time spent waiting for Stage A's next computed block (writer idle).
             #[cfg(feature = "commit-metrics")]
             let _wait_start = std::time::Instant::now();
-            let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() else {
+            let Ok((computed_result, ordered_block)) = computed_receiver.recv() else {
                 break;
             };
             #[cfg(feature = "commit-metrics")]
             metrics::histogram!("zebra.state.write.wait.duration_seconds")
                 .record(_wait_start.elapsed().as_secs_f64());
-            // How many finalized blocks are still queued for the writer after we
-            // took this one: ~0 means the writer is starved by the feed; a large
-            // backlog means the writer itself is the bottleneck.
-            #[cfg(feature = "commit-metrics")]
-            metrics::histogram!("zebra.state.write.channel.depth")
-                .record(finalized_block_write_receiver.len() as f64);
 
             // TODO: split these checks into separate functions
 
@@ -301,12 +417,12 @@ impl WriteBlockWorkerTask {
                 return;
             }
 
-            // Discard any children of invalid blocks in the channel
+            // Discard any children of invalid blocks.
             //
-            // `commit_finalized()` requires blocks in height order.
-            // So if there has been a block commit error,
-            // we need to drop all the descendants of that block,
-            // until we receive a block at the required next height.
+            // `finish_pipelined()` requires blocks in height order. So if there
+            // has been a block commit error, we need to drop all the descendants
+            // of that block, until we receive a block at the required next height.
+            // (This also covers blocks Stage A computed before it saw the reset.)
             let next_valid_height = finalized_state
                 .db
                 .finalized_tip_height()
@@ -323,25 +439,29 @@ impl WriteBlockWorkerTask {
                 );
 
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
-                std::mem::drop(ordered_block);
+                std::mem::drop((computed_result, ordered_block));
                 continue;
             }
 
-            // Try committing the block
+            // Try committing the block (write half only; compute is already done).
             #[cfg(feature = "commit-metrics")]
             let _busy_start = std::time::Instant::now();
-            let commit_result = finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take());
+            let commit_result = finalized_state.finish_pipelined(computed_result, ordered_block);
             #[cfg(feature = "commit-metrics")]
             metrics::histogram!("zebra.state.write.busy.duration_seconds")
                 .record(_busy_start.elapsed().as_secs_f64());
             match commit_result {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
+                    // Kept for the handoff to the non-finalized phase below, which
+                    // finalizes its first block from the last finalized trees.
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err(error) => {
+                    // Tell Stage A to drop its threaded trees and re-seed.
+                    reset_flag.store(true, std::sync::atomic::Ordering::Release);
+
                     let finalized_tip = finalized_state.db.tip();
 
                     // The last block in the queue failed, so we can't commit the next block.
@@ -366,6 +486,9 @@ impl WriteBlockWorkerTask {
                 }
             }
         }
+
+        // Stage A has finished (it closed the channel); join it before moving on.
+        let _ = stage_a.join();
 
         // Do this check even if the channel got closed before any finalized blocks were sent.
         // This can happen if we're past the finalized tip.

@@ -22,7 +22,9 @@ use std::{
     },
 };
 
-use zebra_chain::{block, parallel::tree::NoteCommitmentTrees, parameters::Network};
+use zebra_chain::{
+    block, history_tree::HistoryTree, parallel::tree::NoteCommitmentTrees, parameters::Network,
+};
 use zebra_db::{
     block::RetentionPlan,
     chain::BLOCK_INFO,
@@ -77,6 +79,36 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("rayon thread pool configuration is valid")
 });
+
+/// A finalizable block whose treestate has been computed by
+/// [`FinalizedState::compute_finalized`] and is ready to be written to disk by
+/// [`FinalizedState::write_finalized`].
+///
+/// Splitting compute from write lets the writer pipeline the two: the ordered,
+/// chained treestate computation (Stage A) can run for the next block while the
+/// previous block's batch construction + db write (Stage B) is still in flight.
+pub(crate) struct ComputedFinalized {
+    height: block::Height,
+    hash: block::Hash,
+    finalized: FinalizedBlock,
+    prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+    retention: RetentionPlan,
+}
+
+impl ComputedFinalized {
+    /// The note commitment trees *after* this block, for threading in memory to
+    /// the next block's [`FinalizedState::compute_finalized`] in a pipelined
+    /// writer (so the next block does not re-read a not-yet-written tip).
+    pub(crate) fn threaded_note_commitment_trees(&self) -> NoteCommitmentTrees {
+        self.finalized.treestate.note_commitment_trees.clone()
+    }
+
+    /// The history tree *after* this block, for threading in memory to the next
+    /// block's [`FinalizedState::compute_finalized`] in a pipelined writer.
+    pub(crate) fn threaded_history_tree(&self) -> Arc<HistoryTree> {
+        self.finalized.treestate.history_tree.clone()
+    }
+}
 
 pub mod column_family;
 
@@ -524,12 +556,31 @@ impl FinalizedState {
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
     ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let computed_result =
+            self.compute_finalized(ordered_block.0.clone().into(), prev_note_commitment_trees, None);
+        self.finish_pipelined(computed_result, ordered_block)
+    }
+
+    /// Finish committing a [`Self::compute_finalized`]d block: write it to disk,
+    /// update commit metrics, and send the result on the request's response
+    /// channel. Returns the block and its updated note commitment trees.
+    ///
+    /// This is the second half of [`Self::commit_finalized`], split out so a
+    /// pipelined writer can run [`Self::compute_finalized`] (the ordered, chained
+    /// treestate computation) on a separate thread, *ahead* of this disk write.
+    ///
+    /// `computed_result` is the (possibly failed) output of
+    /// [`Self::compute_finalized`] for `ordered_block`. The caller must compute
+    /// results in strict height order and pass them here in that same order.
+    pub(crate) fn finish_pipelined(
+        &mut self,
+        computed_result: Result<ComputedFinalized, CommitCheckpointVerifiedError>,
+        ordered_block: QueuedCheckpointVerified,
+    ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (checkpoint_verified, rsp_tx) = ordered_block;
-        let result = self.commit_finalized_direct(
-            checkpoint_verified.clone().into(),
-            prev_note_commitment_trees,
-            "commit checkpoint-verified request",
-        );
+        let result = computed_result.and_then(|computed| {
+            self.write_finalized(computed, "commit checkpoint-verified request")
+        });
 
         if result.is_ok() {
             metrics::counter!("state.checkpoint.finalized.block.count").increment(1);
@@ -553,26 +604,21 @@ impl FinalizedState {
         result.map(|(_hash, note_commitment_trees)| (checkpoint_verified, note_commitment_trees))
     }
 
-    /// Immediately commit a `finalized` block to the finalized state.
+    /// Compute the treestate for a finalizable block — the note-commitment tree
+    /// update, the ZIP-244 commitment check, and the history-tree push — without
+    /// writing anything to disk. The result is written by [`Self::write_finalized`].
     ///
-    /// This can be called either by the non-finalized state (when finalizing
-    /// a block) or by the checkpoint verifier.
-    ///
-    /// Use `source` as the source of the block in log messages.
-    ///
-    /// # Errors
-    ///
-    /// - Propagates any errors from writing to the DB
-    /// - Propagates any errors from updating history and note commitment trees
-    /// - If `hashFinalSaplingRoot` / `hashLightClientRoot` / `hashBlockCommitments`
-    ///   does not match the expected value
+    /// `prev_history_tree` lets the caller thread the parent block's history tree
+    /// in memory (as it already threads `prev_note_commitment_trees`), so a
+    /// pipelined writer does not re-read a stale tip. `None` reads the finalized
+    /// tip's history tree from the database (the non-pipelined behaviour).
     #[allow(clippy::unwrap_in_result)]
-    pub fn commit_finalized_direct(
-        &mut self,
+    pub(crate) fn compute_finalized(
+        &self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        source: &str,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        prev_history_tree: Option<Arc<HistoryTree>>,
+    ) -> Result<ComputedFinalized, CommitCheckpointVerifiedError> {
         let (height, hash, finalized, prev_note_commitment_trees, retention) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
@@ -589,7 +635,10 @@ impl FinalizedState {
                     // so the commitment check below doesn't recompute it here on the
                     // single-threaded committer. `AuthDataRoot` is `Copy`.
                     let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
-                    let mut history_tree = self.db.history_tree();
+                    // Use the threaded parent history tree if provided (pipelined
+                    // writer), otherwise read it from the finalized tip.
+                    let mut history_tree =
+                        prev_history_tree.unwrap_or_else(|| self.db.history_tree());
                     let prev_note_commitment_trees = prev_note_commitment_trees
                         .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
@@ -700,6 +749,34 @@ impl FinalizedState {
                 }
             };
 
+        Ok(ComputedFinalized {
+            height,
+            hash,
+            finalized,
+            prev_note_commitment_trees,
+            retention,
+        })
+    }
+
+    /// Write a [`Self::compute_finalized`]d block to disk and return its hash and
+    /// the updated note commitment trees.
+    ///
+    /// Asserts that the block is the child of the current finalized tip (so it
+    /// must be called in strict height order, which the writer guarantees).
+    #[allow(clippy::unwrap_in_result)]
+    fn write_finalized(
+        &mut self,
+        computed: ComputedFinalized,
+        source: &str,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let ComputedFinalized {
+            height,
+            hash,
+            finalized,
+            prev_note_commitment_trees,
+            retention,
+        } = computed;
+
         let committed_tip_hash = self.db.finalized_tip_hash();
         let committed_tip_height = self.db.finalized_tip_height();
 
@@ -780,6 +857,25 @@ impl FinalizedState {
         }
 
         result.map(|hash| (hash, note_commitment_trees))
+    }
+
+    /// Immediately commit a `finalized` block to the finalized state, computing
+    /// its treestate and writing it to disk in one (non-pipelined) call.
+    ///
+    /// This can be called either by the non-finalized state (when finalizing
+    /// a block) or by the checkpoint verifier.
+    ///
+    /// Use `source` as the source of the block in log messages.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn commit_finalized_direct(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        source: &str,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let computed =
+            self.compute_finalized(finalizable_block, prev_note_commitment_trees, None)?;
+        self.write_finalized(computed, source)
     }
 
     #[cfg(feature = "elasticsearch")]
