@@ -1136,6 +1136,13 @@ where
         let state_service = self.state_service.clone();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
+            let hash = req_block
+                .rx
+                .await
+                .map_err(Into::into)
+                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                .expect("CheckpointVerifier does not leave dangling receivers")?;
+
             // Precompute the ZIP-244 authorizing-data commitment root here, off
             // the single-threaded checkpoint-verifier buffer worker. This task
             // is spawned per block, so the (CPU-heavy, per-transaction) auth
@@ -1152,13 +1159,6 @@ where
                     req_block.block.auth_data_root = Some(auth_data_root);
                 }
             }
-
-            let hash = req_block
-                .rx
-                .await
-                .map_err(Into::into)
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .expect("CheckpointVerifier does not leave dangling receivers")?;
 
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.
