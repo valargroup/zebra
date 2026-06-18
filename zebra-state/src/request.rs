@@ -10,7 +10,7 @@ use std::{
 use tower::{BoxError, Service, ServiceExt};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::{self, Block, HeightDiff},
+    block::{self, merkle::AuthDataRoot, Block, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
     orchard,
@@ -260,6 +260,14 @@ pub struct SemanticallyVerifiedBlock {
     pub transaction_hashes: Arc<[transaction::Hash]>,
     /// This block's deferred pool value balance change.
     pub deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    /// The precomputed ZIP-244 authorizing-data commitment root for this block,
+    /// if it was computed during verification.
+    ///
+    /// The checkpoint verifier sets this (it runs with high concurrency, ahead
+    /// of the single-threaded finalized committer) so the committer does not
+    /// have to recompute the per-transaction auth digests on its critical path.
+    /// `None` means "not precomputed"; the committer falls back to computing it.
+    pub auth_data_root: Option<AuthDataRoot>,
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -491,6 +499,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change,
+            auth_data_root: _,
         } = semantically_verified;
 
         // This is redundant for the non-finalized state,
@@ -552,6 +561,7 @@ impl SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            auth_data_root: None,
         }
     }
 
@@ -587,6 +597,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            auth_data_root: None,
         }
     }
 }
@@ -602,6 +613,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
             )),
+            auth_data_root: None,
         }
     }
 }
@@ -615,6 +627,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             new_outputs: finalized.new_outputs,
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
+            auth_data_root: None,
         }
     }
 }

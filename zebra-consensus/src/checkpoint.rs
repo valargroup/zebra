@@ -33,7 +33,7 @@ use zebra_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
-        Network, GENESIS_PREVIOUS_BLOCK_HASH,
+        Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
 };
@@ -621,7 +621,19 @@ where
             .map(DeferredPoolBalanceChange::new);
 
         // don't do precalculation until the block passes basic difficulty checks
-        let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
+        let mut block =
+            CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
+
+        // Precompute the ZIP-244 authorizing-data commitment root here, in the
+        // verifier. The checkpoint verifier runs with high concurrency, well
+        // ahead of the single-threaded finalized committer, so computing the
+        // per-transaction auth digests here (instead of on the committer's
+        // critical path) moves that work off the commit bottleneck. Only
+        // Nu5-onward blocks bind the auth data in their block commitment.
+        if NetworkUpgrade::current(&self.network, height) >= NetworkUpgrade::Nu5 {
+            let auth_data_root = block.block.auth_data_root();
+            block.auth_data_root = Some(auth_data_root);
+        }
 
         crate::block::check::merkle_root_validity(
             &self.network,
