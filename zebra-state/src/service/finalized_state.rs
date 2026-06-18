@@ -581,6 +581,10 @@ impl FinalizedState {
                     // finalized tip is the parent block of the block being committed.
 
                     let block = checkpoint_verified.block.clone();
+                    // Auth data root precomputed by the checkpoint verifier (if any),
+                    // so the commitment check below doesn't recompute it here on the
+                    // single-threaded committer. `AuthDataRoot` is `Copy`.
+                    let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
                     let mut history_tree = self.db.history_tree();
                     let prev_note_commitment_trees = prev_note_commitment_trees
                         .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
@@ -621,6 +625,7 @@ impl FinalizedState {
                                         block.clone(),
                                         &network,
                                         &history_tree,
+                                        precomputed_auth_data_root,
                                     )
                                 ));
                             });
