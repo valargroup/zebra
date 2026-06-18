@@ -401,33 +401,31 @@ impl NoteCommitmentTree {
         }
     }
 
-    /// Appends a batch of note commitment x-coordinates from a single block to the
-    /// tree in parallel, returning the index and root of the [`TRACKED_SUBTREE_HEIGHT`]
-    /// subtree completed by the batch, if any.
+    /// Appends one block's note commitments in parallel.
     ///
-    /// The Merkle hashing is parallelized across the rayon pool. The frontier and
-    /// subtree result are identical to calling [`Self::append`] for each commitment
-    /// in order. This equivalence is enforced by the differential property tests in
-    /// [`crate::parallel::batch_frontier`].
+    /// Returns the [`TRACKED_SUBTREE_HEIGHT`] subtree completed by this block, if
+    /// any. This must match calling [`Self::append`] for each commitment in order.
     ///
-    /// `cms` must contain the actions of a single block. The consensus block-size cap
-    /// bounds a block to far fewer than `2^TRACKED_SUBTREE_HEIGHT` (65,536) actions,
-    /// so at most one subtree boundary can be crossed per call.
+    /// `note_commitments` must come from one block, so the batch can cross at
+    /// most one tracked-subtree boundary.
     ///
     /// Returns an error if the tree would overflow its capacity.
     #[allow(clippy::unwrap_in_result)]
     pub fn append_batch(
         &mut self,
-        cms: &[NoteCommitmentUpdate],
+        note_commitments: &[NoteCommitmentUpdate],
     ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
         use crate::parallel::batch_frontier::append_batch_with_subtree;
 
-        if cms.is_empty() {
+        if note_commitments.is_empty() {
             return Ok(None);
         }
 
         // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions.
-        let nodes: Vec<Node> = cms.iter().map(|cm_x| (*cm_x).into()).collect();
+        let nodes: Vec<Node> = note_commitments
+            .iter()
+            .map(|commitment_x| (*commitment_x).into())
+            .collect();
 
         let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
             .map_err(|_| NoteCommitmentTreeError::FullTree)?;
@@ -798,19 +796,24 @@ mod tests {
             cached_root: Default::default(),
         };
 
-        // cms[0] fills position 65535, completing subtree 0; cms[1] starts subtree 1.
-        let cms = [note_commitment(100), note_commitment(200)];
+        // note_commitments[0] fills position 65535, completing subtree 0.
+        // note_commitments[1] starts subtree 1.
+        let note_commitments = [note_commitment(100), note_commitment(200)];
 
         // Sequential reference: append one at a time.
         let mut seq_tree = tree.clone();
-        seq_tree.append(cms[0]).expect("sequential first append");
+        seq_tree
+            .append(note_commitments[0])
+            .expect("sequential first append");
         let expected_subtree = seq_tree.completed_subtree_index_and_root();
-        seq_tree.append(cms[1]).expect("sequential second append");
+        seq_tree
+            .append(note_commitments[1])
+            .expect("sequential second append");
 
         // Batch must return the same subtree result and produce the same final tree.
         let mut batch_tree = tree;
         let batch_result = batch_tree
-            .append_batch(&cms)
+            .append_batch(&note_commitments)
             .expect("batch append succeeds");
 
         assert!(
