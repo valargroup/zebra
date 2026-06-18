@@ -54,6 +54,16 @@ SAMPLE_INTERVAL=5
 log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
 
+# Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
+# run never leaves an orphan zebrad thrashing the box or a fork eating disk.
+CUR_PID=""; CUR_FORK=""
+cleanup() {
+  [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null
+  [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT INT TERM
+
 # pick a free TCP port starting at $1 (avoids colliding with another node on the host)
 pick_free_port() {
   local p="$1"
@@ -188,7 +198,7 @@ run_one() {
   local cfg="$fork.config.toml"
 
   log "fork: cp -al master -> $fork"
-  rm -rf "$fork"; cp -al "$MASTER" "$fork"
+  rm -rf "$fork"; cp -al "$MASTER" "$fork"; CUR_FORK="$fork"
   find "$fork" -name LOCK -delete 2>/dev/null || true
 
   # $1 = include the Zakura v2 P2P toggles (present only on v5.0.0+ "Zakura" releases)
@@ -226,14 +236,14 @@ run_one() {
   log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=$FEED_PEER, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
-  pid=$!; t0=$(date +%s); sleep 3
+  pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
   if ! kill -0 "$pid" 2>/dev/null; then
     # version-skew fallback: older tags lack v2_p2p/legacy_p2p -> deny_unknown_fields.
     if grep -qiE 'unknown field|v2_p2p|legacy_p2p|deny_unknown|error parsing config|failed to parse' "$logf"; then
       log "config rejected (likely pre-Zakura tag); retrying without v2_p2p/legacy_p2p"
       write_config "no_zakura"
       "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
-      pid=$!; t0=$(date +%s); sleep 3
+      pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
     fi
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -287,6 +297,7 @@ run_one() {
   (( end_height < STOP_HEIGHT )) && stalled="yes (capped before stop_height)"
 
   rm -rf "$fork" "$cfg"   # reclaim divergent SSTs; keep csv/log artifacts
+  CUR_PID=""; CUR_FORK=""
 
   RESULT_TAG="$tag"; RESULT_START="$START_HEIGHT"; RESULT_END="$end_height"
   RESULT_BLOCKS="$blocks"; RESULT_TIME="$total"; RESULT_POST="$post"
