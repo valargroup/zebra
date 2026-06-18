@@ -970,7 +970,9 @@ fn binding_signatures() {
                                 .expect("network upgrade is valid for tx");
 
                             let bvk = redjubjub::VerificationKey::try_from(
-                                sapling_shielded_data.binding_verification_key(),
+                                sapling_shielded_data
+                                    .binding_verification_key()
+                                    .expect("test transaction has valid value commitments"),
                             )
                             .expect("a valid redjubjub::VerificationKey");
 
@@ -1001,7 +1003,9 @@ fn binding_signatures() {
                                 .expect("network upgrade is valid for tx");
 
                             let bvk = redjubjub::VerificationKey::try_from(
-                                sapling_shielded_data.binding_verification_key(),
+                                sapling_shielded_data
+                                    .binding_verification_key()
+                                    .expect("test transaction has valid value commitments"),
                             )
                             .expect("a valid redjubjub::VerificationKey");
 
@@ -1033,7 +1037,9 @@ fn binding_signatures() {
                                 .expect("network upgrade is valid for tx");
 
                             let bvk = redjubjub::VerificationKey::try_from(
-                                sapling_shielded_data.binding_verification_key(),
+                                sapling_shielded_data
+                                    .binding_verification_key()
+                                    .expect("test transaction has valid value commitments"),
                             )
                             .expect("a valid redjubjub::VerificationKey");
 
@@ -1431,7 +1437,10 @@ fn sapling_lazy_cv_epk_edge_cases() {
 
     // `commitment()` decompresses a valid encoding to the same point.
     assert_eq!(
-        ValueCommitment(valid_cv).commitment().to_bytes(),
+        ValueCommitment(valid_cv)
+            .commitment()
+            .expect("the generator is a valid value commitment")
+            .to_bytes(),
         valid_cv,
         "commitment() must round-trip a valid value commitment",
     );

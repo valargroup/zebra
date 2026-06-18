@@ -297,15 +297,29 @@ where
     /// descriptions of the transaction, and the balancing value.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#saplingbalance>
-    pub fn binding_verification_key(&self) -> redjubjub::VerificationKeyBytes<Binding> {
-        let cv_old: sapling_crypto::value::CommitmentSum =
-            self.spends().map(|spend| spend.cv.commitment()).sum();
-        let cv_new: sapling_crypto::value::CommitmentSum =
-            self.outputs().map(|output| output.cv.commitment()).sum();
+    /// Returns `None` if any value commitment is not a canonical, non-small-order
+    /// point. The encodings are validated on the semantic verification path
+    /// (`Transaction::sapling_point_encodings_are_valid`), so a `None` here means
+    /// the caller is working with an unvalidated transaction.
+    pub fn binding_verification_key(&self) -> Option<redjubjub::VerificationKeyBytes<Binding>> {
+        let cv_old: sapling_crypto::value::CommitmentSum = self
+            .spends()
+            .map(|spend| spend.cv.commitment())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        let cv_new: sapling_crypto::value::CommitmentSum = self
+            .outputs()
+            .map(|output| output.cv.commitment())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .sum();
 
-        (cv_old - cv_new)
-            .into_bvk(self.value_balance.zatoshis())
-            .into()
+        Some(
+            (cv_old - cv_new)
+                .into_bvk(self.value_balance.zatoshis())
+                .into(),
+        )
     }
 }
 

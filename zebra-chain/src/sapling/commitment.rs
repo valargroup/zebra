@@ -42,22 +42,19 @@ pub struct CommitmentRandomness(jubjub::Fr);
 pub struct ValueCommitment(pub(crate) [u8; 32]);
 
 impl ValueCommitment {
-    /// Decompress and return the underlying `sapling_crypto` value commitment.
+    /// Decompresses and returns the underlying `sapling_crypto` value
+    /// commitment, or `None` if the stored bytes are not a canonical,
+    /// non-small-order Jubjub point.
     ///
-    /// This performs the Jubjub point decompression that deserialization defers.
-    /// It is only used by `ShieldedData::binding_verification_key`, a helper
-    /// that is not on the consensus hot path; consensus validation of the
-    /// encoding happens via `to_librustzcash` (see the type docs).
-    ///
-    /// # Panics
-    ///
-    /// If the stored bytes are not a valid, non-small-order value commitment.
-    /// Callers must only use this once the encoding has been validated (e.g. by
-    /// the librustzcash conversion); the checkpoint verifier never calls it.
-    pub fn commitment(&self) -> sapling_crypto::value::ValueCommitment {
-        sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0)
-            .into_option()
-            .expect("ValueCommitment bytes are a valid non-small-order point")
+    /// This performs the point decompression that deserialization defers, so it
+    /// is fallible by design: the encoding is validated only where the point is
+    /// used, and callers must handle an invalid commitment rather than assume it
+    /// is valid. Consensus validation of the encoding happens on the semantic
+    /// path via [`crate::transaction::Transaction::sapling_point_encodings_are_valid`]
+    /// and `to_librustzcash`; the checkpoint verifier trusts block hashes and
+    /// never calls this.
+    pub fn commitment(&self) -> Option<sapling_crypto::value::ValueCommitment> {
+        sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).into_option()
     }
 
     /// Return the canonical 32-byte (little-endian) compressed encoding.
