@@ -22,6 +22,10 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Emit per-block checkpoint-verify phase histograms for performance
+# investigation (zero overhead when disabled).
+commit-metrics = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [

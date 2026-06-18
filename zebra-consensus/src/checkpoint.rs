@@ -54,6 +54,20 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+/// Times `$body` and records its duration to the named histogram when the
+/// `commit-metrics` feature is enabled; otherwise just evaluates `$body` with
+/// zero overhead. Used to profile the serial checkpoint-verify (feed) stages.
+macro_rules! timed_verify_phase {
+    ($name:expr, $body:expr) => {{
+        #[cfg(feature = "commit-metrics")]
+        let _phase_start = std::time::Instant::now();
+        let _phase_result = $body;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!($name).record(_phase_start.elapsed().as_secs_f64());
+        _phase_result
+    }};
+}
+
 pub use zebra_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 
 /// An unverified block, which is in the queue for checkpoint verification.
@@ -607,7 +621,10 @@ where
             )?;
         } else {
             crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
-            crate::block::check::equihash_solution_is_valid(&block.header)?;
+            timed_verify_phase!(
+                "zebra.consensus.check_block.equihash.duration_seconds",
+                crate::block::check::equihash_solution_is_valid(&block.header)
+            )?;
         }
 
         // See [ZIP-1015](https://zips.z.cash/zip-1015).
@@ -621,12 +638,20 @@ where
             .map(DeferredPoolBalanceChange::new);
 
         // don't do precalculation until the block passes basic difficulty checks
-        let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
+        // (`CheckpointVerifiedBlock::new` precomputes the per-transaction hashes
+        // and ordered outputs, which scale with block weight).
+        let block = timed_verify_phase!(
+            "zebra.consensus.check_block.precompute.duration_seconds",
+            CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change)
+        );
 
-        crate::block::check::merkle_root_validity(
-            &self.network,
-            &block.block,
-            &block.transaction_hashes,
+        timed_verify_phase!(
+            "zebra.consensus.check_block.merkle.duration_seconds",
+            crate::block::check::merkle_root_validity(
+                &self.network,
+                &block.block,
+                &block.transaction_hashes,
+            )
         )?;
 
         Ok(block)
@@ -1086,12 +1111,22 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let mut req_block = match self.queue_block(block) {
+        // `queue_block` (which runs `check_block`) and `process_checkpoint_range`
+        // are the synchronous, single-threaded work this verifier does on the
+        // tower `Buffer` worker for every block — i.e. the serial feed stage
+        // between the parallel downloads and the serial committer.
+        let mut req_block = match timed_verify_phase!(
+            "zebra.consensus.queue_block.duration_seconds",
+            self.queue_block(block)
+        ) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };
 
-        self.process_checkpoint_range();
+        timed_verify_phase!(
+            "zebra.consensus.process_range.duration_seconds",
+            self.process_checkpoint_range()
+        );
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
 
