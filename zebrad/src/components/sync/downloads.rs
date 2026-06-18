@@ -449,11 +449,13 @@ where
                     match single_block {
                         Some(block_and_advertiser) => block_and_advertiser,
                         None => {
+                            // Use a typed SharedPeerError so not_found_download()
+                            // can downcast it and route to the bounded retry path.
                             return Err(BlockDownloadVerifyError::DownloadFailed {
-                                error: format!(
-                                    "peer returned {} block(s), or an unavailable block, \
-                                     for a single-hash request",
-                                    blocks.len()
+                                error: zn::SharedPeerError::from(
+                                    zn::PeerError::NotFoundResponse(vec![
+                                        zn::InventoryHash::from(hash),
+                                    ]),
                                 )
                                 .into(),
                                 hash,

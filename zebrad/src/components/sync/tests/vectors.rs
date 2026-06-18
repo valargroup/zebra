@@ -33,7 +33,11 @@ use zebra_state as zs;
 
 use crate::{
     components::{
-        sync::{self, downloads::BlockDownloadVerifyError, SyncStatus},
+        sync::{
+            self,
+            downloads::{BlockDownloadVerifyError, Downloads, NotFoundKind},
+            SyncStatus,
+        },
         ChainSync,
     },
     config::ZebradConfig,
@@ -1875,6 +1879,107 @@ fn setup_chain_sync() -> (
         state_service,
         mock_chain_tip_sender,
     )
+}
+
+/// Builds a [`Downloads`] with a mock network and verifier for unit tests that
+/// exercise `download_and_verify` directly.
+fn setup_downloads() -> (
+    Downloads<
+        MockService<zn::Request, zn::Response, PanicAssertion>,
+        MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+        MockChainTip,
+    >,
+    MockService<zn::Request, zn::Response, PanicAssertion>,
+    MockService<zebra_consensus::Request, block::Hash, PanicAssertion>,
+) {
+    let peer_set = MockService::build()
+        .with_max_request_delay(MAX_SERVICE_REQUEST_DELAY)
+        .for_unit_tests();
+    let verifier = MockService::build()
+        .with_max_request_delay(MAX_SERVICE_REQUEST_DELAY)
+        .for_unit_tests();
+    let (mock_chain_tip, _tip_sender) = MockChainTip::new();
+    let (lookahead_tx, _) = tokio::sync::watch::channel(false);
+
+    let downloads = Downloads::new(
+        peer_set.clone(),
+        verifier.clone(),
+        mock_chain_tip,
+        lookahead_tx,
+        10,
+        Height(0),
+    );
+
+    (downloads, peer_set, verifier)
+}
+
+/// An empty `Response::Blocks` from the network must produce a `DownloadFailed` error whose inner
+/// source downcasts to `SharedPeerError` with `NotFoundClass::Response`, so the sync requeue path
+/// fires instead of treating the failure as a generic unrecoverable error.
+#[tokio::test]
+async fn empty_block_response_produces_typed_not_found() -> Result<(), crate::BoxError> {
+    let _guard = zebra_test::init();
+
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+
+    let (mut downloads, mut peer_set, mut verifier) = setup_downloads();
+
+    downloads.download_and_verify(block1_hash).await?;
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![]));
+
+    let result = futures::StreamExt::next(&mut downloads)
+        .await
+        .expect("stream yields an item");
+
+    let err = result.expect_err("empty block response should be an error");
+    assert_eq!(
+        err.not_found_download(),
+        Some((block1_hash, NotFoundKind::Response)),
+        "empty block response must produce a typed NotFoundResponse so sync can requeue the block"
+    );
+
+    verifier.expect_no_requests().await;
+    Ok(())
+}
+
+/// A single `Missing` entry in `Response::Blocks` must also produce a typed `NotFoundResponse`
+/// error so the sync requeue path fires — not a generic `DownloadFailed` string error.
+#[tokio::test]
+async fn missing_block_response_produces_typed_not_found() -> Result<(), crate::BoxError> {
+    let _guard = zebra_test::init();
+
+    let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block1_hash = block1.hash();
+
+    let (mut downloads, mut peer_set, mut verifier) = setup_downloads();
+
+    downloads.download_and_verify(block1_hash).await?;
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![InventoryResponse::Missing(
+            block1_hash,
+        )]));
+
+    let result = futures::StreamExt::next(&mut downloads)
+        .await
+        .expect("stream yields an item");
+
+    let err = result.expect_err("missing block response should be an error");
+    assert_eq!(
+        err.not_found_download(),
+        Some((block1_hash, NotFoundKind::Response)),
+        "missing block response must produce a typed NotFoundResponse so sync can requeue the block"
+    );
+
+    verifier.expect_no_requests().await;
+    Ok(())
 }
 
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {

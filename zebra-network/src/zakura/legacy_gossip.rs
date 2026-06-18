@@ -35,6 +35,7 @@ use zebra_chain::{
 };
 
 use crate::{
+    peer::{PeerError, SharedPeerError},
     protocol::{
         external::InventoryHash,
         internal::{InventoryResponse, PeerSource, Request, Response},
@@ -1408,6 +1409,8 @@ where
                     Ok(Response::Nil)
                 }
                 DualStackRoute::LegacyFirstThenZakura => {
+                    let not_found_inventory = requested_inventory_from_request(&request);
+
                     if !legacy_enabled {
                         return request_adapter.call(request).await;
                     }
@@ -1424,10 +1427,17 @@ where
                         Ok(Ok(response)) if !all_inventory_missing(&response) => Ok(response),
                         Ok(Ok(response)) => match request_adapter.call(request).await {
                             Ok(zakura) if !all_inventory_missing(&zakura) => Ok(zakura),
-                            _ => Ok(response),
+                            Ok(zakura) => {
+                                missing_inventory_as_not_found(Ok(zakura), not_found_inventory)
+                            }
+                            Err(_) => {
+                                missing_inventory_as_not_found(Ok(response), not_found_inventory)
+                            }
                         },
                         Ok(Err(legacy_error)) => match request_adapter.call(request).await {
-                            Ok(zakura) => Ok(zakura),
+                            Ok(zakura) => {
+                                missing_inventory_as_not_found(Ok(zakura), not_found_inventory)
+                            }
                             Err(_) => Err(legacy_error),
                         },
                         // Legacy timed out (no ready peer): use Zakura.
@@ -1480,14 +1490,15 @@ impl ZakuraRequestClient {
         };
 
         let request_kind = frame.kind();
+        let not_found_inventory = requested_inventory(&frame);
         let first_result = self
             .request_one(primary.clone(), frame.clone(), request_kind)
             .await;
-        match first_result {
+        let result = match first_result {
             Ok(response) if !all_inventory_missing(&response) => Ok(response),
             Ok(response) => {
                 let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
-                    return Ok(response);
+                    return missing_inventory_as_not_found(Ok(response), not_found_inventory);
                 };
                 self.request_one(fallback, frame, request_kind)
                     .await
@@ -1499,7 +1510,9 @@ impl ZakuraRequestClient {
                 };
                 self.request_one(fallback, frame, request_kind).await
             }
-        }
+        };
+
+        missing_inventory_as_not_found(result, not_found_inventory)
     }
 
     async fn request_one(
@@ -1556,6 +1569,8 @@ fn select_handle(
         .or_else(|| handles.first().cloned())
 }
 
+/// Returns the first handle in `handles` whose peer ID differs from `primary`,
+/// or `None` if no such handle exists.
 fn select_fallback_handle(
     handles: &[ZakuraPeerHandle],
     primary: &ZakuraPeerId,
@@ -1566,19 +1581,88 @@ fn select_fallback_handle(
         .cloned()
 }
 
+/// Returns `true` if every item in `response` is marked missing, or if the
+/// response carries no items at all (vacuously true for an empty iterator).
+///
+/// Only meaningful for `Blocks` and `Transactions` responses; all other
+/// variants return `false`.
 fn all_inventory_missing(response: &Response) -> bool {
     match response {
-        Response::Blocks(blocks) => {
-            !blocks.is_empty() && blocks.iter().all(|block| block.is_missing())
-        }
-        Response::Transactions(transactions) => {
-            !transactions.is_empty()
-                && transactions
-                    .iter()
-                    .all(|transaction| transaction.is_missing())
-        }
+        Response::Blocks(blocks) => blocks.iter().all(|block| block.is_missing()),
+        Response::Transactions(transactions) => transactions
+            .iter()
+            .all(|transaction| transaction.is_missing()),
         _ => false,
     }
+}
+
+/// Returns the inventory hashes being requested by `frame`, or `None` for
+/// request kinds that do not carry inventory (e.g. `GetAddr`, peer hints).
+fn requested_inventory(frame: &LegacyRequestFrame) -> Option<Vec<InventoryHash>> {
+    match frame {
+        LegacyRequestFrame::BlocksByHash(hashes) => {
+            Some(hashes.iter().copied().map(InventoryHash::from).collect())
+        }
+        LegacyRequestFrame::TransactionsById(ids) => {
+            Some(ids.iter().copied().map(InventoryHash::from).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Returns the inventory hashes being requested by a high-level [`Request`],
+/// or `None` for request kinds that do not carry inventory.
+///
+/// Mirrors [`requested_inventory`] but operates on the internal [`Request`]
+/// type used by the dual-stack routing path rather than a [`LegacyRequestFrame`].
+fn requested_inventory_from_request(request: &Request) -> Option<Vec<InventoryHash>> {
+    match request {
+        Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+            Some(hashes.iter().copied().map(InventoryHash::from).collect())
+        }
+        Request::TransactionsById(ids) | Request::TransactionsByIdFrom { ids, .. } => {
+            Some(ids.iter().copied().map(InventoryHash::from).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Converts an all-missing `Ok` response into a typed [`SharedPeerError`] so
+/// downstream sync can use its bounded not-found retry path.
+///
+/// If `result` is `Err`, propagates the error unchanged.
+/// If `result` is `Ok` but [`all_inventory_missing`] is true and
+/// `not_found_inventory` is non-empty, returns
+/// `Err(SharedPeerError::NotFoundResponse(...))` carrying the *requested*
+/// hashes (not the response contents, which may be empty).
+/// Otherwise returns the `Ok` response unchanged.
+///
+/// Using the original request hashes rather than response contents is
+/// necessary because a peer can signal "not found" with an empty block list
+/// as well as with explicit missing-item entries.
+fn missing_inventory_as_not_found(
+    result: Result<Response, BoxError>,
+    not_found_inventory: Option<Vec<InventoryHash>>,
+) -> Result<Response, BoxError> {
+    let response = result?;
+
+    // The legacy peer set represents "none of the requested inventory was available" as a
+    // typed peer `notfound` error. Preserve that contract for Zakura so sync can use its
+    // bounded missing-block retry path instead of treating the response as a generic
+    // download failure.
+    if all_inventory_missing(&response) {
+        if let Some(not_found_inventory) =
+            not_found_inventory.filter(|inventory| !inventory.is_empty())
+        {
+            // Use the original request inventory, not the response contents: a peer can
+            // also signal this condition by returning an empty block/transaction response.
+            return Err(
+                SharedPeerError::from(PeerError::NotFoundResponse(not_found_inventory)).into(),
+            );
+        }
+    }
+
+    Ok(response)
 }
 
 #[derive(Clone, Debug)]
@@ -2120,6 +2204,17 @@ mod tests {
             .expect("compact size serializes")
     }
 
+    fn assert_not_found_response(error: &BoxError) {
+        let peer_error = error
+            .downcast_ref::<SharedPeerError>()
+            .expect("missing Zakura inventory should be a typed peer error");
+
+        assert_eq!(
+            peer_error.not_found_class(),
+            Some(crate::peer::NotFoundClass::Response),
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct RequestRecorder {
         tx: tokio::sync::mpsc::UnboundedSender<Request>,
@@ -2603,19 +2698,14 @@ mod tests {
         let hash = block_hash(90);
 
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
-        let response = adapter
+        let error = adapter
             .request_from_source(
                 Request::BlocksByHash(HashSet::from([hash])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
-            .await?;
-
-        match response {
-            Response::Blocks(blocks) => {
-                assert_eq!(blocks, vec![InventoryResponse::Missing(hash)]);
-            }
-            response => panic!("unexpected response: {response:?}"),
-        }
+            .await
+            .expect_err("all-missing block response should be a typed notfound");
+        assert_not_found_response(&error);
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -3866,10 +3956,34 @@ mod tests {
         let (request_result, response_result) = futures::join!(second_request, second_response);
 
         response_result?;
-        assert_eq!(
-            request_result?,
-            Response::Blocks(vec![InventoryResponse::Missing(second_hash)])
+        let error = request_result.expect_err("missing block response should be a typed notfound");
+        assert_not_found_response(&error);
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_outbound_block_response_becomes_typed_notfound() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let node = ZakuraTestNode::builder(81).spawn().await?;
+        let hostile = HostilePeer::connect_native(&node, 82).await?;
+        wait_registered_count(&node, 1).await?;
+        let hostile_id = hostile.id()?;
+
+        let adapter = LegacyRequestAdapter::new(node.supervisor());
+        let request = adapter.request_from_source(
+            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Some(PeerSource::Zakura(hostile_id)),
         );
+        let responder = hostile.respond_to_next_request(Vec::new());
+        let (request_result, responder_result) = futures::join!(request, responder);
+
+        responder_result?;
+        let error = request_result.expect_err("empty block response should be a typed notfound");
+        assert_not_found_response(&error);
+        wait_registered_count(&node, 1).await?;
 
         hostile.shutdown().await;
         node.shutdown().await;
@@ -4101,6 +4215,39 @@ mod tests {
         }
 
         advertiser.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dual_stack_all_missing_inventory_becomes_typed_notfound() -> Result<(), BoxError> {
+        let _guard = zebra_test::init();
+        let requester = ZakuraTestNode::builder(208).spawn().await?;
+
+        let (legacy_tx, mut rx_legacy) = tokio::sync::mpsc::unbounded_channel();
+        let mut composite = ZakuraDualStackService::new(
+            DualStackLegacyStub {
+                tx: legacy_tx,
+                inventory: StubInventory::Missing,
+            },
+            requester.supervisor(),
+            true,
+        );
+
+        let hash = block_hash(18);
+        let error = composite
+            .ready()
+            .await?
+            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .await
+            .expect_err("all-missing dual-stack inventory should be a typed notfound");
+        assert_not_found_response(&error);
+
+        match recv_request(&mut rx_legacy).await? {
+            Request::BlocksByHash(hashes) => assert_eq!(hashes, HashSet::from([hash])),
+            request => panic!("unexpected legacy request: {request:?}"),
+        }
+
         requester.shutdown().await;
         Ok(())
     }
