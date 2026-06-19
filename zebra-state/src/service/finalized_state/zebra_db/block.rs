@@ -1117,12 +1117,18 @@ impl DiskWriteBatch {
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
 
-        // Serialize the raw transaction bytes in parallel: on heavy shielded
-        // blocks this serialization dominates the per-block write cost, and each
+        // Serialize the raw transaction bytes up front: on heavy shielded blocks
+        // this serialization dominates the per-block write cost, and each
         // transaction serializes independently. The result is byte-identical to
         // inserting the transactions directly, because `RawBytes` is stored
         // verbatim. The serialized bytes are inserted in height/index order below.
-        let raw_transactions: Vec<RawBytes> = if store_raw_transactions {
+        //
+        // Only fan out to rayon once the block has enough transactions to amortize
+        // the fork-join cost; small blocks serialize sequentially (see
+        // PARALLEL_BLOCK_TX_THRESHOLD).
+        let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
+            Vec::new()
+        } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
             use rayon::prelude::*;
             block
                 .transactions
@@ -1130,7 +1136,11 @@ impl DiskWriteBatch {
                 .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
                 .collect()
         } else {
-            Vec::new()
+            block
+                .transactions
+                .iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
         };
 
         for (transaction_index, transaction_hash) in transaction_hashes.iter().enumerate() {
