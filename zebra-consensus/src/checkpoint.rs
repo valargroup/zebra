@@ -33,7 +33,7 @@ use zebra_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
-        Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
+        Network, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
 };
@@ -598,30 +598,73 @@ where
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
+        // Cheap proof-of-work checks run *before* the expensive precomputation,
+        // so a flood of invalid-PoW blocks can't make us do per-transaction work.
+        self.check_proof_of_work(&block.header, height, hash)?;
+
+        // Precompute the per-transaction hashes and auth data root, which scale
+        // with block weight. (The precomputed path does this concurrently in the
+        // caller and skips it here.)
+        let block = CheckpointVerifiedBlock::with_hash(block, hash);
+
+        self.finish_validation(block)
+    }
+
+    /// Check a [`CheckpointVerifiedBlock`] whose precomputation (txids, auth data
+    /// root) was already done by the caller, off the single-threaded verifier.
+    ///
+    /// Runs the same validity checks as [`Self::check_block`] (height, proof of
+    /// work, Merkle root) against the precomputed block.
+    fn validate_precomputed_block(
+        &self,
+        block: CheckpointVerifiedBlock,
+    ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
+        let hash = block.hash;
+        let height = block.height;
+        self.check_height(height)?;
+        self.check_proof_of_work(&block.block.header, height, hash)?;
+        self.finish_validation(block)
+    }
+
+    /// Check the block's proof of work (difficulty, and equihash unless disabled).
+    fn check_proof_of_work(
+        &self,
+        header: &block::Header,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Result<(), VerifyCheckpointError> {
         if self.network.disable_pow() {
             crate::block::check::difficulty_threshold_is_valid(
-                &block.header,
+                header,
                 &self.network,
                 &height,
                 &hash,
             )?;
         } else {
-            crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
-            crate::block::check::equihash_solution_is_valid(&block.header)?;
+            crate::block::check::difficulty_is_valid(header, &self.network, &height, &hash)?;
+            crate::block::check::equihash_solution_is_valid(header)?;
         }
+
+        Ok(())
+    }
+
+    /// Finish validating a (precomputed) checkpoint block: set its deferred pool
+    /// balance change and check its Merkle root.
+    fn finish_validation(
+        &self,
+        mut block: CheckpointVerifiedBlock,
+    ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
+        let height = block.height;
 
         // See [ZIP-1015](https://zips.z.cash/zip-1015).
         let expected_deferred_amount =
             funding_stream_values(height, &self.network, block_subsidy(height, &self.network)?)?
                 .remove(&FundingStreamReceiver::Deferred);
 
-        let deferred_pool_balance_change = expected_deferred_amount
+        block.deferred_pool_balance_change = expected_deferred_amount
             .unwrap_or_default()
             .checked_sub(self.network.lockbox_disbursement_total_amount(height))
             .map(DeferredPoolBalanceChange::new);
-
-        // don't do precalculation until the block passes basic difficulty checks
-        let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
 
         crate::block::check::merkle_root_validity(
             &self.network,
@@ -644,11 +687,31 @@ where
     /// returns an error immediately.
     #[allow(clippy::unwrap_in_result)]
     fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
+        let block = self.check_block(block)?;
+        self.enqueue(block)
+    }
+
+    /// Like [`Self::queue_block`], but for a block whose precomputation was
+    /// already done by the caller (off the single-threaded verifier).
+    #[allow(clippy::unwrap_in_result)]
+    fn queue_precomputed_block(
+        &mut self,
+        block: CheckpointVerifiedBlock,
+    ) -> Result<RequestBlock, VerifyCheckpointError> {
+        let block = self.validate_precomputed_block(block)?;
+        self.enqueue(block)
+    }
+
+    /// Add an already-validated checkpoint block to the queue of blocks waiting
+    /// to be verified against a checkpoint.
+    #[allow(clippy::unwrap_in_result)]
+    fn enqueue(
+        &mut self,
+        block: CheckpointVerifiedBlock,
+    ) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
-        // Check that the height and Merkle roots are valid.
-        let block = self.check_block(block)?;
         let height = block.height;
         let hash = block.hash;
 
@@ -702,6 +765,134 @@ where
         self.queued_block_diagnostics(height, hash);
 
         Ok(req_block)
+    }
+
+    /// Verify a checkpoint block whose precomputation (per-transaction txids and
+    /// auth data root) was already done concurrently by the caller, off this
+    /// single-threaded verifier. The verifier still performs all validity checks.
+    ///
+    /// This is the fast path used by the syncer: only the cheap checks and the
+    /// queue/commit bookkeeping run here, while the expensive precomputation has
+    /// already happened across many concurrent download tasks.
+    pub(crate) fn call_precomputed(
+        &mut self,
+        block: CheckpointVerifiedBlock,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        // Reset the verifier back to the state tip if requested
+        // (e.g. due to an error when committing a block to the state)
+        if let Ok(tip) = self.reset_receiver.try_recv() {
+            self.reset_progress(tip);
+        }
+
+        // Immediately reject all incoming blocks that arrive after we've finished.
+        if let FinalCheckpoint = self.previous_checkpoint_height() {
+            return async { Err(VerifyCheckpointError::Finished) }.boxed();
+        }
+
+        let req_block = match self.queue_precomputed_block(block) {
+            Ok(req_block) => req_block,
+            Err(e) => return async { Err(e) }.boxed(),
+        };
+
+        self.verify_and_commit(req_block)
+    }
+
+    /// Process a queued checkpoint block: advance checkpoint-range verification
+    /// and spawn the task that commits the block to the state once its range is
+    /// verified. Shared by the [`Service`] and precomputed entry points.
+    fn verify_and_commit(
+        &mut self,
+        req_block: RequestBlock,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        self.process_checkpoint_range();
+
+        metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
+
+        // Because the checkpoint verifier duplicates state from the state
+        // service (it tracks which checkpoints have been verified), we must
+        // commit blocks transactionally on a per-checkpoint basis. Otherwise,
+        // the checkpoint verifier's state could desync from the underlying
+        // state service. Among other problems, this could cause the checkpoint
+        // verifier to reject blocks not already in the state as
+        // already-verified.
+        //
+        // # Dropped Receivers
+        //
+        // To commit blocks transactionally on a per-checkpoint basis, we must
+        // commit all verified blocks in a checkpoint range, regardless of
+        // whether or not the response futures for each block were dropped.
+        //
+        // We accomplish this by spawning a new task containing the
+        // commit-if-verified logic. This task will always execute, except if
+        // the program is interrupted, in which case there is no longer a
+        // checkpoint verifier to keep in sync with the state.
+        //
+        // # State Commit Failures
+        //
+        // If the state commit fails due to corrupt block data,
+        // we don't reject the entire checkpoint.
+        // Instead, we reset the verifier to the successfully committed state tip.
+        let state_service = self.state_service.clone();
+        let commit_checkpoint_verified = tokio::spawn(async move {
+            let hash = req_block
+                .rx
+                .await
+                .map_err(Into::into)
+                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                .expect("CheckpointVerifier does not leave dangling receivers")?;
+
+            // We use a `ServiceExt::oneshot`, so that every state service
+            // `poll_ready` has a corresponding `call`. See #1593.
+            match state_service
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                .await?
+            {
+                zs::Response::Committed(committed_hash) => {
+                    assert_eq!(committed_hash, hash, "state must commit correct hash");
+                    Ok(hash)
+                }
+                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
+            }
+        });
+
+        let state_service = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
+        async move {
+            let result = commit_checkpoint_verified.await;
+            // Avoid a panic on shutdown
+            //
+            // When `zebrad` is terminated using Ctrl-C, the `commit_checkpoint_verified` task
+            // can return a `JoinError::Cancelled`. We expect task cancellation on shutdown,
+            // so we don't need to panic here. The persistent state is correct even when the
+            // task is cancelled, because block data is committed inside transactions, in
+            // height order.
+            let result = if zebra_chain::shutdown::is_shutting_down() {
+                Err(VerifyCheckpointError::ShuttingDown)
+            } else {
+                result.expect("commit_checkpoint_verified should not panic")
+            };
+            if result.is_err() {
+                // If there was an error committing the block, then this verifier
+                // will be out of sync with the state. In that case, reset
+                // its progress back to the state tip.
+                let tip = match state_service
+                    .oneshot(zs::Request::Tip)
+                    .await
+                    .map_err(VerifyCheckpointError::Tip)?
+                {
+                    zs::Response::Tip(tip) => tip,
+                    _ => unreachable!("wrong response for Tip"),
+                };
+                // Ignore errors since send() can fail only when the verifier
+                // is being dropped, and then it doesn't matter anymore.
+                let _ = reset_sender.send(tip);
+            }
+            result
+        }
+        .boxed()
     }
 
     /// During checkpoint range processing, process all the blocks at `height`.
@@ -1102,104 +1293,6 @@ where
             Err(e) => return async { Err(e) }.boxed(),
         };
 
-        self.process_checkpoint_range();
-
-        metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
-
-        // Because the checkpoint verifier duplicates state from the state
-        // service (it tracks which checkpoints have been verified), we must
-        // commit blocks transactionally on a per-checkpoint basis. Otherwise,
-        // the checkpoint verifier's state could desync from the underlying
-        // state service. Among other problems, this could cause the checkpoint
-        // verifier to reject blocks not already in the state as
-        // already-verified.
-        //
-        // # Dropped Receivers
-        //
-        // To commit blocks transactionally on a per-checkpoint basis, we must
-        // commit all verified blocks in a checkpoint range, regardless of
-        // whether or not the response futures for each block were dropped.
-        //
-        // We accomplish this by spawning a new task containing the
-        // commit-if-verified logic. This task will always execute, except if
-        // the program is interrupted, in which case there is no longer a
-        // checkpoint verifier to keep in sync with the state.
-        //
-        // # State Commit Failures
-        //
-        // If the state commit fails due to corrupt block data,
-        // we don't reject the entire checkpoint.
-        // Instead, we reset the verifier to the successfully committed state tip.
-        let state_service = self.state_service.clone();
-        let network = self.network.clone();
-        let commit_checkpoint_verified = tokio::spawn(async move {
-            let hash = req_block
-                .rx
-                .await
-                .map_err(Into::into)
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .expect("CheckpointVerifier does not leave dangling receivers")?;
-
-            // Precompute the ZIP-244 authorizing-data commitment root here, off
-            // the single-threaded checkpoint-verifier buffer worker.
-            if NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5 {
-                let block = req_block.block.block.clone();
-                if let Ok(auth_data_root) =
-                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
-                {
-                    req_block.block.auth_data_root = Some(auth_data_root);
-                }
-            }
-
-            // We use a `ServiceExt::oneshot`, so that every state service
-            // `poll_ready` has a corresponding `call`. See #1593.
-            match state_service
-                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
-            {
-                zs::Response::Committed(committed_hash) => {
-                    assert_eq!(committed_hash, hash, "state must commit correct hash");
-                    Ok(hash)
-                }
-                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
-            }
-        });
-
-        let state_service = self.state_service.clone();
-        let reset_sender = self.reset_sender.clone();
-        async move {
-            let result = commit_checkpoint_verified.await;
-            // Avoid a panic on shutdown
-            //
-            // When `zebrad` is terminated using Ctrl-C, the `commit_checkpoint_verified` task
-            // can return a `JoinError::Cancelled`. We expect task cancellation on shutdown,
-            // so we don't need to panic here. The persistent state is correct even when the
-            // task is cancelled, because block data is committed inside transactions, in
-            // height order.
-            let result = if zebra_chain::shutdown::is_shutting_down() {
-                Err(VerifyCheckpointError::ShuttingDown)
-            } else {
-                result.expect("commit_checkpoint_verified should not panic")
-            };
-            if result.is_err() {
-                // If there was an error committing the block, then this verifier
-                // will be out of sync with the state. In that case, reset
-                // its progress back to the state tip.
-                let tip = match state_service
-                    .oneshot(zs::Request::Tip)
-                    .await
-                    .map_err(VerifyCheckpointError::Tip)?
-                {
-                    zs::Response::Tip(tip) => tip,
-                    _ => unreachable!("wrong response for Tip"),
-                };
-                // Ignore errors since send() can fail only when the verifier
-                // is being dropped, and then it doesn't matter anymore.
-                let _ = reset_sender.send(tip);
-            }
-            result
-        }
-        .boxed()
+        self.verify_and_commit(req_block)
     }
 }
