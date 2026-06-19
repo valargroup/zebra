@@ -40,6 +40,27 @@ use crate::{
     CommitSemanticallyVerifiedError,
 };
 
+/// Times `$body` and records its duration to the named histogram when the
+/// `commit-metrics` feature is enabled; otherwise just evaluates `$body` with
+/// zero overhead. Used to profile checkpoint prepare phases.
+macro_rules! timed_prepare_phase {
+    ($name:expr, $body:expr) => {{
+        #[cfg(feature = "commit-metrics")]
+        let _start = std::time::Instant::now();
+        let result = $body;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
+        result
+    }};
+}
+
+/// Minimum transaction count before checkpoint prepare uses Rayon for
+/// per-transaction digest fanout.
+///
+/// Small blocks are faster serially because Rayon scheduling costs dominate the
+/// native ZIP-244 digest work.
+const MIN_PARALLEL_CHECKPOINT_PREPARE_TRANSACTIONS: usize = 16;
+
 /// Identify a spend by a transparent outpoint or revealed nullifier.
 ///
 /// This enum supports [`transparent::OutPoint`], [`sprout::Nullifier`],
@@ -569,14 +590,77 @@ impl CheckpointVerifiedBlock {
     }
 }
 
+fn prepare_block_data(
+    block: &Block,
+) -> (
+    Arc<[transaction::Hash]>,
+    AuthDataRoot,
+    HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) {
+    #[cfg(feature = "commit-metrics")]
+    {
+        let transaction_count = block.transactions.len();
+        let output_count: usize = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.outputs().len())
+            .sum();
+        let v5_transaction_count = block
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.version() == 5)
+            .count();
+
+        if let Some(height) = block.coinbase_height() {
+            metrics::gauge!("zebra.state.prepare.block.height").set(height.0 as f64);
+        }
+        metrics::histogram!("zebra.state.prepare.block_tx_count").record(transaction_count as f64);
+        metrics::histogram!("zebra.state.prepare.block_output_count").record(output_count as f64);
+        metrics::histogram!("zebra.state.prepare.block_v5_tx_count")
+            .record(v5_transaction_count as f64);
+    }
+
+    // Compute each transaction's txid and ZIP-244 auth digest together, for efficiency.
+    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) =
+        timed_prepare_phase!("zebra.state.prepare.txid_auth_digest.duration_seconds", {
+            if block.transactions.len() < MIN_PARALLEL_CHECKPOINT_PREPARE_TRANSACTIONS {
+                block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.txid_and_auth_digest())
+                    .unzip()
+            } else {
+                use rayon::prelude::*;
+                block
+                    .transactions
+                    .par_iter()
+                    .map(|tx| tx.txid_and_auth_digest())
+                    .unzip()
+            }
+        });
+    let transaction_hashes: Arc<[_]> = transaction_hashes.into();
+    let auth_data_root = timed_prepare_phase!(
+        "zebra.state.prepare.auth_data_root.duration_seconds",
+        auth_digests
+            .into_iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect::<AuthDataRoot>()
+    );
+    let new_outputs = timed_prepare_phase!(
+        "zebra.state.prepare.new_ordered_outputs.duration_seconds",
+        transparent::new_ordered_outputs(block, &transaction_hashes)
+    );
+
+    (transaction_hashes, auth_data_root, new_outputs)
+}
+
 impl SemanticallyVerifiedBlock {
     /// Creates [`SemanticallyVerifiedBlock`] from [`Block`] and [`block::Hash`].
     pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let (transaction_hashes, auth_data_root, new_outputs) = prepare_block_data(&block);
 
         Self {
             block,
@@ -611,8 +695,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let (transaction_hashes, auth_data_root, new_outputs) = prepare_block_data(&block);
 
         Self {
             block,
@@ -626,26 +709,6 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
     }
 }
 
-/// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
-fn transaction_hashes_and_auth_data_root(
-    block: &Block,
-) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
-    use rayon::prelude::*;
-
-    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .transactions
-        .par_iter()
-        .map(|transaction| transaction.txid_and_auth_digest())
-        .unzip();
-
-    let auth_data_root = auth_digests
-        .into_iter()
-        .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
-        .collect();
-
-    (transaction_hashes.into(), auth_data_root)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,14 +716,14 @@ mod tests {
     use zebra_chain::serialization::ZcashDeserializeInto;
 
     #[test]
-    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
+    fn prepare_block_data_matches_separate_computation() {
         let _init_guard = zebra_test::init();
 
         let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
             .zcash_deserialize_into::<Block>()
             .expect("NU5 mainnet block deserializes");
 
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
+        let (transaction_hashes, auth_data_root, new_outputs) = prepare_block_data(&block);
         let expected_transaction_hashes: Vec<_> = block
             .transactions
             .iter()
@@ -669,6 +732,10 @@ mod tests {
 
         assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
         assert_eq!(auth_data_root, block.auth_data_root());
+        assert_eq!(
+            new_outputs,
+            transparent::new_ordered_outputs(&block, &transaction_hashes),
+        );
     }
 }
 
