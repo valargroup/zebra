@@ -234,6 +234,24 @@ where
         self.transfers.outputs()
     }
 
+    /// Returns true if every value commitment and ephemeral public key in this
+    /// bundle is a canonical, non-small-order Jubjub point.
+    ///
+    /// Deserialization stores these points as raw bytes and defers the
+    /// not-small-order check to keep point decompression off the checkpoint-sync
+    /// hot path. This method performs that deferred check; the semantic verifier
+    /// calls it for untrusted transactions, while the checkpoint verifier (which
+    /// trusts block hashes) does not. Spend `rk` is validated separately at
+    /// deserialization.
+    pub fn point_encodings_are_valid(&self) -> bool {
+        self.spends()
+            .all(|spend| spend.cv.is_valid_not_small_order())
+            && self.outputs().all(|output| {
+                output.cv.is_valid_not_small_order()
+                    && output.ephemeral_key.is_valid_not_small_order()
+            })
+    }
+
     /// Provide the shared anchor for this transaction, if present.
     ///
     /// The shared anchor is only present if:
@@ -279,15 +297,29 @@ where
     /// descriptions of the transaction, and the balancing value.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#saplingbalance>
-    pub fn binding_verification_key(&self) -> redjubjub::VerificationKeyBytes<Binding> {
-        let cv_old: sapling_crypto::value::CommitmentSum =
-            self.spends().map(|spend| spend.cv.0.clone()).sum();
-        let cv_new: sapling_crypto::value::CommitmentSum =
-            self.outputs().map(|output| output.cv.0.clone()).sum();
+    /// Returns `None` if any value commitment is not a canonical, non-small-order
+    /// point. The encodings are validated on the semantic verification path
+    /// (`Transaction::sapling_point_encodings_are_valid`), so a `None` here means
+    /// the caller is working with an unvalidated transaction.
+    pub fn binding_verification_key(&self) -> Option<redjubjub::VerificationKeyBytes<Binding>> {
+        let cv_old: sapling_crypto::value::CommitmentSum = self
+            .spends()
+            .map(|spend| spend.cv.commitment())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        let cv_new: sapling_crypto::value::CommitmentSum = self
+            .outputs()
+            .map(|output| output.cv.commitment())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .sum();
 
-        (cv_old - cv_new)
-            .into_bvk(self.value_balance.zatoshis())
-            .into()
+        Some(
+            (cv_old - cv_new)
+                .into_bvk(self.value_balance.zatoshis())
+                .into(),
+        )
     }
 }
 
