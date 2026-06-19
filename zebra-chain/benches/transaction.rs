@@ -114,9 +114,48 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_transaction_digest(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Transaction Digest");
+
+    let block = Block::zcash_deserialize(Cursor::new(
+        zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ))
+    .expect("valid block");
+    let v5_orchard = block
+        .transactions
+        .iter()
+        .find(|tx| tx.version() == 5)
+        .expect("block has a v5 transaction");
+
+    let block = Block::zcash_deserialize(Cursor::new(
+        zebra_test::vectors::BLOCK_MAINNET_1687121_BYTES.as_slice(),
+    ))
+    .expect("valid block");
+    let v5_later_nu5 = block
+        .transactions
+        .iter()
+        .find(|tx| tx.version() == 5)
+        .expect("block has a v5 transaction");
+
+    let tx_samples = vec![
+        ("V5 orchard 1687107", v5_orchard),
+        ("V5 orchard 1687121", v5_later_nu5),
+    ];
+
+    for (label, tx) in tx_samples {
+        group.bench_with_input(
+            BenchmarkId::new("txid_and_auth_digest", label),
+            tx,
+            |b, tx| b.iter(|| tx.txid_and_auth_digest()),
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().noise_threshold(0.1).sample_size(50);
-    targets = bench_transaction_deserialize
+    targets = bench_transaction_deserialize, bench_transaction_digest
 }
 criterion_main!(benches);
