@@ -44,6 +44,7 @@ use crate::{
         disk_format::{
             block::TransactionLocation,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, RawBytes, PRUNING_METADATA,
@@ -1454,7 +1455,9 @@ impl DiskWriteBatch {
 
         // Serialize the raw transaction bytes up front: on heavy shielded blocks
         // this serialization dominates the per-block write cost, and each
-        // transaction serializes independently.
+        // transaction serializes independently. The result is byte-identical to
+        // inserting the transactions directly, because `RawBytes` is stored
+        // verbatim. The serialized bytes are inserted in height/index order below.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
         // the multi-threading overhead. Small blocks serialize sequentially (see
@@ -1480,7 +1483,8 @@ impl DiskWriteBatch {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
-            // keeps historical transaction data for this height.
+            // keeps historical transaction data for this height (then
+            // `raw_transactions` holds the pre-serialized bytes in order).
             if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
                 self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }

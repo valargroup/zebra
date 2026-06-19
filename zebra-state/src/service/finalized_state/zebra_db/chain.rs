@@ -297,7 +297,10 @@ impl DiskWriteBatch {
         // `Block::zcash_serialized_size` walks the entire block's serialization
         // on a single thread, which is a significant per-block cost on heavy
         // shielded blocks (it re-traverses every transaction).
-        // Sum the independent per-transaction sizes across the rayon pool.
+        // Sum the independent per-transaction sizes. This is byte-count-identical
+        // to serializing the block:
+        // size = header + CompactSize(tx_count) + sum(transaction sizes).
+        //
         // Only fan out to rayon once the block has enough transactions to
         // amortize the multi-threading overhead.
         let block_size = {
