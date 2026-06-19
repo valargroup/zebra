@@ -68,6 +68,18 @@ impl ValueCommitment {
     /// This performs the point decompression that deserialization defers; it is
     /// called by the semantic verifier (not the checkpoint verifier) to enforce
     /// the not-small-order rule on untrusted transactions.
+    ///
+    /// # Consensus equivalence
+    ///
+    /// This MUST accept exactly the encodings that librustzcash accepts for a
+    /// `cv` on the verification path. If it diverged, Zebra and the rest of the
+    /// network would disagree on transaction validity — a chain split, not a
+    /// local bug. `zcash_primitives`'s `read_value_commitment` rejects a `cv`
+    /// unless `sapling_crypto::value::ValueCommitment::from_bytes_not_small_order`
+    /// returns a point, so this calls that exact function. Do not reimplement it
+    /// in terms of a different decoder. The equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates` in
+    /// `transaction/tests/vectors.rs`.
     pub fn is_valid_not_small_order(&self) -> bool {
         bool::from(
             sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).is_some(),

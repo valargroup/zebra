@@ -274,8 +274,21 @@ impl EphemeralPublicKey {
     ///
     /// This performs the point decompression that deserialization defers; it is
     /// called by the semantic verifier (not the checkpoint verifier) to enforce
-    /// the not-small-order rule on untrusted transactions. It matches the check
-    /// that `SaplingVerificationContext::check_output` performs in librustzcash.
+    /// the not-small-order rule on untrusted transactions.
+    ///
+    /// # Consensus equivalence
+    ///
+    /// This MUST accept exactly the encodings that librustzcash accepts for an
+    /// `epk` on the verification path. If it diverged, Zebra and the rest of the
+    /// network would disagree on transaction validity — a chain split, not a
+    /// local bug. librustzcash decodes `epk` with `jubjub::ExtendedPoint::from_bytes`
+    /// (sapling-crypto `verifier/batch.rs`) and rejects it in
+    /// `SaplingVerificationContext::check_output` when `epk.is_small_order()`
+    /// (sapling-crypto `verifier.rs`). Decoding as an `AffinePoint` here is
+    /// equivalent — both reject the same non-canonical/off-curve encodings and
+    /// agree on `is_small_order` — and that equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates` in
+    /// `transaction/tests/vectors.rs`.
     pub fn is_valid_not_small_order(&self) -> bool {
         match jubjub::AffinePoint::from_bytes(self.0).into_option() {
             Some(point) => !bool::from(point.is_small_order()),

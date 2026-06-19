@@ -1547,6 +1547,99 @@ fn sapling_point_encodings_check_rejects_bad_points() {
     );
 }
 
+/// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
+/// same encodings as the librustzcash functions they mirror.
+///
+/// The consensus check was moved off the deserialization path into
+/// `ValueCommitment::is_valid_not_small_order` and
+/// `EphemeralPublicKey::is_valid_not_small_order`. If either ever diverged from
+/// what librustzcash enforces at the FFI boundary, Zebra would accept or reject a
+/// transaction that the rest of the network does not — a chain split, not a local
+/// bug. This pins each Zebra predicate against the exact library predicate, over a
+/// corpus that covers both verdicts:
+///
+/// - `cv`: `zcash_primitives`'s `read_value_commitment` accepts a `cv` iff
+///   `sapling_crypto::value::ValueCommitment::from_bytes_not_small_order` returns
+///   a point.
+/// - `epk`: sapling-crypto decodes `epk` via `jubjub::ExtendedPoint::from_bytes`
+///   (`verifier/batch.rs`) and `check_output` rejects it when
+///   `epk.is_small_order()` (`verifier.rs`). Zebra decodes as an `AffinePoint`, so
+///   this also guards that the two decoders agree across the input space.
+#[test]
+fn sapling_point_checks_match_librustzcash_predicates() {
+    use group::{Group, GroupEncoding};
+
+    use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
+
+    let _init_guard = zebra_test::init();
+
+    // The exact predicate librustzcash applies to a `cv` at read.
+    let librustzcash_cv_valid = |bytes: [u8; 32]| -> bool {
+        bool::from(
+            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes).is_some(),
+        )
+    };
+
+    // The exact predicate librustzcash applies to an `epk`: decode as an
+    // `ExtendedPoint` (as sapling-crypto's batch verifier does), then reject a
+    // small-order point (as `check_output` does).
+    let librustzcash_epk_valid = |bytes: [u8; 32]| -> bool {
+        match jubjub::ExtendedPoint::from_bytes(&bytes).into_option() {
+            Some(point) => !bool::from(point.is_small_order()),
+            None => false,
+        }
+    };
+
+    // A representative spread of encodings: the three consensus-relevant classes
+    // (valid non-small-order, valid small-order, off-curve/non-canonical), a
+    // deterministic byte-pattern sweep that mixes decodable and undecodable
+    // encodings, and many prime-order points `[k]·G` to exercise the accepting
+    // branch heavily.
+    let mut inputs: Vec<[u8; 32]> = vec![
+        jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes(),
+        jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes(),
+        [0xffu8; 32],
+        [0x00u8; 32],
+    ];
+    for b in 0u8..=255 {
+        inputs.push([b; 32]);
+    }
+    let mut acc = jubjub::ExtendedPoint::generator();
+    for _ in 0..64 {
+        inputs.push(jubjub::AffinePoint::from(acc).to_bytes());
+        acc += jubjub::ExtendedPoint::generator();
+    }
+
+    // Guard against a vacuous comparison: the corpus must contain both accepted
+    // and rejected encodings for each predicate, otherwise an all-accept or
+    // all-reject bug could pass the equivalence assertion below.
+    assert!(
+        inputs.iter().any(|&b| librustzcash_cv_valid(b))
+            && inputs.iter().any(|&b| !librustzcash_cv_valid(b)),
+        "cv corpus must contain both accepted and rejected encodings",
+    );
+    assert!(
+        inputs.iter().any(|&b| librustzcash_epk_valid(b))
+            && inputs.iter().any(|&b| !librustzcash_epk_valid(b)),
+        "epk corpus must contain both accepted and rejected encodings",
+    );
+
+    for bytes in inputs {
+        assert_eq!(
+            ValueCommitment(bytes).is_valid_not_small_order(),
+            librustzcash_cv_valid(bytes),
+            "ValueCommitment::is_valid_not_small_order must match librustzcash \
+             read_value_commitment for {bytes:02x?}",
+        );
+        assert_eq!(
+            EphemeralPublicKey(bytes).is_valid_not_small_order(),
+            librustzcash_epk_valid(bytes),
+            "EphemeralPublicKey::is_valid_not_small_order must match librustzcash \
+             check_output for {bytes:02x?}",
+        );
+    }
+}
+
 /// Reproduction for GHSA-rgwx-8r98-p34c:
 /// Coinbase Sapling spend vectors allocate before zero-spend consensus rule.
 ///
