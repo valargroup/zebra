@@ -1457,7 +1457,7 @@ impl DiskWriteBatch {
         // transaction serializes independently.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
-        // the multi-threading overhead. Small blocks serialize sequentially (see
+        // the multithreading overhead. Small blocks serialize sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
             Vec::new()
