@@ -50,8 +50,7 @@ pub(crate) const PARALLEL_BLOCK_TX_THRESHOLD: usize = 16;
 ///
 /// In the transparent-heavy ranges these point lookups are cache-served but
 /// serial, and dominate the per-block write time while most cores sit idle. Above
-/// this count the fan-out pays for its fork-join overhead; below it (most
-/// early/sparse blocks) the sequential path is cheaper.
+/// this count the fan-out pays for the multithreading overhead.
 pub(crate) const PARALLEL_BLOCK_READ_THRESHOLD: usize = 16;
 
 pub mod prune;
