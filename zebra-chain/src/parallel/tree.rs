@@ -58,6 +58,24 @@ impl NoteCommitmentTrees {
         &mut self,
         block: &Arc<Block>,
     ) -> Result<(), NoteCommitmentTreeError> {
+        self.update_trees_parallel_with(block, None)
+    }
+
+    /// Like [`update_trees_parallel`](Self::update_trees_parallel), but applies a
+    /// [`BlockNotePrecompute`] computed ahead of time off the committer when one is
+    /// supplied and still matches the current tree sizes.
+    ///
+    /// The Sapling/Orchard per-leaf Merkle hashing is the dominant cost of
+    /// committing a shielded block; precomputing it concurrently (keyed only on the
+    /// note position) lets the committer do just the cheap graft. A `None` or
+    /// size-mismatched precompute transparently falls back to hashing inline, so the
+    /// result is always identical to the plain update.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn update_trees_parallel_with(
+        &mut self,
+        block: &Arc<Block>,
+        precompute: Option<BlockNotePrecompute>,
+    ) -> Result<(), NoteCommitmentTreeError> {
         let block = block.clone();
         let height = block
             .coinbase_height()
@@ -75,6 +93,11 @@ impl NoteCommitmentTrees {
         let sapling_note_commitments: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_note_commitments: Vec<_> = block.orchard_note_commitments().cloned().collect();
 
+        let (sapling_precompute, orchard_precompute) = match precompute {
+            Some(p) => (p.sapling, p.orchard),
+            None => (None, None),
+        };
+
         let mut sprout_result = None;
         let mut sapling_result = None;
         let mut orchard_result = None;
@@ -91,18 +114,20 @@ impl NoteCommitmentTrees {
 
             if !sapling_note_commitments.is_empty() {
                 scope.spawn_fifo(|_scope| {
-                    sapling_result = Some(Self::update_sapling_note_commitment_tree(
+                    sapling_result = Some(Self::update_sapling_note_commitment_tree_with(
                         sapling,
                         sapling_note_commitments,
+                        sapling_precompute,
                     ));
                 });
             }
 
             if !orchard_note_commitments.is_empty() {
                 scope.spawn_fifo(|_scope| {
-                    orchard_result = Some(Self::update_orchard_note_commitment_tree(
+                    orchard_result = Some(Self::update_orchard_note_commitment_tree_with(
                         orchard,
                         orchard_note_commitments,
+                        orchard_precompute,
                     ));
                 });
             }
@@ -211,5 +236,111 @@ impl NoteCommitmentTrees {
         let _ = orchard_nct.root();
 
         Ok((orchard, subtree_root))
+    }
+
+    /// Like [`update_sapling_note_commitment_tree`](Self::update_sapling_note_commitment_tree),
+    /// but applies `precompute` (off-committer parallel hashing) when present and its
+    /// `start_size` still matches the tree; otherwise hashes inline. Identical result.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn update_sapling_note_commitment_tree_with(
+        mut sapling: Arc<sapling::tree::NoteCommitmentTree>,
+        sapling_note_commitments: Vec<sapling::tree::NoteCommitmentUpdate>,
+        precompute: Option<sapling::tree::PrecomputedAppendBatch>,
+    ) -> Result<
+        (
+            Arc<sapling::tree::NoteCommitmentTree>,
+            Option<(NoteCommitmentSubtreeIndex, sapling_crypto::Node)>,
+        ),
+        NoteCommitmentTreeError,
+    > {
+        let sapling_nct = Arc::make_mut(&mut sapling);
+
+        let subtree_root = match precompute {
+            Some(pre) if pre.start_size() == sapling_nct.count() => {
+                sapling_nct.apply_precomputed_append(pre)?
+            }
+            _ => sapling_nct.append_batch(&sapling_note_commitments)?,
+        };
+
+        // Re-calculate and cache the tree root.
+        let _ = sapling_nct.root();
+
+        Ok((sapling, subtree_root))
+    }
+
+    /// Like [`update_orchard_note_commitment_tree`](Self::update_orchard_note_commitment_tree),
+    /// but applies `precompute` when present and size-matched; otherwise inline. Identical result.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn update_orchard_note_commitment_tree_with(
+        mut orchard: Arc<orchard::tree::NoteCommitmentTree>,
+        orchard_note_commitments: Vec<orchard::tree::NoteCommitmentUpdate>,
+        precompute: Option<orchard::tree::PrecomputedAppendBatch>,
+    ) -> Result<
+        (
+            Arc<orchard::tree::NoteCommitmentTree>,
+            Option<(NoteCommitmentSubtreeIndex, orchard::tree::Node)>,
+        ),
+        NoteCommitmentTreeError,
+    > {
+        let orchard_nct = Arc::make_mut(&mut orchard);
+
+        let subtree_root = match precompute {
+            Some(pre) if pre.start_size() == orchard_nct.count() => {
+                orchard_nct.apply_precomputed_append(pre)?
+            }
+            _ => orchard_nct.append_batch(&orchard_note_commitments)?,
+        };
+
+        // Re-calculate and cache the tree root.
+        let _ = orchard_nct.root();
+
+        Ok((orchard, subtree_root))
+    }
+}
+
+/// The off-committer precomputed parallel-append work for one block's Sapling and
+/// Orchard note commitments, produced by [`BlockNotePrecompute::compute`] and applied
+/// via [`NoteCommitmentTrees::update_trees_parallel_with`].
+#[derive(Clone, Debug, Default)]
+pub struct BlockNotePrecompute {
+    /// Precomputed Sapling append, if the block has Sapling outputs.
+    pub sapling: Option<sapling::tree::PrecomputedAppendBatch>,
+    /// Precomputed Orchard append, if the block has Orchard actions.
+    pub orchard: Option<orchard::tree::PrecomputedAppendBatch>,
+}
+
+impl BlockNotePrecompute {
+    /// Precomputes the Sapling and Orchard per-leaf Merkle hashing for `block`,
+    /// given the tree sizes (cumulative note counts) the block will commit at.
+    ///
+    /// Runs off the committer, concurrently across blocks. The committer then only
+    /// grafts. `sapling_start` / `orchard_start` are the respective tree `count`s
+    /// immediately before this block; the committer re-checks them and falls back to
+    /// inline hashing on any mismatch. Pools with no notes (or a precompute error)
+    /// are left `None`, also falling back to inline.
+    pub fn compute(sapling_start: u64, orchard_start: u64, block: &Block) -> Self {
+        let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
+        let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
+
+        Self {
+            sapling: (!sapling_notes.is_empty())
+                .then(|| {
+                    sapling::tree::NoteCommitmentTree::precompute_append(
+                        sapling_start,
+                        &sapling_notes,
+                    )
+                    .ok()
+                })
+                .flatten(),
+            orchard: (!orchard_notes.is_empty())
+                .then(|| {
+                    orchard::tree::NoteCommitmentTree::precompute_append(
+                        orchard_start,
+                        &orchard_notes,
+                    )
+                    .ok()
+                })
+                .flatten(),
+        }
     }
 }

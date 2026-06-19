@@ -23,11 +23,29 @@ use incrementalmerkletree::frontier::{Frontier, NonEmptyFrontier};
 use thiserror::Error;
 
 use crate::{
+    parallel::batch_frontier::{
+        apply_append_batch_with_subtree, precompute_append_batch_with_subtree,
+        PrecomputedSubtreeAppend,
+    },
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
+
+/// The precomputed parallel-append work for one block's Sapling note commitments,
+/// produced off the committer by [`NoteCommitmentTree::precompute_append`] and
+/// applied with [`NoteCommitmentTree::apply_precomputed_append`].
+#[derive(Clone, Debug)]
+pub struct PrecomputedAppendBatch(PrecomputedSubtreeAppend<sapling_crypto::Node>);
+
+impl PrecomputedAppendBatch {
+    /// The tree size (leaf [`count`](NoteCommitmentTree::count)) this precompute
+    /// must be applied to.
+    pub fn start_size(&self) -> u64 {
+        self.0.start_size()
+    }
+}
 
 pub mod legacy;
 use legacy::LegacyNoteCommitmentTree;
@@ -246,6 +264,57 @@ impl NoteCommitmentTree {
 
         let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
             .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+
+        self.inner = frontier;
+        *self
+            .cached_root
+            .get_mut()
+            .expect("a thread that previously held exclusive lock access panicked") = None;
+
+        Ok(completed.map(|(index_value, root)| {
+            let index = NoteCommitmentSubtreeIndex(
+                index_value.try_into().expect("subtree index fits in u16"),
+            );
+            (index, root)
+        }))
+    }
+
+    /// Precomputes the parallel-append work for `note_commitments` against a tree
+    /// of size `start_size`, off the committer's critical path.
+    ///
+    /// This does the per-leaf Merkle hashing (the dominant cost of committing a
+    /// shielded block) using only the starting leaf *count*, so it can run
+    /// concurrently ahead of the committer. Apply with
+    /// [`Self::apply_precomputed_append`] on a tree whose [`count`](Self::count)
+    /// equals `start_size`. `note_commitments` must be non-empty.
+    pub fn precompute_append(
+        start_size: u64,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<PrecomputedAppendBatch, NoteCommitmentTreeError> {
+        let nodes: Vec<sapling_crypto::Node> = note_commitments
+            .iter()
+            .map(sapling_crypto::Node::from_cmu)
+            .collect();
+
+        let inner = precompute_append_batch_with_subtree::<_, MERKLE_DEPTH>(start_size, &nodes)
+            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+
+        Ok(PrecomputedAppendBatch(inner))
+    }
+
+    /// Applies a [`PrecomputedAppendBatch`] from [`Self::precompute_append`],
+    /// returning any completed [`TRACKED_SUBTREE_HEIGHT`] subtree, exactly like
+    /// [`Self::append_batch`]. `precomputed.start_size()` must equal this tree's
+    /// [`count`](Self::count); callers fall back to [`Self::append_batch`] on mismatch.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn apply_precomputed_append(
+        &mut self,
+        precomputed: PrecomputedAppendBatch,
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, sapling_crypto::Node)>, NoteCommitmentTreeError>
+    {
+        let (frontier, completed) =
+            apply_append_batch_with_subtree(self.inner.clone(), precomputed.0)
+                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
 
         self.inner = frontier;
         *self

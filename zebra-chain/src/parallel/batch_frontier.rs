@@ -366,6 +366,227 @@ where
     }
 }
 
+// --- Off-committer precompute / graft split ---------------------------------
+//
+// [`parallel_append`] does two things: it hashes the new leaves into complete
+// subtree roots (the dominant cost on heavy shielded blocks), and it merges
+// those roots onto the existing frontier. The hashing depends only on the
+// starting leaf *position*, not on the frontier's hashes, so it can run ahead of
+// the committer, concurrently across many blocks. [`precompute_subtree_roots`]
+// does that hashing; [`graft`] does the cheap merge on the committer. Their
+// composition is byte-identical to [`parallel_append`] (differential proptests).
+
+/// The position-independent result of appending a run of `num_leaves` leaves
+/// starting at tree size [`start_position`](Self::start_position): the
+/// parallel-hashed complete subtree roots, plus the last (raw tip) leaf.
+#[derive(Clone, Debug)]
+pub struct PrecomputedAppend<H> {
+    /// Tree size (next leaf position) this was hashed against. [`graft`] must be
+    /// applied to a frontier of exactly this size.
+    start_position: u64,
+    /// Number of leaves in the run (>= 1).
+    num_leaves: usize,
+    /// `(level, root)` for each complete subtree chunk of the first
+    /// `num_leaves - 1` leaves, in ascending position order.
+    chunk_roots: Vec<(usize, H)>,
+    /// The last leaf, which becomes the grafted frontier's raw tip.
+    tip_leaf: H,
+}
+
+impl<H> PrecomputedAppend<H> {
+    /// The tree size this precompute assumes — the frontier size [`graft`] must
+    /// be applied to.
+    pub fn start_position(&self) -> u64 {
+        self.start_position
+    }
+}
+
+/// Hashes the complete subtree roots for appending `new_leaves` to a tree of size
+/// `start_position`, in parallel. The expensive, position-independent half of
+/// [`parallel_append`]; pair with [`graft`]. `new_leaves` must be non-empty.
+pub fn precompute_subtree_roots<H>(start_position: u64, new_leaves: &[H]) -> PrecomputedAppend<H>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    assert!(
+        !new_leaves.is_empty(),
+        "precompute_subtree_roots requires at least one leaf"
+    );
+
+    let num_leaves = new_leaves.len();
+    let leaves_to_merge = &new_leaves[..num_leaves - 1];
+    let tip_leaf = new_leaves[num_leaves - 1].clone();
+
+    let chunks = complete_subtree_chunks(start_position, leaves_to_merge);
+    let chunk_roots: Vec<(usize, H)> = chunks
+        .into_par_iter()
+        .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
+        .collect();
+
+    PrecomputedAppend {
+        start_position,
+        num_leaves,
+        chunk_roots,
+        tip_leaf,
+    }
+}
+
+/// Merges a [`PrecomputedAppend`] onto `frontier`, returning the updated frontier.
+/// The cheap, committer-side half of [`parallel_append`] (O(log N) merges). The
+/// frontier's size MUST equal `precomputed.start_position()`; callers compare and
+/// recompute via [`parallel_append`] on mismatch, so the equality is asserted.
+pub fn graft<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    precomputed: PrecomputedAppend<H>,
+) -> Result<Frontier<H, DEPTH>, FrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    let (mut complete_subtree_roots, next_leaf_position) =
+        frontier_complete_subtree_roots(&frontier);
+
+    assert_eq!(
+        next_leaf_position, precomputed.start_position,
+        "graft applied to a frontier of the wrong size (tree {next_leaf_position}, precompute {})",
+        precomputed.start_position
+    );
+
+    for (level, root) in precomputed.chunk_roots {
+        merge_complete_subtree(&mut complete_subtree_roots, level, root);
+    }
+
+    let new_tip_position = next_leaf_position + (precomputed.num_leaves as u64 - 1);
+    let complete_subtree_roots = complete_subtree_roots.into_iter().flatten().collect();
+
+    Frontier::from_parts(
+        Position::from(new_tip_position),
+        precomputed.tip_leaf,
+        complete_subtree_roots,
+    )
+}
+
+/// The precomputed form of [`append_batch_with_subtree`]: the parallel hashing for
+/// one block's nodes, split at the tracked-subtree boundary if it crosses one.
+/// Produced by [`precompute_append_batch_with_subtree`] off the committer and
+/// applied with [`apply_append_batch_with_subtree`].
+#[derive(Clone, Debug)]
+pub struct PrecomputedSubtreeAppend<H> {
+    /// Tree size this was hashed against; the frontier it is applied to must match.
+    start_size: u64,
+    inner: PrecomputedSubtreeKind<H>,
+}
+
+#[derive(Clone, Debug)]
+enum PrecomputedSubtreeKind<H> {
+    /// The batch fits within one tracked-subtree window.
+    Single(PrecomputedAppend<H>),
+    /// The batch crosses one tracked-subtree boundary, completing the subtree at
+    /// `index_value`. `head` ends the subtree; `tail` continues after it (`None`
+    /// if the batch ends exactly on the boundary).
+    Boundary {
+        head: PrecomputedAppend<H>,
+        tail: Option<PrecomputedAppend<H>>,
+        index_value: u64,
+    },
+}
+
+impl<H> PrecomputedSubtreeAppend<H> {
+    /// The tree size this precompute assumes — the frontier `tree_size` it must
+    /// be applied to.
+    pub fn start_size(&self) -> u64 {
+        self.start_size
+    }
+}
+
+/// Precomputes the parallel hashing for appending `nodes` to a tree of size
+/// `start_size`, off the committer. Mirrors [`append_batch_with_subtree`]'s
+/// boundary handling. `nodes` must be non-empty.
+pub fn precompute_append_batch_with_subtree<H, const DEPTH: u8>(
+    start_size: u64,
+    nodes: &[H],
+) -> Result<PrecomputedSubtreeAppend<H>, BatchFrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    use crate::subtree::TRACKED_SUBTREE_HEIGHT;
+
+    assert!(
+        !nodes.is_empty(),
+        "precompute_append_batch_with_subtree requires at least one node"
+    );
+
+    let new_size = start_size + nodes.len() as u64;
+    if new_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
+        return Err(FrontierError::MaxDepthExceeded {
+            depth: DEPTH.saturating_add(1),
+        }
+        .into());
+    }
+
+    let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+    let boundary = (start_size / subtree_size)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(subtree_size));
+    if boundary
+        .and_then(|b| b.checked_add(subtree_size))
+        .is_some_and(|second_boundary| second_boundary <= new_size)
+    {
+        return Err(BatchFrontierError::BatchSpansMultipleSubtrees);
+    }
+
+    let inner = if boundary.is_some_and(|b| b <= new_size) {
+        let boundary = boundary.expect("checked above");
+        let head_len = (boundary - start_size) as usize;
+        let (head, tail) = nodes.split_at(head_len);
+        let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
+        PrecomputedSubtreeKind::Boundary {
+            head: precompute_subtree_roots(start_size, head),
+            tail: (!tail.is_empty()).then(|| precompute_subtree_roots(boundary, tail)),
+            index_value,
+        }
+    } else {
+        PrecomputedSubtreeKind::Single(precompute_subtree_roots(start_size, nodes))
+    };
+
+    Ok(PrecomputedSubtreeAppend { start_size, inner })
+}
+
+/// Applies a [`PrecomputedSubtreeAppend`] onto `frontier`, returning the completed
+/// tracked subtree's `(index_value, root)` if the batch crossed a boundary. The
+/// counterpart to [`precompute_append_batch_with_subtree`]; byte-identical to
+/// [`append_batch_with_subtree`].
+pub fn apply_append_batch_with_subtree<H, const DEPTH: u8>(
+    frontier: Frontier<H, DEPTH>,
+    precomputed: PrecomputedSubtreeAppend<H>,
+) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), BatchFrontierError>
+where
+    H: Hashable + Clone + Send + Sync,
+{
+    use crate::subtree::TRACKED_SUBTREE_HEIGHT;
+
+    match precomputed.inner {
+        PrecomputedSubtreeKind::Single(pre) => Ok((graft(frontier, pre)?, None)),
+        PrecomputedSubtreeKind::Boundary {
+            head,
+            tail,
+            index_value,
+        } => {
+            let f1 = graft(frontier, head)?;
+            // The boundary subtree root needs the grafted head, so it is computed
+            // here on the committer (rare: once per 2^16 leaves).
+            let root = f1
+                .value()
+                .expect("just appended at least one leaf")
+                .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
+            let f2 = match tail {
+                Some(tail) => graft(f1, tail)?,
+                None => f1,
+            };
+            Ok((f2, Some((index_value, root))))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +779,65 @@ mod tests {
                 par.value().map(|f| f.clone().into_parts()),
                 "frontier parts mismatch"
             );
+        }
+
+        /// The off-committer split: precompute the subtree roots keyed only on the
+        /// starting leaf *count* (no frontier hashes), then graft onto the real
+        /// frontier. Must be byte-identical to the sequential append, proving the
+        /// precompute can run ahead of the committer using just the note position.
+        #[test]
+        fn precompute_then_graft_matches_sequential(
+            prefix_len in 0usize..300,
+            batch in proptest::collection::vec(any::<u64>().prop_map(TestNode), 1..300),
+        ) {
+            let prefix: Vec<TestNode> = (0..prefix_len as u64).map(TestNode).collect();
+            let start = build_frontier::<DEPTH>(&prefix);
+
+            // Precompute is given only the count (prefix_len), not `start`.
+            let precomputed = precompute_subtree_roots(prefix_len as u64, &batch);
+            prop_assert_eq!(precomputed.start_position(), prefix_len as u64);
+
+            let seq = sequential_append::<DEPTH>(start.clone(), &batch);
+            let grafted = graft(start, precomputed).expect("no overflow in tests");
+
+            prop_assert_eq!(seq.root(), grafted.root(), "root mismatch");
+            prop_assert_eq!(
+                seq.value().map(|f| f.clone().into_parts()),
+                grafted.value().map(|f| f.clone().into_parts()),
+                "frontier parts mismatch"
+            );
+        }
+
+        /// The precomputed batch-with-subtree path (off-committer precompute + graft)
+        /// must produce the same frontier AND the same completed-subtree result as
+        /// the inline `append_batch_with_subtree`, across the tracked-subtree boundary.
+        #[test]
+        fn precompute_subtree_matches_append_batch_with_subtree(
+            prefix_len in 0u64..300,
+            batch_len in 1usize..300,
+        ) {
+            // Exercise the boundary by starting just below it, so some batches cross it.
+            use crate::subtree::TRACKED_SUBTREE_HEIGHT;
+            let boundary = 1u64 << TRACKED_SUBTREE_HEIGHT;
+            let start_size = boundary - 1 - prefix_len.min(boundary - 1);
+            let prefix: Vec<TestNode> = (0..start_size).map(TestNode).collect();
+            let start = build_frontier::<DEPTH>(&prefix);
+            let batch: Vec<TestNode> = (1000..1000 + batch_len as u64).map(TestNode).collect();
+
+            let (inline_frontier, inline_completed) =
+                append_batch_with_subtree::<_, DEPTH>(start.clone(), batch.clone())
+                    .expect("no overflow in tests");
+
+            let precomputed =
+                precompute_append_batch_with_subtree::<_, DEPTH>(start_size, &batch)
+                    .expect("no overflow in tests");
+            prop_assert_eq!(precomputed.start_size(), start_size);
+            let (pre_frontier, pre_completed) =
+                apply_append_batch_with_subtree(start, precomputed)
+                    .expect("no overflow in tests");
+
+            prop_assert_eq!(inline_frontier.root(), pre_frontier.root(), "root mismatch");
+            prop_assert_eq!(inline_completed, pre_completed, "completed subtree mismatch");
         }
     }
 

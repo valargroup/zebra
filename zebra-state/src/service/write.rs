@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -16,12 +16,14 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::block::{self, Height};
 
+use zebra_chain::parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees};
+
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZebraDb},
+        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -35,6 +37,14 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
+
+/// Whether the finalized committer precomputes the next block's note-commitment
+/// tree hashing ahead of time (the look-ahead pipeline). On by default; set the
+/// `NOTE_PRECOMPUTE_DISABLE` env var to force the inline path, for benchmarking the
+/// pipeline against the baseline on a single binary. The name omits the `ZEBRA_`
+/// prefix so Zebra's config loader ignores it.
+static NOTE_PRECOMPUTE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("NOTE_PRECOMPUTE_DISABLE").is_none());
 
 /// The maximum size of the parent error map.
 ///
@@ -317,8 +327,20 @@ impl WriteBlockWorkerTask {
             backup_dir_path,
         } = &mut self;
 
-        let mut prev_finalized_note_commitment_trees = None;
+        let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
         let mut deferred_non_finalized_messages = VecDeque::new();
+
+        // One-block look-ahead so the next block's note-commitment tree hashing can
+        // be precomputed off the committer (on idle cores) while the current block
+        // commits. `pending_precompute` holds the receiver for the block started last
+        // iteration; `finalized_lookahead` buffers the peeked next block. The
+        // precompute is keyed on the running tree sizes and only applied if those
+        // still match at commit time, so this never affects correctness, only speed.
+        let mut pending_precompute: Option<(
+            block::Hash,
+            crossbeam_channel::Receiver<BlockNotePrecompute>,
+        )> = None;
+        let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -338,13 +360,16 @@ impl WriteBlockWorkerTask {
                 Err(TryRecvError::Disconnected) => {}
             }
 
-            let ordered_block = match finalized_block_write_receiver.try_recv() {
-                Ok(block) => block,
-                Err(TryRecvError::Empty) => {
-                    std::thread::park_timeout(Duration::from_millis(10));
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => break,
+            let ordered_block = match finalized_lookahead.pop_front() {
+                Some(block) => block,
+                None => match finalized_block_write_receiver.try_recv() {
+                    Ok(block) => block,
+                    Err(TryRecvError::Empty) => {
+                        std::thread::park_timeout(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                },
             };
 
             // TODO: split these checks into separate functions
@@ -375,15 +400,51 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
+                // The pipeline is broken; drop any look-ahead so the next precompute
+                // re-seeds from the real tip (a stale precompute just falls back).
+                pending_precompute = None;
+                finalized_lookahead.clear();
+
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
                 std::mem::drop(ordered_block);
                 continue;
             }
 
+            // Use the precompute for this block if we started it last iteration and
+            // it is for this exact block; otherwise the committer hashes inline.
+            let note_precompute = match pending_precompute.take() {
+                Some((hash, rx)) if hash == ordered_block.0.hash => rx.recv().ok(),
+                _ => None,
+            };
+
+            // Peek the next block and start its precompute, so the heavy hashing
+            // overlaps this block's commit. Its start sizes are the current tree
+            // sizes plus this block's note counts (the sizes after this block).
+            if *NOTE_PRECOMPUTE_ENABLED && finalized_lookahead.is_empty() {
+                if let Ok(next) = finalized_block_write_receiver.try_recv() {
+                    finalized_lookahead.push_back(next);
+                }
+            }
+            if let (true, Some(trees), Some(next)) = (
+                *NOTE_PRECOMPUTE_ENABLED,
+                prev_finalized_note_commitment_trees.as_ref(),
+                finalized_lookahead.front(),
+            ) {
+                let block = &ordered_block.0.block;
+                let sapling_start =
+                    trees.sapling.count() + block.sapling_note_commitments().count() as u64;
+                let orchard_start =
+                    trees.orchard.count() + block.orchard_note_commitments().count() as u64;
+                let rx = spawn_note_precompute(sapling_start, orchard_start, next.0.block.clone());
+                pending_precompute = Some((next.0.hash, rx));
+            }
+
             // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
-            {
+            match finalized_state.commit_finalized(
+                ordered_block,
+                prev_finalized_note_commitment_trees.take(),
+                note_precompute,
+            ) {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
@@ -391,6 +452,12 @@ impl WriteBlockWorkerTask {
                 }
                 Err(error) => {
                     let finalized_tip = finalized_state.db.tip();
+
+                    // The commit failed and the queue is being reset, so any
+                    // look-ahead precompute is stale: drop it (it would only fall
+                    // back to inline hashing anyway).
+                    pending_precompute = None;
+                    finalized_lookahead.clear();
 
                     // The last block in the queue failed, so we can't commit the next block.
                     // Instead, we need to reset the state queue,
@@ -554,7 +621,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
