@@ -197,8 +197,10 @@ scrape_height() {
       [[ -n "$v" && "$v" -gt 0 ]] && { echo "$v"; return; }
     done
   fi
-  v="$(grep -aoiE '(finaliz|committed|checkpoint)[a-z_ ]*[Hh]eight[^0-9]*([0-9]{6,})' "$logf" 2>/dev/null \
-        | grep -oE '[0-9]{6,}' | sort -n | tail -1)" || true
+  # the sync progress logger prints the real synced height as current_height=Height(N);
+  # match that specifically (NOT after_checkpoint_height / network-tip lines)
+  v="$(grep -aoE 'current_height=Height\(([0-9]+)\)' "$logf" 2>/dev/null \
+        | grep -oE '[0-9]+' | sort -n | tail -1)" || true
   [[ -n "$v" ]] && echo "$v"
 }
 
@@ -269,18 +271,19 @@ run_one() {
   fi
 
   echo "epoch,elapsed,height" > "$csv"
-  local t_escape="" end_height="$START_HEIGHT" h now elapsed
+  local t_escape="" end_height="$START_HEIGHT" h now elapsed clean_stop=0
   while :; do
     now=$(date +%s); elapsed=$((now - t0))
     h="$(scrape_height "$logf")" || true
-    if [[ -n "$h" ]]; then
+    # only trust sane readings: between the snapshot tip and just past the stop height
+    if [[ -n "$h" ]] && (( h >= START_HEIGHT && h <= STOP_HEIGHT + 200 )); then
       echo "$now,$elapsed,$h" >> "$csv"
       end_height="$h"
       [[ -z "$t_escape" && "$h" -gt "$START_HEIGHT" ]] && { t_escape=$now; log "escaped cold-start at +${elapsed}s, height $h"; }
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid" 2>/dev/null || true
-      log "zebrad exited (clean stop) at +${elapsed}s, height ${end_height}"
+      clean_stop=1
       break
     fi
     if (( elapsed >= WALL_CAP )); then
@@ -292,9 +295,15 @@ run_one() {
   done
   local t_end; t_end=$(date +%s)
 
-  # final authoritative height (log scan catches the very last commit)
-  h="$(scrape_height "$logf")" || true
-  [[ -n "$h" && "$h" -gt "$end_height" ]] && end_height="$h"
+  # a clean exit means zebrad committed through debug_stop_at_height; otherwise the
+  # last sane in-loop sample stands (wall-capped). The metrics endpoint is gone after
+  # exit, so do NOT re-scrape here (it would fall back to log parsing).
+  if (( clean_stop )); then
+    end_height="$STOP_HEIGHT"
+    log "zebrad exited cleanly at stop height $STOP_HEIGHT (+$((t_end - t0))s)"
+  else
+    log "wall-capped at height $end_height (+$((t_end - t0))s)"
+  fi
 
   # quick error scan (ignore peer/network noise)
   local errs
