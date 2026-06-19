@@ -300,14 +300,24 @@ impl DiskWriteBatch {
         // Sum the independent per-transaction sizes across the rayon
         // pool. This is byte-count-identical to serializing the block:
         // size = header + CompactSize(tx_count) + sum(transaction sizes).
+        // Only fan out to rayon once the block has enough transactions to
+        // amortize the fork-join cost; small blocks sum sequentially (see
+        // PARALLEL_BLOCK_TX_THRESHOLD).
         let block_size = {
-            use rayon::prelude::*;
-
             let transactions = &finalized.block.transactions;
-            let transactions_size: usize = transactions
-                .par_iter()
-                .map(|transaction| transaction.zcash_serialized_size())
-                .sum();
+            let transactions_size: usize =
+                if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+                    use rayon::prelude::*;
+                    transactions
+                        .par_iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum()
+                } else {
+                    transactions
+                        .iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum()
+                };
             let tx_count_size = CompactSizeMessage::try_from(transactions.len())
                 .expect("block must have a valid transaction count")
                 .zcash_serialized_size();
