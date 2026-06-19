@@ -830,34 +830,47 @@ impl ZebraDb {
             })
             .collect();
 
-        // Get a list of the spent UTXOs, before we delete any from the database
-        let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
-            finalized
-                .block
-                .transactions
-                .iter()
-                .flat_map(|tx| tx.inputs().iter())
-                .flat_map(|input| input.outpoint())
-                .map(|outpoint| {
-                    (
-                        outpoint,
-                        // Some utxos are spent in the same block, so they will be in
-                        // `tx_hash_indexes` and `new_outputs`
-                        self.output_location(&outpoint).unwrap_or_else(|| {
-                            lookup_out_loc(finalized.height, &outpoint, &tx_hash_indexes)
-                        }),
-                        self.utxo(&outpoint)
-                            .map(|ordered_utxo| ordered_utxo.utxo)
-                            .or_else(|| {
-                                finalized
-                                    .new_outputs
-                                    .get(&outpoint)
-                                    .map(|ordered_utxo| ordered_utxo.utxo.clone())
-                            })
-                            .expect("already checked UTXO was in state or block"),
-                    )
+        // Get a list of the spent UTXOs, before we delete any from the database.
+        //
+        // Each input triggers cache-served but serial RocksDB point lookups, which
+        // dominate the per-block write time in the transparent-heavy ranges. Read
+        // the output location once and reuse it for the UTXO fetch (instead of
+        // letting `utxo()` re-derive it), and fan the reads across the rayon pool
+        // once a block has enough inputs to amortize the fork-join cost.
+        let read_spent = |outpoint: transparent::OutPoint| {
+            // Some utxos are spent in the same block, so they will be in
+            // `tx_hash_indexes` and `new_outputs` rather than the database.
+            let db_out_loc = self.output_location(&outpoint);
+            let out_loc = db_out_loc
+                .unwrap_or_else(|| lookup_out_loc(finalized.height, &outpoint, &tx_hash_indexes));
+            let utxo = db_out_loc
+                .and_then(|loc| self.utxo_by_location(loc))
+                .map(|ordered_utxo| ordered_utxo.utxo)
+                .or_else(|| {
+                    finalized
+                        .new_outputs
+                        .get(&outpoint)
+                        .map(|ordered_utxo| ordered_utxo.utxo.clone())
                 })
-                .collect();
+                .expect("already checked UTXO was in state or block");
+            (outpoint, out_loc, utxo)
+        };
+
+        let outpoints: Vec<transparent::OutPoint> = finalized
+            .block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.inputs().iter())
+            .flat_map(|input| input.outpoint())
+            .collect();
+
+        let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
+            if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                use rayon::prelude::*;
+                outpoints.into_par_iter().map(read_spent).collect()
+            } else {
+                outpoints.into_iter().map(read_spent).collect()
+            };
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -891,14 +904,27 @@ impl ZebraDb {
 
         // Get the current address balances, before the transactions in this block
 
-        fn read_addr_locs<T, F: Fn(&transparent::Address) -> Option<T>>(
+        // Like the spent-UTXO reads above, the per-address balance lookups are
+        // cache-served but serial. Fan them across the rayon pool once a block
+        // touches enough addresses to amortize the fork-join cost.
+        fn read_addr_locs<T: Send, F: Fn(&transparent::Address) -> Option<T> + Sync>(
             changed_addresses: HashSet<transparent::Address>,
             f: F,
         ) -> HashMap<transparent::Address, T> {
-            changed_addresses
-                .into_iter()
-                .filter_map(|address| Some((address, f(&address)?)))
-                .collect()
+            if changed_addresses.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                use rayon::prelude::*;
+                changed_addresses
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .filter_map(|address| Some((address, f(&address)?)))
+                    .collect()
+            } else {
+                changed_addresses
+                    .into_iter()
+                    .filter_map(|address| Some((address, f(&address)?)))
+                    .collect()
+            }
         }
 
         // # Performance
