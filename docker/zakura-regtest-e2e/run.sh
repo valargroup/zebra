@@ -133,6 +133,15 @@ PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-${DEFAULT_PROPAGATE_TIMEOUT}}"
 # READY_TIMEOUT used for the (fast) startup assertions is too tight here. This
 # ceiling only matters on failure: the waits exit as soon as catch-up starts.
 CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
+# The Zakura JSONL trace writer (zebra-jsonl-trace) only flushes to disk every
+# DEFAULT_FILE_FLUSH_INTERVAL (~17s) or after DEFAULT_BUFFER_FLUSH_BYTES (256
+# KiB), and production zebrad uses JsonlTracer::spawn (no guard / no shutdown
+# flush), so stopping the nodes does not flush the tail. The oracle reads the
+# trace files, so it must wait for the final commit_finish rows to be flushed
+# before running, or it sees commit_start rows with no matching finish. This
+# ceiling only needs to exceed the writer's flush interval; it exits as soon as
+# every commit_start has a matching commit_finish.
+TRACE_FLUSH_TIMEOUT="${TRACE_FLUSH_TIMEOUT:-45}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${DEFAULT_CHECKPOINT_INTERVAL}}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-${ZAKURA_E2E_MODE}}"
 
@@ -220,9 +229,39 @@ assert_trace_layout() {
   fi
 }
 
+# Wait until each node's commit_state trace is fully flushed to disk, i.e. every
+# commit_start row has a matching commit_finish row. The writer flushes on a
+# timer (~17s), so without this the oracle can read a trace whose tail (the last
+# few commit_finish rows) is still buffered in the live node, producing spurious
+# commit_start_has_finish / handoff / leak failures. Best-effort: on timeout we
+# log and let the oracle run so a genuine stall still surfaces.
+wait_for_trace_flush() {
+  trace_dir_has_jsonl || return 0
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file starts finishes pending
+  log "waiting for Zakura commit_state traces to flush before the oracle"
+  while (( SECONDS < deadline )); do
+    pending=0
+    for node in node1 node2 node4; do
+      file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
+      [[ -s "${file}" ]] || continue
+      starts=$(grep -c 'commit_start' "${file}" 2>/dev/null || true)
+      finishes=$(grep -c 'commit_finish' "${file}" 2>/dev/null || true)
+      if (( finishes < starts )); then
+        printf '  %s commit_state starts=%s finishes=%s (waiting for flush)\n' \
+          "${node}" "${starts}" "${finishes}"
+        pending=1
+      fi
+    done
+    (( pending == 0 )) && { log "commit_state traces flushed"; return 0; }
+    sleep 3
+  done
+  log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; running oracle anyway"
+}
+
 run_trace_oracle() {
   trace_dir_has_jsonl || return 0
   ORACLE_RAN=1
+  wait_for_trace_flush
   log "running Zakura trace oracle"
   local oracle_args=(
     "--commit-elapsed-ms" "${ZAKURA_E2E_ORACLE_COMMIT_ELAPSED_MS:-1800000}"
