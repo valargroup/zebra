@@ -15,21 +15,25 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to benchmark (GitHub release of this repo)"
+        description: "Release tag to benchmark, or a pre-staged binary name under bins/ (e.g. ironwood-main)"
         required: true
-        default: "v5.0.0-test.7"
+        default: "ironwood-main"
       stop_height:
         description: "Sync stops after committing this height (snapshot tip is 1,707,210)"
         required: true
-        default: "1737210"
+        default: "1730000"
       wall_cap_seconds:
         description: "Hard wall-clock cap for a single run"
         required: false
-        default: "3600"
+        default: "2400"
       feed_peer:
-        description: "Single peer to pin (ip:port); blank uses the BENCH_FEED_PEER variable"
+        description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
         required: false
         default: ""
+      peerset_size:
+        description: "Target peer count (1 = strict single pinned peer; ~75 for DNS-seeder mode)"
+        required: false
+        default: "75"
       checkpoint_verify_concurrency_limit:
         required: false
         default: "1500"
@@ -67,7 +71,8 @@ jobs:
           BASELINE_TAG: ${{ inputs.baseline_tag }}
           STOP_HEIGHT: ${{ inputs.stop_height }}
           WALL_CAP: ${{ inputs.wall_cap_seconds }}
-          FEED_PEER: ${{ inputs.feed_peer || vars.BENCH_FEED_PEER || '167.99.162.47:8233' }}
+          FEED_PEER: ${{ inputs.feed_peer }}    # blank = public DNS-seeder peers
+          PEERSET_SIZE: ${{ inputs.peerset_size }}
           CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
