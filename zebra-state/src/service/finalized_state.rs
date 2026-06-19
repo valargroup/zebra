@@ -51,10 +51,11 @@ macro_rules! timed_commit_phase {
     }};
 }
 
-/// A dedicated rayon thread pool for checkpoint-commit treestate computation:
-/// the note-commitment tree update and the ZIP-244 auth-data-root commitment
-/// check, which run on the single finalized-writer thread and dominate the
-/// per-block commit cost on heavy shielded blocks.
+/// A dedicated rayon thread pool for checkpoint-commit treestate computation. Namely:
+/// - the note-commitment tree update
+/// - the ZIP-244 auth-data-root commitment leaf-hashes
+///
+/// These are the two dominant compute-steps during commit heavy shielded blocks.
 ///
 /// This isolates the commit-compute phase from the main thread pool, allowing it
 /// to keep making progress when download/verify work is busy.
