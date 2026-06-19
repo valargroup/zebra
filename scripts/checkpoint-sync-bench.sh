@@ -39,6 +39,7 @@ WALL_CAP="${WALL_CAP:-3600}"
 FEED_PEER="${FEED_PEER:-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
+PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
 START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
@@ -184,9 +185,12 @@ ensure_binary() {
 # log line — never a bare Height(N), which also appears for network-tip/target heights.
 HEIGHT_METRICS="state_finalized_block_height state_checkpoint_finalized_block_height checkpoint_finalized_block_height checkpoint_verified_height"
 scrape_height() {
-  local logf="$1" page m v
+  local logf="$1" page m v c
   page="$(curl -fsS --max-time 4 "127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)"
   if [[ -n "$page" ]]; then
+    # most reliable: blocks finalized since startup + the snapshot tip height
+    c="$(awk '/^state_finalized_block_count /{printf "%d", $2; exit}' <<<"$page")"
+    [[ -n "$c" ]] && { echo "$(( START_HEIGHT + c ))"; return; }
     for m in $HEIGHT_METRICS; do
       v="$(awk -v n="$m" '$1==n {printf "%d", $2; exit}' <<<"$page")"
       [[ -n "$v" && "$v" -gt 0 ]] && { echo "$v"; return; }
@@ -220,7 +224,7 @@ run_one() {
       echo "cache_dir = \"$fork\""
       echo "listen_addr = \"127.0.0.1:$LISTEN_PORT\""
       echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
-      echo 'peerset_initial_target_size = 1'
+      echo "peerset_initial_target_size = $PEERSET_SIZE"
       if [[ "$1" == "with_zakura" ]]; then
         echo 'legacy_p2p = true'
         echo 'v2_p2p = false'   # ZAKURA off: legacy single-peer feed only
