@@ -555,12 +555,7 @@ impl SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        // Compute each transaction's txid and ZIP-244 auth digest together,
-        // sharing the single (expensive) librustzcash conversion that dominates
-        // the cost on heavy shielded transactions, instead of computing the txid
-        // here and re-converting the same transactions for the auth data root
-        // later on the commit path. The auth digest is nearly free once the txid
-        // has been computed.
+        // Compute each transaction's txid and ZIP-244 auth digest together, for efficiency
         let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = {
             use rayon::prelude::*;
             block
@@ -609,12 +604,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        // Compute each transaction's txid and ZIP-244 auth digest together,
-        // sharing the single (expensive) librustzcash conversion that dominates
-        // the cost on heavy shielded transactions, instead of computing the txid
-        // here and re-converting the same transactions for the auth data root
-        // later on the commit path. The auth digest is nearly free once the txid
-        // has been computed.
+        // Compute each transaction's txid and ZIP-244 auth digest together, for efficiency
         let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = {
             use rayon::prelude::*;
             block

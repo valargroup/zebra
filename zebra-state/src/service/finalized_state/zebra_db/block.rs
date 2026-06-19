@@ -44,7 +44,6 @@ use crate::{
         disk_format::{
             block::TransactionLocation,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
-            IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, RawBytes, PRUNING_METADATA,
