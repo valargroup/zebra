@@ -223,7 +223,8 @@ run_one() {
       echo 'network = "Mainnet"'
       echo "cache_dir = \"$fork\""
       echo "listen_addr = \"127.0.0.1:$LISTEN_PORT\""
-      echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
+      # pin a single peer when given; otherwise fall back to the default DNS seeders
+      [[ -n "$FEED_PEER" ]] && echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
       echo "peerset_initial_target_size = $PEERSET_SIZE"
       if [[ "$1" == "with_zakura" ]]; then
         echo 'legacy_p2p = true'
@@ -248,7 +249,7 @@ run_one() {
   }
 
   local pid t0 mode="with_zakura"
-  log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=$FEED_PEER, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  log "starting zebrad ($tag), stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
@@ -325,7 +326,7 @@ print_one() {
 
 === checkpoint-sync benchmark ${title} ===
 release:        $RESULT_TAG
-feed peer:      $FEED_PEER  (single-peer)
+feed:           ${FEED_PEER:-DNS seeders (public mainnet)}  (peerset=$PEERSET_SIZE)
 start height:   $RESULT_START
 end height:     $RESULT_END
 blocks covered: $RESULT_BLOCKS
