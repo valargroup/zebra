@@ -1033,7 +1033,17 @@ impl ZcashDeserialize for Transaction {
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 let orchard_shielded_data = (&mut limited_reader).zcash_deserialize_into()?;
 
-                let tx = Transaction::V5 {
+                // Convertibility to the librustzcash transaction type is
+                // intentionally not re-checked here. That check re-runs the full
+                // conversion, which decompresses every Jubjub/Pallas curve point,
+                // on every block, and it is the dominant CPU cost of checkpoint
+                // sync. It is also redundant: untrusted transactions that are not
+                // convertible are still rejected by the semantic verifier, which
+                // converts every transaction via `CachedFfiTransaction::new`
+                // before accepting it, while blocks below the checkpoints are
+                // trusted by their hash (and validated against the header merkle
+                // root built from the transaction IDs).
+                Ok(Transaction::V5 {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1041,11 +1051,7 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                };
-
-                tx.to_librustzcash(network_upgrade)?;
-
-                Ok(tx)
+                })
             }
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
