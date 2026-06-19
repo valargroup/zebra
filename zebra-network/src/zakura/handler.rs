@@ -175,7 +175,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_2 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 2);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -3925,6 +3925,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
+#[cfg(test)]
 const ZAKURA_STREAM_VERSION_2: u16 = 2;
 
 /// Returns whether the handler can serve a stream with this kind and version.

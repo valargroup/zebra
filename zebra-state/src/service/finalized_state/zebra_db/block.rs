@@ -1587,6 +1587,7 @@ impl DiskWriteBatch {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
         }
+        let last_header = headers.last().ok_or(CommitHeaderRangeError::EmptyRange)?;
 
         if headers.len() != body_sizes.len() {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
@@ -1601,13 +1602,30 @@ impl DiskWriteBatch {
             });
         }
 
-        let header_by_height = zebra_db.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
-        let hash_by_height = zebra_db.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
-        let height_by_hash = zebra_db.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
+        let header_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_BY_HEIGHT)
+            .ok_or_else(|| CommitHeaderRangeError::StorageWriteError {
+                error: format!("missing {ZAKURA_HEADER_BY_HEIGHT} column family"),
+            })?;
+        let hash_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT)
+            .ok_or_else(|| CommitHeaderRangeError::StorageWriteError {
+                error: format!("missing {ZAKURA_HEADER_HASH_BY_HEIGHT} column family"),
+            })?;
+        let height_by_hash = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH)
+            .ok_or_else(|| CommitHeaderRangeError::StorageWriteError {
+                error: format!("missing {ZAKURA_HEADER_HEIGHT_BY_HASH} column family"),
+            })?;
         let body_size_by_height = zebra_db
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
-            .unwrap();
+            .ok_or_else(|| CommitHeaderRangeError::StorageWriteError {
+                error: format!("missing {ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT} column family"),
+            })?;
 
         let anchor_height = zebra_db
             .header_height(anchor)
@@ -1766,9 +1784,7 @@ impl DiskWriteBatch {
             }
         }
 
-        Ok(block::Hash::from(
-            &**headers.last().expect("headers is non-empty"),
-        ))
+        Ok(block::Hash::from(&**last_header))
     }
 
     /// Deletes the block header at `height`.
