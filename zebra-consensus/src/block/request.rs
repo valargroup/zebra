@@ -2,8 +2,13 @@
 
 use std::sync::Arc;
 
-use zebra_chain::block::{self, Block};
+use zebra_chain::{
+    block::{self, Block},
+    parameters::Network,
+};
 use zebra_state::CheckpointVerifiedBlock;
+
+use crate::checkpoint::VerifyCheckpointError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A request to the chain or block verifier
@@ -38,18 +43,36 @@ impl Request {
         block: Arc<Block>,
         block_height: block::Height,
         max_checkpoint_height: block::Height,
-    ) -> Self {
+        network: Network,
+    ) -> Result<Self, VerifyCheckpointError> {
         if block_height <= max_checkpoint_height {
+            let hash = block.hash();
+
+            // Keep checkpoint sync's cheap proof-of-work gate before the
+            // per-transaction precomputation, matching the verifier path.
+            // Security: This prevents attackers from flooding the verifier with invalid blocks
+            // only to reject afterwards.
+            if network.disable_pow() {
+                super::check::difficulty_threshold_is_valid(
+                    &block.header,
+                    &network,
+                    &block_height,
+                    &hash,
+                )?;
+            } else {
+                super::check::difficulty_is_valid(&block.header, &network, &block_height, &hash)?;
+                super::check::equihash_solution_is_valid(&block.header)?;
+            }
+
             let checkpoint_block = tokio::task::spawn_blocking(move || {
-                let hash = block.hash();
                 CheckpointVerifiedBlock::with_hash(block, hash)
             })
             .await
             .expect("checkpoint block precomputation should not panic");
 
-            Request::CommitCheckpointPrecomputed(checkpoint_block)
+            Ok(Request::CommitCheckpointPrecomputed(checkpoint_block))
         } else {
-            Request::Commit(block)
+            Ok(Request::Commit(block))
         }
     }
 

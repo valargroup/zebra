@@ -26,6 +26,7 @@ use tracing_futures::Instrument;
 use zebra_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_state as zs;
@@ -254,6 +255,9 @@ where
 
     // Configuration
     //
+    /// The configured Zcash network.
+    chain_network: Network,
+
     /// The configured lookahead limit, after applying the minimum limit.
     lookahead_limit: usize,
 
@@ -356,6 +360,7 @@ where
         verifier: ZV,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
+        chain_network: Network,
         lookahead_limit: usize,
         max_checkpoint_height: Height,
     ) -> Self {
@@ -366,6 +371,7 @@ where
             network,
             verifier,
             latest_chain_tip,
+            chain_network,
             lookahead_limit,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
@@ -414,6 +420,7 @@ where
 
         let lookahead_limit = self.lookahead_limit;
         let max_checkpoint_height = self.max_checkpoint_height;
+        let chain_network = self.chain_network.clone();
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
@@ -586,8 +593,15 @@ where
                     block,
                     block_height,
                     max_checkpoint_height,
+                    chain_network,
                 )
-                .await;
+                .await
+                .map_err(|error| BlockDownloadVerifyError::Invalid {
+                    error: error.into(),
+                    height: block_height,
+                    hash,
+                    advertiser_addr,
+                })?;
 
                 // Wait for the verifier service to be ready.
                 let readiness = verifier.ready();
