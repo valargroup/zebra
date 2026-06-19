@@ -360,6 +360,8 @@ where
                 new_outputs,
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
+                // The semantic verifier checks the auth-data commitment during
+                // contextual validation, so it isn't precomputed here.
                 auth_data_root: None,
             };
 

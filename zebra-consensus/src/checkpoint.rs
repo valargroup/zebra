@@ -1143,6 +1143,9 @@ where
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
+            // Precompute the ZIP-244 authorizing-data commitment root here, off
+            // the single-threaded checkpoint-verifier buffer worker, unless a
+            // newer constructor already cached it from the block's transactions.
             if req_block.block.auth_data_root.is_none()
                 && NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5
             {

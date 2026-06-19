@@ -268,9 +268,10 @@ pub struct SemanticallyVerifiedBlock {
     /// The precomputed ZIP-244 authorizing-data commitment root for this block,
     /// if it was computed during verification.
     ///
-    /// The checkpoint verifier can set this ahead of the single-threaded
-    /// finalized committer. `None` means the committer falls back to computing
-    /// it from the block's transactions.
+    /// The checkpoint verifier sets this (it runs with high concurrency, ahead
+    /// of the single-threaded finalized committer) so the committer does not
+    /// have to recompute the per-transaction auth digests on its critical path.
+    /// `None` means "not precomputed"; the committer falls back to computing it.
     pub auth_data_root: Option<AuthDataRoot>,
 }
 
