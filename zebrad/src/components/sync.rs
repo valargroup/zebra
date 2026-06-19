@@ -927,6 +927,7 @@ where
             verifier,
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
+            config.network.network.clone(),
             max(
                 checkpoint_verify_concurrency_limit,
                 full_verify_concurrency_limit,
