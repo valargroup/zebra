@@ -2,11 +2,10 @@ use super::{error::*, wire::*, *};
 
 /// Default number of blocks advertised per response.
 ///
-/// Set to the wire ceiling so block-body requests batch as many blocks as the
-/// per-response byte cap ([`MAX_BS_RESPONSE_BYTES`]) allows. Small early-chain
-/// blocks ride in large counts; large near-tip blocks are byte-capped to fewer.
-pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 128;
-/// Default number of in-flight block requests advertised per peer.
+/// Keep block-body ranges narrow so a missing response only holds one height at
+/// the body-download floor.
+pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
+/// Initial number of in-flight block requests advertised per peer.
 ///
 /// Combined with the global byte budget ([`DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES`])
 /// this gives each peer enough work to keep its stream busy while avoiding a
