@@ -300,9 +300,9 @@ impl DiskWriteBatch {
         // Sum the independent per-transaction sizes. This is byte-count-identical
         // to serializing the block:
         // size = header + CompactSize(tx_count) + sum(transaction sizes).
-        //
         // Only fan out to rayon once the block has enough transactions to
-        // amortize the multi-threading overhead.
+        // amortize the fork-join cost; small blocks sum sequentially (see
+        // PARALLEL_BLOCK_TX_THRESHOLD).
         let block_size = {
             let transactions = &finalized.block.transactions;
             let transactions_size: usize =
