@@ -14,10 +14,23 @@ name: Checkpoint-sync benchmark
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Release tag to benchmark, or a pre-staged binary name under bins/ (e.g. ironwood-main)"
-        required: true
+      build_ref:
+        description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
+        required: false
         default: "ironwood-main"
+      force_rebuild:
+        description: "Rebuild even if a binary for this commit SHA is already cached"
+        type: boolean
+        required: false
+        default: false
+      baseline_ref:
+        description: "Optional second ref to build+run first, for a baseline -> primary speedup"
+        required: false
+        default: ""
+      release_tag:
+        description: "Alternative to build_ref: download this release tarball instead of building"
+        required: false
+        default: ""
       stop_height:
         description: "Sync stops after committing this height (snapshot tip is 1,707,210)"
         required: true
@@ -41,7 +54,7 @@ on:
         required: false
         default: "150"
       baseline_tag:
-        description: "Optional: also run this tag first and print a baseline -> release speedup"
+        description: "Optional (download mode): baseline release tag for a speedup comparison"
         required: false
         default: ""
 
@@ -54,9 +67,9 @@ permissions:
 
 jobs:
   bench:
-    name: "checkpoint sync ${{ inputs.release_tag }}"
+    name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
     runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
-    timeout-minutes: 180
+    timeout-minutes: 300   # first-ever on-host build is cold; later builds are incremental
     steps:
       - name: Checkout (for the bench script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
@@ -67,6 +80,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          BUILD_REF: ${{ inputs.build_ref }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild && '1' || '0' }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           BASELINE_TAG: ${{ inputs.baseline_tag }}
           STOP_HEIGHT: ${{ inputs.stop_height }}
@@ -86,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
-          name: checkpoint-sync-bench-${{ inputs.release_tag }}-${{ github.run_id }}
+          name: checkpoint-sync-bench-${{ inputs.build_ref || inputs.release_tag }}-${{ github.run_id }}
           path: bench-out/
           if-no-files-found: ignore
           retention-days: 30

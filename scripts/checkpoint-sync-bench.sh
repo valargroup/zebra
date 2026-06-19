@@ -10,9 +10,14 @@
 # Designed to run on the roman-zakura-3 self-hosted runner, but it is self-contained
 # and can be run by hand on any Linux box with enough disk.
 #
-# Inputs (environment variables; the workflow sets these from inputs/vars):
-#   RELEASE_TAG            release tag to benchmark            (e.g. v5.0.0-test.7)
-#   BASELINE_TAG          optional: also run this tag, print A/B comparison
+# Binary source (pick one; BUILD_REF wins):
+#   BUILD_REF             git branch/tag/SHA to build ON THIS HOST, cached by commit
+#   BASELINE_REF          optional second ref to build+run first (A/B speedup)
+#   FORCE_REBUILD         1 = rebuild even if a binary for the commit SHA is cached
+#   RELEASE_TAG           else: download this release tarball (e.g. v5.0.0-test.7)
+#   BASELINE_TAG          optional baseline release tag for A/B (download mode)
+#
+# Other inputs (environment variables; the workflow sets these from inputs/vars):
 #   STOP_HEIGHT           debug_stop_at_height                (default 1737210, +30k)
 #   WALL_CAP              hard wall-clock cap, seconds         (default 3600)
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
@@ -32,7 +37,12 @@
 set -euo pipefail
 
 # ---- inputs / defaults -------------------------------------------------------
-RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required}"
+# Binary source: either build a git ref on this host (BUILD_REF, cached by commit
+# SHA), or download a published release tarball (RELEASE_TAG). BUILD_REF wins.
+BUILD_REF="${BUILD_REF:-}"
+BASELINE_REF="${BASELINE_REF:-}"
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
+RELEASE_TAG="${RELEASE_TAG:-}"
 BASELINE_TAG="${BASELINE_TAG:-}"
 STOP_HEIGHT="${STOP_HEIGHT:-1737210}"
 WALL_CAP="${WALL_CAP:-3600}"
@@ -179,6 +189,85 @@ ensure_binary() {
   ZEBRAD_BIN="$zebrad"
 }
 
+# ---- 2b. build a git ref on this host, cached by commit SHA -------------------
+# Persistent build state lives on the bench disk so a new commit on the same branch
+# is an incremental (fast) rebuild, and a cache hit on the same SHA skips the build.
+BUILD_SRC="$BENCH_HOME/src"
+BUILD_TARGET="$BENCH_HOME/build-target"
+BUILD_CARGO_HOME="$BENCH_HOME/cargo-home"
+
+# validate a cached binary really is the one we built for $2=sha: integrity (sha256
+# matches the stored value) AND provenance (zebrad --version embeds the git short sha).
+validate_cached_binary() {
+  local zebrad="$1" sha="$2" meta="$3" want got ver
+  [[ -x "$zebrad" && -f "$meta" ]] || { log "cache miss: missing binary/meta for $sha"; return 1; }
+  want="$(awk -F= '/^bin_sha256=/{print $2}' "$meta")"
+  got="$(sha256sum "$zebrad" | awk '{print $1}')"
+  [[ -n "$want" && "$want" == "$got" ]] || { log "cache invalid: binary sha256 mismatch for $sha"; return 1; }
+  ver="$("$zebrad" --version 2>/dev/null | head -1)"
+  [[ -n "$ver" ]] || { log "cache invalid: $sha binary will not report --version"; return 1; }
+  # Zebra's version embeds the git short sha as g<short>; require it to match.
+  if [[ "$ver" != *"g${sha}"* ]]; then
+    log "cache invalid: $sha --version ('$ver') does not embed g$sha"; return 1
+  fi
+  log "cache hit: validated prebuilt binary for $sha (sha256 ok, --version='$ver')"
+  return 0
+}
+
+ensure_toolchain() {
+  [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
+  export PATH="$HOME/.cargo/bin:$PATH"
+  command -v cargo >/dev/null 2>&1 || die "cargo not found on host (install rustup)"
+}
+
+ensure_source() {
+  ensure_toolchain
+  if [[ ! -d "$BUILD_SRC/.git" ]]; then
+    log "cloning $GH_REPO -> $BUILD_SRC (first build only) ..." >&2
+    gh auth setup-git 2>/dev/null || true
+    git clone "https://github.com/$GH_REPO.git" "$BUILD_SRC" >&2 || die "git clone failed"
+  fi
+  git -C "$BUILD_SRC" fetch --tags --force origin >&2 || die "git fetch failed"
+}
+
+# build $1=ref; sets ZEBRAD_BIN. Skips the build (with revalidation) on a SHA cache hit.
+build_from_ref() {
+  local ref="$1" sha full ver bindir zebrad meta
+  ensure_source
+  # resolve ref (branch/tag/sha) to a commit; prefer the remote branch
+  full="$(git -C "$BUILD_SRC" rev-parse --verify --quiet "origin/$ref^{commit}" \
+        || git -C "$BUILD_SRC" rev-parse --verify --quiet "$ref^{commit}")" \
+        || die "cannot resolve ref '$ref' to a commit"
+  sha="${full:0:9}"
+  bindir="$BENCH_HOME/bins/$sha"; zebrad="$bindir/zebrad"; meta="$bindir/meta"
+  log "ref '$ref' -> commit $sha"
+
+  if [[ "$FORCE_REBUILD" != "1" ]] && validate_cached_binary "$zebrad" "$sha" "$meta"; then
+    ZEBRAD_BIN="$zebrad"; return
+  fi
+
+  log "building $sha on host (incremental; first build is slow) ..." >&2
+  git -C "$BUILD_SRC" checkout --quiet --detach "$full" >&2 || die "git checkout $sha failed"
+  ( cd "$BUILD_SRC" && \
+    CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_HOME="$BUILD_CARGO_HOME" CXXFLAGS="-include cstdint" \
+    cargo build --release -p zebrad --features prometheus --locked >&2 ) \
+    || die "cargo build failed for $sha"
+  local built="$BUILD_TARGET/release/zebrad"
+  [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
+  ver="$("$built" --version 2>/dev/null | head -1)"
+  [[ "$ver" == *"g${sha}"* ]] || log "WARNING: built --version ('$ver') does not embed g$sha"
+  mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
+  { echo "commit=$full"; echo "ref=$ref"; echo "version=$ver";
+    echo "bin_sha256=$(sha256sum "$zebrad" | awk '{print $1}')"; } > "$meta"
+  log "built and cached $sha: $ver" >&2
+  ZEBRAD_BIN="$zebrad"
+}
+
+# pick build-vs-download for a given spec ($1=ref-or-tag); sets ZEBRAD_BIN
+resolve_binary() {
+  if [[ -n "$BUILD_REF" ]]; then build_from_ref "$1"; else ensure_binary "$1"; fi
+}
+
 # ---- height scraping ---------------------------------------------------------
 # Prometheus first, trying several metric names across zebrad versions (the
 # checkpoint verifier exports checkpoint_verified_height; newer builds also export
@@ -208,7 +297,7 @@ scrape_height() {
 # usage: run_one TAG OUTPREFIX ; sets RESULT_* globals
 run_one() {
   local tag="$1" prefix="$2"
-  ensure_binary "$tag"; local zebrad="$ZEBRAD_BIN"
+  resolve_binary "$tag"; local zebrad="$ZEBRAD_BIN"
   local run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
   local logf="/dev/shm/zebra-bench-$run_id.log"
@@ -353,6 +442,17 @@ summary_row() { # markdown row -> step summary
 }
 
 # ---- main --------------------------------------------------------------------
+# choose binary source: build a git ref on this host, or download a release tarball
+PRIMARY_SPEC=""; BASELINE_SPEC=""; MODE=""
+if [[ -n "$BUILD_REF" ]]; then
+  MODE="build (on host, cached by commit)"; PRIMARY_SPEC="$BUILD_REF"; BASELINE_SPEC="$BASELINE_REF"
+elif [[ -n "$RELEASE_TAG" ]]; then
+  MODE="download release"; PRIMARY_SPEC="$RELEASE_TAG"; BASELINE_SPEC="$BASELINE_TAG"
+else
+  die "set BUILD_REF (git ref to build on host) or RELEASE_TAG (release to download)"
+fi
+log "binary source: $MODE; primary='$PRIMARY_SPEC'${BASELINE_SPEC:+, baseline='$BASELINE_SPEC'}"
+
 ensure_deps
 ensure_bench_home
 ensure_snapshot
@@ -361,27 +461,25 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
 {
   echo "## Checkpoint-sync benchmark"
   echo ""
-  echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, peer: \`$FEED_PEER\`"
+  echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
+  echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
   echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
   echo ""
-  echo "| tag | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
-  echo "|-----|-----------:|---------------:|-----------:|---------:|------------------:|"
+  echo "| binary | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
+  echo "|--------|-----------:|---------------:|-----------:|---------:|------------------:|"
 } >> "$SUMMARY"
 
-if [[ -n "$BASELINE_TAG" ]]; then
-  log "A/B mode: baseline=$BASELINE_TAG vs release=$RELEASE_TAG"
-  run_one "$BASELINE_TAG" "baseline"; print_one "(baseline)"; summary_row "$BASELINE_TAG (baseline)" >> "$SUMMARY"
-  B_BPS="$RESULT_BPS"; B_TIME="$RESULT_TIME"
-  run_one "$RELEASE_TAG" "release";  print_one "(release)";  summary_row "$RELEASE_TAG (release)"  >> "$SUMMARY"
+if [[ -n "$BASELINE_SPEC" ]]; then
+  log "A/B mode: baseline='$BASELINE_SPEC' vs primary='$PRIMARY_SPEC'"
+  run_one "$BASELINE_SPEC" "baseline"; print_one "(baseline)"; summary_row "$BASELINE_SPEC (baseline)" >> "$SUMMARY"
+  B_BPS="$RESULT_BPS"
+  run_one "$PRIMARY_SPEC" "primary";  print_one "(primary)";  summary_row "$PRIMARY_SPEC (primary)"  >> "$SUMMARY"
   R_BPS="$RESULT_BPS"
   SPEEDUP="$(awk -v r="$R_BPS" -v b="$B_BPS" 'BEGIN{ if (b>0) printf "%.2f", r/b; else print "n/a" }')"
-  {
-    echo ""
-    echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"
-  } >> "$SUMMARY"
+  { echo ""; echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"; } >> "$SUMMARY"
   printf '\n=== A/B: %s -> %s = %s× faster ===\n' "$B_BPS" "$R_BPS" "$SPEEDUP"
 else
-  run_one "$RELEASE_TAG" "release"; print_one ""; summary_row "$RELEASE_TAG" >> "$SUMMARY"
+  run_one "$PRIMARY_SPEC" "primary"; print_one ""; summary_row "$PRIMARY_SPEC" >> "$SUMMARY"
 fi
 
 log "done. artifacts in $OUT_DIR"
