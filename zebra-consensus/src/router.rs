@@ -200,6 +200,17 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        // A precomputed checkpoint block is, by construction, below the
+        // checkpoint height; route it straight to the checkpoint verifier's
+        // fast path (which skips the now-already-done precomputation).
+        if let Request::CommitCheckpointPrecomputed(block) = request {
+            return self
+                .checkpoint
+                .call_precomputed(block)
+                .map_err(Into::into)
+                .boxed();
+        }
+
         let block = request.block();
 
         match block.coinbase_height() {
