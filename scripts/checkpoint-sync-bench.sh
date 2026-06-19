@@ -199,16 +199,19 @@ BUILD_CARGO_HOME="$BENCH_HOME/cargo-home"
 # validate a cached binary really is the one we built for $2=sha: integrity (sha256
 # matches the stored value) AND provenance (zebrad --version embeds the git short sha).
 validate_cached_binary() {
-  local zebrad="$1" sha="$2" meta="$3" want got ver
+  local zebrad="$1" sha="$2" meta="$3" want got ver vsha commit
   [[ -x "$zebrad" && -f "$meta" ]] || { log "cache miss: missing binary/meta for $sha"; return 1; }
+  # integrity: the binary is byte-identical to the one we recorded for this commit
   want="$(awk -F= '/^bin_sha256=/{print $2}' "$meta")"
   got="$(sha256sum "$zebrad" | awk '{print $1}')"
   [[ -n "$want" && "$want" == "$got" ]] || { log "cache invalid: binary sha256 mismatch for $sha"; return 1; }
+  # runnable + provenance: --version embeds a git abbrev (g<hex>) that prefixes the commit
   ver="$("$zebrad" --version 2>/dev/null | head -1)"
   [[ -n "$ver" ]] || { log "cache invalid: $sha binary will not report --version"; return 1; }
-  # Zebra's version embeds the git short sha as g<short>; require it to match.
-  if [[ "$ver" != *"g${sha}"* ]]; then
-    log "cache invalid: $sha --version ('$ver') does not embed g$sha"; return 1
+  commit="$(awk -F= '/^commit=/{print $2}' "$meta")"
+  vsha="$(grep -oE 'g[0-9a-f]{7,}' <<<"$ver" | head -1 | sed 's/^g//')"
+  if [[ -n "$vsha" && -n "$commit" && "$commit" != "$vsha"* ]]; then
+    log "cache invalid: $sha --version sha 'g$vsha' is not a prefix of $commit"; return 1
   fi
   log "cache hit: validated prebuilt binary for $sha (sha256 ok, --version='$ver')"
   return 0
@@ -255,7 +258,8 @@ build_from_ref() {
   local built="$BUILD_TARGET/release/zebrad"
   [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
   ver="$("$built" --version 2>/dev/null | head -1)"
-  [[ "$ver" == *"g${sha}"* ]] || log "WARNING: built --version ('$ver') does not embed g$sha"
+  local vsha; vsha="$(grep -oE 'g[0-9a-f]{7,}' <<<"$ver" | head -1 | sed 's/^g//')"
+  [[ -z "$vsha" || "$full" == "$vsha"* ]] || log "WARNING: built --version ('$ver') sha g$vsha not a prefix of $full"
   mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
   { echo "commit=$full"; echo "ref=$ref"; echo "version=$ver";
     echo "bin_sha256=$(sha256sum "$zebrad" | awk '{print $1}')"; } > "$meta"
