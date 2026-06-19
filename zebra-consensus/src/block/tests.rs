@@ -158,6 +158,32 @@ async fn check_transcripts() -> Result<(), Report> {
     Ok(())
 }
 
+#[tokio::test]
+async fn create_commit_request_selects_checkpoint_precomputation() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block: Arc<Block> =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?.into();
+    let max_checkpoint_height = Height(1);
+
+    let request =
+        Request::create_commit_request(block.clone(), Height(0), max_checkpoint_height).await;
+    assert!(matches!(request, Request::CommitCheckpointPrecomputed(_)));
+    assert_eq!(request.block(), block);
+
+    let request =
+        Request::create_commit_request(block.clone(), max_checkpoint_height, max_checkpoint_height)
+            .await;
+    assert!(matches!(request, Request::CommitCheckpointPrecomputed(_)));
+    assert_eq!(request.block(), block);
+
+    let request =
+        Request::create_commit_request(block.clone(), Height(2), max_checkpoint_height).await;
+    assert_eq!(request, Request::Commit(block));
+
+    Ok(())
+}
+
 #[test]
 fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
     let _init_guard = zebra_test::init();

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use zebra_chain::block::Block;
+use zebra_chain::block::{self, Block};
 use zebra_state::CheckpointVerifiedBlock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,31 @@ pub enum Request {
 }
 
 impl Request {
+    /// Creates a commit request for the downloaded block.
+    ///
+    /// For checkpoint-height blocks, precompute the checkpoint-verified block
+    /// off the verifier's single-threaded buffer worker. Callers should do this
+    /// before reserving verifier readiness, so the CPU-heavy work does not hold a
+    /// verifier slot.
+    pub async fn create_commit_request(
+        block: Arc<Block>,
+        block_height: block::Height,
+        max_checkpoint_height: block::Height,
+    ) -> Self {
+        if block_height <= max_checkpoint_height {
+            let checkpoint_block = tokio::task::spawn_blocking(move || {
+                let hash = block.hash();
+                CheckpointVerifiedBlock::with_hash(block, hash)
+            })
+            .await
+            .expect("checkpoint block precomputation should not panic");
+
+            Request::CommitCheckpointPrecomputed(checkpoint_block)
+        } else {
+            Request::Commit(block)
+        }
+    }
+
     /// Returns inner block
     pub fn block(&self) -> Arc<Block> {
         match self {
