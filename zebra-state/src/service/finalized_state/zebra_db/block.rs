@@ -831,31 +831,6 @@ impl ZebraDb {
             .collect();
 
         // Get a list of the spent UTXOs, before we delete any from the database.
-        //
-        // Each input triggers cache-served but serial RocksDB point lookups, which
-        // dominate the per-block write time in the transparent-heavy ranges. Read
-        // the output location once and reuse it for the UTXO fetch (instead of
-        // letting `utxo()` re-derive it), and fan the reads across the rayon pool
-        // once a block has enough inputs to amortize the fork-join cost.
-        let read_spent = |outpoint: transparent::OutPoint| {
-            // Some utxos are spent in the same block, so they will be in
-            // `tx_hash_indexes` and `new_outputs` rather than the database.
-            let db_out_loc = self.output_location(&outpoint);
-            let out_loc = db_out_loc
-                .unwrap_or_else(|| lookup_out_loc(finalized.height, &outpoint, &tx_hash_indexes));
-            let utxo = db_out_loc
-                .and_then(|loc| self.utxo_by_location(loc))
-                .map(|ordered_utxo| ordered_utxo.utxo)
-                .or_else(|| {
-                    finalized
-                        .new_outputs
-                        .get(&outpoint)
-                        .map(|ordered_utxo| ordered_utxo.utxo.clone())
-                })
-                .expect("already checked UTXO was in state or block");
-            (outpoint, out_loc, utxo)
-        };
-
         let outpoints: Vec<transparent::OutPoint> = finalized
             .block
             .transactions
@@ -867,9 +842,31 @@ impl ZebraDb {
         let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
             if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                 use rayon::prelude::*;
-                outpoints.into_par_iter().map(read_spent).collect()
+                outpoints
+                    .into_par_iter()
+                    .map(|outpoint| {
+                        read_spent_utxo(
+                            self,
+                            finalized.height,
+                            outpoint,
+                            &tx_hash_indexes,
+                            &finalized.new_outputs,
+                        )
+                    })
+                    .collect()
             } else {
-                outpoints.into_iter().map(read_spent).collect()
+                outpoints
+                    .into_iter()
+                    .map(|outpoint| {
+                        read_spent_utxo(
+                            self,
+                            finalized.height,
+                            outpoint,
+                            &tx_hash_indexes,
+                            &finalized.new_outputs,
+                        )
+                    })
+                    .collect()
             };
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
@@ -1024,6 +1021,32 @@ impl ZebraDb {
                 error: error.to_string(),
             })
     }
+}
+
+/// Read a spent transparent UTXO and its output location before deleting it from the database.
+///
+/// Some UTXOs are created and spent in the same block, so they are in
+/// `tx_hash_indexes` and `new_outputs` rather than the database.
+fn read_spent_utxo(
+    db: &ZebraDb,
+    height: Height,
+    outpoint: transparent::OutPoint,
+    tx_hash_indexes: &HashMap<transaction::Hash, usize>,
+    new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
+    let db_out_loc = db.output_location(&outpoint);
+    let out_loc = db_out_loc.unwrap_or_else(|| lookup_out_loc(height, &outpoint, tx_hash_indexes));
+    let utxo = db_out_loc
+        .and_then(|loc| db.utxo_by_location(loc))
+        .map(|ordered_utxo| ordered_utxo.utxo)
+        .or_else(|| {
+            new_outputs
+                .get(&outpoint)
+                .map(|ordered_utxo| ordered_utxo.utxo.clone())
+        })
+        .expect("already checked UTXO was in state or block");
+
+    (outpoint, out_loc, utxo)
 }
 
 /// Lookup the output location for an outpoint.
