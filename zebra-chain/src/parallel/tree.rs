@@ -318,29 +318,40 @@ impl BlockNotePrecompute {
     /// immediately before this block; the committer re-checks them and falls back to
     /// inline hashing on any mismatch. Pools with no notes (or a precompute error)
     /// are left `None`, also falling back to inline.
+    ///
+    /// The Sapling and Orchard precomputes run concurrently via [`rayon::join`],
+    /// mirroring the per-pool parallelism of [`NoteCommitmentTrees::update_trees_parallel`]:
+    /// each pool's hashing is already internally parallel, and the join lets the two
+    /// pools overlap instead of hashing one fully before the other.
     pub fn compute(sapling_start: u64, orchard_start: u64, block: &Block) -> Self {
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
 
-        Self {
-            sapling: (!sapling_notes.is_empty())
-                .then(|| {
-                    sapling::tree::NoteCommitmentTree::precompute_append(
-                        sapling_start,
-                        &sapling_notes,
-                    )
-                    .ok()
-                })
-                .flatten(),
-            orchard: (!orchard_notes.is_empty())
-                .then(|| {
-                    orchard::tree::NoteCommitmentTree::precompute_append(
-                        orchard_start,
-                        &orchard_notes,
-                    )
-                    .ok()
-                })
-                .flatten(),
-        }
+        let (sapling, orchard) = rayon::join(
+            || {
+                (!sapling_notes.is_empty())
+                    .then(|| {
+                        sapling::tree::NoteCommitmentTree::precompute_append(
+                            sapling_start,
+                            &sapling_notes,
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            },
+            || {
+                (!orchard_notes.is_empty())
+                    .then(|| {
+                        orchard::tree::NoteCommitmentTree::precompute_append(
+                            orchard_start,
+                            &orchard_notes,
+                        )
+                        .ok()
+                    })
+                    .flatten()
+            },
+        );
+
+        Self { sapling, orchard }
     }
 }
