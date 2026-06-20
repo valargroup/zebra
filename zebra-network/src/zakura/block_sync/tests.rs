@@ -2398,6 +2398,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         .try_send(BlockSyncEvent::WireMessage {
             peer: peer(90),
             msg: BlockSyncMessage::Status(status()),
+            body_wire_bytes: None,
         })
         .expect("test fills bounded wire queue");
     let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
@@ -3191,6 +3192,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         .send(BlockSyncEvent::WireMessage {
             peer: peer_id,
             msg: BlockSyncMessage::Block(blocks[0].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("body queues");
@@ -3466,6 +3468,164 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
         quiet.is_err(),
         "unmatched body for a currently needed height should not be hard misbehavior",
     );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_accepts_unmatched_body_for_queued_height() {
+    let blocks = mainnet_blocks_1_to_3();
+    let config = immediate_body_download_config();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        143,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        1,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    let no_getblocks = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            if let BlockSyncAction::SendMessage {
+                msg: BlockSyncMessage::GetBlocks { .. },
+                ..
+            } = next_action(&mut actions).await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        no_getblocks.is_err(),
+        "test setup requires the body to remain queued without an outstanding request",
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("unmatched queued block queues");
+
+    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
+                return block.hash();
+            }
+        }
+    })
+    .await
+    .expect("unmatched queued body is submitted");
+    assert_eq!(submitted, blocks[0].hash());
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_accepts_queued_body_from_recently_disconnected_peer() {
+    let blocks = mainnet_blocks_1_to_3();
+    let config = immediate_body_download_config();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, _inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        144,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        1,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    let no_getblocks = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            if let BlockSyncAction::SendMessage {
+                msg: BlockSyncMessage::GetBlocks { .. },
+                ..
+            } = next_action(&mut actions).await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        no_getblocks.is_err(),
+        "test setup requires the body to remain queued without an outstanding request",
+    );
+
+    service.remove_peer(&peer_id);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.peer_snapshot().outbound_peers == 0 && service.peer_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disconnect releases the block-sync peer slot");
+
+    handle
+        .send(BlockSyncEvent::WireMessage {
+            peer: peer_id,
+            msg: BlockSyncMessage::Block(blocks[0].clone()),
+            body_wire_bytes: None,
+        })
+        .await
+        .expect("late disconnected body queues");
+
+    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
+                return block.hash();
+            }
+        }
+    })
+    .await
+    .expect("late disconnected queued body is submitted");
+    assert_eq!(submitted, blocks[0].hash());
 
     reactor_task.abort();
 }
@@ -4632,6 +4792,7 @@ async fn reactor_does_not_retry_missing_height_already_in_flight() {
         .send(BlockSyncEvent::WireMessage {
             peer: first_request.0.clone(),
             msg: BlockSyncMessage::Block(blocks[0].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("first body queues");
@@ -4653,6 +4814,7 @@ async fn reactor_does_not_retry_missing_height_already_in_flight() {
                 start_height: block::Height(1),
                 returned: 1,
             },
+            body_wire_bytes: None,
         })
         .await
         .expect("BlocksDone queues");
@@ -8518,6 +8680,7 @@ async fn reactor_ignores_unmatched_response_for_height_active_on_another_request
         .send(BlockSyncEvent::WireMessage {
             peer: late_peer.clone(),
             msg: BlockSyncMessage::Block(blocks[1].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("late body queues");
@@ -8528,6 +8691,7 @@ async fn reactor_ignores_unmatched_response_for_height_active_on_another_request
                 start_height: block::Height(2),
                 returned: 1,
             },
+            body_wire_bytes: None,
         })
         .await
         .expect("late terminator queues");
@@ -8707,6 +8871,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
         .send(BlockSyncEvent::WireMessage {
             peer: first_request.0.clone(),
             msg: BlockSyncMessage::Block(blocks[1].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("first body queues");
@@ -8733,6 +8898,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
         .send(BlockSyncEvent::WireMessage {
             peer: second_request.0.clone(),
             msg: BlockSyncMessage::Block(blocks[1].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("late duplicate body queues");
@@ -8808,6 +8974,7 @@ async fn reactor_ignores_late_response_frames_after_peer_disconnect() {
         .send(BlockSyncEvent::WireMessage {
             peer: peer_id.clone(),
             msg: BlockSyncMessage::Block(blocks[1].clone()),
+            body_wire_bytes: None,
         })
         .await
         .expect("late body frame queues");
@@ -8818,6 +8985,7 @@ async fn reactor_ignores_late_response_frames_after_peer_disconnect() {
                 start_height: block::Height(2),
                 returned: 1,
             },
+            body_wire_bytes: None,
         })
         .await
         .expect("late terminator frame queues");
@@ -8952,6 +9120,7 @@ async fn misbehaving_peer_is_disconnected_even_when_action_channel_is_saturated(
                     start_height: block::Height(1),
                     count: 1,
                 },
+                body_wire_bytes: None,
             }),
         )
         .await;
