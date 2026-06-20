@@ -510,13 +510,14 @@ where
         "precompute_append_batch_with_subtree requires at least one node"
     );
 
-    let new_size = start_size + nodes.len() as u64;
-    if new_size > TreeCapacity::<DEPTH>::MAX_LEAVES {
-        return Err(FrontierError::MaxDepthExceeded {
-            depth: DEPTH.saturating_add(1),
-        }
-        .into());
-    }
+    let new_size = start_size
+        .checked_add(nodes.len() as u64)
+        .filter(|&new_size| new_size <= TreeCapacity::<DEPTH>::MAX_LEAVES)
+        .ok_or(BatchFrontierError::Frontier(
+            FrontierError::MaxDepthExceeded {
+                depth: DEPTH.saturating_add(1),
+            },
+        ))?;
 
     let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
     let boundary = (start_size / subtree_size)
@@ -898,6 +899,42 @@ mod tests {
         assert!(
             partial_batch_overflow.is_err(),
             "batch crossing tree capacity overflows"
+        );
+    }
+
+    /// A caller-supplied `start_size` near `u64::MAX` must report a clean capacity
+    /// error rather than wrapping past the `MAX_LEAVES` check (which would build an
+    /// inconsistent precompute and panic in `graft`, or panic on overflow in debug
+    /// builds).
+    #[test]
+    fn precompute_start_size_overflow_is_reported() {
+        let batch = [TestNode(1), TestNode(2)];
+
+        let is_capacity_error = |result| {
+            matches!(
+                result,
+                Err(BatchFrontierError::Frontier(
+                    FrontierError::MaxDepthExceeded { .. }
+                ))
+            )
+        };
+
+        // `start_size + nodes.len()` overflows u64.
+        assert!(
+            is_capacity_error(precompute_append_batch_with_subtree::<_, DEPTH>(
+                u64::MAX - 1,
+                &batch
+            )),
+            "overflowing start_size must report a capacity error"
+        );
+
+        // `start_size` past the tree's capacity without overflowing u64.
+        assert!(
+            is_capacity_error(precompute_append_batch_with_subtree::<_, DEPTH>(
+                TreeCapacity::<DEPTH>::MAX_LEAVES,
+                &batch
+            )),
+            "start_size at capacity must report a capacity error"
         );
     }
 
