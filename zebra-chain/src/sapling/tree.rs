@@ -23,11 +23,29 @@ use incrementalmerkletree::frontier::{Frontier, NonEmptyFrontier};
 use thiserror::Error;
 
 use crate::{
+    parallel::batch_frontier::{
+        apply_append_batch_with_subtree, precompute_append_batch_with_subtree, BatchFrontierError,
+        PrecomputedSubtreeAppend,
+    },
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
+
+/// The precomputed parallel-append work for one block's Sapling note commitments,
+/// produced off the committer by [`NoteCommitmentTree::precompute_append`] and
+/// applied with [`NoteCommitmentTree::apply_precomputed_append`].
+#[derive(Clone, Debug)]
+pub(crate) struct PrecomputedAppendBatch(PrecomputedSubtreeAppend<sapling_crypto::Node>);
+
+impl PrecomputedAppendBatch {
+    /// The tree size (leaf [`count`](NoteCommitmentTree::count)) this precompute
+    /// must be applied to.
+    pub(crate) fn start_size(&self) -> u64 {
+        self.0.start_size()
+    }
+}
 
 pub mod legacy;
 use legacy::LegacyNoteCommitmentTree;
@@ -145,6 +163,25 @@ impl ZcashDeserialize for Root {
 pub enum NoteCommitmentTreeError {
     #[error("The note commitment tree is full")]
     FullTree,
+
+    #[error("Invalid precompute: empty batch, stale start size, or multi-subtree batch")]
+    InvalidPrecompute,
+}
+
+impl From<BatchFrontierError> for NoteCommitmentTreeError {
+    fn from(error: BatchFrontierError) -> Self {
+        match error {
+            // A capacity overflow is the tree being full.
+            BatchFrontierError::Frontier(_) => NoteCommitmentTreeError::FullTree,
+            // The remaining variants are caller-supplied precompute misuse, which
+            // is reported as a recoverable error rather than panicking.
+            BatchFrontierError::BatchSpansMultipleSubtrees
+            | BatchFrontierError::EmptyBatch
+            | BatchFrontierError::PrecomputeStartMismatch { .. } => {
+                NoteCommitmentTreeError::InvalidPrecompute
+            }
+        }
+    }
 }
 
 /// Sapling Incremental Note Commitment Tree.
@@ -259,6 +296,73 @@ impl NoteCommitmentTree {
             );
             (index, root)
         }))
+    }
+
+    /// Precomputes the parallel-append work for `note_commitments` against a tree
+    /// of size `start_size`, off the committer's critical path.
+    ///
+    /// This does the per-leaf Merkle hashing (the dominant cost of committing a
+    /// shielded block) using only the starting leaf *count*, so it can run
+    /// concurrently ahead of the committer. Apply with
+    /// [`Self::apply_precomputed_append`] on a tree whose [`count`](Self::count)
+    /// equals `start_size`. Returns [`NoteCommitmentTreeError::InvalidPrecompute`]
+    /// for an empty `note_commitments`, rather than panicking.
+    pub(crate) fn precompute_append(
+        start_size: u64,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<PrecomputedAppendBatch, NoteCommitmentTreeError> {
+        let nodes: Vec<sapling_crypto::Node> = note_commitments
+            .iter()
+            .map(sapling_crypto::Node::from_cmu)
+            .collect();
+
+        let inner = precompute_append_batch_with_subtree::<_, MERKLE_DEPTH>(start_size, &nodes)?;
+
+        Ok(PrecomputedAppendBatch(inner))
+    }
+
+    /// Applies a [`PrecomputedAppendBatch`] from [`Self::precompute_append`],
+    /// returning any completed [`TRACKED_SUBTREE_HEIGHT`] subtree, exactly like
+    /// [`Self::append_batch`]. `precomputed.start_size()` must equal this tree's
+    /// [`count`](Self::count); a stale precompute returns
+    /// [`NoteCommitmentTreeError::InvalidPrecompute`] (rather than panicking) so
+    /// callers can fall back to [`Self::append_batch`].
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn apply_precomputed_append(
+        &mut self,
+        precomputed: PrecomputedAppendBatch,
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, sapling_crypto::Node)>, NoteCommitmentTreeError>
+    {
+        let (frontier, completed) =
+            apply_append_batch_with_subtree(self.inner.clone(), precomputed.0)?;
+
+        self.inner = frontier;
+        *self
+            .cached_root
+            .get_mut()
+            .expect("a thread that previously held exclusive lock access panicked") = None;
+
+        Ok(completed.map(|(index_value, root)| {
+            let index = NoteCommitmentSubtreeIndex(
+                index_value.try_into().expect("subtree index fits in u16"),
+            );
+            (index, root)
+        }))
+    }
+
+    /// Benchmark-only: precompute the parallel append for `note_commitments`
+    /// (rayon hashing), apply it onto a fresh tree, and return the resulting root.
+    /// Mirrors the committer's precompute path end-to-end so the
+    /// `precompute_threshold` benchmark can compare it against a serial append.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn precompute_then_apply_root(note_commitments: &[NoteCommitmentUpdate]) -> [u8; 32] {
+        let mut tree = NoteCommitmentTree::default();
+        let precomputed =
+            Self::precompute_append(0, note_commitments).expect("non-empty batch in benchmark");
+        tree.apply_precomputed_append(precomputed)
+            .expect("fresh tree matches start size 0");
+        tree.root().into()
     }
 
     /// Returns frontier of non-empty tree, or None.
@@ -804,5 +908,165 @@ mod tests {
         assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
         tree.assert_frontier_eq(&original);
         assert_eq!(tree.root(), original.root());
+    }
+
+    /// The off-committer precompute (`precompute_append` + `apply_precomputed_append`)
+    /// must produce the same frontier, root, and completed-subtree result as the
+    /// inline `append_batch` across a range of tree/batch sizes.
+    #[test]
+    fn precompute_append_matches_append_batch() {
+        let cases = [
+            ("empty tree, one leaf", 0u64, 1usize),
+            ("empty tree, small batch", 0, 5),
+            ("odd tree, small batch", 3, 4),
+            ("power-of-two tree, small batch", 8, 7),
+            ("after power-of-two tree, small batch", 9, 6),
+        ];
+
+        for (name, prefix_len, batch_len) in cases {
+            let start = build_tree(prefix_len);
+            let note_commitments: Vec<_> = (0..batch_len as u64)
+                .map(|value| note_commitment(1_000 + prefix_len + value))
+                .collect();
+
+            let mut inline_tree = start.clone();
+            let _ = inline_tree.root();
+            let inline_result = inline_tree
+                .append_batch(&note_commitments)
+                .expect("inline append succeeds");
+
+            let mut precompute_tree = start;
+            let _ = precompute_tree.root();
+            let precomputed = NoteCommitmentTree::precompute_append(prefix_len, &note_commitments)
+                .expect("precompute succeeds");
+            assert_eq!(precomputed.start_size(), prefix_len, "{name}: start size");
+            let precompute_result = precompute_tree
+                .apply_precomputed_append(precomputed)
+                .expect("apply precompute succeeds");
+
+            assert_eq!(
+                precompute_result, inline_result,
+                "{name}: subtree result mismatch"
+            );
+            precompute_tree.assert_frontier_eq(&inline_tree);
+            assert_eq!(
+                precompute_tree.root(),
+                inline_tree.root(),
+                "{name}: root mismatch"
+            );
+        }
+    }
+
+    /// The precompute path matches inline `append_batch` when the batch crosses the
+    /// first tracked-subtree boundary, including the returned subtree index and root.
+    #[test]
+    fn precompute_append_crosses_subtree_boundary() {
+        let start = pre_subtree_boundary_tree();
+        let note_commitments = [note_commitment(100), note_commitment(200)];
+
+        let mut inline_tree = start.clone();
+        let _ = inline_tree.root();
+        let inline_result = inline_tree
+            .append_batch(&note_commitments)
+            .expect("inline append succeeds");
+        assert!(inline_result.is_some(), "batch crosses a subtree boundary");
+
+        let mut precompute_tree = start;
+        let _ = precompute_tree.root();
+        let start_size = precompute_tree.count();
+        let precomputed = NoteCommitmentTree::precompute_append(start_size, &note_commitments)
+            .expect("precompute succeeds");
+        let precompute_result = precompute_tree
+            .apply_precomputed_append(precomputed)
+            .expect("apply precompute succeeds");
+
+        assert_eq!(precompute_result, inline_result, "subtree result mismatch");
+        precompute_tree.assert_frontier_eq(&inline_tree);
+        assert_eq!(precompute_tree.root(), inline_tree.root(), "root mismatch");
+    }
+
+    /// The committer's size-match guard in `update_sapling_note_commitment_tree_with`:
+    /// a precompute keyed on the wrong tree size must be rejected and fall back to
+    /// inline hashing, so a stale look-ahead can never corrupt the tree — it can only
+    /// lose the speedup. A correctly-keyed precompute and `None` must match inline too.
+    #[test]
+    fn update_with_falls_back_on_size_mismatch() {
+        use crate::parallel::tree::NoteCommitmentTrees;
+        use std::sync::Arc;
+
+        let start = build_tree(9);
+        let note_commitments: Vec<_> = (0..6).map(|value| note_commitment(2_000 + value)).collect();
+
+        // Inline reference.
+        let mut inline_tree = start.clone();
+        let _ = inline_tree.root();
+        let expected_subtree = inline_tree
+            .append_batch(&note_commitments)
+            .expect("inline append succeeds");
+        let expected_root = inline_tree.root();
+
+        let run = |precompute: Option<PrecomputedAppendBatch>| {
+            let base = start.clone();
+            let _ = base.root();
+            let (tree, subtree) = NoteCommitmentTrees::update_sapling_note_commitment_tree_with(
+                Arc::new(base),
+                note_commitments.clone(),
+                precompute,
+            )
+            .expect("update succeeds");
+            (tree.root(), subtree)
+        };
+
+        // No precompute: inline path.
+        assert_eq!(
+            run(None),
+            (expected_root, expected_subtree),
+            "None fallback"
+        );
+
+        // Correctly-keyed precompute (start_size == tree count 9): applies the precomputed subtree roots, same result.
+        let matched = NoteCommitmentTree::precompute_append(9, &note_commitments)
+            .expect("precompute succeeds");
+        assert_eq!(
+            run(Some(matched)),
+            (expected_root, expected_subtree),
+            "matched precompute"
+        );
+
+        // Wrong-keyed precompute (start_size 7 != tree count 9): the guard rejects it
+        // and falls back to inline, still producing the correct tree.
+        let stale = NoteCommitmentTree::precompute_append(7, &note_commitments)
+            .expect("precompute succeeds");
+        assert_eq!(
+            run(Some(stale)),
+            (expected_root, expected_subtree),
+            "stale precompute falls back"
+        );
+    }
+
+    /// The public precompute wrappers report invalid input as a recoverable
+    /// `NoteCommitmentTreeError`, never a panic: an empty batch, and a stale
+    /// precompute applied directly to a mismatched tree.
+    #[test]
+    fn precompute_wrappers_report_invalid_input() {
+        // Empty batch.
+        assert_eq!(
+            NoteCommitmentTree::precompute_append(0, &[]).err(),
+            Some(NoteCommitmentTreeError::InvalidPrecompute),
+            "empty precompute_append is a recoverable error"
+        );
+
+        // Stale precompute applied to a tree of the wrong size.
+        let note_commitments: Vec<_> = (0..4).map(|value| note_commitment(3_000 + value)).collect();
+        let stale = NoteCommitmentTree::precompute_append(5, &note_commitments)
+            .expect("precompute succeeds");
+
+        let mut tree = build_tree(2);
+        let _ = tree.root();
+        assert_eq!(
+            tree.apply_precomputed_append(stale),
+            Err(NoteCommitmentTreeError::InvalidPrecompute),
+            "applying a stale precompute is a recoverable error"
+        );
     }
 }
