@@ -125,9 +125,24 @@ fn merge_complete_subtree<H: Hashable + Clone>(
     }
 }
 
+/// Below this many leaves in a batch, the per-leaf Merkle hashing is done entirely
+/// serially (no rayon at all). Benchmarks (`precompute_threshold`) show that for
+/// small batches the rayon `join`/`par_iter` overhead matches or exceeds the
+/// hashing it parallelizes — the crossover is ~16 note commitments for both
+/// Sapling Pedersen and Orchard Sinsemilla — so gating below it avoids paying for
+/// parallelism that does not buy anything on the common small/empty blocks.
+///
+/// This gates the *whole-batch* decision only. Above it, the per-chunk reduction
+/// still splits all the way down (see [`perfect_subtree_root`]): the largest chunk
+/// of a medium batch benefits from internal parallelism, so capping the split
+/// granularity here would instead *serialize* that chunk and regress medium
+/// batches.
+pub(crate) const PARALLEL_HASH_THRESHOLD: usize = 16;
+
 /// Computes the root of a perfect subtree of exactly `2^k` `leaves`, using a
-/// parallel divide-and-conquer reduction. The combine hashes within and across
-/// the two halves are independent, so this scales across the rayon pool.
+/// parallel divide-and-conquer reduction across the rayon pool. The combine hashes
+/// within and across the two halves are independent, so this scales across cores.
+/// Used for large batches; small batches use [`perfect_subtree_root_serial`].
 fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
     debug_assert!(leaves.len().is_power_of_two());
     if leaves.len() == 1 {
@@ -142,6 +157,23 @@ fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
         || perfect_subtree_root(right),
     );
     H::combine(child_level, &l, &r)
+}
+
+/// Serial reduction of a perfect subtree of exactly `2^k` `leaves`, with no rayon
+/// overhead. Used for small batches (see [`PARALLEL_HASH_THRESHOLD`]).
+fn perfect_subtree_root_serial<H: Hashable + Clone>(leaves: &[H]) -> H {
+    debug_assert!(leaves.len().is_power_of_two());
+    if leaves.len() == 1 {
+        return leaves[0].clone();
+    }
+    let half = leaves.len() / 2;
+    let child_level = Level::from(half.trailing_zeros() as u8);
+    let (left, right) = leaves.split_at(half);
+    H::combine(
+        child_level,
+        &perfect_subtree_root_serial(left),
+        &perfect_subtree_root_serial(right),
+    )
 }
 
 /// Returns true if the leaves before the frontier tip include a complete
@@ -435,10 +467,20 @@ where
     let tip_leaf = tip_leaf.clone();
 
     let chunks = complete_subtree_chunks(start_position, leaves_to_merge);
-    let chunk_roots: Vec<(usize, H)> = chunks
-        .into_par_iter()
-        .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
-        .collect();
+    // Small batches hash entirely serially (no rayon); larger batches fan the chunks
+    // out across the pool and split each chunk down to the leaves. See
+    // [`PARALLEL_HASH_THRESHOLD`].
+    let chunk_roots: Vec<(usize, H)> = if leaves_to_merge.len() <= PARALLEL_HASH_THRESHOLD {
+        chunks
+            .into_iter()
+            .map(|(level, leaves)| (level, perfect_subtree_root_serial(leaves)))
+            .collect()
+    } else {
+        chunks
+            .into_par_iter()
+            .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
+            .collect()
+    };
 
     Ok(PrecomputedAppend {
         start_position,

@@ -6,7 +6,9 @@ use thiserror::Error;
 
 use crate::{
     block::Block,
-    orchard, sapling, sprout,
+    orchard,
+    parallel::batch_frontier::PARALLEL_HASH_THRESHOLD,
+    sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
 };
 
@@ -322,35 +324,43 @@ impl BlockNotePrecompute {
     /// The Sapling and Orchard precomputes run concurrently via [`rayon::join`],
     /// mirroring the per-pool parallelism of [`NoteCommitmentTrees::update_trees_parallel`]:
     /// each pool's hashing is already internally parallel, and the join lets the two
-    /// pools overlap instead of hashing one fully before the other.
+    /// pools overlap instead of hashing one fully before the other. For small blocks
+    /// (both pools below [`PARALLEL_HASH_THRESHOLD`]) the two pools are computed
+    /// sequentially, since there is too little hashing to repay the cross-pool join.
     pub fn compute(sapling_start: u64, orchard_start: u64, block: &Block) -> Self {
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
 
-        let (sapling, orchard) = rayon::join(
-            || {
-                (!sapling_notes.is_empty())
-                    .then(|| {
-                        sapling::tree::NoteCommitmentTree::precompute_append(
-                            sapling_start,
-                            &sapling_notes,
-                        )
-                        .ok()
-                    })
-                    .flatten()
-            },
-            || {
-                (!orchard_notes.is_empty())
-                    .then(|| {
-                        orchard::tree::NoteCommitmentTree::precompute_append(
-                            orchard_start,
-                            &orchard_notes,
-                        )
-                        .ok()
-                    })
-                    .flatten()
-            },
-        );
+        let sapling_fn = || {
+            (!sapling_notes.is_empty())
+                .then(|| {
+                    sapling::tree::NoteCommitmentTree::precompute_append(
+                        sapling_start,
+                        &sapling_notes,
+                    )
+                    .ok()
+                })
+                .flatten()
+        };
+        let orchard_fn = || {
+            (!orchard_notes.is_empty())
+                .then(|| {
+                    orchard::tree::NoteCommitmentTree::precompute_append(
+                        orchard_start,
+                        &orchard_notes,
+                    )
+                    .ok()
+                })
+                .flatten()
+        };
+
+        let overlap_pools = sapling_notes.len() >= PARALLEL_HASH_THRESHOLD
+            || orchard_notes.len() >= PARALLEL_HASH_THRESHOLD;
+        let (sapling, orchard) = if overlap_pools {
+            rayon::join(sapling_fn, orchard_fn)
+        } else {
+            (sapling_fn(), orchard_fn())
+        };
 
         Self { sapling, orchard }
     }

@@ -541,6 +541,21 @@ impl NoteCommitmentTree {
         }))
     }
 
+    /// Benchmark-only: precompute the parallel append for `note_commitments`
+    /// (rayon hashing), graft it onto a fresh tree, and return the resulting root.
+    /// Mirrors the committer's precompute path end-to-end so the
+    /// `precompute_threshold` benchmark can compare it against a serial append.
+    #[cfg(feature = "bench")]
+    #[doc(hidden)]
+    pub fn precompute_then_graft_root(note_commitments: &[NoteCommitmentUpdate]) -> [u8; 32] {
+        let mut tree = NoteCommitmentTree::default();
+        let precomputed =
+            Self::precompute_append(0, note_commitments).expect("non-empty batch in benchmark");
+        tree.apply_precomputed_append(precomputed)
+            .expect("fresh tree matches start size 0");
+        tree.root().into()
+    }
+
     /// Returns frontier of non-empty tree, or `None` if the tree is empty.
     fn frontier(&self) -> Option<&NonEmptyFrontier<Node>> {
         self.inner.value()
