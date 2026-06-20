@@ -8,7 +8,7 @@ use std::sync::{
 use thiserror::Error;
 
 use crate::{
-    block::Block,
+    block::{self, Block},
     orchard,
     parallel::batch_frontier::PARALLEL_HASH_THRESHOLD,
     sapling, sprout,
@@ -98,9 +98,15 @@ impl NoteCommitmentTrees {
         let sapling_note_commitments: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_note_commitments: Vec<_> = block.orchard_note_commitments().cloned().collect();
 
+        // Only use the precompute if it was computed for this exact block. A
+        // precompute is otherwise keyed only by starting tree size, so without this
+        // check one accidentally paired with a different block of the same starting
+        // size would apply the wrong leaves and silently produce a wrong root. A
+        // mismatch (or `None`) falls back to inline hashing, which is correct, just
+        // slower — so this can only cost speed, never correctness.
         let (sapling_precompute, orchard_precompute) = match precompute {
-            Some(p) => (p.sapling, p.orchard),
-            None => (None, None),
+            Some(p) if p.block_hash == block.hash() => (p.sapling, p.orchard),
+            _ => (None, None),
         };
 
         let mut sprout_result = None;
@@ -306,8 +312,14 @@ impl NoteCommitmentTrees {
 /// The off-committer precomputed parallel-append work for one block's Sapling and
 /// Orchard note commitments, produced by [`BlockNotePrecompute::compute`] and applied
 /// via [`NoteCommitmentTrees::update_trees_parallel_with`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BlockNotePrecompute {
+    /// The hash of the block this precompute was computed for. The committer
+    /// applies the precompute only to this exact block, so a precompute that was
+    /// accidentally paired with a different block (even one with the same starting
+    /// tree size) is rejected instead of applying the wrong leaves. See
+    /// [`NoteCommitmentTrees::update_trees_parallel_with`].
+    pub(crate) block_hash: block::Hash,
     /// Precomputed Sapling append, if the block has Sapling outputs.
     pub(crate) sapling: Option<sapling::tree::PrecomputedAppendBatch>,
     /// Precomputed Orchard append, if the block has Orchard actions.
@@ -347,8 +359,14 @@ impl BlockNotePrecompute {
         block: &Block,
         cancel: &AtomicBool,
     ) -> Self {
+        let block_hash = block.hash();
+
         if cancel.load(Ordering::Relaxed) {
-            return Self::default();
+            return Self {
+                block_hash,
+                sapling: None,
+                orchard: None,
+            };
         }
 
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
@@ -375,7 +393,11 @@ impl BlockNotePrecompute {
             (sapling_fn(), orchard_fn())
         };
 
-        Self { sapling, orchard }
+        Self {
+            block_hash,
+            sapling,
+            orchard,
+        }
     }
 }
 
@@ -416,6 +438,75 @@ mod tests {
         assert!(
             cancelled.sapling.is_none() && cancelled.orchard.is_none(),
             "a cancelled precompute does no work"
+        );
+    }
+
+    /// A precompute is bound to the block it was computed for: applying one built for
+    /// a *different* block — even with the same starting tree size, which the
+    /// size-only guard would have accepted — must be rejected and fall back to inline
+    /// hashing, so it can never silently graft the wrong block's leaves.
+    #[test]
+    fn precompute_is_bound_to_its_block() {
+        let _init_guard = zebra_test::init();
+
+        // Two distinct blocks that both add Sapling notes.
+        let candidates: [&[u8]; 6] = [
+            zebra_test::vectors::BLOCK_MAINNET_1687106_BYTES.as_slice(),
+            zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+            zebra_test::vectors::BLOCK_MAINNET_1687108_BYTES.as_slice(),
+            zebra_test::vectors::BLOCK_MAINNET_1687113_BYTES.as_slice(),
+            zebra_test::vectors::BLOCK_MAINNET_1687118_BYTES.as_slice(),
+            zebra_test::vectors::BLOCK_MAINNET_1687121_BYTES.as_slice(),
+        ];
+        let sapling_blocks: Vec<Block> = candidates
+            .iter()
+            .map(|bytes| Block::zcash_deserialize(*bytes).expect("block vector deserializes"))
+            .filter(|block| block.sapling_note_commitments().next().is_some())
+            .collect();
+        assert!(
+            sapling_blocks.len() >= 2,
+            "need two distinct Sapling blocks for this test"
+        );
+
+        let block_a = Arc::new(sapling_blocks[0].clone());
+        let block_b = sapling_blocks[1].clone();
+        assert_ne!(block_a.hash(), block_b.hash(), "blocks must differ");
+
+        // The correct trees for committing block A onto the genesis trees.
+        let mut correct = NoteCommitmentTrees::default();
+        correct
+            .update_trees_parallel(&block_a)
+            .expect("appending block A's notes succeeds");
+
+        // A precompute built for block B at the same starting tree size (0) as A: its
+        // `start_size` matches A's tree, so the size-only guard would have applied B's
+        // leaves. The block-hash binding must reject it instead.
+        let pre_b = BlockNotePrecompute::compute(0, 0, &block_b, &AtomicBool::new(false));
+        assert!(
+            pre_b.sapling.is_some(),
+            "block B exercises the Sapling pool"
+        );
+
+        let mut mismatched = NoteCommitmentTrees::default();
+        mismatched
+            .update_trees_parallel_with(&block_a, Some(pre_b))
+            .expect("update succeeds");
+        assert_eq!(
+            mismatched.sapling.root(),
+            correct.sapling.root(),
+            "a precompute for a different block must be rejected, not grafted"
+        );
+
+        // The correctly-bound precompute for A is still applied and matches.
+        let pre_a = BlockNotePrecompute::compute(0, 0, &block_a, &AtomicBool::new(false));
+        let mut matched = NoteCommitmentTrees::default();
+        matched
+            .update_trees_parallel_with(&block_a, Some(pre_a))
+            .expect("update succeeds");
+        assert_eq!(
+            matched.sapling.root(),
+            correct.sapling.root(),
+            "a precompute bound to this block is applied"
         );
     }
 }
