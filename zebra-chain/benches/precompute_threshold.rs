@@ -60,7 +60,7 @@ fn bench_orchard(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", count), &notes, |b, notes| {
-            b.iter(|| black_box(OrchardTree::precompute_then_graft_root(black_box(notes))))
+            b.iter(|| black_box(OrchardTree::precompute_then_apply_root(black_box(notes))))
         });
     }
 
@@ -85,7 +85,7 @@ fn bench_sapling(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", count), &notes, |b, notes| {
-            b.iter(|| black_box(SaplingTree::precompute_then_graft_root(black_box(notes))))
+            b.iter(|| black_box(SaplingTree::precompute_then_apply_root(black_box(notes))))
         });
     }
 

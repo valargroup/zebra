@@ -75,29 +75,43 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 });
 
 /// Spawns the note-commitment tree per-leaf hashing for `block` onto the
-/// commit-compute pool, returning a receiver for the result.
+/// commit-compute pool, returning a receiver for the result and a cancellation
+/// flag.
 ///
 /// The off-committer half of the tree-update pipeline: the finalized write loop
 /// starts this for the *next* block — using the running tree sizes `sapling_start`
 /// / `orchard_start` (the tree `count`s the block will commit at) — so the heavy
 /// hashing overlaps the *current* block's commit on otherwise idle cores. The
-/// committer then only grafts. If the precompute is stale (its `start_size` no
+/// committer then only applies the precomputed subtree roots. If the precompute is stale (its `start_size` no
 /// longer matches the tree), the committer falls back to inline hashing, so this
 /// is purely a scheduling optimization.
+///
+/// Because it is started speculatively before the current block has committed, the
+/// caller must keep the returned flag and set it if it discards the precompute —
+/// e.g. when the current block's commit fails. The spawned task checks the flag
+/// between the Sapling and Orchard pools and stops early, so a discarded child does
+/// not keep hashing both pools.
 pub(crate) fn spawn_note_precompute(
     sapling_start: u64,
     orchard_start: u64,
     block: Arc<block::Block>,
-) -> crossbeam_channel::Receiver<BlockNotePrecompute> {
+) -> (
+    crossbeam_channel::Receiver<BlockNotePrecompute>,
+    Arc<AtomicBool>,
+) {
     let (tx, rx) = crossbeam_channel::bounded(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task_cancel = cancel.clone();
     COMMIT_COMPUTE_POOL.spawn(move || {
-        let _ = tx.send(BlockNotePrecompute::compute(
-            sapling_start,
-            orchard_start,
-            &block,
-        ));
+        let result =
+            BlockNotePrecompute::compute(sapling_start, orchard_start, &block, &task_cancel);
+        // If the precompute was cancelled, the receiver has been (or is being)
+        // dropped and the result is unwanted; skip the send.
+        if !task_cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(result);
+        }
     });
-    rx
+    (rx, cancel)
 }
 
 pub mod column_family;
@@ -665,7 +679,7 @@ impl FinalizedState {
                             });
 
                             // `note_precompute`, if present and still size-matched,
-                            // lets the committer graft the precomputed subtree roots
+                            // lets the committer apply the precomputed subtree roots
                             // instead of re-hashing the notes here; else hashes inline.
                             timed_commit_phase!(
                                 "zebra.state.write.update_trees.duration_seconds",

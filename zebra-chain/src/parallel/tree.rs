@@ -1,14 +1,15 @@
 //! Parallel note commitment tree update methods.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use thiserror::Error;
 
 use crate::{
     block::Block,
-    orchard,
-    parallel::batch_frontier::PARALLEL_HASH_THRESHOLD,
-    sapling, sprout,
+    orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
 };
 
@@ -69,7 +70,7 @@ impl NoteCommitmentTrees {
     ///
     /// The Sapling/Orchard per-leaf Merkle hashing is the dominant cost of
     /// committing a shielded block; precomputing it concurrently (keyed only on the
-    /// note position) lets the committer do just the cheap graft. A `None` or
+    /// note position) lets the committer do just the cheap apply the precomputed subtree roots. A `None` or
     /// size-mismatched precompute transparently falls back to hashing inline, so the
     /// result is always identical to the plain update.
     #[allow(clippy::unwrap_in_result)]
@@ -316,52 +317,93 @@ impl BlockNotePrecompute {
     /// given the tree sizes (cumulative note counts) the block will commit at.
     ///
     /// Runs off the committer, concurrently across blocks. The committer then only
-    /// grafts. `sapling_start` / `orchard_start` are the respective tree `count`s
+    /// applies the precomputed subtree roots. `sapling_start` / `orchard_start` are the respective tree `count`s
     /// immediately before this block; the committer re-checks them and falls back to
     /// inline hashing on any mismatch. Pools with no notes (or a precompute error)
     /// are left `None`, also falling back to inline.
     ///
-    /// The Sapling and Orchard precomputes run concurrently via [`rayon::join`],
-    /// mirroring the per-pool parallelism of [`NoteCommitmentTrees::update_trees_parallel`]:
-    /// each pool's hashing is already internally parallel, and the join lets the two
-    /// pools overlap instead of hashing one fully before the other. For small blocks
-    /// (both pools below [`PARALLEL_HASH_THRESHOLD`]) the two pools are computed
-    /// sequentially, since there is too little hashing to repay the cross-pool join.
-    pub fn compute(sapling_start: u64, orchard_start: u64, block: &Block) -> Self {
+    /// # Cancellation
+    ///
+    /// This is started speculatively for the *next* block while the *current* block
+    /// is still committing, so a failed or invalid current block leaves the work
+    /// unwanted (the committer drops the receiver). `cancel` lets the writer abort
+    /// it: the two pools are hashed sequentially — each is still internally parallel
+    /// across the rayon pool — so the flag is checked between them, and a cancel that
+    /// arrives while the in-flight parent commit fails skips the Orchard hashing.
+    /// This bounds the wasted work for a discarded child to at most one pool instead
+    /// of hashing both. A cancelled call returns an empty precompute, which the
+    /// committer treats like any other miss and hashes inline.
+    pub fn compute(
+        sapling_start: u64,
+        orchard_start: u64,
+        block: &Block,
+        cancel: &AtomicBool,
+    ) -> Self {
+        if cancel.load(Ordering::Relaxed) {
+            return Self::default();
+        }
+
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
+        let sapling = (!sapling_notes.is_empty())
+            .then(|| {
+                sapling::tree::NoteCommitmentTree::precompute_append(sapling_start, &sapling_notes)
+                    .ok()
+            })
+            .flatten();
+
+        if cancel.load(Ordering::Relaxed) {
+            return Self::default();
+        }
+
         let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
-
-        let sapling_fn = || {
-            (!sapling_notes.is_empty())
-                .then(|| {
-                    sapling::tree::NoteCommitmentTree::precompute_append(
-                        sapling_start,
-                        &sapling_notes,
-                    )
+        let orchard = (!orchard_notes.is_empty())
+            .then(|| {
+                orchard::tree::NoteCommitmentTree::precompute_append(orchard_start, &orchard_notes)
                     .ok()
-                })
-                .flatten()
-        };
-        let orchard_fn = || {
-            (!orchard_notes.is_empty())
-                .then(|| {
-                    orchard::tree::NoteCommitmentTree::precompute_append(
-                        orchard_start,
-                        &orchard_notes,
-                    )
-                    .ok()
-                })
-                .flatten()
-        };
-
-        let overlap_pools = sapling_notes.len() >= PARALLEL_HASH_THRESHOLD
-            || orchard_notes.len() >= PARALLEL_HASH_THRESHOLD;
-        let (sapling, orchard) = if overlap_pools {
-            rayon::join(sapling_fn, orchard_fn)
-        } else {
-            (sapling_fn(), orchard_fn())
-        };
+            })
+            .flatten();
 
         Self { sapling, orchard }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serialization::ZcashDeserialize;
+
+    /// A precompute started speculatively for the next block is cancellable: when
+    /// the writer trips the flag (because the current block's commit failed and the
+    /// child will be discarded), `compute` returns an empty precompute instead of
+    /// hashing the block. Uses a real NU5 block with Sapling notes; the flag check
+    /// is identical for the Orchard pool.
+    #[test]
+    fn block_note_precompute_respects_cancellation() {
+        let _init_guard = zebra_test::init();
+
+        let block =
+            Block::zcash_deserialize(zebra_test::vectors::BLOCK_MAINNET_1687106_BYTES.as_slice())
+                .expect("hard-coded NU5 block vector deserializes");
+
+        // Precondition: the block exercises the Sapling pool.
+        assert!(
+            block.sapling_note_commitments().next().is_some(),
+            "test block must have Sapling notes"
+        );
+
+        // Not cancelled: the Sapling pool is precomputed.
+        let live = BlockNotePrecompute::compute(0, 0, &block, &AtomicBool::new(false));
+        assert!(
+            live.sapling.is_some(),
+            "a live precompute hashes the populated pool"
+        );
+
+        // Cancelled before it runs: no hashing, an empty precompute the committer
+        // treats as a miss (hashing inline instead).
+        let cancelled = BlockNotePrecompute::compute(0, 0, &block, &AtomicBool::new(true));
+        assert!(
+            cancelled.sapling.is_none() && cancelled.orchard.is_none(),
+            "a cancelled precompute does no work"
+        );
     }
 }

@@ -3,7 +3,10 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -37,6 +40,25 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
+
+/// A speculatively-started note-commitment precompute for an upcoming finalized
+/// block: the block hash it was started for, the channel to receive the result on,
+/// and a flag to cancel it if the block is no longer going to be committed.
+type PendingPrecompute = (
+    block::Hash,
+    crossbeam_channel::Receiver<BlockNotePrecompute>,
+    Arc<AtomicBool>,
+);
+
+/// Cancels and drops a pending look-ahead precompute, if any.
+///
+/// Tripping the flag tells the spawned task (started before the current block
+/// committed) to stop instead of hashing a block that will not be committed.
+fn cancel_pending_precompute(pending: &mut Option<PendingPrecompute>) {
+    if let Some((_hash, _rx, cancel)) = pending.take() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// The maximum size of the parent error map.
 ///
@@ -324,14 +346,19 @@ impl WriteBlockWorkerTask {
 
         // One-block look-ahead so the next block's note-commitment tree hashing can
         // be precomputed off the committer (on idle cores) while the current block
-        // commits. `pending_precompute` holds the receiver for the block started last
-        // iteration; `finalized_lookahead` buffers the peeked next block. The
-        // precompute is keyed on the running tree sizes and only applied if those
-        // still match at commit time, so this never affects correctness, only speed.
-        let mut pending_precompute: Option<(
-            block::Hash,
-            crossbeam_channel::Receiver<BlockNotePrecompute>,
-        )> = None;
+        // commits. `pending_precompute` holds the receiver and cancellation flag for
+        // the block started last iteration; `finalized_lookahead` buffers the peeked
+        // next block. The precompute is keyed on the running tree sizes and only
+        // applied if those still match at commit time, so this never affects
+        // correctness, only speed.
+        //
+        // Because the next block's precompute is started before the current block
+        // commits, a current block that fails to commit (e.g. an invalid block from
+        // a peer) leaves that speculative work unwanted. Whenever this loop discards
+        // a pending precompute it trips the cancellation flag via
+        // [`cancel_pending_precompute`], so the spawned task stops instead of hashing
+        // a block that will never be committed.
+        let mut pending_precompute: Option<PendingPrecompute> = None;
         let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
 
         // Write all the finalized blocks sent by the state,
@@ -392,9 +419,10 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
-                // The pipeline is broken; drop any look-ahead so the next precompute
-                // re-seeds from the real tip (a stale precompute just falls back).
-                pending_precompute = None;
+                // The pipeline is broken; cancel and drop any look-ahead so the next
+                // precompute re-seeds from the real tip (a stale precompute would
+                // only fall back anyway, but cancelling stops the wasted hashing).
+                cancel_pending_precompute(&mut pending_precompute);
                 finalized_lookahead.clear();
 
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
@@ -403,10 +431,15 @@ impl WriteBlockWorkerTask {
             }
 
             // Use the precompute for this block if we started it last iteration and
-            // it is for this exact block; otherwise the committer hashes inline.
+            // it is for this exact block; otherwise cancel it (so the spawned task
+            // stops) and let the committer hash inline.
             let note_precompute = match pending_precompute.take() {
-                Some((hash, rx)) if hash == ordered_block.0.hash => rx.recv().ok(),
-                _ => None,
+                Some((hash, rx, _cancel)) if hash == ordered_block.0.hash => rx.recv().ok(),
+                Some((_hash, _rx, cancel)) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    None
+                }
+                None => None,
             };
 
             // Peek the next block and start its precompute, so the heavy hashing
@@ -426,8 +459,9 @@ impl WriteBlockWorkerTask {
                     trees.sapling.count() + block.sapling_note_commitments().count() as u64;
                 let orchard_start =
                     trees.orchard.count() + block.orchard_note_commitments().count() as u64;
-                let rx = spawn_note_precompute(sapling_start, orchard_start, next.0.block.clone());
-                pending_precompute = Some((next.0.hash, rx));
+                let (rx, cancel) =
+                    spawn_note_precompute(sapling_start, orchard_start, next.0.block.clone());
+                pending_precompute = Some((next.0.hash, rx, cancel));
             }
 
             // Try committing the block
@@ -445,9 +479,10 @@ impl WriteBlockWorkerTask {
                     let finalized_tip = finalized_state.db.tip();
 
                     // The commit failed and the queue is being reset, so any
-                    // look-ahead precompute is stale: drop it (it would only fall
-                    // back to inline hashing anyway).
-                    pending_precompute = None;
+                    // look-ahead precompute is for a block that will not be
+                    // committed: cancel it so the spawned task stops instead of
+                    // hashing the discarded child, and clear the look-ahead.
+                    cancel_pending_precompute(&mut pending_precompute);
                     finalized_lookahead.clear();
 
                     // The last block in the queue failed, so we can't commit the next block.

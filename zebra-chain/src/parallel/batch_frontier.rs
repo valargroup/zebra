@@ -419,14 +419,14 @@ where
     }
 }
 
-// --- Off-committer precompute / graft split ---------------------------------
+// --- Off-committer precompute / apply_precompute split ---------------------------------
 //
 // [`parallel_append`] does two things: it hashes the new leaves into complete
 // subtree roots (the dominant cost on heavy shielded blocks), and it merges
 // those roots onto the existing frontier. The hashing depends only on the
 // starting leaf *position*, not on the frontier's hashes, so it can run ahead of
 // the committer, concurrently across many blocks. [`precompute_subtree_roots`]
-// does that hashing; [`graft`] does the cheap merge on the committer. Their
+// does that hashing; [`apply_precompute`] does the cheap merge on the committer. Their
 // composition is byte-identical to [`parallel_append`] (differential proptests).
 
 /// The position-independent result of appending a run of `num_leaves` leaves
@@ -434,7 +434,7 @@ where
 /// parallel-hashed complete subtree roots, plus the last (raw tip) leaf.
 #[derive(Clone, Debug)]
 pub(crate) struct PrecomputedAppend<H> {
-    /// Tree size (next leaf position) this was hashed against. [`graft`] must be
+    /// Tree size (next leaf position) this was hashed against. [`apply_precompute`] must be
     /// applied to a frontier of exactly this size.
     start_position: u64,
     /// Number of leaves in the run (>= 1).
@@ -442,13 +442,13 @@ pub(crate) struct PrecomputedAppend<H> {
     /// `(level, root)` for each complete subtree chunk of the first
     /// `num_leaves - 1` leaves, in ascending position order.
     chunk_roots: Vec<(usize, H)>,
-    /// The last leaf, which becomes the grafted frontier's raw tip.
+    /// The last leaf, which becomes the applied frontier's raw tip.
     tip_leaf: H,
 }
 
 /// Hashes the complete subtree roots for appending `new_leaves` to a tree of size
 /// `start_position`, in parallel. The expensive, position-independent half of
-/// [`parallel_append`]; pair with [`graft`].
+/// [`parallel_append`]; pair with [`apply_precompute`].
 ///
 /// Returns [`BatchFrontierError::EmptyBatch`] if `new_leaves` is empty: the
 /// precompute represents a non-empty append (its tip is the last leaf), so an
@@ -497,7 +497,7 @@ where
 /// compare and recompute via [`parallel_append`] on mismatch, so a mismatch here
 /// is reported as a recoverable [`BatchFrontierError::PrecomputeStartMismatch`]
 /// (a stale precompute must not panic the process).
-pub(crate) fn graft<H, const DEPTH: u8>(
+pub(crate) fn apply_precompute<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     precomputed: PrecomputedAppend<H>,
 ) -> Result<Frontier<H, DEPTH>, BatchFrontierError>
@@ -630,21 +630,21 @@ where
     use crate::subtree::TRACKED_SUBTREE_HEIGHT;
 
     match precomputed.inner {
-        PrecomputedSubtreeKind::Single(pre) => Ok((graft(frontier, pre)?, None)),
+        PrecomputedSubtreeKind::Single(pre) => Ok((apply_precompute(frontier, pre)?, None)),
         PrecomputedSubtreeKind::Boundary {
             head,
             tail,
             index_value,
         } => {
-            let f1 = graft(frontier, head)?;
-            // The boundary subtree root needs the grafted head, so it is computed
+            let f1 = apply_precompute(frontier, head)?;
+            // The boundary subtree root needs the applied head, so it is computed
             // here on the committer (rare: once per 2^16 leaves).
             let root = f1
                 .value()
                 .expect("just appended at least one leaf")
                 .root(Some(Level::from(TRACKED_SUBTREE_HEIGHT)));
             let f2 = match tail {
-                Some(tail) => graft(f1, tail)?,
+                Some(tail) => apply_precompute(f1, tail)?,
                 None => f1,
             };
             Ok((f2, Some((index_value, root))))
@@ -847,11 +847,11 @@ mod tests {
         }
 
         /// The off-committer split: precompute the subtree roots keyed only on the
-        /// starting leaf *count* (no frontier hashes), then graft onto the real
+        /// starting leaf *count* (no frontier hashes), then apply the precomputed subtree roots onto the real
         /// frontier. Must be byte-identical to the sequential append, proving the
         /// precompute can run ahead of the committer using just the note position.
         #[test]
-        fn precompute_then_graft_matches_sequential(
+        fn precompute_then_apply_precompute_matches_sequential(
             prefix_len in 0usize..300,
             batch in proptest::collection::vec(any::<u64>().prop_map(TestNode), 1..300),
         ) {
@@ -864,17 +864,17 @@ mod tests {
             prop_assert_eq!(precomputed.start_position, prefix_len as u64);
 
             let seq = sequential_append::<DEPTH>(start.clone(), &batch);
-            let grafted = graft(start, precomputed).expect("no overflow in tests");
+            let applied = apply_precompute(start, precomputed).expect("no overflow in tests");
 
-            prop_assert_eq!(seq.root(), grafted.root(), "root mismatch");
+            prop_assert_eq!(seq.root(), applied.root(), "root mismatch");
             prop_assert_eq!(
                 seq.value().map(|f| f.clone().into_parts()),
-                grafted.value().map(|f| f.clone().into_parts()),
+                applied.value().map(|f| f.clone().into_parts()),
                 "frontier parts mismatch"
             );
         }
 
-        /// The precomputed batch-with-subtree path (off-committer precompute + graft)
+        /// The precomputed batch-with-subtree path (off-committer precompute + apply_precompute)
         /// must produce the same frontier AND the same completed-subtree result as
         /// the inline `append_batch_with_subtree`, across the tracked-subtree boundary.
         #[test]
@@ -974,7 +974,7 @@ mod tests {
 
     /// A caller-supplied `start_size` near `u64::MAX` must report a clean capacity
     /// error rather than wrapping past the `MAX_LEAVES` check (which would build an
-    /// inconsistent precompute and panic in `graft`, or panic on overflow in debug
+    /// inconsistent precompute and panic in `apply_precompute`, or panic on overflow in debug
     /// builds).
     #[test]
     fn precompute_start_size_overflow_is_reported() {
@@ -1026,10 +1026,10 @@ mod tests {
         );
     }
 
-    /// Grafting a precompute onto a frontier of the wrong size is a recoverable
+    /// Applying a precompute onto a frontier of the wrong size is a recoverable
     /// error, not a panic, so a stale look-ahead can never crash the process.
     #[test]
-    fn graft_size_mismatch_is_reported() {
+    fn apply_precompute_size_mismatch_is_reported() {
         let batch = [TestNode(1), TestNode(2), TestNode(3)];
         // Precompute is keyed on tree size 5.
         let precomputed = precompute_subtree_roots(5, &batch).expect("non-empty batch");
@@ -1037,12 +1037,12 @@ mod tests {
         // Apply it to a frontier of size 2 (a different starting size).
         let frontier = build_frontier::<DEPTH>(&[TestNode(10), TestNode(11)]);
         assert_eq!(
-            graft(frontier, precomputed).err(),
+            apply_precompute(frontier, precomputed).err(),
             Some(BatchFrontierError::PrecomputeStartMismatch {
                 expected: 5,
                 found: 2,
             }),
-            "graft reports a size mismatch instead of panicking"
+            "apply_precompute reports a size mismatch instead of panicking"
         );
     }
 
