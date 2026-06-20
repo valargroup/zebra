@@ -112,6 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Limit RocksDB write-ahead logs to 4 GiB in the finalized state database. Heavy
   sync could otherwise accumulate tens of GiB of WAL files, making restarts spend
   minutes replaying logs before Zebra could resume syncing.
+- Precompute note-commitment tree hashing ahead of the finalized committer. The
+  per-leaf Merkle hashing for a block (the dominant committer cost on shielded
+  blocks) depends only on the starting note count, not the frontier's hashes, so
+  the finalized write loop now does a one-block look-ahead and runs the next
+  block's Sapling/Orchard hashing on idle cores while the current block commits;
+  the committer then only applies the precomputed subtree roots onto the frontier
+  (`update_trees_parallel_with` in `zebra-chain`). The precompute is applied only
+  if its starting tree size still matches at commit time and otherwise falls back
+  to inline hashing, so it affects only speed, never the resulting tree. This cuts
+  the committer's tree-update cost by ~54% (12.5 → 5.7 ms/block) where the
+  committer is the bottleneck.
 
 ### Changed
 
