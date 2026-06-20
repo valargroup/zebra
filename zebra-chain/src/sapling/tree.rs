@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use crate::{
     parallel::batch_frontier::{
-        apply_append_batch_with_subtree, precompute_append_batch_with_subtree,
+        apply_append_batch_with_subtree, precompute_append_batch_with_subtree, BatchFrontierError,
         PrecomputedSubtreeAppend,
     },
     serialization::{
@@ -163,6 +163,25 @@ impl ZcashDeserialize for Root {
 pub enum NoteCommitmentTreeError {
     #[error("The note commitment tree is full")]
     FullTree,
+
+    #[error("Invalid precompute: empty batch, stale start size, or multi-subtree batch")]
+    InvalidPrecompute,
+}
+
+impl From<BatchFrontierError> for NoteCommitmentTreeError {
+    fn from(error: BatchFrontierError) -> Self {
+        match error {
+            // A capacity overflow is the tree being full.
+            BatchFrontierError::Frontier(_) => NoteCommitmentTreeError::FullTree,
+            // The remaining variants are caller-supplied precompute misuse, which
+            // is reported as a recoverable error rather than panicking.
+            BatchFrontierError::BatchSpansMultipleSubtrees
+            | BatchFrontierError::EmptyBatch
+            | BatchFrontierError::PrecomputeStartMismatch { .. } => {
+                NoteCommitmentTreeError::InvalidPrecompute
+            }
+        }
+    }
 }
 
 /// Sapling Incremental Note Commitment Tree.
@@ -286,7 +305,8 @@ impl NoteCommitmentTree {
     /// shielded block) using only the starting leaf *count*, so it can run
     /// concurrently ahead of the committer. Apply with
     /// [`Self::apply_precomputed_append`] on a tree whose [`count`](Self::count)
-    /// equals `start_size`. `note_commitments` must be non-empty.
+    /// equals `start_size`. Returns [`NoteCommitmentTreeError::InvalidPrecompute`]
+    /// for an empty `note_commitments`, rather than panicking.
     pub(crate) fn precompute_append(
         start_size: u64,
         note_commitments: &[NoteCommitmentUpdate],
@@ -296,8 +316,7 @@ impl NoteCommitmentTree {
             .map(sapling_crypto::Node::from_cmu)
             .collect();
 
-        let inner = precompute_append_batch_with_subtree::<_, MERKLE_DEPTH>(start_size, &nodes)
-            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+        let inner = precompute_append_batch_with_subtree::<_, MERKLE_DEPTH>(start_size, &nodes)?;
 
         Ok(PrecomputedAppendBatch(inner))
     }
@@ -305,7 +324,9 @@ impl NoteCommitmentTree {
     /// Applies a [`PrecomputedAppendBatch`] from [`Self::precompute_append`],
     /// returning any completed [`TRACKED_SUBTREE_HEIGHT`] subtree, exactly like
     /// [`Self::append_batch`]. `precomputed.start_size()` must equal this tree's
-    /// [`count`](Self::count); callers fall back to [`Self::append_batch`] on mismatch.
+    /// [`count`](Self::count); a stale precompute returns
+    /// [`NoteCommitmentTreeError::InvalidPrecompute`] (rather than panicking) so
+    /// callers can fall back to [`Self::append_batch`].
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn apply_precomputed_append(
         &mut self,
@@ -313,8 +334,7 @@ impl NoteCommitmentTree {
     ) -> Result<Option<(NoteCommitmentSubtreeIndex, sapling_crypto::Node)>, NoteCommitmentTreeError>
     {
         let (frontier, completed) =
-            apply_append_batch_with_subtree(self.inner.clone(), precomputed.0)
-                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+            apply_append_batch_with_subtree(self.inner.clone(), precomputed.0)?;
 
         self.inner = frontier;
         *self
@@ -1006,6 +1026,32 @@ mod tests {
             run(Some(stale)),
             (expected_root, expected_subtree),
             "stale precompute falls back"
+        );
+    }
+
+    /// The public precompute wrappers report invalid input as a recoverable
+    /// `NoteCommitmentTreeError`, never a panic: an empty batch, and a stale
+    /// precompute applied directly to a mismatched tree.
+    #[test]
+    fn precompute_wrappers_report_invalid_input() {
+        // Empty batch.
+        assert_eq!(
+            NoteCommitmentTree::precompute_append(0, &[]).err(),
+            Some(NoteCommitmentTreeError::InvalidPrecompute),
+            "empty precompute_append is a recoverable error"
+        );
+
+        // Stale precompute applied to a tree of the wrong size.
+        let note_commitments: Vec<_> = (0..4).map(|value| note_commitment(3_000 + value)).collect();
+        let stale = NoteCommitmentTree::precompute_append(5, &note_commitments)
+            .expect("precompute succeeds");
+
+        let mut tree = build_tree(2);
+        let _ = tree.root();
+        assert_eq!(
+            tree.apply_precomputed_append(stale),
+            Err(NoteCommitmentTreeError::InvalidPrecompute),
+            "applying a stale precompute is a recoverable error"
         );
     }
 }

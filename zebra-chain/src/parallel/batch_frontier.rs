@@ -46,6 +46,18 @@ pub enum BatchFrontierError {
 
     /// The batch would complete more than one tracked subtree.
     BatchSpansMultipleSubtrees,
+
+    /// A precompute was requested for, or applied to, an empty batch of leaves.
+    EmptyBatch,
+
+    /// A precompute was applied to a frontier whose size does not match the size
+    /// the precompute was computed against (a stale look-ahead).
+    PrecomputeStartMismatch {
+        /// The tree size the precompute was computed against.
+        expected: u64,
+        /// The actual size of the frontier the precompute was applied to.
+        found: u64,
+    },
 }
 
 impl fmt::Display for BatchFrontierError {
@@ -56,6 +68,15 @@ impl fmt::Display for BatchFrontierError {
             }
             BatchFrontierError::BatchSpansMultipleSubtrees => {
                 write!(f, "batch spans more than one tracked subtree boundary")
+            }
+            BatchFrontierError::EmptyBatch => {
+                write!(f, "precompute requested for an empty batch of leaves")
+            }
+            BatchFrontierError::PrecomputeStartMismatch { expected, found } => {
+                write!(
+                    f,
+                    "precompute computed for tree size {expected} applied to a frontier of size {found}"
+                )
             }
         }
     }
@@ -395,22 +416,23 @@ pub(crate) struct PrecomputedAppend<H> {
 
 /// Hashes the complete subtree roots for appending `new_leaves` to a tree of size
 /// `start_position`, in parallel. The expensive, position-independent half of
-/// [`parallel_append`]; pair with [`graft`]. `new_leaves` must be non-empty.
+/// [`parallel_append`]; pair with [`graft`].
+///
+/// Returns [`BatchFrontierError::EmptyBatch`] if `new_leaves` is empty: the
+/// precompute represents a non-empty append (its tip is the last leaf), so an
+/// empty batch is reported as a recoverable error rather than panicking.
 pub(crate) fn precompute_subtree_roots<H>(
     start_position: u64,
     new_leaves: &[H],
-) -> PrecomputedAppend<H>
+) -> Result<PrecomputedAppend<H>, BatchFrontierError>
 where
     H: Hashable + Clone + Send + Sync,
 {
-    assert!(
-        !new_leaves.is_empty(),
-        "precompute_subtree_roots requires at least one leaf"
-    );
-
     let num_leaves = new_leaves.len();
-    let leaves_to_merge = &new_leaves[..num_leaves - 1];
-    let tip_leaf = new_leaves[num_leaves - 1].clone();
+    let (tip_leaf, leaves_to_merge) = new_leaves
+        .split_last()
+        .ok_or(BatchFrontierError::EmptyBatch)?;
+    let tip_leaf = tip_leaf.clone();
 
     let chunks = complete_subtree_chunks(start_position, leaves_to_merge);
     let chunk_roots: Vec<(usize, H)> = chunks
@@ -418,33 +440,37 @@ where
         .map(|(level, leaves)| (level, perfect_subtree_root(leaves)))
         .collect();
 
-    PrecomputedAppend {
+    Ok(PrecomputedAppend {
         start_position,
         num_leaves,
         chunk_roots,
         tip_leaf,
-    }
+    })
 }
 
 /// Merges a [`PrecomputedAppend`] onto `frontier`, returning the updated frontier.
-/// The cheap, committer-side half of [`parallel_append`] (O(log N) merges). The
-/// frontier's size MUST equal the precompute's `start_position`; callers compare
-/// and recompute via [`parallel_append`] on mismatch, so the equality is asserted.
+/// The cheap, committer-side half of [`parallel_append`] (O(log N) merges).
+///
+/// The frontier's size MUST equal the precompute's `start_position`. Callers
+/// compare and recompute via [`parallel_append`] on mismatch, so a mismatch here
+/// is reported as a recoverable [`BatchFrontierError::PrecomputeStartMismatch`]
+/// (a stale precompute must not panic the process).
 pub(crate) fn graft<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     precomputed: PrecomputedAppend<H>,
-) -> Result<Frontier<H, DEPTH>, FrontierError>
+) -> Result<Frontier<H, DEPTH>, BatchFrontierError>
 where
     H: Hashable + Clone + Send + Sync,
 {
     let (mut complete_subtree_roots, next_leaf_position) =
         frontier_complete_subtree_roots(&frontier);
 
-    assert_eq!(
-        next_leaf_position, precomputed.start_position,
-        "graft applied to a frontier of the wrong size (tree {next_leaf_position}, precompute {})",
-        precomputed.start_position
-    );
+    if next_leaf_position != precomputed.start_position {
+        return Err(BatchFrontierError::PrecomputeStartMismatch {
+            expected: precomputed.start_position,
+            found: next_leaf_position,
+        });
+    }
 
     for (level, root) in precomputed.chunk_roots {
         merge_complete_subtree(&mut complete_subtree_roots, level, root);
@@ -453,11 +479,11 @@ where
     let new_tip_position = next_leaf_position + (precomputed.num_leaves as u64 - 1);
     let complete_subtree_roots = complete_subtree_roots.into_iter().flatten().collect();
 
-    Frontier::from_parts(
+    Ok(Frontier::from_parts(
         Position::from(new_tip_position),
         precomputed.tip_leaf,
         complete_subtree_roots,
-    )
+    )?)
 }
 
 /// The precomputed form of [`append_batch_with_subtree`]: the parallel hashing for
@@ -505,10 +531,9 @@ where
 {
     use crate::subtree::TRACKED_SUBTREE_HEIGHT;
 
-    assert!(
-        !nodes.is_empty(),
-        "precompute_append_batch_with_subtree requires at least one node"
-    );
+    if nodes.is_empty() {
+        return Err(BatchFrontierError::EmptyBatch);
+    }
 
     let new_size = start_size
         .checked_add(nodes.len() as u64)
@@ -536,12 +561,14 @@ where
         let (head, tail) = nodes.split_at(head_len);
         let index_value = (boundary >> TRACKED_SUBTREE_HEIGHT) - 1;
         PrecomputedSubtreeKind::Boundary {
-            head: precompute_subtree_roots(start_size, head),
-            tail: (!tail.is_empty()).then(|| precompute_subtree_roots(boundary, tail)),
+            head: precompute_subtree_roots(start_size, head)?,
+            tail: (!tail.is_empty())
+                .then(|| precompute_subtree_roots(boundary, tail))
+                .transpose()?,
             index_value,
         }
     } else {
-        PrecomputedSubtreeKind::Single(precompute_subtree_roots(start_size, nodes))
+        PrecomputedSubtreeKind::Single(precompute_subtree_roots(start_size, nodes)?)
     };
 
     Ok(PrecomputedSubtreeAppend { start_size, inner })
@@ -790,7 +817,8 @@ mod tests {
             let start = build_frontier::<DEPTH>(&prefix);
 
             // Precompute is given only the count (prefix_len), not `start`.
-            let precomputed = precompute_subtree_roots(prefix_len as u64, &batch);
+            let precomputed = precompute_subtree_roots(prefix_len as u64, &batch)
+                .expect("non-empty batch in tests");
             prop_assert_eq!(precomputed.start_position, prefix_len as u64);
 
             let seq = sequential_append::<DEPTH>(start.clone(), &batch);
@@ -935,6 +963,44 @@ mod tests {
                 &batch
             )),
             "start_size at capacity must report a capacity error"
+        );
+    }
+
+    /// Empty input is a recoverable error, not a panic: the precompute represents a
+    /// non-empty append (its tip is the last leaf).
+    #[test]
+    fn precompute_empty_batch_is_reported() {
+        let empty: [TestNode; 0] = [];
+
+        assert_eq!(
+            precompute_subtree_roots(0, &empty).err(),
+            Some(BatchFrontierError::EmptyBatch),
+            "precompute_subtree_roots rejects an empty slice"
+        );
+        assert_eq!(
+            precompute_append_batch_with_subtree::<_, DEPTH>(0, &empty).err(),
+            Some(BatchFrontierError::EmptyBatch),
+            "precompute_append_batch_with_subtree rejects an empty slice"
+        );
+    }
+
+    /// Grafting a precompute onto a frontier of the wrong size is a recoverable
+    /// error, not a panic, so a stale look-ahead can never crash the process.
+    #[test]
+    fn graft_size_mismatch_is_reported() {
+        let batch = [TestNode(1), TestNode(2), TestNode(3)];
+        // Precompute is keyed on tree size 5.
+        let precomputed = precompute_subtree_roots(5, &batch).expect("non-empty batch");
+
+        // Apply it to a frontier of size 2 (a different starting size).
+        let frontier = build_frontier::<DEPTH>(&[TestNode(10), TestNode(11)]);
+        assert_eq!(
+            graft(frontier, precomputed).err(),
+            Some(BatchFrontierError::PrecomputeStartMismatch {
+                expected: 5,
+                found: 2,
+            }),
+            "graft reports a size mismatch instead of panicking"
         );
     }
 
