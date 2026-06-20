@@ -42,12 +42,12 @@ use crate::{
 /// produced off the committer by [`NoteCommitmentTree::precompute_append`] and
 /// applied with [`NoteCommitmentTree::apply_precomputed_append`].
 #[derive(Clone, Debug)]
-pub struct PrecomputedAppendBatch(PrecomputedSubtreeAppend<Node>);
+pub(crate) struct PrecomputedAppendBatch(PrecomputedSubtreeAppend<Node>);
 
 impl PrecomputedAppendBatch {
     /// The tree size (leaf [`count`](NoteCommitmentTree::count)) this precompute
     /// must be applied to.
-    pub fn start_size(&self) -> u64 {
+    pub(crate) fn start_size(&self) -> u64 {
         self.0.start_size()
     }
 }
@@ -479,7 +479,7 @@ impl NoteCommitmentTree {
     /// Precomputes the parallel-append work for `note_commitments` against a tree
     /// of size `start_size`, off the committer. See the Sapling equivalent.
     /// `note_commitments` must be non-empty.
-    pub fn precompute_append(
+    pub(crate) fn precompute_append(
         start_size: u64,
         note_commitments: &[NoteCommitmentUpdate],
     ) -> Result<PrecomputedAppendBatch, NoteCommitmentTreeError> {
@@ -499,7 +499,7 @@ impl NoteCommitmentTree {
     /// [`Self::append_batch`]. `precomputed.start_size()` must equal this tree's
     /// [`count`](Self::count); callers fall back to [`Self::append_batch`] on mismatch.
     #[allow(clippy::unwrap_in_result)]
-    pub fn apply_precomputed_append(
+    pub(crate) fn apply_precomputed_append(
         &mut self,
         precomputed: PrecomputedAppendBatch,
     ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {

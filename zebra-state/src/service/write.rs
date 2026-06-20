@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -37,14 +37,6 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
-
-/// Whether the finalized committer precomputes the next block's note-commitment
-/// tree hashing ahead of time (the look-ahead pipeline). On by default; set the
-/// `NOTE_PRECOMPUTE_DISABLE` env var to force the inline path, for benchmarking the
-/// pipeline against the baseline on a single binary. The name omits the `ZEBRA_`
-/// prefix so Zebra's config loader ignores it.
-static NOTE_PRECOMPUTE_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("NOTE_PRECOMPUTE_DISABLE").is_none());
 
 /// The maximum size of the parent error map.
 ///
@@ -420,13 +412,12 @@ impl WriteBlockWorkerTask {
             // Peek the next block and start its precompute, so the heavy hashing
             // overlaps this block's commit. Its start sizes are the current tree
             // sizes plus this block's note counts (the sizes after this block).
-            if *NOTE_PRECOMPUTE_ENABLED && finalized_lookahead.is_empty() {
+            if finalized_lookahead.is_empty() {
                 if let Ok(next) = finalized_block_write_receiver.try_recv() {
                     finalized_lookahead.push_back(next);
                 }
             }
-            if let (true, Some(trees), Some(next)) = (
-                *NOTE_PRECOMPUTE_ENABLED,
+            if let (Some(trees), Some(next)) = (
                 prev_finalized_note_commitment_trees.as_ref(),
                 finalized_lookahead.front(),
             ) {

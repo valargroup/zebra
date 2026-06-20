@@ -242,7 +242,7 @@ impl NoteCommitmentTrees {
     /// but applies `precompute` (off-committer parallel hashing) when present and its
     /// `start_size` still matches the tree; otherwise hashes inline. Identical result.
     #[allow(clippy::unwrap_in_result)]
-    pub fn update_sapling_note_commitment_tree_with(
+    pub(crate) fn update_sapling_note_commitment_tree_with(
         mut sapling: Arc<sapling::tree::NoteCommitmentTree>,
         sapling_note_commitments: Vec<sapling::tree::NoteCommitmentUpdate>,
         precompute: Option<sapling::tree::PrecomputedAppendBatch>,
@@ -271,7 +271,7 @@ impl NoteCommitmentTrees {
     /// Like [`update_orchard_note_commitment_tree`](Self::update_orchard_note_commitment_tree),
     /// but applies `precompute` when present and size-matched; otherwise inline. Identical result.
     #[allow(clippy::unwrap_in_result)]
-    pub fn update_orchard_note_commitment_tree_with(
+    pub(crate) fn update_orchard_note_commitment_tree_with(
         mut orchard: Arc<orchard::tree::NoteCommitmentTree>,
         orchard_note_commitments: Vec<orchard::tree::NoteCommitmentUpdate>,
         precompute: Option<orchard::tree::PrecomputedAppendBatch>,
@@ -304,9 +304,9 @@ impl NoteCommitmentTrees {
 #[derive(Clone, Debug, Default)]
 pub struct BlockNotePrecompute {
     /// Precomputed Sapling append, if the block has Sapling outputs.
-    pub sapling: Option<sapling::tree::PrecomputedAppendBatch>,
+    pub(crate) sapling: Option<sapling::tree::PrecomputedAppendBatch>,
     /// Precomputed Orchard append, if the block has Orchard actions.
-    pub orchard: Option<orchard::tree::PrecomputedAppendBatch>,
+    pub(crate) orchard: Option<orchard::tree::PrecomputedAppendBatch>,
 }
 
 impl BlockNotePrecompute {

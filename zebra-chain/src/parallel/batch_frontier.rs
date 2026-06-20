@@ -380,7 +380,7 @@ where
 /// starting at tree size [`start_position`](Self::start_position): the
 /// parallel-hashed complete subtree roots, plus the last (raw tip) leaf.
 #[derive(Clone, Debug)]
-pub struct PrecomputedAppend<H> {
+pub(crate) struct PrecomputedAppend<H> {
     /// Tree size (next leaf position) this was hashed against. [`graft`] must be
     /// applied to a frontier of exactly this size.
     start_position: u64,
@@ -393,18 +393,13 @@ pub struct PrecomputedAppend<H> {
     tip_leaf: H,
 }
 
-impl<H> PrecomputedAppend<H> {
-    /// The tree size this precompute assumes — the frontier size [`graft`] must
-    /// be applied to.
-    pub fn start_position(&self) -> u64 {
-        self.start_position
-    }
-}
-
 /// Hashes the complete subtree roots for appending `new_leaves` to a tree of size
 /// `start_position`, in parallel. The expensive, position-independent half of
 /// [`parallel_append`]; pair with [`graft`]. `new_leaves` must be non-empty.
-pub fn precompute_subtree_roots<H>(start_position: u64, new_leaves: &[H]) -> PrecomputedAppend<H>
+pub(crate) fn precompute_subtree_roots<H>(
+    start_position: u64,
+    new_leaves: &[H],
+) -> PrecomputedAppend<H>
 where
     H: Hashable + Clone + Send + Sync,
 {
@@ -433,9 +428,9 @@ where
 
 /// Merges a [`PrecomputedAppend`] onto `frontier`, returning the updated frontier.
 /// The cheap, committer-side half of [`parallel_append`] (O(log N) merges). The
-/// frontier's size MUST equal `precomputed.start_position()`; callers compare and
-/// recompute via [`parallel_append`] on mismatch, so the equality is asserted.
-pub fn graft<H, const DEPTH: u8>(
+/// frontier's size MUST equal the precompute's `start_position`; callers compare
+/// and recompute via [`parallel_append`] on mismatch, so the equality is asserted.
+pub(crate) fn graft<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     precomputed: PrecomputedAppend<H>,
 ) -> Result<Frontier<H, DEPTH>, FrontierError>
@@ -470,7 +465,7 @@ where
 /// Produced by [`precompute_append_batch_with_subtree`] off the committer and
 /// applied with [`apply_append_batch_with_subtree`].
 #[derive(Clone, Debug)]
-pub struct PrecomputedSubtreeAppend<H> {
+pub(crate) struct PrecomputedSubtreeAppend<H> {
     /// Tree size this was hashed against; the frontier it is applied to must match.
     start_size: u64,
     inner: PrecomputedSubtreeKind<H>,
@@ -493,7 +488,7 @@ enum PrecomputedSubtreeKind<H> {
 impl<H> PrecomputedSubtreeAppend<H> {
     /// The tree size this precompute assumes — the frontier `tree_size` it must
     /// be applied to.
-    pub fn start_size(&self) -> u64 {
+    pub(crate) fn start_size(&self) -> u64 {
         self.start_size
     }
 }
@@ -501,7 +496,7 @@ impl<H> PrecomputedSubtreeAppend<H> {
 /// Precomputes the parallel hashing for appending `nodes` to a tree of size
 /// `start_size`, off the committer. Mirrors [`append_batch_with_subtree`]'s
 /// boundary handling. `nodes` must be non-empty.
-pub fn precompute_append_batch_with_subtree<H, const DEPTH: u8>(
+pub(crate) fn precompute_append_batch_with_subtree<H, const DEPTH: u8>(
     start_size: u64,
     nodes: &[H],
 ) -> Result<PrecomputedSubtreeAppend<H>, BatchFrontierError>
@@ -555,7 +550,7 @@ where
 /// tracked subtree's `(index_value, root)` if the batch crossed a boundary. The
 /// counterpart to [`precompute_append_batch_with_subtree`]; byte-identical to
 /// [`append_batch_with_subtree`].
-pub fn apply_append_batch_with_subtree<H, const DEPTH: u8>(
+pub(crate) fn apply_append_batch_with_subtree<H, const DEPTH: u8>(
     frontier: Frontier<H, DEPTH>,
     precomputed: PrecomputedSubtreeAppend<H>,
 ) -> Result<(Frontier<H, DEPTH>, Option<(u64, H)>), BatchFrontierError>
@@ -795,7 +790,7 @@ mod tests {
 
             // Precompute is given only the count (prefix_len), not `start`.
             let precomputed = precompute_subtree_roots(prefix_len as u64, &batch);
-            prop_assert_eq!(precomputed.start_position(), prefix_len as u64);
+            prop_assert_eq!(precomputed.start_position, prefix_len as u64);
 
             let seq = sequential_append::<DEPTH>(start.clone(), &batch);
             let grafted = graft(start, precomputed).expect("no overflow in tests");
