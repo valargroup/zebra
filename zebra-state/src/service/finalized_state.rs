@@ -89,8 +89,8 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 /// Because it is started speculatively before the current block has committed, the
 /// caller must keep the returned flag and set it if it discards the precompute —
 /// e.g. when the current block's commit fails. The spawned task checks the flag
-/// between the Sapling and Orchard pools and stops early, so a discarded child does
-/// not keep hashing both pools.
+/// before each pool's hashing (and skips the send if cancelled), so a discarded
+/// child that has not started a pool yet avoids that pool's work.
 pub(crate) fn spawn_note_precompute(
     sapling_start: u64,
     orchard_start: u64,

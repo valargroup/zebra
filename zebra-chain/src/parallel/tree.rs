@@ -9,7 +9,9 @@ use thiserror::Error;
 
 use crate::{
     block::Block,
-    orchard, sapling, sprout,
+    orchard,
+    parallel::batch_frontier::PARALLEL_HASH_THRESHOLD,
+    sapling, sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
 };
 
@@ -322,17 +324,23 @@ impl BlockNotePrecompute {
     /// inline hashing on any mismatch. Pools with no notes (or a precompute error)
     /// are left `None`, also falling back to inline.
     ///
+    /// The Sapling and Orchard precomputes run concurrently via [`rayon::join`],
+    /// mirroring the per-pool parallelism of [`NoteCommitmentTrees::update_trees_parallel`]:
+    /// each pool's hashing is already internally parallel, and the join lets the two
+    /// pools overlap. For small blocks (both pools below [`PARALLEL_HASH_THRESHOLD`])
+    /// they are computed sequentially, since there is too little hashing to repay the
+    /// cross-pool join.
+    ///
     /// # Cancellation
     ///
     /// This is started speculatively for the *next* block while the *current* block
     /// is still committing, so a failed or invalid current block leaves the work
-    /// unwanted (the committer drops the receiver). `cancel` lets the writer abort
-    /// it: the two pools are hashed sequentially — each is still internally parallel
-    /// across the rayon pool — so the flag is checked between them, and a cancel that
-    /// arrives while the in-flight parent commit fails skips the Orchard hashing.
-    /// This bounds the wasted work for a discarded child to at most one pool instead
-    /// of hashing both. A cancelled call returns an empty precompute, which the
-    /// committer treats like any other miss and hashes inline.
+    /// unwanted (the committer drops the receiver). `cancel` lets the writer abort it:
+    /// the flag is checked once up front and again at the start of each pool's hashing,
+    /// so a cancel that lands before a pool starts skips that pool's work. (Once a
+    /// pool's hashing is under way it runs to completion — the bound is best-effort,
+    /// not interrupt-in-the-middle.) A cancelled call returns an empty precompute,
+    /// which the committer treats like any other miss and hashes inline.
     pub fn compute(
         sapling_start: u64,
         orchard_start: u64,
@@ -344,24 +352,28 @@ impl BlockNotePrecompute {
         }
 
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
-        let sapling = (!sapling_notes.is_empty())
-            .then(|| {
-                sapling::tree::NoteCommitmentTree::precompute_append(sapling_start, &sapling_notes)
-                    .ok()
-            })
-            .flatten();
-
-        if cancel.load(Ordering::Relaxed) {
-            return Self::default();
-        }
-
         let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
-        let orchard = (!orchard_notes.is_empty())
-            .then(|| {
-                orchard::tree::NoteCommitmentTree::precompute_append(orchard_start, &orchard_notes)
-                    .ok()
-            })
-            .flatten();
+
+        let sapling_fn = || {
+            if cancel.load(Ordering::Relaxed) || sapling_notes.is_empty() {
+                return None;
+            }
+            sapling::tree::NoteCommitmentTree::precompute_append(sapling_start, &sapling_notes).ok()
+        };
+        let orchard_fn = || {
+            if cancel.load(Ordering::Relaxed) || orchard_notes.is_empty() {
+                return None;
+            }
+            orchard::tree::NoteCommitmentTree::precompute_append(orchard_start, &orchard_notes).ok()
+        };
+
+        let overlap_pools = sapling_notes.len() >= PARALLEL_HASH_THRESHOLD
+            || orchard_notes.len() >= PARALLEL_HASH_THRESHOLD;
+        let (sapling, orchard) = if overlap_pools {
+            rayon::join(sapling_fn, orchard_fn)
+        } else {
+            (sapling_fn(), orchard_fn())
+        };
 
         Self { sapling, orchard }
     }
