@@ -22,7 +22,11 @@ use std::{
     },
 };
 
-use zebra_chain::{block, parallel::tree::NoteCommitmentTrees, parameters::Network};
+use zebra_chain::{
+    block,
+    parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
+    parameters::Network,
+};
 use zebra_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
     chain::BLOCK_INFO,
@@ -69,6 +73,46 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("rayon thread pool configuration is valid")
 });
+
+/// Spawns the note-commitment tree per-leaf hashing for `block` onto the
+/// commit-compute pool, returning a receiver for the result and a cancellation
+/// flag.
+///
+/// The off-committer half of the tree-update pipeline: the finalized write loop
+/// starts this for the *next* block — using the running tree sizes `sapling_start`
+/// / `orchard_start` (the tree `count`s the block will commit at) — so the heavy
+/// hashing overlaps the *current* block's commit on otherwise idle cores. The
+/// committer then only applies the precomputed subtree roots. If the precompute is stale (its `start_size` no
+/// longer matches the tree), the committer falls back to inline hashing, so this
+/// is purely a scheduling optimization.
+///
+/// Because it is started speculatively before the current block has committed, the
+/// caller must keep the returned flag and set it if it discards the precompute —
+/// e.g. when the current block's commit fails. The spawned task checks the flag
+/// before each pool's hashing (and skips the send if cancelled), so a discarded
+/// child that has not started a pool yet avoids that pool's work.
+pub(crate) fn spawn_note_precompute(
+    sapling_start: u64,
+    orchard_start: u64,
+    block: Arc<block::Block>,
+) -> (
+    crossbeam_channel::Receiver<BlockNotePrecompute>,
+    Arc<AtomicBool>,
+) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task_cancel = cancel.clone();
+    COMMIT_COMPUTE_POOL.spawn(move || {
+        let result =
+            BlockNotePrecompute::compute(sapling_start, orchard_start, &block, &task_cancel);
+        // If the precompute was cancelled, the receiver has been (or is being)
+        // dropped and the result is unwanted; skip the send.
+        if !task_cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(result);
+        }
+    });
+    (rx, cancel)
+}
 
 pub mod column_family;
 
@@ -520,11 +564,13 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        note_precompute: Option<BlockNotePrecompute>,
     ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (checkpoint_verified, rsp_tx) = ordered_block;
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
+            note_precompute,
             "commit checkpoint-verified request",
         );
 
@@ -568,6 +614,7 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        note_precompute: Option<BlockNotePrecompute>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (height, hash, finalized, prev_note_commitment_trees, retention) =
@@ -631,9 +678,13 @@ impl FinalizedState {
                                 ));
                             });
 
+                            // `note_precompute`, if present and still size-matched,
+                            // lets the committer apply the precomputed subtree roots
+                            // instead of re-hashing the notes here; else hashes inline.
                             timed_commit_phase!(
                                 "zebra.state.write.update_trees.duration_seconds",
-                                note_commitment_trees.update_trees_parallel(&block)
+                                note_commitment_trees
+                                    .update_trees_parallel_with(&block, note_precompute)
                             )
                         })
                     });
