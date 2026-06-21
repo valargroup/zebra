@@ -1387,9 +1387,7 @@ impl BlockSyncReactor {
         // The received (download) meter is shared with the routines (they record
         // on receipt); only the reactor samples it. The committed (commit) rate is
         // sampled by the Sequencer task and read from the latest view snapshot.
-        if let Ok(mut meter) = self.state.received_throughput.lock() {
-            meter.sample(now);
-        }
+        self.state.received_throughput.lock().sample(now);
     }
 
     fn trace_sync_state(&self) {
@@ -1417,12 +1415,10 @@ impl BlockSyncReactor {
         // from the latest published view snapshot.
         let view = self.last_view;
         let submitted_applies = view.submitted_applying_count;
-        let (received_bytes_per_sec, received_blocks_per_sec) = self
-            .state
-            .received_throughput
-            .lock()
-            .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
-            .unwrap_or((0, 0));
+        let (received_bytes_per_sec, received_blocks_per_sec) = {
+            let meter = self.state.received_throughput.lock();
+            (meter.bytes_per_sec(), meter.blocks_per_sec())
+        };
         self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
             bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.floor);
             bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);

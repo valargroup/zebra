@@ -7,9 +7,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{self, Cursor, Read, Write},
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+// Non-poisoning lock for the block-sync service's per-peer map so a peer routine
+// that panics while holding the guard cannot poison the map other peers' teardown
+// and admission paths share (chunk 06).
+use parking_lot::Mutex as StdMutex;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};

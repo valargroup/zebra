@@ -9354,6 +9354,7 @@ dependencies = [
  "metrics",
  "num-integer",
  "ordered-map",
+ "parking_lot",
  "pin-project",
  "proptest",
  "proptest-derive",

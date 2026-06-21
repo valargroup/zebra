@@ -330,6 +330,40 @@ mod tests {
     }
 
     #[test]
+    fn byte_budget_releases_reservation_after_routine_panic() {
+        // The byte budget is a lock-free shared `AtomicU64`, so it cannot be
+        // poisoned by a panic. A routine that reserves byte budget and then
+        // panics must still release it so another peer can reserve again — the
+        // routine's Drop guard releases in production; here we release directly
+        // against the shared budget after the panic (chunk 06).
+        let mut budget = ByteBudget::new(1_000);
+        assert!(budget.try_reserve(1_000));
+        assert_eq!(budget.available(), 0);
+
+        // A second clone shares the same atomic counter.
+        let mut other = budget.clone();
+        assert!(!other.try_reserve(1), "budget is fully reserved");
+
+        let mut panicker = budget.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panicker.release(400);
+            panic!("routine panicked after partially releasing its reservation");
+        }));
+        assert!(result.is_err(), "the injected panic must unwind");
+
+        // The partial release survived the panic (atomics are never poisoned),
+        // and another peer can reserve the freed capacity.
+        assert_eq!(other.available(), 400);
+        assert!(other.try_reserve(400));
+        assert_eq!(other.available(), 0);
+
+        // Releasing the rest restores full capacity.
+        budget.release(600);
+        other.release(400);
+        assert_eq!(budget.available(), 1_000);
+    }
+
+    #[test]
     fn admit_passes_allowed_under_caps() {
         let mut guard = SessionGuard::new(ALLOWED, 1_024, None);
         assert_eq!(guard.admit(&frame(1, 16)), Admit::Pass);

@@ -148,7 +148,7 @@ pub(super) struct RoutineWiring {
     pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) received_throughput: Arc<parking_lot::Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencerInput>,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
@@ -246,7 +246,9 @@ pub(super) struct BlockSyncState {
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
     /// throughput it separates a download-limited sync from a commit-limited one.
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    /// Non-poisoning ([`parking_lot::Mutex`]) so a routine panic while recording a
+    /// body cannot poison the meter the reactor and other routines share (chunk 06).
+    pub(super) received_throughput: Arc<parking_lot::Mutex<ThroughputMeter>>,
 }
 
 impl BlockSyncState {
@@ -275,7 +277,7 @@ impl BlockSyncState {
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
             pending_status_refresh: false,
             last_advertised_status,
-            received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
+            received_throughput: Arc::new(parking_lot::Mutex::new(ThroughputMeter::new(
                 Instant::now(),
             ))),
         }
@@ -602,4 +604,43 @@ pub(super) fn previous_height(height: block::Height) -> Option<block::Height> {
 
 pub(super) fn height_after_count(start: block::Height, count: u32) -> Option<block::Height> {
     start.0.checked_add(count).map(block::Height)
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// The shared download throughput meter is wrapped in a non-poisoning
+    /// `parking_lot::Mutex`, so a routine that panics while recording a body
+    /// cannot poison the meter the reactor and other routines share: throughput
+    /// accounting still works afterward (chunk 06).
+    #[test]
+    fn throughput_meter_accounting_works_after_panic_while_locked() {
+        // Fix the window start so the sampled rate is over an exact one-second
+        // interval, independent of wall-clock time spent in the test.
+        let base = Instant::now();
+        let meter = Arc::new(parking_lot::Mutex::new(ThroughputMeter::new(base)));
+        meter.lock().record(1_000);
+
+        let panicker = Arc::clone(&meter);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.lock();
+            panic!("routine panicked while holding the throughput meter guard");
+        }));
+        assert!(result.is_err(), "the injected panic must unwind");
+
+        // The meter is still usable: another routine records and the reactor
+        // samples a non-zero rate over a one-second window (2000 bytes / 1s,
+        // 2 blocks / 1s).
+        {
+            let mut guard = meter.lock();
+            guard.record(1_000);
+            guard.sample(base + std::time::Duration::from_secs(1));
+        }
+        let guard = meter.lock();
+        assert_eq!(guard.bytes_per_sec(), 2_000);
+        assert_eq!(guard.blocks_per_sec(), 2);
+    }
 }

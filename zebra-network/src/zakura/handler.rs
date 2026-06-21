@@ -8,10 +8,16 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc,
     },
     time::Duration,
 };
+
+// Non-poisoning locks for connection-management state reachable from
+// peer-influenced tasks (the upgrade-dial registry and per-connection freshness),
+// so a panicking task cannot poison structures other peers/connections share
+// (chunk 06).
+use parking_lot::Mutex as StdMutex;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use iroh::Watcher as _;
@@ -610,10 +616,7 @@ impl ZakuraEndpoint {
         // same peer. `tokio::spawn` does not await, and the spawned task only
         // re-locks after its (non-instant) dial returns, so this cannot
         // deadlock or `.await` under the lock.
-        let mut upgrade_dials = self
-            .upgrade_dials
-            .lock()
-            .expect("Zakura upgrade dial registry mutex is never poisoned");
+        let mut upgrade_dials = self.upgrade_dials.lock();
         if upgrade_dials.contains_key(&peer_id) {
             return true;
         }
@@ -627,11 +630,7 @@ impl ZakuraEndpoint {
         let task_peer_id = peer_id.clone();
         let dial = tokio::spawn(async move {
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
-            endpoint
-                .upgrade_dials
-                .lock()
-                .expect("Zakura upgrade dial registry mutex is never poisoned")
-                .remove(&task_peer_id);
+            endpoint.upgrade_dials.lock().remove(&task_peer_id);
         });
         upgrade_dials.insert(peer_id, dial.abort_handle());
         true
@@ -649,11 +648,7 @@ impl ZakuraEndpoint {
     /// registered (its entry is reclaimed only when the maintained dial ends on
     /// shutdown) or if another upgrade owns the dedup slot.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
-        let handle = self
-            .upgrade_dials
-            .lock()
-            .expect("Zakura upgrade dial registry mutex is never poisoned")
-            .remove(peer_id);
+        let handle = self.upgrade_dials.lock().remove(peer_id);
         if let Some(handle) = handle {
             handle.abort();
         }
@@ -1227,10 +1222,7 @@ fn admit_inbound_message(
     }
 
     let admitted = {
-        let mut bucket = context
-            .message_bucket
-            .lock()
-            .expect("Zakura message-rate bucket mutex is never poisoned");
+        let mut bucket = context.message_bucket.lock();
         bucket.try_take()
     };
     if !admitted {
@@ -4125,7 +4117,11 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// A worker holds this briefly (no `.await` while locked) to spend one token
 /// per decoded frame, so N concurrent same-kind streams draw from a single
 /// per-connection budget instead of N independent ones (FLUP-014).
-type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
+///
+/// Non-poisoning ([`parking_lot::Mutex`]) so a stream worker that panics while
+/// holding the guard cannot poison the bucket the connection's other workers
+/// share (chunk 06).
+type SharedMessageBucket<C = RealClock> = Arc<parking_lot::Mutex<TokenBucket<C>>>;
 
 /// Per-connection collection of message-rate buckets keyed by validated stream
 /// kind. Created lazily (FLUP-015 rejects unknown kinds before this point, so
@@ -4147,7 +4143,7 @@ fn message_bucket_for<C: Clock>(
     buckets
         .entry(stream_kind)
         .or_insert_with(|| {
-            Arc::new(std::sync::Mutex::new(TokenBucket::with_clock(
+            Arc::new(parking_lot::Mutex::new(TokenBucket::with_clock(
                 message_rate_per_second,
                 clock,
             )))
@@ -4855,11 +4851,7 @@ mod tests {
             "an unreachable upgrade peer must not report a completed hand-off",
         );
         assert!(
-            endpoint
-                .upgrade_dials
-                .lock()
-                .expect("Zakura upgrade dial registry mutex is never poisoned")
-                .is_empty(),
+            endpoint.upgrade_dials.lock().is_empty(),
             "a failed legacy upgrade leaked a maintained native dial / upgrade_dials entry",
         );
 
@@ -5628,7 +5620,7 @@ mod tests {
             stream_id: 1,
             _permit: permit,
             limits,
-            message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            message_bucket: Arc::new(parking_lot::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
             freshness_tx,
@@ -5788,7 +5780,7 @@ mod tests {
                 stream_id,
                 _permit: permit,
                 limits,
-                message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                message_bucket: Arc::new(parking_lot::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
                 ))),
                 connection_token: connection_token.clone(),
@@ -6735,10 +6727,7 @@ mod tests {
 
         // The aggregate across both handles is capped at the single-bucket budget.
         let take = |bucket: &SharedMessageBucket<crate::zakura::testkit::TestClock>| {
-            bucket
-                .lock()
-                .expect("test bucket mutex is never poisoned")
-                .try_take()
+            bucket.lock().try_take()
         };
         let mut accepted = 0;
         for _ in 0..rate as usize * 4 {
@@ -6789,10 +6778,7 @@ mod tests {
         assert_eq!(buckets.len(), 2);
 
         let take = |bucket: &SharedMessageBucket<crate::zakura::testkit::TestClock>| {
-            bucket
-                .lock()
-                .expect("test bucket mutex is never poisoned")
-                .try_take()
+            bucket.lock().try_take()
         };
         // Drain the request budget; gossip must be untouched.
         assert!(take(&request));

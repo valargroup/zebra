@@ -8,8 +8,10 @@
 //! candidate publication — plus the per-peer servable range / caps the routine
 //! reads back when it runs its want-work loop.
 //!
-//! Field ownership is disjoint so the brief `std::sync::Mutex` is never a
-//! contention point and is **never held across `.await`** (the anti-block rule).
+//! Field ownership is disjoint so the brief non-poisoning [`parking_lot::Mutex`]
+//! is never a contention point and is **never held across `.await`** (the
+//! anti-block rule). A non-poisoning lock keeps the registry usable by other
+//! peers if a routine panics while holding the guard (chunk 06).
 //! After inbound flow is inverted the **routine** is authoritative for its own
 //! per-peer facts and writes them all (generation-gated): servable/caps/
 //! `received_status` (when it decodes a `Status` frame in its own task),
@@ -19,11 +21,9 @@
 //! misbehavior. Misbehavior is record-only: it is observed and traced but never
 //! drives a disconnect, so the registry keeps no per-peer misbehavior state.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Mutex as StdMutex,
-};
+use std::collections::{BTreeMap, HashMap};
 
+use parking_lot::Mutex;
 use zebra_chain::block;
 
 use super::{
@@ -97,7 +97,7 @@ pub(super) struct SlotDiagnostics {
 /// reactor and every routine share one table.
 #[derive(Debug)]
 pub(super) struct PeerRegistry {
-    peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
+    peers: Mutex<HashMap<ZakuraPeerId, Entry>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
 }
@@ -111,15 +111,13 @@ impl Default for PeerRegistry {
 impl PeerRegistry {
     pub(super) fn new() -> Self {
         Self {
-            peers: StdMutex::new(HashMap::new()),
+            peers: Mutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
-        self.peers
-            .lock()
-            .expect("peer registry mutex is never poisoned")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
+        self.peers.lock()
     }
 
     /// Admit (or re-admit) a peer and allocate a fresh routine generation.
@@ -414,4 +412,84 @@ pub(super) struct DirectionStatusCounts {
 /// in-flight cap (the routine's slot bound; mirrors `PeerBlockState`).
 pub(super) fn hard_outbound_capacity(max_inflight_requests: u16) -> usize {
     usize::from(max_inflight_requests).min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn peer(byte: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+    }
+
+    fn outstanding(height: u32) -> BTreeMap<block::Height, block::Hash> {
+        BTreeMap::from([(block::Height(height), block::Hash([height as u8; 32]))])
+    }
+
+    /// A peer routine panicking while holding the registry guard must not poison
+    /// the shared registry: a different peer's routine can still admit, publish,
+    /// and read facts afterward, and the panicking peer's already-published facts
+    /// survive (chunk 06).
+    #[test]
+    fn registry_usable_by_other_peers_after_panic_while_locked() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let registry = Arc::new(PeerRegistry::new());
+
+        let peer_a = peer(1);
+        let gen_a = registry.admit(&peer_a, ServicePeerDirection::Outbound, &config);
+        registry.set_outstanding(&peer_a, gen_a, outstanding(100));
+        assert_eq!(registry.total_unreceived(), 1);
+
+        // Peer A's routine panics while holding the guard.
+        let panicker = Arc::clone(&registry);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.lock();
+            panic!("routine panicked while holding the registry guard");
+        }));
+        assert!(result.is_err(), "the injected panic must unwind");
+
+        // Peer A's published outstanding work survived the panic (not poisoned),
+        // so it is still visible to the producer's cross-peer filters.
+        assert!(registry.has_outstanding_request(block::Height(100), block::Hash([100u8; 32])));
+        assert_eq!(registry.total_unreceived(), 1);
+
+        // A different peer can still admit and publish through the same registry.
+        let peer_b = peer(2);
+        let gen_b = registry.admit(&peer_b, ServicePeerDirection::Inbound, &config);
+        registry.set_outstanding(&peer_b, gen_b, outstanding(200));
+        assert_eq!(registry.total_unreceived(), 2);
+        assert!(registry.has_outstanding_request(block::Height(200), block::Hash([200u8; 32])));
+    }
+
+    /// A panicking routine's outstanding work is releasable from the registry
+    /// afterward (its Drop guard clears it in production); the clear is
+    /// generation-gated and leaves other peers' work intact.
+    #[test]
+    fn outstanding_work_clears_after_panic_without_disturbing_peers() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let registry = Arc::new(PeerRegistry::new());
+
+        let peer_a = peer(1);
+        let gen_a = registry.admit(&peer_a, ServicePeerDirection::Outbound, &config);
+        registry.set_outstanding(&peer_a, gen_a, outstanding(100));
+        let peer_b = peer(2);
+        let gen_b = registry.admit(&peer_b, ServicePeerDirection::Outbound, &config);
+        registry.set_outstanding(&peer_b, gen_b, outstanding(200));
+        assert_eq!(registry.total_unreceived(), 2);
+
+        let panicker = Arc::clone(&registry);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.lock();
+            panic!("routine panicked holding published outstanding work");
+        }));
+
+        // Clearing peer A's outstanding (the Drop guard's generation-gated release)
+        // works against the still-usable registry and leaves peer B untouched.
+        registry.clear_outstanding(&peer_a, gen_a);
+        assert!(!registry.has_outstanding_request(block::Height(100), block::Hash([100u8; 32])));
+        assert!(registry.has_outstanding_request(block::Height(200), block::Hash([200u8; 32])));
+        assert_eq!(registry.total_unreceived(), 1);
+    }
 }

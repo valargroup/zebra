@@ -1,5 +1,4 @@
-use std::sync::Mutex;
-
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::{config::*, state::*, wire::*, *};
@@ -382,11 +381,12 @@ impl RangeScheduler {
 /// `take_for_peer`/`return_work`).
 ///
 /// The inner [`RangeScheduler`] is a purely synchronous data structure, so a
-/// plain [`std::sync::Mutex`] suffices and a guard is never held across an
-/// `.await`: every method locks, runs the synchronous range math, and drops the
-/// guard before notifying. A [`Notify`] wakes parked routines whenever a mutation
-/// may have produced newly assignable work, so routines pull lazily instead of
-/// the reactor pushing.
+/// brief non-poisoning [`parking_lot::Mutex`] suffices and a guard is never held
+/// across an `.await`: every method locks, runs the synchronous range math, and
+/// drops the guard before notifying. A non-poisoning lock keeps the shared queue
+/// usable by every other peer if a routine panics while holding the guard (chunk
+/// 06). A [`Notify`] wakes parked routines whenever a mutation may have produced
+/// newly assignable work, so routines pull lazily instead of the reactor pushing.
 #[derive(Clone, Debug)]
 pub(super) struct SharedHeaderRangeQueue {
     inner: Arc<Mutex<RangeScheduler>>,
@@ -401,10 +401,8 @@ impl SharedHeaderRangeQueue {
         }
     }
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, RangeScheduler> {
-        self.inner
-            .lock()
-            .expect("header-sync range queue mutex is never poisoned: guarded sections never panic")
+    fn locked(&self) -> parking_lot::MutexGuard<'_, RangeScheduler> {
+        self.inner.lock()
     }
 
     /// Wake every routine currently parked waiting for work. Called after any
@@ -752,5 +750,49 @@ mod tests {
                     && range.end_height() > block::Height(5)),
             "assignments above the reset target are cleared"
         );
+    }
+
+    /// A header-sync routine that panics while holding the shared range-queue
+    /// guard must not poison the queue: the non-poisoning lock is released on
+    /// unwind, so another peer can still pull and return work, and a panicking
+    /// peer's outstanding range is re-fannable to others (chunk 06).
+    #[test]
+    fn shared_range_queue_usable_after_panic_while_locked() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(10, 2));
+
+        let peer_a = pid(1);
+        let work = queue
+            .take_for_peer(
+                &peer_a,
+                1,
+                caps(100, 100),
+                &Network::Mainnet,
+                LOCAL_MAX_MESSAGE_BYTES,
+            )
+            .expect("forward range is assignable");
+
+        // Peer A's routine panics while holding the guard.
+        let panicker = queue.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.locked();
+            panic!("routine panicked while holding the shared range queue guard");
+        }));
+        assert!(result.is_err(), "the injected panic must unwind");
+
+        // The queue is still usable: peer A returns its outstanding range (its
+        // Drop guard does this in production), and another peer re-fetches it.
+        queue.return_work(&peer_a, 1, work.range, ReturnReason::Teardown);
+        let peer_b = pid(2);
+        let refetched = queue
+            .take_for_peer(
+                &peer_b,
+                1,
+                caps(100, 100),
+                &Network::Mainnet,
+                LOCAL_MAX_MESSAGE_BYTES,
+            )
+            .expect("returned range is re-assignable to another peer after the panic");
+        assert_eq!(refetched.range.start_height, work.range.start_height);
     }
 }

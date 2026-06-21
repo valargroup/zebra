@@ -8,12 +8,16 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex, OnceLock,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     time::Duration,
 };
 
+// Non-poisoning lock for the legacy gossip outbound/session/latest-block maps and
+// the per-supervisor registries reachable from peer-influenced gossip tasks, so a
+// panicking gossip task cannot poison the state other peers share (chunk 06).
+use parking_lot::Mutex as StdMutex;
 use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use tokio::{
@@ -158,8 +162,7 @@ pub(crate) fn legacy_gossip_streams() -> &'static [Stream] {
     &LEGACY_GOSSIP_SERVICE_STREAMS
 }
 
-static FIRST_SEEN_BY_SUPERVISOR: OnceLock<std::sync::Mutex<HashMap<u64, FirstSeenCache>>> =
-    OnceLock::new();
+static FIRST_SEEN_BY_SUPERVISOR: OnceLock<StdMutex<HashMap<u64, FirstSeenCache>>> = OnceLock::new();
 static NEXT_LEGACY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A typed legacy gossip frame carried by Zakura stream kind 2.
@@ -1289,31 +1292,21 @@ impl LegacyGossipOutbound {
     fn insert(&self, session: LegacyGossipPeerSession) {
         self.sessions
             .lock()
-            .expect("legacy gossip outbound mutex is never poisoned")
             .insert(session.peer_id().clone(), session);
     }
 
     fn remove(&self, peer: &ZakuraPeerId) {
-        self.sessions
-            .lock()
-            .expect("legacy gossip outbound mutex is never poisoned")
-            .remove(peer);
+        self.sessions.lock().remove(peer);
     }
 
     #[cfg(test)]
     fn contains(&self, peer: &ZakuraPeerId) -> bool {
-        self.sessions
-            .lock()
-            .expect("legacy gossip outbound mutex is never poisoned")
-            .contains_key(peer)
+        self.sessions.lock().contains_key(peer)
     }
 
     fn remember_latest_block(&self, frame: &LegacyGossipFrame) {
         if let LegacyGossipFrame::AdvertiseBlock(hash) = frame {
-            *self
-                .latest_block
-                .lock()
-                .expect("legacy gossip latest-block mutex is never poisoned") = Some(*hash);
+            *self.latest_block.lock() = Some(*hash);
         }
     }
 
@@ -1321,11 +1314,7 @@ impl LegacyGossipOutbound {
         &self,
         session: LegacyGossipPeerSession,
     ) -> Result<(), BoxError> {
-        let Some(hash) = *self
-            .latest_block
-            .lock()
-            .expect("legacy gossip latest-block mutex is never poisoned")
-        else {
+        let Some(hash) = *self.latest_block.lock() else {
             return Ok(());
         };
 
@@ -1338,10 +1327,7 @@ impl LegacyGossipOutbound {
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
         let sessions: Vec<_> = {
-            let sessions = self
-                .sessions
-                .lock()
-                .expect("legacy gossip outbound mutex is never poisoned");
+            let sessions = self.sessions.lock();
             sessions
                 .iter()
                 .filter(|(peer_id, _)| !exclude.is_some_and(|exclude| exclude == *peer_id))
@@ -1361,16 +1347,34 @@ fn legacy_gossip_recv_loop_panic_target() -> &'static StdMutex<Option<ZakuraPeer
 
 #[cfg(test)]
 fn arm_legacy_gossip_recv_loop_panic(peer: ZakuraPeerId) {
-    *legacy_gossip_recv_loop_panic_target()
-        .lock()
-        .expect("legacy gossip recv-loop panic target mutex is never poisoned") = Some(peer);
+    *legacy_gossip_recv_loop_panic_target().lock() = Some(peer);
 }
 
 #[cfg(test)]
 fn should_panic_legacy_gossip_recv_loop(peer: &ZakuraPeerId) -> bool {
-    let mut target = legacy_gossip_recv_loop_panic_target()
-        .lock()
-        .expect("legacy gossip recv-loop panic target mutex is never poisoned");
+    let mut target = legacy_gossip_recv_loop_panic_target().lock();
+    if target.as_ref() == Some(peer) {
+        *target = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn legacy_gossip_replay_panic_target() -> &'static StdMutex<Option<ZakuraPeerId>> {
+    static TARGET: OnceLock<StdMutex<Option<ZakuraPeerId>>> = OnceLock::new();
+    TARGET.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn arm_legacy_gossip_replay_panic(peer: ZakuraPeerId) {
+    *legacy_gossip_replay_panic_target().lock() = Some(peer);
+}
+
+#[cfg(test)]
+fn should_panic_legacy_gossip_replay(peer: &ZakuraPeerId) -> bool {
+    let mut target = legacy_gossip_replay_panic_target().lock();
     if target.as_ref() == Some(peer) {
         *target = None;
         true
@@ -1422,22 +1426,18 @@ impl LegacyGossipPeerSession {
 }
 
 static LEGACY_GOSSIP_OUTBOUND_BY_SUPERVISOR: OnceLock<
-    std::sync::Mutex<HashMap<u64, LegacyGossipOutbound>>,
+    StdMutex<HashMap<u64, LegacyGossipOutbound>>,
 > = OnceLock::new();
 
 fn outbound_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> LegacyGossipOutbound {
     let registry = LEGACY_GOSSIP_OUTBOUND_BY_SUPERVISOR.get_or_init(Default::default);
-    let mut registry = registry
-        .lock()
-        .expect("legacy gossip outbound registry mutex is never poisoned");
+    let mut registry = registry.lock();
     registry.entry(supervisor.id()).or_default().clone()
 }
 
 fn first_seen_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> FirstSeenCache {
     let registry = FIRST_SEEN_BY_SUPERVISOR.get_or_init(Default::default);
-    let mut registry = registry
-        .lock()
-        .expect("legacy gossip first-seen registry mutex is never poisoned");
+    let mut registry = registry.lock();
     registry
         .entry(supervisor.id())
         .or_insert_with(|| FirstSeenCache::new(DEFAULT_FIRST_SEEN_CAPACITY, DEFAULT_FIRST_SEEN_TTL))
@@ -2341,6 +2341,10 @@ impl ZakuraService for LegacyGossipSink {
                 let outbound = outbound.clone();
                 let session = session.clone();
                 async move {
+                    #[cfg(test)]
+                    if should_panic_legacy_gossip_replay(session.peer_id()) {
+                        panic!("injected legacy gossip replay-task panic after state registration");
+                    }
                     if let Err(error) = outbound.replay_latest_block_to_peer(session).await {
                         debug!(?error, "latest Zakura block gossip replay failed");
                     }
@@ -4209,6 +4213,13 @@ mod tests {
         Ok(())
     }
 
+    /// A panic in the replay task must run the supervised cleanup (cancel the
+    /// peer, remove its outbound session) regardless of the lock type. The panic
+    /// is injected directly (not via lock poisoning) because the legacy gossip
+    /// shared maps are now non-poisoning ([`parking_lot::Mutex`], chunk 06), so a
+    /// task panic while holding a guard no longer poisons the shared state — the
+    /// panic-isolation handler is what removes the session, not a propagated
+    /// poison.
     #[tokio::test]
     async fn legacy_gossip_replay_panic_cancels_peer_and_removes_outbound_session(
     ) -> Result<(), BoxError> {
@@ -4223,16 +4234,15 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let (peer, _peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
 
-        let poisoned_latest_block = outbound.latest_block.clone();
-        let _ = std::panic::catch_unwind(move || {
-            let _guard = poisoned_latest_block
-                .lock()
-                .expect("latest-block mutex starts unpoisoned");
-            panic!("poison latest-block mutex before replay");
-        });
-
+        arm_legacy_gossip_replay_panic(peer_id.clone());
         sink.add_peer(peer);
-        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
+        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await?;
+
+        // The non-poisoning latest-block map is still usable by other peers after
+        // the replay task panicked while it could have held the guard.
+        outbound.remember_latest_block(&LegacyGossipFrame::AdvertiseBlock(block_hash(92)));
+        assert_eq!(*outbound.latest_block.lock(), Some(block_hash(92)));
+        Ok(())
     }
 
     #[tokio::test]

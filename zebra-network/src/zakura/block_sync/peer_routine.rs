@@ -125,7 +125,7 @@ pub(super) struct PeerRoutine {
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
-    received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    received_throughput: Arc<parking_lot::Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencerInput>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
@@ -158,7 +158,7 @@ impl PeerRoutine {
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
-        received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+        received_throughput: Arc<parking_lot::Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencerInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -1203,9 +1203,7 @@ impl PeerRoutine {
     }
 
     fn record_received(&self, bytes: u64) {
-        if let Ok(mut meter) = self.received_throughput.lock() {
-            meter.record(bytes);
-        }
+        self.received_throughput.lock().record(bytes);
     }
 
     // ===================== tracing =========================================

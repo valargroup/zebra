@@ -280,19 +280,11 @@ impl BlockSyncService {
 
     #[cfg(test)]
     pub(crate) fn peer_count(&self) -> usize {
-        self.inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned")
-            .len()
+        self.inner.peers.lock().len()
     }
 
     fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
-        let peers = self
-            .inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned");
+        let peers = self.inner.peers.lock();
         let count = peers
             .values()
             .filter(|record| record.direction == direction)
@@ -310,11 +302,7 @@ impl BlockSyncService {
     /// resolves to the winner's stream by replacing the loser's already-counted
     /// session); only genuinely new peers are held to the per-direction cap.
     fn can_admit_peer(&self, peer_id: &ZakuraPeerId, direction: ServicePeerDirection) -> bool {
-        let peers = self
-            .inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned");
+        let peers = self.inner.peers.lock();
         if peers.contains_key(peer_id) {
             return true;
         }
@@ -385,7 +373,8 @@ impl Service for BlockSyncService {
             let peer_id = peer_id.clone();
             let inner = self.inner.clone();
             move || {
-                let should_notify = if let Ok(mut peers) = inner.peers.lock() {
+                let should_notify = {
+                    let mut peers = inner.peers.lock();
                     if peers
                         .get(&peer_id)
                         .is_some_and(|record| record.session_id == session_id)
@@ -395,8 +384,6 @@ impl Service for BlockSyncService {
                     } else {
                         false
                     }
-                } else {
-                    false
                 };
 
                 if should_notify {
@@ -461,11 +448,7 @@ impl Service for BlockSyncService {
         );
 
         {
-            let mut peers = self
-                .inner
-                .peers
-                .lock()
-                .expect("block-sync peer map mutex is never poisoned");
+            let mut peers = self.inner.peers.lock();
             if let Some(old_record) = peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
@@ -485,12 +468,7 @@ impl Service for BlockSyncService {
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId) {
-        let removed = self
-            .inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned")
-            .remove(peer);
+        let removed = self.inner.peers.lock().remove(peer);
         if let Some(record) = removed {
             record.cancel_token.cancel();
         }

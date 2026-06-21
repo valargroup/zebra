@@ -15,13 +15,15 @@
 //! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
 //!   committed floor never throttles the fetch decision.
 //!
-//! Internals are a brief `std::sync::Mutex` whose critical sections are tiny map
-//! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
-//! on a [`WorkItem`] is the block's size *estimate* (not its worst-case
-//! reservation); it exists only to carry the `SizeMismatch` tolerance check
-//! through to the reactor's receive path.
+//! Internals are a brief non-poisoning [`parking_lot::Mutex`] whose critical
+//! sections are tiny map splices held **never across `.await`** (the anti-block
+//! rule). A non-poisoning lock is used so a peer routine that panics while
+//! holding the guard cannot poison the shared queue for other peers (chunk 06).
+//! `estimated_bytes` on a [`WorkItem`] is the block's size *estimate* (not its
+//! worst-case reservation); it exists only to carry the `SizeMismatch` tolerance
+//! check through to the reactor's receive path.
 
-use std::sync::Mutex as StdMutex;
+use parking_lot::Mutex;
 
 use tokio::sync::Notify;
 use zebra_chain::block;
@@ -82,14 +84,14 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, ewma: u64, floor: u64) -> u6
 /// The shared download work source. See the module docs for the invariants.
 #[derive(Debug)]
 pub(super) struct WorkQueue {
-    inner: StdMutex<WorkQueueInner>,
+    inner: Mutex<WorkQueueInner>,
     available: Notify,
 }
 
 impl WorkQueue {
     pub(super) fn new(floor: block::Height) -> Self {
         Self {
-            inner: StdMutex::new(WorkQueueInner {
+            inner: Mutex::new(WorkQueueInner {
                 pending: std::collections::BTreeMap::new(),
                 in_flight: std::collections::BTreeMap::new(),
                 floor,
@@ -107,10 +109,8 @@ impl WorkQueue {
         inner.floor_estimate_bytes = floor.max(1);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, WorkQueueInner> {
-        self.inner
-            .lock()
-            .expect("work queue mutex is never poisoned")
+    fn lock(&self) -> parking_lot::MutexGuard<'_, WorkQueueInner> {
+        self.inner.lock()
     }
 
     /// Add `(height, hash, size)` items to `pending`. Each is inserted iff its
@@ -315,5 +315,75 @@ impl WorkQueue {
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {
         self.lock().in_flight.contains_key(&height)
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn item(height: u32) -> (block::Height, block::Hash, BlockSizeEstimate) {
+        (
+            block::Height(height),
+            block::Hash([height as u8; 32]),
+            BlockSizeEstimate::Unknown,
+        )
+    }
+
+    /// A peer routine that panics while holding the work-queue guard must not
+    /// poison the shared queue: a non-poisoning lock is simply released on unwind,
+    /// so another peer can still take/extend work afterward (chunk 06).
+    #[test]
+    fn work_queue_usable_after_panic_while_locked() {
+        let queue = Arc::new(WorkQueue::new(block::Height(0)));
+        queue.extend([item(1), item(2), item(3)]);
+
+        // Simulate a routine that panics while holding the guard. With a
+        // poisoning `std::sync::Mutex` the next `lock()` would propagate the
+        // poison; with `parking_lot::Mutex` the guard is dropped on unwind.
+        let panicker = Arc::clone(&queue);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.lock();
+            panic!("routine panicked while holding the work-queue guard");
+        }));
+        assert!(result.is_err(), "the injected panic must unwind");
+
+        // The queue is still usable by another peer: it can read state and take
+        // and extend work with no poison.
+        assert_eq!(queue.pending_len(), 3);
+        let taken = queue.take_in_range(block::Height(1), block::Height(3), 3);
+        assert_eq!(taken.len(), 3);
+        assert_eq!(queue.in_flight_len(), 3);
+        assert_eq!(queue.extend([item(4)]), 1);
+    }
+
+    /// Outstanding (in-flight) work must be returnable to `pending` after a
+    /// routine panic, so the heights it had taken are re-fetchable by other peers.
+    #[test]
+    fn outstanding_work_returns_after_panic() {
+        let queue = Arc::new(WorkQueue::new(block::Height(0)));
+        queue.extend([item(10), item(11)]);
+        let taken = queue.take_in_range(block::Height(10), block::Height(11), 2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(queue.in_flight_len(), 2);
+
+        // A routine panics after taking work but before issuing it.
+        let panicker = Arc::clone(&queue);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = panicker.lock();
+            panic!("routine panicked holding work it had taken");
+        }));
+        assert!(result.is_err());
+
+        // The taken heights are returned to pending and re-fetchable (the routine's
+        // Drop guard does this in production; here we drive `return_items` directly
+        // against the still-usable queue).
+        queue.return_items(taken.iter().map(|(height, _)| *height));
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.pending_len(), 2);
+        let refetched = queue.take_in_range(block::Height(10), block::Height(11), 2);
+        assert_eq!(refetched.len(), 2);
     }
 }

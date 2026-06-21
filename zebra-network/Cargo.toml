@@ -56,6 +56,7 @@ itertools = { workspace = true }
 lazy_static = { workspace = true }
 num-integer = { workspace = true }
 ordered-map = { workspace = true }
+parking_lot = { workspace = true }
 pin-project = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
