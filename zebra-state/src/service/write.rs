@@ -450,18 +450,23 @@ impl WriteBlockWorkerTask {
                     finalized_lookahead.push_back(next);
                 }
             }
-            if let (Some(trees), Some(next)) = (
-                prev_finalized_note_commitment_trees.as_ref(),
-                finalized_lookahead.front(),
-            ) {
-                let block = &ordered_block.0.block;
-                let sapling_start =
-                    trees.sapling.count() + block.sapling_note_commitments().count() as u64;
-                let orchard_start =
-                    trees.orchard.count() + block.orchard_note_commitments().count() as u64;
-                let (rx, cancel) =
-                    spawn_note_precompute(sapling_start, orchard_start, next.0.block.clone());
-                pending_precompute = Some((next.0.hash, rx, cancel));
+            // POC: in verified-commitment-trees fast mode the committer skips the
+            // note-commitment frontier entirely, so the off-thread precompute would
+            // just be discarded heat. Skip spawning it so the CPU saving is real.
+            if !finalized_state.vct_fast_enabled() {
+                if let (Some(trees), Some(next)) = (
+                    prev_finalized_note_commitment_trees.as_ref(),
+                    finalized_lookahead.front(),
+                ) {
+                    let block = &ordered_block.0.block;
+                    let sapling_start =
+                        trees.sapling.count() + block.sapling_note_commitments().count() as u64;
+                    let orchard_start =
+                        trees.orchard.count() + block.orchard_note_commitments().count() as u64;
+                    let (rx, cancel) =
+                        spawn_note_precompute(sapling_start, orchard_start, next.0.block.clone());
+                    pending_precompute = Some((next.0.hash, rx, cancel));
+                }
             }
 
             // Try committing the block
