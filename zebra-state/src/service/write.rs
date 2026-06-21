@@ -469,11 +469,20 @@ impl WriteBlockWorkerTask {
                 }
             }
 
+            // The buffered successor (if any) lets the committer verify this block's
+            // verified-commitment-trees fixture roots before trusting them: a block's
+            // roots are only committed by the next block's header. Its auth data root
+            // is already precomputed by the checkpoint verifier.
+            let next_checkpoint = finalized_lookahead
+                .front()
+                .map(|next| (next.0.block.clone(), next.0.auth_data_root));
+
             // Try committing the block
             match finalized_state.commit_finalized(
                 ordered_block,
                 prev_finalized_note_commitment_trees.take(),
                 note_precompute,
+                next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
@@ -652,7 +661,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
