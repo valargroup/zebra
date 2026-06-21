@@ -240,7 +240,7 @@ mod test {
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
         assert!(
-            matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3),
+            matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7),
             "expected coverage of all network upgrades: \
             add the new network upgrade to the list in this test"
         );
@@ -257,6 +257,7 @@ mod test {
             Nu6_1,
             Nu6_2,
             Nu6_3,
+            Nu7,
         ] {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {
