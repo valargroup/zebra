@@ -33,6 +33,7 @@ const DEFAULT_BLOCKS: u32 = 100_000;
 const DEFAULT_MAX_BLOCKS_PER_RESPONSE: u32 = 128;
 const DEFAULT_MAX_INFLIGHT: u16 = 512;
 const DEFAULT_FANOUT: usize = 1;
+const RUN_THROUGHPUT_ENV: &str = "ZAKURA_MOCK_BS_RUN";
 const SYNTHETIC_CORPUS_SEED: u64 = 0x5eed_5eed_b10c_0006;
 const MIN_SYNTHETIC_TXS: usize = 1;
 const MAX_SYNTHETIC_TXS: usize = 16;
@@ -925,9 +926,17 @@ fn mock_apply_frontier_commits_duplicates_and_rejects_gaps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "local-only throughput harness; run with ZAKURA_MOCK_BS_* env vars and --nocapture"]
+#[ignore = "local-only throughput harness; set ZAKURA_MOCK_BS_RUN=1 and run with --nocapture"]
 async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
     let _guard = zebra_test::init();
+    if env::var_os(RUN_THROUGHPUT_ENV).is_none() {
+        tracing::info!(
+            env = RUN_THROUGHPUT_ENV,
+            "skipping opt-in Zakura mock block-sync throughput harness"
+        );
+        return Ok(());
+    }
+
     let config = HarnessConfig::from_env();
     let corpus = SyntheticBlockCorpus::generate(config.blocks, SYNTHETIC_CORPUS_SEED, config.shape);
     let stats = ThroughputStats::default();
