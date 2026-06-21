@@ -125,7 +125,7 @@ use tower::{
     Service,
 };
 
-use zebra_chain::{chain_tip::ChainTip, parameters::Network};
+use zebra_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     address_book::AddressMetrics,
@@ -1135,6 +1135,88 @@ where
         .boxed()
     }
 
+    /// Routes a single-block download to up to `fanout` random ready peers,
+    /// ignoring inventory markers, and resolves with the first peer that
+    /// delivers the block.
+    ///
+    /// # Security
+    ///
+    /// Peers are chosen randomly and load is ignored, matching the broadcast
+    /// path: this prevents a peer from biasing selection by manipulating its own
+    /// load. Inventory markers are deliberately ignored — the caller uses this
+    /// only for the head-of-line block after a registry-miss, where the markers
+    /// are stale and `route_inv` would otherwise fail the request even though
+    /// ready peers actually have the block. The fanout is small and scoped to a
+    /// single hash, bounding the extra load this places on the peer set.
+    ///
+    /// If no ready peers have the block (or there are none), returns the same
+    /// synthetic [`NotFoundRegistry`](PeerError::NotFoundRegistry) error as
+    /// [`route_inv`](Self::route_inv), so the caller's head-of-line retry and
+    /// backoff handling applies unchanged.
+    fn route_hedge(
+        &mut self,
+        hashes: HashSet<block::Hash>,
+        fanout: usize,
+    ) -> <Self as tower::Service<Request>>::Future {
+        let inv_hash = InventoryHash::from(
+            *hashes
+                .iter()
+                .next()
+                .expect("hedged block requests contain exactly one hash"),
+        );
+
+        if self.ready_services.is_empty() {
+            metrics::counter!("pool.route_hedge.no_ready.count").increment(1);
+            return async move {
+                // Let other tasks run, so a retry might find different ready peers.
+                tokio::task::yield_now().await;
+                Err::<Response, BoxError>(
+                    SharedPeerError::from(PeerError::NotFoundRegistry(vec![inv_hash])).into(),
+                )
+            }
+            .boxed();
+        }
+
+        let fanout = fanout.clamp(1, self.ready_services.len());
+        let selected_peers = self.select_random_ready_peers(fanout);
+        metrics::counter!("pool.route_hedge.dispatch.count").increment(1);
+
+        // Send a plain `BlocksByHash` to each selected peer; peers and
+        // connections never see the hedged variant.
+        let inner = Request::BlocksByHash(hashes);
+        let mut futs = FuturesUnordered::new();
+        for key in selected_peers {
+            let mut svc = self
+                .take_ready_service(&key)
+                .expect("selected peers are ready");
+            futs.push(svc.call(inner.clone()));
+            self.push_unready(key, svc);
+        }
+
+        async move {
+            // Take the first peer that actually delivers an available block.
+            // Peers that are genuinely missing it (or error) are skipped; the
+            // remaining in-flight calls are cancelled when `futs` drops on return.
+            while let Some(result) = futs.next().await {
+                if let Ok(Response::Blocks(blocks)) = result {
+                    if blocks.iter().any(|block| block.available().is_some()) {
+                        metrics::counter!("pool.route_hedge.win.count").increment(1);
+                        return Ok(Response::Blocks(blocks));
+                    }
+                }
+            }
+
+            // Every hedged peer was missing the block (or errored). Surface the
+            // same synthetic registry-miss `route_inv` would, so the sync layer's
+            // head-of-line retry/backoff handling applies.
+            metrics::counter!("pool.route_hedge.exhausted.count").increment(1);
+            Err::<Response, BoxError>(
+                SharedPeerError::from(PeerError::NotFoundRegistry(vec![inv_hash])).into(),
+            )
+        }
+        .boxed()
+    }
+
     /// Broadcasts the same request to lots of ready peers, ignoring return values.
     fn route_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         // Broadcasts ignore the response
@@ -1431,6 +1513,12 @@ where
             } if hashes.len() == 1 => {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());
                 self.route_inv(req, hash)
+            }
+
+            // Head-of-line hedge: fan a single-block download out to a few random
+            // ready peers, ignoring inventory markers, and take the first delivery.
+            Request::HedgedBlocksByHash { ref hashes, fanout } if hashes.len() == 1 => {
+                self.route_hedge(hashes.clone(), fanout)
             }
 
             // Broadcast advertisements to lots of peers
