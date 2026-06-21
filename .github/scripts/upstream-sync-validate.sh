@@ -37,6 +37,12 @@ if [ -n "$CANDIDATE_JSON" ]; then
     echo "ERROR: result source_pr ${ACTUAL_PR} does not match candidate ${EXPECTED_PR}" >&2
     exit 1
   fi
+
+  EXPECTED_PR_MARKER="$(jq -r '.body_markers.upstream_pr // "Upstream-Zebra-PR: \(.source_pr)"' "$CANDIDATE_JSON")"
+  EXPECTED_MERGE_MARKER="$(jq -r '.body_markers.upstream_merge // (if .source_merge_commit then "Upstream-Zebra-Merge: \(.source_merge_commit)" else "" end)' "$CANDIDATE_JSON")"
+else
+  EXPECTED_PR_MARKER="Upstream-Zebra-PR: $(jq -r '.source_pr' "$RESULT_JSON")"
+  EXPECTED_MERGE_MARKER=""
 fi
 
 TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
@@ -69,6 +75,16 @@ fi
 
 if ! printf '%s\n' "$BODY" | grep -q 'Codex was used'; then
   echo "ERROR: PR body must disclose Codex usage" >&2
+  exit 1
+fi
+
+if ! printf '%s\n' "$BODY" | grep -Fqx "$EXPECTED_PR_MARKER"; then
+  echo "ERROR: PR body must include ${EXPECTED_PR_MARKER}" >&2
+  exit 1
+fi
+
+if [ -n "$EXPECTED_MERGE_MARKER" ] && ! printf '%s\n' "$BODY" | grep -Fqx "$EXPECTED_MERGE_MARKER"; then
+  echo "ERROR: PR body must include ${EXPECTED_MERGE_MARKER}" >&2
   exit 1
 fi
 
