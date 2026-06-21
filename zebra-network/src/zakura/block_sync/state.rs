@@ -122,7 +122,7 @@ impl BlockSyncStartup {
 
 /// Cheap cloneable handle used by services and drivers to inform block sync.
 ///
-/// S4 carries the shared per-peer download primitives here too, so
+/// per-peer routines carries the shared per-peer download primitives here too, so
 /// `service::add_peer` (the pipe-routine spawn point) can wire each per-peer
 /// pipe-routine with the same `WorkQueue`/`ByteBudget`/`PeerRegistry`/Sequencer/
 /// action/routine-to-reactor channels the reactor created.
@@ -227,7 +227,7 @@ pub(super) struct BlockSyncState {
     pub(super) best_header_hash: block::Hash,
     /// Thin per-peer handles the reactor keeps for demux/serving/admission. The
     /// per-peer *download* state moved into the spawned [`PeerRoutine`](super::peer_routine)
-    /// (S4); the cross-peer facts the reactor/producer need live in the
+    /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
     /// [`PeerRegistry`](super::peer_registry).
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
@@ -300,7 +300,7 @@ impl BlockSyncState {
 ///
 /// Carved out of the old `PeerBlockState` so the window math stays unit-testable
 /// while the per-peer download state moves into the spawned
-/// [`PeerRoutine`](super::peer_routine) (S4). The routine embeds one of these.
+/// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u16,
@@ -381,7 +381,7 @@ impl DownloadWindow {
     }
 }
 
-/// Thin per-peer handle the reactor keeps after S4: enough to serve inbound
+/// Thin per-peer handle the reactor keeps to serve inbound
 /// `GetBlocks` (the session clone + serving meters), advertise our `Status`, count
 /// admission, and tear down. The per-peer *download* state + inbound decode live
 /// in the per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)); servable/
@@ -393,7 +393,7 @@ pub(super) struct PeerBlockState {
     pub(super) direction: ServicePeerDirection,
     /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
     /// (serving-tip change broadcast + retry to peers that have not acknowledged
-    /// our Status). The pre-S4 `unsolicited` meter was dual-use; its inbound-status
+    /// our Status). The previous `unsolicited` meter was dual-use; its inbound-status
     /// *reply* half moved to the routine's `status_reply_meter`. This half stays
     /// reactor-side because the reactor owns serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,

@@ -125,7 +125,7 @@ impl ByteBudget {
     /// budget registers `subscribe_capacity().notified()` *before* re-reading
     /// `available()`/`try_reserve`, so a concurrent `release`/`shrink` can never
     /// be missed between the check and the wait.
-    #[allow(dead_code)] // consumed by the per-peer download routines in S4
+    #[allow(dead_code)] // consumed by the per-peer download routines in per-peer routines
     pub(crate) fn subscribe_capacity(&self) -> &Notify {
         &self.inner.capacity
     }
@@ -142,7 +142,7 @@ pub(crate) enum Admit {
     Reject(&'static str),
 }
 
-/// Per-peer semantic meters (status spam, new-block spam, ...).
+/// Per-peer semantic meters (status spam, new-block spam,...).
 ///
 /// Minimal in Phase 0: a pass-through that admits everything. The real
 /// per-service semantic meters (the `RateMeter`s currently in the per-peer

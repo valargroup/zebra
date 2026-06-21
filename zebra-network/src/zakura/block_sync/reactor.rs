@@ -87,7 +87,7 @@ pub fn spawn_block_sync_reactor(
     let (candidates_tx, candidates_rx) = watch::channel(ZakuraBlockSyncCandidateState::default());
 
     // The Sequencer (commit pipeline) and the committed-throughput meter move out
-    // of the reactor onto their own serial task (S3b). The reactor forwards every
+    // of the reactor onto their own serial task (Sequencer task). The reactor forwards every
     // Sequencer-mutating event over a bounded ordered input channel and learns
     // committed progress back over a non-blocking `watch`.
     let sequencer = Sequencer::new(
@@ -115,7 +115,7 @@ pub fn spawn_block_sync_reactor(
     );
     tokio::spawn(sequencer_task.run());
 
-    // S4: the shared per-peer fact table read by the producer / candidate / trace
+    // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
     // (admission/teardown entry insert/remove).
     let registry = Arc::new(PeerRegistry::new());
@@ -178,14 +178,14 @@ pub fn spawn_block_sync_reactor(
 pub(super) struct BlockSyncReactor {
     startup: BlockSyncStartup,
     state: BlockSyncState,
-    /// Shared per-peer fact table (S4): servable/caps/outstanding written by the
+    /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
     registry: Arc<PeerRegistry>,
     events: mpsc::Receiver<BlockSyncEvent>,
     /// A keep-alive sender clone for the bounded driver-event channel so the
-    /// receiver never resolves to `None` while the reactor lives. S4 dropped the
-    /// service's stored `events` sender (it was only used by the deleted
+    /// receiver never resolves to `None` while the reactor lives. The service no
+    /// longer stores an `events` sender (it was only used by the deleted
     /// `deliver_frame` pipe path), so without this the channel would close as soon
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
@@ -213,7 +213,7 @@ pub(super) struct BlockSyncReactor {
     verified_block_tip: block::Height,
     /// Reactor-side mirror of the Sequencer's body-download floor. Used ONLY for
     /// the producer query lower bound, candidate prune, and stale-prefix trim —
-    /// never as a fetch decision (design doc §7.8).
+    /// never as a fetch decision.
     committed_floor: block::Height,
     /// `(verified_tip, best_header_tip, best_header_hash)` for a dispatched
     /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
@@ -479,7 +479,7 @@ impl BlockSyncReactor {
         }
 
         self.state.parked_peers.remove(&peer);
-        // S4 inverted flow: the per-peer pipe-routine was already spawned by
+        // inverted inbound flow: the per-peer pipe-routine was already spawned by
         // `service::add_peer` (the pipe spawn point), wired with the shared
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
@@ -487,7 +487,7 @@ impl BlockSyncReactor {
         let mut peer_state = PeerBlockState::new(session, &self.startup.config);
         // Consume the status-advertisement refresh allowance: the connect Status
         // below counts as this peer's first advertisement, so the next periodic
-        // refresh must wait a full interval before re-sending (matches the pre-S4
+        // refresh must wait a full interval before re-sending (matches the previous
         // `unsolicited.mark_taken` at connect).
         peer_state.refresh_meter.mark_taken(Instant::now());
         self.state.peers.insert(peer.clone(), peer_state);
@@ -612,7 +612,7 @@ impl BlockSyncReactor {
     /// `needed_heights`; this prunes the heights the floor passed so the candidate
     /// gap clears promptly without waiting for the next `NeededBlocks` snapshot.
     /// Reads the `committed_floor` mirror (the Sequencer's floor now lives on the
-    /// task); this is a GC/candidate use, never a fetch throttle (§7.8).
+    /// task); this is a GC/candidate use, never a fetch throttle.
     fn prune_needed_below_floor(&mut self) {
         let floor = self.committed_floor;
         let before = self.state.needed_heights.len();
@@ -635,7 +635,7 @@ impl BlockSyncReactor {
         // them and makes the destructive-vs-growth call against its own
         // authoritative copy.
         let tip = frontiers.verified_block_tip;
-        // S4: peer `outstanding` lives in the routines, mirrored into the registry
+        // peer `outstanding` lives in the routines, mirrored into the registry
         // (per-peer *unreceived* in-flight heights). The reactor reads it from the
         // registry to precompute the two peer-derived halves of the reset
         // decision. Received-and-buffered heights are caught by the Sequencer's own
@@ -670,7 +670,7 @@ impl BlockSyncReactor {
         // Always update the committed mirrors so the producer lower bound,
         // candidate prune, and trace read the latest floor/tip — even on a
         // view change that only reflects buffering/submission. The mirrors are
-        // read-only control inputs (§7.8); updating them is cheap and idempotent.
+        // read-only control inputs; updating them is cheap and idempotent.
         let reset_advanced = view.reset_epoch != self.last_reset_epoch;
         let reaction_advanced = view.reaction_epoch != self.last_reaction_epoch;
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
@@ -696,7 +696,7 @@ impl BlockSyncReactor {
         self.last_reaction_epoch = view.reaction_epoch;
 
         if reset_advanced {
-            // A destructive reset (S4: reset = in-place clear in each routine). The
+            // A destructive reset (reset = in-place clear in each routine). The
             // Sequencer already pinned its floor/tip and `work.reset_above`'d the
             // dropped successor heights, then bumped `reset_epoch`. Each per-peer
             // pipe-routine watches the same `view`: on the `reset_epoch` bump it
@@ -712,7 +712,7 @@ impl BlockSyncReactor {
             // proactively drop outstanding through the tip: a still-open request
             // for a now-committed height releases its budget on delivery (Sequencer
             // `Redundant`) or on its own timeout, so there is no leak, only a
-            // slightly later release (§6 S4 "reset = respawn"). Trace the change
+            // slightly later release. Trace the change
             // only when the tip actually moved.
             self.trace_frontiers_changed(view.verified_tip);
         }
@@ -736,7 +736,7 @@ impl BlockSyncReactor {
         // ever being queued, freezing `body_download_floor` and re-requesting
         // already-held blocks forever. Only schedule heights we do not already
         // hold in memory and have not already submitted contiguously.
-        // Producer filter (S3b substitution): the Sequencer's reorder/applying/
+        // Producer filter (Sequencer task substitution): the Sequencer's reorder/applying/
         // submitted predicates are no longer reactor-local. They are replaced by
         // the structural invariant "held-or-outstanding ⟺ `work.in_flight`":
         // every buffered/applying/submitted/outstanding height was taken into
@@ -744,7 +744,7 @@ impl BlockSyncReactor {
         // or `reset_above` (reset). So a height above the committed floor that is
         // not in `in_flight` is genuinely missing and re-queuable; one that is
         // in `in_flight` is already claimed and must not be re-issued. The
-        // `committed_floor` mirror is the producer's lower bound only (§7.8).
+        // `committed_floor` mirror is the producer's lower bound only.
         //
         // `!has_outstanding_request` is kept (the registry's per-peer outstanding):
         // the `in_flight ⟺ outstanding` half of the invariant breaks transiently
@@ -776,7 +776,7 @@ impl BlockSyncReactor {
         // buffered/in-flight height is never re-queued and a stale snapshot cannot
         // duplicate work. Heights below the floor are GC'd by `advance_floor`;
         // heights above a reset target by `reset_above`. The per-peer routines pick
-        // the new work up via `work.subscribe_available()` (the §7.3 wake), so the
+        // the new work up via `work.subscribe_available()` (the wake), so the
         // reactor no longer schedules here. Stale-hash pruning of an *outstanding*
         // request is now owned by the routine (and reset = in-place clear) rather
         // than the reactor's old `drop_ranges_not_in_needed`.
@@ -797,7 +797,7 @@ impl BlockSyncReactor {
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
     /// only. Downloads gate on byte budget + per-peer slots — never on this lag
-    /// (no near-tip pause); see the design doc §7.8.
+    /// (no near-tip pause).
     fn body_lag(&self) -> u32 {
         self.state
             .best_header_tip
@@ -805,7 +805,7 @@ impl BlockSyncReactor {
             .saturating_sub(self.verified_block_tip.0)
     }
 
-    /// Handle one shared routine→reactor message (S4 inverted flow). The per-peer
+    /// Handle one shared routine→reactor message (inverted inbound flow). The per-peer
     /// pipe-routines forward only the concerns that need reactor-global state:
     /// serving, status advertisement, the producer re-query, and serving-side
     /// misbehavior.
@@ -1708,14 +1708,14 @@ impl BlockSyncReactor {
         // Servable / outstanding peer counts come from the registry (the routines
         // mirror their outstanding heights there). The per-request deadline ages
         // now live in the routines and are no longer reactor-visible; this trace
-        // field drops the `oldest/next deadline ms` breakdown (S4) — the periodic
+        // field drops the `oldest/next deadline ms` breakdown (per-peer routines) — the periodic
         // `BLOCK_SYNC_STATE` row still carries the slot/budget signals.
         let (servable_peers, outstanding_peers) = self.registry.floor_gap_servable(height);
         let available_peers = 0usize;
         let oldest_outstanding_ms = None;
         let next_deadline_ms = None;
 
-        // S3b: the Sequencer's per-height `applying`/`submitted_apply`/`reorder`
+        // Sequencer task: the Sequencer's per-height `applying`/`submitted_apply`/`reorder`
         // membership is no longer reactor-visible (it lives on the task). A height
         // held in any of those buffers is in `work.in_flight` (the structural
         // invariant), so it classifies here as `outstanding` (a peer holds the

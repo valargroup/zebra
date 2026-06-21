@@ -2,7 +2,7 @@
 //!
 //! Block sync downloads block *bodies* over QUIC stream 6 for the heights header
 //! sync has already committed, and serves those same bodies back to other peers.
-//! After S4 the shape is "the pipe IS the routine": each connected peer is driven
+//! After per-peer routines the shape is "the pipe IS the routine": each connected peer is driven
 //! by one task that owns its transport read and runs the download logic inline —
 //! there is no central scheduler and no reactor inbound demux.
 //!

@@ -232,7 +232,7 @@ async fn wait_for_query_needed_blocks(
 
 /// Push one decoded stream-6 message to a peer's inbound stream as a real frame.
 ///
-/// S4 inverted the inbound data flow: a peer's frames are decoded and dispatched
+/// The inbound data flow is inverted: a peer's frames are decoded and dispatched
 /// by its per-peer pipe-routine, not the reactor. Tests that previously injected a
 /// `BlockSyncEvent::WireMessage{peer,msg}` shortcut now push the encoded frame onto
 /// the peer's `inbound_tx` (the same `FramedSend` `connect_peer_with_status`
@@ -319,9 +319,9 @@ async fn wait_for_outbound_status(outbound: &mut FramedRecv) -> BlockSyncStatus 
 }
 
 /// Multi-peer replacement for the old mirror-based `wait_for_getblocks` in tests
-/// where work assignment between peers is nondeterministic. The pre-S4 mirror
+/// where work assignment between peers is nondeterministic. The previous mirror
 /// serialized every peer's outbound on one global `actions` channel and returned
-/// which peer was asked; post-S4 the only real signal is each peer's own outbound
+/// which peer was asked; now the only real signal is each peer's own outbound
 /// `FramedRecv`, so we `select!` across all of them and return the `(peer, start,
 /// count)` of whichever peer the routine actually sent a `GetBlocks` to. Skips
 /// `Status` frames (status refreshes interleave with requests). `peers` pairs each
@@ -401,7 +401,7 @@ async fn drain_parent_first_actions(
     }
 }
 
-/// Build a `DownloadWindow` (the per-peer adaptive outbound window that S4 moved
+/// Build a `DownloadWindow` (the per-peer adaptive outbound window that per-peer routines moved
 /// off `PeerBlockState` into the spawned `PeerRoutine`). The window math is the
 /// same the routine drives; these unit tests pin it in isolation.
 fn download_window() -> DownloadWindow {
@@ -500,9 +500,9 @@ fn peer_timeout_recovery_slot_replaces_timed_out_request_above_reduced_window() 
 }
 
 // The old `BlockRangeScheduler` single-pass timeout-retry bias
-// (`scheduler_retry_after_timeout_*`) is removed in S3a: the WorkQueue has no
+// (`scheduler_retry_after_timeout_*`) is removed: the WorkQueue has no
 // per-peer assignment to bias, so a returned height is simply contestable by any
-// servable peer. The peer-local timeout bias is re-introduced in S4. The
+// servable peer. The peer-local timeout bias is re-introduced in per-peer routines. The
 // reactor-level locality property is still covered by
 // `reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling`.
 #[test]
@@ -517,7 +517,7 @@ fn work_queue_returned_height_is_contestable_by_any_peer() {
 
     // Its request times out: the height returns to `pending`, where any servable
     // peer (not just the original holder) can take it again. No bias toward or
-    // away from any particular peer exists in S3a.
+    // away from any particular peer exists in WorkQueue.
     queue.return_items([block::Height(1)]);
     assert!(queue.pending_contains(block::Height(1)));
     assert_eq!(
@@ -972,7 +972,7 @@ fn work_queue_take_respects_servable_range_contiguity_and_max() {
 #[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
     // The committed floor is NOT an upper bound on a take: a peer fetches as far
-    // above the floor as its servable range allows (design doc §7.8 footgun).
+    // above the floor as its servable range allows.
     let queue = work_queue_with(
         0,
         (100..=104)
@@ -1041,7 +1041,7 @@ fn work_queue_advance_floor_and_reset_above_gc_both_maps() {
 
 #[test]
 fn work_queue_height_is_in_exactly_one_set() {
-    // §7.7: a height is in exactly one of {below-floor (gone), pending, in_flight}.
+    // : a height is in exactly one of {below-floor (gone), pending, in_flight}.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(100))]);
     let in_one_set = |height: block::Height| -> usize {
         usize::from(queue.pending_contains(height)) + usize::from(queue.in_flight_contains(height))
@@ -1378,7 +1378,7 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
 /// must rotate across the status-ready peers rather than always pouring the
 /// single budgeted request into the lowest-node-id peer.
 ///
-/// S4 deletes the central full-pass `fill_rotation_cursor`: per-peer routines
+/// Per-peer routines replace the central full-pass `fill_rotation_cursor`: per-peer routines
 /// race for the shared work, with the per-peer byte cap as the fairness mechanism
 /// for multi-height work. For a single contested height with fanout=1 there is no
 /// per-round rotation guarantee (whichever routine's `take_in_range` wins the race
@@ -1629,7 +1629,7 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
 // The old covered-prefix / assigned-key / queued-retry-ordering scheduler tests
 // (`scheduler_partial_*`, `scheduler_drops_*`, `scheduler_splits_*`,
 // `scheduler_retries_only_uncovered_suffix`, `scheduler_keeps_queued_*`,
-// `scheduler_releases_budget_*`) are removed in S3a: the WorkQueue replaces the
+// `scheduler_releases_budget_*`) are removed: the WorkQueue replaces the
 // covered/assigned bookkeeping with `in_flight`, the byte budget moves to the
 // reactor's `fill_peer`, and a `BTreeMap` keeps ascending order by construction.
 // The remaining WorkQueue-owned behaviors (dedup, range eligibility, GC, the
@@ -1828,7 +1828,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(budget.reserved(), 0);
 }
 
-// ---- Sequencer (S1 commit-pipeline extraction) ----
+// ---- Sequencer commit pipeline ----
 
 fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
     Sequencer::new(block::Height(verified_tip), submitted_apply_limit)
@@ -2360,7 +2360,7 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
     assert_eq!(service.peer_count(), 1);
     let _outbound_rx = outbound_rx;
 
-    // S4 inverted the inbound data flow: with no reactor wiring (`new_for_test`),
+    // The inbound data flow is inverted: with no reactor wiring (`new_for_test`),
     // `add_peer` drains inbound frames rather than emitting a `WireMessage` event
     // (the production inbound path is the per-peer pipe-routine, exercised by the
     // reactor tests with real wiring). The frame still queues onto the framed
@@ -2425,7 +2425,7 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     }
     // The replacement session remains installed (the stale teardown did not
     // disconnect it): `peer_count` stays 1 and the live replacement record was
-    // never removed by the old session's teardown. (The pre-S4 check that routed a
+    // never removed by the old session's teardown. (The previous check that routed a
     // `send_action(SendMessage)` through the record only exercised the removed
     // test-only source-pump scaffolding.)
     assert_eq!(service.peer_count(), 1);
@@ -2438,7 +2438,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let mut config = ZakuraBlockSyncConfig::default();
     config.peer_limits.inbound_queue_depth = 1;
     let (events, _event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth);
-    // Fill the bounded wire-event queue (S4 deleted `WireMessage`; any event that
+    // Fill the bounded wire-event queue (per-peer routines deleted `WireMessage`; any event that
     // rides the bounded `events` channel proves lifecycle bypass — use a header-tip
     // change).
     events
@@ -2497,7 +2497,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
 
 #[tokio::test]
 async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
-    // S4 inverted flow: the per-peer pipe-routine decodes inbound frames in its own
+    // inverted inbound flow: the per-peer pipe-routine decodes inbound frames in its own
     // task. A malformed frame is `MalformedMessage` misbehavior AND a fatal protocol
     // reject for the whole connection (the routine returns `Err(SinkReject::protocol)`,
     // which `handle_pipe_exit` turns into a connection cancel). With real reactor
@@ -2877,7 +2877,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     assert_eq!(handle.local_status().servable_high, block::Height(0));
 
     // The submitted-but-unapplied block must keep the body budget full, so no new
-    // GetBlocks may issue. S4: a routine that consumed work pings the reactor to
+    // GetBlocks may issue. a routine that consumed work pings the reactor to
     // re-query, so a budget-orthogonal `QueryNeededBlocks` may appear in this
     // window (the producer self-gates; it is idempotent and downloads nothing).
     // Tolerate only that; any GetBlocks/SubmitBlock here would be the regression.
@@ -2924,7 +2924,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     reactor_task.abort();
 }
 
-/// Pins the S3b producer-filter substitution `height > committed_floor &&
+/// Pins the Sequencer task producer-filter substitution `height > committed_floor &&
 /// !work.in_flight_contains(height)`. A height that has been received and is held
 /// in the commit pipeline (buffered / applying / submitted) was taken into the
 /// WorkQueue's `in_flight` at issuance and stays there until it commits, so a
@@ -3650,7 +3650,7 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks { .. }
     ) {}
-    // S4 inverted flow: the body is decoded by the peer's pipe-routine in its own
+    // inverted inbound flow: the body is decoded by the peer's pipe-routine in its own
     // task, racing the reactor's producer `work.extend`. The reactor extends the
     // WorkQueue BEFORE publishing the candidate set, so waiting for height 1 to
     // appear in the candidate watch deterministically confirms the work is in
@@ -3778,7 +3778,7 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
     reactor_task.abort();
 }
 
-// DELETED in S4 (the pipe IS the routine): `reactor_accepts_queued_body_from_
+// Removed by the per-peer routine design: `reactor_accepts_queued_body_from_
 // recently_disconnected_peer` exercised the reactor's "late body" path — a body
 // arriving for a peer with no live routine, demuxed by the reactor's
 // `handle_late_body`/`accept_unmatched_queued_body`. The inverted data flow removes
@@ -3909,7 +3909,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
         .await
         .expect("apply-finished event queues");
 
-    // S4: routines ping the producer on a low-water timer, so an early query can
+    // routines ping the producer on a low-water timer, so an early query can
     // fire while the contiguous prefix is still draining into `applying` (floor
     // still 1). Wait for the query whose lower bound has reached the submitted
     // floor (2) — that is the one that must skip the already-submitted bodies.
@@ -4035,7 +4035,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
         })
         .await
         .expect("apply-finished event queues");
-    // S4: the rejection rollback (`reset_above` + floor reset) runs on the
+    // the rejection rollback (`reset_above` + floor reset) runs on the
     // Sequencer task while routines independently re-query, so re-supply the needed
     // metadata on every `QueryNeededBlocks` (idempotent — filtered while the height
     // is still in flight, re-extended once the rollback clears it) and wait for the
@@ -4083,7 +4083,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
     reactor_task.abort();
 }
 
-/// §7.8 footgun regression: downloads gate ONLY on byte budget + per-peer slots,
+/// footgun regression: downloads gate ONLY on byte budget + per-peer slots,
 /// never on floor-distance / near-tip lag. With the verified floor at 0 and
 /// needed heights far above it (1..=4 with the header tip near 1000), a peer with
 /// free slots and ample budget MUST keep issuing GetBlocks — there is no
@@ -4169,7 +4169,7 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
 
 #[tokio::test]
 async fn routine_refills_after_budget_release_no_missed_wake() {
-    // §7.3 missed-wake guard at the routine level: a routine blocked on an
+    // missed-wake guard at the routine level: a routine blocked on an
     // exhausted byte budget must re-fill when budget is freed. The budget holds
     // exactly one worst-case block, so the first GetBlocks exhausts it; delivering
     // that body releases budget (shrink + commit) and the routine must issue the
@@ -4243,8 +4243,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
 
     // Drive height 1 to commit: drain its SubmitBlock and report it applied. The
     // Sequencer task then releases the byte budget and the capacity notify must
-    // wake the budget-blocked routine to issue the next GetBlocks (the §7.3
-    // missed-wake guarantee — a release between the routine's fill-check and its
+    // wake the budget-blocked routine to issue the next GetBlocks (the     // missed-wake guarantee — a release between the routine's fill-check and its
     // await must not be lost).
     let token = loop {
         match next_action(&mut actions).await {
@@ -4279,7 +4278,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
 
 #[tokio::test]
 async fn routine_disconnect_returns_outstanding_and_releases_budget() {
-    // §7.5 disconnect-mid-fetch guard: cancelling a routine with unreceived
+    // disconnect-mid-fetch guard: cancelling a routine with unreceived
     // outstanding must return those heights to `work.pending` and release their
     // budget, so a fresh peer is offered the same height. Driven black-box: the
     // first peer takes the height, then disconnects mid-fetch; a second peer must
@@ -5172,7 +5171,7 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
 // `reactor_does_not_retry_missing_height_already_in_flight` was a fanout=2 test:
 // it required the same range to be assigned to two peers and asserted that a
 // partial response from one did not re-request heights the *other* still held.
-// Fanout > 1 is removed in S3a (a height is taken by exactly one peer), so the
+// Fanout > 1 is removed in WorkQueue (a height is taken by exactly one peer), so the
 // "in flight on another peer" scenario no longer exists. The structural property
 // — a taken (in_flight) height is not re-takable — is now covered by the
 // WorkQueue unit test `work_queue_take_dedups_a_height_across_peers`.
@@ -5300,7 +5299,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                             verified_block_tip,
                             best_header_tip,
                         } => {
-                            // S4: queries fire at various floor states as commits
+                            // queries fire at various floor states as commits
                             // advance the floor (it starts at 800 and climbs as the
                             // prefix commits), so the lower bound is `>= 800`, not
                             // exactly 800.
@@ -5507,7 +5506,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         }))
         .await
         .expect("reset event queues");
-    // S4: the reset (FrontierReset) and the producer are decoupled across tasks,
+    // the reset (FrontierReset) and the producer are decoupled across tasks,
     // and routines re-query on a low-water ping, so several `QueryNeededBlocks`
     // can race the in-flight reset clear. Re-supply the new-fork metadata on every
     // query (idempotent: it is filtered while the stale height is still in flight,
@@ -5986,7 +5985,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         .await
         .expect("same-hash needed metadata queues");
 
-    // S3b: the destructive reset preserves the submitted-apply record for height 2
+    // Sequencer task: the destructive reset preserves the submitted-apply record for height 2
     // (`remember_released_applies`) but `reset_above` drops its WorkQueue
     // `in_flight` claim, and the reactor's producer filter is now the hash-blind
     // `in_flight_contains` structural check (it can no longer read the Sequencer's
@@ -6040,7 +6039,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     // A genuine fork to a different hash at height 2 reaches block sync as a reset
     // (reanchor), which `reset_above`s the WorkQueue and clears any stale
     // `in_flight` claim for height 2 before the producer re-fills — the path the
-    // S3a/S3b design relies on to install a new per-height hash (a bare
+    // reset path relies on to install a new per-height hash (a bare
     // `NeededBlocks` never hash-corrects an in-flight height). After that reset the
     // different hash at the same height must schedule.
     handle
@@ -6170,7 +6169,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         }))
         .await
         .expect("reset event queues");
-    // S4: the reset's `reset_above` runs on the Sequencer task while routines
+    // the reset's `reset_above` runs on the Sequencer task while routines
     // re-query, so re-supply the needed metadata on every query (idempotent until
     // the reset clears the stale in-flight) and wait for the re-fetch.
     let reset_meta = vec![BlockSyncBlockMeta {
@@ -6240,7 +6239,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         .await
         .expect("stale apply-finished event queues");
     // The stale completion must not release the current submission: it produces no
-    // new `SubmitBlock` (no re-submission). S4 routines ping the producer on a
+    // new `SubmitBlock` (no re-submission). Routines ping the producer on a
     // low-water timer, so a benign `QueryNeededBlocks` is allowed and skipped; the
     // releasing signal we guard against is a fresh `SubmitBlock`.
     while let Ok(Some(action)) =
@@ -6372,7 +6371,7 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
     );
     assert_eq!(service.peer_count(), 1);
 
-    // S4: the fast-forward commit + budget release run on the Sequencer task while
+    // the fast-forward commit + budget release run on the Sequencer task while
     // routines re-query, so re-supply the needed metadata on every query and wait
     // for the height-4 request that proves the buffered bytes were released.
     let post_reset_meta = vec![BlockSyncBlockMeta {
@@ -6575,7 +6574,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
         }
 
-        // S4: reset and the producer are decoupled across tasks, so re-supply the
+        // reset and the producer are decoupled across tasks, so re-supply the
         // new-fork metadata on every query until the height-2 re-fetch appears.
         let new_fork_meta = vec![
             BlockSyncBlockMeta {
@@ -6749,7 +6748,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         }))
         .await
         .expect("reset event queues");
-    // S4: reset (`reset_above`) and the producer are decoupled, so re-supply the
+    // reset (`reset_above`) and the producer are decoupled, so re-supply the
     // new-fork metadata on every query until the height-2 re-fetch appears.
     let new_fork_meta = vec![BlockSyncBlockMeta {
         height: block::Height(2),
@@ -7441,7 +7440,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
         .await
         .expect("apply-finished event queues");
 
-    // S4: the apply-rejection `Misbehavior` is emitted by the Sequencer task while
+    // the apply-rejection `Misbehavior` is emitted by the Sequencer task while
     // the routines independently ping `RequeryNeeded`, so one or more
     // `QueryNeededBlocks` can race ahead of the misbehavior report. Skip queries
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
@@ -8546,7 +8545,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
         .await
         .expect("unmatched RangeUnavailable frame queues");
 
-    // S4: routines re-query on a low-water ping, so a benign `QueryNeededBlocks`
+    // routines re-query on a low-water ping, so a benign `QueryNeededBlocks`
     // may appear; the unmatched RangeUnavailable must NOT score the peer or trigger
     // a fresh GetBlocks for the already-in-flight range. A fresh request would land
     // on this peer's own outbound, so watch the real wire while draining advisory
@@ -9510,7 +9509,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     reactor_task.abort();
 }
 
-// S4 (the pipe IS the routine) removed the reactor "late response after disconnect"
+// Per-peer routines removed the reactor "late response after disconnect"
 // path that the original first half of this test exercised: a disconnected peer's
 // `FramedRecv` is closed and its routine has exited, so there is no transport for a
 // late frame and no reactor inbound demux to ignore one. The surviving, still-
@@ -9593,7 +9592,7 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
-    // Connect the probe peer with a real pipe-routine (S4) so its inbound frames
+    // Connect the probe peer with a real pipe-routine (per-peer routines) so its inbound frames
     // are decoded and dispatched.
     let probe = peer(7);
     let (probe_inbound_tx, probe_inbound_rx) = framed_channel(8);

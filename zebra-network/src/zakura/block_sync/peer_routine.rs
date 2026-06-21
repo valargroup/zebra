@@ -1,6 +1,6 @@
-//! Per-peer pipe-routine for Zakura block sync (S4 — the pipe IS the routine).
+//! Per-peer pipe-routine for Zakura block sync.
 //!
-//! S4 inverts the inbound data flow. One task per connected peer owns its
+//! per-peer routines inverts the inbound data flow. One task per connected peer owns its
 //! `FramedRecv` (the transport read), decodes each stream-6 frame, AND runs the
 //! download logic as a direct continuation in the **same task** — there is no
 //! reactor inbound demux and no per-peer `PeerInput` channel. Data flows
@@ -13,12 +13,11 @@
 //! The one throughput-critical effect: the matched-body
 //! `sequencer_input.send(AcceptBody).await` runs in this per-peer task, so a
 //! slow verifier (Sequencer backpressure) stalls only one routine, not the whole
-//! fleet (design doc §7.4/§9). The download decision gates **only** on the byte
-//! budget + per-peer slots — never on the committed/verified/finalized floor
-//! (§7.8): `take_in_range(servable_low, servable_high, n)` uses `servable_high` as
-//! the *only* upper bound.
+//! fleet. The download decision gates **only** on the byte budget + per-peer
+//! slots: `take_in_range(servable_low, servable_high, n)` uses `servable_high`
+//! as the *only* upper bound.
 //!
-//! The download logic is **moved, not rewritten** from the pre-S4 reactor: the
+//! The download logic is **moved, not rewritten** from the previous reactor: the
 //! want-work fill loop ports `fill_peer`, the matched-body tail ports
 //! `handle_block`, and the unmatched fallthroughs port `accept_unmatched_queued_body`
 //! / the `ignore_*` helpers / `stale_adjusted_outstanding_disposition` verbatim,
@@ -60,9 +59,9 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 /// single-threaded test runtime, the other routines woken by the same failure
 /// `return_items` get a chance to take the contested work first — it is the
 /// peer-local retry bias the central `fill_rotation_cursor` used to provide
-/// (design doc §6 S4 "the peer-local timeout bias is re-introduced in S4"). It is
+///. It is
 /// negligible against real sync timescales, and the height stays `pending` and
-/// fully contestable by every other peer throughout (§7.5).
+/// fully contestable by every other peer throughout.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Outcome classification for finishing an outstanding request (ported verbatim
@@ -86,7 +85,7 @@ pub(super) struct PeerRoutine {
 
     // ---- transport inbound (the pipe half) ----
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
-    /// task; inbound never flows through the reactor (S4 inverted data flow).
+    /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
     recv: FramedRecv,
 
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
@@ -95,7 +94,7 @@ pub(super) struct PeerRoutine {
     /// the registry for the reactor's serving/candidate reads).
     received_status: bool,
     /// This peer's advertised servable range, learned from its `Status`. The
-    /// want-work upper bound (§7.8); never the floor.
+    /// want-work upper bound; never the floor.
     servable_low: block::Height,
     servable_high: block::Height,
     /// This peer's clamped advertised serving caps, learned from its `Status`.
@@ -104,11 +103,11 @@ pub(super) struct PeerRoutine {
     max_blocks_per_response: u32,
     max_response_bytes: u32,
     /// Rate meter for sending our `Status` reply to this peer's inbound `Status`
-    /// (the pre-S4 `unsolicited` meter; the reply decision is routine-local now,
+    /// (the previous `unsolicited` meter; the reply decision is routine-local now,
     /// the actual send stays reactor-side via `RoutineToReactor::StatusReceived`).
     status_reply_meter: super::state::RateMeter,
     /// Rate meter gating how often this peer's `Status` frames are applied at all
-    /// (the pre-S4 `inbound_status` meter), so a status flood cannot spin the
+    /// (the previous `inbound_status` meter), so a status flood cannot spin the
     /// routine. A status that grows the servable range bypasses the meter.
     inbound_status_meter: super::state::RateMeter,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -175,7 +174,7 @@ impl PeerRoutine {
         );
         // Defer the first Status reply: the reactor already sends a connect-status
         // on `PeerConnected`, so the peer's first inbound `Status` should not also
-        // trigger an immediate reply (matches the pre-S4 `peer_connected`
+        // trigger an immediate reply (matches the previous `peer_connected`
         // `unsolicited.mark_taken`).
         let mut status_reply_meter = status_reply_meter;
         status_reply_meter.mark_taken(Instant::now());
@@ -212,7 +211,7 @@ impl PeerRoutine {
 
     /// Run the pipe-routine until stream close, cancellation, or a protocol
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
-    /// pipe tears the whole connection down, matching the pre-S4 `run_peer`.
+    /// pipe tears the whole connection down, matching the previous `run_peer`.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
@@ -221,10 +220,10 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
-        // The per-connection oversize guard the pre-S4 pipe applied at ingress.
+        // The per-connection oversize guard the previous pipe applied at ingress.
         let mut guard = block_sync_guard();
         loop {
-            // §7.3 missed-wake safety: register both `Notify`s via
+            // missed-wake safety: register both `Notify`s via
             // `Notified::enable()` BEFORE the fill attempt. The budget/work
             // `Notify`s use `notify_waiters` (no stored permit), so a
             // release/extend that lands between the fill-check and the await
@@ -250,7 +249,7 @@ impl PeerRoutine {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
                         // the supervised pipe cancels the connection (matches the
-                        // pre-S4 `run_peer` reject path); the `Drop` guard returns
+                        // previous `run_peer` reject path); the `Drop` guard returns
                         // unreceived work on the way out.
                         Some(frame) => self.handle_frame(&mut guard, frame).await?,
                         // Stream closed (peer gone): exit cleanly. `Drop` returns
@@ -310,7 +309,7 @@ impl PeerRoutine {
             Ok(msg) => msg,
             Err(error) => {
                 // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                // protocol reject for the whole connection (matches the pre-S4
+                // protocol reject for the whole connection (matches the previous
                 // `run_peer` decode-error path). Report via the shared channel,
                 // then reject; the report is best-effort and never blocks.
                 let protocol_error =
@@ -362,7 +361,7 @@ impl PeerRoutine {
 
     /// Apply this peer's `Status` locally (servable range, caps, `received_status`)
     /// and into the registry, then ping the reactor to advertise our reply and
-    /// republish the candidate. Ports the reactor's pre-S4 `handle_status`
+    /// republish the candidate. Ports the reactor's previous `handle_status`
     /// validate / rate-meter / upsert; the servable read for want-work is now this
     /// routine's own fields.
     fn handle_status(&mut self, status: BlockSyncStatus) {
@@ -414,8 +413,8 @@ impl PeerRoutine {
     /// and on a destructive `reset_epoch` bump clear this routine's outstanding
     /// **in place** (return unreceived heights to `work.pending`, release their
     /// budget, clear the registry outstanding, drop retry-avoid) and re-fan from
-    /// the post-`reset_above` `WorkQueue`. The transport is never torn down (§6 S4
-    /// "reset = in-place clear, not respawn").
+    /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
+    /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
         let reset_epoch = self.view.borrow().reset_epoch;
         if reset_epoch == self.last_reset_epoch {
@@ -430,7 +429,7 @@ impl PeerRoutine {
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
-        // `reset_above`) and release their reservations exactly once (§7.5).
+        // `reset_above`) and release their reservations exactly once.
         for outstanding in self.window.outstanding.drain(..).collect::<Vec<_>>() {
             self.budget.release(outstanding.reserved_bytes());
             self.work.return_items(unreceived_heights(&outstanding));
@@ -476,13 +475,13 @@ impl PeerRoutine {
     /// per-peer state lives (now routine-local / the registry) and the handles.
     ///
     /// There is no floor gate: downloads are governed solely by the byte budget
-    /// and per-peer slots — never floor-distance / near-tip lag (§7.8).
+    /// and per-peer slots — never floor-distance / near-tip lag.
     async fn try_fill(&mut self) {
         let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
         // Reconcile the adaptive window's hard cap with the peer's currently
         // advertised `max_inflight_requests` (it may have grown/shrunk via a
         // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
-        // the pre-S4 `handle_status` clamp of the window / recovery slots to the
+        // the previous `handle_status` clamp of the window / recovery slots to the
         // new hard capacity.
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
@@ -491,8 +490,8 @@ impl PeerRoutine {
         // committed floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
         // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* committed requests (§7.8-permitted), never a fetch
-        // throttle — it replaces the pre-S4 reactor `drop_outstanding_through`
+        // GC of *our own* committed requests, never a fetch
+        // throttle — it replaces the previous reactor `drop_outstanding_through`
         // without the cross-peer churn the spec warned about (a partially-received
         // request whose suffix is still above the floor is left in place).
         self.gc_committed_outstanding();
@@ -523,7 +522,7 @@ impl PeerRoutine {
             // chunk only to return it. Taking-then-returning would call
             // `work.return_items` → `notify_waiters`, which re-wakes THIS routine's
             // own enabled `work_added` notification (registered before the fill) and
-            // busy-loops the want-work arm (§7.3 missed-wake's mirror image — a
+            // busy-loops the want-work arm (missed-wake's mirror image — a
             // self-wake spin). Gating before the take keeps the routine parked on
             // `capacity` until budget frees up.
             let max_bytes = self
@@ -543,7 +542,7 @@ impl PeerRoutine {
 
             // Take work in this peer's servable range. `servable_high` is NOT
             // clamped to the floor: a peer fetches as far ahead of the committed
-            // floor as its servable range and the byte budget allow (§7.8).
+            // floor as its servable range and the byte budget allow.
             let mut items = self
                 .work
                 .take_in_range(servable_low, servable_high, byte_capped_count);
@@ -855,7 +854,7 @@ impl PeerRoutine {
         // Forward the body to the commit-pipeline task. THE ONLY blocking send in
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
-        // isolated to this peer (the S4 throughput win).
+        // isolated to this peer (the per-peer routines throughput win).
         let _ = self
             .sequencer_input
             .send(SequencerInput::AcceptBody(SequencedBody {
@@ -964,7 +963,7 @@ impl PeerRoutine {
     fn ignore_unmatched_needed_response(&self, height: block::Height, response_kind: &str) -> bool {
         // The reactor-local `needed_heights` is gone from the routine; the
         // structural equivalent is "the height is still wanted" = pending or
-        // in-flight in the WorkQueue (design doc §6 S4 inbound path).
+        // in-flight in the WorkQueue.
         if !(self.work.pending_contains(height) || self.work.in_flight_contains(height)) {
             return false;
         }
@@ -1000,7 +999,7 @@ impl PeerRoutine {
         // at `start_height`; the registry answers whether another peer is actively
         // requesting a range covering it (cross-peer fanout/retry race), in which
         // case the terminator is dropped quietly rather than scored. A faithful
-        // (slightly wider) superset of the pre-S4 start-keyed check.
+        // (slightly wider) superset of the previous start-keyed check.
         if !self.registry.has_outstanding_height(start_height) {
             return false;
         }
@@ -1021,9 +1020,9 @@ impl PeerRoutine {
     /// raced ahead of the producer's asynchronous `work.extend`. The peer asked
     /// for and served this range honestly, so scoring it the *hard*
     /// `UnsolicitedBlock`/`UnsolicitedDone` (immediate, thresholdless disconnect)
-    /// would churn honest peers on every reorg. The pre-S3b serial reactor
+    /// would churn honest peers on every reorg. The previous serial reactor
     /// avoided this by dropping outstanding in the same loop turn as the reset;
-    /// the Sequencer-task split (S3b) made that drop asynchronous, opening this
+    /// the Sequencer-task split (Sequencer task) made that drop asynchronous, opening this
     /// window — restore the no-churn property by dropping the response quietly. A
     /// response *outside* the peer's advertised range is still scored.
     fn ignore_servable_range_response(&self, height: block::Height, response_kind: &str) -> bool {
@@ -1149,10 +1148,10 @@ impl PeerRoutine {
     /// Publish this peer's current *unreceived* in-flight height→hash set to the
     /// registry, so the producer's `!has_outstanding_request` filter and the
     /// low-water `total_unreceived` gate read the same per-request-granularity
-    /// count the pre-S4 reactor used (`expected_hashes.len() − received.len()`).
+    /// count the previous reactor used (`expected_hashes.len() − received.len()`).
     /// Received-but-uncommitted heights are excluded here because they are held in
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
-    /// already keeps them out of `pending` (design doc §6 S3b/S4).
+    /// already keeps them out of `pending`.
     fn publish_outstanding(&self) {
         let mut map: BTreeMap<block::Height, block::Hash> = BTreeMap::new();
         for outstanding in &self.window.outstanding {
@@ -1238,7 +1237,7 @@ impl PeerRoutine {
         });
     }
 
-    /// Trace a decoded inbound message (the pre-S4 reactor's `trace_message_received`,
+    /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
     /// now emitted in the routine that decoded it). Records the message kind only;
     /// the per-variant field detail lives on the reactor's heavier trace path.
     fn trace_message_received(&self, msg: &BlockSyncMessage) {
@@ -1343,7 +1342,7 @@ fn unreceived_heights(
 }
 
 impl Drop for PeerRoutine {
-    /// §7.5 disconnect-mid-fetch correctness: on every exit path
+    /// disconnect-mid-fetch correctness: on every exit path
     /// (cancel/panic/normal) return this routine's unreceived outstanding heights
     /// to `work.pending`, release their byte reservation, and clear this peer's
     /// outstanding set in the registry. All operations are sync (lock/atomic), so

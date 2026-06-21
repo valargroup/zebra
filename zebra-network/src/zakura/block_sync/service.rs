@@ -175,7 +175,7 @@ struct BlockSyncServiceInner {
     config: ZakuraBlockSyncConfig,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
-    /// `add_peer` (S4). `None` for the inert/handle-less constructors that never
+    /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
     /// spawn routines (they only observe `events`/`lifecycle`).
     routine_wiring: Option<super::state::RoutineWiring>,
     peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
@@ -408,7 +408,7 @@ impl Service for BlockSyncService {
             let connection_cancel_token = connection_cancel_token.clone();
             move || connection_cancel_token.cancel()
         };
-        // S4: the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
+        // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
         // a protocol reject still cancels the whole connection via
         // `handle_pipe_exit`. The routine owns `recv` (the transport read), decodes
         // each frame, and runs the download/serving dispatch in its own task —
@@ -506,7 +506,7 @@ impl Service for BlockSyncService {
         _stream_kind: u16,
         _frame: Frame,
     ) -> Result<(), SinkReject> {
-        // S4 inverted the inbound data flow: block sync is an `Ordered` stream
+        // The inbound data flow is inverted: block sync is an `Ordered` stream
         // whose `FramedRecv` is taken by `add_peer` and owned by the per-peer
         // pipe-routine ([`PeerRoutine`](super::peer_routine)), which decodes and
         // dispatches every frame in its own task. The `Service::deliver_frame`

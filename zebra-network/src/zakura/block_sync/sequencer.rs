@@ -7,7 +7,7 @@
 //!
 //! - every method that frees reserved bytes *returns* the freed count, so the
 //!   reactor releases it against the budget (the budget stays in the reactor for
-//!   S1; S2 makes it shareable), and
+//!   the budget is shared), and
 //! - every download-side consequence (mark a height covered, clear covered,
 //!   re-query, attribute misbehavior) is expressed as a value the reactor acts
 //!   on, not performed here.

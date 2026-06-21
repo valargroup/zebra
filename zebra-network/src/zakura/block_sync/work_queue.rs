@@ -3,7 +3,7 @@
 //! The [`WorkQueue`] is the sole shared download-scheduling primitive: a sorted
 //! set of needed block heights the per-peer issuance path pulls from. It replaces
 //! the central `BlockRangeScheduler`'s eligibility/dedup/retry roles with a small
-//! API the caller drives from its own per-peer state (see the design doc §2/§3):
+//! API the caller drives from its own per-peer state (see the ):
 //!
 //! - a height is in **exactly one** of `{below-floor (gone), pending, in_flight}`;
 //! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
@@ -247,7 +247,7 @@ impl WorkQueue {
         inner.in_flight.retain(|height, _| *height <= floor);
     }
 
-    /// The "work added" notifier (S4 wake source).
+    /// The "work added" notifier (per-peer routines wake source).
     #[allow(dead_code)]
     pub(super) fn subscribe_available(&self) -> &Notify {
         &self.available

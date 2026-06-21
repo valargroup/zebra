@@ -1,6 +1,6 @@
-//! Shared per-peer fact table for Zakura block sync (S4).
+//! Shared per-peer fact table for Zakura block sync (per-peer routines).
 //!
-//! S4 moves all per-peer *download* state and the take-work decision off the
+//! Per-peer routines move all per-peer *download* state and the take-work decision off the
 //! reactor's single loop into a spawned [`PeerRoutine`](super::peer_routine) per
 //! connected peer. The [`PeerRegistry`] is the small shared table the reactor
 //! still needs for *global* decisions — admission counting, the producer's
@@ -10,7 +10,7 @@
 //!
 //! Field ownership is disjoint so the brief `std::sync::Mutex` is never a
 //! contention point and is **never held across `.await`** (the anti-block rule).
-//! After the S4 inverted data flow the **routine** is authoritative for its own
+//! After inbound flow is inverted the **routine** is authoritative for its own
 //! per-peer facts and writes them all (generation-gated): servable/caps/
 //! `received_status` (when it decodes a `Status` frame in its own task),
 //! `outstanding` (on issue/finish/timeout/disconnect — per *request*, never per
@@ -44,7 +44,7 @@ pub(super) struct Entry {
     pub(super) max_response_bytes: u32,
     /// The height→hash set of this peer's *unreceived* in-flight request heights.
     /// Per-*request* granularity (each outstanding `BlockRangeRequest` contributes
-    /// its still-unreceived expected heights), never per-body. This is the S3b
+    /// its still-unreceived expected heights), never per-body. This is the Sequencer task
     /// producer filter's `!has_outstanding_request` home, now routine-owned and
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
@@ -155,7 +155,7 @@ impl PeerRegistry {
         self.lock().remove(peer);
     }
 
-    /// Publish a freshly-applied `Status` (routine-side, S4 inverted flow): grow
+    /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow
     /// servable range, clamp the advertised caps, and mark the peer as having sent
     /// a status. Generation-gated like the other routine writers so a superseded
     /// routine cannot clobber the live entry. No-op if the peer is gone.
@@ -313,7 +313,7 @@ impl PeerRegistry {
 
     /// Whether the peer has sent a `Status` (the reactor's serving-admission and
     /// disconnect-trace read). The routine owns the rest of the serving caps
-    /// locally now (S4 inverted flow); only `received_status` is read reactor-side.
+    /// locally now (inverted inbound flow); only `received_status` is read reactor-side.
     pub(super) fn has_received_status(&self, peer: &ZakuraPeerId) -> bool {
         let peers = self.lock();
         peers.get(peer).is_some_and(|entry| entry.received_status)

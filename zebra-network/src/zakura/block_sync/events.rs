@@ -13,7 +13,7 @@ pub struct BlockSyncBlockMeta {
 
 /// Facts accepted by the block-sync scaffold and later reactor.
 ///
-/// S4 inverted the inbound data flow: a peer's stream-6 frames are decoded and
+/// The inbound data flow is inverted: a peer's stream-6 frames are decoded and
 /// the download logic runs in the per-peer pipe-routine
 /// ([`PeerRoutine`](super::peer_routine)). Inbound messages no longer flow
 /// through the reactor as a `WireMessage`; the routine forwards only shared
@@ -157,7 +157,7 @@ pub enum BlockSyncMisbehavior {
     StatusSpam,
 }
 
-/// The shared routine→reactor channel (S4 inverted data flow).
+/// The shared routine→reactor channel (per-peer routines inverted data flow).
 ///
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its
 /// own frames and runs the download logic locally; it forwards only the concerns
@@ -170,7 +170,7 @@ pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the
     /// registry. The reactor advertises our `Status` reply and republishes the
     /// candidate set. `send_reply` is the routine's rate-meter decision (the
-    /// pre-S4 `unsolicited.try_take`) for whether a reply is due this time.
+    /// previous `unsolicited.try_take`) for whether a reply is due this time.
     StatusReceived {
         /// Peer whose status was applied.
         peer: ZakuraPeerId,

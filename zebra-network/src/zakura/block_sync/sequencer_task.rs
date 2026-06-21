@@ -1,6 +1,6 @@
-//! The Sequencer's own serial task (S3b boundary split).
+//! The Sequencer's own serial task (Sequencer task boundary split).
 //!
-//! S3b moves the consensus-critical commit pipeline (`Sequencer`: reorder →
+//! Sequencer task moves the consensus-critical commit pipeline (`Sequencer`: reorder →
 //! applying → `SubmitBlock` → apply-finished) off the reactor's single thread
 //! and into this spawned serial task. The reactor keeps issuance, peer matching,
 //! serving, and the producer; it forwards every Sequencer-mutating event over a
@@ -11,7 +11,7 @@
 //! inline in the matching reactor handler (`handle_block`'s body-acceptance tail,
 //! `apply_state_frontiers_changed`'s Sequencer half, `handle_chain_tip_reset`,
 //! `handle_block_apply_finished`); only its location and the budget/work/actions
-//! handles it uses move here. See the design doc §6 "S3b — RESOLVED DESIGN".
+//! handles it uses move here. See the  "Sequencer task".
 
 use super::{
     events::*,
