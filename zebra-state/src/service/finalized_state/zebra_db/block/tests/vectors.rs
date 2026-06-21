@@ -1283,3 +1283,90 @@ fn missing_pruning_metadata_cf_is_archive_database() {
     assert!(state.lowest_retained_height().is_none());
     assert!(!state.is_pruned());
 }
+
+/// POC (verified-commitment-trees): the anchor-only fast write produces the same
+/// `sapling_anchors` / `orchard_anchors` contents as the legacy full write, while
+/// skipping the per-height note-commitment tree CFs, and is idempotent.
+/// See `docs/design/verified-commitment-trees-poc.md`.
+#[test]
+fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
+    use zebra_chain::{orchard, sapling};
+
+    fn ephemeral_db() -> ZebraDb {
+        ZebraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+    }
+
+    let sapling_tree = sapling::tree::NoteCommitmentTree::default();
+    let orchard_tree = orchard::tree::NoteCommitmentTree::default();
+    let sapling_root = sapling_tree.root();
+    let orchard_root = orchard_tree.root();
+
+    // Legacy path: the full write inserts the anchor *and* a per-height tree at each
+    // of two heights (the anchor set collapses to one key; two tree entries).
+    let legacy = ephemeral_db();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.create_sapling_tree(&legacy, &Height(10), &sapling_tree);
+        batch.create_sapling_tree(&legacy, &Height(11), &sapling_tree);
+        batch.create_orchard_tree(&legacy, &Height(10), &orchard_tree);
+        legacy.db.write(batch).expect("legacy batch writes");
+    }
+
+    // Fast path: anchor-only writes for the same roots, no per-height trees.
+    let fast = ephemeral_db();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&fast, &sapling_root);
+        batch.insert_orchard_anchor(&fast, &orchard_root);
+        fast.db.write(batch).expect("fast batch writes");
+    }
+
+    // The anchor sets are byte-identical (same count, same digest): the fast
+    // anchor-only write reproduces exactly the legacy anchor index.
+    assert_eq!(
+        legacy.vct_anchor_digest(),
+        fast.vct_anchor_digest(),
+        "fast anchor-only write must match legacy anchor set"
+    );
+
+    // The fast DB skipped the per-height Sapling tree CF; the legacy DB did not.
+    let count_sapling_trees = |db: &ZebraDb| -> usize {
+        let cf = db.db.cf_handle("sapling_note_commitment_tree").unwrap();
+        db.db
+            .zs_forward_range_iter::<_, Height, sapling::tree::NoteCommitmentTree, _>(&cf, ..)
+            .count()
+    };
+    assert_eq!(
+        count_sapling_trees(&legacy),
+        2,
+        "legacy path writes a per-height tree at each height"
+    );
+    assert_eq!(
+        count_sapling_trees(&fast),
+        0,
+        "fast path skips per-height trees entirely"
+    );
+
+    // Re-inserting an unchanged root is idempotent (anchor CF is a set).
+    let before = fast.vct_anchor_digest();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&fast, &sapling_root);
+        fast.db.write(batch).expect("idempotent write");
+    }
+    assert_eq!(
+        fast.vct_anchor_digest(),
+        before,
+        "anchor insert is idempotent"
+    );
+}
