@@ -15,5 +15,5 @@ entries:
       - 94c09363d1c0ac2caf1d0e487de7ea5adc19d308
       - 6784f720831fe650f7d84e30e493ec27ddd37a09
       - 40eddc797106112d0a8fd906a054916c2f3d89fe
-    target_branch: adam/upstream-pr-10676
+    target_branch: upstream-sync/pr-10676
     notes: "Initial pilot candidate. The workflow should report conflicts or needs_human if this cannot be safely adapted."

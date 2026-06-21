@@ -35,7 +35,7 @@
     },
     "branch_name": {
       "type": "string",
-      "pattern": "^adam/upstream-pr-[0-9]+$"
+      "pattern": "^upstream-sync/pr-[0-9]+$"
     },
     "pr_title": {
       "type": "string",

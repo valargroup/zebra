@@ -158,7 +158,7 @@ def candidate_from_pr(
     pr: dict[str, Any],
 ) -> dict[str, Any]:
     source_pr = int(pr["number"])
-    branch = f"adam/upstream-pr-{source_pr}"
+    branch = f"upstream-sync/pr-{source_pr}"
     return {
         "status": "candidate",
         "source_repo": source_repo,

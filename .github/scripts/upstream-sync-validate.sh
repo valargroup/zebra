@@ -17,7 +17,7 @@ jq -e '
   (.source_pr | type == "number") and
   (.confidence_percent | type == "number" and . >= 0 and . <= 100) and
   (.recommendation | type == "string" and length > 0) and
-  (.branch_name | type == "string" and test("^adam/upstream-pr-[0-9]+$")) and
+  (.branch_name | type == "string" and test("^upstream-sync/pr-[0-9]+$")) and
   (.pr_title | type == "string" and length > 0) and
   (.pr_body | type == "string" and length > 0) and
   (.files_changed | type == "array") and

@@ -96,7 +96,7 @@ def main() -> int:
     assert candidate["status"] == "candidate"
     assert candidate["source_pr"] == 10676
     assert candidate["source_merge_commit"].startswith("8ead00cab")
-    assert candidate["branch_name"] == "adam/upstream-pr-10676"
+    assert candidate["branch_name"] == "upstream-sync/pr-10676"
 
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]
@@ -131,7 +131,7 @@ def main() -> int:
         f"PR body must include {upstream_merge_marker}",
     )
 
-    wrong_branch = "adam/upstream-pr-10604"
+    wrong_branch = "upstream-sync/pr-10604"
     assert_validator_failed(
         run_validator(output_dir, candidate_path, result_for(candidate, valid_body, branch_name=wrong_branch)),
         f"result branch_name {wrong_branch} does not match candidate {candidate['branch_name']}",
