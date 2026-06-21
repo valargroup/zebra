@@ -383,15 +383,48 @@ where
         }
     }
 
-    /// Queue a block for download and verification.
+    /// Queue a block for download and verification, routed to a single peer via the
+    /// normal inventory-aware path.
     ///
     /// This method waits for the network to become ready, and returns an error
     /// only if the network service fails. It returns immediately after queuing
     /// the request.
-    #[instrument(level = "debug", skip(self), fields(%hash))]
     pub async fn download_and_verify(
         &mut self,
         hash: block::Hash,
+    ) -> Result<(), BlockDownloadVerifyError> {
+        let request = zn::Request::BlocksByHash(std::iter::once(hash).collect());
+        self.queue_download(hash, request).await
+    }
+
+    /// Queue the head-of-line block for a *hedged* download: the peer set fans the
+    /// request out to up to `fanout` random ready peers (ignoring inventory markers)
+    /// and resolves with the first peer that delivers the block.
+    ///
+    /// Used only for the registry-miss retry, to bypass stale "missing" markers that
+    /// stall ordered commit. Otherwise identical to [`Self::download_and_verify`].
+    pub async fn download_and_verify_hedged(
+        &mut self,
+        hash: block::Hash,
+        fanout: usize,
+    ) -> Result<(), BlockDownloadVerifyError> {
+        let request = zn::Request::HedgedBlocksByHash {
+            hashes: std::iter::once(hash).collect(),
+            fanout,
+        };
+        self.queue_download(hash, request).await
+    }
+
+    /// Queue a block for download and verification using the given network `request`.
+    ///
+    /// The `request` must resolve to a [`zn::Response::Blocks`] for `hash`. It returns
+    /// an error only if the network service fails, and returns immediately after
+    /// queuing the request.
+    #[instrument(level = "debug", skip(self, request), fields(%hash))]
+    async fn queue_download(
+        &mut self,
+        hash: block::Hash,
+        request: zn::Request,
     ) -> Result<(), BlockDownloadVerifyError> {
         if self.cancel_handles.contains_key(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
@@ -410,7 +443,7 @@ where
             .ready()
             .await
             .map_err(|error| BlockDownloadVerifyError::NetworkServiceError { error })?
-            .call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+            .call(request);
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
