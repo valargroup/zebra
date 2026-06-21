@@ -6,7 +6,8 @@ evaluated for `ironwood-main`.
 The automation is intentionally conservative:
 
 - it runs hourly and can also be started manually;
-- it processes exactly one upstream PR per run;
+- it triages up to 25 upstream PRs per run;
+- it opens at most one downstream PR per run;
 - it pauses while any generated upstream sync PR is open;
 - it triages before attempting any import;
 - Codex runs without GitHub write permissions;
@@ -29,9 +30,13 @@ manual fix, or keep investigating.
 The state branch tracks terminal decisions per upstream PR instead of a single
 "last upstream PR seen" pointer. A single pointer would be unsafe because
 intentionally skipped upstream PRs remain absent from the fork, and upstream PR
-numbers do not perfectly describe commit order. The per-PR record lets each
-hourly run skip reviewed PRs and continue to the next oldest missing upstream
-change.
+numbers do not perfectly describe commit order. The per-PR record lets each run
+skip reviewed PRs and continue to the next oldest missing upstream change.
+
+When a run sees a backlog, it triages candidates in upstream order. Quiet
+decisions are recorded in one batch. If it reaches an important fix or a
+`needs_human` blocker, it records the earlier quiet decisions, opens one draft
+PR, and stops. While that draft PR is open, later runs pause.
 
 ## Statuses
 

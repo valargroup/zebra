@@ -13,7 +13,8 @@
     "files_changed",
     "validation",
     "risks",
-    "follow_up"
+    "follow_up",
+    "triage_decisions"
   ],
   "properties": {
     "status": {
@@ -82,6 +83,38 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "triage_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_pr",
+          "status",
+          "confidence_percent",
+          "recommendation"
+        ],
+        "properties": {
+          "source_pr": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": ["already_present", "skipped"]
+          },
+          "confidence_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "recommendation": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
       }
     }
   }

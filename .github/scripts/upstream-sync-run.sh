@@ -37,14 +37,37 @@ validate_pr_body_autolinks() {
 case "$COMMAND" in
   prepare)
     require_file "$CANDIDATE_JSON"
-    require_file "${WORK_DIR}/source.patch"
-    require_file "${WORK_DIR}/source.diff"
     mkdir -p "$WORK_DIR"
-    jq -r '.source_files[]' "$CANDIDATE_JSON" > "${WORK_DIR}/source-files.txt"
+    jq -r '
+      if (.candidates | type) == "array" then
+        .candidates[] | .source_files[]
+      else
+        .source_files[]
+      end
+    ' "$CANDIDATE_JSON" | sort -u > "${WORK_DIR}/source-files.txt"
+    while IFS= read -r source_pr; do
+      require_file "${WORK_DIR}/candidates/pr-${source_pr}/source.patch"
+      require_file "${WORK_DIR}/candidates/pr-${source_pr}/source.diff"
+    done < <(
+      jq -r '
+        if (.candidates | type) == "array" then
+          .candidates[].source_pr
+        else
+          .source_pr
+        end
+      ' "$CANDIDATE_JSON"
+    )
     {
       echo "Prepared upstream sync context"
-      echo "Candidate: upstream PR $(jq -r '.source_pr' "$CANDIDATE_JSON")"
-      echo "Branch: $(jq -r '.branch_name' "$CANDIDATE_JSON")"
+      echo "Candidates: $(jq -r '.candidate_count // 1' "$CANDIDATE_JSON")"
+      jq -r '
+        if (.candidates | type) == "array" then
+          .candidates[]
+        else
+          .
+        end
+        | "Candidate: upstream PR \(.source_pr) -> \(.branch_name)"
+      ' "$CANDIDATE_JSON"
     } | tee "${WORK_DIR}/prepare.log"
     ;;
 
@@ -70,6 +93,14 @@ case "$COMMAND" in
       : > "${WORK_DIR}/changed-files.txt"
     fi
     echo "status=${STATUS}" >> "${GITHUB_OUTPUT:-/dev/null}"
+    HAS_RECORDABLE_DECISIONS="$(
+      jq -r '
+        (.status == "skipped" or .status == "already_present")
+        or
+        (((.triage_decisions // []) | map(select(.status == "skipped" or .status == "already_present")) | length) > 0)
+      ' "$RESULT_JSON"
+    )"
+    echo "has_recordable_decisions=${HAS_RECORDABLE_DECISIONS}" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "Collected Codex patch with status: ${STATUS}"
     ;;
 
@@ -118,53 +149,66 @@ case "$COMMAND" in
     require_file "$RESULT_JSON"
     require_file "$CANDIDATE_JSON"
     STATUS="$(jq -r '.status' "$RESULT_JSON")"
-    case "$STATUS" in
-      already_present|skipped) ;;
-      *)
-        echo "No terminal triage decision to record for status: $STATUS"
-        exit 0
-        ;;
-    esac
-
     STATE_BRANCH="${UPSTREAM_SYNC_STATE_BRANCH:-upstream-sync/state}"
     STATE_FILE="${UPSTREAM_SYNC_STATE_FILE:-.github/upstream-sync/triage-ledger.jsonl}"
-    SOURCE_PR="$(jq -r '.source_pr' "$RESULT_JSON")"
-    RECORD="$(
-      jq -c -n \
-        --arg decision "$STATUS" \
-        --arg recommendation "$(jq -r '.recommendation' "$RESULT_JSON")" \
-        --arg source_repo "$(jq -r '.source_repo // ""' "$CANDIDATE_JSON")" \
-        --arg source_ref "$(jq -r '.source_ref // ""' "$CANDIDATE_JSON")" \
-        --arg source_ref_sha "$(jq -r '.source_ref_sha // ""' "$CANDIDATE_JSON")" \
-        --arg target_repo "$(jq -r '.target_repo // ""' "$CANDIDATE_JSON")" \
-        --arg target_ref "$(jq -r '.target_ref // ""' "$CANDIDATE_JSON")" \
-        --arg target_ref_sha "$(jq -r '.target_ref_sha // ""' "$CANDIDATE_JSON")" \
-        --arg first_missing_sha "$(jq -r '.first_missing_sha // ""' "$CANDIDATE_JSON")" \
-        --arg merged_at "$(jq -r '.source_pr_merged_at // ""' "$CANDIDATE_JSON")" \
-        --arg title "$(jq -r '.source_pr_title' "$CANDIDATE_JSON")" \
-        --arg merge_commit "$(jq -r '.source_merge_commit // ""' "$CANDIDATE_JSON")" \
-        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}" \
-        --argjson upstream_pr "$SOURCE_PR" \
-        --argjson confidence_percent "$(jq -r '.confidence_percent' "$RESULT_JSON")" \
-        '{
+    RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}"
+    RECORDS_FILE="${WORK_DIR}/triage-records.jsonl"
+    mkdir -p "$WORK_DIR"
+    jq -n -c \
+      --arg run_url "$RUN_URL" \
+      --slurpfile result "$RESULT_JSON" \
+      --slurpfile candidate "$CANDIDATE_JSON" \
+      '
+        ($result[0]) as $result_root |
+        ($candidate[0]) as $candidate_root |
+        def candidates:
+          if ($candidate_root.candidates | type) == "array" then
+            $candidate_root.candidates
+          else
+            [$candidate_root]
+          end;
+        def decisions:
+          (($result_root.triage_decisions // []) +
+            (if ($result_root.status == "skipped" or $result_root.status == "already_present") then
+              [{
+                source_pr: $result_root.source_pr,
+                status: $result_root.status,
+                confidence_percent: $result_root.confidence_percent,
+                recommendation: $result_root.recommendation
+              }]
+            else
+              []
+            end));
+        decisions[] as $decision |
+        select($decision.status == "skipped" or $decision.status == "already_present") |
+        (candidates[] | select(.source_pr == $decision.source_pr)) as $candidate |
+        {
           schema_version: 1,
-          upstream_pr: $upstream_pr,
-          decision: $decision,
-          confidence_percent: $confidence_percent,
-          recommendation: $recommendation,
-          source_repo: $source_repo,
-          source_ref: $source_ref,
-          source_ref_sha: $source_ref_sha,
-          target_repo: $target_repo,
-          target_ref: $target_ref,
-          target_ref_sha: $target_ref_sha,
-          first_missing_sha: $first_missing_sha,
-          source_title: $title,
-          source_merged_at: $merged_at,
-          source_merge_commit: $merge_commit,
+          upstream_pr: $decision.source_pr,
+          decision: $decision.status,
+          confidence_percent: $decision.confidence_percent,
+          recommendation: $decision.recommendation,
+          source_repo: $candidate.source_repo,
+          source_ref: $candidate.source_ref,
+          source_ref_sha: $candidate.source_ref_sha,
+          target_repo: $candidate.target_repo,
+          target_ref: $candidate.target_ref,
+          target_ref_sha: $candidate.target_ref_sha,
+          first_missing_sha: ($candidate.first_missing_sha // ""),
+          source_title: $candidate.source_pr_title,
+          source_merged_at: ($candidate.source_pr_merged_at // ""),
+          source_merge_commit: ($candidate.source_merge_commit // ""),
           run_url: $run_url
-        }'
-    )"
+        }
+      ' > "$RECORDS_FILE"
+    if [ ! -s "$RECORDS_FILE" ]; then
+      echo "No terminal triage decisions to record for status: $STATUS"
+      exit 0
+    fi
+    if [ "${UPSTREAM_SYNC_RECORD_DECISION_DRY_RUN:-false}" = "true" ]; then
+      cat "$RECORDS_FILE"
+      exit 0
+    fi
 
     git config user.name "github-actions[bot]"
     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -177,13 +221,13 @@ case "$COMMAND" in
     fi
 
     mkdir -p "$(dirname "$STATE_FILE")"
-    printf '%s\n' "$RECORD" >> "$STATE_FILE"
+    cat "$RECORDS_FILE" >> "$STATE_FILE"
     git add "$STATE_FILE"
     if git diff --cached --quiet; then
       echo "No triage decision changes to record"
       exit 0
     fi
-    git commit -m "Record upstream PR ${SOURCE_PR} ${STATUS}"
+    git commit -m "Record upstream PR triage decisions"
     git push origin "HEAD:${STATE_BRANCH}"
     ;;
 

@@ -1,6 +1,6 @@
-# Upstream PR discovery and one-at-a-time triage for the Valar Zebra fork.
+# Upstream PR discovery and conservative triage for the Valar Zebra fork.
 #
-# v1 is capped at a single upstream PR per run, including scheduled runs.
+# Scheduled runs batch quiet triage, but open at most one downstream PR.
 name: Upstream PR Triage Pilot
 
 on:
@@ -31,9 +31,9 @@ on:
         type: string
         default: ""
       limit:
-        description: "Maximum candidates to process. v1 only accepts 1."
+        description: "Maximum candidates to triage. Must be between 1 and 25."
         type: string
-        default: "1"
+        default: "25"
   schedule:
     - cron: "17 * * * *"
 
@@ -56,13 +56,20 @@ jobs:
       source_pr: ${{ steps.discover.outputs.source_pr }}
       branch_name: ${{ steps.discover.outputs.branch_name }}
       pr_title: ${{ steps.discover.outputs.pr_title }}
+      candidate_count: ${{ steps.discover.outputs.candidate_count }}
     steps:
       - name: Validate inputs
         env:
-          LIMIT: ${{ inputs.limit || '1' }}
+          LIMIT: ${{ inputs.limit || '25' }}
         run: |
-          if [ "$LIMIT" != "1" ]; then
-            echo "upstream-sync v1 only supports limit=1" >&2
+          case "$LIMIT" in
+            ""|*[!0-9]*)
+              echo "upstream-sync limit must be a number between 1 and 25" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 25 ]; then
+            echo "upstream-sync supports limit between 1 and 25" >&2
             exit 1
           fi
 
@@ -82,7 +89,7 @@ jobs:
           TARGET_REPO: ${{ github.repository }}
           TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
           CANDIDATE_PR: ${{ inputs.candidate_pr || '' }}
-          LIMIT: ${{ inputs.limit || '1' }}
+          LIMIT: ${{ inputs.limit || '25' }}
         run: |
           .github/scripts/upstream-sync-discover.py \
             --source-repo "$SOURCE_REPO" \
@@ -114,6 +121,7 @@ jobs:
       pull-requests: read
     outputs:
       result_status: ${{ steps.collect.outputs.status }}
+      has_recordable_decisions: ${{ steps.collect.outputs.has_recordable_decisions }}
     steps:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
@@ -172,10 +180,7 @@ jobs:
       ${{
         (inputs.mode || 'open-pr') == 'open-pr' &&
         needs.discover.outputs.has_candidate == 'true' &&
-        (
-          needs.codex-patch.outputs.result_status == 'already_present' ||
-          needs.codex-patch.outputs.result_status == 'skipped'
-        )
+        needs.codex-patch.outputs.has_recordable_decisions == 'true'
       }}
     permissions:
       contents: write
