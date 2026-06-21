@@ -74,6 +74,13 @@ pub fn quick_check(db: &ZebraDb) -> Result<(), String> {
         return Ok(());
     }
 
+    // A fast-synced database deliberately has no per-height note-commitment trees
+    // below the checkpoint handoff height, including the genesis trees this check
+    // reads. The genesis-root-caching invariant does not apply to it.
+    if db.is_fast_synced() {
+        return Ok(());
+    }
+
     let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
     let sprout_genesis_tree = db
         .sprout_tree_by_anchor(&sprout_genesis_tree.root())
@@ -127,6 +134,13 @@ pub fn detailed_check(
     db: &ZebraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<Result<(), String>, CancelFormatChange> {
+    // A fast-synced database deliberately has no per-height note-commitment trees
+    // below the checkpoint handoff height, so the per-height tree scans below do
+    // not apply to it.
+    if db.is_fast_synced() {
+        return Ok(Ok(()));
+    }
+
     // This is redundant in some code paths, but not in others. But it's quick anyway.
     // Check the entire format before returning any errors.
     let mut result = quick_check(db);

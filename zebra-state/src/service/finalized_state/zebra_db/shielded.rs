@@ -194,7 +194,17 @@ impl ZebraDb {
                 .map(|(_key, tree_value): (Height, _)| tree_value);
         }
 
-        sprout_tree.expect("Sprout note commitment tree must exist if there is a finalized tip")
+        sprout_tree.unwrap_or_else(|| {
+            // While a fast sync is in progress (tip below the handoff height), the
+            // sprout tip tree is only written at the handoff; the committer does not
+            // read it before then.
+            assert!(
+                self.fast_synced_below()
+                    .is_some_and(|below| self.finalized_tip_height() < Some(below)),
+                "Sprout note commitment tree must exist if there is a finalized tip"
+            );
+            Arc::<sprout::tree::NoteCommitmentTree>::default()
+        })
     }
 
     /// Returns the Sprout note commitment tree matching the given anchor.
@@ -244,8 +254,17 @@ impl ZebraDb {
             None => return Default::default(),
         };
 
-        self.sapling_tree_by_height(&height)
-            .expect("Sapling note commitment tree must exist if there is a finalized tip")
+        self.sapling_tree_by_height(&height).unwrap_or_else(|| {
+            // While a fast sync is in progress the tip is below the handoff height
+            // and its frontier is not stored; the committer does not read it (it
+            // folds verified roots). Every other caller reaches here only at or
+            // above the handoff, where the tree is present.
+            assert!(
+                self.fast_synced_below().is_some_and(|below| height < below),
+                "Sapling note commitment tree must exist if there is a finalized tip"
+            );
+            Default::default()
+        })
     }
 
     /// Returns the Sapling note commitment tree matching the given block height, or `None` if the
@@ -260,6 +279,17 @@ impl ZebraDb {
         // If we're above the tip, searching backwards would always return the tip tree.
         // But the correct answer is "we don't know that tree yet".
         if *height > tip_height {
+            return None;
+        }
+
+        // On a verified-commitment-trees fast-synced database, the per-height
+        // trees below the checkpoint handoff height were never written. Return
+        // `None` rather than letting the backward search return a stale tree from
+        // an earlier height; the tree at the handoff height and above is present.
+        if self
+            .fast_synced_below()
+            .is_some_and(|boundary| *height < boundary)
+        {
             return None;
         }
 
@@ -370,8 +400,15 @@ impl ZebraDb {
             None => return Default::default(),
         };
 
-        self.orchard_tree_by_height(&height)
-            .expect("Orchard note commitment tree must exist if there is a finalized tip")
+        self.orchard_tree_by_height(&height).unwrap_or_else(|| {
+            // See `sapling_tree_for_tip`: the fast-sync tip frontier below the
+            // handoff height is not stored and not read by the committer.
+            assert!(
+                self.fast_synced_below().is_some_and(|below| height < below),
+                "Orchard note commitment tree must exist if there is a finalized tip"
+            );
+            Default::default()
+        })
     }
 
     /// Returns the Orchard note commitment tree matching the given block height,
@@ -386,6 +423,17 @@ impl ZebraDb {
         // If we're above the tip, searching backwards would always return the tip tree.
         // But the correct answer is "we don't know that tree yet".
         if *height > tip_height {
+            return None;
+        }
+
+        // On a verified-commitment-trees fast-synced database, the per-height
+        // trees below the checkpoint handoff height were never written. Return
+        // `None` rather than letting the backward search return a stale tree from
+        // an earlier height; the tree at the handoff height and above is present.
+        if self
+            .fast_synced_below()
+            .is_some_and(|boundary| *height < boundary)
+        {
             return None;
         }
 
@@ -575,6 +623,7 @@ impl DiskWriteBatch {
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        fast_sync_below: Option<Height>,
     ) {
         let FinalizedBlock {
             height,
@@ -585,6 +634,14 @@ impl DiskWriteBatch {
                 },
             ..
         } = finalized;
+
+        // Mark the database as fast-synced (per-height note-commitment trees absent
+        // below the checkpoint handoff height). Written in the same atomic batch as
+        // every fast commit, so a fast-synced database always carries the marker and
+        // the read/validity guards never see absent trees without it.
+        if let Some(handoff) = fast_sync_below {
+            self.update_fast_sync_marker(zebra_db, handoff);
+        }
 
         // POC (verified-commitment-trees) fast path: the committer skipped the
         // per-block frontier recompute, so `note_commitment_trees` is the frozen
@@ -708,6 +765,17 @@ impl DiskWriteBatch {
     pub fn insert_sapling_anchor(&mut self, zebra_db: &ZebraDb, root: &sapling::tree::Root) {
         let sapling_anchors = zebra_db.db.cf_handle("sapling_anchors").unwrap();
         self.zs_insert(&sapling_anchors, root, ());
+    }
+
+    /// Records the verified-commitment-trees fast-sync marker: per-height
+    /// note-commitment trees are absent below `handoff`. Idempotent (written in the
+    /// same batch as each fast commit).
+    pub fn update_fast_sync_marker(&mut self, zebra_db: &ZebraDb, handoff: Height) {
+        let fast_sync_metadata = zebra_db
+            .db
+            .cf_handle(crate::service::finalized_state::FAST_SYNC_METADATA)
+            .unwrap();
+        self.zs_insert(&fast_sync_metadata, (), handoff);
     }
 
     /// Inserts the Sapling note commitment subtree into the batch.
