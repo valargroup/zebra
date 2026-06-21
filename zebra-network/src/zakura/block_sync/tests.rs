@@ -451,7 +451,7 @@ fn peer_outbound_request_window_halves_on_timeout_and_grows_on_success() {
     window.outstanding.clear();
     window.timeout_recovery_slots = 0;
     window.increase_outbound_window_after_success();
-    assert_eq!(window.outbound_request_window, 2);
+    assert_eq!(window.outbound_request_window, 65);
 
     window.outbound_request_window = usize::from(MAX_BS_INFLIGHT_REQUESTS);
     window.increase_outbound_window_after_success();
@@ -617,7 +617,7 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
     assert_eq!(default.max_blocks_per_response, 1);
-    assert_eq!(default.max_inflight_requests, 512);
+    assert_eq!(default.max_inflight_requests, 2048);
     assert_eq!(
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES

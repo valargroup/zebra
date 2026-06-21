@@ -533,13 +533,10 @@ impl PeerRoutine {
             // Cap the chunk taken to what the byte ceiling can fund at worst case;
             // break (without taking) when not even one block fits, so no take/return
             // self-wake cycle can occur.
-            let byte_capped_count = if worst == 0 {
-                max_count
-            } else {
-                usize::try_from(max_bytes / worst)
-                    .unwrap_or(usize::MAX)
-                    .min(max_count)
-            };
+            let byte_capped_count = max_bytes
+                .checked_div(worst)
+                .map(|count| usize::try_from(count).unwrap_or(usize::MAX).min(max_count))
+                .unwrap_or(max_count);
             if byte_capped_count == 0 {
                 break;
             }

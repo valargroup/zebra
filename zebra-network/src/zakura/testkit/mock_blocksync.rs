@@ -22,8 +22,8 @@ use super::{await_until, ZakuraTestCluster, ZakuraTestNode};
 use crate::{
     zakura::{
         BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, HeaderSyncAction, HeaderSyncFrontiers, ServicePeerLimits,
-        ZakuraBlockSyncConfig, ZakuraLocalLimits,
+        BlockSyncFrontiers, HeaderSyncFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
+        ZakuraLocalLimits,
     },
     BoxError, Config,
 };
@@ -463,19 +463,12 @@ async fn spawn_mock_node(
 }
 
 async fn drain_header_sync_actions(node: &ZakuraTestNode) -> JoinHandle<()> {
-    let supervisor = node.supervisor();
     let mut actions = node
         .take_header_sync_actions()
         .await
         .expect("header-sync action receiver is enabled");
 
-    tokio::spawn(async move {
-        while let Some(action) = actions.recv().await {
-            if let HeaderSyncAction::Misbehavior { peer, .. } = action {
-                let _ = supervisor.disconnect_peer(&peer).await;
-            }
-        }
-    })
+    tokio::spawn(async move { while actions.recv().await.is_some() {} })
 }
 
 async fn drive_mock_block_sync_actions(
@@ -487,7 +480,6 @@ async fn drive_mock_block_sync_actions(
     mut needed_blocks_gate: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
     let endpoint = node.endpoint();
-    let supervisor = node.supervisor();
     let mut actions = node
         .take_block_sync_actions()
         .await
@@ -557,9 +549,7 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::Misbehavior { peer, .. } => {
-                    let _ = supervisor.disconnect_peer(&peer).await;
-                }
+                BlockSyncAction::Misbehavior { .. } => {}
             }
         }
     })

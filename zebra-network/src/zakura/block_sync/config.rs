@@ -10,13 +10,13 @@ pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Outbound scheduling starts at this window and adjusts per peer based on
 /// request timeouts, while peer advertisements can still allow growth up to
 /// [`MAX_BS_INFLIGHT_REQUESTS`].
-pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 512;
+pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 2048;
 /// Maximum peer-advertised in-flight request count accepted by this node.
-pub const MAX_BS_INFLIGHT_REQUESTS: u16 = 2048;
+pub const MAX_BS_INFLIGHT_REQUESTS: u16 = 10_000;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves this much per requested block at send time and only ever

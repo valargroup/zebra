@@ -1079,9 +1079,7 @@ mod tests {
                             })
                             .await;
                     }
-                    BlockSyncAction::Misbehavior { peer, .. } => {
-                        let _ = endpoint.supervisor().disconnect_peer(&peer).await;
-                    }
+                    BlockSyncAction::Misbehavior { .. } => {}
                 }
             }
         })

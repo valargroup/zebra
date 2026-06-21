@@ -8,8 +8,13 @@ use crate::zakura::{
 ///
 /// A safety bound only; the binding per-peer concurrency is the peer's advertised
 /// `max_inflight_requests` (config `max_inflight_requests`, clamped to
-/// [`DEFAULT_BS_MAX_INFLIGHT`]).
-pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 16;
+/// [`MAX_BS_INFLIGHT_REQUESTS`]).
+// `MAX_BS_INFLIGHT_REQUESTS` is a `u16`, which always fits in `usize` on supported targets.
+pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
+/// Minimum additive growth after a successful response.
+const MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH: usize = 64;
+/// Fractional additive-increase divisor after a successful response.
+const OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR: usize = 8;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -338,7 +343,15 @@ impl DownloadWindow {
     pub(super) fn increase_outbound_window_after_success(&mut self) {
         let max_window = self.hard_outbound_capacity();
         if self.outbound_request_window < max_window {
-            self.outbound_request_window = self.outbound_request_window.saturating_add(1);
+            let growth = self
+                .outbound_request_window
+                .checked_div(OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR)
+                .unwrap_or(0)
+                .max(MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH);
+            self.outbound_request_window = self
+                .outbound_request_window
+                .saturating_add(growth)
+                .min(max_window);
         }
     }
 
