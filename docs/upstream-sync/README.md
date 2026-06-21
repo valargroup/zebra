@@ -31,7 +31,9 @@ The state branch tracks terminal decisions per upstream PR instead of a single
 "last upstream PR seen" pointer. A single pointer would be unsafe because
 intentionally skipped upstream PRs remain absent from the fork, and upstream PR
 numbers do not perfectly describe commit order. The per-PR record lets each run
-skip reviewed PRs and continue to the next oldest missing upstream change.
+skip reviewed PRs and continue to the next oldest missing upstream change. State
+records are scoped to their source repository, and `already_present` records
+only apply to the target revision that was inspected.
 
 When a run sees a backlog, it triages candidates in upstream order. Quiet
 decisions are recorded in one batch. If it reaches an important fix or a

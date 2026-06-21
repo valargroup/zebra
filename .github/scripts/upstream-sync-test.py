@@ -241,9 +241,24 @@ def main() -> int:
                 '{"upstream_pr": 10676, "decision": "skipped"}',
                 '{"upstream_pr": 10604, "decision": "failed"}',
                 '{"upstream_pr": 10603, "decision": "needs_human"}',
+                '{"upstream_pr": 10602, "decision": "skipped", "source_repo": "other/repo"}',
+                '{"upstream_pr": 10601, "decision": "already_present", "source_repo": "ZcashFoundation/zebra", "target_ref_sha": "old-target"}',
+                '{"upstream_pr": 10600, "decision": "already_present", "source_repo": "ZcashFoundation/zebra", "target_ref_sha": "current-target"}',
             ]
-        )
-    ) == {10676, 10603}
+        ),
+        source_repo="ZcashFoundation/zebra",
+        target_ref_sha="current-target",
+    ) == {10676, 10603, 10600}
+    assert discover.terminal_prs_from_state_lines(
+        "\n".join(
+            [
+                '{"upstream_pr": 10676, "decision": "skipped", "source_repo": "ZcashFoundation/zebra"}',
+                '{"upstream_pr": 10602, "decision": "skipped", "source_repo": "other/repo"}',
+            ]
+        ),
+        source_repo="other/repo",
+        target_ref_sha="current-target",
+    ) == {10602}
 
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]

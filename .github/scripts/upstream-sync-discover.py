@@ -26,6 +26,7 @@ TERMINAL_STATE_DECISIONS = {
     "superseded",
 }
 
+DEFAULT_SOURCE_REPO = "ZcashFoundation/zebra"
 MAX_LIMIT = 25
 
 
@@ -82,7 +83,15 @@ def pr_metadata(source_repo: str, pr_number: int) -> dict[str, Any]:
     }
 
 
-def terminal_prs_from_state_lines(text: str) -> set[int]:
+def state_record_matches_source(record: dict[str, Any], source_repo: str) -> bool:
+    record_source_repo = record.get("source_repo")
+    if isinstance(record_source_repo, str) and record_source_repo:
+        return record_source_repo.lower() == source_repo.lower()
+
+    return source_repo.lower() == DEFAULT_SOURCE_REPO.lower()
+
+
+def terminal_prs_from_state_lines(text: str, *, source_repo: str, target_ref_sha: str) -> set[int]:
     terminal: set[int] = set()
 
     for line in text.splitlines():
@@ -95,13 +104,23 @@ def terminal_prs_from_state_lines(text: str) -> set[int]:
 
         decision = record.get("decision") or record.get("status")
         upstream_pr = record.get("upstream_pr")
+        if not state_record_matches_source(record, source_repo):
+            continue
+        if decision == "already_present" and record.get("target_ref_sha", "").lower() != target_ref_sha.lower():
+            continue
         if decision in TERMINAL_STATE_DECISIONS and isinstance(upstream_pr, int):
             terminal.add(upstream_pr)
 
     return terminal
 
 
-def terminal_prs_from_state_branch(target_repo: str, branch: str, path: str) -> set[int]:
+def terminal_prs_from_state_branch(
+    target_repo: str,
+    branch: str,
+    path: str,
+    source_repo: str,
+    target_ref_sha: str,
+) -> set[int]:
     local_ref = "refs/remotes/upstream-sync/state"
     try:
         fetch_ref(target_repo, branch, local_ref)
@@ -109,7 +128,11 @@ def terminal_prs_from_state_branch(target_repo: str, branch: str, path: str) -> 
     except subprocess.CalledProcessError:
         return set()
 
-    return terminal_prs_from_state_lines(text)
+    return terminal_prs_from_state_lines(
+        text,
+        source_repo=source_repo,
+        target_ref_sha=target_ref_sha,
+    )
 
 
 def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, Any]:
@@ -372,6 +395,8 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
         args.target_repo,
         args.state_branch,
         args.state_ledger,
+        args.source_repo,
+        target_sha,
     )
     missing_commits = run(
         ["git", "rev-list", "--reverse", f"{target_local_ref}..{source_local_ref}"]
