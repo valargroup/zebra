@@ -16,6 +16,13 @@
 //! frames so a response cannot beat its local expectation. This retires the
 //! session mutex without changing the reactor's synthetic `WireMessage` test
 //! path.
+//!
+//! The concrete production owner of this loop is [`HeaderSyncPeerRoutine`]: it
+//! owns the [`HsLocal`] decode/correlation state, the inbound stream-guard
+//! admission, the command draining, and the frame decode, while the reactor keeps
+//! global scheduling, the direct `GetHeaders` sends, and the direct
+//! status/`NewBlock`/`Headers`-response sends. Decoded stream-5 messages are still
+//! forwarded to the reactor as `WireMessage` (the compatibility seam).
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -165,8 +172,9 @@ pub(super) const PIPE_SHAPE: PipeShape = PipeShape {
 /// The two callers differ only in how they treat a closed reactor queue, which
 /// reproduces the old per-caller handling exactly: the production sink logged
 /// the `SinkReject::Local` and continued the loop, so `run_inbound` maps that
-/// one case to a debug log plus [`Flow::Done`] (which [`run_peer`] treats as
-/// "continue"). Protocol rejects pass straight through and tear the peer down.
+/// one case to a debug log plus [`Flow::Done`] (which [`HeaderSyncPeerRoutine`]
+/// treats as "continue"). Protocol rejects pass straight through and tear the
+/// peer down.
 ///
 /// One addition over the old per-caller handling: when a *solicited* `Headers`
 /// response hits that local-reject path, the expectation popped before decode is
@@ -291,7 +299,27 @@ pub(super) fn deliver(
     forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg })
 }
 
-/// Run one peer-owned header-sync pipe until stream close, cancellation, or reject.
+/// One inbound input the routine's recv loop selects over.
+enum HsRoutineInput {
+    /// An inbound stream-5 frame to admit, decode, correlate, and forward.
+    Frame(Frame),
+    /// A peer command (e.g. `RecordExpectedHeaders`) from shared scheduling state.
+    Command(HeaderSyncPeerCommand),
+    /// Cancellation or stream close — the routine exits cleanly.
+    Done,
+}
+
+/// The concrete production owner of one admitted header-sync peer's stream-5 recv
+/// loop.
+///
+/// The routine owns the local decode/correlation state ([`HsLocal`] — the
+/// expected-`Headers` FIFO, the command receiver, and the pre-decode `NewBlock`
+/// rate gate), the inbound stream-guard admission, and the frame decode. It is a
+/// compatibility shell over the existing per-peer [`Pipe`]: shared global
+/// scheduling, direct `GetHeaders` sends, and direct status/`NewBlock`/`Headers`
+/// response sends all stay in [`HeaderSyncReactor`](super::reactor); decoded
+/// stream-5 messages are still forwarded to the reactor as
+/// [`HeaderSyncEvent::WireMessage`](super::events::HeaderSyncEvent::WireMessage).
 ///
 /// Correlation-ordering invariant: a `RecordExpectedHeaders` command is enqueued
 /// synchronously the moment its outbound `GetHeaders` is queued, so it is already
@@ -302,46 +330,68 @@ pub(super) fn deliver(
 /// `HsLocal.expected_headers` before the matching `Headers` frame is decoded —
 /// never the reverse, which would reject a solicited response as
 /// `UnsolicitedHeaders`.
-pub(super) async fn run_peer(
-    mut pipe: Pipe<HsLocal, HsEnv>,
-    mut recv: FramedRecv,
+pub(super) struct HeaderSyncPeerRoutine {
+    /// The per-peer pipe: it owns this peer's [`HsLocal`] decode/correlation
+    /// state, its session guard (oversize admission), and the
+    /// correlate→decode→emit entry. The routine drives it one frame at a time
+    /// through [`Pipe::run_one`].
+    pipe: Pipe<HsLocal, HsEnv>,
+    /// This peer's ordered stream-5 frame reader, owned and drained by the routine.
+    recv: FramedRecv,
+    /// The peer's service-session cancellation token. Fires on disconnect, park,
+    /// or local shutdown; the routine then exits cleanly.
     cancel: CancellationToken,
-) -> Result<(), SinkReject> {
-    enum Input {
-        Frame(Frame),
-        Command(HeaderSyncPeerCommand),
-        Done,
+}
+
+impl HeaderSyncPeerRoutine {
+    /// Build the routine around a peer's pipe, its inbound reader, and its
+    /// service-session cancellation token.
+    pub(super) fn new(
+        pipe: Pipe<HsLocal, HsEnv>,
+        recv: FramedRecv,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self { pipe, recv, cancel }
     }
 
-    loop {
-        pipe.local_mut().drain_ready_commands();
+    /// Run the routine until stream close, cancellation, or a reject.
+    ///
+    /// A protocol reject is the only `Err` returned (a closed-queue `Local` is
+    /// mapped to a benign continue inside [`run_inbound`]); the caller composes it
+    /// with [`handle_pipe_exit`](crate::zakura::handle_pipe_exit) so a protocol
+    /// reject cancels the whole connection while a clean stream-end/cancel leaves
+    /// it alone.
+    pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        loop {
+            self.pipe.local_mut().drain_ready_commands();
 
-        let input = {
-            let local = pipe.local_mut();
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => Input::Done,
-                command = local.commands.recv() => match command {
-                    Some(command) => Input::Command(command),
-                    None => Input::Done,
-                },
-                frame = recv.recv() => match frame {
-                    Some(frame) => Input::Frame(frame),
-                    None => Input::Done,
-                },
-            }
-        };
-
-        match input {
-            Input::Done => return Ok(()),
-            Input::Frame(frame) => {
-                pipe.local_mut().drain_ready_commands();
-                match pipe.run_one(frame) {
-                    Flow::Continue(()) | Flow::Done => {}
-                    Flow::Reject(reject) => return Err(reject),
+            let input = {
+                let local = self.pipe.local_mut();
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => HsRoutineInput::Done,
+                    command = local.commands.recv() => match command {
+                        Some(command) => HsRoutineInput::Command(command),
+                        None => HsRoutineInput::Done,
+                    },
+                    frame = self.recv.recv() => match frame {
+                        Some(frame) => HsRoutineInput::Frame(frame),
+                        None => HsRoutineInput::Done,
+                    },
                 }
+            };
+
+            match input {
+                HsRoutineInput::Done => return Ok(()),
+                HsRoutineInput::Frame(frame) => {
+                    self.pipe.local_mut().drain_ready_commands();
+                    match self.pipe.run_one(frame) {
+                        Flow::Continue(()) | Flow::Done => {}
+                        Flow::Reject(reject) => return Err(reject),
+                    }
+                }
+                HsRoutineInput::Command(command) => self.pipe.local_mut().handle_command(command),
             }
-            Input::Command(command) => pipe.local_mut().handle_command(command),
         }
     }
 }
@@ -480,9 +530,9 @@ mod tests {
     }
 
     /// The peer-local correlation queue is FIFO and is filled by draining ready
-    /// commands. This is the invariant `run_peer` relies on: an expectation
-    /// recorded by a `RecordExpectedHeaders` command is drained and available to
-    /// pop before the matching `Headers` response is processed.
+    /// commands. This is the invariant [`HeaderSyncPeerRoutine`] relies on: an
+    /// expectation recorded by a `RecordExpectedHeaders` command is drained and
+    /// available to pop before the matching `Headers` response is processed.
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -612,7 +662,7 @@ mod tests {
             run_inbound,
             &PIPE_SHAPE,
         );
-        // Drain the recorded expectation into `HsLocal`, mirroring `run_peer`'s
+        // Drain the recorded expectation into `HsLocal`, mirroring the routine's
         // pre-frame command drain so the `Headers` frame is correlated.
         pipe.local_mut().drain_ready_commands();
 
@@ -675,5 +725,319 @@ mod tests {
                 .any(|node| node.id == "emit" && matches!(node.kind, NodeKind::Emit)),
             "the pipe terminates at a single `emit` node"
         );
+    }
+
+    // ===================== HeaderSyncPeerRoutine recv-loop tests =============
+
+    use crate::zakura::{framed_channel, spawn_supervised_pipe, FramedSend};
+
+    /// Build a routine around a fresh handle/commands/stream so a test can drive
+    /// its recv loop. Returns the routine, the drained reactor `events` queue, the
+    /// peer-side stream sender (closing it ends the stream), the command sender
+    /// (records expectations), and the routine's cancel token.
+    #[allow(clippy::type_complexity)]
+    fn routine_with(
+        handle: HeaderSyncHandle,
+        cancel: CancellationToken,
+    ) -> (
+        HeaderSyncPeerRoutine,
+        FramedSend,
+        mpsc::UnboundedSender<HeaderSyncPeerCommand>,
+    ) {
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (peer_send, service_recv) = framed_channel(16);
+        let pipe = Pipe::new(
+            peer(),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsEnv::new(handle),
+            // MAX_HS_MESSAGE_BYTES is a small compile-time const that fits in u32.
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        let routine = HeaderSyncPeerRoutine::new(pipe, service_recv, cancel);
+        (routine, peer_send, commands_tx)
+    }
+
+    fn one_header_response_frame() -> Frame {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+        let block_one: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        HeaderSyncMessage::Headers {
+            headers: vec![block_one.header.clone()],
+            body_sizes: vec![0],
+        }
+        .encode_frame()
+        .expect("headers frame encodes")
+    }
+
+    /// Cancelling the routine's token drives its recv loop out cleanly (`Ok`),
+    /// even while the stream's send half is still alive (so the exit is the
+    /// cancellation, not a stream close).
+    #[tokio::test]
+    async fn routine_exits_cleanly_on_service_cancellation() {
+        let (handle, _events) = test_handle();
+        let cancel = CancellationToken::new();
+        // Keep the peer-side send half alive so the stream does not close on its
+        // own; the routine must exit because of the cancellation.
+        let (routine, _peer_send, _commands_tx) = routine_with(handle, cancel.clone());
+        let run = tokio::spawn(routine.run());
+
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("a cancelled routine exits promptly")
+            .expect("the routine task does not panic");
+        assert!(
+            result.is_ok(),
+            "service cancellation is a clean exit, not a reject"
+        );
+    }
+
+    /// Closing the peer's send half (stream close) ends `recv.recv()` with `None`,
+    /// so the routine exits cleanly (`Ok`).
+    #[tokio::test]
+    async fn routine_exits_cleanly_on_stream_close() {
+        let (handle, _events) = test_handle();
+        let cancel = CancellationToken::new();
+        let (routine, peer_send, _commands_tx) = routine_with(handle, cancel);
+        let run = tokio::spawn(routine.run());
+
+        drop(peer_send);
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("a stream-closed routine exits promptly")
+            .expect("the routine task does not panic");
+        assert!(
+            result.is_ok(),
+            "a stream close is a clean exit, not a reject"
+        );
+    }
+
+    /// A protocol-invalid frame (an unsolicited `Headers` with no recorded
+    /// expectation) makes the routine return `Err(SinkReject::Protocol)`, which the
+    /// supervised pipe turns into a connection cancellation. This is the production
+    /// recv-loop's decode-failure path, not the bare `deliver` unit.
+    #[tokio::test]
+    async fn routine_protocol_reject_disconnects() {
+        let (handle, mut events) = test_handle();
+        let cancel = CancellationToken::new();
+        let (routine, peer_send, _commands_tx) = routine_with(handle, cancel);
+        let run = tokio::spawn(routine.run());
+
+        // An unsolicited `Headers` frame has no recorded expectation; the routine
+        // rejects it as a protocol failure.
+        peer_send
+            .send(headers_frame(Vec::new()))
+            .await
+            .expect("the stream has capacity");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the routine rejects promptly")
+            .expect("the routine task does not panic");
+        assert!(
+            matches!(result, Err(SinkReject::Protocol(_))),
+            "an unsolicited Headers frame is a protocol reject"
+        );
+        // The misbehavior was reported to the reactor exactly as `deliver` does.
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+                assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
+            }
+            other => panic!("expected WireProtocolFailure(UnsolicitedHeaders), got {other:?}"),
+        }
+    }
+
+    /// A local-only failure (the reactor `events` queue is full) is NOT the peer's
+    /// fault: the routine logs and continues without rejecting or scoring the peer,
+    /// and a subsequent cancellation still exits cleanly (`Ok`). This proves a
+    /// closed/full reactor queue never falsely blames the peer.
+    #[tokio::test]
+    async fn routine_local_failure_does_not_falsely_score_or_disconnect() {
+        // Keep `_events_rx` alive so the saturated queue rejects with `Full`,
+        // mapping to `SinkReject::Local` inside `forward`.
+        let (handle, _events_rx) = saturated_events_handle();
+        let cancel = CancellationToken::new();
+        let (routine, peer_send, commands_tx) = routine_with(handle, cancel.clone());
+        let run = tokio::spawn(routine.run());
+
+        // Record the expectation, then send the matching solicited response. The
+        // routine drains the command, correlates, decodes, and tries to forward —
+        // the full queue turns the forward into a `Local` reject, which the routine
+        // logs and continues past (it does not reject the peer).
+        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        commands_tx
+            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
+            .expect("the routine is alive");
+        peer_send
+            .send(one_header_response_frame())
+            .await
+            .expect("the stream has capacity");
+
+        // The routine is still running (it did not reject on the local failure);
+        // cancelling it is the only thing that makes it exit, and it exits cleanly.
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the routine exits promptly after cancellation")
+            .expect("the routine task does not panic");
+        assert!(
+            result.is_ok(),
+            "a local (full reactor queue) failure must not reject the peer"
+        );
+    }
+
+    /// A panic inside the routine sends `PeerDisconnected` (via the supervised
+    /// pipe's `on_teardown`) and cancels the connection token (via `on_panic`),
+    /// wired exactly as `HeaderSyncService::add_peer` wires them. The panic is
+    /// contained to this one task.
+    #[tokio::test]
+    async fn panic_after_peer_connection_disconnects_and_cancels_connection() {
+        // `add_peer` sends `PeerDisconnected` from teardown over the *lifecycle*
+        // channel (`send_lifecycle`), not the bounded `events` queue, so keep that
+        // receiver alive here to observe the teardown send.
+        let (events, _events_rx) = mpsc::channel(16);
+        let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_candidates_tx, candidates) =
+            watch::channel(ZakuraHeaderSyncCandidateState::default());
+        let handle = HeaderSyncHandle {
+            events,
+            lifecycle,
+            tip,
+            peers,
+            candidates,
+        };
+
+        let service_cancel = CancellationToken::new();
+        let connection_cancel = CancellationToken::new();
+        let (routine, _peer_send, _commands_tx) =
+            routine_with(handle.clone(), service_cancel.clone());
+
+        // Mirror `add_peer`'s teardown wiring: `on_teardown` sends
+        // `PeerDisconnected`, `on_panic` cancels the connection.
+        let teardown_peer = peer();
+        let on_teardown = move || {
+            let _ = handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
+        };
+        let panic_connection_cancel = connection_cancel.clone();
+        let on_panic = move || panic_connection_cancel.cancel();
+
+        let handle_task = spawn_supervised_pipe(
+            peer(),
+            service_cancel.clone(),
+            on_teardown,
+            on_panic,
+            async move {
+                // Hold the routine, then panic inside the supervised task.
+                let _routine = routine;
+                panic!("header-sync routine panics after peer connection");
+            },
+        );
+
+        let join_error = handle_task
+            .await
+            .expect_err("a panicking routine surfaces a join error");
+        assert!(
+            join_error.is_panic(),
+            "the routine panic is reported as a panic, not a cancellation"
+        );
+
+        // `PeerDisconnected` was sent on teardown so the reactor never leaks the
+        // panicked peer's state.
+        match lifecycle_rx.try_recv() {
+            Ok(HeaderSyncEvent::PeerDisconnected(disconnected)) => {
+                assert_eq!(disconnected, peer());
+            }
+            other => panic!("expected PeerDisconnected on panic teardown, got {other:?}"),
+        }
+        assert!(
+            connection_cancel.is_cancelled(),
+            "a panic after peer connection cancels the connection token"
+        );
+        assert!(
+            service_cancel.is_cancelled(),
+            "the service token is cancelled on every exit path"
+        );
+    }
+
+    /// End-to-end through the routine recv loop: a `RecordExpectedHeaders` command
+    /// queued before the matching `Headers` frame arrives is drained and popped
+    /// before the frame is decoded, so the solicited response is correlated (it
+    /// reports `MalformedMessage` against the expectation, never the pre-correlation
+    /// `UnsolicitedHeaders`). This proves the routine's ordering: the expectation is
+    /// recorded before any matching frame can be decoded.
+    #[tokio::test]
+    async fn routine_records_expectation_before_decoding_matching_headers() {
+        let (handle, mut events) = test_handle();
+        let cancel = CancellationToken::new();
+        let (routine, peer_send, commands_tx) = routine_with(handle, cancel.clone());
+        let run = tokio::spawn(routine.run());
+
+        // Record the expectation, then send an empty (malformed) solicited Headers
+        // frame. The routine must correlate it against the expectation: a
+        // correlated-but-malformed response reports `MalformedMessage` and rejects;
+        // an UNcorrelated one would report `UnsolicitedHeaders`.
+        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        commands_tx
+            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
+            .expect("the routine is alive");
+        peer_send
+            .send(headers_frame(Vec::new()))
+            .await
+            .expect("the stream has capacity");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the routine processes the frame promptly")
+            .expect("the routine task does not panic");
+        assert!(
+            matches!(result, Err(SinkReject::Protocol(_))),
+            "a malformed correlated response is still a protocol reject"
+        );
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+                assert!(
+                    matches!(reason, HeaderSyncMisbehavior::MalformedMessage),
+                    "the expectation was popped before decode (MalformedMessage, not UnsolicitedHeaders)"
+                );
+            }
+            other => panic!("expected WireProtocolFailure(MalformedMessage), got {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    /// Multiple `RecordExpectedHeaders` commands the routine drains preserve FIFO
+    /// order: the first-recorded expectation is the first popped against the first
+    /// matching `Headers` frame. Driven through the routine's command drain (the
+    /// same `drain_ready_commands` the recv loop runs before each frame).
+    #[test]
+    fn routine_preserves_fifo_for_multiple_expectations() {
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
+
+        let first = ExpectedHeadersResponse::new(block::Height(10), 1).expect("count is valid");
+        let second = ExpectedHeadersResponse::new(block::Height(20), 2).expect("count is valid");
+        let third = ExpectedHeadersResponse::new(block::Height(30), 3).expect("count is valid");
+        for expected in [first, second, third] {
+            commands_tx
+                .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
+                .expect("the routine is alive");
+        }
+
+        // The recv loop drains ready commands before touching a frame; after the
+        // drain the FIFO pops in record order.
+        local.drain_ready_commands();
+        assert_eq!(local.pop_expected_headers_response(), Some(first));
+        assert_eq!(local.pop_expected_headers_response(), Some(second));
+        assert_eq!(local.pop_expected_headers_response(), Some(third));
+        assert_eq!(local.pop_expected_headers_response(), None);
     }
 }

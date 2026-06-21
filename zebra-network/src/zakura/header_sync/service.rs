@@ -336,9 +336,14 @@ impl Service for HeaderSyncService {
 
         let (_session_peer, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
 
-        // Phase 2 keeps request/response correlation in `HsLocal`: after the
-        // session queues an outbound `GetHeaders`, the peer-owned pipe records
-        // the expected `Headers` response in plain local state.
+        // The concrete `HeaderSyncPeerRoutine` is the production owner of this
+        // peer's recv loop: it owns `HsLocal` (the expected-`Headers` FIFO, the
+        // command receiver, and the pre-decode `NewBlock` gate), the inbound
+        // stream-guard admission, and the frame decode. Request/response
+        // correlation stays in `HsLocal`: after the session queues an outbound
+        // `GetHeaders`, the routine records the expected `Headers` response in
+        // plain local state. Global scheduling and the direct outbound writes stay
+        // in the reactor (this chunk is a compatibility step).
         let pipe = Pipe::new(
             peer_id.clone(),
             HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
@@ -347,19 +352,20 @@ impl Service for HeaderSyncService {
             run_inbound,
             &PIPE_SHAPE,
         );
-        // The pipe future reproduces the old sink's connection handling: a
-        // protocol reject (the only way `run_peer` returns `Err`, since
+        // The routine future reproduces the old sink's connection handling: a
+        // protocol reject (the only way the routine returns `Err`, since
         // `run_inbound` maps a closed-queue `Local` to a benign continue)
         // cancels the *connection*, matching the old
         // `connection_cancel_token.cancel()` on `SinkReject::Protocol`. A normal
         // or parked exit leaves the connection alone.
         let pipe_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
+        let routine = HeaderSyncPeerRoutine::new(pipe, recv, pipe_cancel_token);
         let pipe = async move {
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
-                run_peer(pipe, recv, pipe_cancel_token).await,
+                routine.run().await,
             );
         };
 
@@ -540,5 +546,87 @@ impl Sink for HeaderSyncPassthroughSink {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::watch;
+
+    use super::*;
+    use crate::zakura::{ServicePeerSnapshot, ZakuraHeaderSyncCandidateState};
+
+    fn peer() -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds")
+    }
+
+    /// Build a `HeaderSyncHandle` whose bounded `events` queue the test can drain.
+    /// The watch frontiers are never read on the `deliver_frame` decode path, so
+    /// dummy values suffice.
+    fn test_handle() -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
+        let (events, events_rx) = mpsc::channel(16);
+        let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+        let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_candidates_tx, candidates) =
+            watch::channel(ZakuraHeaderSyncCandidateState::default());
+        (
+            HeaderSyncHandle {
+                events,
+                lifecycle,
+                tip,
+                peers,
+                candidates,
+            },
+            events_rx,
+        )
+    }
+
+    /// The test/recorder `Service::deliver_frame` path has no peer session, so a
+    /// `Headers` response with no outstanding request is still rejected as
+    /// `UnsolicitedHeaders` (a `SinkReject::Protocol`) exactly as before the
+    /// routine landed. This is the compatibility path chunk 07 retires, not now.
+    #[test]
+    fn deliver_frame_rejects_unsolicited_headers_without_peer_session() {
+        let (handle, mut events) = test_handle();
+        let service = HeaderSyncService::new(handle);
+
+        let headers_frame = Frame {
+            message_type: u16::from(MSG_HS_HEADERS),
+            flags: 0,
+            payload: Vec::new(),
+        };
+
+        let result = service.deliver_frame(peer(), ZAKURA_STREAM_HEADER_SYNC, headers_frame);
+
+        assert!(
+            matches!(result, Err(SinkReject::Protocol(_))),
+            "an unsolicited Headers frame with no peer session is a protocol reject"
+        );
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+                assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
+            }
+            other => panic!("expected WireProtocolFailure(UnsolicitedHeaders), got {other:?}"),
+        }
+    }
+
+    /// A frame for a different stream kind is ignored by `deliver_frame` (returns
+    /// `Ok`), unchanged by the routine landing.
+    #[test]
+    fn deliver_frame_ignores_other_stream_kinds() {
+        let (handle, _events) = test_handle();
+        let service = HeaderSyncService::new(handle);
+
+        let frame = Frame {
+            message_type: u16::from(MSG_HS_HEADERS),
+            flags: 0,
+            payload: Vec::new(),
+        };
+
+        // A non-header-sync stream kind is not this service's concern.
+        assert!(service
+            .deliver_frame(peer(), ZAKURA_STREAM_HEADER_SYNC + 1, frame)
+            .is_ok());
     }
 }
