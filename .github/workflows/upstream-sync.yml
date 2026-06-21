@@ -100,6 +100,7 @@ jobs:
         with:
           name: upstream-sync-discovery
           path: .github/upstream-sync/work
+          include-hidden-files: true
 
   codex-patch:
     name: Ask Codex to adapt candidate
@@ -156,6 +157,7 @@ jobs:
         with:
           name: upstream-sync-codex
           path: .github/upstream-sync/work
+          include-hidden-files: true
 
   open-pr:
     name: Open draft PR
