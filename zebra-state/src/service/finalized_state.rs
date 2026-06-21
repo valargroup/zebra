@@ -417,7 +417,7 @@ impl FinalizedState {
             read_only,
         );
 
-        let vct = VctState::from_config(config.enable_verified_commitment_trees);
+        let vct = VctState::from_config(config.enable_verified_commitment_trees, network);
 
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
@@ -934,9 +934,6 @@ impl FinalizedState {
                     // POC capture: record the freshly computed roots for this height.
                     if let Some(v) = &self.vct {
                         v.capture(height.0, &sapling_root, &orchard_root);
-                        // Dump the final frontiers sidecar at the configured
-                        // handoff height (no-op otherwise).
-                        v.capture_final_frontiers(height, &note_commitment_trees);
                     }
                 }
 
