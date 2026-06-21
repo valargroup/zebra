@@ -16,10 +16,10 @@ use crate::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncStartup, DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle,
-        ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
-        P2P_V2_ALPN,
+        HeaderSyncHandle, HeaderSyncServiceConfig, HeaderSyncStartup, Service,
+        ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig,
+        ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler,
+        ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -398,6 +398,7 @@ impl ZakuraTestNodeBuilder {
         let mut block_sync_handle = None;
         let mut block_sync_actions = None;
         let mut header_sync_tasks = Vec::new();
+        let mut header_sync_service_config = None;
         let header_sync = if let Some(header_sync) = self.header_sync {
             let TestHeaderSyncStartup {
                 network,
@@ -406,6 +407,14 @@ impl ZakuraTestNodeBuilder {
                 best_header_tip,
                 verified_block_tip_hash,
             } = header_sync;
+            // Capture the header-sync service ingest facts before `network` is moved
+            // into the reactor startup, so the peer routine validates inbound frames
+            // against the same values the reactor started with.
+            header_sync_service_config = Some(HeaderSyncServiceConfig {
+                network: network.clone(),
+                config: ZakuraHeaderSyncConfig::default(),
+                max_frame_bytes: self.limits.max_frame_bytes,
+            });
             let mut startup = HeaderSyncStartup::new(
                 network,
                 anchor,
@@ -470,6 +479,13 @@ impl ZakuraTestNodeBuilder {
             self.block_sync_config.clone(),
             base_service,
             discovery_service,
+            // When header-sync is disabled the passthrough service ignores this; the
+            // values are only consumed by the native `HeaderSyncService` routine.
+            header_sync_service_config.unwrap_or_else(|| HeaderSyncServiceConfig {
+                network: network.clone(),
+                config: ZakuraHeaderSyncConfig::default(),
+                max_frame_bytes: self.limits.max_frame_bytes,
+            }),
         )?;
         let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),

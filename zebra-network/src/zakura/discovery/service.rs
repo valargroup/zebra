@@ -1085,15 +1085,15 @@ mod tests {
             .await?;
         fixture
             .header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::PeerStatusUpdated {
                 peer: fixture.peer_id.clone(),
-                msg: HeaderSyncMessage::Status(HeaderSyncStatus {
+                status: HeaderSyncStatus {
                     tip_height: block::Height(1),
                     tip_hash: block::Hash([9; 32]),
                     anchor_height: block::Height(0),
                     max_headers_per_response: 1,
                     max_inflight_requests: 1,
-                }),
+                },
             })
             .await?;
 
@@ -1115,12 +1115,10 @@ mod tests {
 
         fixture
             .header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::PeerHeadersReceived {
                 peer: fixture.peer_id.clone(),
-                msg: HeaderSyncMessage::Headers {
-                    headers: Vec::new(),
-                    body_sizes: Vec::new(),
-                },
+                headers: Vec::new(),
+                body_sizes: Vec::new(),
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;

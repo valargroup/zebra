@@ -150,15 +150,17 @@ mod tests {
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
         zakura::{
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
-            spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
-            BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
-            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+            decode_and_ingest, new_ingest_local, spawn_header_sync_reactor, BlockApplyResult,
+            BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
+            BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus, DiscoveryMessage,
+            ExpectedHeadersResponse, Frame, FramedRecv, FramedSend, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
-            HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            HeaderSyncStatus, HsEnv, HsLocal, Peer, Service, ServicePeerLimits, Stream,
+            ZakuraBlockSyncConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -511,6 +513,57 @@ mod tests {
         misbehaviors: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMisbehavior)>>>,
         sent: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMessage)>>>,
         outbound_receivers: Arc<StdMutex<Vec<FramedRecv>>>,
+        /// Per-peer ingest environment: this node's reactor handle plus the startup
+        /// facts the relocated peer-local validation reads, mirroring production
+        /// `HeaderSyncService` wiring so the synthetic harness runs the *real*
+        /// routine validation rather than the retired `WireMessage` demux.
+        ingest_env: HsEnv,
+        /// Per-source-peer routine ingest state (the expected-`Headers` FIFO, caps,
+        /// and rate meters). One `HsLocal` per remote peer this node validates
+        /// inbound frames from, kept in lockstep with the requester-side
+        /// `record_expected` calls below.
+        peer_locals: Arc<StdMutex<HashMap<ZakuraPeerId, HsLocal>>>,
+    }
+
+    impl E2eNodeView {
+        /// Run one inbound stream-5 message from `source` through this node's real
+        /// per-peer routine validation, forwarding the narrowed shared-effect events
+        /// the routine emits into this node's reactor (over `ingest_env`'s handle).
+        fn ingest_from(&self, source: &ZakuraPeerId, msg: HeaderSyncMessage) {
+            let frame = msg.encode_frame().expect("test message encodes");
+            let mut locals = self
+                .peer_locals
+                .lock()
+                .expect("test peer-locals mutex is not poisoned");
+            let env = self.ingest_env.clone();
+            let local = locals
+                .entry(source.clone())
+                .or_insert_with(|| new_ingest_local(&env));
+            let _ = decode_and_ingest(local, &self.ingest_env, source.clone(), frame);
+        }
+
+        /// Record an outbound `GetHeaders` expectation on the requester side so a
+        /// later `Headers` response from `peer` correlates, mirroring production's
+        /// `RecordExpectedHeaders` command path.
+        fn record_outbound_get_headers(
+            &self,
+            peer: &ZakuraPeerId,
+            start_height: block::Height,
+            count: u32,
+        ) {
+            let Ok(expected) = ExpectedHeadersResponse::new(start_height, count) else {
+                return;
+            };
+            let env = self.ingest_env.clone();
+            let mut locals = self
+                .peer_locals
+                .lock()
+                .expect("test peer-locals mutex is not poisoned");
+            locals
+                .entry(peer.clone())
+                .or_insert_with(|| new_ingest_local(&env))
+                .record_expected(expected);
+        }
     }
 
     #[derive(Debug)]
@@ -558,13 +611,18 @@ mod tests {
             let startup_store = store
                 .lock()
                 .map_err(|_| std::io::Error::other("test store mutex is poisoned"))?;
+            // Mirror the production `HeaderSyncService` ingest facts so the synthetic
+            // harness runs the real per-peer routine validation.
+            let ingest_network = network.clone();
+            let ingest_config = ZakuraHeaderSyncConfig::default();
+            let ingest_max_frame_bytes = 4 * 1024 * 1024;
             let mut startup = HeaderSyncStartup::new(
                 network,
                 anchor,
                 startup_store.frontiers(),
                 Some(startup_store.best_header_tip()),
                 ZakuraHeaderSyncConfig::default(),
-                4 * 1024 * 1024,
+                ingest_max_frame_bytes,
             );
             drop(startup_store);
             startup.trace = trace;
@@ -576,6 +634,12 @@ mod tests {
             startup.shutdown = shutdown.clone();
 
             let (handle, actions, task) = spawn_header_sync_reactor(startup)?;
+            let ingest_env = HsEnv::new(
+                handle.clone(),
+                ingest_network,
+                ingest_config,
+                ingest_max_frame_bytes,
+            );
             let view = E2eNodeView {
                 peer_id: e2e_peer(seed),
                 handle,
@@ -584,6 +648,8 @@ mod tests {
                 misbehaviors: Arc::new(Mutex::new(Vec::new())),
                 sent: Arc::new(Mutex::new(Vec::new())),
                 outbound_receivers: Arc::new(StdMutex::new(Vec::new())),
+                ingest_env,
+                peer_locals: Arc::new(StdMutex::new(HashMap::new())),
             };
             self.nodes.push(E2eNode {
                 view,
@@ -643,13 +709,11 @@ mod tests {
                 .unwrap();
         }
 
-        async fn inject(&self, node: usize, peer: ZakuraPeerId, msg: HeaderSyncMessage) {
-            self.nodes[node]
-                .view
-                .handle
-                .send(HeaderSyncEvent::WireMessage { peer, msg })
-                .await
-                .unwrap();
+        fn inject(&self, node: usize, peer: ZakuraPeerId, msg: HeaderSyncMessage) {
+            // Drive the injected message through this node's real per-peer routine
+            // validation; the routine forwards the narrowed shared-effect events to
+            // the node's reactor (replacing the retired `WireMessage` demux).
+            self.nodes[node].view.ingest_from(&peer, msg);
         }
 
         async fn commit_body(&self, node: usize, block: Arc<block::Block>) {
@@ -815,26 +879,25 @@ mod tests {
             match action {
                 HeaderSyncAction::SendMessage { peer, msg } => {
                     if let Some(target) = peer_to_index.get(&peer) {
-                        let _ = nodes[*target]
-                            .handle
-                            .send(HeaderSyncEvent::WireMessage {
-                                peer: local.peer_id.clone(),
-                                msg,
-                            })
-                            .await;
+                        // An outbound `GetHeaders` records the requester-side
+                        // expectation so the peer's later `Headers` response
+                        // correlates, mirroring production's `RecordExpectedHeaders`.
+                        if let HeaderSyncMessage::GetHeaders {
+                            start_height,
+                            count,
+                        } = &msg
+                        {
+                            local.record_outbound_get_headers(&peer, *start_height, *count);
+                        }
+                        nodes[*target].ingest_from(&local.peer_id, msg);
                     } else {
                         local.sent.lock().await.push((peer, msg));
                     }
                 }
                 HeaderSyncAction::ForwardNewBlock { peer, block, .. } => {
                     if let Some(target) = peer_to_index.get(&peer) {
-                        let _ = nodes[*target]
-                            .handle
-                            .send(HeaderSyncEvent::WireMessage {
-                                peer: local.peer_id.clone(),
-                                msg: HeaderSyncMessage::NewBlock(block),
-                            })
-                            .await;
+                        nodes[*target]
+                            .ingest_from(&local.peer_id, HeaderSyncMessage::NewBlock(block));
                     } else {
                         local
                             .sent
@@ -851,13 +914,7 @@ mod tests {
                         .headers_by_range(start, count);
                     let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     if let Some(target) = peer_to_index.get(&peer) {
-                        let _ = nodes[*target]
-                            .handle
-                            .send(HeaderSyncEvent::WireMessage {
-                                peer: local.peer_id.clone(),
-                                msg: headers_message(headers),
-                            })
-                            .await;
+                        nodes[*target].ingest_from(&local.peer_id, headers_message(headers));
                         let _ = local
                             .handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -2793,24 +2850,20 @@ mod tests {
 
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let hash1 = block1.hash();
-        cluster
-            .inject(
-                0,
-                cluster.nodes[1].view.peer_id.clone(),
-                HeaderSyncMessage::NewBlock(block1.clone()),
-            )
-            .await;
+        cluster.inject(
+            0,
+            cluster.nodes[1].view.peer_id.clone(),
+            HeaderSyncMessage::NewBlock(block1.clone()),
+        );
         cluster.wait_for_body(0, hash1).await?;
         cluster.wait_for_body(2, hash1).await?;
 
         cluster.commit_body(0, block1.clone()).await;
-        cluster
-            .inject(
-                0,
-                cluster.nodes[1].view.peer_id.clone(),
-                HeaderSyncMessage::NewBlock(block1),
-            )
-            .await;
+        cluster.inject(
+            0,
+            cluster.nodes[1].view.peer_id.clone(),
+            HeaderSyncMessage::NewBlock(block1),
+        );
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -2861,20 +2914,16 @@ mod tests {
         cluster.connect_all().await;
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let hash1 = block1.hash();
-        cluster
-            .inject(
-                0,
-                cluster.nodes[1].view.peer_id.clone(),
-                HeaderSyncMessage::NewBlock(block1.clone()),
-            )
-            .await;
-        cluster
-            .inject(
-                0,
-                cluster.nodes[2].view.peer_id.clone(),
-                HeaderSyncMessage::NewBlock(block1),
-            )
-            .await;
+        cluster.inject(
+            0,
+            cluster.nodes[1].view.peer_id.clone(),
+            HeaderSyncMessage::NewBlock(block1.clone()),
+        );
+        cluster.inject(
+            0,
+            cluster.nodes[2].view.peer_id.clone(),
+            HeaderSyncMessage::NewBlock(block1),
+        );
         cluster.start_drivers();
         cluster.wait_for_body(0, hash1).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2914,69 +2963,42 @@ mod tests {
 
         let unsolicited = e2e_peer(90);
         cluster.connect_peer(victim, unsolicited.clone()).await;
+        cluster.inject(
+            victim,
+            unsolicited,
+            headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
+        );
         cluster
-            .inject(
-                victim,
-                unsolicited,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
-            )
-            .await;
-        await_until(
-            "header-sync e2e unsolicited headers violation trace",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("01")
-                        .table("header_sync")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some(hs_trace::HEADER_PEER_VIOLATION)
-                                && row.get("reason").and_then(serde_json::Value::as_str)
-                                    == Some("unsolicited_headers")
-                        })
-                })
-            },
-        )
-        .await?;
+            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::UnsolicitedHeaders)
+            .await?;
 
         let out_of_range = e2e_peer(95);
         cluster.connect_peer(victim, out_of_range.clone()).await;
-        cluster
-            .inject(victim, out_of_range.clone(), status_for_tip(4, 4, 1))
-            .await;
+        cluster.inject(victim, out_of_range.clone(), status_for_tip(4, 4, 1));
         cluster
             .wait_for_get_headers(victim, &out_of_range, block::Height(1), 4)
             .await?;
-        cluster
-            .inject(
-                victim,
-                out_of_range,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
-            )
-            .await;
+        cluster.inject(
+            victim,
+            out_of_range,
+            headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let over_in_flight = e2e_peer(96);
         cluster.connect_peer(victim, over_in_flight.clone()).await;
-        cluster
-            .inject(victim, over_in_flight.clone(), status_for_tip(0, 4, 1))
-            .await;
+        cluster.inject(victim, over_in_flight.clone(), status_for_tip(0, 4, 1));
         for start in 1..=17 {
-            cluster
-                .inject(
-                    victim,
-                    over_in_flight.clone(),
-                    HeaderSyncMessage::GetHeaders {
-                        start_height: block::Height(start),
-                        count: 1,
-                    },
-                )
-                .await;
+            cluster.inject(
+                victim,
+                over_in_flight.clone(),
+                HeaderSyncMessage::GetHeaders {
+                    start_height: block::Height(start),
+                    count: 1,
+                },
+            );
         }
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::GetHeadersSpam)
@@ -2986,22 +3008,18 @@ mod tests {
         cluster
             .connect_peer(victim, response_too_long.clone())
             .await;
-        cluster
-            .inject(victim, response_too_long.clone(), status_for_tip(4, 1, 1))
-            .await;
+        cluster.inject(victim, response_too_long.clone(), status_for_tip(4, 1, 1));
         cluster
             .wait_for_get_headers(victim, &response_too_long, block::Height(1), 1)
             .await?;
-        cluster
-            .inject(
-                victim,
-                response_too_long,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
-                ]),
-            )
-            .await;
+        cluster.inject(
+            victim,
+            response_too_long,
+            headers_message(vec![
+                mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
+            ]),
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::ResponseTooLong)
             .await?;
@@ -3018,28 +3036,24 @@ mod tests {
         cluster
             .connect_peer(bad_continuity_victim, bad_continuity.clone())
             .await;
-        cluster
-            .inject(
-                bad_continuity_victim,
-                bad_continuity.clone(),
-                status_for_tip(4, 4, 1),
-            )
-            .await;
+        cluster.inject(
+            bad_continuity_victim,
+            bad_continuity.clone(),
+            status_for_tip(4, 4, 1),
+        );
         cluster
             .wait_for_get_headers(bad_continuity_victim, &bad_continuity, block::Height(1), 4)
             .await?;
         let mut non_contiguous = *mainnet_block(&BLOCK_MAINNET_2_BYTES).header;
         non_contiguous.previous_block_hash = block::Hash([7; 32]);
-        cluster
-            .inject(
-                bad_continuity_victim,
-                bad_continuity,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    Arc::new(non_contiguous),
-                ]),
-            )
-            .await;
+        cluster.inject(
+            bad_continuity_victim,
+            bad_continuity,
+            headers_message(vec![
+                mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                Arc::new(non_contiguous),
+            ]),
+        );
         cluster
             .wait_for_misbehavior_reason(bad_continuity_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
@@ -3054,21 +3068,17 @@ mod tests {
         cluster.start_drivers();
         let bad_pow = e2e_peer(99);
         cluster.connect_peer(bad_pow_victim, bad_pow.clone()).await;
-        cluster
-            .inject(bad_pow_victim, bad_pow.clone(), status_for_tip(4, 4, 1))
-            .await;
+        cluster.inject(bad_pow_victim, bad_pow.clone(), status_for_tip(4, 4, 1));
         cluster
             .wait_for_get_headers(bad_pow_victim, &bad_pow, block::Height(1), 4)
             .await?;
         let mut bad_pow_header = *mainnet_block(&BLOCK_MAINNET_1_BYTES).header;
         bad_pow_header.nonce = [1; 32].into();
-        cluster
-            .inject(
-                bad_pow_victim,
-                bad_pow,
-                headers_message(vec![Arc::new(bad_pow_header)]),
-            )
-            .await;
+        cluster.inject(
+            bad_pow_victim,
+            bad_pow,
+            headers_message(vec![Arc::new(bad_pow_header)]),
+        );
         cluster
             .wait_for_misbehavior_reason(bad_pow_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
@@ -3083,9 +3093,7 @@ mod tests {
         cluster.start_drivers();
         let bad_daa = e2e_peer(100);
         cluster.connect_peer(bad_daa_victim, bad_daa.clone()).await;
-        cluster
-            .inject(bad_daa_victim, bad_daa.clone(), status_for_tip(4, 4, 1))
-            .await;
+        cluster.inject(bad_daa_victim, bad_daa.clone(), status_for_tip(4, 4, 1));
         cluster
             .wait_for_get_headers(bad_daa_victim, &bad_daa, block::Height(1), 4)
             .await?;
@@ -3095,18 +3103,16 @@ mod tests {
                 HeaderSyncCommitFailureKind::InvalidPeerRange,
             )
             .await;
-        cluster
-            .inject(
-                bad_daa_victim,
-                bad_daa,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_4_BYTES).header.clone(),
-                ]),
-            )
-            .await;
+        cluster.inject(
+            bad_daa_victim,
+            bad_daa,
+            headers_message(vec![
+                mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_4_BYTES).header.clone(),
+            ]),
+        );
         cluster
             .wait_for_misbehavior_reason(bad_daa_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
@@ -3125,90 +3131,74 @@ mod tests {
         cluster
             .connect_peer(checkpointed, bad_checkpoint_backfill.clone())
             .await;
-        cluster
-            .inject(
-                checkpointed,
-                bad_checkpoint_backfill.clone(),
-                status_for_tip(3, 4, 1),
-            )
-            .await;
+        cluster.inject(
+            checkpointed,
+            bad_checkpoint_backfill.clone(),
+            status_for_tip(3, 4, 1),
+        );
         cluster
             .wait_for_get_headers(checkpointed, &bad_checkpoint_backfill, block::Height(1), 3)
             .await?;
-        cluster
-            .inject(
-                checkpointed,
-                bad_checkpoint_backfill,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
-                ]),
-            )
-            .await;
+        cluster.inject(
+            checkpointed,
+            bad_checkpoint_backfill,
+            headers_message(vec![
+                mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
+                mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
+            ]),
+        );
         cluster
             .wait_for_misbehavior_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let over_cap = e2e_peer(91);
         cluster.connect_peer(victim, over_cap.clone()).await;
-        cluster
-            .inject(
-                victim,
-                over_cap.clone(),
-                HeaderSyncMessage::Status(Default::default()),
-            )
-            .await;
-        cluster
-            .inject(
-                victim,
-                over_cap,
-                HeaderSyncMessage::GetHeaders {
-                    start_height: block::Height(1),
-                    count: 4_001,
-                },
-            )
-            .await;
+        cluster.inject(
+            victim,
+            over_cap.clone(),
+            HeaderSyncMessage::Status(Default::default()),
+        );
+        cluster.inject(
+            victim,
+            over_cap,
+            HeaderSyncMessage::GetHeaders {
+                start_height: block::Height(1),
+                count: 4_001,
+            },
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::GetHeadersTooLong)
             .await?;
 
         let status_spam = e2e_peer(92);
         cluster.connect_peer(victim, status_spam.clone()).await;
-        cluster
-            .inject(
-                victim,
-                status_spam.clone(),
-                HeaderSyncMessage::Status(Default::default()),
-            )
-            .await;
-        cluster
-            .inject(
-                victim,
-                status_spam,
-                HeaderSyncMessage::Status(Default::default()),
-            )
-            .await;
+        cluster.inject(
+            victim,
+            status_spam.clone(),
+            HeaderSyncMessage::Status(Default::default()),
+        );
+        cluster.inject(
+            victim,
+            status_spam,
+            HeaderSyncMessage::Status(Default::default()),
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::StatusSpam)
             .await?;
 
         let new_block_spam = e2e_peer(93);
         cluster.connect_peer(victim, new_block_spam.clone()).await;
-        cluster
-            .inject(
-                victim,
-                new_block_spam.clone(),
-                HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
-            )
-            .await;
-        cluster
-            .inject(
-                victim,
-                new_block_spam,
-                HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_2_BYTES)),
-            )
-            .await;
+        cluster.inject(
+            victim,
+            new_block_spam.clone(),
+            HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
+        );
+        cluster.inject(
+            victim,
+            new_block_spam,
+            HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_2_BYTES)),
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::NewBlockSpam)
             .await?;
@@ -3217,13 +3207,11 @@ mod tests {
         cluster.connect_peer(victim, invalid_block.clone()).await;
         let mut bad_block = (*mainnet_block(&BLOCK_MAINNET_1_BYTES)).clone();
         bad_block.transactions.clear();
-        cluster
-            .inject(
-                victim,
-                invalid_block,
-                HeaderSyncMessage::NewBlock(Arc::new(bad_block)),
-            )
-            .await;
+        cluster.inject(
+            victim,
+            invalid_block,
+            HeaderSyncMessage::NewBlock(Arc::new(bad_block)),
+        );
         cluster
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::MalformedMessage)
             .await?;

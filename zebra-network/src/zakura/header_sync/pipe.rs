@@ -1,40 +1,48 @@
 //! header_sync/pipe.rs — the per-peer header-sync pipe (stream 5).
 //!
-//! THE PHASE-2 DAG SLICE IS THIS DIAGRAM. The code below is a mechanical
-//! transcription; the [`PIPE_SHAPE`] const is the inspectable, drift-checked
-//! copy of it.
+//! THE DAG SLICE IS THIS DIAGRAM. The code below is a mechanical transcription;
+//! the [`PIPE_SHAPE`] const is the inspectable, drift-checked copy of it.
 //!
 //!  queued(GetHeaders) ─▶ command(record expected) ─▶ expected_headers.push_back
-//!  recv ─▶ guard ─┬─ Headers ─▶ expected_headers.pop_front ─▶ decode ─▶ forward(WireMessage)
-//!                 └─ Control ───────────────────────────────▶ decode ─▶ forward(WireMessage)
+//!  recv ─▶ guard ─┬─ Headers ─▶ expected_headers.pop_front ─▶ decode ─▶ validate ─▶ emit(narrowed)
+//!                 └─ Control ───────────────────────────────▶ decode ─▶ validate ─▶ emit(narrowed)
 //!
-//! Phase 2 moves request/response correlation out of
-//! [`HeaderSyncPeerSession`] and into [`HsLocal`]. The shared scheduler still
+//! Request/response correlation lives in [`HsLocal`]. The shared scheduler still
 //! decides when to ask a peer for headers, but it sends that decision to this
 //! peer-owned pipe as a command after the outbound `GetHeaders` is queued
 //! successfully. The pipe prioritizes and drains those commands before inbound
-//! frames so a response cannot beat its local expectation. This retires the
-//! session mutex without changing the reactor's synthetic `WireMessage` test
-//! path.
+//! frames so a response cannot beat its local expectation.
 //!
 //! The concrete production owner of this loop is [`HeaderSyncPeerRoutine`]: it
-//! owns the [`HsLocal`] decode/correlation state, the inbound stream-guard
-//! admission, the command draining, and the frame decode, while the reactor keeps
-//! global scheduling, the direct `GetHeaders` sends, and the direct
-//! status/`NewBlock`/`Headers`-response sends. Decoded stream-5 messages are still
-//! forwarded to the reactor as `WireMessage` (the compatibility seam).
+//! owns the [`HsLocal`] decode/correlation state, the peer-local advertised caps
+//! and rate meters, the inbound stream-guard admission, the command draining, the
+//! frame decode, and the relocated peer-local protocol validation. After
+//! validating, it forwards only NARROWED shared-effect events
+//! ([`HeaderSyncEvent::PeerStatusUpdated`], [`PeerHeadersReceived`],
+//! [`InboundGetHeadersRequested`], [`NewBlockCandidate`], [`PeerMisbehavior`]) to
+//! the reactor; the reactor no longer matches a raw decoded wire message. Global
+//! scheduling, the direct `GetHeaders` sends, and the direct
+//! status/`NewBlock`/`Headers`-response sends stay reactor-side (chunks 04/05).
+//!
+//! [`PeerHeadersReceived`]: super::events::HeaderSyncEvent::PeerHeadersReceived
+//! [`InboundGetHeadersRequested`]: super::events::HeaderSyncEvent::InboundGetHeadersRequested
+//! [`NewBlockCandidate`]: super::events::HeaderSyncEvent::NewBlockCandidate
+//! [`PeerMisbehavior`]: super::events::HeaderSyncEvent::PeerMisbehavior
 
 use std::{collections::VecDeque, sync::Arc};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, scheduler::*, service::HeaderSyncPeerCommand, wire::*, *};
+use super::{
+    config::*, events::*, scheduler::*, service::HeaderSyncPeerCommand, validation::*, wire::*, *,
+};
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };
 
-pub(super) struct HsLocal {
+#[derive(Debug)]
+pub(crate) struct HsLocal {
     /// Plain peer-local response expectations, owned by this pipe task.
     expected_headers: VecDeque<ExpectedHeadersResponse>,
     /// Commands from shared scheduling state into this peer-local pipe.
@@ -49,18 +57,33 @@ pub(super) struct HsLocal {
     /// same minimum interval *before* decode so excess `NewBlock` frames are
     /// dropped without ever reaching `Block::zcash_deserialize`.
     new_block_meter: RateMeter,
+    /// Peer-local advertised status, caps, and the status-spam rate gate.
+    ///
+    /// Owned by the routine (this chunk relocated peer-local `Status` validation
+    /// off the reactor). The reactor keeps a write-only snapshot it updates from
+    /// [`HeaderSyncEvent::PeerStatusUpdated`].
+    advertised_tip: block::Height,
+    received_status: bool,
+    inbound_status_meter: RateMeter,
 }
 
 impl HsLocal {
     /// Build per-peer local state around this peer's stream-5 session.
-    pub(super) fn new(
+    pub(crate) fn new(
         commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+        anchor_height: block::Height,
+        inbound_status_min_interval: Duration,
         new_block_min_interval: Duration,
     ) -> Self {
         Self {
             expected_headers: VecDeque::new(),
             commands,
             new_block_meter: RateMeter::new(new_block_min_interval),
+            // A fresh session has advertised nothing; the peer's tip starts at the
+            // trusted anchor and gates serving on a first valid status.
+            advertised_tip: anchor_height,
+            received_status: false,
+            inbound_status_meter: RateMeter::new(inbound_status_min_interval),
         }
     }
 
@@ -91,6 +114,18 @@ impl HsLocal {
         }
     }
 
+    /// Record an expected `Headers` response on the requester side.
+    ///
+    /// Production records this through the `RecordExpectedHeaders` command the
+    /// moment an outbound `GetHeaders` is queued. The synthetic in-process cluster
+    /// harness has no command channel, so it records the expectation directly when
+    /// it observes the outbound `GetHeaders`, keeping its per-peer ingest state in
+    /// lockstep with the production correlation FIFO.
+    #[cfg(test)]
+    pub(crate) fn record_expected(&mut self, expected: ExpectedHeadersResponse) {
+        self.expected_headers.push_back(expected);
+    }
+
     fn drain_ready_commands(&mut self) {
         while let Ok(command) = self.commands.try_recv() {
             self.handle_command(command);
@@ -100,19 +135,49 @@ impl HsLocal {
 
 /// Shared environment handed to every header-sync pipe.
 ///
-/// Phase 1's environment is just the cloneable reactor handle: the decode stage
-/// forwards each decoded message (or decode failure) to the unchanged reactor
-/// over this handle. Cross-peer shared core state arrives in Phase 2.
-#[derive(Clone)]
-pub(super) struct HsEnv {
-    /// Handle used to forward inbound wire events to the header-sync reactor.
+/// Carries the cloneable reactor handle the routine forwards narrowed
+/// shared-effect events over, plus the read-only startup facts the relocated
+/// peer-local validation needs (the active network, this node's advertised caps,
+/// and the negotiated frame cap used to bound an inbound `GetHeaders`).
+#[derive(Clone, Debug)]
+pub(crate) struct HsEnv {
+    /// Handle used to forward narrowed shared-effect events to the reactor.
     handle: HeaderSyncHandle,
+    /// Active network, used by the inbound `GetHeaders` count limit.
+    network: Network,
+    /// This node's local header-sync advertisement and serving caps.
+    config: ZakuraHeaderSyncConfig,
+    /// Negotiated or local application frame cap for header-sync responses.
+    max_frame_bytes: u32,
 }
 
 impl HsEnv {
-    /// Wrap a cloneable reactor handle as the pipe's shared environment.
-    pub(super) fn new(handle: HeaderSyncHandle) -> Self {
-        Self { handle }
+    /// Wrap a cloneable reactor handle plus the read-only startup facts the
+    /// relocated peer-local validation reads.
+    pub(crate) fn new(
+        handle: HeaderSyncHandle,
+        network: Network,
+        config: ZakuraHeaderSyncConfig,
+        max_frame_bytes: u32,
+    ) -> Self {
+        Self {
+            handle,
+            network,
+            config,
+            max_frame_bytes,
+        }
+    }
+
+    /// Largest inbound `GetHeaders` count this node will serve, bounded by its
+    /// advertised cap and the negotiated frame size.
+    fn inbound_get_headers_count_limit(&self) -> u32 {
+        inbound_get_headers_count_limit(&self.config, &self.network, self.max_frame_bytes)
+    }
+
+    /// Trusted anchor height (or genesis when no override is configured). A fresh
+    /// peer's advertised tip starts here so the first status advances it.
+    pub(crate) fn anchor_height(&self) -> block::Height {
+        self.config.anchor_height.unwrap_or(block::Height(0))
     }
 }
 
@@ -163,56 +228,30 @@ pub(super) const PIPE_SHAPE: PipeShape = PipeShape {
 
 /// Executable transcription of [`PIPE_SHAPE`] — the production entry function.
 ///
-/// The guard already admitted this frame (oversize-only) before `run_inbound`
-/// is reached, so this is the `Headers|Control → correlate → decode → emit` tail. It
-/// delegates to the single [`deliver`] implementation with the peer-owned
-/// expected-response value, so the production pipe and the test/recorder
-/// `deliver_frame` path can never diverge on *what* they decode or emit.
+/// The guard already admitted this frame (oversize-only) before `run_inbound` is
+/// reached, so this is the `Headers|Control → correlate → decode → emit` tail. It
+/// delegates to [`decode_and_ingest`], which decodes the frame, correlates a
+/// `Headers` response against the peer-owned expectation FIFO, runs the relocated
+/// peer-local protocol validation, and forwards only the narrowed shared-effect
+/// events the reactor consumes. The production pipe and the test/recorder
+/// `deliver_frame` path share that one implementation, so they can never diverge
+/// on *what* they decode, validate, or emit.
 ///
-/// The two callers differ only in how they treat a closed reactor queue, which
-/// reproduces the old per-caller handling exactly: the production sink logged
-/// the `SinkReject::Local` and continued the loop, so `run_inbound` maps that
-/// one case to a debug log plus [`Flow::Done`] (which [`HeaderSyncPeerRoutine`]
-/// treats as "continue"). Protocol rejects pass straight through and tear the
-/// peer down.
-///
-/// One addition over the old per-caller handling: when a *solicited* `Headers`
-/// response hits that local-reject path, the expectation popped before decode is
-/// restored to [`HsLocal`] so reactor queue saturation cannot silently consume it
-/// and strand the still-outstanding range.
+/// A closed reactor queue is the only `SinkReject::Local`: it is the peer's
+/// non-fault, so `run_inbound` logs it and returns [`Flow::Done`] (which
+/// [`HeaderSyncPeerRoutine`] treats as "continue"). Protocol rejects pass straight
+/// through and tear the peer down. When a *solicited* `Headers` response hits the
+/// local-reject path, the expectation popped before decode is restored to
+/// [`HsLocal`] so reactor queue saturation cannot silently consume it and strand
+/// the still-outstanding range.
 pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> Flow<()> {
-    // Pre-decode `NewBlock` rate gate: a `NewBlock` frame that arrives inside the
-    // per-peer minimum interval is dropped *before* the full `Arc<Block>` is
-    // deserialized, so a flood cannot force repeated full-block decode ahead of
-    // the reactor's semantic meter. Throttling (drop, keep the peer) matches the
-    // session guard's back-pressure outcome and the reactor's cheap
-    // dedup-without-scoring policy, so honest re-floods are not penalized; the
-    // first frame in each window still reaches the reactor, preserving
-    // first-offense malformed/spam disconnects.
-    if u8::try_from(frame.message_type).ok() == Some(MSG_HS_NEW_BLOCK)
-        && !cx.local.admit_new_block()
-    {
-        metrics::counter!("sync.header.tip.new_block.predecode_throttled").increment(1);
-        return Flow::Done;
-    }
-
-    let expected = (u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS))
-        .then(|| cx.local.pop_expected_headers_response())
-        .flatten();
-    match deliver(&cx.env.handle, expected, cx.peer_id.clone(), frame) {
+    let env = cx.env.clone();
+    match decode_and_ingest(cx.local, &env, cx.peer_id.clone(), frame) {
+        // A closed/full reactor queue is the peer's non-fault: the routine logs it
+        // and continues (treated as `Flow::Done`) rather than tearing the peer down.
+        // The solicited-`Headers` expectation was already restored inside
+        // `decode_and_ingest`, so the still-outstanding range stays correlated.
         Flow::Reject(SinkReject::Local(error)) => {
-            // The reactor `events` queue was full or closed, so this decoded frame
-            // could not be delivered locally. For a *solicited* `Headers` response
-            // the expectation was already popped before decode, so restore it: the
-            // reactor's matching range is still outstanding, and a consumed-but-
-            // undelivered expectation would otherwise lose the response entirely
-            // (recoverable only by the request timeout) and desynchronize the
-            // peer-local FIFO from that outstanding range. Restoring keeps the pipe
-            // in the same state as a request still awaiting its response, which the
-            // timeout/retry machinery already handles correctly.
-            if let Some(expected) = expected {
-                cx.local.restore_expected_headers(expected);
-            }
             tracing::debug!(
                 ?error,
                 peer_id = ?cx.peer_id,
@@ -224,79 +263,354 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
     }
 }
 
-/// The single inbound decode/branch/forward stage, shared by both paths.
+/// Decode one admitted stream-5 frame, run the relocated peer-local validation,
+/// and emit the narrowed shared-effect events to the reactor.
 ///
-/// This is the one decode implementation reachable from:
+/// This is the single implementation reachable from both:
 ///
-/// - the production pipe's [`run_inbound`] (with `Some(session)` so a `Headers`
-///   response is correlated against the peer's outstanding `GetHeaders`), and
+/// - the production pipe's [`run_inbound`] (with the peer's live [`HsLocal`] so a
+///   `Headers` response correlates against the outstanding `GetHeaders` FIFO and
+///   the per-peer rate meters/caps carry across frames), and
 /// - [`HeaderSyncService::deliver_frame`](super::service::HeaderSyncService) (the
-///   test/recorder path, which passes `None` so a `Headers` response with no
-///   outstanding request is rejected as `UnsolicitedHeaders`).
+///   test/recorder path, which uses an ephemeral [`HsLocal`] with no recorded
+///   expectation, so a `Headers` response is `UnsolicitedHeaders`).
 ///
-/// It is a faithful port of the old `deliver_header_sync_frame`: the same events
-/// fire on the same conditions, mapped onto [`Flow`]:
+/// Effects map onto [`Flow`]:
 ///
-/// - a successful forward to the reactor ⇒ [`Flow::Continue`],
-/// - the old `SinkReject::Protocol` cases ⇒ [`Flow::Reject`] with a `Protocol`
-///   reason (fatal — disconnect the peer), and
-/// - the old `SinkReject::Local` "queue closed" case ⇒ [`Flow::Reject`] with a
-///   `Local` reason. Each caller then maps `Local` to its old behavior:
-///   `run_inbound` logs and continues, while `deliver_frame` returns it to the
-///   registry as `Err(SinkReject::Local(_))`.
-pub(super) fn deliver(
-    handle: &HeaderSyncHandle,
-    expected: Option<ExpectedHeadersResponse>,
+/// - emitting all effects successfully ⇒ [`Flow::Continue`] (or [`Flow::Done`]
+///   when nothing was emitted, e.g. a dropped-before-decode `NewBlock` flood);
+/// - a routine-classified protocol violation ⇒ the misbehavior event plus
+///   [`Flow::Reject`] with a `Protocol` reason (fatal — disconnect the peer);
+/// - a full/closed reactor queue ⇒ [`Flow::Reject`] with a `Local` reason. Each
+///   caller maps `Local` to its old behavior: `run_inbound` logs and continues,
+///   while `deliver_frame` returns it to the registry as `Err(SinkReject::Local)`.
+pub(crate) fn decode_and_ingest(
+    local: &mut HsLocal,
+    env: &HsEnv,
     peer_id: ZakuraPeerId,
     frame: Frame,
 ) -> Flow<()> {
-    if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
-        let Some(expected) = expected else {
-            let error = Arc::new(HeaderSyncWireError::UnsolicitedHeaders);
-            let _ = handle.try_send(HeaderSyncEvent::WireProtocolFailure {
-                peer: peer_id.clone(),
-                reason: HeaderSyncMisbehavior::UnsolicitedHeaders,
-                error: error.clone(),
-            });
-            let protocol_error =
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-            return Flow::Reject(SinkReject::protocol(protocol_error));
-        };
+    let is_headers = u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS);
+    let is_new_block = u8::try_from(frame.message_type).ok() == Some(MSG_HS_NEW_BLOCK);
 
-        let msg = match HeaderSyncMessage::decode_frame(
-            frame,
-            HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
-        ) {
-            Ok(msg) => msg,
-            Err(error) => {
-                let protocol_error =
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                let _ = handle.try_send(HeaderSyncEvent::WireProtocolFailure {
-                    peer: peer_id.clone(),
-                    reason: HeaderSyncMisbehavior::MalformedMessage,
-                    error: Arc::new(error),
-                });
-                return Flow::Reject(SinkReject::protocol(protocol_error));
-            }
-        };
-
-        return forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg });
+    // Pre-decode `NewBlock` rate gate: a `NewBlock` frame that arrives inside the
+    // per-peer minimum interval is dropped *before* the full `Arc<Block>` is
+    // deserialized, so a flood cannot force repeated full-block decode ahead of
+    // the reactor's semantic meter. Throttling (drop, keep the peer) matches the
+    // reactor's cheap dedup-without-scoring policy, so honest re-floods are not
+    // penalized; the first frame in each window still reaches the reactor,
+    // preserving first-offense malformed/spam disconnects.
+    if is_new_block && !local.admit_new_block() {
+        metrics::counter!("sync.header.tip.new_block.predecode_throttled").increment(1);
+        return Flow::Done;
     }
 
-    let msg = match decode_control_frame(frame) {
+    // Correlate a `Headers` response against the peer-owned expectation FIFO before
+    // decode, so an over-long or otherwise malformed response is bounded by the
+    // matching `GetHeaders` count. A `Headers` frame with no expectation is
+    // unsolicited; the routine classifies it and rejects the peer.
+    let expected = if is_headers {
+        let Some(expected) = local.pop_expected_headers_response() else {
+            return reject_misbehavior(
+                env,
+                &peer_id,
+                HeaderSyncMisbehavior::UnsolicitedHeaders,
+                &HeaderSyncWireError::UnsolicitedHeaders,
+            );
+        };
+        Some(expected)
+    } else {
+        None
+    };
+
+    let decode_context = match expected {
+        Some(expected) => HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
+        None if is_headers => HeaderSyncDecodeContext::for_headers_response(
+            // Unreachable: `is_headers` always sets `expected` above. Kept total
+            // for exhaustiveness.
+            ExpectedHeadersResponse::new(block::Height(0), 1)
+                .expect("count 1 is a valid bounded request"),
+            1,
+        ),
+        None => HeaderSyncDecodeContext::control(),
+    };
+
+    let msg = match HeaderSyncMessage::decode_frame(frame, decode_context) {
         Ok(msg) => msg,
         Err(error) => {
-            let protocol_error =
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-            let _ = handle.try_send(HeaderSyncEvent::WireDecodeFailed {
-                peer: peer_id,
-                error: Arc::new(error),
-            });
-            return Flow::Reject(SinkReject::protocol(protocol_error));
+            // A `Headers` response over its correlated count, or any malformed
+            // frame, is a peer-local protocol violation classified here before the
+            // shared misbehavior event is emitted.
+            if let Some(expected) = expected {
+                // The expectation was popped for decode but the response was
+                // malformed: the peer is being torn down, so the FIFO is discarded
+                // with the session; restoring would be moot. Leave it consumed.
+                let _ = expected;
+            }
+            return reject_misbehavior(
+                env,
+                &peer_id,
+                HeaderSyncMisbehavior::MalformedMessage,
+                &error,
+            );
         }
     };
 
-    forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg })
+    match ingest_message(local, env, &peer_id, msg) {
+        // The reactor `events` queue was full or closed, so this decoded message
+        // could not be delivered locally. For a *solicited* `Headers` response the
+        // expectation was already popped before decode, so restore it: the reactor's
+        // matching range is still outstanding, and a consumed-but-undelivered
+        // expectation would otherwise lose the response entirely (recoverable only by
+        // the request timeout) and desynchronize the peer-local FIFO from that
+        // outstanding range. Restoring keeps the pipe in the same state as a request
+        // still awaiting its response, which the timeout/retry machinery handles.
+        //
+        // The `Local` reject is RETURNED to the caller (not swallowed): `run_inbound`
+        // logs it and continues, while `deliver_frame` surfaces it to the registry as
+        // `Err(SinkReject::Local)`. Preserving `SinkReject::Local` vs `Protocol` here
+        // is what keeps a local queue failure from being mistaken for peer fault.
+        reject @ Flow::Reject(SinkReject::Local(_)) => {
+            if let Some(expected) = expected {
+                local.restore_expected_headers(expected);
+            }
+            reject
+        }
+        other => other,
+    }
+}
+
+/// Build a fresh per-peer ingest [`HsLocal`] seeded from `env` using the default
+/// inbound rate intervals.
+///
+/// Used by the synthetic in-process cluster harness, which has no command channel
+/// and constructs one `HsLocal` per remote source peer. Production builds `HsLocal`
+/// directly in [`HeaderSyncService::add_peer`](super::service::HeaderSyncService)
+/// with the live command receiver.
+///
+/// The cluster harness exercises the reactor-side global `NewBlock` dedup
+/// (seen/pending sets) and the no-double-gossip property, which are a *different*
+/// layer than the routine's pre-decode `NewBlock` rate gate. The pre-decode gate is
+/// covered by its own routine-harness test, so this ingest state disables it (zero
+/// interval) to keep the harness focused on reactor-side dedup; the status spam gate
+/// keeps its real interval so hostile-status e2e flows still classify spam.
+#[cfg(test)]
+pub(crate) fn new_ingest_local(env: &HsEnv) -> HsLocal {
+    let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+    HsLocal::new(
+        commands_rx,
+        env.anchor_height(),
+        DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+        Duration::ZERO,
+    )
+}
+
+/// Run the relocated peer-local validation for one decoded stream-5 message and
+/// emit the narrowed shared-effect event(s) to the reactor.
+///
+/// This is where the chunk-03 demux removal lives: each wire variant is validated
+/// against this peer's local state and either forwarded as a narrowed shared
+/// effect (`PeerStatusUpdated`, `PeerHeadersReceived`, `InboundGetHeadersRequested`,
+/// `NewBlockCandidate`) or rejected as `PeerMisbehavior`. The reactor never sees a
+/// raw decoded wire message.
+pub(super) fn ingest_message(
+    local: &mut HsLocal,
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    msg: HeaderSyncMessage,
+) -> Flow<()> {
+    match msg {
+        HeaderSyncMessage::Status(status) => ingest_status(local, env, peer_id, status),
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+        } => ingest_headers(env, peer_id, headers, body_sizes),
+        HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+        } => ingest_get_headers(local, env, peer_id, start_height, count),
+        HeaderSyncMessage::NewBlock(block) => forward(
+            &env.handle,
+            HeaderSyncEvent::NewBlockCandidate {
+                peer: peer_id.clone(),
+                block,
+            },
+        ),
+    }
+}
+
+/// Peer-local `Status` validation: anchor/tip ordering, the status-spam rate gate,
+/// and advertised-cap clamping. A valid status updates this peer's advertised tip
+/// and is forwarded as a clamped [`HeaderSyncEvent::PeerStatusUpdated`].
+fn ingest_status(
+    local: &mut HsLocal,
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    status: HeaderSyncStatus,
+) -> Flow<()> {
+    metrics::counter!("sync.header.peer.status.received").increment(1);
+    if status.anchor_height > status.tip_height {
+        // A decoded `Status` with anchor past tip is semantically invalid but was
+        // record-only at the baseline (reactor `report_misbehavior`): report it and
+        // keep the connection.
+        return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::InvalidStatus);
+    }
+
+    // A status is applied if it advances this peer's advertised tip OR the spam
+    // rate meter allows it; otherwise it is redundant-or-spammy traffic.
+    let advances_advertised_tip = status.tip_height > local.advertised_tip;
+    let status_token_available = local.inbound_status_meter.try_take(Instant::now());
+    if !advances_advertised_tip && !status_token_available {
+        // Status spam is a decoded-message rate violation: record-only at the
+        // baseline, so report it and keep the connection.
+        return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::StatusSpam);
+    }
+
+    local.advertised_tip = status.tip_height;
+    local.received_status = true;
+    let clamped = HeaderSyncStatus {
+        max_headers_per_response: clamp_advertised_range(status.max_headers_per_response),
+        max_inflight_requests: status
+            .max_inflight_requests
+            .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER),
+        ..status
+    };
+    forward(
+        &env.handle,
+        HeaderSyncEvent::PeerStatusUpdated {
+            peer: peer_id.clone(),
+            status: clamped,
+        },
+    )
+}
+
+/// Peer-local `Headers` shape validation: the body-size/header-count parity check.
+/// The decode already capped the response against the correlated request count, so
+/// the routine only forwards the validated, correlated response as
+/// [`HeaderSyncEvent::PeerHeadersReceived`]. The reactor matches it against its
+/// outstanding range and drives the link/stateless/checkpoint validation and
+/// commit pipeline (range bookkeeping stays reactor-side).
+fn ingest_headers(
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+) -> Flow<()> {
+    metrics::counter!("sync.header.response.received").increment(1);
+    if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
+        // A body-size/header-count parity check on an ALREADY-DECODED `Headers` is a
+        // semantic shape violation, not a decode failure. At the baseline this was
+        // the reactor's record-only `report_misbehavior(MalformedMessage)`, so report
+        // it and keep the connection (the correlated-`Headers` *decode* failure, which
+        // does disconnect, is handled in `decode_and_ingest`).
+        return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::MalformedMessage);
+    }
+    forward(
+        &env.handle,
+        HeaderSyncEvent::PeerHeadersReceived {
+            peer: peer_id.clone(),
+            headers,
+            body_sizes,
+        },
+    )
+}
+
+/// Peer-local inbound `GetHeaders` gates owned by the routine: the received-status
+/// gate and the requested-count cap. A request that passes both is forwarded as
+/// [`HeaderSyncEvent::InboundGetHeadersRequested`]; the reactor accounts the
+/// inbound serving slot (the stateful inflight budget tied to backend completion
+/// stays reactor-side) and dispatches the state query.
+fn ingest_get_headers(
+    local: &mut HsLocal,
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    start_height: block::Height,
+    count: u32,
+) -> Flow<()> {
+    if !local.received_status {
+        // A `GetHeaders` before any status is a decoded-message spam violation:
+        // record-only at the baseline, so report it and keep the connection.
+        return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::GetHeadersSpam);
+    }
+
+    let allowed_count = env.inbound_get_headers_count_limit();
+    if count == 0 || count > allowed_count {
+        // An out-of-bounds requested count on a decoded `GetHeaders` is record-only
+        // at the baseline: report it and keep the connection.
+        return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::GetHeadersTooLong);
+    }
+
+    forward(
+        &env.handle,
+        HeaderSyncEvent::InboundGetHeadersRequested {
+            peer: peer_id.clone(),
+            start_height,
+            count,
+        },
+    )
+}
+
+/// Emit a routine-classified [`HeaderSyncEvent::PeerMisbehavior`] and reject the
+/// peer with a protocol-fatal [`SinkReject`].
+///
+/// ONLY for the hard protocol failures that disconnected the connection at the
+/// chunk-02 baseline: a frame that fails to DECODE (control or correlated
+/// `Headers`), and a `Headers` frame with no recorded expectation
+/// (`UnsolicitedHeaders`). These are violations the peer commits *before* a
+/// well-formed message exists, so the connection is torn down.
+///
+/// A decoded-but-semantically-invalid message (invalid/spammy `Status`,
+/// `GetHeaders` spam/too-long, a body-size check on an already-decoded `Headers`)
+/// is RECORD-ONLY at the baseline — it was forwarded to the reactor, which never
+/// cancelled the session. Use [`record_misbehavior`] for those: the routine still
+/// reports the misbehavior but keeps the connection alive (the reactor owns the
+/// disconnect decision, which is currently record-only).
+///
+/// The misbehavior is classified *before* the shared event is emitted (the reactor
+/// only aggregates and owns the disconnect decision). The `error` is used only for
+/// the protocol-reject diagnostic and a debug log; misbehavior reporting needs only
+/// the peer and the reason.
+fn reject_misbehavior(
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    reason: HeaderSyncMisbehavior,
+    error: &HeaderSyncWireError,
+) -> Flow<()> {
+    tracing::debug!(
+        ?peer_id,
+        ?reason,
+        ?error,
+        "invalid Zakura header-sync message"
+    );
+    let _ = env.handle.try_send(HeaderSyncEvent::PeerMisbehavior {
+        peer: peer_id.clone(),
+        reason,
+    });
+    let protocol_error = std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+    Flow::Reject(SinkReject::protocol(protocol_error))
+}
+
+/// Emit a routine-classified [`HeaderSyncEvent::PeerMisbehavior`] for a
+/// decoded-but-semantically-invalid message WITHOUT disconnecting the peer.
+///
+/// This is the record-only sibling of [`reject_misbehavior`]. At the chunk-02
+/// baseline these classifications (invalid/spammy `Status`, `GetHeaders`
+/// spam/too-long, a body-size parity check on an already-decoded `Headers`) were
+/// forwarded to the reactor and handled by its record-only `report_misbehavior`,
+/// which traces/aggregates the violation but never cancels the session (peer
+/// scoring no longer drives disconnects). The routine preserves that exactly: it
+/// still surfaces the same `PeerMisbehavior { peer, reason }` event so the
+/// reactor's aggregation/tracing sees it, then continues processing frames.
+fn record_misbehavior(
+    env: &HsEnv,
+    peer_id: &ZakuraPeerId,
+    reason: HeaderSyncMisbehavior,
+) -> Flow<()> {
+    let _ = env.handle.try_send(HeaderSyncEvent::PeerMisbehavior {
+        peer: peer_id.clone(),
+        reason,
+    });
+    Flow::Continue(())
 }
 
 /// One inbound input the routine's recv loop selects over.
@@ -313,13 +627,13 @@ enum HsRoutineInput {
 /// loop.
 ///
 /// The routine owns the local decode/correlation state ([`HsLocal`] — the
-/// expected-`Headers` FIFO, the command receiver, and the pre-decode `NewBlock`
-/// rate gate), the inbound stream-guard admission, and the frame decode. It is a
-/// compatibility shell over the existing per-peer [`Pipe`]: shared global
-/// scheduling, direct `GetHeaders` sends, and direct status/`NewBlock`/`Headers`
-/// response sends all stay in [`HeaderSyncReactor`](super::reactor); decoded
-/// stream-5 messages are still forwarded to the reactor as
-/// [`HeaderSyncEvent::WireMessage`](super::events::HeaderSyncEvent::WireMessage).
+/// expected-`Headers` FIFO, the command receiver, the pre-decode `NewBlock` rate
+/// gate, and the peer-local advertised caps + status-spam meter), the inbound
+/// stream-guard admission, the frame decode, and the relocated peer-local protocol
+/// validation. It drives the per-peer [`Pipe`] one frame at a time, forwarding only
+/// narrowed shared-effect events to [`HeaderSyncReactor`](super::reactor); shared
+/// global scheduling, direct `GetHeaders` sends, and direct
+/// status/`NewBlock`/`Headers` response sends stay reactor-side (chunks 04/05).
 ///
 /// Correlation-ordering invariant: a `RecordExpectedHeaders` command is enqueued
 /// synchronously the moment its outbound `GetHeaders` is queued, so it is already
@@ -396,12 +710,11 @@ impl HeaderSyncPeerRoutine {
     }
 }
 
-/// Forward a successfully decoded inbound event to the reactor.
+/// Forward a narrowed shared-effect event to the reactor.
 ///
-/// A closed reactor queue is a local, non-fatal condition for the peer: the old
-/// `deliver_header_sync_frame` returned `SinkReject::local` here, so this returns
-/// [`Flow::Reject`] with a `Local` reason. Callers decide whether to continue or
-/// surface it (see [`deliver`]).
+/// A closed/full reactor queue is a local, non-fatal condition for the peer, so
+/// this returns [`Flow::Reject`] with a `Local` reason. Callers decide whether to
+/// continue or surface it (see [`decode_and_ingest`]).
 fn forward(handle: &HeaderSyncHandle, event: HeaderSyncEvent) -> Flow<()> {
     match handle.try_send(event) {
         Ok(()) => Flow::Continue(()),
@@ -409,20 +722,6 @@ fn forward(handle: &HeaderSyncHandle, event: HeaderSyncEvent) -> Flow<()> {
             "header-sync queue closed: {error}"
         ))),
     }
-}
-
-/// Decode a non-`Headers` (control) frame.
-///
-/// `Headers` frames need the peer's outstanding-request context and are handled
-/// in [`deliver`]; a `Headers` frame reaching this path has no correlated
-/// request, so it is rejected as `UnsolicitedHeaders` exactly as the old
-/// `decode_header_sync_frame` did.
-fn decode_control_frame(frame: Frame) -> Result<HeaderSyncMessage, HeaderSyncWireError> {
-    if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
-        return Err(HeaderSyncWireError::UnsolicitedHeaders);
-    }
-
-    HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
 }
 
 #[cfg(test)]
@@ -493,20 +792,45 @@ mod tests {
         }
     }
 
-    /// A `Headers` frame with no recorded expectation is unsolicited: it reports
-    /// `UnsolicitedHeaders` misbehavior and rejects the peer, before any decode.
-    #[test]
-    fn deliver_unsolicited_headers_rejects_without_expectation() {
-        let (handle, mut events) = test_handle();
+    /// Wrap a reactor handle as a routine environment for the inbound decode path.
+    fn test_env(handle: HeaderSyncHandle) -> HsEnv {
+        HsEnv::new(
+            handle,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            // MAX_HS_MESSAGE_BYTES fits the frame cap; any non-zero value works here.
+            MAX_HS_MESSAGE_BYTES as u32,
+        )
+    }
 
-        let flow = deliver(&handle, None, peer(), headers_frame(Vec::new()));
+    /// Build a fresh per-peer ingest `HsLocal` with a detached command channel.
+    fn test_local() -> HsLocal {
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        HsLocal::new(
+            commands_rx,
+            block::Height(0),
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+        )
+    }
+
+    /// A `Headers` frame with no recorded expectation is unsolicited: the routine
+    /// classifies `UnsolicitedHeaders`, emits `PeerMisbehavior`, and rejects the
+    /// peer, before any decode.
+    #[test]
+    fn ingest_unsolicited_headers_rejects_without_expectation() {
+        let (handle, mut events) = test_handle();
+        let env = test_env(handle);
+        let mut local = test_local();
+
+        let flow = decode_and_ingest(&mut local, &env, peer(), headers_frame(Vec::new()));
 
         assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+            Ok(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
             }
-            other => panic!("expected WireProtocolFailure(UnsolicitedHeaders), got {other:?}"),
+            other => panic!("expected PeerMisbehavior(UnsolicitedHeaders), got {other:?}"),
         }
     }
 
@@ -514,18 +838,22 @@ mod tests {
     /// decoded: a malformed payload now reports `MalformedMessage`, not
     /// `UnsolicitedHeaders`, proving the expectation was consumed before decode.
     #[test]
-    fn deliver_correlated_headers_decodes_against_expectation() {
+    fn ingest_correlated_headers_decodes_against_expectation() {
         let (handle, mut events) = test_handle();
-        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        let env = test_env(handle);
+        let mut local = test_local();
+        local.record_expected(
+            ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid"),
+        );
 
-        let flow = deliver(&handle, Some(expected), peer(), headers_frame(Vec::new()));
+        let flow = decode_and_ingest(&mut local, &env, peer(), headers_frame(Vec::new()));
 
         assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+            Ok(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::MalformedMessage));
             }
-            other => panic!("expected WireProtocolFailure(MalformedMessage), got {other:?}"),
+            other => panic!("expected PeerMisbehavior(MalformedMessage), got {other:?}"),
         }
     }
 
@@ -536,7 +864,12 @@ mod tests {
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
+        let mut local = HsLocal::new(
+            commands_rx,
+            block::Height(0),
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+        );
 
         let first = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
         let second = ExpectedHeadersResponse::new(block::Height(2), 2).expect("count is valid");
@@ -590,8 +923,18 @@ mod tests {
 
         let mut pipe = Pipe::new(
             peer(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
-            HsEnv::new(handle),
+            HsLocal::new(
+                commands_rx,
+                block::Height(0),
+                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ),
+            HsEnv::new(
+                handle,
+                Network::Mainnet,
+                ZakuraHeaderSyncConfig::default(),
+                MAX_HS_MESSAGE_BYTES as u32,
+            ),
             crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
             run_inbound,
             &PIPE_SHAPE,
@@ -600,10 +943,9 @@ mod tests {
         // First flood frame: admitted, decoded, and forwarded to the reactor.
         assert!(matches!(pipe.run_one(frame_one), Flow::Continue(())));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireMessage {
-                msg: HeaderSyncMessage::NewBlock(block),
-                ..
-            }) => assert_eq!(block.hash(), block_one.hash()),
+            Ok(HeaderSyncEvent::NewBlockCandidate { block, .. }) => {
+                assert_eq!(block.hash(), block_one.hash())
+            }
             other => panic!("expected first NewBlock to be forwarded, got {other:?}"),
         }
 
@@ -656,8 +998,18 @@ mod tests {
 
         let mut pipe = Pipe::new(
             peer(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
-            HsEnv::new(handle),
+            HsLocal::new(
+                commands_rx,
+                block::Height(0),
+                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ),
+            HsEnv::new(
+                handle,
+                Network::Mainnet,
+                ZakuraHeaderSyncConfig::default(),
+                MAX_HS_MESSAGE_BYTES as u32,
+            ),
             crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
             run_inbound,
             &PIPE_SHAPE,
@@ -748,8 +1100,18 @@ mod tests {
         let (peer_send, service_recv) = framed_channel(16);
         let pipe = Pipe::new(
             peer(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
-            HsEnv::new(handle),
+            HsLocal::new(
+                commands_rx,
+                block::Height(0),
+                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ),
+            HsEnv::new(
+                handle,
+                Network::Mainnet,
+                ZakuraHeaderSyncConfig::default(),
+                MAX_HS_MESSAGE_BYTES as u32,
+            ),
             // MAX_HS_MESSAGE_BYTES is a small compile-time const that fits in u32.
             crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
             run_inbound,
@@ -847,10 +1209,10 @@ mod tests {
         );
         // The misbehavior was reported to the reactor exactly as `deliver` does.
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+            Ok(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
             }
-            other => panic!("expected WireProtocolFailure(UnsolicitedHeaders), got {other:?}"),
+            other => panic!("expected PeerMisbehavior(UnsolicitedHeaders), got {other:?}"),
         }
     }
 
@@ -890,6 +1252,85 @@ mod tests {
         assert!(
             result.is_ok(),
             "a local (full reactor queue) failure must not reject the peer"
+        );
+    }
+
+    /// Regression guard for the chunk-03 disconnect-vs-record-only split: a decoded
+    /// but semantically-invalid header-sync message (here `GetHeadersSpam` — an
+    /// inbound `GetHeaders` before any status) must be RECORD-ONLY, exactly as the
+    /// chunk-02 baseline forwarded it to the reactor's never-disconnecting
+    /// `report_misbehavior`. The routine emits `PeerMisbehavior` but does NOT return
+    /// a `SinkReject::Protocol` and does NOT cancel the connection: it keeps running
+    /// and processes the next frame. Only a cancellation makes it exit, cleanly.
+    #[tokio::test]
+    async fn routine_records_semantic_misbehavior_without_disconnecting() {
+        let (handle, mut events) = test_handle();
+        let cancel = CancellationToken::new();
+        let (routine, peer_send, _commands_tx) = routine_with(handle, cancel.clone());
+        let run = tokio::spawn(routine.run());
+
+        // An inbound `GetHeaders` before any status is `GetHeadersSpam`: a decoded
+        // message that is semantically invalid, which is record-only at the baseline.
+        let spam_get_headers = || {
+            HeaderSyncMessage::GetHeaders {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .expect("get_headers frame encodes")
+        };
+
+        peer_send
+            .send(spam_get_headers())
+            .await
+            .expect("the stream has capacity");
+
+        // The misbehavior is reported as a narrowed `PeerMisbehavior` event, but the
+        // connection is NOT cancelled by the routine.
+        let first = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the routine reports the misbehavior promptly");
+        match first {
+            Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+                assert_eq!(reason, HeaderSyncMisbehavior::GetHeadersSpam);
+            }
+            other => panic!("expected PeerMisbehavior(GetHeadersSpam), got {other:?}"),
+        }
+        assert!(
+            !cancel.is_cancelled(),
+            "record-only semantic misbehavior must not cancel the connection token"
+        );
+
+        // The routine kept running (it did not protocol-reject and exit): a second
+        // spam frame is still processed and reported, proving the loop is alive.
+        peer_send
+            .send(spam_get_headers())
+            .await
+            .expect("the routine is still consuming frames");
+        let second = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the routine is still running and reports the second misbehavior");
+        assert!(
+            matches!(
+                second,
+                Some(HeaderSyncEvent::PeerMisbehavior {
+                    reason: HeaderSyncMisbehavior::GetHeadersSpam,
+                    ..
+                })
+            ),
+            "the routine keeps processing frames after a record-only misbehavior"
+        );
+
+        // The only thing that ends the routine is the cancellation, and it is a clean
+        // `Ok` exit (never an `Err(SinkReject::Protocol)`).
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the routine exits promptly after cancellation")
+            .expect("the routine task does not panic");
+        assert!(
+            result.is_ok(),
+            "a record-only semantic misbehavior must not turn into a protocol reject"
         );
     }
 
@@ -1003,13 +1444,13 @@ mod tests {
             "a malformed correlated response is still a protocol reject"
         );
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+            Ok(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
                 assert!(
                     matches!(reason, HeaderSyncMisbehavior::MalformedMessage),
                     "the expectation was popped before decode (MalformedMessage, not UnsolicitedHeaders)"
                 );
             }
-            other => panic!("expected WireProtocolFailure(MalformedMessage), got {other:?}"),
+            other => panic!("expected PeerMisbehavior(MalformedMessage), got {other:?}"),
         }
         cancel.cancel();
     }
@@ -1021,7 +1462,12 @@ mod tests {
     #[test]
     fn routine_preserves_fifo_for_multiple_expectations() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
+        let mut local = HsLocal::new(
+            commands_rx,
+            block::Height(0),
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+        );
 
         let first = ExpectedHeadersResponse::new(block::Height(10), 1).expect("count is valid");
         let second = ExpectedHeadersResponse::new(block::Height(20), 2).expect("count is valid");

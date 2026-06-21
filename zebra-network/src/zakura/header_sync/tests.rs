@@ -115,6 +115,39 @@ fn mainnet_header(bytes: &[u8]) -> Arc<block::Header> {
     mainnet_block(bytes).header.clone()
 }
 
+/// Map a decoded stream-5 message to the narrowed shared-effect event a peer
+/// routine would forward to the reactor after running its peer-local validation.
+///
+/// Reactor-effect tests inject this narrowed event directly (the routine-level
+/// validation is covered by dedicated routine-harness tests). This is test
+/// plumbing, not production demux: the routine, not this helper, owns the
+/// validation that decides which narrowed event a real wire frame produces. A
+/// rejected message (which the routine would turn into `PeerMisbehavior` + a
+/// disconnect) is not representable here; tests that need a routine rejection
+/// drive the routine harness instead.
+fn narrowed_event(peer: ZakuraPeerId, msg: HeaderSyncMessage) -> HeaderSyncEvent {
+    match msg {
+        HeaderSyncMessage::Status(status) => HeaderSyncEvent::PeerStatusUpdated { peer, status },
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+        } => HeaderSyncEvent::PeerHeadersReceived {
+            peer,
+            headers,
+            body_sizes,
+        },
+        HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+        } => HeaderSyncEvent::InboundGetHeadersRequested {
+            peer,
+            start_height,
+            count,
+        },
+        HeaderSyncMessage::NewBlock(block) => HeaderSyncEvent::NewBlockCandidate { peer, block },
+    }
+}
+
 fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
     let body_sizes = vec![0; headers.len()];
     HeaderSyncMessage::Headers {
@@ -156,6 +189,68 @@ fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
         ExpectedHeadersResponse::new(block::Height(1), count).unwrap(),
         peer_cap,
     )
+}
+
+/// A minimal in-process driver for one peer routine's relocated peer-local
+/// validation, used by the tests that moved off the reactor in chunk 03 (the
+/// peer-local `Status`/`GetHeaders`/`NewBlock` gates). It encodes a constructed
+/// message to a frame and runs the production [`decode_and_ingest`] against a fresh
+/// per-peer [`HsLocal`], then drains the narrowed shared-effect events the routine
+/// forwarded.
+struct RoutineHarness {
+    local: super::pipe::HsLocal,
+    env: super::pipe::HsEnv,
+    peer: ZakuraPeerId,
+    events: mpsc::Receiver<HeaderSyncEvent>,
+}
+
+impl RoutineHarness {
+    fn new(peer: ZakuraPeerId) -> Self {
+        Self::with_config(peer, Network::Mainnet, ZakuraHeaderSyncConfig::default())
+    }
+
+    fn with_config(peer: ZakuraPeerId, network: Network, config: ZakuraHeaderSyncConfig) -> Self {
+        let (events, events_rx) = mpsc::channel(64);
+        let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+        let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_peers_tx, peers) = watch::channel(crate::zakura::ServicePeerSnapshot::default());
+        let (_candidates_tx, candidates) =
+            watch::channel(crate::zakura::ZakuraHeaderSyncCandidateState::default());
+        let handle = HeaderSyncHandle {
+            events,
+            lifecycle,
+            tip,
+            peers,
+            candidates,
+        };
+        let env = super::pipe::HsEnv::new(handle, network, config, LOCAL_MAX_MESSAGE_BYTES);
+        let local = super::pipe::new_ingest_local(&env);
+        Self {
+            local,
+            env,
+            peer,
+            events: events_rx,
+        }
+    }
+
+    /// Record an outbound `GetHeaders` expectation so a later `Headers` response
+    /// correlates (mirrors production's `RecordExpectedHeaders`).
+    fn record_expected(&mut self, start_height: block::Height, count: u32) {
+        self.local.record_expected(
+            ExpectedHeadersResponse::new(start_height, count).expect("valid count"),
+        );
+    }
+
+    /// Drive one constructed message through the routine and return the resulting
+    /// [`Flow`].
+    fn ingest(&mut self, msg: HeaderSyncMessage) -> crate::zakura::Flow<()> {
+        let frame = msg.encode_frame().expect("message encodes");
+        super::pipe::decode_and_ingest(&mut self.local, &self.env, self.peer.clone(), frame)
+    }
+
+    fn try_next_event(&mut self) -> Option<HeaderSyncEvent> {
+        self.events.try_recv().ok()
+    }
 }
 
 struct ReactorFixture {
@@ -359,10 +454,10 @@ async fn peer_caps_reject_full_without_status_or_misbehavior_and_free_on_remove(
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: rejected.clone(),
-            msg: HeaderSyncMessage::Status(HeaderSyncStatus::default()),
-        })
+        .send(narrowed_event(
+            rejected.clone(),
+            HeaderSyncMessage::Status(HeaderSyncStatus::default()),
+        ))
         .await
         .unwrap();
     while let Ok(Some(action)) =
@@ -460,10 +555,7 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(peer_id.clone(), headers_message(Vec::new())))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -528,10 +620,7 @@ async fn advisory_backoff_is_pruned_on_peer_disconnected() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(peer_id.clone(), headers_message(Vec::new())))
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -767,15 +856,15 @@ async fn advertise_tip_with_hash(
 ) {
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
+        .send(HeaderSyncEvent::PeerStatusUpdated {
             peer: peer_id,
-            msg: HeaderSyncMessage::Status(HeaderSyncStatus {
+            status: HeaderSyncStatus {
                 tip_height,
                 tip_hash,
                 anchor_height,
                 max_headers_per_response,
                 max_inflight_requests,
-            }),
+            },
         })
         .await
         .unwrap();
@@ -1450,10 +1539,10 @@ async fn incoming_headers_match_outstanding_before_commit() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        ))
         .await
         .unwrap();
 
@@ -1512,13 +1601,13 @@ async fn headers_over_outstanding_contract_reports_response_too_long_without_flo
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_1_BYTES),
                 mainnet_header(&BLOCK_MAINNET_2_BYTES),
             ]),
-        })
+        ))
         .await
         .unwrap();
 
@@ -1584,13 +1673,13 @@ async fn matching_headers_are_statelessly_validated_before_commit() {
     bad_second.previous_block_hash = block::Hash([7; 32]);
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_1_BYTES),
                 Arc::new(bad_second),
             ]),
-        })
+        ))
         .await
         .unwrap();
 
@@ -1682,10 +1771,10 @@ async fn peer_disconnect_removes_outstanding_requests_for_that_peer() {
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+        ))
         .await
         .unwrap();
 
@@ -1793,10 +1882,7 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: second_peer,
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(second_peer, headers_message(Vec::new())))
         .await
         .unwrap();
 
@@ -1868,10 +1954,10 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id,
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id,
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+        ))
         .await
         .unwrap();
 
@@ -1921,10 +2007,10 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: first_peer.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
-        })
+        .send(narrowed_event(
+            first_peer.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        ))
         .await
         .unwrap();
     loop {
@@ -2051,7 +2137,6 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
         (block::Height(0), block::Hash([0; 32])),
         DEFAULT_HS_RANGE,
         DEFAULT_HS_MAX_INFLIGHT,
-        std::time::Duration::from_secs(1),
         std::time::Duration::from_secs(1),
         std::time::Duration::from_secs(1),
     );
@@ -2239,10 +2324,7 @@ async fn full_block_committed_covers_outstanding_height() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id,
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(peer_id, headers_message(Vec::new())))
         .await
         .unwrap();
 
@@ -2297,10 +2379,10 @@ async fn inbound_unseen_valid_new_block_is_seen_and_forwarded_to_eligible_peers(
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: source.clone(),
-            msg: HeaderSyncMessage::NewBlock(block.clone()),
-        })
+        .send(narrowed_event(
+            source.clone(),
+            HeaderSyncMessage::NewBlock(block.clone()),
+        ))
         .await
         .unwrap();
 
@@ -2358,10 +2440,10 @@ async fn inbound_unseen_valid_new_block_is_seen_and_forwarded_to_eligible_peers(
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: source.clone(),
-            msg: HeaderSyncMessage::NewBlock(block),
-        })
+        .send(narrowed_event(
+            source.clone(),
+            HeaderSyncMessage::NewBlock(block),
+        ))
         .await
         .unwrap();
 
@@ -2416,10 +2498,10 @@ async fn concurrent_duplicate_new_block_dedups_pending_acceptance_without_scorin
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: first_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(block.clone()),
-        })
+        .send(narrowed_event(
+            first_peer.clone(),
+            HeaderSyncMessage::NewBlock(block.clone()),
+        ))
         .await
         .unwrap();
 
@@ -2445,10 +2527,10 @@ async fn concurrent_duplicate_new_block_dedups_pending_acceptance_without_scorin
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: duplicate_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(block.clone()),
-        })
+        .send(narrowed_event(
+            duplicate_peer.clone(),
+            HeaderSyncMessage::NewBlock(block.clone()),
+        ))
         .await
         .unwrap();
 
@@ -2527,10 +2609,7 @@ async fn local_full_block_commit_prevents_later_new_block_regossip() {
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: source,
-            msg: HeaderSyncMessage::NewBlock(block),
-        })
+        .send(narrowed_event(source, HeaderSyncMessage::NewBlock(block)))
         .await
         .unwrap();
 
@@ -2562,10 +2641,10 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: unknown_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
-        })
+        .send(narrowed_event(
+            unknown_peer.clone(),
+            HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
+        ))
         .await
         .unwrap();
     loop {
@@ -2584,10 +2663,10 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
     bad_block.header = Arc::new(bad_header);
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: invalid_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(Arc::new(bad_block)),
-        })
+        .send(narrowed_event(
+            invalid_peer.clone(),
+            HeaderSyncMessage::NewBlock(Arc::new(bad_block)),
+        ))
         .await
         .unwrap();
 
@@ -2603,9 +2682,9 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireDecodeFailed {
+        .send(HeaderSyncEvent::PeerMisbehavior {
             peer: malformed_peer.clone(),
-            error: Arc::new(HeaderSyncWireError::UnknownMessageType(MSG_HS_NEW_BLOCK)),
+            reason: HeaderSyncMisbehavior::MalformedMessage,
         })
         .await
         .unwrap();
@@ -2621,40 +2700,60 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
     }
 }
 
+/// Status-spam classification moved into the routine. A second non-advancing
+/// status inside the rate window is `StatusSpam`: the routine emits
+/// `PeerMisbehavior` but, matching the chunk-02 baseline's record-only handling,
+/// does NOT reject the peer — it keeps processing frames (`Flow::Continue`). The
+/// first status is accepted.
+#[test]
+fn rapid_status_updates_report_status_spam_in_routine() {
+    let mut harness = RoutineHarness::new(peer(53));
+    let status = || {
+        HeaderSyncMessage::Status(HeaderSyncStatus {
+            tip_height: block::Height(1),
+            tip_hash: block::Hash([9; 32]),
+            anchor_height: block::Height(0),
+            max_headers_per_response: DEFAULT_HS_RANGE,
+            max_inflight_requests: 1,
+        })
+    };
+    assert!(matches!(
+        harness.ingest(status()),
+        crate::zakura::Flow::Continue(())
+    ));
+    assert!(matches!(
+        harness.try_next_event(),
+        Some(HeaderSyncEvent::PeerStatusUpdated { .. })
+    ));
+
+    // Status spam is a decoded-message rate violation: record-only at the baseline,
+    // so the routine continues rather than tearing down the connection.
+    assert!(matches!(
+        harness.ingest(status()),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
+        }
+        other => panic!("expected PeerMisbehavior(StatusSpam), got {other:?}"),
+    }
+}
+
+/// `NewBlock` spam classification stays reactor-side: the semantic, post-dedup
+/// flood meter fires for distinct unseen blocks delivered faster than the budget.
+/// The narrowed `NewBlockCandidate` event re-enters the reactor's dedup + meter
+/// path exactly as a routine-forwarded candidate would.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
+async fn new_block_spam_reports_disconnect() {
     let network = Network::Mainnet;
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
         None,
     ));
-    let status_peer = peer(53);
     let block_peer = peer(54);
-    connect_peer(&fixture, status_peer.clone()).await;
     connect_peer(&fixture, block_peer.clone()).await;
-
-    for _ in 0..2 {
-        advertise_tip(
-            &fixture,
-            status_peer.clone(),
-            block::Height(0),
-            block::Height(1),
-            DEFAULT_HS_RANGE,
-            1,
-        )
-        .await;
-    }
-
-    loop {
-        if let HeaderSyncAction::Misbehavior { peer, reason } =
-            next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, status_peer);
-            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
-            break;
-        }
-    }
 
     for bytes in [
         BLOCK_MAINNET_1_BYTES.as_slice(),
@@ -2662,10 +2761,10 @@ async fn rapid_status_updates_and_new_block_spam_report_disconnect() {
     ] {
         fixture
             .handle
-            .send(HeaderSyncEvent::WireMessage {
-                peer: block_peer.clone(),
-                msg: HeaderSyncMessage::NewBlock(mainnet_block(bytes)),
-            })
+            .send(narrowed_event(
+                block_peer.clone(),
+                HeaderSyncMessage::NewBlock(mainnet_block(bytes)),
+            ))
             .await
             .unwrap();
     }
@@ -2723,46 +2822,383 @@ async fn rapid_advancing_status_updates_are_not_spam() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn same_height_hash_churn_is_status_spam() {
-    let network = Network::Mainnet;
-    let mut fixture = spawn_test_reactor(startup_for(
-        network.clone(),
-        (block::Height(0), network.genesis_hash()),
-        None,
+/// Status-spam classification moved into the routine. A second non-tip-advancing
+/// status at the same height (only the hash churned) inside the rate window is
+/// classified `StatusSpam` by the routine, which emits `PeerMisbehavior` but keeps
+/// the connection alive (record-only at the baseline, `Flow::Continue`). The first
+/// status is accepted (`PeerStatusUpdated`).
+#[test]
+fn same_height_hash_churn_is_status_spam() {
+    let mut harness = RoutineHarness::new(peer(59));
+
+    let first = HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([1; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    });
+    assert!(matches!(
+        harness.ingest(first),
+        crate::zakura::Flow::Continue(())
     ));
-    let status_peer = peer(59);
-    connect_peer(&fixture, status_peer.clone()).await;
+    assert!(matches!(
+        harness.try_next_event(),
+        Some(HeaderSyncEvent::PeerStatusUpdated { .. })
+    ));
 
-    advertise_tip_with_hash(
-        &fixture,
-        status_peer.clone(),
-        block::Height(0),
-        block::Height(1),
-        block::Hash([1; 32]),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    advertise_tip_with_hash(
-        &fixture,
-        status_peer.clone(),
-        block::Height(0),
-        block::Height(1),
-        block::Hash([2; 32]),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-
-    loop {
-        if let HeaderSyncAction::Misbehavior { peer, reason } =
-            next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, status_peer);
+    let churned = HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([2; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    });
+    assert!(matches!(
+        harness.ingest(churned),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { peer, reason }) => {
+            assert_eq!(peer, harness.peer);
             assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
-            break;
         }
+        other => panic!("expected PeerMisbehavior(StatusSpam), got {other:?}"),
+    }
+}
+
+// ===================== chunk 03: routine-local validation =====================
+//
+// The following tests drive the relocated peer-local validation directly through
+// the routine ingest path. They cover the gates the chunk moved off the reactor.
+
+/// A valid `Status` updates the peer summary through the typed event path: the
+/// routine forwards `PeerStatusUpdated` carrying the accepted status. No raw wire
+/// message reaches the reactor.
+#[test]
+fn routine_valid_status_updates_summary_via_typed_event() {
+    let mut harness = RoutineHarness::new(peer(70));
+    let status = HeaderSyncStatus {
+        tip_height: block::Height(5),
+        tip_hash: block::Hash([3; 32]),
+        anchor_height: block::Height(1),
+        max_headers_per_response: 7,
+        max_inflight_requests: 4,
+    };
+
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::Status(status)),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerStatusUpdated {
+            peer,
+            status: forwarded,
+        }) => {
+            assert_eq!(peer, harness.peer);
+            assert_eq!(forwarded.tip_height, block::Height(5));
+            assert_eq!(forwarded.anchor_height, block::Height(1));
+        }
+        other => panic!("expected PeerStatusUpdated, got {other:?}"),
+    }
+}
+
+/// An impossible `Status` (`anchor_height > tip_height`) is `InvalidStatus`: the
+/// routine emits `PeerMisbehavior` but, matching the chunk-02 baseline's
+/// record-only handling, keeps the connection alive (`Flow::Continue`).
+#[test]
+fn routine_invalid_status_is_misbehavior() {
+    let mut harness = RoutineHarness::new(peer(71));
+    let status = HeaderSyncStatus {
+        tip_height: block::Height(0),
+        tip_hash: block::Hash([0; 32]),
+        anchor_height: block::Height(1),
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+    };
+
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::Status(status)),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidStatus);
+        }
+        other => panic!("expected PeerMisbehavior(InvalidStatus), got {other:?}"),
+    }
+}
+
+/// Advertised caps are clamped by the routine before the summary is forwarded: an
+/// over-large `max_headers_per_response` is clamped to `MAX_HS_RANGE`, and a zero
+/// `max_inflight_requests` is clamped up to 1.
+#[test]
+fn routine_clamps_advertised_caps() {
+    let mut harness = RoutineHarness::new(peer(72));
+    let status = HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: MAX_HS_RANGE + 1000,
+        max_inflight_requests: 0,
+    };
+
+    harness.ingest(HeaderSyncMessage::Status(status));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerStatusUpdated { status, .. }) => {
+            assert_eq!(status.max_headers_per_response, MAX_HS_RANGE);
+            assert_eq!(status.max_inflight_requests, 1);
+        }
+        other => panic!("expected PeerStatusUpdated, got {other:?}"),
+    }
+}
+
+/// A valid inbound `GetHeaders` from a status-confirmed peer is forwarded as
+/// `InboundGetHeadersRequested` (which the reactor dispatches to the backend).
+#[test]
+fn routine_valid_get_headers_requests_backend_lookup() {
+    let mut harness = RoutineHarness::new(peer(73));
+    // First confirm status so the received-status gate passes.
+    harness.ingest(HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    }));
+    assert!(matches!(
+        harness.try_next_event(),
+        Some(HeaderSyncEvent::PeerStatusUpdated { .. })
+    ));
+
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::GetHeaders {
+            start_height: block::Height(2),
+            count: 3,
+        }),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::InboundGetHeadersRequested {
+            start_height,
+            count,
+            ..
+        }) => {
+            assert_eq!(start_height, block::Height(2));
+            assert_eq!(count, 3);
+        }
+        other => panic!("expected InboundGetHeadersRequested, got {other:?}"),
+    }
+}
+
+/// Inbound `GetHeaders` before any status is `GetHeadersSpam` (the received-status
+/// gate the routine owns); an over-cap count is `GetHeadersTooLong`. Both operate on
+/// a DECODED `GetHeaders`, so they are record-only at the chunk-02 baseline: the
+/// routine emits `PeerMisbehavior` but keeps the connection (`Flow::Continue`).
+#[test]
+fn routine_get_headers_gates_status_and_count() {
+    let mut harness = RoutineHarness::new(peer(74));
+
+    // No status yet: the received-status gate records GetHeadersSpam and continues.
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::GetHeaders {
+            start_height: block::Height(1),
+            count: 1,
+        }),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::GetHeadersSpam);
+        }
+        other => panic!("expected PeerMisbehavior(GetHeadersSpam), got {other:?}"),
+    }
+
+    // Confirm status, then send an over-cap request: GetHeadersTooLong.
+    harness.ingest(HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    }));
+    assert!(matches!(
+        harness.try_next_event(),
+        Some(HeaderSyncEvent::PeerStatusUpdated { .. })
+    ));
+    // A count above this node's advertised serving cap (DEFAULT_HS_RANGE) but still
+    // encodable (<= MAX_HS_RANGE) exceeds the inbound count limit: GetHeadersTooLong,
+    // record-only, so the routine continues.
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::GetHeaders {
+            start_height: block::Height(1),
+            count: DEFAULT_HS_RANGE + 1,
+        }),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::GetHeadersTooLong);
+        }
+        other => panic!("expected PeerMisbehavior(GetHeadersTooLong), got {other:?}"),
+    }
+}
+
+/// A correlated `Headers` response (matching a recorded expectation) is forwarded
+/// as `PeerHeadersReceived`; a body-size/header-count mismatch is `MalformedMessage`.
+#[test]
+fn routine_headers_correlation_and_shape_validation() {
+    let mut harness = RoutineHarness::new(peer(75));
+    harness.record_expected(block::Height(1), 1);
+
+    // A valid, correlated one-header response is forwarded as PeerHeadersReceived.
+    let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    assert!(matches!(
+        harness.ingest(headers_message_with_sizes(vec![header.clone()], vec![0])),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerHeadersReceived {
+            headers,
+            body_sizes,
+            ..
+        }) => {
+            assert_eq!(headers.len(), 1);
+            assert_eq!(body_sizes, vec![0]);
+        }
+        other => panic!("expected PeerHeadersReceived, got {other:?}"),
+    }
+}
+
+/// A valid `NewBlock` decode is forwarded as a `NewBlockCandidate` for global
+/// acceptance; the routine does not run global dedup or stateless validation.
+#[test]
+fn routine_new_block_forwards_candidate() {
+    let mut harness = RoutineHarness::new(peer(76));
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+
+    assert!(matches!(
+        harness.ingest(HeaderSyncMessage::NewBlock(block.clone())),
+        crate::zakura::Flow::Continue(())
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::NewBlockCandidate {
+            block: candidate, ..
+        }) => {
+            assert_eq!(candidate.hash(), block.hash());
+        }
+        other => panic!("expected NewBlockCandidate, got {other:?}"),
+    }
+}
+
+/// A malformed stream-5 frame (an empty `Status` payload) is a protocol reject and
+/// `MalformedMessage` misbehavior, so it still disconnects the peer.
+#[test]
+fn routine_malformed_frame_disconnects() {
+    let mut harness = RoutineHarness::new(peer(77));
+    let malformed = Frame {
+        message_type: u16::from(MSG_HS_STATUS),
+        flags: 0,
+        payload: Vec::new(),
+    };
+
+    let flow = super::pipe::decode_and_ingest(
+        &mut harness.local,
+        &harness.env,
+        harness.peer.clone(),
+        malformed,
+    );
+    assert!(matches!(
+        flow,
+        crate::zakura::Flow::Reject(crate::zakura::SinkReject::Protocol(_))
+    ));
+    match harness.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
+        }
+        other => panic!("expected PeerMisbehavior(MalformedMessage), got {other:?}"),
+    }
+}
+
+/// The inbound status/response receive metrics moved into the routine with chunk
+/// 03: the routine increments `peer.status.received` and `response.received` as it
+/// decodes each inbound message. (`tip.new_block.received` stays reactor-side,
+/// emitted once the `NewBlockCandidate` reaches the reactor.)
+#[test]
+fn routine_records_inbound_receive_metrics() {
+    let names = [
+        "sync.header.peer.status.received",
+        "sync.header.response.received",
+    ];
+    let before = metric_snapshot(&names);
+
+    let mut harness = RoutineHarness::new(peer(80));
+    harness.ingest(HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    }));
+    harness.record_expected(block::Height(1), 1);
+    harness.ingest(headers_message_with_sizes(
+        vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+        vec![0],
+    ));
+
+    for name in names {
+        assert_metric_incremented(&before, name);
+    }
+}
+
+/// Gate: routine-to-reactor events are narrowed shared effects, NOT a one-for-one
+/// mirror of the four wire-message variants. There are five shared-effect events,
+/// `PeerMisbehavior` has no wire counterpart (every wire variant can produce it),
+/// and the invalid/spam paths produce no positive event at all.
+#[test]
+fn routine_events_do_not_mirror_wire_variants() {
+    // Four wire variants: Status, GetHeaders, Headers, NewBlock.
+    // The narrowed events a routine emits are a different set, with PeerMisbehavior
+    // as a cross-cutting effect produced by ANY wire variant's validation failure.
+    let mut spam = RoutineHarness::new(peer(78));
+    // A Status produces PeerStatusUpdated...
+    spam.ingest(HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    }));
+    assert!(matches!(
+        spam.try_next_event(),
+        Some(HeaderSyncEvent::PeerStatusUpdated { .. })
+    ));
+    // ...but a second, non-advancing Status produces PeerMisbehavior, NOT a second
+    // PeerStatusUpdated — so Status does not map one-for-one onto a single event.
+    spam.ingest(HeaderSyncMessage::Status(HeaderSyncStatus {
+        tip_height: block::Height(1),
+        tip_hash: block::Hash([9; 32]),
+        anchor_height: block::Height(0),
+        max_headers_per_response: DEFAULT_HS_RANGE,
+        max_inflight_requests: 1,
+    }));
+    match spam.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::StatusSpam);
+        }
+        other => panic!("expected PeerMisbehavior(StatusSpam), got {other:?}"),
+    }
+
+    // An unsolicited Headers (a different wire variant) ALSO collapses to
+    // PeerMisbehavior, proving the misbehavior event is not a per-variant mirror.
+    let mut unsolicited = RoutineHarness::new(peer(79));
+    let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    unsolicited.ingest(headers_message_with_sizes(vec![header], vec![0]));
+    match unsolicited.try_next_event() {
+        Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
+            assert_eq!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders);
+        }
+        other => panic!("expected PeerMisbehavior(UnsolicitedHeaders), got {other:?}"),
     }
 }
 
@@ -2821,10 +3257,10 @@ async fn new_block_spam_does_not_poison_seen_cache() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: spam_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(first_block),
-        })
+        .send(narrowed_event(
+            spam_peer.clone(),
+            HeaderSyncMessage::NewBlock(first_block),
+        ))
         .await
         .unwrap();
     loop {
@@ -2838,10 +3274,10 @@ async fn new_block_spam_does_not_poison_seen_cache() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: spam_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(second_block.clone()),
-        })
+        .send(narrowed_event(
+            spam_peer.clone(),
+            HeaderSyncMessage::NewBlock(second_block.clone()),
+        ))
         .await
         .unwrap();
     loop {
@@ -2856,10 +3292,10 @@ async fn new_block_spam_does_not_poison_seen_cache() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: honest_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(second_block),
-        })
+        .send(narrowed_event(
+            honest_peer.clone(),
+            HeaderSyncMessage::NewBlock(second_block),
+        ))
         .await
         .unwrap();
 
@@ -2898,10 +3334,10 @@ async fn rejected_new_block_does_not_forward_or_poison_seen_cache() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: source.clone(),
-            msg: HeaderSyncMessage::NewBlock(block.clone()),
-        })
+        .send(narrowed_event(
+            source.clone(),
+            HeaderSyncMessage::NewBlock(block.clone()),
+        ))
         .await
         .unwrap();
 
@@ -2940,10 +3376,10 @@ async fn rejected_new_block_does_not_forward_or_poison_seen_cache() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: retry_peer.clone(),
-            msg: HeaderSyncMessage::NewBlock(block),
-        })
+        .send(narrowed_event(
+            retry_peer.clone(),
+            HeaderSyncMessage::NewBlock(block),
+        ))
         .await
         .unwrap();
 
@@ -2985,13 +3421,13 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
     connect_peer(&fixture, no_status_peer.clone()).await;
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: no_status_peer.clone(),
-            msg: HeaderSyncMessage::GetHeaders {
+        .send(narrowed_event(
+            no_status_peer.clone(),
+            HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
             },
-        })
+        ))
         .await
         .unwrap();
     loop {
@@ -3018,13 +3454,13 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
     for start in [block::Height(1), block::Height(4)] {
         fixture
             .handle
-            .send(HeaderSyncEvent::WireMessage {
-                peer: requester.clone(),
-                msg: HeaderSyncMessage::GetHeaders {
+            .send(narrowed_event(
+                requester.clone(),
+                HeaderSyncMessage::GetHeaders {
                     start_height: start,
                     count: 3,
                 },
-            })
+            ))
             .await
             .unwrap();
         match next_query_headers_action(&mut fixture.actions).await {
@@ -3043,13 +3479,13 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: requester.clone(),
-            msg: HeaderSyncMessage::GetHeaders {
+        .send(narrowed_event(
+            requester.clone(),
+            HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(7),
                 count: 1,
             },
-        })
+        ))
         .await
         .unwrap();
     loop {
@@ -3074,13 +3510,13 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: requester.clone(),
-            msg: HeaderSyncMessage::GetHeaders {
+        .send(narrowed_event(
+            requester.clone(),
+            HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(8),
                 count: 1,
             },
-        })
+        ))
         .await
         .unwrap();
     match next_query_headers_action(&mut fixture.actions).await {
@@ -3118,13 +3554,13 @@ async fn inbound_get_headers_over_cap_disconnects_without_state_read() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: requester.clone(),
-            msg: HeaderSyncMessage::GetHeaders {
+        .send(narrowed_event(
+            requester.clone(),
+            HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 4,
             },
-        })
+        ))
         .await
         .unwrap();
 
@@ -3172,10 +3608,10 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+        ))
         .await
         .unwrap();
 
@@ -3253,17 +3689,17 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
+        ))
         .await
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireDecodeFailed {
+        .send(HeaderSyncEvent::PeerMisbehavior {
             peer: peer_id,
-            error: Arc::new(HeaderSyncWireError::UnknownMessageType(99)),
+            reason: HeaderSyncMisbehavior::MalformedMessage,
         })
         .await
         .unwrap();
@@ -3291,11 +3727,14 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation() {
+    // Reactor-owned metrics. The peer-local inbound-receive counters
+    // (`peer.status.received`, `response.received`) moved into the routine with
+    // chunk 03 and are asserted by `routine_records_inbound_receive_metrics`
+    // instead, since this reactor flow injects the narrowed events and never runs
+    // the routine decode. `tip.new_block.received` stays reactor-side.
     let metrics = [
         "sync.header.peer.status.sent",
-        "sync.header.peer.status.received",
         "sync.header.request.sent",
-        "sync.header.response.received",
         "sync.header.range.committed",
         "sync.header.tip.new_block.received",
         "sync.header.tip.new_block.deduped",
@@ -3345,10 +3784,10 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        ))
         .await
         .unwrap();
     let committed_hash = match next_non_query_action(&mut fixture.actions).await {
@@ -3386,17 +3825,17 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES)),
+        ))
         .await
         .unwrap();
     fixture
         .handle
-        .send(HeaderSyncEvent::WireDecodeFailed {
+        .send(HeaderSyncEvent::PeerMisbehavior {
             peer: peer_id,
-            error: Arc::new(HeaderSyncWireError::UnknownMessageType(99)),
+            reason: HeaderSyncMisbehavior::MalformedMessage,
         })
         .await
         .unwrap();
@@ -3420,10 +3859,7 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(peer_id.clone(), headers_message(Vec::new())))
         .await
         .unwrap();
     match next_non_query_action(&mut fixture.actions).await {
@@ -3457,10 +3893,7 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(Vec::new()),
-        })
+        .send(narrowed_event(peer_id.clone(), headers_message(Vec::new())))
         .await
         .unwrap();
     assert!(
@@ -3543,10 +3976,10 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
         assert_eq!(count, 1);
         fixture
             .handle
-            .send(HeaderSyncEvent::WireMessage {
-                peer: served_peer,
-                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-            })
+            .send(narrowed_event(
+                served_peer,
+                headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            ))
             .await
             .unwrap();
     }
@@ -3624,10 +4057,10 @@ async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
         assert_eq!(count, 1);
         fixture
             .handle
-            .send(HeaderSyncEvent::WireMessage {
-                peer: served_peer,
-                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-            })
+            .send(narrowed_event(
+                served_peer,
+                headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            ))
             .await
             .unwrap();
     }
@@ -3686,10 +4119,10 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(headers.to_vec()),
+        ))
         .await
         .unwrap();
 
@@ -3750,10 +4183,10 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers[..2].to_vec()),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(headers[..2].to_vec()),
+        ))
         .await
         .unwrap();
 
@@ -3807,10 +4240,10 @@ async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(headers.to_vec()),
+        ))
         .await
         .unwrap();
 
@@ -3865,14 +4298,14 @@ async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
                 mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
             ]),
-        })
+        ))
         .await
         .unwrap();
 
@@ -3917,10 +4350,10 @@ async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_comm
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+        ))
         .await
         .unwrap();
 
@@ -3974,10 +4407,10 @@ async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
-        })
+        .send(narrowed_event(
+            peer_id.clone(),
+            headers_message(headers.to_vec()),
+        ))
         .await
         .unwrap();
 
@@ -4285,19 +4718,14 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
     let probe_cancel =
         connect_peer_with_direction(&fixture, probe.clone(), ServicePeerDirection::Inbound).await;
 
-    // `anchor_height > tip_height` is an `InvalidStatus` misbehavior.
-    let invalid_status = HeaderSyncMessage::Status(HeaderSyncStatus {
-        tip_height: block::Height(0),
-        tip_hash: block::Hash([0; 32]),
-        anchor_height: block::Height(1),
-        max_headers_per_response: 1,
-        max_inflight_requests: 1,
-    });
+    // `anchor_height > tip_height` is an `InvalidStatus` misbehavior the routine
+    // classifies; the reactor only aggregates it (record-only). Inject the narrowed
+    // misbehavior event the routine would forward.
     fixture
         .handle
-        .send(HeaderSyncEvent::WireMessage {
+        .send(HeaderSyncEvent::PeerMisbehavior {
             peer: probe.clone(),
-            msg: invalid_status,
+            reason: HeaderSyncMisbehavior::InvalidStatus,
         })
         .await
         .expect("event queues");

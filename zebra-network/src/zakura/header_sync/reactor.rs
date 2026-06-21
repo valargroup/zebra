@@ -157,18 +157,28 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::NewBlockRejected { peer, hash } => {
                 self.handle_new_block_rejected(peer, hash).await
             }
-            HeaderSyncEvent::WireMessage { peer, msg } => {
-                self.handle_wire_message(peer, msg).await;
+            HeaderSyncEvent::PeerStatusUpdated { peer, status } => {
+                self.handle_peer_status_updated(peer, status).await;
             }
-            HeaderSyncEvent::WireDecodeFailed { peer, error } => {
-                self.handle_wire_decode_failed(peer, error).await;
-            }
-            HeaderSyncEvent::WireProtocolFailure {
+            HeaderSyncEvent::PeerHeadersReceived {
                 peer,
-                reason,
-                error,
+                headers,
+                body_sizes,
             } => {
-                self.handle_wire_protocol_failure(peer, reason, error).await;
+                self.handle_headers(peer, headers, body_sizes).await;
+            }
+            HeaderSyncEvent::InboundGetHeadersRequested {
+                peer,
+                start_height,
+                count,
+            } => {
+                self.handle_get_headers(peer, start_height, count).await;
+            }
+            HeaderSyncEvent::NewBlockCandidate { peer, block } => {
+                self.handle_new_block(peer, block).await;
+            }
+            HeaderSyncEvent::PeerMisbehavior { peer, reason } => {
+                self.handle_peer_misbehavior(peer, reason).await;
             }
             HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await;
@@ -405,7 +415,6 @@ impl HeaderSyncReactor {
                 peer_state.served_headers_inflight = 0;
                 peer_state.meters = HeaderSyncPeerMeters::new(
                     status_refresh_interval,
-                    DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
                     DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 );
             })
@@ -416,7 +425,6 @@ impl HeaderSyncReactor {
                     self.startup.config.advertised_max_headers_per_response(),
                     self.startup.config.advertised_max_inflight_requests(),
                     self.startup.status_refresh_interval,
-                    DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
                     DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 )
             });
@@ -527,31 +535,16 @@ impl HeaderSyncReactor {
             .await;
     }
 
-    async fn handle_wire_decode_failed(
-        &mut self,
-        peer: ZakuraPeerId,
-        error: Arc<HeaderSyncWireError>,
-    ) {
+    /// Aggregate a routine-classified peer-local protocol violation.
+    ///
+    /// The peer routine already classified the violation (invalid/spammy `Status`,
+    /// unsolicited/malformed `Headers`, over-cap/unsolicited `GetHeaders`, malformed
+    /// frame) before emitting this event. The reactor only owns aggregation and the
+    /// connection-level disconnect decision.
+    async fn handle_peer_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
         if self.state.parked_peers.contains(&peer) {
             return;
         }
-        self.trace_peer_violation(&peer, HeaderSyncMisbehavior::MalformedMessage);
-        tracing::debug!(?peer, ?error, "malformed Zakura header-sync frame");
-        self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
-            .await;
-    }
-
-    async fn handle_wire_protocol_failure(
-        &mut self,
-        peer: ZakuraPeerId,
-        reason: HeaderSyncMisbehavior,
-        error: Arc<HeaderSyncWireError>,
-    ) {
-        if self.state.parked_peers.contains(&peer) {
-            return;
-        }
-        self.trace_peer_violation(&peer, reason);
-        tracing::debug!(?peer, ?error, ?reason, "invalid Zakura header-sync message");
         self.report_misbehavior(peer, reason).await;
     }
 
@@ -678,60 +671,34 @@ impl HeaderSyncReactor {
         }
     }
 
-    async fn handle_wire_message(&mut self, peer: ZakuraPeerId, msg: HeaderSyncMessage) {
+    /// Apply a peer routine's accepted, cap-clamped `Status` to the reactor's peer
+    /// snapshot.
+    ///
+    /// The routine already ran the peer-local validation that was here: anchor/tip
+    /// ordering, the status-spam rate gate, and advertised-cap clamping. The reactor
+    /// trusts the narrowed event and only mirrors the status into `PeerHeaderState`
+    /// (read by scheduling), confirms advisory usefulness, traces, and schedules.
+    async fn handle_peer_status_updated(&mut self, peer: ZakuraPeerId, status: HeaderSyncStatus) {
         if self.state.parked_peers.contains(&peer) {
             return;
         }
-
-        match msg {
-            HeaderSyncMessage::Status(status) => {
-                metrics::counter!("sync.header.peer.status.received").increment(1);
-                if status.anchor_height > status.tip_height {
-                    self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidStatus)
-                        .await;
-                    return;
-                }
-
-                let Some(peer_state) = self.state.peers.get_mut(&peer) else {
-                    return;
-                };
-                let advances_advertised_tip = status.tip_height > peer_state.advertised_tip;
-                let status_token_available =
-                    peer_state.meters.inbound_status.try_take(Instant::now());
-                if !advances_advertised_tip && !status_token_available {
-                    self.report_misbehavior(peer, HeaderSyncMisbehavior::StatusSpam)
-                        .await;
-                    return;
-                }
-                peer_state.advertised_tip = status.tip_height;
-                peer_state.advertised_hash = status.tip_hash;
-                peer_state.anchor = status.anchor_height;
-                peer_state.max_headers_per_response =
-                    clamp_advertised_range(status.max_headers_per_response);
-                peer_state.max_inflight_requests = status
-                    .max_inflight_requests
-                    .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER);
-                peer_state.received_status = true;
-                self.confirm_advisory_status(&peer, status);
-                self.trace_status_received(&peer, status);
-                self.schedule().await;
-            }
-            HeaderSyncMessage::Headers {
-                headers,
-                body_sizes,
-            } => {
-                self.handle_headers(peer, headers, body_sizes).await;
-            }
-            HeaderSyncMessage::GetHeaders {
-                start_height,
-                count,
-            } => {
-                self.handle_get_headers(peer, start_height, count).await;
-            }
-            HeaderSyncMessage::NewBlock(block) => {
-                self.handle_new_block(peer, block).await;
-            }
-        }
+        let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+            return;
+        };
+        peer_state.advertised_tip = status.tip_height;
+        peer_state.advertised_hash = status.tip_hash;
+        peer_state.anchor = status.anchor_height;
+        // The routine already clamped these; re-clamp defensively so a stray event
+        // cannot widen the reactor's serving/scheduling bounds.
+        peer_state.max_headers_per_response =
+            clamp_advertised_range(status.max_headers_per_response);
+        peer_state.max_inflight_requests = status
+            .max_inflight_requests
+            .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER);
+        peer_state.received_status = true;
+        self.confirm_advisory_status(&peer, status);
+        self.trace_status_received(&peer, status);
+        self.schedule().await;
     }
 
     fn restore_outstanding_after_late_covered_response(
@@ -1454,18 +1421,38 @@ impl HeaderSyncReactor {
                 insert_peer(row, hs_trace::PEER, peer);
                 insert_hash(row, hs_trace::HASH, *hash);
             }
-            HeaderSyncEvent::WireMessage { peer, msg } => {
-                insert_optional_str(row, hs_trace::KIND, Some("wire_message"));
-                insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
+            HeaderSyncEvent::PeerStatusUpdated { peer, status } => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_status_updated"));
                 insert_peer(row, hs_trace::PEER, peer);
-                trace_header_sync_message_fields(row, msg);
+                insert_height(row, hs_trace::HEIGHT, status.tip_height);
+                insert_hash(row, hs_trace::HASH, status.tip_hash);
+                insert_height(row, hs_trace::RANGE_START, status.anchor_height);
             }
-            HeaderSyncEvent::WireDecodeFailed { peer, .. } => {
-                insert_optional_str(row, hs_trace::KIND, Some("wire_decode_failed"));
+            HeaderSyncEvent::PeerHeadersReceived { peer, headers, .. } => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_headers_received"));
                 insert_peer(row, hs_trace::PEER, peer);
+                insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
             }
-            HeaderSyncEvent::WireProtocolFailure { peer, reason, .. } => {
-                insert_optional_str(row, hs_trace::KIND, Some("wire_protocol_failure"));
+            HeaderSyncEvent::InboundGetHeadersRequested {
+                peer,
+                start_height,
+                count,
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("inbound_get_headers_requested"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+            }
+            HeaderSyncEvent::NewBlockCandidate { peer, block } => {
+                insert_optional_str(row, hs_trace::KIND, Some("new_block_candidate"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_hash(row, hs_trace::HASH, block.hash());
+                if let Some(height) = block.coinbase_height() {
+                    insert_height(row, hs_trace::HEIGHT, height);
+                }
+            }
+            HeaderSyncEvent::PeerMisbehavior { peer, reason } => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_misbehavior"));
                 insert_optional_str(
                     row,
                     hs_trace::REASON,
@@ -1955,6 +1942,7 @@ fn node_id_from_header_peer_id(peer: &ZakuraPeerId) -> Option<NodeId> {
     NodeId::from_bytes(&bytes).ok()
 }
 
+#[cfg(test)]
 fn trace_header_sync_message_fields(
     row: &mut serde_json::Map<String, Value>,
     msg: &HeaderSyncMessage,
@@ -1994,6 +1982,7 @@ fn trace_header_sync_message_fields(
     }
 }
 
+#[cfg(test)]
 fn header_sync_message_label(msg: &HeaderSyncMessage) -> &'static str {
     match msg {
         HeaderSyncMessage::Status(_) => "status",

@@ -192,28 +192,70 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Inbound stream-5 message from `peer`.
-    WireMessage {
-        /// Serving peer.
+    /// A peer routine accepted a valid `Status` and its peer summary changed.
+    ///
+    /// The routine has already run peer-local validation (anchor/tip ordering,
+    /// status-spam rate gate) and clamped the advertised caps, so the reactor
+    /// applies this directly to its peer snapshot without re-validating; it then
+    /// runs global scheduling and advisory confirmation.
+    PeerStatusUpdated {
+        /// Peer whose summary changed.
         peer: ZakuraPeerId,
-        /// Decoded stream-5 message.
-        msg: HeaderSyncMessage,
+        /// Validated, cap-clamped status the routine accepted.
+        status: HeaderSyncStatus,
     },
-    /// Stream-5 frame decoding failed after handler admission.
-    WireDecodeFailed {
-        /// Peer that sent the malformed frame.
+    /// A peer routine validated a correlated `Headers` response that is ready for
+    /// shared commit or retry bookkeeping.
+    ///
+    /// The routine has already popped the matching expectation and run the
+    /// peer-local shape checks (correlation, decode-time count cap); the reactor
+    /// matches it against its outstanding range and drives link/stateless/
+    /// checkpoint validation and the commit pipeline.
+    PeerHeadersReceived {
+        /// Peer that supplied the response.
         peer: ZakuraPeerId,
-        /// Decode/validation error.
-        error: Arc<HeaderSyncWireError>,
+        /// Headers in ascending height order.
+        headers: Vec<Arc<block::Header>>,
+        /// Advisory serialized body sizes, parallel to `headers`.
+        body_sizes: Vec<u32>,
     },
-    /// Stream-5 protocol failure decoded by the peer-owned session.
-    WireProtocolFailure {
-        /// Peer that sent the invalid message.
+    /// A peer routine accepted an inbound `GetHeaders` that needs a backend/state
+    /// header lookup.
+    ///
+    /// The routine has already run the peer-local gates it owns (received-status
+    /// gate, requested-count cap); the reactor accounts the inbound serving slot
+    /// and dispatches the state query.
+    InboundGetHeadersRequested {
+        /// Peer that requested the range.
         peer: ZakuraPeerId,
-        /// Misbehavior classification for the protocol failure.
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested header count.
+        count: u32,
+    },
+    /// A peer routine decoded a valid `NewBlock` candidate that needs global
+    /// acceptance.
+    ///
+    /// The routine has already applied its pre-decode rate gate; the reactor runs
+    /// the global seen/pending dedup, the semantic flood meter, stateless
+    /// validation, and forwarding.
+    NewBlockCandidate {
+        /// Source peer.
+        peer: ZakuraPeerId,
+        /// Full block decoded from the wire.
+        block: Arc<block::Block>,
+    },
+    /// A peer routine classified a peer-local protocol violation.
+    ///
+    /// Routine-local validation decided the peer violated protocol (invalid or
+    /// spammy `Status`, unsolicited or malformed `Headers`, over-cap or
+    /// unsolicited `GetHeaders`, a malformed frame). The reactor aggregates the
+    /// violation and owns the connection-level disconnect decision.
+    PeerMisbehavior {
+        /// Peer that violated protocol.
+        peer: ZakuraPeerId,
+        /// Routine-local misbehavior classification.
         reason: HeaderSyncMisbehavior,
-        /// Decode/validation error.
-        error: Arc<HeaderSyncWireError>,
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),

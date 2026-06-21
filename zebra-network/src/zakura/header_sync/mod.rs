@@ -54,6 +54,8 @@ pub use events::{
     ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
     HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncStartup,
 };
+#[cfg(test)]
+pub(crate) use pipe::{decode_and_ingest, new_ingest_local, HsEnv, HsLocal};
 pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{

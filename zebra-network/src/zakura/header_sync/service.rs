@@ -199,7 +199,7 @@ impl HeaderSyncPeerSession {
 
 /// Commands from shared scheduling state into one peer-owned header-sync pipe.
 #[derive(Debug)]
-pub(super) enum HeaderSyncPeerCommand {
+pub(crate) enum HeaderSyncPeerCommand {
     /// Record an expected `Headers` response after `GetHeaders` was queued.
     RecordExpectedHeaders(ExpectedHeadersResponse),
 }
@@ -274,11 +274,34 @@ pub(crate) async fn drive_header_sync_actions(
 #[derive(Debug)]
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
+    network: Network,
+    config: ZakuraHeaderSyncConfig,
+    max_frame_bytes: u32,
 }
 
 impl HeaderSyncService {
-    pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
-        Self { header_sync }
+    pub(crate) fn new(
+        header_sync: HeaderSyncHandle,
+        network: Network,
+        config: ZakuraHeaderSyncConfig,
+        max_frame_bytes: u32,
+    ) -> Self {
+        Self {
+            header_sync,
+            network,
+            config,
+            max_frame_bytes,
+        }
+    }
+
+    /// Build the per-peer routine environment from this service's startup facts.
+    fn pipe_env(&self) -> HsEnv {
+        HsEnv::new(
+            self.header_sync.clone(),
+            self.network.clone(),
+            self.config.clone(),
+            self.max_frame_bytes,
+        )
     }
 }
 
@@ -344,10 +367,16 @@ impl Service for HeaderSyncService {
         // `GetHeaders`, the routine records the expected `Headers` response in
         // plain local state. Global scheduling and the direct outbound writes stay
         // in the reactor (this chunk is a compatibility step).
+        let env = self.pipe_env();
         let pipe = Pipe::new(
             peer_id.clone(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
-            HsEnv::new(self.header_sync.clone()),
+            HsLocal::new(
+                commands_rx,
+                env.anchor_height(),
+                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ),
+            env,
             SessionGuard::oversize_only(header_sync_guard_max_bytes()),
             run_inbound,
             &PIPE_SHAPE,
@@ -405,11 +434,22 @@ impl Service for HeaderSyncService {
             return Ok(());
         }
 
-        // The test/recorder path has no peer session, so a `Headers` response
-        // with no outstanding request is rejected as `UnsolicitedHeaders`. A
-        // `Local` reject (closed reactor queue) is surfaced to the registry
-        // exactly as the old `deliver_header_sync_frame` returned it.
-        match deliver(&self.header_sync, None, peer_id, frame) {
+        // The test/recorder path has no per-peer routine, so it runs the same
+        // decode + peer-local validation against an ephemeral `HsLocal` with no
+        // recorded expectation: a `Headers` response with no outstanding request is
+        // `UnsolicitedHeaders`. A `Local` reject (closed/full reactor queue) is
+        // surfaced to the registry unchanged. The ephemeral state means each frame
+        // is validated in isolation (no cross-frame rate metering), which matches
+        // the recorder seam's stateless semantics; chunk 07 retires this path.
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let env = self.pipe_env();
+        let mut local = HsLocal::new(
+            commands_rx,
+            env.anchor_height(),
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+        );
+        match decode_and_ingest(&mut local, &env, peer_id, frame) {
             Flow::Continue(()) | Flow::Done => Ok(()),
             Flow::Reject(reject) => Err(reject),
         }
@@ -586,10 +626,19 @@ mod tests {
     /// `Headers` response with no outstanding request is still rejected as
     /// `UnsolicitedHeaders` (a `SinkReject::Protocol`) exactly as before the
     /// routine landed. This is the compatibility path chunk 07 retires, not now.
+    fn test_service(handle: HeaderSyncHandle) -> HeaderSyncService {
+        HeaderSyncService::new(
+            handle,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            LOCAL_MAX_MESSAGE_BYTES,
+        )
+    }
+
     #[test]
     fn deliver_frame_rejects_unsolicited_headers_without_peer_session() {
         let (handle, mut events) = test_handle();
-        let service = HeaderSyncService::new(handle);
+        let service = test_service(handle);
 
         let headers_frame = Frame {
             message_type: u16::from(MSG_HS_HEADERS),
@@ -604,10 +653,10 @@ mod tests {
             "an unsolicited Headers frame with no peer session is a protocol reject"
         );
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+            Ok(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
             }
-            other => panic!("expected WireProtocolFailure(UnsolicitedHeaders), got {other:?}"),
+            other => panic!("expected PeerMisbehavior(UnsolicitedHeaders), got {other:?}"),
         }
     }
 
@@ -616,7 +665,7 @@ mod tests {
     #[test]
     fn deliver_frame_ignores_other_stream_kinds() {
         let (handle, _events) = test_handle();
-        let service = HeaderSyncService::new(handle);
+        let service = test_service(handle);
 
         let frame = Frame {
             message_type: u16::from(MSG_HS_HEADERS),

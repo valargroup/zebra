@@ -219,7 +219,6 @@ impl PeerHeaderState {
         local_range: u32,
         local_inflight: u16,
         status_refresh_interval: Duration,
-        inbound_status_min_interval: Duration,
         inbound_new_block_min_interval: Duration,
     ) -> Self {
         Self {
@@ -236,7 +235,6 @@ impl PeerHeaderState {
             late_covered_responses: 0,
             meters: HeaderSyncPeerMeters::new(
                 status_refresh_interval,
-                inbound_status_min_interval,
                 inbound_new_block_min_interval,
             ),
             served_headers_inflight: 0,
@@ -302,20 +300,23 @@ impl PeerHeaderState {
 
 #[derive(Clone, Debug)]
 pub(super) struct HeaderSyncPeerMeters {
+    /// Outbound unsolicited status-refresh rate gate (reactor-owned broadcast).
     pub(super) unsolicited: RateMeter,
-    pub(super) inbound_status: RateMeter,
+    /// Semantic, post-dedup inbound `NewBlock` flood meter (reactor-owned).
+    ///
+    /// The peer-local *pre-decode* `NewBlock` gate moved into the routine; this is
+    /// the cheaper-after-dedup semantic meter that fires only for blocks the global
+    /// seen/pending sets did not already drop.
     pub(super) inbound_new_block: RateMeter,
 }
 
 impl HeaderSyncPeerMeters {
     pub(super) fn new(
         status_refresh_interval: Duration,
-        inbound_status_min_interval: Duration,
         inbound_new_block_min_interval: Duration,
     ) -> Self {
         Self {
             unsolicited: RateMeter::new(status_refresh_interval),
-            inbound_status: RateMeter::new(inbound_status_min_interval),
             inbound_new_block: RateMeter::new(inbound_new_block_min_interval),
         }
     }

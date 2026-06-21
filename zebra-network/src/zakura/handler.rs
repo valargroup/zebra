@@ -1255,6 +1255,16 @@ pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) accepted_capabilities: u64,
 }
 
+/// Startup facts the native header-sync service hands to each peer routine so it
+/// can validate inbound stream-5 frames locally (active network, advertised serving
+/// caps, negotiated frame cap). Mirrors the header-sync reactor's startup values.
+#[derive(Clone, Debug)]
+pub(crate) struct HeaderSyncServiceConfig {
+    pub(crate) network: Network,
+    pub(crate) config: ZakuraHeaderSyncConfig,
+    pub(crate) max_frame_bytes: u32,
+}
+
 pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
@@ -1262,10 +1272,24 @@ pub(crate) fn service_registry(
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
+    // The header-sync peer routine validates inbound stream-5 frames against these
+    // startup facts (active network, this node's advertised serving caps, and the
+    // negotiated frame cap), matching the values the header-sync reactor started with.
+    header_sync_service_config: HeaderSyncServiceConfig,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
+    let HeaderSyncServiceConfig {
+        network: header_sync_network,
+        config: header_sync_config,
+        max_frame_bytes: header_sync_max_frame_bytes,
+    } = header_sync_service_config;
     let mut services = vec![legacy_service.clone(), discovery_service];
     if let Some(header_sync) = &header_sync {
-        services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
+        services.push(Arc::new(HeaderSyncService::new(
+            header_sync.clone(),
+            header_sync_network,
+            header_sync_config,
+            header_sync_max_frame_bytes,
+        )) as Arc<dyn Service>);
     } else {
         services
             .push(Arc::new(HeaderSyncPassthroughService::new(legacy_service)) as Arc<dyn Service>);
@@ -2560,6 +2584,11 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
+        HeaderSyncServiceConfig {
+            network: config.network.clone(),
+            config: config.zakura.header_sync.clone(),
+            max_frame_bytes: limits.max_frame_bytes,
+        },
     )?;
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
@@ -4548,6 +4577,14 @@ mod tests {
         startup
     }
 
+    fn test_header_sync_service_config() -> HeaderSyncServiceConfig {
+        HeaderSyncServiceConfig {
+            network: Network::Mainnet,
+            config: ZakuraHeaderSyncConfig::default(),
+            max_frame_bytes: LOCAL_MAX_MESSAGE_BYTES,
+        }
+    }
+
     async fn next_header_sync_action(
         actions: &mut mpsc::Receiver<HeaderSyncAction>,
     ) -> HeaderSyncAction {
@@ -4845,6 +4882,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             recorder.clone(),
             test_discovery_service(&supervisor),
+            test_header_sync_service_config(),
         )?;
         let peer = test_peer(6);
 
@@ -4884,7 +4922,18 @@ mod tests {
 
         gossip_result?;
         request_result?;
-        header_sync_result?;
+        // The kind-5 `GetHeaders` arrives with no recorded peer status on the
+        // recorder seam's ephemeral routine state, so the peer routine classifies it
+        // `GetHeadersSpam` and forwards `PeerMisbehavior` to the reactor (the routine
+        // now owns the inbound `GetHeaders` received-status gate). A `GetHeadersSpam`
+        // is a decoded-but-semantically-invalid message, which is RECORD-ONLY at the
+        // chunk-02 baseline: the routine reports it but does NOT disconnect, so the
+        // delivery returns `Ok(())` (the connection stays up). The reactor records the
+        // violation as a `Misbehavior` action below.
+        assert!(
+            matches!(header_sync_result, Ok(())),
+            "an unsolicited GetHeaders is record-only (no protocol reject), got {header_sync_result:?}"
+        );
         registry.deliver(
             peer.clone(),
             99,
@@ -4946,7 +4995,12 @@ mod tests {
         let shutdown = CancellationToken::new();
         let startup = header_sync_startup(shutdown.clone());
         let (header_sync, _actions, task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
+        let service = HeaderSyncService::new(
+            header_sync,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            LOCAL_MAX_MESSAGE_BYTES,
+        );
         let peer = test_peer(11);
 
         shutdown.cancel();
@@ -4982,7 +5036,12 @@ mod tests {
         let shutdown = CancellationToken::new();
         let startup = header_sync_startup(shutdown.clone());
         let (header_sync, mut actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
+        let service = HeaderSyncService::new(
+            header_sync,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            LOCAL_MAX_MESSAGE_BYTES,
+        );
         let peer = test_peer(12);
         let cancel_token = CancellationToken::new();
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
@@ -5030,7 +5089,12 @@ mod tests {
             ..ServicePeerLimits::default()
         };
         let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let service = HeaderSyncService::new(header_sync);
+        let service = HeaderSyncService::new(
+            header_sync,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            LOCAL_MAX_MESSAGE_BYTES,
+        );
         let peer = test_peer(17);
 
         assert!(
@@ -5066,6 +5130,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
+            test_header_sync_service_config(),
         )?;
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
@@ -5087,20 +5152,18 @@ mod tests {
         ));
 
         header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::PeerStatusUpdated {
                 peer: peer.clone(),
-                msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
+                status: status_at_genesis(&Network::Mainnet),
             })
             .await?;
         registry.remove_peer(&peer, ZAKURA_CAP_HEADER_SYNC);
         tokio::time::sleep(Duration::from_millis(50)).await;
         header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::InboundGetHeadersRequested {
                 peer: peer.clone(),
-                msg: HeaderSyncMessage::GetHeaders {
-                    start_height: block::Height(1),
-                    count: 1,
-                },
+                start_height: block::Height(1),
+                count: 1,
             })
             .await?;
 
@@ -5146,6 +5209,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
+            test_header_sync_service_config(),
         )?;
         let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -5249,6 +5313,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
+            test_header_sync_service_config(),
         )?;
         let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
