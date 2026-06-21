@@ -369,6 +369,9 @@ pub enum FinalizableBlock {
     },
     Contextual {
         contextually_verified: ContextuallyVerifiedBlock,
+        // `Treestate` embeds the note-commitment trees, so an unboxed `Contextual`
+        // variant is ~392 bytes and trips `clippy::large_enum_variant`. Box it to
+        // keep `FinalizableBlock` small as it moves through the finalization queue.
         treestate: Box<Treestate>,
     },
 }
