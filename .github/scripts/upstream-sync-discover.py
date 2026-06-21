@@ -12,14 +12,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
-TERMINAL_LEDGER_STATUSES = {"imported", "skipped", "superseded"}
 TERMINAL_STATE_DECISIONS = {
     "already_present",
     "human_skipped",
@@ -81,28 +79,6 @@ def pr_metadata(source_repo: str, pr_number: int) -> dict[str, Any]:
         "deletions": pull.get("deletions"),
         "changed_files": pull.get("changed_files"),
     }
-
-
-def terminal_prs_from_ledger(path: Path) -> set[int]:
-    if not path.exists():
-        return set()
-
-    terminal: set[int] = set()
-    current_pr: int | None = None
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        pr_match = re.match(r"\s*-\s+upstream_pr:\s+([0-9]+)\s*$", line)
-        if pr_match:
-            current_pr = int(pr_match.group(1))
-            continue
-
-        status_match = re.match(r"\s*status:\s+([A-Za-z0-9_-]+)\s*$", line)
-        if current_pr is not None and status_match:
-            if status_match.group(1) in TERMINAL_LEDGER_STATUSES:
-                terminal.add(current_pr)
-            current_pr = None
-
-    return terminal
 
 
 def terminal_prs_from_state_lines(text: str) -> set[int]:
@@ -285,7 +261,6 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
     )
     ahead_count, behind_count = [int(part) for part in counts.split()]
 
-    ledger_terminal = terminal_prs_from_ledger(args.ledger)
     state_terminal = terminal_prs_from_state_branch(
         args.target_repo,
         args.state_branch,
@@ -307,7 +282,7 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
             if not pull:
                 continue
             pr_number = int(pull["number"])
-            if pr_number in ledger_terminal or pr_number in state_terminal:
+            if pr_number in state_terminal:
                 continue
             maybe_pr = pr_metadata(args.source_repo, pr_number)
             maybe_candidate = candidate_from_pr(
@@ -444,7 +419,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pr", default="")
     parser.add_argument("--limit", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path(".github/upstream-sync/work"))
-    parser.add_argument("--ledger", type=Path, default=Path("docs/upstream-sync/ledger.yml"))
     parser.add_argument("--state-branch", default="upstream-sync/state")
     parser.add_argument("--state-ledger", default=".github/upstream-sync/triage-ledger.jsonl")
     parser.add_argument("--fixture", type=Path)
