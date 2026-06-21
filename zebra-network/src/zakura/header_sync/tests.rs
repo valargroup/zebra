@@ -1,5 +1,8 @@
 use super::*;
-use super::{config::*, error::*, events::*, reactor::*, validation::*, wire::*};
+use super::{
+    config::*, error::*, events::*, reactor::*, service::HeaderSyncCommandSink, validation::*,
+    wire::*,
+};
 use crate::zakura::{
     testkit::{TraceCapture, TraceValue},
     HeaderSyncServiceSummary, ServicePeerDirection, ServicePeerLimits,
@@ -256,12 +259,14 @@ impl RoutineHarness {
 
 /// Per-peer test handles for a routine the fixture spawned: the stream sender the
 /// test feeds `Status`/`Headers` frames into, the routine's cancel token, and the
-/// outbound `FramedRecv` (kept alive so the routine's sends never close the
-/// channel; observation of outbound `GetHeaders` is via the reactor's test mirror).
+/// outbound `FramedRecv`. The reactor's test `SendMessage`/`ForwardNewBlock` mirror
+/// records the reactor's send DECISION; reading `outbound` proves the ROUTINE wrote
+/// the frame on its own stream. A test can take the receiver via
+/// [`ReactorFixture::take_outbound`] to read those frames directly.
 struct FixturePeer {
     peer_send: crate::zakura::FramedSend,
     cancel: CancellationToken,
-    _outbound: crate::zakura::FramedRecv,
+    outbound: Option<crate::zakura::FramedRecv>,
     _task: JoinHandle<()>,
 }
 
@@ -859,10 +864,12 @@ async fn connect_peer_with_direction(
     let generation = next_test_generation();
     let cancel = CancellationToken::new();
     let (peer_send, service_recv) = crate::zakura::framed_channel(64);
-    // The routine's outbound `GetHeaders` go here; kept alive so the channel never
-    // closes. Tests observe outbound `GetHeaders` via the reactor's test mirror.
+    // The routine's outbound frames (its own `GetHeaders`, and the reactor-commanded
+    // `Status`/`Headers`/`NewBlock`) go here. Tests can read this to verify the
+    // routine — not the reactor — wrote the frame.
     let (outbound_send, outbound_recv) = crate::zakura::framed_channel(64);
-    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    // Bounded/coalescing routine command channel, exactly as `add_peer` wires it.
+    let (command_sink, command_receivers) = HeaderSyncCommandSink::channel();
 
     let session = HeaderSyncPeerSession::from_parts_with_commands(
         peer_id.clone(),
@@ -870,7 +877,7 @@ async fn connect_peer_with_direction(
         generation,
         outbound_send,
         cancel.clone(),
-        commands_tx,
+        command_sink,
     );
     fixture
         .handle
@@ -885,7 +892,7 @@ async fn connect_peer_with_direction(
         fixture.routine_config.clone(),
         fixture.routine_max_frame_bytes,
     );
-    let pipe = super::pipe::test_pipe(peer_id.clone(), commands_rx, env);
+    let pipe = super::pipe::test_pipe(peer_id.clone(), command_receivers, env);
     let routine = super::pipe::HeaderSyncPeerRoutine::new(
         pipe,
         service_recv,
@@ -906,11 +913,85 @@ async fn connect_peer_with_direction(
             FixturePeer {
                 peer_send,
                 cancel: cancel.clone(),
-                _outbound: outbound_recv,
+                outbound: Some(outbound_recv),
                 _task: task,
             },
         );
     cancel
+}
+
+/// Take ownership of a connected peer's outbound `FramedRecv` so a test can read the
+/// frames the ROUTINE wrote on its own stream (its `GetHeaders`, plus the
+/// reactor-commanded `Status`/`Headers`/`NewBlock`). The routine and the reactor
+/// stay alive; only the receiver moves to the test.
+fn take_outbound(fixture: &ReactorFixture, peer_id: &ZakuraPeerId) -> crate::zakura::FramedRecv {
+    fixture
+        .peers
+        .lock()
+        .expect("fixture peers mutex ok")
+        .get_mut(peer_id)
+        .expect("peer is connected")
+        .outbound
+        .take()
+        .expect("outbound receiver taken only once")
+}
+
+/// Read the next non-`Headers` stream-5 message the routine wrote on its own
+/// outbound stream (a commanded `Status` or forwarded `NewBlock`), or `None` if no
+/// frame arrives within the deadline. Skips the routine's own outbound `GetHeaders`
+/// so a test waiting on a commanded broadcast is not confused by a pull. `Headers`
+/// responses need a request context, so a test reading those uses
+/// [`next_outbound_headers`].
+async fn next_outbound_control(
+    outbound: &mut crate::zakura::FramedRecv,
+) -> Option<HeaderSyncMessage> {
+    loop {
+        let frame = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            outbound.recv(),
+        )
+        .await
+        {
+            Ok(Some(frame)) => frame,
+            Ok(None) | Err(_) => return None,
+        };
+        if u8::try_from(frame.message_type).ok() == Some(MSG_HS_GET_HEADERS) {
+            continue;
+        }
+        let message = HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
+            .expect("routine wrote a valid control frame");
+        return Some(message);
+    }
+}
+
+/// Read the next `Headers` response the routine wrote on its own outbound stream,
+/// decoded against `requested`, or `None` if no `Headers` frame arrives within the
+/// deadline. Skips the routine's own outbound `GetHeaders`.
+async fn next_outbound_headers(
+    outbound: &mut crate::zakura::FramedRecv,
+    requested: ExpectedHeadersResponse,
+) -> Option<Vec<Arc<block::Header>>> {
+    let context = HeaderSyncDecodeContext::for_headers_response(requested, MAX_HS_RANGE);
+    loop {
+        let frame = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            outbound.recv(),
+        )
+        .await
+        {
+            Ok(Some(frame)) => frame,
+            Ok(None) | Err(_) => return None,
+        };
+        if u8::try_from(frame.message_type).ok() == Some(MSG_HS_GET_HEADERS) {
+            continue;
+        }
+        match HeaderSyncMessage::decode_frame(frame, context)
+            .expect("routine wrote a valid Headers frame")
+        {
+            HeaderSyncMessage::Headers { headers, .. } => return Some(headers),
+            other => panic!("expected a Headers response on the outbound stream, got {other:?}"),
+        }
+    }
 }
 
 /// Feed an encoded stream-5 frame to a connected peer's routine and yield so the
@@ -4865,5 +4946,390 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
     assert!(
         !probe_cancel.is_cancelled(),
         "misbehavior is record-only: an InvalidStatus peer must NOT be disconnected",
+    );
+}
+
+// =============== outbound commands: routines own all stream writes ===========
+
+/// Read the next `Status` message a peer's routine wrote on its own outbound stream,
+/// or panic on timeout. `next_outbound_control` already skips the routine's own
+/// `GetHeaders`, so the next control frame here is the commanded `Status`.
+async fn next_status(outbound: &mut crate::zakura::FramedRecv) -> HeaderSyncStatus {
+    match next_outbound_control(outbound)
+        .await
+        .expect("the routine wrote an outbound control frame")
+    {
+        HeaderSyncMessage::Status(status) => status,
+        other => panic!("expected a Status on the outbound stream, got {other:?}"),
+    }
+}
+
+/// A best-tip advance broadcasts a refreshed `Status` to every admitted peer, and
+/// each peer's ROUTINE writes the `Status` on its own stream. The reactor selects
+/// the destinations (all admitted peers); the routines do the writing. This proves
+/// the broadcast reaches all intended routines without the reactor writing frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_broadcast_reaches_all_intended_routines() {
+    let network = Network::Mainnet;
+    let fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_a = peer(70);
+    let peer_b = peer(71);
+    connect_peer(&fixture, peer_a.clone()).await;
+    connect_peer(&fixture, peer_b.clone()).await;
+
+    // Each peer's routine writes the initial handshake `Status` on connect; read and
+    // discard it so the next status we observe is the broadcast.
+    let mut out_a = take_outbound(&fixture, &peer_a);
+    let mut out_b = take_outbound(&fixture, &peer_b);
+    let _initial_a = next_status(&mut out_a).await;
+    let _initial_b = next_status(&mut out_b).await;
+
+    // Advance the best header tip; the reactor broadcasts a refreshed status to BOTH
+    // admitted peers.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    // Both peers' routines wrote the broadcast status reflecting the new tip.
+    let status_a = next_status(&mut out_a).await;
+    let status_b = next_status(&mut out_b).await;
+    assert_eq!(
+        status_a.tip_height,
+        block::Height(1),
+        "peer A's routine wrote the broadcast status with the advanced tip"
+    );
+    assert_eq!(
+        status_b.tip_height,
+        block::Height(1),
+        "peer B's routine wrote the broadcast status with the advanced tip"
+    );
+}
+
+/// An accepted, deduplicated tip `NewBlock` is forwarded to the eligible peer, and
+/// that peer's ROUTINE writes the `NewBlock` frame on its own stream. The reactor
+/// selects the forwarding destination; the routine writes. The source peer (and any
+/// peer already at/above the tip) is not a destination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_block_forwarding_reaches_intended_peer_routine() {
+    let network = Network::Mainnet;
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let hash = block.hash();
+    let height = block.coinbase_height().expect("test block has height");
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let source = peer(72);
+    let eligible = peer(73);
+    connect_peer(&fixture, source.clone()).await;
+    connect_peer(&fixture, eligible.clone()).await;
+    // The eligible peer is below the new block's height, so it is a destination.
+    advertise_tip(
+        &fixture,
+        eligible.clone(),
+        block::Height(0),
+        block::Height(0),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let mut eligible_out = take_outbound(&fixture, &eligible);
+    // Drain the eligible peer's initial handshake status so the next frame we read is
+    // the forwarded NewBlock.
+    let _initial = next_status(&mut eligible_out).await;
+
+    // Feed an accepted NewBlock candidate from the source; the reactor selects the
+    // eligible peer as a forwarding destination and commands its routine to write it.
+    fixture
+        .handle
+        .send(narrowed_event(
+            source.clone(),
+            HeaderSyncMessage::NewBlock(block.clone()),
+        ))
+        .await
+        .unwrap();
+
+    // Drive the pipeline acceptance fact and confirm the accepted block, mirroring
+    // the other forward tests.
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::NewBlockReceived { peer, .. } => {
+                assert_eq!(peer, source);
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::NewBlockAccepted {
+                        peer: source.clone(),
+                        height,
+                        hash,
+                        block: block.clone(),
+                    })
+                    .await
+                    .unwrap();
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("valid NewBlock must not score {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+
+    // The eligible peer's ROUTINE wrote the forwarded NewBlock on its own stream.
+    // Accepting the block advanced the best tip, so a broadcast `Status` may also be
+    // written to this peer; skip any Status and look for the forwarded NewBlock.
+    let forwarded_block = loop {
+        match next_outbound_control(&mut eligible_out)
+            .await
+            .expect("the eligible peer's routine wrote a frame")
+        {
+            HeaderSyncMessage::NewBlock(forwarded_block) => break forwarded_block,
+            HeaderSyncMessage::Status(_) => continue,
+            other => panic!("expected a forwarded NewBlock on the outbound stream, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        forwarded_block.hash(),
+        hash,
+        "the routine forwarded the accepted tip block on its own stream"
+    );
+}
+
+/// An inbound `GetHeaders` the reactor serves from state results in a `Headers`
+/// response written by the REQUESTING peer's routine on its own stream — the
+/// backend-lookup completion destination is chosen reactor-side, the routine writes
+/// the reply. This is the never-drop backend Headers delivery path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backend_headers_response_reaches_requesting_routine() {
+    let network = Network::Mainnet;
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let requester = peer(74);
+    connect_peer(&fixture, requester.clone()).await;
+    // The peer must have sent us a status before we will serve its GetHeaders.
+    advertise_tip(
+        &fixture,
+        requester.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let mut out = take_outbound(&fixture, &requester);
+    let _initial = next_status(&mut out).await;
+
+    // The peer requests one header at height 1. The routine validates it locally and
+    // forwards `InboundGetHeadersRequested`; the reactor accounts the serving slot
+    // and dispatches a `QueryHeadersByHeightRange` action.
+    fixture
+        .handle
+        .send(narrowed_event(
+            requester.clone(),
+            HeaderSyncMessage::GetHeaders {
+                start_height: block::Height(1),
+                count: 1,
+            },
+        ))
+        .await
+        .unwrap();
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                assert_eq!(peer, requester);
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 1);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("a valid GetHeaders must not score {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+
+    // State returns the headers; the reactor commands the requesting routine to write
+    // the `Headers` response on its own stream.
+    let served = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: requester.clone(),
+            start_height: block::Height(1),
+            requested_count: 1,
+            headers: served.clone(),
+            body_sizes: vec![0],
+        })
+        .await
+        .unwrap();
+
+    // The requesting peer's ROUTINE wrote the served Headers response on its stream.
+    let requested = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+    let written = next_outbound_headers(&mut out, requested)
+        .await
+        .expect("the requesting routine wrote a Headers response");
+    assert_eq!(written.len(), 1, "the served header reached the requester");
+    assert_eq!(
+        block::Hash::from(written[0].as_ref()),
+        block::Hash::from(served[0].as_ref())
+    );
+}
+
+/// A correctness-critical `Headers` response that cannot be delivered (its routine's
+/// command channel is closed) PARKS the peer rather than silently losing the reply.
+/// Parking is the explicit service-policy mechanism for an undeliverable never-drop
+/// command — it is NOT ordinary misbehavior (no `Misbehavior` action), and it
+/// removes the peer's state so the reply is never stranded. Proven via the
+/// `header_command_enqueued` `result=parked` trace row plus the peer no longer
+/// receiving a subsequent status broadcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeliverable_headers_response_parks_peer_without_misbehavior() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut capture =
+        TraceCapture::for_test("undeliverable_headers_response_parks_peer_without_misbehavior")
+            .unwrap();
+    let mut startup = startup_for(network, anchor, None);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(77);
+
+    // Connect the peer with a command sink whose receivers are immediately dropped:
+    // there is no routine to drain it, so the channel reads as closed and any
+    // never-drop command reports `ParkRequired`.
+    let (command_sink, command_receivers) = HeaderSyncCommandSink::channel();
+    drop(command_receivers);
+    let (send, _recv) = crate::zakura::framed_channel(16);
+    let session = HeaderSyncPeerSession::from_parts_with_commands(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        7,
+        send,
+        CancellationToken::new(),
+        command_sink,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    // Drain the initial-status SendMessage mirror so it does not confuse later checks.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    while fixture.actions.try_recv().is_ok() {}
+
+    // The reactor serves a Headers response to this peer; the closed channel makes it
+    // undeliverable, so the reactor parks the peer.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 1,
+            headers: vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+            body_sizes: vec![0],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // No misbehavior was reported (parking is NOT misbehavior).
+    while let Ok(action) = fixture.actions.try_recv() {
+        assert!(
+            !matches!(action, HeaderSyncAction::Misbehavior { .. }),
+            "parking an undeliverable command must not score the peer: {action:?}"
+        );
+    }
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    let label = crate::zakura::trace::peer_label(&peer_id);
+    header_sync.assert_row(
+        hs_trace::HEADER_COMMAND_ENQUEUED,
+        &[
+            (hs_trace::KIND, TraceValue::Str("headers_response")),
+            (hs_trace::PEER, TraceValue::Str(&label)),
+            (hs_trace::RESULT, TraceValue::Str("parked")),
+        ],
+    );
+}
+
+/// A status broadcast records both a `header_broadcast_started` row (with the
+/// destination count) and a per-peer `header_command_enqueued` row carrying the
+/// enqueue result, so the per-peer broadcast enqueue success/failure is
+/// trace-observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_broadcast_records_per_peer_enqueue_result_in_trace() {
+    use crate::zakura::trace::peer_label;
+
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut capture =
+        TraceCapture::for_test("status_broadcast_records_per_peer_enqueue_result_in_trace")
+            .unwrap();
+    let mut startup = startup_for(network, anchor, None);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let fixture = spawn_test_reactor(startup);
+    let peer_a = peer(75);
+    let peer_b = peer(76);
+    connect_peer(&fixture, peer_a.clone()).await;
+    connect_peer(&fixture, peer_b.clone()).await;
+
+    // Advance the best tip: the reactor broadcasts a refreshed status to both peers.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+    // Let the broadcast enqueue + tracing run.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+
+    // The broadcast was traced with a destination-count.
+    header_sync.assert_row(
+        hs_trace::HEADER_BROADCAST_STARTED,
+        &[(hs_trace::KIND, TraceValue::Str("status"))],
+    );
+    // Each peer's enqueue result is traced.
+    let label_a = peer_label(&peer_a);
+    let label_b = peer_label(&peer_b);
+    header_sync.assert_row(
+        hs_trace::HEADER_COMMAND_ENQUEUED,
+        &[
+            (hs_trace::KIND, TraceValue::Str("status")),
+            (hs_trace::PEER, TraceValue::Str(&label_a)),
+            (hs_trace::RESULT, TraceValue::Str("queued")),
+        ],
+    );
+    header_sync.assert_row(
+        hs_trace::HEADER_COMMAND_ENQUEUED,
+        &[
+            (hs_trace::KIND, TraceValue::Str("status")),
+            (hs_trace::PEER, TraceValue::Str(&label_b)),
+            (hs_trace::RESULT, TraceValue::Str("queued")),
+        ],
     );
 }

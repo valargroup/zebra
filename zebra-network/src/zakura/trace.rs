@@ -297,11 +297,20 @@ pub mod header_sync_trace {
     pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
+    /// Per-peer command enqueue result field (`queued`/`coalesced`/`dropped`/
+    /// `parked`).
+    pub const RESULT: &str = "result";
 
     /// Reactor accepted an inbound event.
     pub const HEADER_EVENT_RECEIVED: &str = "header_event_received";
     /// Reactor queued an outbound driver action.
     pub const HEADER_ACTION_DISPATCHED: &str = "header_action_dispatched";
+    /// Reactor enqueued a per-peer routine command (status/headers/new-block/
+    /// wake/reset). The `result` field records the per-peer enqueue outcome
+    /// (`queued`/`coalesced`/`dropped`/`parked`).
+    pub const HEADER_COMMAND_ENQUEUED: &str = "header_command_enqueued";
+    /// Reactor started a status/new-block broadcast across admitted routines.
+    pub const HEADER_BROADCAST_STARTED: &str = "header_broadcast_started";
     /// Local status sent to a peer.
     pub const HEADER_STATUS_SENT: &str = "header_status_sent";
     /// Peer status received.

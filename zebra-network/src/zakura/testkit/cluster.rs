@@ -153,13 +153,14 @@ mod tests {
             decode_and_ingest, new_ingest_local, spawn_header_sync_reactor, BlockApplyResult,
             BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
             BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus, DiscoveryMessage, Frame,
-            FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+            FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncCommandReceivers,
+            HeaderSyncCommandSink, HeaderSyncCommitFailureKind, HeaderSyncEvent,
             HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
             HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, HsEnv, HsLocal, Peer,
-            Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraHeaderSyncConfig,
-            ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            Service, ServicePeerDirection, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
+            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -512,6 +513,13 @@ mod tests {
         misbehaviors: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMisbehavior)>>>,
         sent: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMessage)>>>,
         outbound_receivers: Arc<StdMutex<Vec<FramedRecv>>>,
+        /// Kept-alive command receivers for the sessions this node hands the reactor.
+        /// The synthetic harness has no per-peer routine to drain these; the reactor
+        /// only needs the command channel to be open so its outbound-command enqueues
+        /// (e.g. `ForwardNewBlock`) report success and re-emit their test action
+        /// mirror, which the driver reads. Holding the receivers keeps the bounded
+        /// queue open without anyone consuming it.
+        command_receivers: Arc<StdMutex<Vec<HeaderSyncCommandReceivers>>>,
         /// Per-peer ingest environment: this node's reactor handle plus the startup
         /// facts the relocated peer-local validation reads, mirroring production
         /// `HeaderSyncService` wiring so the synthetic harness runs the *real*
@@ -591,7 +599,23 @@ mod tests {
                 .lock()
                 .expect("test outbound receiver mutex is not poisoned")
                 .push(recv);
-            HeaderSyncPeerSession::from_parts(peer, send, CancellationToken::new())
+            // Wire a live command sink so the reactor's outbound-command enqueues
+            // (status/headers/new-block) report success; the harness drives the data
+            // plane off the test action mirror, so nothing drains the sink — keep its
+            // receivers alive so the channel stays open.
+            let (command_sink, command_receivers) = HeaderSyncCommandSink::channel();
+            self.command_receivers
+                .lock()
+                .expect("test command receiver mutex is not poisoned")
+                .push(command_receivers);
+            HeaderSyncPeerSession::from_parts_with_commands(
+                peer,
+                ServicePeerDirection::Inbound,
+                0,
+                send,
+                CancellationToken::new(),
+                command_sink,
+            )
         }
     }
 
@@ -658,6 +682,7 @@ mod tests {
                 misbehaviors: Arc::new(Mutex::new(Vec::new())),
                 sent: Arc::new(Mutex::new(Vec::new())),
                 outbound_receivers: Arc::new(StdMutex::new(Vec::new())),
+                command_receivers: Arc::new(StdMutex::new(Vec::new())),
                 ingest_env,
                 peer_locals: Arc::new(StdMutex::new(HashMap::new())),
             };

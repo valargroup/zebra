@@ -3,7 +3,10 @@ use std::sync::{
     Arc,
 };
 
-use tokio::{sync::mpsc, task};
+use tokio::{
+    sync::{mpsc, watch},
+    task,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{events::*, pipe::*, wire::*, *};
@@ -54,7 +57,7 @@ pub struct HeaderSyncPeerSession {
 struct HeaderSyncPeerSessionInner {
     send: FramedSend,
     cancel_token: CancellationToken,
-    commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+    commands: Option<HeaderSyncCommandSink>,
 }
 
 impl HeaderSyncPeerSession {
@@ -62,7 +65,7 @@ impl HeaderSyncPeerSession {
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
         generation: u64,
-        commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
+        commands: HeaderSyncCommandSink,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             session.peer_id().clone(),
@@ -100,9 +103,9 @@ impl HeaderSyncPeerSession {
         )
     }
 
-    /// Test-only constructor that wires a routine command channel and generation,
-    /// so a fixture can spawn a real routine and feed it reactor `DropExpectation`
-    /// commands.
+    /// Test-only constructor that wires a routine command sink and generation, so a
+    /// fixture can spawn a real routine and feed it reactor commands (status, headers
+    /// responses, NewBlock forwards, wakes, and the reset/timeout `DropExpectation`).
     #[cfg(test)]
     pub(crate) fn from_parts_with_commands(
         peer_id: ZakuraPeerId,
@@ -110,7 +113,7 @@ impl HeaderSyncPeerSession {
         generation: u64,
         send: FramedSend,
         cancel_token: CancellationToken,
-        commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
+        commands: HeaderSyncCommandSink,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             peer_id,
@@ -128,7 +131,7 @@ impl HeaderSyncPeerSession {
         generation: u64,
         send: FramedSend,
         cancel_token: CancellationToken,
-        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+        commands: Option<HeaderSyncCommandSink>,
     ) -> Self {
         Self {
             peer_id,
@@ -187,16 +190,14 @@ impl HeaderSyncPeerSession {
         })
     }
 
-    /// Send a control command to this peer's routine over the per-session command
-    /// channel. Returns `false` if there is no live routine (test sessions) or the
-    /// channel is closed; the reactor treats a failed send as a benign no-op since
-    /// the only command, `DropExpectation`, self-heals (the routine drops it on its
-    /// own response/teardown).
-    pub(crate) fn try_send_command(&self, command: HeaderSyncPeerCommand) -> bool {
-        self.inner
-            .commands
-            .as_ref()
-            .is_some_and(|commands| commands.send(command).is_ok())
+    /// The per-peer routine command sink, if a live routine owns this session.
+    ///
+    /// `None` for the test/recorder sessions that have no routine. The reactor
+    /// enqueues typed commands here (status/headers/new-block/wake/reset) and the
+    /// routine writes the frame on this same stream; the sink applies each command's
+    /// full-queue policy (coalesce, drop, or signal park).
+    pub(crate) fn commands(&self) -> Option<&HeaderSyncCommandSink> {
+        self.inner.commands.as_ref()
     }
 
     /// Send a typed header range response.
@@ -237,14 +238,47 @@ impl HeaderSyncPeerSession {
     }
 }
 
+/// Bounded depth of the per-peer routine command queue (the never-drop/best-effort
+/// FIFO). Status is coalesced through a separate single-slot watch, so this queue
+/// only carries `SendHeaders`, `ForwardNewBlock`, `Wake`, and `DropExpectation`.
+/// A peer is admitted with at most a few in-flight inbound `GetHeaders` and one
+/// outbound request at a time, so this depth comfortably absorbs a transient burst
+/// before the never-drop policy parks the peer.
+pub(crate) const HEADER_SYNC_COMMAND_QUEUE_DEPTH: usize = 256;
+
 /// Commands from the reactor into one peer-owned header-sync routine.
-#[derive(Copy, Clone, Debug)]
+///
+/// The reactor decides WHO should receive each frame (broadcast/forwarding/backend
+/// destination selection stays reactor-side); the routine writes WHAT on its own
+/// stream when it dequeues the command. `Status` is delivered out-of-band through a
+/// coalescing single-slot watch on the [`HeaderSyncCommandSink`], not this enum.
+#[derive(Clone, Debug)]
 pub(crate) enum HeaderSyncPeerCommand {
-    /// The reactor timed out an outstanding request for this session and returned
-    /// the range to the shared queue. The routine drops the matching expectation
-    /// (front of its FIFO, if its generation matches) and frees its outbound slot
-    /// so it can pull fresh work. Idempotent: a no-op if the response already
-    /// arrived and the expectation was popped.
+    /// Write a `Headers` response (for an inbound `GetHeaders` the reactor served
+    /// from state) on this peer's stream. Must NOT be silently dropped: it is the
+    /// correlated reply the peer is waiting for. On a full queue the sink signals a
+    /// park instead of dropping it.
+    SendHeaders {
+        /// Headers to send in ascending height order.
+        headers: Vec<Arc<block::Header>>,
+        /// Advisory serialized body sizes, parallel to `headers`.
+        body_sizes: Vec<u32>,
+    },
+    /// Forward an accepted, deduplicated tip `NewBlock` to this peer. Advisory tip
+    /// gossip: droppable when the queue is full (the peer re-learns the tip via
+    /// `Status`/sync), matching the reactor's previous best-effort `try_send`.
+    ForwardNewBlock(Arc<block::Block>),
+    /// Wake the routine so it re-attempts an outbound work pull. Idempotent and
+    /// coalescible: dropping it when the queue already holds work is harmless
+    /// because the routine re-pulls on every loop iteration.
+    Wake,
+    /// The reactor timed out or covered an outstanding request for this session and
+    /// returned the range to the shared queue. The routine drops the matching
+    /// expectation (front of its FIFO, if its generation matches) and frees its
+    /// outbound slot so it can pull fresh work. Idempotent: a no-op if the response
+    /// already arrived and the expectation was popped. Must NOT be silently dropped:
+    /// it controls request correlation and the outbound slot, so a full queue parks
+    /// the peer instead.
     DropExpectation {
         /// Session generation the timed-out request belonged to.
         generation: u64,
@@ -253,6 +287,184 @@ pub(crate) enum HeaderSyncPeerCommand {
         /// Requested count of the timed-out range.
         count: u32,
     },
+}
+
+/// The per-peer routine command outcome the reactor observes after enqueue.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HeaderSyncCommandOutcome {
+    /// The command was placed on the routine's queue (or coalesced into the status
+    /// slot, fully replacing an older pending status).
+    Queued,
+    /// A redundant/idempotent command (status or wake) was coalesced or dropped
+    /// because a newer command already covers it; no correctness is lost.
+    Coalesced,
+    /// An advisory command (`ForwardNewBlock`) was dropped because the queue was
+    /// full; the peer re-learns the tip through `Status`/sync, so no correctness is
+    /// lost.
+    Dropped,
+    /// There is no live routine for this session (a test/recorder session), so the
+    /// command had nowhere to go.
+    NoRoutine,
+    /// A correctness-critical command (`SendHeaders`/`DropExpectation`) could not be
+    /// delivered because the queue was full or the routine had already exited. The
+    /// caller MUST park or disconnect this peer rather than continue: silently
+    /// losing it would strand a correlated reply or the outbound slot.
+    ParkRequired,
+}
+
+impl HeaderSyncCommandOutcome {
+    /// Whether the reactor must park/disconnect the peer because a
+    /// correctness-critical command could not be delivered.
+    pub(crate) fn requires_park(self) -> bool {
+        matches!(self, Self::ParkRequired)
+    }
+
+    /// Stable label for tracing the per-peer enqueue result.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Coalesced => "coalesced",
+            Self::Dropped => "dropped",
+            Self::NoRoutine => "no_routine",
+            Self::ParkRequired => "parked",
+        }
+    }
+}
+
+/// The reactor's per-peer command sink: a coalescing single-slot status watch plus a
+/// bounded FIFO for the remaining commands. Cloneable and carried on
+/// [`HeaderSyncPeerSession`] so the reactor can enqueue without touching the routine.
+///
+/// Full-queue policy is applied per variant here so the reactor's call sites stay
+/// simple and the policy is defined in one place:
+///
+/// - `SendStatus`: coalesced through the watch — the newest status fully replaces an
+///   unread older one (a `Status` is a full snapshot, so coalescing loses nothing).
+/// - `SendHeaders` / `DropExpectation`: never silently dropped — on a full queue or
+///   a closed channel the sink returns [`HeaderSyncCommandOutcome::ParkRequired`] so
+///   the reactor parks/disconnects the peer.
+/// - `ForwardNewBlock`: advisory — dropped on a full queue.
+/// - `Wake`: idempotent — coalesced/dropped on a full queue.
+#[derive(Clone, Debug)]
+pub(crate) struct HeaderSyncCommandSink {
+    /// Coalescing single-slot status channel. `None` is the initial value; the
+    /// reactor sends `Some(status)`, and the routine reacts on a change.
+    status: watch::Sender<Option<HeaderSyncStatus>>,
+    /// Bounded FIFO for the remaining (non-status) commands.
+    commands: mpsc::Sender<HeaderSyncPeerCommand>,
+}
+
+impl HeaderSyncCommandSink {
+    /// Build a sink and the matching receivers the routine owns.
+    pub(crate) fn channel() -> (Self, HeaderSyncCommandReceivers) {
+        let (status_tx, status_rx) = watch::channel(None);
+        let (commands_tx, commands_rx) = mpsc::channel(HEADER_SYNC_COMMAND_QUEUE_DEPTH);
+        (
+            Self {
+                status: status_tx,
+                commands: commands_tx,
+            },
+            HeaderSyncCommandReceivers {
+                status: status_rx,
+                commands: commands_rx,
+            },
+        )
+    }
+
+    /// Coalesce a `Status` into the single-slot watch. The slot always holds only the
+    /// latest value: if the routine has not yet read a prior status, this newer one
+    /// fully replaces it (a `Status` is a complete snapshot, so nothing is lost). The
+    /// sender cannot observe whether the routine had read the prior value, so this
+    /// reports `Queued` on a successful enqueue (the coalescing is a transparent slot
+    /// property) and `NoRoutine` if the routine already exited (status is advisory —
+    /// a re-send goes out on reconnect, so this never forces a park).
+    pub(crate) fn enqueue_status(&self, status: HeaderSyncStatus) -> HeaderSyncCommandOutcome {
+        if self.status.send(Some(status)).is_err() {
+            return HeaderSyncCommandOutcome::NoRoutine;
+        }
+        HeaderSyncCommandOutcome::Queued
+    }
+
+    /// Enqueue a `Headers` response. Correctness-critical: never silently dropped —
+    /// a full queue or closed channel returns `ParkRequired`.
+    pub(crate) fn enqueue_headers(
+        &self,
+        headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
+    ) -> HeaderSyncCommandOutcome {
+        self.enqueue_never_drop(HeaderSyncPeerCommand::SendHeaders {
+            headers,
+            body_sizes,
+        })
+    }
+
+    /// Forward an accepted tip `NewBlock`. Advisory: dropped on a full queue.
+    pub(crate) fn enqueue_new_block(&self, block: Arc<block::Block>) -> HeaderSyncCommandOutcome {
+        match self
+            .commands
+            .try_send(HeaderSyncPeerCommand::ForwardNewBlock(block))
+        {
+            Ok(()) => HeaderSyncCommandOutcome::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => HeaderSyncCommandOutcome::Dropped,
+            Err(mpsc::error::TrySendError::Closed(_)) => HeaderSyncCommandOutcome::NoRoutine,
+        }
+    }
+
+    /// Wake the routine to re-attempt a pull. Idempotent: coalesced/dropped on a
+    /// full queue (the routine re-pulls every loop, so a dropped wake self-heals).
+    pub(crate) fn enqueue_wake(&self) -> HeaderSyncCommandOutcome {
+        match self.commands.try_send(HeaderSyncPeerCommand::Wake) {
+            Ok(()) => HeaderSyncCommandOutcome::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => HeaderSyncCommandOutcome::Coalesced,
+            Err(mpsc::error::TrySendError::Closed(_)) => HeaderSyncCommandOutcome::NoRoutine,
+        }
+    }
+
+    /// Enqueue a reset/timeout `DropExpectation`. Correctness-critical: never
+    /// silently dropped — a full queue or closed channel returns `ParkRequired`.
+    pub(crate) fn enqueue_drop_expectation(
+        &self,
+        generation: u64,
+        start_height: block::Height,
+        count: u32,
+    ) -> HeaderSyncCommandOutcome {
+        self.enqueue_never_drop(HeaderSyncPeerCommand::DropExpectation {
+            generation,
+            start_height,
+            count,
+        })
+    }
+
+    /// Shared never-drop enqueue for the correctness-critical commands.
+    fn enqueue_never_drop(&self, command: HeaderSyncPeerCommand) -> HeaderSyncCommandOutcome {
+        match self.commands.try_send(command) {
+            Ok(()) => HeaderSyncCommandOutcome::Queued,
+            // A full or closed queue would silently lose a correlated reply or the
+            // outbound-slot reset; the reactor must park/disconnect instead.
+            Err(_) => HeaderSyncCommandOutcome::ParkRequired,
+        }
+    }
+}
+
+/// The receivers the routine owns: the coalescing status watch and the bounded
+/// command FIFO. Built together with the [`HeaderSyncCommandSink`].
+#[derive(Debug)]
+pub(crate) struct HeaderSyncCommandReceivers {
+    /// Coalescing single-slot status updates from the reactor.
+    pub(crate) status: watch::Receiver<Option<HeaderSyncStatus>>,
+    /// Bounded FIFO of non-status routine commands.
+    pub(crate) commands: mpsc::Receiver<HeaderSyncPeerCommand>,
+}
+
+impl HeaderSyncCommandReceivers {
+    /// Receivers with no live sender, for the test/recorder `deliver_frame` path and
+    /// the in-process cluster harness that decode against an ephemeral `HsLocal`
+    /// without a routine. The senders are dropped, so both channels read as closed.
+    pub(crate) fn detached() -> Self {
+        let (sink, receivers) = HeaderSyncCommandSink::channel();
+        drop(sink);
+        receivers
+    }
 }
 
 /// Pump actor actions that can be satisfied at the transport/service seam.
@@ -400,7 +612,12 @@ impl Service for HeaderSyncService {
         // shared connection that other services (discovery, block-sync) ride on.
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        // Bounded/coalescing routine command channel. The reactor enqueues
+        // status/headers/new-block/wake/reset commands here and the routine writes
+        // the matching frame on this same stream; the sink owns the per-variant
+        // full-queue policy (coalesce status, drop advisory NewBlock, park on a full
+        // never-drop queue).
+        let (command_sink, command_receivers) = HeaderSyncCommandSink::channel();
         // Mint a fresh session generation so the reactor and the shared range queue
         // can scope timeout/return/reset cleanup to this exact transport — an older
         // session's stale teardown can never disturb this one's live work.
@@ -409,7 +626,7 @@ impl Service for HeaderSyncService {
             &session,
             peer.direction,
             generation,
-            commands_tx,
+            command_sink,
         );
 
         let _ = self
@@ -432,7 +649,7 @@ impl Service for HeaderSyncService {
         let pipe = Pipe::new(
             peer_id.clone(),
             HsLocal::new(
-                commands_rx,
+                command_receivers,
                 env.anchor_height(),
                 DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
                 DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
@@ -508,10 +725,9 @@ impl Service for HeaderSyncService {
         // surfaced to the registry unchanged. The ephemeral state means each frame
         // is validated in isolation (no cross-frame rate metering), which matches
         // the recorder seam's stateless semantics; chunk 07 retires this path.
-        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let env = self.pipe_env();
         let mut local = HsLocal::new(
-            commands_rx,
+            HeaderSyncCommandReceivers::detached(),
             env.anchor_height(),
             DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
             DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
@@ -745,5 +961,149 @@ mod tests {
         assert!(service
             .deliver_frame(peer(), ZAKURA_STREAM_HEADER_SYNC + 1, frame)
             .is_ok());
+    }
+
+    // ============== outbound-command sink full-queue policy ==============
+
+    fn a_status() -> HeaderSyncStatus {
+        HeaderSyncStatus {
+            tip_height: block::Height(10),
+            tip_hash: block::Hash([1; 32]),
+            anchor_height: block::Height(0),
+            max_headers_per_response: 100,
+            max_inflight_requests: 1,
+        }
+    }
+
+    /// Fill the bounded command queue right up to its depth by draining nothing, so
+    /// the next never-drop enqueue must report `ParkRequired`.
+    fn fill_command_queue(sink: &HeaderSyncCommandSink) {
+        for _ in 0..HEADER_SYNC_COMMAND_QUEUE_DEPTH {
+            assert_eq!(
+                sink.enqueue_wake(),
+                HeaderSyncCommandOutcome::Queued,
+                "the queue accepts commands until it is full"
+            );
+        }
+    }
+
+    /// A `Headers` response is correctness-critical: a full queue parks the peer,
+    /// never silently dropping the correlated reply.
+    #[test]
+    fn headers_command_parks_on_full_queue_never_dropped() {
+        let (sink, _receivers) = HeaderSyncCommandSink::channel();
+        fill_command_queue(&sink);
+        assert_eq!(
+            sink.enqueue_headers(Vec::new(), Vec::new()),
+            HeaderSyncCommandOutcome::ParkRequired,
+            "a Headers response must never be silently dropped on a full queue"
+        );
+        assert!(sink.enqueue_headers(Vec::new(), Vec::new()).requires_park());
+    }
+
+    /// A reset/timeout `DropExpectation` is correctness-critical: a full queue parks
+    /// the peer rather than stranding the outbound slot.
+    #[test]
+    fn drop_expectation_command_parks_on_full_queue_never_dropped() {
+        let (sink, _receivers) = HeaderSyncCommandSink::channel();
+        fill_command_queue(&sink);
+        assert_eq!(
+            sink.enqueue_drop_expectation(7, block::Height(1), 1),
+            HeaderSyncCommandOutcome::ParkRequired,
+            "a reset/generation command must never be silently dropped on a full queue"
+        );
+    }
+
+    /// A `NewBlock` forward is advisory: a full queue drops it (the peer re-learns
+    /// the tip via Status/sync), and the policy never parks.
+    #[test]
+    fn new_block_command_drops_on_full_queue_without_parking() {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+        let (sink, _receivers) = HeaderSyncCommandSink::channel();
+        let block: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        fill_command_queue(&sink);
+        let outcome = sink.enqueue_new_block(block);
+        assert_eq!(
+            outcome,
+            HeaderSyncCommandOutcome::Dropped,
+            "advisory NewBlock forwarding is dropped on a full queue"
+        );
+        assert!(!outcome.requires_park(), "dropping NewBlock must not park");
+    }
+
+    /// A wake is idempotent: a full queue coalesces it (reported as `Coalesced`,
+    /// never parked) because the routine re-pulls every loop iteration anyway.
+    #[test]
+    fn wake_command_coalesces_on_full_queue_without_parking() {
+        let (sink, _receivers) = HeaderSyncCommandSink::channel();
+        fill_command_queue(&sink);
+        let outcome = sink.enqueue_wake();
+        assert_eq!(outcome, HeaderSyncCommandOutcome::Coalesced);
+        assert!(!outcome.requires_park(), "a coalesced wake must not park");
+    }
+
+    /// Status is coalesced through the single-slot watch: a second unread status
+    /// fully replaces the first, and the routine only ever observes the latest value.
+    /// A status is never parked, and the coalescing loses nothing because a `Status`
+    /// is a complete snapshot.
+    #[test]
+    fn status_command_coalesces_newest_replaces_unread() {
+        let (sink, receivers) = HeaderSyncCommandSink::channel();
+        let first = a_status();
+        let mut second = a_status();
+        second.tip_height = block::Height(20);
+
+        // Two enqueues before the routine reads: the slot holds only the latest.
+        assert_eq!(sink.enqueue_status(first), HeaderSyncCommandOutcome::Queued);
+        assert_eq!(
+            sink.enqueue_status(second),
+            HeaderSyncCommandOutcome::Queued
+        );
+        assert!(!sink.enqueue_status(second).requires_park());
+
+        // The routine reads only the latest coalesced value — the first was dropped
+        // because the newer status fully replaced it.
+        let mut status_rx = receivers.status;
+        assert_eq!(*status_rx.borrow_and_update(), Some(second));
+    }
+
+    /// A sink whose routine has exited (receivers dropped) reports a closed channel,
+    /// never a false `Queued`. Never-drop commands then surface `ParkRequired`.
+    #[test]
+    fn closed_channel_surfaces_no_routine_and_park_required() {
+        let (sink, receivers) = HeaderSyncCommandSink::channel();
+        drop(receivers);
+        assert_eq!(
+            sink.enqueue_status(a_status()),
+            HeaderSyncCommandOutcome::NoRoutine
+        );
+        assert_eq!(sink.enqueue_wake(), HeaderSyncCommandOutcome::NoRoutine);
+        // A correctness-critical command on a dead routine must park, not be lost.
+        assert!(sink.enqueue_headers(Vec::new(), Vec::new()).requires_park());
+        assert!(sink
+            .enqueue_drop_expectation(1, block::Height(1), 1)
+            .requires_park());
+    }
+
+    /// One peer's full command queue does not affect a second peer's independent
+    /// sink: backpressure on one routine never wedges another.
+    #[test]
+    fn full_queue_on_one_sink_does_not_affect_another() {
+        let (slow, _slow_receivers) = HeaderSyncCommandSink::channel();
+        let (fast, _fast_receivers) = HeaderSyncCommandSink::channel();
+        fill_command_queue(&slow);
+        assert!(slow.enqueue_headers(Vec::new(), Vec::new()).requires_park());
+        // The unrelated sink still accepts a never-drop command.
+        assert_eq!(
+            fast.enqueue_headers(Vec::new(), Vec::new()),
+            HeaderSyncCommandOutcome::Queued,
+            "a full queue on one peer must not block an unrelated peer's sink"
+        );
     }
 }

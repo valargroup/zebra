@@ -61,6 +61,8 @@ pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,
 };
+#[cfg(test)]
+pub(crate) use service::{HeaderSyncCommandReceivers, HeaderSyncCommandSink};
 pub use validation::{
     validate_header_range_links, validate_headers_stateless, validate_new_block_stateless,
     HeaderSyncDecodeContext, HeaderSyncValidationContext,

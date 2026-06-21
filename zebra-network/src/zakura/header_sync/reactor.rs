@@ -1,6 +1,13 @@
 use super::{
-    config::*, error::*, events::*, scheduler::*, service::HeaderSyncPeerCommand, state::*,
-    validation::*, wire::*, *,
+    config::*,
+    error::*,
+    events::*,
+    scheduler::*,
+    service::{HeaderSyncCommandOutcome, HeaderSyncCommandSink},
+    state::*,
+    validation::*,
+    wire::*,
+    *,
 };
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
@@ -508,20 +515,28 @@ impl HeaderSyncReactor {
             self.publish_best_tip(height, hash).await;
         }
 
+        // The reactor selects the forwarding destinations (who); each destination's
+        // routine writes the `NewBlock` frame on its own stream (what). Forwarding is
+        // advisory tip gossip: a full command queue drops it for that peer (the peer
+        // re-learns the tip via `Status`/sync), matching the previous best-effort
+        // `try_send_new_block`.
         let destinations = self.eligible_tip_destinations(&peer, height);
         let destination_count = destinations.len();
+        self.trace_broadcast_started("new_block", destination_count);
         for destination in destinations {
-            let Some(destination_peer) = self.state.peers.get(&destination) else {
-                continue;
+            let outcome = match self.command_sink(&destination) {
+                Some(sink) => sink.enqueue_new_block(block.clone()),
+                None => HeaderSyncCommandOutcome::NoRoutine,
             };
-            if let Err(error) = destination_peer.session.try_send_new_block(block.clone()) {
+            self.trace_command_enqueued(&destination, "new_block", outcome);
+            if outcome != HeaderSyncCommandOutcome::Queued {
                 tracing::debug!(
                     ?peer,
                     ?destination,
                     ?height,
                     ?hash,
-                    ?error,
-                    "failed to queue Zakura header-sync NewBlock"
+                    ?outcome,
+                    "did not forward Zakura header-sync NewBlock to peer routine"
                 );
                 continue;
             }
@@ -673,32 +688,46 @@ impl HeaderSyncReactor {
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
     ) {
-        let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+        if !self.state.peers.contains_key(&peer) {
             return;
-        };
+        }
         if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
-            peer_state.finish_serving_headers();
+            if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+                peer_state.finish_serving_headers();
+            }
             return;
         }
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        let send_result = peer_state
-            .session
-            .try_send_headers_with_sizes(headers, body_sizes);
-        peer_state.finish_serving_headers();
-
-        match send_result {
-            Ok(()) => {
-                self.trace_headers_served(&peer, start_height, requested_count, returned_count)
+        // The reactor served this inbound `GetHeaders` from state and chose the
+        // destination; the peer's routine writes the `Headers` frame on its own
+        // stream. A `Headers` response is the correlated reply the peer is waiting
+        // for, so it is never silently dropped: a full command queue or a routine
+        // that already exited parks the peer (the explicit service-policy mechanism)
+        // rather than losing the reply.
+        let outcome = match self.command_sink(&peer) {
+            Some(sink) => sink.enqueue_headers(headers, body_sizes),
+            None => HeaderSyncCommandOutcome::NoRoutine,
+        };
+        self.trace_command_enqueued(&peer, "headers_response", outcome);
+        if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+            peer_state.finish_serving_headers();
+        }
+        match outcome {
+            HeaderSyncCommandOutcome::Queued => {
+                self.trace_headers_served(&peer, start_height, requested_count, returned_count);
             }
-            Err(error) => {
+            HeaderSyncCommandOutcome::ParkRequired => {
                 tracing::debug!(
                     ?peer,
                     ?start_height,
                     ?requested_count,
-                    ?error,
-                    "failed to queue Zakura header-sync Headers response"
+                    "parking peer: could not deliver Zakura header-sync Headers response"
                 );
+                self.park_peer_for_undeliverable_command(&peer, "headers_response");
             }
+            // NoRoutine (test/recorder session) and the coalesce/drop outcomes do not
+            // apply to the never-drop `Headers` command, so nothing else to do.
+            _ => {}
         }
     }
 
@@ -729,7 +758,18 @@ impl HeaderSyncReactor {
         peer_state.received_status = true;
         self.confirm_advisory_status(&peer, status);
         self.trace_status_received(&peer, status);
+        // Refresh global ranges, then nudge THIS peer's routine to re-attempt a pull
+        // now that its advertised tip/caps are known and any forward range it just
+        // enabled has been produced. `schedule()` also broadcasts a queue wake, but
+        // the targeted wake is the per-peer command path: the reactor decides which
+        // routine to wake, the routine re-pulls. Idempotent and coalescible, so it is
+        // never parked.
         self.schedule().await;
+        let outcome = match self.command_sink(&peer) {
+            Some(sink) => sink.enqueue_wake(),
+            None => HeaderSyncCommandOutcome::NoRoutine,
+        };
+        self.trace_command_enqueued(&peer, "wake", outcome);
     }
 
     fn restore_outstanding_after_late_covered_response(
@@ -1173,18 +1213,28 @@ impl HeaderSyncReactor {
                 ReturnReason::Timeout,
             );
             // Tell the routine to drop the stale expectation and free its slot so it
-            // can pull fresh work. The reactor stays the single timeout authority;
-            // the routine only owns its local FIFO. Best-effort: a missing/closed
-            // routine self-heals (a superseded session is irrelevant).
-            if let Some(peer_state) = self.state.peers.get(&peer_id) {
-                if peer_state.generation == outstanding.generation {
-                    let _ = peer_state.session.try_send_command(
-                        HeaderSyncPeerCommand::DropExpectation {
-                            generation: outstanding.generation,
-                            start_height: outstanding.range.start_height,
-                            count: outstanding.expected_max_count,
-                        },
-                    );
+            // can pull fresh work. The reactor stays the single timeout authority; the
+            // routine only owns its local FIFO. This reset controls request
+            // correlation and the outbound slot, so it is never silently dropped: a
+            // full command queue parks the peer (its remaining work is returned) so
+            // the slot cannot stay wedged on a covered range.
+            let matches_generation = self
+                .state
+                .peers
+                .get(&peer_id)
+                .is_some_and(|peer_state| peer_state.generation == outstanding.generation);
+            if matches_generation {
+                let outcome = match self.command_sink(&peer_id) {
+                    Some(sink) => sink.enqueue_drop_expectation(
+                        outstanding.generation,
+                        outstanding.range.start_height,
+                        outstanding.expected_max_count,
+                    ),
+                    None => HeaderSyncCommandOutcome::NoRoutine,
+                };
+                self.trace_command_enqueued(&peer_id, "drop_expectation", outcome);
+                if outcome.requires_park() {
+                    self.park_peer_for_undeliverable_command(&peer_id, "drop_expectation");
                 }
             }
         }
@@ -1297,11 +1347,11 @@ impl HeaderSyncReactor {
         }
         metrics::counter!("sync.header.peer.status.sent").increment(1);
         self.trace_status_sent(peer, status);
-        if let Some(peer_state) = self.state.peers.get(peer) {
-            if let Err(error) = peer_state.session.try_send_status(status) {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
-            }
-        }
+        // The reactor chose the status and the destination; the peer's routine writes
+        // the frame on its own stream. Status is coalesced through the routine's
+        // single-slot watch (a newer status fully replaces an unread one) and is
+        // advisory, so it is never parked.
+        self.enqueue_status(peer, status);
         #[cfg(test)]
         let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
             peer: peer.clone(),
@@ -1372,13 +1422,13 @@ impl HeaderSyncReactor {
             })
             .collect();
 
+        // The reactor selects the broadcast destinations (who); each peer's routine
+        // writes the `Status` frame on its own stream (what). The broadcast loop
+        // iterates the reactor's admitted sessions and enqueues a per-routine command
+        // — routines never scan all peers themselves.
+        self.trace_broadcast_started("status", peer_ids.len());
         for peer in peer_ids {
-            let Some(peer_state) = self.state.peers.get(&peer) else {
-                continue;
-            };
-            if let Err(error) = peer_state.session.try_send_status(status) {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
-            }
+            self.enqueue_status(&peer, status);
             #[cfg(test)]
             let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
                 peer,
@@ -1439,6 +1489,98 @@ impl HeaderSyncReactor {
         if self.actions.try_send(action).is_err() {
             metrics::counter!("sync.header.peer.violation.action_dropped").increment(1);
         }
+    }
+
+    /// Enqueue this node's current local `Status` to one peer's routine through its
+    /// coalescing command slot, returning the per-peer enqueue outcome. The routine
+    /// writes the frame on its own stream; the reactor only chose the destination and
+    /// the status. A redundant status is suppressed by the caller (via
+    /// `status_differs_from_last_sent`) before this is reached, and the watch slot
+    /// further coalesces a burst to the newest value — both safe, since a `Status` is
+    /// a full snapshot that fully replaces any older one.
+    fn enqueue_status(
+        &self,
+        peer: &ZakuraPeerId,
+        status: HeaderSyncStatus,
+    ) -> HeaderSyncCommandOutcome {
+        let outcome = match self.command_sink(peer) {
+            Some(sink) => sink.enqueue_status(status),
+            None => HeaderSyncCommandOutcome::NoRoutine,
+        };
+        self.trace_command_enqueued(peer, "status", outcome);
+        outcome
+    }
+
+    /// The per-peer routine command sink, if the peer has live state with a routine.
+    fn command_sink(&self, peer: &ZakuraPeerId) -> Option<&HeaderSyncCommandSink> {
+        self.state.peers.get(peer)?.session.commands()
+    }
+
+    /// Park a peer whose routine could not be handed a correctness-critical command
+    /// (a `Headers` response or a reset/timeout `DropExpectation`) because its bounded
+    /// command queue was full or its routine had already exited. This is the explicit
+    /// service-policy mechanism the outbound-commands chunk introduces: rather than
+    /// silently lose a correlated reply or strand the outbound slot, the reactor drops
+    /// this peer's header-sync state, marks it parked (so re-admission must mint a
+    /// fresh session), and cancels its *service* token. It is NOT wired to ordinary
+    /// misbehavior — record-only misbehavior still never disconnects — and cancels
+    /// only the service token, leaving the shared connection (discovery, block-sync)
+    /// untouched. Any outstanding range this peer held is returned to the shared queue
+    /// so it re-fans to another peer and is never stranded.
+    fn park_peer_for_undeliverable_command(
+        &mut self,
+        peer: &ZakuraPeerId,
+        command_kind: &'static str,
+    ) {
+        metrics::counter!("sync.header.peer.command.park").increment(1);
+        self.trace_command_enqueued(peer, command_kind, HeaderSyncCommandOutcome::ParkRequired);
+        let Some(peer_state) = self.state.peers.remove(peer) else {
+            return;
+        };
+        // Return every outstanding range this peer held to the shared queue under its
+        // own generation so it re-fans to another peer (the routine's own `Drop` also
+        // returns its single in-flight range; both are generation-scoped and
+        // idempotent, so a double-return cannot disturb a reconnected session).
+        for outstanding in &peer_state.outstanding {
+            self.state.schedule.return_work(
+                peer,
+                outstanding.generation,
+                outstanding.range,
+                ReturnReason::Teardown,
+            );
+        }
+        self.state.schedule.forget_peer(peer);
+        self.state.parked_peers.insert(peer.clone());
+        // Cancel only the service token: parking one service must not tear down a
+        // multi-service connection.
+        peer_state.session.cancel_token().cancel();
+        self.publish_peer_snapshot();
+        self.publish_candidate_state();
+    }
+
+    fn trace_command_enqueued(
+        &self,
+        peer: &ZakuraPeerId,
+        command_kind: &'static str,
+        outcome: HeaderSyncCommandOutcome,
+    ) {
+        self.emit_trace(hs_trace::HEADER_COMMAND_ENQUEUED, |row| {
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_optional_str(row, hs_trace::KIND, Some(command_kind));
+            insert_optional_str(row, hs_trace::RESULT, Some(outcome.label()));
+        });
+    }
+
+    fn trace_broadcast_started(&self, command_kind: &'static str, destination_count: usize) {
+        self.emit_trace(hs_trace::HEADER_BROADCAST_STARTED, |row| {
+            insert_optional_str(row, hs_trace::KIND, Some(command_kind));
+            insert_u64(
+                row,
+                hs_trace::DESTINATION_PEER_COUNT,
+                // Lossless usize -> u64 widening for the trace row.
+                destination_count as u64,
+            );
+        });
     }
 
     fn trace_event_received(&self, event: &HeaderSyncEvent) {
@@ -1936,13 +2078,31 @@ impl HeaderSyncReactor {
 
     fn cancel_covered_outstanding(&mut self) {
         let covered = self.state.schedule.clone();
-        Self::cancel_outstanding_matching(&mut self.state.peers, |range| covered.is_covered(range));
+        let park = Self::cancel_outstanding_matching(&mut self.state.peers, |range| {
+            covered.is_covered(range)
+        });
+        self.park_undeliverable_drop_peers(park);
     }
 
     fn cancel_forward_outstanding(&mut self) {
-        Self::cancel_outstanding_matching(&mut self.state.peers, |range| {
+        let park = Self::cancel_outstanding_matching(&mut self.state.peers, |range| {
             range.priority == RangePriority::Forward
         });
+        self.park_undeliverable_drop_peers(park);
+    }
+
+    /// Park every peer whose covered/forward-cancel `DropExpectation` could not be
+    /// delivered (full command queue or exited routine). Collected by
+    /// [`Self::cancel_outstanding_matching`] and parked here, after the `&mut peers`
+    /// borrow ends, since parking removes peer state.
+    fn park_undeliverable_drop_peers(&mut self, park: Vec<ZakuraPeerId>) {
+        for peer in park {
+            // A peer may appear more than once when several of its ranges were
+            // covered; the first park removes it, so later parks are no-ops.
+            if self.state.peers.contains_key(&peer) {
+                self.park_peer_for_undeliverable_command(&peer, "drop_expectation");
+            }
+        }
     }
 
     /// Remove every outstanding range matching `predicate` from each peer, bump its
@@ -1951,30 +2111,42 @@ impl HeaderSyncReactor {
     /// expectation and free its outbound slot (generation-scoped) so it can pull
     /// fresh work. Without the `DropExpectation` the routine's slot would stay
     /// occupied by a range the reactor already covered, stalling its next pull.
+    ///
+    /// Returns the peers whose `DropExpectation` could not be delivered (full command
+    /// queue or exited routine); the caller parks them, since that reset controls
+    /// request correlation and the outbound slot and must never be silently lost. The
+    /// caller parks after this returns, because parking removes peer state and this
+    /// holds `&mut peers`.
     fn cancel_outstanding_matching(
         peers: &mut HashMap<ZakuraPeerId, PeerHeaderState>,
         predicate: impl Fn(RangeRequest) -> bool,
-    ) {
-        for peer in peers.values_mut() {
+    ) -> Vec<ZakuraPeerId> {
+        let mut park = Vec::new();
+        for (peer_id, peer) in peers.iter_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if predicate(peer.outstanding[index].range) {
                     let outstanding = peer.outstanding.remove(index);
                     peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
                     if peer.generation == outstanding.generation {
-                        let _ =
-                            peer.session
-                                .try_send_command(HeaderSyncPeerCommand::DropExpectation {
-                                    generation: outstanding.generation,
-                                    start_height: outstanding.range.start_height,
-                                    count: outstanding.expected_max_count,
-                                });
+                        let outcome = match peer.session.commands() {
+                            Some(sink) => sink.enqueue_drop_expectation(
+                                outstanding.generation,
+                                outstanding.range.start_height,
+                                outstanding.expected_max_count,
+                            ),
+                            None => HeaderSyncCommandOutcome::NoRoutine,
+                        };
+                        if outcome.requires_park() {
+                            park.push(peer_id.clone());
+                        }
                     }
                 } else {
                     index += 1;
                 }
             }
         }
+        park
     }
 }
 
