@@ -1,9 +1,9 @@
 //! Verified-commitment-trees fast-sync experiment state (POC harness).
 //!
-//! This module holds the fixture/sidecar *plumbing* for the verified-commitment-trees
-//! fast path: loading the per-block roots fixture (`VCT_FIXTURE`) and the final
-//! frontiers (`VCT_FRONTIERS`) from local files, capturing them during a legacy sync,
-//! and the run counters. It is gated behind
+//! This module holds the fixture/embedded-frontier *plumbing* for the
+//! verified-commitment-trees fast path: loading the per-block roots fixture
+//! (`VCT_FIXTURE`), loading the final frontiers embedded in the binary, capturing
+//! per-block roots during a legacy sync, and the run counters. It is gated behind
 //! `Config::enable_verified_commitment_trees` / the `VCT_*` environment variables and
 //! is **experiment scaffolding, not a shippable feature** — the local files stand in
 //! for the eventual `tree_aux` peer source.
@@ -23,15 +23,20 @@ use std::{
     },
 };
 
-use zebra_chain::{block, orchard, parallel::tree::NoteCommitmentTrees, sapling, sprout};
+#[cfg(test)]
+use zebra_chain::parallel::tree::NoteCommitmentTrees;
+use zebra_chain::{block, orchard, parameters::Network, sapling, sprout};
 
 use super::{FromDisk, IntoDisk};
 
 /// Byte length of one fixture record: height (u32 LE) + sapling root + orchard root.
 const VCT_RECORD_LEN: usize = 4 + 32 + 32;
 
+/// Embedded verified final note-commitment frontiers for Mainnet.
+const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
+
 /// The verified final note-commitment frontiers at the checkpoint handoff height,
-/// loaded from the `VCT_FRONTIERS` sidecar.
+/// embedded in the binary.
 ///
 /// Fast mode skips the per-block frontier recompute below the checkpoint, so the
 /// running sapling/orchard frontiers are never advanced. To let post-checkpoint
@@ -48,8 +53,9 @@ struct FinalFrontiers {
 }
 
 impl FinalFrontiers {
-    /// Serialize to the sidecar byte format: height (u32 LE), then sapling, orchard,
+    /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
     /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes.
+    #[cfg(test)]
     fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.height.0.to_le_bytes());
@@ -66,7 +72,7 @@ impl FinalFrontiers {
         out
     }
 
-    /// Parse the sidecar byte format written by [`Self::to_bytes`].
+    /// Parse the embedded byte format.
     fn from_bytes(bytes: &[u8]) -> Self {
         let height = block::Height(u32::from_le_bytes(
             bytes[0..4].try_into().expect("4 bytes for height"),
@@ -129,15 +135,10 @@ pub(crate) struct VctState {
     /// assert the dedup actually engages, so it can't be silently regressed.
     prevalidated_count: AtomicU64,
     /// Verified final frontiers at the checkpoint handoff height (fast mode), loaded
-    /// from `VCT_FRONTIERS`. When present, the fast path marks the database as
-    /// fast-synced (boundary = `height`) and writes the real treestate at the
-    /// handoff so semantic verification can resume. `None` for the bare benchmark
-    /// (no persistent handoff).
+    /// from embedded network data. When present, the fast path marks the database
+    /// as fast-synced (boundary = `height`) and writes the real treestate at the
+    /// handoff so semantic verification can resume.
     frontiers: Option<FinalFrontiers>,
-    /// Capture sink for the final frontiers: `(path, height)`. During a legacy
-    /// capture sync, when the committer reaches `height`, the tip treestate is
-    /// dumped to `path` to produce the `VCT_FRONTIERS` sidecar for a later fast run.
-    capture_frontiers: Option<(std::path::PathBuf, u32)>,
 }
 
 impl VctState {
@@ -145,7 +146,7 @@ impl VctState {
     /// `VCT_CAPTURE` environment variables. Returns `None` when neither
     /// capture nor fast mode is requested (the default), so there is zero overhead.
     #[allow(clippy::unwrap_in_result)] // misconfiguration / unreadable fixture should fail loudly
-    pub(super) fn from_config(fast_flag: bool) -> Option<Arc<Self>> {
+    pub(super) fn from_config(fast_flag: bool, network: &Network) -> Option<Arc<Self>> {
         // The config flag is `serde(skip)`, so for the POC harness also honor an
         // env override to enable fast mode without TOML/zebrad plumbing.
         let fast_flag = fast_flag || std::env::var_os("VCT_FAST").is_some();
@@ -183,22 +184,14 @@ impl VctState {
             }
             fast = true;
 
-            // The frontiers sidecar (optional) supplies the verified treestate at
-            // the checkpoint handoff height, enabling a persistent, reopenable
-            // fast-synced database. Without it, fast mode is the bare benchmark.
-            if let Some(path) = std::env::var_os("VCT_FRONTIERS") {
-                let mut bytes = Vec::new();
-                File::open(&path)
-                    .expect("VCT_FRONTIERS must exist")
-                    .read_to_end(&mut bytes)
-                    .expect("VCT_FRONTIERS read failed");
-                let parsed = FinalFrontiers::from_bytes(&bytes);
-                tracing::info!(
-                    handoff_height = parsed.height.0,
-                    "VCT: loaded final frontiers, checkpoint handoff enabled"
-                );
-                frontiers = Some(parsed);
-            }
+            let parsed = embedded_final_frontiers(network).unwrap_or_else(|| {
+                panic!("VCT fast mode requires embedded final frontiers for {network}")
+            });
+            tracing::info!(
+                handoff_height = parsed.height.0,
+                "VCT: loaded embedded final frontiers, checkpoint handoff enabled"
+            );
+            frontiers = Some(parsed);
 
             tracing::info!(
                 fixture_roots = roots.len(),
@@ -206,23 +199,7 @@ impl VctState {
             );
         }
 
-        // Capture sink for the final frontiers, written at `VCT_FRONTIERS_AT` height
-        // during a legacy capture sync.
-        let capture_frontiers = match (
-            std::env::var_os("VCT_FRONTIERS"),
-            std::env::var_os("VCT_FRONTIERS_AT"),
-        ) {
-            (Some(path), Some(height)) if !fast => {
-                let height = height
-                    .to_str()
-                    .and_then(|s| s.parse().ok())
-                    .expect("VCT_FRONTIERS_AT must be a block height");
-                Some((path.into(), height))
-            }
-            _ => None,
-        };
-
-        if capture.is_none() && !fast && capture_frontiers.is_none() {
+        if capture.is_none() && !fast {
             return None;
         }
         if capture.is_some() {
@@ -235,7 +212,6 @@ impl VctState {
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
             frontiers,
-            capture_frontiers,
         }))
     }
 
@@ -277,31 +253,6 @@ impl VctState {
             .as_ref()
             .filter(|f| f.height == height)
             .map(|f| (f.sapling.clone(), f.orchard.clone(), f.sprout.clone()))
-    }
-
-    /// During a legacy capture sync, dump the final frontiers sidecar when the
-    /// committer reaches the configured handoff height (no-op otherwise).
-    pub(super) fn capture_final_frontiers(
-        &self,
-        height: block::Height,
-        trees: &NoteCommitmentTrees,
-    ) {
-        if let Some((path, at)) = &self.capture_frontiers {
-            if height.0 == *at {
-                let frontiers = FinalFrontiers {
-                    height,
-                    sapling: trees.sapling.clone(),
-                    orchard: trees.orchard.clone(),
-                    sprout: trees.sprout.clone(),
-                };
-                std::fs::write(path, frontiers.to_bytes())
-                    .expect("VCT_FRONTIERS sidecar write failed");
-                tracing::info!(
-                    handoff_height = height.0,
-                    "VCT: captured final frontiers sidecar"
-                );
-            }
-        }
     }
 
     /// Append a captured per-block roots record for `height` (no-op outside capture mode).
@@ -361,7 +312,6 @@ impl VctState {
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
             frontiers: None,
-            capture_frontiers: None,
         })
     }
 
@@ -388,21 +338,54 @@ impl VctState {
                 orchard,
                 sprout,
             }),
-            capture_frontiers: None,
         })
     }
+}
+
+/// The verified final frontiers embedded for `network`, if supported.
+fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontiers> {
+    match network {
+        Network::Mainnet => Some(parse_embedded_final_frontiers(
+            MAINNET_FINAL_FRONTIERS,
+            network.checkpoint_list().max_height(),
+        )),
+        Network::Testnet(_) => None,
+    }
+}
+
+/// Parse embedded final frontiers and verify they match the checkpoint list.
+fn parse_embedded_final_frontiers(bytes: &[u8], expected_height: block::Height) -> FinalFrontiers {
+    let parsed = FinalFrontiers::from_bytes(bytes);
+    assert_eq!(
+        parsed.height, expected_height,
+        "embedded VCT final frontier height must match the network's max checkpoint height"
+    );
+    parsed
+}
+
+/// Test/developer helper for producing embedded final-frontier bytes from a
+/// legacy-computed tip treestate.
+#[cfg(test)]
+fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> Vec<u8> {
+    FinalFrontiers {
+        height,
+        sapling: trees.sapling.clone(),
+        orchard: trees.orchard.clone(),
+        sprout: trees.sprout.clone(),
+    }
+    .to_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The `VCT_FRONTIERS` sidecar serialization round-trips: the parsed frontiers
+    /// The embedded frontier serialization round-trips: the parsed frontiers
     /// carry the same height and tree roots as the originals. (The handoff write
     /// path is covered end-to-end by `vct_fast_sync_handoff_marks_database_and_resumes`
     /// and the real-mainnet e2e; this isolates the byte format.)
     #[test]
-    fn final_frontiers_sidecar_round_trips() {
+    fn final_frontiers_bytes_round_trips() {
         let frontiers = FinalFrontiers {
             height: block::Height(1_687_200),
             sapling: Arc::new(Default::default()),
@@ -427,6 +410,67 @@ mod tests {
             parsed.sprout.root(),
             frontiers.sprout.root(),
             "sprout frontier round-trips"
+        );
+    }
+
+    #[test]
+    fn embedded_mainnet_final_frontiers_parse() {
+        let frontiers = embedded_final_frontiers(&Network::Mainnet)
+            .expect("mainnet has embedded final frontiers");
+
+        assert_eq!(
+            frontiers.height,
+            Network::Mainnet.checkpoint_list().max_height(),
+            "embedded frontier is tied to the last mainnet checkpoint"
+        );
+        let _sapling_root = frontiers.sapling.root();
+        let _orchard_root = frontiers.orchard.root();
+        let _sprout_root = frontiers.sprout.root();
+    }
+
+    #[test]
+    fn final_frontiers_capture_helper_serializes_tip_trees() {
+        let height = block::Height(3_358_006);
+        let trees = NoteCommitmentTrees::default();
+
+        let parsed = FinalFrontiers::from_bytes(&final_frontiers_bytes(height, &trees));
+
+        assert_eq!(parsed.height, height, "captured height round-trips");
+        assert_eq!(
+            parsed.sapling.root(),
+            trees.sapling.root(),
+            "captured sapling frontier round-trips"
+        );
+        assert_eq!(
+            parsed.orchard.root(),
+            trees.orchard.root(),
+            "captured orchard frontier round-trips"
+        );
+        assert_eq!(
+            parsed.sprout.root(),
+            trees.sprout.root(),
+            "captured sprout frontier round-trips"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "embedded VCT final frontier height must match")]
+    fn embedded_final_frontiers_reject_checkpoint_height_mismatch() {
+        let frontiers = FinalFrontiers {
+            height: block::Height(1),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        };
+
+        let _ = parse_embedded_final_frontiers(&frontiers.to_bytes(), block::Height(2));
+    }
+
+    #[test]
+    fn embedded_final_frontiers_are_network_specific() {
+        assert!(
+            embedded_final_frontiers(&Network::new_default_testnet()).is_none(),
+            "testnet has no embedded final frontier until VCT fast sync supports it"
         );
     }
 }
