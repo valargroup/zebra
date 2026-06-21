@@ -1129,6 +1129,39 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 }
 
 #[test]
+#[should_panic(expected = "fast-synced")]
+fn reopening_fast_synced_database_in_archive_mode_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    // Commit blocks, write the verified-commitment-trees fast-sync marker, then drop
+    // the handle to release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_fast_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Reopening in archive mode (the default) must refuse, because the per-height
+    // note-commitment trees below the handoff height were never written, so the
+    // database can't serve historical tree RPCs.
+    let _state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+}
+
+#[test]
 fn validate_storage_mode_enforces_retention_floor() {
     let pruned = |tx_retention| Config {
         storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),
