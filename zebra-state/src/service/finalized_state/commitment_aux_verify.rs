@@ -167,6 +167,7 @@ mod tests {
     /// ```
     #[ignore]
     #[test]
+    #[allow(clippy::print_stderr)] // intentional progress output for a manual run
     fn verifies_real_nu5_range_over_synced_forks() {
         use std::path::PathBuf;
 
@@ -217,7 +218,7 @@ mod tests {
             "VCT_SEED_DB must be the unsynced 1,707,210 master fork"
         );
         assert!(
-            archive_db.finalized_tip_height().map(|h| h.0).unwrap_or(0) >= end + 1,
+            archive_db.finalized_tip_height().map(|h| h.0).unwrap_or(0) > end,
             "VCT_ARCHIVE_DB must be synced to at least {}",
             end + 1
         );
