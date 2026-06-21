@@ -19,6 +19,7 @@ use crate::{
         finalized_state::{CheckpointVerifiedBlock, FinalizedState},
     },
     tests::FakeChainHelper,
+    HashOrHeight,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -229,6 +230,10 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history must match legacy");
             prop_assert_eq!(fast.vct_fast_count(), (last - seed) as u64, "every fast-eligible block took the fast path");
+            // The dedup: each header commitment is checked once, not twice. Only the
+            // first fast block runs its own commitment check; every later fast block
+            // was already validated by its predecessor's look-ahead, so it is skipped.
+            prop_assert_eq!(fast.vct_prevalidated_count(), (last - seed - 1) as u64, "every fast block after the first skips its redundant own commitment check");
 
             // Negative: corrupt the fixture Sapling root at a V2 (post-NU5) height with a
             // distinct value (the empty root; a V2 block has a non-empty Sapling tree).
@@ -253,6 +258,225 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                 }
             }
             prop_assert_eq!(error_height, Some(bad_height), "a wrong fixture root is rejected at its own commit");
+    });
+
+    Ok(())
+}
+
+/// Verified-commitment-trees checkpoint handoff (merged increments 4+5): a
+/// genesis-start fast sync writes the verified final frontier at the handoff
+/// height, marks the database fast-synced, guards historical per-height tree reads
+/// below the handoff, and leaves the tip treestate (which post-checkpoint semantic
+/// verification resumes from) byte-identical to the legacy recompute.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
+fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            let handoff = Height(last as u32);
+
+            // The fast range is seeded just below Heartwood, so it is authenticated by
+            // the ZIP-221 MMR (the synthetic chain's pre-Heartwood `FinalSaplingRoot`
+            // headers are not consistent with the computed trees, so the Sapling-era
+            // direct-header path can't be exercised here — that rides with the real
+            // synced node). The handoff is at the tip.
+            let seed = (heartwood - 1) as usize;
+
+            // Legacy pass over [0, last]: the per-block fixture for the fast range, the
+            // golden consensus state, and the real final frontiers at the handoff.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            let mut handoff_trees = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+                if i == last {
+                    handoff_trees = Some(trees);
+                }
+            }
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+            let golden_tip = legacy.db.note_commitment_trees_for_tip();
+            let handoff_trees = handoff_trees.expect("committed the handoff block");
+
+            // Fast genesis-start pass over [0, last], supplying the verified frontiers
+            // for the handoff at `last`.
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_fixture_with_handoff(
+                fixture.clone(),
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+            );
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct fast handoff")
+                    .expect("verified fast commit succeeds");
+            }
+
+            // The database is marked fast-synced at the handoff height.
+            prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast-sync marker is set to the handoff height");
+
+            // Consensus state (anchor sets + history root) matches the legacy recompute.
+            prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
+            prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history must match legacy");
+
+            // The handoff wrote the real frontier at the checkpoint, so the tip
+            // treestate that semantic verification resumes from matches legacy.
+            let fast_tip = fast.db.note_commitment_trees_for_tip();
+            prop_assert_eq!(fast_tip.sapling.root(), golden_tip.sapling.root(), "tip sapling frontier must match legacy");
+            prop_assert_eq!(fast_tip.orchard.root(), golden_tip.orchard.root(), "tip orchard frontier must match legacy");
+            prop_assert_eq!(fast_tip.sprout.root(), golden_tip.sprout.root(), "tip sprout frontier must match legacy");
+
+            // Historical per-height tree reads below the handoff are unavailable
+            // (guarded, no panic), while the handoff height itself is present.
+            prop_assert!(fast.db.sapling_tree_by_height(&Height(last as u32 - 1)).is_none(), "below-handoff sapling tree read is guarded");
+            prop_assert!(fast.db.orchard_tree_by_height(&Height(last as u32 - 1)).is_none(), "below-handoff orchard tree read is guarded");
+            prop_assert!(fast.db.sapling_tree_by_height(&handoff).is_some(), "handoff sapling tree is present");
+            prop_assert!(fast.db.orchard_tree_by_height(&handoff).is_some(), "handoff orchard tree is present");
+
+            // The `z_gettreestate` RPC gate predicate matches the read guard: a
+            // below-handoff height is unavailable (typed archive-mode error), while the
+            // handoff height itself is available.
+            prop_assert!(fast.db.fast_synced_tree_unavailable(HashOrHeight::Height(Height(last as u32 - 1))), "RPC gate: below-handoff treestate is unavailable");
+            prop_assert!(!fast.db.fast_synced_tree_unavailable(HashOrHeight::Height(handoff)), "RPC gate: handoff treestate is available");
+    });
+
+    Ok(())
+}
+
+/// Standalone test isolating the verify-before-commit **dedup**: each header
+/// commitment is checked once, not twice.
+///
+/// - **Skip:** the first fast block runs its own commitment check; the next one
+///   is skipped, because the first block's look-ahead already validated it.
+/// - **Stale-cache guard:** a cache entry with the right height but the *wrong*
+///   hash must not trigger a skip — the guard forces the own check to run, so a
+///   stale or mismatched entry can never let an unverified block through.
+#[test]
+fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0 as usize;
+
+            // Seed just before Heartwood so the fast range creates the history tree,
+            // then operate on four consecutive fast blocks. The dedup is era-agnostic;
+            // the cross-boundary coverage lives in the proptest above.
+            let seed = heartwood - 1;
+            let last = seed + 4;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+
+            // Legacy pass to record the correct per-block roots as the fixture.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
+                let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct dedup legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+            }
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_fixture(fixture);
+
+            // Commit block `i` with its real successor as the one-block look-ahead.
+            let commit = |fast: &mut FinalizedState, i: usize| {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct dedup fast")
+                    .expect("verified fast commit succeeds");
+            };
+
+            // genesis..=seed take the recompute path (no fixture entries), so the dedup
+            // never engages here.
+            for i in 0..=seed {
+                commit(&mut fast, i);
+            }
+            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "no fast blocks committed yet");
+
+            // First fast block: no cached predecessor, so it runs its own check.
+            commit(&mut fast, seed + 1);
+            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own commitment check");
+
+            // Second fast block: its predecessor's look-ahead already validated it,
+            // so the own check is skipped — the dedup engages.
+            commit(&mut fast, seed + 2);
+            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
+
+            // Stale-cache guard: overwrite the cache with the correct height but the
+            // hash of a *different* block. The next commit must NOT skip.
+            let stale_hash = blocks[seed + 1].hash;
+            prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
+            fast.vct_prevalidated_next = Some((Height((seed + 3) as u32), stale_hash));
+            commit(&mut fast, seed + 3);
+            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
     });
 
     Ok(())
