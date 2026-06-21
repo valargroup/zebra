@@ -88,6 +88,13 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
+/// Error returned for historical note-commitment tree/subtree read requests on a
+/// verified-commitment-trees fast-synced database, where the per-height trees
+/// below the checkpoint handoff height were never written.
+const FAST_SYNCED_TREE_UNAVAILABLE_ERROR: &str =
+    "note commitment treestate is unavailable below the checkpoint on a fast-synced node; \
+     historical treestate queries require an archive node";
+
 /// A read-write service for Zebra's cached blockchain state.
 ///
 /// This service modifies and provides access to:
@@ -1759,15 +1766,34 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
-                read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::SaplingTree(hash_or_height) => {
+                if state.db.fast_synced_tree_unavailable(hash_or_height) {
+                    return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
+                }
+                Ok(ReadResponse::SaplingTree(read::sapling_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
-            ReadRequest::OrchardTree(hash_or_height) => Ok(ReadResponse::OrchardTree(
-                read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::OrchardTree(hash_or_height) => {
+                if state.db.fast_synced_tree_unavailable(hash_or_height) {
+                    return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
+                }
+                Ok(ReadResponse::OrchardTree(read::orchard_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {
+                // On a fast-synced database, subtrees below the checkpoint handoff
+                // height were never written, so a below-checkpoint range returns an
+                // empty list (the existing "no subtree at the start index" contract)
+                // rather than panicking. A typed archive-mode error for subtrees
+                // unifies with the indexing watermark in a later increment.
                 let end_index = limit
                     .and_then(|limit| start_index.0.checked_add(limit.0))
                     .map(NoteCommitmentSubtreeIndex);
