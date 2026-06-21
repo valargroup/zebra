@@ -694,10 +694,7 @@ fn target_tx_count(template: &Arc<block::Block>, target_bytes: usize) -> usize {
         tx_count = tx_count.saturating_sub(1);
     }
 
-    loop {
-        let Some(next_tx_count) = tx_count.checked_add(1) else {
-            break;
-        };
+    while let Some(next_tx_count) = tx_count.checked_add(1) {
         let candidate = synthetic_block_at_height(
             template,
             block::Height(1),
