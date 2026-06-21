@@ -1152,7 +1152,7 @@ fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) 
 
     let mut batch = DiskWriteBatch::new();
     batch
-        .prepare_block_header_and_transaction_data_batch(state, &finalized, true)
+        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
         .expect("full block header and transaction batch is valid");
     state.db.write(batch).expect("full block batch writes");
 }
@@ -1231,7 +1231,7 @@ fn test_block_db_round_trip_with(
         // Skip validation by writing the block directly to the database
         let mut batch = DiskWriteBatch::new();
         batch
-            .prepare_block_header_and_transaction_data_batch(&state, &finalized, true)
+            .prepare_block_header_and_transaction_data_batch(&state, &finalized, true, None)
             .expect("test block header and transaction batch is valid");
         state.db.write(batch).expect("block is valid for writing");
 
