@@ -1467,13 +1467,14 @@ impl BlockSyncReactor {
             bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
             // Peers that could be issued work but have no free slots are
             // saturated; the remainder want slots. If those exist and the budget
-            // can't fund another worst-case block, the download path is
+            // can't fund another estimated block body, the download path is
             // budget-limited (not peer- or work-limited) — the key throughput
             // signal toward the 1–2 Gbps target.
             let peers_wanting_slots = peers_with_status.saturating_sub(slot_saturated_peers);
             let download_blocked_on_budget = u64::from(
                 peers_wanting_slots > 0
-                    && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                    && self.state.budget.available()
+                        < self.startup.config.block_body_reservation_bytes(),
             );
             bs_insert_u64(
                 row,

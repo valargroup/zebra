@@ -17,14 +17,13 @@ pub const MAX_BS_INFLIGHT_REQUESTS: u16 = 10_000;
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
 pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Default bytes reserved for each requested block body before its actual size is known.
+pub const DEFAULT_BS_BLOCK_BODY_RESERVATION_BYTES: u64 = 512 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
-/// Block-sync reserves this much per requested block at send time and only ever
-/// shrinks the reservation toward the actual serialized size on receipt, so a
-/// valid, already-downloaded body is never discarded for a full budget. Each
-/// body arrives in its own `Block` frame bounded by [`block::MAX_BLOCK_BYTES`]
-/// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
-/// never exceed this worst case and the shrink is always non-negative.
+/// Each body arrives in its own `Block` frame bounded by
+/// [`block::MAX_BLOCK_BYTES`] at decode (`MAX_BS_MESSAGE_BYTES >
+/// MAX_BLOCK_BYTES`), so this is the hard upper bound for one valid body.
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
@@ -123,6 +122,14 @@ pub struct ZakuraBlockSyncConfig {
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for in-flight and buffered block bodies.
     pub max_inflight_block_bytes: u64,
+    /// Estimated bytes reserved for each requested block body before its actual
+    /// serialized size is known.
+    ///
+    /// If a received body is larger than this estimate, block sync reserves the
+    /// additional bytes before buffering it. If the configured total
+    /// `max_inflight_block_bytes` budget cannot cover that delta, the body is
+    /// dropped and retried later instead of exceeding the cap.
+    pub block_body_reservation_bytes: u64,
     /// Maximum block bodies submitted to the verifier before completed applies
     /// release more submission slots.
     pub max_submitted_block_applies: usize,
@@ -156,6 +163,7 @@ impl Default for ZakuraBlockSyncConfig {
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+            block_body_reservation_bytes: DEFAULT_BS_BLOCK_BODY_RESERVATION_BYTES,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
@@ -185,6 +193,12 @@ impl ZakuraBlockSyncConfig {
     /// Return the non-zero verifier submission cap.
     pub fn submitted_apply_limit(&self) -> usize {
         self.max_submitted_block_applies.max(1)
+    }
+
+    /// Return the per-body reservation estimate clamped to one valid body.
+    pub fn block_body_reservation_bytes(&self) -> u64 {
+        self.block_body_reservation_bytes
+            .clamp(1, BS_PER_BLOCK_WORST_CASE_BYTES)
     }
 
     /// Build the inert local status used before the block-sync reactor is wired.
