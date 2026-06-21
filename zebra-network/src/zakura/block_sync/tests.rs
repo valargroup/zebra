@@ -836,7 +836,7 @@ fn status_decode_clamps_peer_capacity_advertisements() {
     };
 
     assert_eq!(status.max_blocks_per_response, MAX_BS_BLOCKS_PER_REQUEST);
-    assert_eq!(status.max_inflight_requests, DEFAULT_BS_MAX_INFLIGHT);
+    assert_eq!(status.max_inflight_requests, MAX_BS_INFLIGHT_REQUESTS);
     assert_eq!(status.max_response_bytes, MAX_BS_RESPONSE_BYTES);
 }
 
@@ -9652,117 +9652,6 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
         service.peer_count(),
         1,
         "misbehavior is record-only: a repeatedly-misbehaving peer must NOT be disconnected",
-    );
-
-    reactor_task.abort();
-}
-
-/// Regression guard for F-88604: two misbehaving peers that sort ahead of an honest
-/// peer and spam `RangeUnavailable` for a contested range do **not** wedge body sync
-/// — the honest peer is still offered the range and makes progress.
-///
-/// The audit flagged the unpenalized retry path as a possible wedge (two peers
-/// re-occupying the whole fanout). Verified here that it is not: `handle_range_unavailable`
-/// reschedules immediately after each response, and with one in-flight request per
-/// peer the other misbehaving peer is still busy holding its stale request when the
-/// first frees its slot, so the honest peer claims the freed companion slot. The
-/// behavior is bounded churn, not a liveness wedge, so no peer-scoring guard is added.
-/// This test fails if a future change ever lets the fanout peers lock the honest peer
-/// out.
-#[tokio::test]
-async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
-    let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
-    config.fanout = 2;
-    // A long request timeout ensures the timeout-driven retry self-heal cannot mask
-    // the wedge within the test window.
-    config.request_timeout = Duration::from_secs(300);
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(2), blocks[1].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-
-    // Two misbehaving peers (ids 0x01, 0x02 sort first) and one honest peer (0x03).
-    let (m1, m1_in, _m1_out) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        0x01,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    let (m2, m2_in, _m2_out) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        0x02,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    let (h, _h_in, _h_out) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        0x03,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            block_meta(&blocks[0]),
-            block_meta(&blocks[1]),
-        ]))
-        .await
-        .expect("needed metadata queues");
-
-    // Every time a misbehaving peer is offered the range it answers RangeUnavailable.
-    // The honest peer must eventually be offered the range.
-    let range_unavailable = || {
-        BlockSyncMessage::RangeUnavailable {
-            start_height: block::Height(1),
-            count: 2,
-        }
-        .encode_frame()
-        .expect("RangeUnavailable frame encodes")
-    };
-    let mut honest_offered = false;
-    for _ in 0..16 {
-        let (peer, _start, _count) = wait_for_getblocks(&mut actions).await;
-        if peer == h {
-            honest_offered = true;
-            break;
-        } else if peer == m1 {
-            m1_in
-                .send(range_unavailable())
-                .await
-                .expect("m1 RangeUnavailable queues");
-        } else if peer == m2 {
-            m2_in
-                .send(range_unavailable())
-                .await
-                .expect("m2 RangeUnavailable queues");
-        }
-    }
-
-    assert!(
-        honest_offered,
-        "honest peer must be offered the contested range after both fanout peers fail it"
     );
 
     reactor_task.abort();

@@ -211,9 +211,9 @@ impl MockApplyFrontier {
             } else {
                 BlockApplyResult::Rejected
             }
-        } else if state.frontier.next().ok() != Some(height) {
-            BlockApplyResult::Rejected
-        } else if self.corpus.height_for_hash(hash) != Some(height) {
+        } else if state.frontier.next().ok() != Some(height)
+            || self.corpus.height_for_hash(hash) != Some(height)
+        {
             BlockApplyResult::Rejected
         } else {
             state.frontier = height;
@@ -805,6 +805,7 @@ fn env_u16(name: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
+#[allow(clippy::print_stdout)]
 fn print_summary(config: &HarnessConfig, summary: &ThroughputSummary, trace_root: Option<&Path>) {
     let elapsed_secs = summary.elapsed.as_secs_f64().max(f64::EPSILON);
     // These casts are for approximate human-readable throughput output only.

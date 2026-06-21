@@ -205,7 +205,7 @@ pub fn clamp_advertised_blocks(count: u32) -> u32 {
 
 /// Clamp an advertised in-flight request count to the local status ceiling.
 pub fn clamp_advertised_inflight(count: u16) -> u16 {
-    count.clamp(1, DEFAULT_BS_MAX_INFLIGHT)
+    count.clamp(1, MAX_BS_INFLIGHT_REQUESTS)
 }
 
 /// Clamp an advertised response byte target to the largest stream-6 message.

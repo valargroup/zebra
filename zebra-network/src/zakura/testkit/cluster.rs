@@ -508,7 +508,7 @@ mod tests {
         handle: HeaderSyncHandle,
         store: Arc<StdMutex<E2eHeaderStore>>,
         observed_gaps: Arc<Mutex<Vec<(block::Height, block::Height)>>>,
-        disconnects: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMisbehavior)>>>,
+        misbehaviors: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMisbehavior)>>>,
         sent: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMessage)>>>,
         outbound_receivers: Arc<StdMutex<Vec<FramedRecv>>>,
     }
@@ -581,7 +581,7 @@ mod tests {
                 handle,
                 store,
                 observed_gaps: Arc::new(Mutex::new(Vec::new())),
-                disconnects: Arc::new(Mutex::new(Vec::new())),
+                misbehaviors: Arc::new(Mutex::new(Vec::new())),
                 sent: Arc::new(Mutex::new(Vec::new())),
                 outbound_receivers: Arc::new(StdMutex::new(Vec::new())),
             };
@@ -724,10 +724,10 @@ mod tests {
             .map_err(Into::into)
         }
 
-        async fn disconnect_reasons(&self, node: usize) -> Vec<HeaderSyncMisbehavior> {
+        async fn misbehavior_reasons(&self, node: usize) -> Vec<HeaderSyncMisbehavior> {
             self.nodes[node]
                 .view
-                .disconnects
+                .misbehaviors
                 .lock()
                 .await
                 .iter()
@@ -735,20 +735,20 @@ mod tests {
                 .collect()
         }
 
-        async fn wait_for_disconnect_reason(
+        async fn wait_for_misbehavior_reason(
             &self,
             node: usize,
             reason: HeaderSyncMisbehavior,
         ) -> Result<(), BoxError> {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if self.disconnect_reasons(node).await.contains(&reason) {
+                if self.misbehavior_reasons(node).await.contains(&reason) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     return Ok(());
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Err(Box::new(WaitError::new(
-                        "header-sync e2e disconnect reason",
+                        "header-sync e2e misbehavior reason",
                         Duration::from_secs(5),
                     )));
                 }
@@ -982,11 +982,7 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::Misbehavior { peer, reason } => {
-                    local.disconnects.lock().await.push((peer.clone(), reason));
-                    let _ = local
-                        .handle
-                        .send(HeaderSyncEvent::PeerDisconnected(peer))
-                        .await;
+                    local.misbehaviors.lock().await.push((peer, reason));
                 }
             }
         }
@@ -1221,10 +1217,9 @@ mod tests {
 
     async fn drive_native_header_sync_actions(
         node: &ZakuraTestNode,
-        disconnects: Arc<StdMutex<Vec<HeaderSyncMisbehavior>>>,
+        misbehaviors: Arc<StdMutex<Vec<HeaderSyncMisbehavior>>>,
     ) -> JoinHandle<()> {
         let endpoint = node.endpoint();
-        let supervisor = node.supervisor();
         let mut actions = node
             .take_header_sync_actions()
             .await
@@ -1235,12 +1230,11 @@ mod tests {
                 match action {
                     HeaderSyncAction::SendMessage { .. }
                     | HeaderSyncAction::ForwardNewBlock { .. } => {}
-                    HeaderSyncAction::Misbehavior { peer, reason } => {
-                        disconnects
+                    HeaderSyncAction::Misbehavior { reason, .. } => {
+                        misbehaviors
                             .lock()
-                            .expect("disconnect list mutex is not poisoned")
+                            .expect("misbehavior list mutex is not poisoned")
                             .push(reason);
-                        let _ = supervisor.disconnect_peer(&peer).await;
                     }
                     HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
                         let Some(handle) = endpoint.header_sync() else {
@@ -1294,17 +1288,17 @@ mod tests {
         })
     }
 
-    async fn wait_for_native_disconnect(
-        disconnects: Arc<StdMutex<Vec<HeaderSyncMisbehavior>>>,
+    async fn wait_for_native_misbehavior(
+        misbehaviors: Arc<StdMutex<Vec<HeaderSyncMisbehavior>>>,
         reason: HeaderSyncMisbehavior,
     ) -> Result<(), BoxError> {
         await_until(
-            "native header-sync disconnect reason",
+            "native header-sync misbehavior reason",
             Duration::from_secs(5),
             || {
-                disconnects
+                misbehaviors
                     .lock()
-                    .expect("disconnect list mutex is not poisoned")
+                    .expect("misbehavior list mutex is not poisoned")
                     .contains(&reason)
             },
         )
@@ -2397,10 +2391,10 @@ mod tests {
         let node2 = header_sync_test_builder(2, network, &mut capture)
             .spawn()
             .await?;
-        let disconnects1 = Arc::new(StdMutex::new(Vec::new()));
-        let disconnects2 = Arc::new(StdMutex::new(Vec::new()));
-        let driver1 = drive_native_header_sync_actions(&node1, disconnects1.clone()).await;
-        let driver2 = drive_native_header_sync_actions(&node2, disconnects2.clone()).await;
+        let misbehaviors1 = Arc::new(StdMutex::new(Vec::new()));
+        let misbehaviors2 = Arc::new(StdMutex::new(Vec::new()));
+        let driver1 = drive_native_header_sync_actions(&node1, misbehaviors1.clone()).await;
+        let driver2 = drive_native_header_sync_actions(&node2, misbehaviors2.clone()).await;
         cluster.nodes.push(node1);
         cluster.nodes.push(node2);
 
@@ -2439,8 +2433,8 @@ mod tests {
             .node("02")
             .table("header_sync")
             .assert_event(hs_trace::HEADER_STATUS_RECEIVED);
-        assert!(disconnects1.lock().unwrap().is_empty());
-        assert!(disconnects2.lock().unwrap().is_empty());
+        assert!(misbehaviors1.lock().unwrap().is_empty());
+        assert!(misbehaviors2.lock().unwrap().is_empty());
 
         cluster.shutdown().await;
         driver1.abort();
@@ -2460,8 +2454,8 @@ mod tests {
         let victim = header_sync_test_builder(11, e2e_network([1]), &mut capture)
             .spawn()
             .await?;
-        let disconnects = Arc::new(StdMutex::new(Vec::new()));
-        let driver = drive_native_header_sync_actions(&victim, disconnects.clone()).await;
+        let misbehaviors = Arc::new(StdMutex::new(Vec::new()));
+        let driver = drive_native_header_sync_actions(&victim, misbehaviors.clone()).await;
 
         let malformed =
             HostilePeer::connect_native_with_capabilities(&victim, 12, ZAKURA_CAP_HEADER_SYNC)
@@ -2476,8 +2470,11 @@ mod tests {
                 },
             )
             .await?;
-        wait_for_native_disconnect(disconnects.clone(), HeaderSyncMisbehavior::MalformedMessage)
-            .await?;
+        wait_for_native_misbehavior(
+            misbehaviors.clone(),
+            HeaderSyncMisbehavior::MalformedMessage,
+        )
+        .await?;
         malformed.shutdown().await;
 
         let unsolicited =
@@ -2489,9 +2486,24 @@ mod tests {
         unsolicited
             .send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, unsolicited_headers)
             .await?;
-        wait_for_native_disconnect(
-            disconnects.clone(),
-            HeaderSyncMisbehavior::UnsolicitedHeaders,
+        await_until(
+            "native header-sync unsolicited headers violation trace",
+            Duration::from_secs(5),
+            || {
+                capture.reader().is_ok_and(|reader| {
+                    reader
+                        .node("11")
+                        .table("header_sync")
+                        .rows()
+                        .iter()
+                        .any(|row| {
+                            row.get("event").and_then(serde_json::Value::as_str)
+                                == Some(hs_trace::HEADER_PEER_VIOLATION)
+                                && row.get("reason").and_then(serde_json::Value::as_str)
+                                    == Some("unsolicited_headers")
+                        })
+                })
+            },
         )
         .await?;
         unsolicited.shutdown().await;
@@ -2544,30 +2556,11 @@ mod tests {
             .await?;
         truncated.shutdown().await;
 
-        // Each misbehavior disconnect cancels the peer's connection token, so the
-        // victim's connection handler exits via the cancellation arm and stamps
-        // the `closed.neutral` row with the bounded `cancelled` reason.
-        await_until(
-            "victim traces closed.neutral with a bounded reason",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader.node("11").table("conn").rows().iter().any(|row| {
-                        row.get("event").and_then(serde_json::Value::as_str)
-                            == Some("closed.neutral")
-                            && row.get("reason").and_then(serde_json::Value::as_str)
-                                == Some("cancelled")
-                    })
-                })
-            },
-        )
-        .await?;
-
         capture.flush().await;
         let reader = capture.reader()?;
         let header_sync = reader.node("11").table("header_sync");
-        header_sync.assert_header_disconnect("malformed_message");
-        header_sync.assert_header_disconnect("unsolicited_headers");
+        header_sync.assert_header_violation("malformed_message");
+        header_sync.assert_header_violation("unsolicited_headers");
         reader.node("11").table("stream").assert_row(
             "accepted",
             &[("stream_kind", TraceValue::Str("header_sync"))],
@@ -2576,11 +2569,6 @@ mod tests {
             "frame.oversize",
             &[("stream_kind", TraceValue::Str("header_sync"))],
         );
-        reader.node("11").table("conn").assert_row(
-            "closed.neutral",
-            &[("reason", TraceValue::Str("cancelled"))],
-        );
-
         victim.shutdown().await;
         driver.abort();
         assert!(capture.finish().await?.is_none());
@@ -2826,8 +2814,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            cluster.disconnect_reasons(0).await.is_empty(),
-            "honest tip-flood and duplicate paths must not disconnect peers"
+            cluster.misbehavior_reasons(0).await.is_empty(),
+            "honest tip-flood and duplicate paths must not record peer misbehavior"
         );
 
         capture.flush().await;
@@ -2890,7 +2878,7 @@ mod tests {
         cluster.start_drivers();
         cluster.wait_for_body(0, hash1).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(cluster.disconnect_reasons(0).await.is_empty());
+        assert!(cluster.misbehavior_reasons(0).await.is_empty());
 
         capture.flush().await;
         capture
@@ -2905,11 +2893,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn header_sync_e2e_hostile_peer_disconnect_matrix_has_traceable_reasons(
+    async fn header_sync_e2e_hostile_peer_misbehavior_matrix_has_traceable_reasons(
     ) -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "header_sync_e2e_hostile_peer_disconnect_matrix_has_traceable_reasons",
+            "header_sync_e2e_hostile_peer_misbehavior_matrix_has_traceable_reasons",
             false,
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
@@ -2933,9 +2921,26 @@ mod tests {
                 headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
             )
             .await;
-        cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::UnsolicitedHeaders)
-            .await?;
+        await_until(
+            "header-sync e2e unsolicited headers violation trace",
+            Duration::from_secs(5),
+            || {
+                capture.reader().is_ok_and(|reader| {
+                    reader
+                        .node("01")
+                        .table("header_sync")
+                        .rows()
+                        .iter()
+                        .any(|row| {
+                            row.get("event").and_then(serde_json::Value::as_str)
+                                == Some(hs_trace::HEADER_PEER_VIOLATION)
+                                && row.get("reason").and_then(serde_json::Value::as_str)
+                                    == Some("unsolicited_headers")
+                        })
+                })
+            },
+        )
+        .await?;
 
         let out_of_range = e2e_peer(95);
         cluster.connect_peer(victim, out_of_range.clone()).await;
@@ -2953,7 +2958,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::InvalidRange)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let over_in_flight = e2e_peer(96);
@@ -2974,7 +2979,7 @@ mod tests {
                 .await;
         }
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::GetHeadersSpam)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::GetHeadersSpam)
             .await?;
 
         let response_too_long = e2e_peer(97);
@@ -2998,7 +3003,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::ResponseTooLong)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::ResponseTooLong)
             .await?;
 
         let bad_continuity_victim = cluster.spawn_node(
@@ -3036,7 +3041,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(bad_continuity_victim, HeaderSyncMisbehavior::InvalidRange)
+            .wait_for_misbehavior_reason(bad_continuity_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let bad_pow_victim = cluster.spawn_node(
@@ -3065,7 +3070,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(bad_pow_victim, HeaderSyncMisbehavior::InvalidRange)
+            .wait_for_misbehavior_reason(bad_pow_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let bad_daa_victim = cluster.spawn_node(
@@ -3103,7 +3108,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(bad_daa_victim, HeaderSyncMisbehavior::InvalidRange)
+            .wait_for_misbehavior_reason(bad_daa_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let bad_checkpoint_backfill = e2e_peer(101);
@@ -3142,7 +3147,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
+            .wait_for_misbehavior_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
         let over_cap = e2e_peer(91);
@@ -3165,7 +3170,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::GetHeadersTooLong)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::GetHeadersTooLong)
             .await?;
 
         let status_spam = e2e_peer(92);
@@ -3185,7 +3190,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::StatusSpam)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::StatusSpam)
             .await?;
 
         let new_block_spam = e2e_peer(93);
@@ -3205,7 +3210,7 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::NewBlockSpam)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::NewBlockSpam)
             .await?;
 
         let invalid_block = e2e_peer(94);
@@ -3220,25 +3225,25 @@ mod tests {
             )
             .await;
         cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::MalformedMessage)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::MalformedMessage)
             .await?;
 
         capture.flush().await;
         let reader = capture.reader()?;
         let trace = reader.node("01").table("header_sync");
-        trace.assert_header_disconnect("unsolicited_headers");
-        trace.assert_header_disconnect("invalid_range");
-        trace.assert_header_disconnect("get_headers_spam");
-        trace.assert_header_disconnect("response_too_long");
-        trace.assert_header_disconnect("get_headers_too_long");
-        trace.assert_header_disconnect("status_spam");
-        trace.assert_header_disconnect("new_block_spam");
-        trace.assert_header_disconnect("malformed_message");
+        trace.assert_header_violation("unsolicited_headers");
+        trace.assert_header_violation("invalid_range");
+        trace.assert_header_violation("get_headers_spam");
+        trace.assert_header_violation("response_too_long");
+        trace.assert_header_violation("get_headers_too_long");
+        trace.assert_header_violation("status_spam");
+        trace.assert_header_violation("new_block_spam");
+        trace.assert_header_violation("malformed_message");
         for node in ["03", "04", "05", "06"] {
             reader
                 .node(node)
                 .table("header_sync")
-                .assert_header_disconnect("invalid_range");
+                .assert_header_violation("invalid_range");
         }
 
         cluster.shutdown().await;

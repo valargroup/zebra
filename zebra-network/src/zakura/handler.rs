@@ -77,11 +77,11 @@ pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
 ///
 /// This is a generous universal cap: block-sync legitimately delivers
 /// hundreds of solicited bodies per second in bursts, so a low limit
-/// starves sync. Exceeding it is treated as misbehavior and disconnects the
-/// peer (we never silently drop a solicited frame -- a dropped block body is
-/// a permanent gap on a reliable stream). Longer term this should be split
-/// per message type (some unbounded, some near-one-shot) rather than a single
-/// universal value.
+/// starves sync. Exceeding it is a transport-level hard failure rather than a
+/// peer-scoring decision: we never silently drop a solicited frame because a
+/// dropped block body is a permanent gap on a reliable stream. Longer term
+/// this should be split per message type (some unbounded, some near-one-shot)
+/// rather than a single universal value.
 pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
@@ -5458,7 +5458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_sync_misbehavior_action_disconnects_peer() -> Result<(), BoxError> {
+    async fn header_sync_misbehavior_action_does_not_disconnect_peer() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let reactor_shutdown = CancellationToken::new();
         let startup = header_sync_startup(reactor_shutdown.clone());
@@ -5483,9 +5483,12 @@ mod tests {
             })
             .await?;
 
-        tokio::time::timeout(Duration::from_secs(1), disconnect_token.cancelled())
-            .await
-            .expect("misbehavior action cancels the registered connection");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), disconnect_token.cancelled())
+                .await
+                .is_err(),
+            "misbehavior is record-only and must not cancel the registered connection",
+        );
 
         driver_shutdown.cancel();
         driver_task.await?;
@@ -5726,7 +5729,6 @@ mod tests {
                 connection_token: connection_token.clone(),
                 stream_token: connection_token.child_token(),
                 freshness_tx: freshness_tx.clone(),
-                last_activity: new_connection_freshness(),
             };
             let prelude = StreamPrelude {
                 magic: STREAM_PRELUDE_MAGIC,
