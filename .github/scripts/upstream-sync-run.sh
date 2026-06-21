@@ -18,6 +18,22 @@ require_file() {
   fi
 }
 
+validate_pr_body_autolinks() {
+  local file="$1"
+  if grep -Eq '(^|[^A-Za-z0-9_])#[0-9]+' "$file"; then
+    echo "ERROR: final PR body contains a bare issue/PR autolink" >&2
+    exit 1
+  fi
+  if grep -Eq '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+' "$file"; then
+    echo "ERROR: final PR body contains an owner/repo issue/PR autolink" >&2
+    exit 1
+  fi
+  if grep -Eq 'https://github\.com/[^[:space:]]+/(pull|issues)/[0-9]+' "$file"; then
+    echo "ERROR: final PR body contains a GitHub PR/issue URL" >&2
+    exit 1
+  fi
+}
+
 case "$COMMAND" in
   prepare)
     require_file "$CANDIDATE_JSON"
@@ -122,6 +138,7 @@ case "$COMMAND" in
         printf '%s\n' "$BODY"
       } > "$PR_BODY_FILE"
     fi
+    validate_pr_body_autolinks "$PR_BODY_FILE"
     TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
     BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
     {

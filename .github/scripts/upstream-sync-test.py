@@ -78,7 +78,7 @@ def run_validator(output_dir: Path, candidate_path: Path, result: dict[str, obje
     )
 
 
-def write_pr_body(output_dir: Path, result: dict[str, object]) -> str:
+def run_write_pr_body(output_dir: Path, result: dict[str, object]) -> tuple[subprocess.CompletedProcess[str], Path]:
     result_path = output_dir / "result.json"
     pr_body_path = output_dir / "pr-body.md"
     github_output_path = output_dir / "github-output.txt"
@@ -87,14 +87,26 @@ def write_pr_body(output_dir: Path, result: dict[str, object]) -> str:
     env["UPSTREAM_SYNC_RESULT_JSON"] = str(result_path)
     env["UPSTREAM_SYNC_PR_BODY_FILE"] = str(pr_body_path)
     env["GITHUB_OUTPUT"] = str(github_output_path)
-    subprocess.check_call(
+    process = subprocess.run(
         [
             str(ROOT / ".github" / "scripts" / "upstream-sync-run.sh"),
             "write-pr-body",
         ],
         cwd=ROOT,
         env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
+    return process, pr_body_path
+
+
+def write_pr_body(output_dir: Path, result: dict[str, object]) -> str:
+    process, pr_body_path = run_write_pr_body(output_dir, result)
+    if process.returncode != 0:
+        print(process.stdout, end="")
+        print(process.stderr, end="", file=sys.stderr)
+    assert process.returncode == 0
     return pr_body_path.read_text(encoding="utf-8")
 
 
@@ -181,6 +193,11 @@ def main() -> int:
 
     pr_body = write_pr_body(output_dir, valid_result)
     assert pr_body.startswith("AI Confidence: 90% - Open a draft PR for human review.\n\n")
+
+    bad_recommendation = result_for(candidate, valid_body, recommendation="Review #123 before merging.")
+    process, _ = run_write_pr_body(output_dir, bad_recommendation)
+    assert process.returncode != 0
+    assert "final PR body contains a bare issue/PR autolink" in process.stderr
 
     missing_pr_marker_body = valid_body.replace(f"{upstream_pr_marker}\n", "")
     assert_validator_failed(
