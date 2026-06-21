@@ -116,6 +116,46 @@ impl ZebraDb {
         self.db.zs_contains(&orchard_anchors, &orchard_anchor)
     }
 
+    /// POC: returns `(sapling_count, sapling_digest, orchard_count, orchard_digest)`,
+    /// a deterministic, order-independent digest of the Sapling and Orchard anchor
+    /// sets. Two syncs that produce the same anchor sets produce the same digest,
+    /// even if one took the fast (skip-recompute) path. See
+    /// `docs/design/verified-commitment-trees-poc.md`.
+    pub fn vct_anchor_digest(&self) -> (u64, u64, u64, u64) {
+        use crate::service::finalized_state::IntoDisk;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
+        let mut sapling_hasher = DefaultHasher::new();
+        let mut sapling_count = 0u64;
+        for (root, ()) in self
+            .db
+            .zs_forward_range_iter::<_, sapling::tree::Root, (), _>(&sapling_anchors, ..)
+        {
+            IntoDisk::as_bytes(&root).hash(&mut sapling_hasher);
+            sapling_count += 1;
+        }
+
+        let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
+        let mut orchard_hasher = DefaultHasher::new();
+        let mut orchard_count = 0u64;
+        for (root, ()) in self
+            .db
+            .zs_forward_range_iter::<_, orchard::tree::Root, (), _>(&orchard_anchors, ..)
+        {
+            IntoDisk::as_bytes(&root).hash(&mut orchard_hasher);
+            orchard_count += 1;
+        }
+
+        (
+            sapling_count,
+            sapling_hasher.finish(),
+            orchard_count,
+            orchard_hasher.finish(),
+        )
+    }
+
     // # Sprout trees
 
     /// Returns the Sprout note commitment tree of the finalized tip
@@ -534,6 +574,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
     ) {
         let FinalizedBlock {
             height,
@@ -544,6 +585,20 @@ impl DiskWriteBatch {
                 },
             ..
         } = finalized;
+
+        // POC (verified-commitment-trees) fast path: the committer skipped the
+        // per-block frontier recompute, so `note_commitment_trees` is the frozen
+        // parent frontier. Write only the supplied roots into the anchor set and
+        // the (already-extended) history tree; skip the per-height Sapling/Orchard
+        // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
+        // modern checkpoint, so it is correctly left untouched here.
+        // See docs/design/verified-commitment-trees-poc.md.
+        if let Some((sapling_root, orchard_root)) = fast_anchor_roots {
+            self.insert_sapling_anchor(zebra_db, &sapling_root);
+            self.insert_orchard_anchor(zebra_db, &orchard_root);
+            self.update_history_tree(zebra_db, history_tree);
+            return;
+        }
 
         let prev_sprout_tree = prev_note_commitment_trees.as_ref().map_or_else(
             || zebra_db.sprout_tree_for_tip(),
@@ -646,6 +701,15 @@ impl DiskWriteBatch {
         self.zs_insert(&sapling_tree_cf, height, tree);
     }
 
+    /// POC: inserts only the Sapling anchor `root` (value `()`), without writing a
+    /// per-height tree. Used by the verified-commitment-trees fast path, which
+    /// supplies the root directly instead of recomputing the frontier. The anchor
+    /// CF is a set, so re-inserting an unchanged root is idempotent.
+    pub fn insert_sapling_anchor(&mut self, zebra_db: &ZebraDb, root: &sapling::tree::Root) {
+        let sapling_anchors = zebra_db.db.cf_handle("sapling_anchors").unwrap();
+        self.zs_insert(&sapling_anchors, root, ());
+    }
+
     /// Inserts the Sapling note commitment subtree into the batch.
     pub fn insert_sapling_subtree(
         &mut self,
@@ -723,6 +787,13 @@ impl DiskWriteBatch {
 
         self.zs_insert(&orchard_anchors, tree.root(), ());
         self.zs_insert(&orchard_tree_cf, height, tree);
+    }
+
+    /// POC: inserts only the Orchard anchor `root` (value `()`), without writing a
+    /// per-height tree. The Orchard twin of [`Self::insert_sapling_anchor`].
+    pub fn insert_orchard_anchor(&mut self, zebra_db: &ZebraDb, root: &orchard::tree::Root) {
+        let orchard_anchors = zebra_db.db.cf_handle("orchard_anchors").unwrap();
+        self.zs_insert(&orchard_anchors, root, ());
     }
 
     /// Inserts the Orchard note commitment subtree into the batch.
