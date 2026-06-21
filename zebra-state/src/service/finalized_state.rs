@@ -81,6 +81,10 @@ pub(crate) struct VctState {
     capture: Option<Mutex<std::io::BufWriter<File>>>,
     /// Count of blocks that took the fast (skip-recompute) path, for the run summary.
     fast_count: AtomicU64,
+    /// Count of fast blocks whose own commitment check was skipped because the
+    /// previous block's look-ahead already validated it (the dedup). Lets tests
+    /// assert the dedup actually engages, so it can't be silently regressed.
+    prevalidated_count: AtomicU64,
 }
 
 impl VctState {
@@ -141,6 +145,7 @@ impl VctState {
             roots,
             capture,
             fast_count: AtomicU64::new(0),
+            prevalidated_count: AtomicU64::new(0),
         }))
     }
 
@@ -366,6 +371,15 @@ pub struct FinalizedState {
     /// POC verified-commitment-trees state (fast/capture mode), or `None` when
     /// the experiment is off (the default). Shared across clones.
     vct: Option<Arc<VctState>>,
+
+    /// POC verify-before-commit dedup. Holds the `(height, hash)` of the next
+    /// block whose commitment was already validated by the previous fast
+    /// commit's look-ahead (`C(next, candidate)`). When the next block to commit
+    /// matches, its own commitment check is the identical computation, so it is
+    /// skipped — making each header commitment check run once instead of twice.
+    /// Guarded by hash identity (and height monotonicity), so a stale or cloned
+    /// value can never cause an incorrect skip.
+    vct_prevalidated_next: Option<(block::Height, block::Hash)>,
 }
 
 impl FinalizedState {
@@ -497,6 +511,7 @@ impl FinalizedState {
             elastic_db,
             elastic_blocks: vec![],
             vct,
+            vct_prevalidated_next: None,
         };
 
         #[cfg(not(feature = "elasticsearch"))]
@@ -506,6 +521,7 @@ impl FinalizedState {
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
             db,
             vct,
+            vct_prevalidated_next: None,
         };
 
         // Pruning is a one-way storage mode. Refuse to open a database that has
@@ -780,16 +796,31 @@ impl FinalizedState {
                     let mut fast_anchor_roots = None;
 
                     if let Some((sapling_root, orchard_root)) = vct_fast {
-                        // This block's own commitment check (validates the parent
-                        // history tree — the roots already committed).
-                        COMMIT_COMPUTE_POOL.install(|| {
-                            check::block_commitment_is_valid_for_chain_history(
-                                block.clone(),
-                                &network,
-                                &history_tree,
-                                precomputed_auth_data_root,
-                            )
-                        })?;
+                        // This block's own commitment check validates the parent
+                        // history tree (the roots already committed). It is the
+                        // *identical* computation to the previous fast block's
+                        // look-ahead `C(this_block, parent_tree)`: that check ran
+                        // one commit earlier as the successor verification below.
+                        // So when the previous look-ahead already validated exactly
+                        // this block, skip the duplicate — each header commitment is
+                        // then checked once, not twice. The guard is hash identity
+                        // (height is monotonic, so a stale entry can never match).
+                        let prevalidated =
+                            self.vct_prevalidated_next == Some((height, checkpoint_verified.hash));
+                        if prevalidated {
+                            if let Some(v) = &self.vct {
+                                v.prevalidated_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            COMMIT_COMPUTE_POOL.install(|| {
+                                check::block_commitment_is_valid_for_chain_history(
+                                    block.clone(),
+                                    &network,
+                                    &history_tree,
+                                    precomputed_auth_data_root,
+                                )
+                            })?;
+                        }
 
                         // Build the candidate history tree with this block's fixture
                         // roots folded in.
@@ -809,6 +840,12 @@ impl FinalizedState {
                         // checkpoint verifier, so this is cheap. With no successor yet (the
                         // sync tip), commit on the in-arrears check above; the root is
                         // verified when the next block arrives.
+                        //
+                        // This same check is the successor's own commitment check, so on
+                        // success record `(next_height, next_hash)` as pre-validated to
+                        // skip the duplicate next call. Clear it otherwise (no successor,
+                        // or a non-fast/legacy block below).
+                        self.vct_prevalidated_next = None;
                         if let Some((next_block, next_auth)) = &next_checkpoint {
                             COMMIT_COMPUTE_POOL.install(|| {
                                 check::block_commitment_is_valid_for_chain_history(
@@ -818,6 +855,10 @@ impl FinalizedState {
                                     *next_auth,
                                 )
                             })?;
+                            self.vct_prevalidated_next = Some((
+                                (height + 1).expect("checkpoint block heights are valid"),
+                                next_block.hash(),
+                            ));
                         }
 
                         history_tree = candidate;
@@ -826,6 +867,10 @@ impl FinalizedState {
                         }
                         fast_anchor_roots = Some((sapling_root, orchard_root));
                     } else {
+                        // Not a fast block: any cached pre-validation does not apply to
+                        // the next fast block (its parent frontier differs), so clear it.
+                        self.vct_prevalidated_next = None;
+
                         // Legacy / capture path: recompute the note-commitment frontier.
                         //
                         // Run two independent CPU-intensive crypto operations concurrently
@@ -1035,6 +1080,7 @@ impl FinalizedState {
             roots,
             capture: None,
             fast_count: AtomicU64::new(0),
+            prevalidated_count: AtomicU64::new(0),
         }));
     }
 
@@ -1044,6 +1090,16 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .map(|v| v.fast_count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Test-only: number of fast blocks whose own commitment check was skipped by
+    /// the dedup (the previous block's look-ahead already validated them).
+    #[cfg(test)]
+    pub(crate) fn vct_prevalidated_count(&self) -> u64 {
+        self.vct
+            .as_ref()
+            .map(|v| v.prevalidated_count.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
