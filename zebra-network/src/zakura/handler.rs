@@ -5515,7 +5515,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_sync_misbehavior_action_does_not_disconnect_peer() -> Result<(), BoxError> {
+    async fn header_sync_misbehavior_action_is_record_only_and_keeps_connection(
+    ) -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let reactor_shutdown = CancellationToken::new();
         let startup = header_sync_startup(reactor_shutdown.clone());
@@ -5525,7 +5526,10 @@ mod tests {
         let disconnect_token = CancellationToken::new();
         register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
 
-        let (actions_tx, actions_rx) = mpsc::channel(4);
+        // A capacity-1 channel lets the test prove the driver consumed (recorded)
+        // the misbehavior action: the second `send` below only completes once the
+        // driver has drained the first slot, so it doubles as a liveness probe.
+        let (actions_tx, actions_rx) = mpsc::channel(1);
         let driver_shutdown = CancellationToken::new();
         let driver_task = tokio::spawn(drive_header_sync_actions(
             actions_rx,
@@ -5535,17 +5539,41 @@ mod tests {
         ));
         actions_tx
             .send(HeaderSyncAction::Misbehavior {
-                peer,
+                peer: peer.clone(),
                 reason: HeaderSyncMisbehavior::MalformedMessage,
             })
             .await?;
 
+        // Record-only contract: the misbehavior action must NOT cancel the
+        // registered connection. Peer scoring no longer drives disconnects, so the
+        // disconnect token stays uncancelled for the whole bounded window.
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), disconnect_token.cancelled())
+            tokio::time::timeout(Duration::from_millis(200), disconnect_token.cancelled())
                 .await
                 .is_err(),
-            "misbehavior is record-only and must not cancel the registered connection",
+            "a record-only misbehavior action must not cancel the registered connection",
         );
+        assert!(
+            !disconnect_token.is_cancelled(),
+            "the connection stays up after a record-only misbehavior action",
+        );
+
+        // The action was handled and the driver kept running: a second `send` on the
+        // capacity-1 channel only completes once the driver has consumed (recorded)
+        // the misbehavior action and freed the slot. A driver that exited or wedged
+        // on the misbehavior action would never drain it, so this send would time
+        // out. `QueryHeadersByHeightRange` is a benign follow-up the driver answers
+        // without touching this peer's connection.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            actions_tx.send(HeaderSyncAction::QueryHeadersByHeightRange {
+                peer,
+                start: block::Height(1),
+                count: 1,
+            }),
+        )
+        .await
+        .expect("driver keeps consuming actions after recording the misbehavior")?;
 
         driver_shutdown.cancel();
         driver_task.await?;

@@ -2588,9 +2588,22 @@ mod tests {
         .await?;
         malformed.shutdown().await;
 
+        // An unsolicited `Headers` (no recorded `GetHeaders` expectation) no longer
+        // emits a record-only misbehavior ACTION: the routine classifies it as a
+        // hard protocol violation and tears the connection down via the
+        // `SinkReject::Protocol` path, NOT via peer scoring. So assert the teardown
+        // through the connection channel (peer-set removal), not the action list.
         let unsolicited =
             HostilePeer::connect_native_with_capabilities(&victim, 13, ZAKURA_CAP_HEADER_SYNC)
                 .await?;
+        let unsolicited_peer = unsolicited.id()?;
+        let unsolicited_peer_set = victim.supervisor().subscribe();
+        await_until(
+            "unsolicited peer registered",
+            Duration::from_secs(5),
+            || unsolicited_peer_set.borrow().contains(&unsolicited_peer),
+        )
+        .await?;
         let unsolicited_headers =
             headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()])
                 .encode_frame()?;
@@ -2598,23 +2611,9 @@ mod tests {
             .send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, unsolicited_headers)
             .await?;
         await_until(
-            "native header-sync unsolicited headers violation trace",
+            "unsolicited headers protocol-reject disconnects peer",
             Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("11")
-                        .table("header_sync")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some(hs_trace::HEADER_PEER_VIOLATION)
-                                && row.get("reason").and_then(serde_json::Value::as_str)
-                                    == Some("unsolicited_headers")
-                        })
-                })
-            },
+            || !unsolicited_peer_set.borrow().contains(&unsolicited_peer),
         )
         .await?;
         unsolicited.shutdown().await;
@@ -2670,7 +2669,12 @@ mod tests {
         capture.flush().await;
         let reader = capture.reader()?;
         let header_sync = reader.node("11").table("header_sync");
-        header_sync.assert_header_violation("malformed_message");
+        header_sync.assert_header_disconnect("malformed_message");
+        // Unsolicited headers are torn down by the routine's `SinkReject::Protocol`
+        // path, not by peer scoring. The reactor still records the misbehavior (a
+        // violation row, plus a record-only disconnect-requested row that does not
+        // itself cancel anything). The teardown is asserted via the peer-set removal
+        // above and the `closed.neutral`/`cancelled` row below.
         header_sync.assert_header_violation("unsolicited_headers");
         reader.node("11").table("stream").assert_row(
             "accepted",
@@ -3015,6 +3019,13 @@ mod tests {
         )?;
         cluster.start_drivers();
 
+        // An unsolicited `Headers` (no recorded `GetHeaders` expectation) is a hard
+        // protocol violation: the routine classifies it and rejects the peer via the
+        // `SinkReject::Protocol` path, so it no longer emits a record-only misbehavior
+        // ACTION. The synthetic e2e harness has no connection layer to observe the
+        // teardown on, so assert the classification through the recorded
+        // `header_peer_violation` trace row instead of the action-driven disconnect
+        // list.
         let unsolicited = e2e_peer(90);
         cluster.connect_peer(victim, unsolicited.clone()).await;
         cluster.inject(
@@ -3022,9 +3033,28 @@ mod tests {
             unsolicited,
             headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
         );
-        cluster
-            .wait_for_disconnect_reason(victim, HeaderSyncMisbehavior::UnsolicitedHeaders)
-            .await?;
+        await_until(
+            "victim records the unsolicited-headers violation",
+            Duration::from_secs(5),
+            || {
+                capture.reader().is_ok_and(|reader| {
+                    reader
+                        .node("01")
+                        .table("header_sync")
+                        .rows()
+                        .iter()
+                        .any(|row| {
+                            row.get("event").and_then(serde_json::Value::as_str)
+                                == Some(hs_trace::HEADER_PEER_VIOLATION)
+                                && row
+                                    .get(hs_trace::REASON)
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("unsolicited_headers")
+                        })
+                })
+            },
+        )
+        .await?;
 
         let out_of_range = e2e_peer(95);
         cluster.connect_peer(victim, out_of_range.clone()).await;
@@ -3058,24 +3088,29 @@ mod tests {
             .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::GetHeadersSpam)
             .await?;
 
-        let response_too_long = e2e_peer(97);
+        // An over-count `Headers` response is now bounded at DECODE by the correlated
+        // request count: this peer requested count=1 but answers with two headers, so
+        // the response fails to decode and is classified `MalformedMessage`. The
+        // reactor's post-decode `ResponseTooLong` check is unreachable from ingest now
+        // that the routine caps the decode, so assert `MalformedMessage` here.
+        let over_count_response = e2e_peer(97);
         cluster
-            .connect_peer(victim, response_too_long.clone())
+            .connect_peer(victim, over_count_response.clone())
             .await;
-        cluster.inject(victim, response_too_long.clone(), status_for_tip(4, 1, 1));
+        cluster.inject(victim, over_count_response.clone(), status_for_tip(4, 1, 1));
         cluster
-            .wait_for_get_headers(victim, &response_too_long, block::Height(1), 1)
+            .wait_for_get_headers(victim, &over_count_response, block::Height(1), 1)
             .await?;
         cluster.inject(
             victim,
-            response_too_long,
+            over_count_response,
             headers_message(vec![
                 mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                 mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
             ]),
         );
         cluster
-            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::ResponseTooLong)
+            .wait_for_misbehavior_reason(victim, HeaderSyncMisbehavior::MalformedMessage)
             .await?;
 
         let bad_continuity_victim = cluster.spawn_node(
@@ -3206,6 +3241,13 @@ mod tests {
             .wait_for_misbehavior_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
+        // An inbound `GetHeaders` whose requested count exceeds the inbound serving
+        // limit is classified `GetHeadersTooLong`. The count must stay encodable:
+        // `inject` now round-trips the message through `encode_frame`, and a count
+        // above the hard wire cap (`MAX_HS_RANGE` = 4000) would panic at encode
+        // before injection. Use a count that is encodable (<= 4000) yet well over the
+        // default serving limit (the e2e config's `DEFAULT_HS_RANGE` = 1000), so it
+        // still classifies `GetHeadersTooLong` via the routine's serving-count gate.
         let over_cap = e2e_peer(91);
         cluster.connect_peer(victim, over_cap.clone()).await;
         cluster.inject(
@@ -3218,7 +3260,7 @@ mod tests {
             over_cap,
             HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
-                count: 4_001,
+                count: 2_000,
             },
         );
         cluster
@@ -3273,14 +3315,20 @@ mod tests {
         capture.flush().await;
         let reader = capture.reader()?;
         let trace = reader.node("01").table("header_sync");
+        // Unsolicited headers are rejected by the routine's `SinkReject::Protocol`
+        // path, not by peer scoring. The reactor records the misbehavior as a
+        // violation (and a record-only disconnect-requested row); this test asserts
+        // the classification.
         trace.assert_header_violation("unsolicited_headers");
-        trace.assert_header_violation("invalid_range");
-        trace.assert_header_violation("get_headers_spam");
-        trace.assert_header_violation("response_too_long");
-        trace.assert_header_violation("get_headers_too_long");
-        trace.assert_header_violation("status_spam");
-        trace.assert_header_violation("new_block_spam");
-        trace.assert_header_violation("malformed_message");
+        trace.assert_header_disconnect("invalid_range");
+        trace.assert_header_disconnect("get_headers_spam");
+        // The over-count `Headers` response now fails the correlated decode bound and
+        // is classified `malformed_message` (asserted below), so `response_too_long`
+        // is no longer reachable from ingest.
+        trace.assert_header_disconnect("get_headers_too_long");
+        trace.assert_header_disconnect("status_spam");
+        trace.assert_header_disconnect("new_block_spam");
+        trace.assert_header_disconnect("malformed_message");
         for node in ["03", "04", "05", "06"] {
             reader
                 .node(node)

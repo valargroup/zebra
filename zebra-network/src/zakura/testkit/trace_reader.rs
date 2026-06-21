@@ -260,7 +260,13 @@ impl<'a> TraceQuery<'a> {
         );
     }
 
-    /// Assert a header-sync peer violation row with its bounded reason label.
+    /// Assert a recorded peer-violation row with its bounded reason label.
+    ///
+    /// Misbehavior is record-only: a violation is traced and aggregated but does
+    /// not by itself disconnect the peer (peer scoring no longer drives
+    /// disconnects). Use this to assert the violation was classified; assert the
+    /// connection teardown separately for the hard-protocol reasons that still
+    /// disconnect via the routine's `SinkReject::Protocol` path.
     pub fn assert_header_violation(&self, reason: &str) {
         self.assert_row(
             hs_trace::HEADER_PEER_VIOLATION,
