@@ -52,7 +52,7 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
                 }]),
             }]),
             lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
-                address: "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV".to_string(),
+                address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
                 amount: Amount::new(6_250_000),
             }]),
             ..Default::default()
