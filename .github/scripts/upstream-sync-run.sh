@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|write-pr-body>}"
+COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|delete-stale-branch|write-pr-body>}"
 WORK_DIR="${UPSTREAM_SYNC_WORK_DIR:-.github/upstream-sync/work}"
 CANDIDATE_JSON="${UPSTREAM_SYNC_CANDIDATE_JSON:-${WORK_DIR}/candidate.json}"
 RESULT_JSON="${UPSTREAM_SYNC_RESULT_JSON:-${WORK_DIR}/result.json}"
@@ -66,9 +66,62 @@ case "$COMMAND" in
     git apply --3way --index "$PATCH_FILE"
     ;;
 
+  delete-stale-branch)
+    require_file "$RESULT_JSON"
+    BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
+    case "$BRANCH" in
+      upstream-sync/pr-[0-9]*) ;;
+      *)
+        echo "ERROR: refusing to delete non upstream-sync PR branch: $BRANCH" >&2
+        exit 1
+        ;;
+    esac
+
+    if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+      OPEN_PRS="$(
+        gh pr list \
+          --repo "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}" \
+          --state open \
+          --head "$BRANCH" \
+          --json number \
+          --jq 'length'
+      )"
+      if [ "$OPEN_PRS" != "0" ]; then
+        echo "ERROR: refusing to delete $BRANCH because it has an open PR" >&2
+        exit 1
+      fi
+
+      git push origin --delete "$BRANCH"
+      echo "Deleted stale upstream sync branch: $BRANCH"
+    else
+      echo "No stale upstream sync branch to delete: $BRANCH"
+    fi
+    ;;
+
   write-pr-body)
     require_file "$RESULT_JSON"
-    jq -r '.pr_body' "$RESULT_JSON" > "$PR_BODY_FILE"
+    BODY="$(jq -r '.pr_body' "$RESULT_JSON")"
+    CONFIDENCE="$(jq -r '.confidence_percent' "$RESULT_JSON")"
+    RECOMMENDATION="$(
+      jq -r '.recommendation' "$RESULT_JSON" \
+        | tr '\n' ' ' \
+        | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//; s/([.!?]) .*/\1/'
+    )"
+    if [ -z "$RECOMMENDATION" ]; then
+      RECOMMENDATION="Review the generated patch and validation evidence before merging."
+    fi
+    if [ "${#RECOMMENDATION}" -gt 180 ]; then
+      RECOMMENDATION="${RECOMMENDATION:0:177}..."
+    fi
+
+    if printf '%s\n' "$BODY" | head -n 1 | grep -Eq '^AI Confidence: [0-9]+% - .+'; then
+      printf '%s\n' "$BODY" > "$PR_BODY_FILE"
+    else
+      {
+        printf 'AI Confidence: %s%% - %s\n\n' "$CONFIDENCE" "$RECOMMENDATION"
+        printf '%s\n' "$BODY"
+      } > "$PR_BODY_FILE"
+    fi
     TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
     BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
     {

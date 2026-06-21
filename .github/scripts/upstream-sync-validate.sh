@@ -75,6 +75,21 @@ if ! printf '%s\n' "$TITLE" | grep -Eq '^(feat|fix|perf|refactor|build|chore|doc
   exit 1
 fi
 
+require_validation_passed() {
+  local pattern="$1"
+  local description="$2"
+
+  if ! jq -e --arg pattern "$pattern" '
+    any(.validation[]?; (.command | test($pattern)) and .status == "passed")
+  ' "$RESULT_JSON" >/dev/null; then
+    echo "ERROR: validation must include passing ${description}" >&2
+    exit 1
+  fi
+}
+
+require_validation_passed '^cargo fmt --all -- --check$' 'cargo fmt --all -- --check'
+require_validation_passed '^git diff --check$' 'git diff --check'
+
 if ! printf '%s\n' "$BODY" | grep -Eq '^(#{2,6}[[:space:]]+AI Disclosure|\*\*AI Disclosure\*\*|AI Disclosure):?[[:space:]]*$'; then
   echo "ERROR: PR body must include an AI Disclosure section" >&2
   exit 1

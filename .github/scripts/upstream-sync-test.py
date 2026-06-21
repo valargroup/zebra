@@ -41,7 +41,12 @@ def result_for(
         "files_changed": ["docs/upstream-sync/ledger.yml"],
         "validation": [
             {
-                "command": "fixture validator",
+                "command": "cargo fmt --all -- --check",
+                "status": "passed",
+                "output": "fixture",
+            },
+            {
+                "command": "git diff --check",
                 "status": "passed",
                 "output": "fixture",
             }
@@ -68,6 +73,26 @@ def run_validator(output_dir: Path, candidate_path: Path, result: dict[str, obje
         capture_output=True,
         check=False,
     )
+
+
+def write_pr_body(output_dir: Path, result: dict[str, object]) -> str:
+    result_path = output_dir / "result.json"
+    pr_body_path = output_dir / "pr-body.md"
+    github_output_path = output_dir / "github-output.txt"
+    result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["UPSTREAM_SYNC_RESULT_JSON"] = str(result_path)
+    env["UPSTREAM_SYNC_PR_BODY_FILE"] = str(pr_body_path)
+    env["GITHUB_OUTPUT"] = str(github_output_path)
+    subprocess.check_call(
+        [
+            str(ROOT / ".github" / "scripts" / "upstream-sync-run.sh"),
+            "write-pr-body",
+        ],
+        cwd=ROOT,
+        env=env,
+    )
+    return pr_body_path.read_text(encoding="utf-8")
 
 
 def assert_validator_passed(process: subprocess.CompletedProcess[str]) -> None:
@@ -110,10 +135,24 @@ def main() -> int:
     assert candidate["branch_name"] == "upstream-sync/pr-10676"
 
     discover = load_discover_module()
-    assert not discover.blocks_candidate({"branch_exists": True, "pull_requests": []})
-    assert not discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "CLOSED"}]})
+    assert not discover.blocks_candidate(
+        {"branch_exists": True, "pull_requests": [], "head_pull_requests": []}
+    )
+    assert not discover.blocks_candidate(
+        {
+            "branch_exists": False,
+            "pull_requests": [{"state": "CLOSED"}],
+            "head_pull_requests": [{"state": "CLOSED"}],
+        }
+    )
     assert discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "OPEN"}]})
     assert discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "MERGED"}]})
+    assert discover.blocks_candidate(
+        {"branch_exists": True, "pull_requests": [], "head_pull_requests": [{"state": "OPEN"}]}
+    )
+    assert discover.blocks_candidate(
+        {"branch_exists": True, "pull_requests": [], "head_pull_requests": [{"state": "MERGED"}]}
+    )
 
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]
@@ -134,7 +173,11 @@ def main() -> int:
         ]
     )
 
-    assert_validator_passed(run_validator(output_dir, candidate_path, result_for(candidate, valid_body)))
+    valid_result = result_for(candidate, valid_body)
+    assert_validator_passed(run_validator(output_dir, candidate_path, valid_result))
+
+    pr_body = write_pr_body(output_dir, valid_result)
+    assert pr_body.startswith("AI Confidence: 90% - Open a draft PR for human review.\n\n")
 
     missing_pr_marker_body = valid_body.replace(f"{upstream_pr_marker}\n", "")
     assert_validator_failed(
@@ -152,6 +195,19 @@ def main() -> int:
     assert_validator_failed(
         run_validator(output_dir, candidate_path, result_for(candidate, valid_body, branch_name=wrong_branch)),
         f"result branch_name {wrong_branch} does not match candidate {candidate['branch_name']}",
+    )
+
+    missing_fmt_result = result_for(candidate, valid_body)
+    missing_fmt_result["validation"] = [
+        {
+            "command": "git diff --check",
+            "status": "passed",
+            "output": "fixture",
+        }
+    ]
+    assert_validator_failed(
+        run_validator(output_dir, candidate_path, missing_fmt_result),
+        "validation must include passing cargo fmt --all -- --check",
     )
 
     subprocess.check_call(["rm", "-rf", str(output_dir)])
