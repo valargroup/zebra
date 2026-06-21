@@ -38,6 +38,13 @@ if [ -n "$CANDIDATE_JSON" ]; then
     exit 1
   fi
 
+  EXPECTED_BRANCH="$(jq -r '.branch_name' "$CANDIDATE_JSON")"
+  ACTUAL_BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
+  if [ "$EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ]; then
+    echo "ERROR: result branch_name ${ACTUAL_BRANCH} does not match candidate ${EXPECTED_BRANCH}" >&2
+    exit 1
+  fi
+
   EXPECTED_PR_MARKER="$(jq -r '.body_markers.upstream_pr // "Upstream-Zebra-PR: \(.source_pr)"' "$CANDIDATE_JSON")"
   EXPECTED_MERGE_MARKER="$(jq -r '.body_markers.upstream_merge // (if .source_merge_commit then "Upstream-Zebra-Merge: \(.source_merge_commit)" else "" end)' "$CANDIDATE_JSON")"
 else

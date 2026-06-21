@@ -13,13 +13,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def result_for(candidate: dict[str, object], body: str) -> dict[str, object]:
+def result_for(
+    candidate: dict[str, object],
+    body: str,
+    *,
+    branch_name: str | None = None,
+) -> dict[str, object]:
     return {
         "status": "applied",
         "source_pr": candidate["source_pr"],
         "confidence_percent": 90,
         "recommendation": "Open a draft PR for human review.",
-        "branch_name": candidate["branch_name"],
+        "branch_name": branch_name or candidate["branch_name"],
         "pr_title": "fix(state): adapt upstream test fixes",
         "pr_body": body,
         "files_changed": ["docs/upstream-sync/ledger.yml"],
@@ -124,6 +129,12 @@ def main() -> int:
     assert_validator_failed(
         run_validator(output_dir, candidate_path, result_for(candidate, wrong_merge_marker_body)),
         f"PR body must include {upstream_merge_marker}",
+    )
+
+    wrong_branch = "adam/upstream-pr-10604"
+    assert_validator_failed(
+        run_validator(output_dir, candidate_path, result_for(candidate, valid_body, branch_name=wrong_branch)),
+        f"result branch_name {wrong_branch} does not match candidate {candidate['branch_name']}",
     )
 
     subprocess.check_call(["rm", "-rf", str(output_dir)])
