@@ -103,11 +103,12 @@ fn check_parameters_impl() {
 /// heights are what's expected.
 #[test]
 fn activates_network_upgrades_correctly() {
-    let expected_activation_height = 1;
+    let expected_nu6_3_activation_height = 1;
+    let expected_nu7_activation_height = 2;
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
-            nu6_3: Some(expected_activation_height),
-            nu7: Some(expected_activation_height),
+            nu6_3: Some(expected_nu6_3_activation_height),
+            nu7: Some(expected_nu7_activation_height),
             ..Default::default()
         })
         .expect("failed to set activation heights")
@@ -126,6 +127,11 @@ fn activates_network_upgrades_correctly() {
     );
 
     for nu in NetworkUpgrade::iter().skip(1) {
+        let expected_activation_height = match nu {
+            NetworkUpgrade::Nu7 => expected_nu7_activation_height,
+            _ => expected_nu6_3_activation_height,
+        };
+
         let activation_height = nu
             .activation_height(&network)
             .expect("must return an activation height");
@@ -753,4 +759,36 @@ fn temporary_orchard_disabling_soft_fork_heights() {
         None,
     );
     assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
+}
+
+/// Checks the canonical proof-size rule activation boundary.
+#[test]
+fn orchard_canonical_proof_size_rule_activation() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_nu6_2_height = NetworkUpgrade::Nu6_2
+        .activation_height(&Network::Mainnet)
+        .expect("mainnet NU6.2 activation height is configured");
+    assert!(!Network::Mainnet.orchard_canonical_proof_size_rule_active(
+        (mainnet_nu6_2_height - 1).expect("NU6.2 is not genesis"),
+    ));
+    assert!(Network::Mainnet.orchard_canonical_proof_size_rule_active(mainnet_nu6_2_height));
+
+    let nu6_3_height = Height(10);
+    let nu6_3_only_network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(nu6_3_height.0),
+            ..Default::default()
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    assert!(
+        !nu6_3_only_network.orchard_canonical_proof_size_rule_active(
+            (nu6_3_height - 1).expect("NU6.3 is not genesis")
+        )
+    );
+    assert!(nu6_3_only_network.orchard_canonical_proof_size_rule_active(nu6_3_height));
 }

@@ -368,6 +368,7 @@ pub struct ConfiguredActivationHeights {
     #[serde(rename = "NU6.2")]
     pub nu6_2: Option<u32>,
     /// Activation height for `NU6.3` network upgrade.
+    #[serde(rename = "NU6.3")]
     pub nu6_3: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
