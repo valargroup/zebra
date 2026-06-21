@@ -329,6 +329,7 @@ fn mock_transparent_transaction(
             expiry_height,
             sapling_shielded_data: None,
             orchard_shielded_data: None,
+            ironwood_shielded_data: None,
             network_upgrade,
         },
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),
@@ -358,7 +359,7 @@ fn sanitize_transaction_version(
             Overwinter => 3,
             Sapling | Blossom | Heartwood | Canopy => 4,
             // FIXME: Use 6 for NU6.3
-            Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => 5,
+            Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => 5,
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => u8::MAX,
