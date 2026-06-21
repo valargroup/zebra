@@ -55,6 +55,7 @@ fi
 TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
 BODY="$(jq -r '.pr_body' "$RESULT_JSON")"
 BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
+STATUS="$(jq -r '.status' "$RESULT_JSON")"
 
 case "$TITLE" in
   *$'\n'*|*$'\r'*)
@@ -87,8 +88,10 @@ require_validation_passed() {
   fi
 }
 
-require_validation_passed '^cargo fmt --all -- --check$' 'cargo fmt --all -- --check'
-require_validation_passed '^git diff --check$' 'git diff --check'
+if [ "$STATUS" = "applied" ]; then
+  require_validation_passed '^cargo fmt --all -- --check$' 'cargo fmt --all -- --check'
+  require_validation_passed '^git diff --check$' 'git diff --check'
+fi
 
 if ! printf '%s\n' "$BODY" | grep -Eq '^(#{2,6}[[:space:]]+AI Disclosure|\*\*AI Disclosure\*\*|AI Disclosure):?[[:space:]]*$'; then
   echo "ERROR: PR body must include an AI Disclosure section" >&2

@@ -29,17 +29,20 @@ def result_for(
     body: str,
     *,
     branch_name: str | None = None,
+    status: str = "applied",
+    validation: list[dict[str, object]] | None = None,
+    recommendation: str = "Open a draft PR for human review.",
 ) -> dict[str, object]:
     return {
-        "status": "applied",
+        "status": status,
         "source_pr": candidate["source_pr"],
         "confidence_percent": 90,
-        "recommendation": "Open a draft PR for human review.",
+        "recommendation": recommendation,
         "branch_name": branch_name or candidate["branch_name"],
         "pr_title": "fix(state): adapt upstream test fixes",
         "pr_body": body,
         "files_changed": ["docs/upstream-sync/ledger.yml"],
-        "validation": [
+        "validation": validation if validation is not None else [
             {
                 "command": "cargo fmt --all -- --check",
                 "status": "passed",
@@ -209,6 +212,9 @@ def main() -> int:
         run_validator(output_dir, candidate_path, missing_fmt_result),
         "validation must include passing cargo fmt --all -- --check",
     )
+
+    no_edit_result = result_for(candidate, valid_body, status="needs_human", validation=[])
+    assert_validator_passed(run_validator(output_dir, candidate_path, no_edit_result))
 
     subprocess.check_call(["rm", "-rf", str(output_dir)])
     print("OK: fixture discovery selects upstream PR 10676")
