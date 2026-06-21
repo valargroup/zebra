@@ -1057,7 +1057,15 @@ where
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
-            (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
+            // `HedgedBlocksByHash` is rewritten to `BlocksByHash` by the peer set
+            // and should not reach an individual connection, but handle it
+            // identically as a defensive fallback.
+            (
+                AwaitingRequest,
+                BlocksByHash(hashes)
+                | BlocksByHashFrom { hashes, .. }
+                | HedgedBlocksByHash { hashes, .. },
+            ) => {
                 self
                     .peer_tx
                     .send(Message::GetData(

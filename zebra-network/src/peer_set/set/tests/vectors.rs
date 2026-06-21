@@ -695,3 +695,81 @@ fn peer_set_route_inv_all_missing_fail() {
         );
     });
 }
+
+/// Check that a hedged block request still reaches ready peers that are all marked
+/// missing the inventory, where a plain `BlocksByHash` would fail with a synthetic
+/// `NotFoundRegistry`. This is the stale-inventory-marker bypass the head-of-line
+/// hedge relies on.
+#[test]
+fn peer_set_route_hedge_bypasses_missing_markers() {
+    let test_hash = block::Hash([0; 32]);
+    let test_inv = InventoryHash::Block(test_hash);
+
+    // Hard-coded fixed test addresses created by mock_peer_discovery.
+    let peer_addrs: [PeerSocketAddr; 2] = [
+        "127.0.0.1:1".parse().expect("valid peer address"),
+        "127.0.0.1:2".parse().expect("valid peer address"),
+    ];
+
+    // Use two peers with the same version.
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+
+    // CORRECTNESS: This test does not depend on external resources that could really timeout.
+    tokio::time::pause();
+
+    let (discovered_peers, mut handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    assert_eq!(handles.len(), 2);
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        // Mark the inventory as missing for both peers, so plain inventory routing
+        // would fail the request.
+        for addr in peer_addrs {
+            peer_set_guard
+                .inventory_sender()
+                .as_mut()
+                .expect("unexpected missing inv sender")
+                .send(InventoryStatus::new_missing(test_inv, addr))
+                .expect("unexpected dropped receiver");
+        }
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+
+        assert_eq!(peer_ready.ready_services.len(), 2);
+
+        // Hedge the request to both ready peers, ignoring the missing markers.
+        let hedged_request = Request::HedgedBlocksByHash {
+            hashes: iter::once(test_hash).collect(),
+            fanout: 2,
+        };
+        let _fut = peer_ready.call(hedged_request);
+
+        // Both missing-marked peers must receive the rewritten plain `BlocksByHash`
+        // request, proving the hedge bypassed the stale markers (`route_inv` would
+        // have dispatched to neither — see `peer_set_route_inv_all_missing_fail`).
+        let expected = Request::BlocksByHash(iter::once(test_hash).collect());
+        for handle in handles.iter_mut() {
+            match handle.try_to_receive_outbound_client_request().request() {
+                Some(ClientRequest { request, .. }) => assert_eq!(request, expected),
+                None => panic!("hedged request was not routed to a ready (missing-marked) peer"),
+            }
+        }
+    });
+}
