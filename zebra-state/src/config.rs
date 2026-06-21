@@ -110,6 +110,16 @@ pub struct Config {
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
+    /// POC: skip the per-block note-commitment frontier recompute below the last
+    /// checkpoint, folding fixture-supplied roots into the anchor set and history
+    /// tree instead (see `docs/design/verified-commitment-trees-poc.md`).
+    ///
+    /// Default off. This is an experiment behind a flag; it trusts a recorded
+    /// fixture (path in `VCT_FIXTURE`) and is NOT shippable. `serde(skip)`
+    /// so it is not a user-facing setting.
+    #[serde(skip)]
+    pub enable_verified_commitment_trees: bool,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -402,6 +412,7 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             enable_zakura_header_seed_from_committed_blocks: false,
+            enable_verified_commitment_trees: false,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
