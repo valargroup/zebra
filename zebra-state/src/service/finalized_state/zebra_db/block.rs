@@ -46,7 +46,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, FAST_SYNC_METADATA, PRUNING_METADATA,
     },
     HashOrHeight,
 };
@@ -726,6 +726,42 @@ impl ZebraDb {
         self.lowest_retained_height().is_some()
     }
 
+    // Verified-commitment-trees fast-sync methods
+
+    /// Returns the checkpoint handoff height of a verified-commitment-trees
+    /// fast-synced database: the lowest height at which a per-height
+    /// note-commitment tree is present.
+    ///
+    /// Per-height note-commitment trees are absent for every non-genesis height
+    /// strictly below this height (they were never written by the fast path).
+    /// Returns `None` if the database was synced normally (it has per-height trees
+    /// for all heights below the tip).
+    pub fn fast_synced_below(&self) -> Option<Height> {
+        let fast_sync_metadata = self.db.cf_handle(FAST_SYNC_METADATA)?;
+        self.db.zs_get(&fast_sync_metadata, &())
+    }
+
+    /// Returns `true` if the database was built by the verified-commitment-trees
+    /// fast path, and therefore lacks per-height note-commitment trees below the
+    /// handoff height. Like pruning, this is a one-way state.
+    pub fn is_fast_synced(&self) -> bool {
+        self.fast_synced_below().is_some()
+    }
+
+    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
+    /// whose per-height note-commitment tree is unavailable because this is a
+    /// fast-synced database (the tree below the checkpoint handoff height was
+    /// never written). Read-request handlers use this to return an archive-mode
+    /// error instead of a misleading "not found".
+    pub fn fast_synced_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
+        let Some(boundary) = self.fast_synced_below() else {
+            return false;
+        };
+        hash_or_height
+            .height_or_else(|hash| self.height(hash))
+            .is_some_and(|height| height < boundary)
+    }
+
     /// Returns the half-open range of block heights `[from, until)` whose raw
     /// transaction data should be pruned when committing a block at `new_tip`,
     /// given the configured `retention` window. Returns `None` if there is
@@ -799,6 +835,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
@@ -809,6 +846,9 @@ impl ZebraDb {
         // POC: when `Some`, skip per-height tree writes and fold these roots into
         // the anchor set instead (verified-commitment-trees fast path).
         fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        // POC verified-commitment-trees: when `Some(handoff)`, mark the database as
+        // fast-synced (per-height note-commitment trees absent below `handoff`).
+        fast_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -964,6 +1004,7 @@ impl ZebraDb {
             prev_note_commitment_trees,
             retention.stores_raw_transactions(),
             fast_anchor_roots,
+            fast_sync_below,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1287,6 +1328,7 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        fast_sync_below: Option<Height>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1307,6 +1349,7 @@ impl DiskWriteBatch {
             finalized,
             prev_note_commitment_trees,
             fast_anchor_roots,
+            fast_sync_below,
         );
 
         // # Consensus
