@@ -1,4 +1,7 @@
-use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
+use super::{
+    config::*, error::*, events::*, scheduler::*, service::HeaderSyncPeerCommand, state::*,
+    validation::*, wire::*, *,
+};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
     ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
@@ -41,6 +44,10 @@ pub fn spawn_header_sync_reactor(
         tip: tip_rx,
         peers: peers_rx,
         candidates: candidates_rx,
+        // Hand routines a clone of the shared range queue so they can pull
+        // `GetHeaders` work directly; the reactor produces work into the same
+        // queue via `schedule()`/`mark_covered`/reset.
+        schedule: state.schedule.clone(),
     };
     let reactor = HeaderSyncReactor {
         startup,
@@ -159,6 +166,26 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::PeerStatusUpdated { peer, status } => {
                 self.handle_peer_status_updated(peer, status).await;
+            }
+            HeaderSyncEvent::PeerWorkAssigned {
+                peer,
+                generation,
+                start_height,
+                count,
+                anchor_hash,
+                finalized,
+                forward,
+            } => {
+                self.handle_peer_work_assigned(
+                    peer,
+                    generation,
+                    start_height,
+                    count,
+                    anchor_hash,
+                    finalized,
+                    forward,
+                )
+                .await;
             }
             HeaderSyncEvent::PeerHeadersReceived {
                 peer,
@@ -396,6 +423,7 @@ impl HeaderSyncReactor {
 
         self.state.parked_peers.remove(&peer);
         self.state.schedule.forget_peer(&peer);
+        let generation = session.generation();
         let status_refresh_interval = self.startup.status_refresh_interval;
         self.state
             .peers
@@ -403,11 +431,13 @@ impl HeaderSyncReactor {
             .and_modify(|peer_state| {
                 peer_state.session = session.clone();
                 peer_state.direction = direction;
-                // A new transport replaces the old one; its remote has received
-                // no status yet, so the initial status below must always be sent.
-                // Outstanding requests and inbound serving counts are also
-                // session-local: responses for the old stream cannot satisfy
-                // work sent on this fresh stream.
+                // A new transport replaces the old one; mint its generation so a
+                // late timeout/teardown of the previous session cannot disturb this
+                // one. Its remote has received no status yet, so the initial status
+                // below must always be sent. Outstanding requests and inbound
+                // serving counts are also session-local: responses for the old
+                // stream cannot satisfy work sent on this fresh stream.
+                peer_state.generation = generation;
                 peer_state.received_status = false;
                 peer_state.reset_sent_status();
                 peer_state.outstanding.clear();
@@ -421,6 +451,7 @@ impl HeaderSyncReactor {
             .or_insert_with(|| {
                 PeerHeaderState::new(
                     session,
+                    generation,
                     self.state.anchor,
                     self.startup.config.advertised_max_headers_per_response(),
                     self.startup.config.advertised_max_inflight_requests(),
@@ -917,7 +948,6 @@ impl HeaderSyncReactor {
 
         if headers.is_empty() {
             self.record_advisory_unconfirmed(&peer);
-            let deadline = Instant::now() + self.empty_headers_retry_delay();
             self.trace_headers_received(
                 &peer,
                 outstanding.range.start_height,
@@ -926,13 +956,11 @@ impl HeaderSyncReactor {
                 peer_max_headers_per_response,
                 in_flight_count,
             );
-            if let Some(peer_state) = self.state.peers.get_mut(&peer) {
-                peer_state.outstanding.push(OutstandingRange {
-                    deadline,
-                    clear_assignment_on_timeout: true,
-                    ..outstanding
-                });
-            }
+            // The reactor already popped this outstanding range. The empty-response
+            // re-fan is owned by the routine now: it returned the range to the
+            // shared queue (clearing this peer's assignment) and armed its own
+            // short retry window before re-pulling. The reactor only drops its
+            // outstanding bookkeeping here.
             return;
         }
 
@@ -1103,7 +1131,12 @@ impl HeaderSyncReactor {
         metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
 
         self.state.stale_anchor.reset();
-        self.state.schedule.clear_forward();
+        // Reanchor re-bases the best-header target down to the verified tip; drop
+        // every forward range above the new target so it is re-derived from the
+        // verified tip on the next `schedule()`. Reanchor only fires while
+        // `best_header_tip > verified_block_tip`, so all forward work is above the
+        // new target — this clears the same set the old `clear_forward()` did.
+        self.state.schedule.reset_above(height);
         self.state
             .pending_commits
             .retain(|_, range| range.priority != RangePriority::Forward);
@@ -1113,23 +1146,47 @@ impl HeaderSyncReactor {
 
     async fn handle_timeouts(&mut self) {
         let now = Instant::now();
+        // Collect (peer, generation, range) for every expired outstanding request,
+        // remembering the session so the range is returned under its generation and
+        // its routine is told to drop the matching expectation.
         let mut timed_out = Vec::new();
-        for peer in self.state.peers.values_mut() {
+        for (peer_id, peer) in self.state.peers.iter_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if peer.outstanding[index].deadline <= now {
                     let outstanding = peer.outstanding.remove(index);
-                    timed_out.push((outstanding.range, outstanding.clear_assignment_on_timeout));
+                    timed_out.push((peer_id.clone(), outstanding));
                 } else {
                     index += 1;
                 }
             }
         }
-        for (range, clear_assignment) in timed_out {
-            if clear_assignment {
-                self.state.schedule.clear_assignment(range);
+        for (peer_id, outstanding) in timed_out {
+            metrics::counter!("sync.header.request.timed_out").increment(1);
+            // Return the range to the shared queue under the requesting session's
+            // generation so it re-fans to another peer; the generation guard means a
+            // stale return cannot disturb a reconnected session's live work.
+            self.state.schedule.return_work(
+                &peer_id,
+                outstanding.generation,
+                outstanding.range,
+                ReturnReason::Timeout,
+            );
+            // Tell the routine to drop the stale expectation and free its slot so it
+            // can pull fresh work. The reactor stays the single timeout authority;
+            // the routine only owns its local FIFO. Best-effort: a missing/closed
+            // routine self-heals (a superseded session is irrelevant).
+            if let Some(peer_state) = self.state.peers.get(&peer_id) {
+                if peer_state.generation == outstanding.generation {
+                    let _ = peer_state.session.try_send_command(
+                        HeaderSyncPeerCommand::DropExpectation {
+                            generation: outstanding.generation,
+                            start_height: outstanding.range.start_height,
+                            count: outstanding.expected_max_count,
+                        },
+                    );
+                }
             }
-            self.state.schedule.retry(range);
         }
         self.schedule().await;
     }
@@ -1138,6 +1195,16 @@ impl HeaderSyncReactor {
         self.startup.request_timeout.min(EMPTY_HEADERS_RETRY_DELAY)
     }
 
+    /// Produce outbound header work into the shared range queue and wake parked
+    /// routines.
+    ///
+    /// As of the routine-pulled-work chunk, the reactor no longer chooses a peer or
+    /// sends `GetHeaders` itself: it refreshes the forward/backward target ranges
+    /// from the current frontier and lets each per-peer routine pull eligible work
+    /// from the shared queue, send the request on its own stream, and record the
+    /// expected response locally. `SharedHeaderRangeQueue::ensure_*` already wakes
+    /// routines; the explicit `wake()` covers the no-new-range case where only a
+    /// peer's status/slot changed.
     async fn schedule(&mut self) {
         if !self.startup.range_state_actions_enabled {
             return;
@@ -1145,80 +1212,72 @@ impl HeaderSyncReactor {
 
         self.state.refresh_forward_range(&self.startup);
         self.state.refresh_backward_range(&self.startup);
+        self.state.schedule.wake();
+    }
 
-        let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
-        peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-
-        for peer_id in peer_ids {
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
+    /// Record the outstanding range a peer routine just requested.
+    ///
+    /// The routine performed the assignment (narrow/clamp/`mark_assigned`) under
+    /// the shared-queue lock and recorded its own expected `Headers` before sending
+    /// `GetHeaders`; this only records the matching [`OutstandingRange`] so the
+    /// reactor's timeout, covered-range, and commit machinery stay reactor-owned.
+    /// The deadline is computed reactor-side (the reactor remains the single
+    /// timeout authority). A `PeerWorkAssigned` for an unknown or generation-stale
+    /// session is dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_peer_work_assigned(
+        &mut self,
+        peer: ZakuraPeerId,
+        generation: u64,
+        start_height: block::Height,
+        count: u32,
+        anchor_hash: block::Hash,
+        finalized: bool,
+        forward: bool,
+    ) {
+        let priority = if forward {
+            RangePriority::Forward
+        } else {
+            RangePriority::Backward
+        };
+        let range = RangeRequest {
+            start_height,
+            count,
+            anchor_hash,
+            finalized,
+            priority,
+        };
+        let peer_cap = {
+            let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+                return;
             };
-            if !peer.received_status || peer.available_slots() == 0 {
-                continue;
+            if peer_state.generation != generation {
+                // A request from a superseded session; its work belongs to the old
+                // generation in the shared queue and will be cleaned up there.
+                return;
             }
-
-            let Some(mut range) = self.state.schedule.next_for_peer(&peer_id, peer) else {
-                continue;
-            };
-            let original_range = range;
-
-            let count = clamp_header_sync_request_count(
-                range.count,
-                peer.max_headers_per_response,
-                &self.startup.network,
-                self.startup.max_frame_bytes,
-            );
-            if range.finalized && count < range.count {
-                self.state.schedule.retry(range);
-                continue;
-            }
-            range.count = count;
-            self.state
-                .schedule
-                .narrow_queued_range(original_range, range);
-
-            let peer_cap = peer.max_headers_per_response;
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
-            };
-            if let Err(error) = peer.session.try_send_get_headers(range.start_height, count) {
-                tracing::debug!(
-                    peer = ?peer_id,
-                    start_height = ?range.start_height,
-                    count,
-                    ?error,
-                    "failed to queue Zakura header-sync GetHeaders"
-                );
-                self.state.schedule.retry(range);
-                continue;
-            }
-
             let deadline = Instant::now() + self.startup.request_timeout;
-            let outstanding = OutstandingRange {
+            peer_state.outstanding.push(OutstandingRange {
                 range,
                 deadline,
                 expected_max_count: count,
-                clear_assignment_on_timeout: false,
-            };
-            if let Some(peer) = self.state.peers.get_mut(&peer_id) {
-                peer.outstanding.push(outstanding);
-            }
-            self.state.schedule.mark_assigned(peer_id.clone(), range);
-            let destination = peer_id.clone();
-            metrics::counter!("sync.header.request.sent").increment(1);
-            self.trace_get_headers_sent(&destination, range.start_height, count, peer_cap);
-            #[cfg(test)]
-            let _ = self
-                .actions
-                .send(HeaderSyncAction::SendMessage {
-                    peer: destination,
-                    msg: HeaderSyncMessage::GetHeaders {
-                        start_height: range.start_height,
-                        count,
-                    },
-                })
-                .await;
-        }
+                generation,
+            });
+            peer_state.max_headers_per_response
+        };
+        metrics::counter!("sync.header.request.sent").increment(1);
+        self.trace_get_headers_sent(&peer, start_height, count, peer_cap);
+        #[cfg(test)]
+        let _ = self
+            .actions
+            .send(HeaderSyncAction::SendMessage {
+                peer,
+                msg: HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                },
+            })
+            .await;
     }
 
     fn send_status(&mut self, peer: &ZakuraPeerId) {
@@ -1427,6 +1486,17 @@ impl HeaderSyncReactor {
                 insert_height(row, hs_trace::HEIGHT, status.tip_height);
                 insert_hash(row, hs_trace::HASH, status.tip_hash);
                 insert_height(row, hs_trace::RANGE_START, status.anchor_height);
+            }
+            HeaderSyncEvent::PeerWorkAssigned {
+                peer,
+                start_height,
+                count,
+                ..
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("peer_work_assigned"));
+                insert_peer(row, hs_trace::PEER, peer);
+                insert_height(row, hs_trace::RANGE_START, *start_height);
+                insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
             }
             HeaderSyncEvent::PeerHeadersReceived { peer, headers, .. } => {
                 insert_optional_str(row, hs_trace::KIND, Some("peer_headers_received"));
@@ -1865,30 +1935,41 @@ impl HeaderSyncReactor {
     }
 
     fn cancel_covered_outstanding(&mut self) {
-        for peer in self.state.peers.values_mut() {
-            let mut index = 0;
-            while index < peer.outstanding.len() {
-                if self
-                    .state
-                    .schedule
-                    .is_covered(peer.outstanding[index].range)
-                {
-                    peer.outstanding.remove(index);
-                    peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
-                } else {
-                    index += 1;
-                }
-            }
-        }
+        let covered = self.state.schedule.clone();
+        Self::cancel_outstanding_matching(&mut self.state.peers, |range| covered.is_covered(range));
     }
 
     fn cancel_forward_outstanding(&mut self) {
-        for peer in self.state.peers.values_mut() {
+        Self::cancel_outstanding_matching(&mut self.state.peers, |range| {
+            range.priority == RangePriority::Forward
+        });
+    }
+
+    /// Remove every outstanding range matching `predicate` from each peer, bump its
+    /// late-covered credit so a late in-flight response is absorbed rather than
+    /// treated as unsolicited, and tell that peer's routine to drop the matching
+    /// expectation and free its outbound slot (generation-scoped) so it can pull
+    /// fresh work. Without the `DropExpectation` the routine's slot would stay
+    /// occupied by a range the reactor already covered, stalling its next pull.
+    fn cancel_outstanding_matching(
+        peers: &mut HashMap<ZakuraPeerId, PeerHeaderState>,
+        predicate: impl Fn(RangeRequest) -> bool,
+    ) {
+        for peer in peers.values_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
-                if peer.outstanding[index].range.priority == RangePriority::Forward {
-                    peer.outstanding.remove(index);
+                if predicate(peer.outstanding[index].range) {
+                    let outstanding = peer.outstanding.remove(index);
                     peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
+                    if peer.generation == outstanding.generation {
+                        let _ =
+                            peer.session
+                                .try_send_command(HeaderSyncPeerCommand::DropExpectation {
+                                    generation: outstanding.generation,
+                                    start_height: outstanding.range.start_height,
+                                    count: outstanding.expected_max_count,
+                                });
+                    }
                 } else {
                     index += 1;
                 }

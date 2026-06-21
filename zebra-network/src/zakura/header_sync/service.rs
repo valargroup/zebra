@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
@@ -28,11 +31,22 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
     &HEADER_SYNC_SERVICE_STREAMS
 }
 
+/// Mint a fresh, process-monotone header-sync session generation. Each admitted
+/// transport gets a unique generation so reconnect/timeout/reset cleanup can be
+/// scoped to the exact session that owns the work.
+fn next_header_sync_generation() -> u64 {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Cloneable typed stream-5 sender and peer-local response expectations.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
+    /// Session generation, minted once per admitted transport. Carried so the
+    /// reactor can tag this session's `PeerHeaderState` and outstanding work.
+    generation: u64,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
 
@@ -47,11 +61,13 @@ impl HeaderSyncPeerSession {
     fn new_with_commands(
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
+        generation: u64,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             session.peer_id().clone(),
             direction,
+            generation,
             session.sender(),
             session.cancel_token(),
             Some(commands),
@@ -74,13 +90,42 @@ impl HeaderSyncPeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(peer_id, direction, send, cancel_token, None)
+        Self::from_parts_with_direction_and_commands(
+            peer_id,
+            direction,
+            0,
+            send,
+            cancel_token,
+            None,
+        )
     }
 
+    /// Test-only constructor that wires a routine command channel and generation,
+    /// so a fixture can spawn a real routine and feed it reactor `DropExpectation`
+    /// commands.
     #[cfg(test)]
+    pub(crate) fn from_parts_with_commands(
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        generation: u64,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+        commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
+    ) -> Self {
+        Self::from_parts_with_direction_and_commands(
+            peer_id,
+            direction,
+            generation,
+            send,
+            cancel_token,
+            Some(commands),
+        )
+    }
+
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
+        generation: u64,
         send: FramedSend,
         cancel_token: CancellationToken,
         commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
@@ -88,6 +133,7 @@ impl HeaderSyncPeerSession {
         Self {
             peer_id,
             direction,
+            generation,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -96,23 +142,9 @@ impl HeaderSyncPeerSession {
         }
     }
 
-    #[cfg(not(test))]
-    fn from_parts_with_direction_and_commands(
-        peer_id: ZakuraPeerId,
-        direction: ServicePeerDirection,
-        send: FramedSend,
-        cancel_token: CancellationToken,
-        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
-    ) -> Self {
-        Self {
-            peer_id,
-            direction,
-            inner: Arc::new(HeaderSyncPeerSessionInner {
-                send,
-                cancel_token,
-                commands,
-            }),
-        }
+    /// Session generation minted when this transport was admitted.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Authenticated peer identity for this header-sync session.
@@ -135,28 +167,36 @@ impl HeaderSyncPeerSession {
         self.try_send_message(HeaderSyncMessage::Status(status))
     }
 
-    /// Send a typed header range request and record the expected response after queueing succeeds.
+    /// Send a typed header range request.
+    ///
+    /// As of the routine-pulled-work chunk, the requesting routine records its
+    /// expected `Headers` response in its own local FIFO before calling this — the
+    /// session no longer records expectations through a command channel.
     pub fn try_send_get_headers(
         &self,
         start_height: block::Height,
         count: u32,
     ) -> Result<(), OrderedSendError> {
-        let expected = ExpectedHeadersResponse::new(start_height, count)
+        // Validate the count bound exactly as before so an out-of-range request is
+        // rejected at the seam rather than encoded onto the wire.
+        ExpectedHeadersResponse::new(start_height, count)
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        if let Some(commands) = &self.inner.commands {
-            self.try_send_message(HeaderSyncMessage::GetHeaders {
-                start_height,
-                count,
-            })?;
-            return commands
-                .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-                .map_err(|_| OrderedSendError::Closed);
-        }
-
         self.try_send_message(HeaderSyncMessage::GetHeaders {
             start_height,
             count,
         })
+    }
+
+    /// Send a control command to this peer's routine over the per-session command
+    /// channel. Returns `false` if there is no live routine (test sessions) or the
+    /// channel is closed; the reactor treats a failed send as a benign no-op since
+    /// the only command, `DropExpectation`, self-heals (the routine drops it on its
+    /// own response/teardown).
+    pub(crate) fn try_send_command(&self, command: HeaderSyncPeerCommand) -> bool {
+        self.inner
+            .commands
+            .as_ref()
+            .is_some_and(|commands| commands.send(command).is_ok())
     }
 
     /// Send a typed header range response.
@@ -197,11 +237,22 @@ impl HeaderSyncPeerSession {
     }
 }
 
-/// Commands from shared scheduling state into one peer-owned header-sync pipe.
-#[derive(Debug)]
+/// Commands from the reactor into one peer-owned header-sync routine.
+#[derive(Copy, Clone, Debug)]
 pub(crate) enum HeaderSyncPeerCommand {
-    /// Record an expected `Headers` response after `GetHeaders` was queued.
-    RecordExpectedHeaders(ExpectedHeadersResponse),
+    /// The reactor timed out an outstanding request for this session and returned
+    /// the range to the shared queue. The routine drops the matching expectation
+    /// (front of its FIFO, if its generation matches) and frees its outbound slot
+    /// so it can pull fresh work. Idempotent: a no-op if the response already
+    /// arrived and the expectation was popped.
+    DropExpectation {
+        /// Session generation the timed-out request belonged to.
+        generation: u64,
+        /// First requested height of the timed-out range.
+        start_height: block::Height,
+        /// Requested count of the timed-out range.
+        count: u32,
+    },
 }
 
 /// Pump actor actions that can be satisfied at the transport/service seam.
@@ -350,8 +401,16 @@ impl Service for HeaderSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let header_sync_session =
-            HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
+        // Mint a fresh session generation so the reactor and the shared range queue
+        // can scope timeout/return/reset cleanup to this exact transport — an older
+        // session's stale teardown can never disturb this one's live work.
+        let generation = next_header_sync_generation();
+        let header_sync_session = HeaderSyncPeerSession::new_with_commands(
+            &session,
+            peer.direction,
+            generation,
+            commands_tx,
+        );
 
         let _ = self
             .header_sync
@@ -360,13 +419,15 @@ impl Service for HeaderSyncService {
         let (_session_peer, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
 
         // The concrete `HeaderSyncPeerRoutine` is the production owner of this
-        // peer's recv loop: it owns `HsLocal` (the expected-`Headers` FIFO, the
-        // command receiver, and the pre-decode `NewBlock` gate), the inbound
-        // stream-guard admission, and the frame decode. Request/response
-        // correlation stays in `HsLocal`: after the session queues an outbound
-        // `GetHeaders`, the routine records the expected `Headers` response in
-        // plain local state. Global scheduling and the direct outbound writes stay
-        // in the reactor (this chunk is a compatibility step).
+        // peer's recv loop AND of its outbound `GetHeaders` work: it owns `HsLocal`
+        // (the expected-`Headers` FIFO, the reactor command receiver, the
+        // pre-decode `NewBlock` gate, and the peer-local caps/slot state), the
+        // inbound stream-guard admission, and the frame decode. It pulls eligible
+        // ranges directly from the shared range queue, sends `GetHeaders` on its
+        // own stream, and records the expected `Headers` locally before yielding —
+        // no reactor push and no command round-trip. The reactor only records the
+        // matching outstanding range (via `PeerWorkAssigned`) and keeps the
+        // timeout/covered/commit machinery.
         let env = self.pipe_env();
         let pipe = Pipe::new(
             peer_id.clone(),
@@ -389,7 +450,13 @@ impl Service for HeaderSyncService {
         // or parked exit leaves the connection alone.
         let pipe_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
-        let routine = HeaderSyncPeerRoutine::new(pipe, recv, pipe_cancel_token);
+        let routine = HeaderSyncPeerRoutine::new(
+            pipe,
+            recv,
+            pipe_cancel_token,
+            Some(header_sync_session),
+            generation,
+        );
         let pipe = async move {
             handle_pipe_exit(
                 "header-sync",
@@ -617,6 +684,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                schedule: super::scheduler::SharedHeaderRangeQueue::new(),
             },
             events_rx,
         )

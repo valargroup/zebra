@@ -203,6 +203,17 @@ impl<S, Env> Pipe<S, Env> {
     pub(crate) fn local_mut(&mut self) -> &mut S {
         &mut self.local
     }
+
+    /// Borrow the shared environment for service-specific side channels (e.g. a
+    /// routine pulling outbound work from a shared queue carried in `Env`).
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// The peer identity this pipe is bound to.
+    pub(crate) fn peer_id(&self) -> &ZakuraPeerId {
+        &self.peer_id
+    }
 }
 
 /// The generic inbound runner for a per-peer pipe.

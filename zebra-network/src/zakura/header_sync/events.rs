@@ -82,6 +82,10 @@ pub struct HeaderSyncHandle {
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
+    /// Shared header-sync range queue. Peer routines pull `GetHeaders` work from
+    /// it directly; the reactor produces work into it. Carried on the handle so
+    /// the service layer can clone it into each routine's environment.
+    pub(super) schedule: super::scheduler::SharedHeaderRangeQueue,
 }
 
 impl HeaderSyncHandle {
@@ -203,6 +207,32 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Validated, cap-clamped status the routine accepted.
         status: HeaderSyncStatus,
+    },
+    /// A peer routine pulled header work from the shared range queue, recorded the
+    /// expected `Headers` response locally, and sent the outbound `GetHeaders` on
+    /// its own stream.
+    ///
+    /// The routine performed the assignment (narrow/clamp/`mark_assigned`) under
+    /// the shared-queue lock; the reactor only records the matching
+    /// [`OutstandingRange`](super::state::OutstandingRange) so its existing
+    /// timeout, covered-range, and commit machinery stay reactor-owned. The
+    /// `generation` ties this request to the session that sent it so a stale
+    /// timeout cannot disturb a reconnected session.
+    PeerWorkAssigned {
+        /// Peer whose routine sent the request.
+        peer: ZakuraPeerId,
+        /// Session generation that owns this request.
+        generation: u64,
+        /// The narrowed range the routine requested.
+        start_height: block::Height,
+        /// Narrowed range count the routine requested; matches the assigned key.
+        count: u32,
+        /// Parent anchor hash carried by the requested range.
+        anchor_hash: block::Hash,
+        /// Whether the range is a finalized/checkpoint bracket.
+        finalized: bool,
+        /// Whether the range is forward or backward priority.
+        forward: bool,
     },
     /// A peer routine validated a correlated `Headers` response that is ready for
     /// shared commit or retry bookkeeping.

@@ -3,26 +3,31 @@
 //! THE DAG SLICE IS THIS DIAGRAM. The code below is a mechanical transcription;
 //! the [`PIPE_SHAPE`] const is the inspectable, drift-checked copy of it.
 //!
-//!  queued(GetHeaders) ─▶ command(record expected) ─▶ expected_headers.push_back
+//!  pull(shared queue) ─▶ record expected ─▶ send GetHeaders ─▶ emit(PeerWorkAssigned)
 //!  recv ─▶ guard ─┬─ Headers ─▶ expected_headers.pop_front ─▶ decode ─▶ validate ─▶ emit(narrowed)
 //!                 └─ Control ───────────────────────────────▶ decode ─▶ validate ─▶ emit(narrowed)
 //!
-//! Request/response correlation lives in [`HsLocal`]. The shared scheduler still
-//! decides when to ask a peer for headers, but it sends that decision to this
-//! peer-owned pipe as a command after the outbound `GetHeaders` is queued
-//! successfully. The pipe prioritizes and drains those commands before inbound
-//! frames so a response cannot beat its local expectation.
+//! Request/response correlation lives in [`HsLocal`]. The routine PULLS its own
+//! outbound work: when the shared range queue signals work may be available, the
+//! routine takes an eligible range, records the expected `Headers` locally, sends
+//! the `GetHeaders` on its own stream, and emits [`PeerWorkAssigned`] so the reactor
+//! records the matching outstanding range — all synchronously before yielding, so a
+//! network response can never beat the local expectation. The reactor no longer
+//! pushes the decision or records the expectation through a command.
 //!
 //! The concrete production owner of this loop is [`HeaderSyncPeerRoutine`]: it
-//! owns the [`HsLocal`] decode/correlation state, the peer-local advertised caps
-//! and rate meters, the inbound stream-guard admission, the command draining, the
-//! frame decode, and the relocated peer-local protocol validation. After
-//! validating, it forwards only NARROWED shared-effect events
-//! ([`HeaderSyncEvent::PeerStatusUpdated`], [`PeerHeadersReceived`],
-//! [`InboundGetHeadersRequested`], [`NewBlockCandidate`], [`PeerMisbehavior`]) to
-//! the reactor; the reactor no longer matches a raw decoded wire message. Global
-//! scheduling, the direct `GetHeaders` sends, and the direct
-//! status/`NewBlock`/`Headers`-response sends stay reactor-side (chunks 04/05).
+//! owns the [`HsLocal`] decode/correlation state, the peer-local advertised caps,
+//! the outbound-slot/empty-retry state, and rate meters, the inbound stream-guard
+//! admission, the work pull, the frame decode, and the relocated peer-local protocol
+//! validation. After validating, it forwards only NARROWED shared-effect events
+//! ([`HeaderSyncEvent::PeerStatusUpdated`], [`PeerWorkAssigned`], [`PeerHeadersReceived`],
+//! [`InboundGetHeadersRequested`], [`NewBlockCandidate`], [`PeerMisbehavior`]) to the
+//! reactor; the reactor no longer matches a raw decoded wire message. The reactor
+//! still owns commit ordering, timeouts (it issues a `DropExpectation` command on
+//! timeout), covered-range cleanup, and the direct status/`NewBlock`/`Headers`-response
+//! sends (the latter is chunk 05).
+//!
+//! [`PeerWorkAssigned`]: super::events::HeaderSyncEvent::PeerWorkAssigned
 //!
 //! [`PeerHeadersReceived`]: super::events::HeaderSyncEvent::PeerHeadersReceived
 //! [`InboundGetHeadersRequested`]: super::events::HeaderSyncEvent::InboundGetHeadersRequested
@@ -35,7 +40,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    config::*, events::*, scheduler::*, service::HeaderSyncPeerCommand, validation::*, wire::*, *,
+    config::*, events::*, scheduler::*, service::HeaderSyncPeerCommand, state::*, validation::*,
+    wire::*, *,
 };
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
@@ -45,7 +51,8 @@ use crate::zakura::{
 pub(crate) struct HsLocal {
     /// Plain peer-local response expectations, owned by this pipe task.
     expected_headers: VecDeque<ExpectedHeadersResponse>,
-    /// Commands from shared scheduling state into this peer-local pipe.
+    /// Commands from the reactor into this peer-local routine (e.g. timeout
+    /// `DropExpectation`).
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
     /// Pre-decode rate gate for inbound `NewBlock` floods.
     ///
@@ -65,6 +72,42 @@ pub(crate) struct HsLocal {
     advertised_tip: block::Height,
     received_status: bool,
     inbound_status_meter: RateMeter,
+    /// This peer's clamped advertised `max_headers_per_response`, retained so the
+    /// routine can clamp its own outbound `GetHeaders` count when it pulls work.
+    /// `None` until the first valid `Status` advances it.
+    advertised_max_headers_per_response: Option<u32>,
+    /// The single range this routine has taken from the shared queue and is
+    /// awaiting a response for. `Some` exactly while an outbound `GetHeaders` is
+    /// outstanding (the per-peer effective inflight cap is 1), so it doubles as the
+    /// slot gate and as the work to return on teardown.
+    in_flight: Option<RangeRequest>,
+    /// While set, the routine declines to pull new work until this instant: the
+    /// peer answered with an empty `Headers`, so the slot stays occupied for a
+    /// short re-fan delay, mirroring the reactor's old empty-headers re-arm.
+    empty_retry_until: Option<Instant>,
+    /// The outcome of the most recently decoded `Headers` response, recorded by
+    /// the ingest stage for the routine to act on after the frame is processed
+    /// (clear the in-flight slot on a filled response; return the range and arm the
+    /// empty-retry window on an empty one). The routine drains this after every
+    /// processed frame.
+    last_headers_outcome: Option<HeadersOutcome>,
+    /// How many late responses for already-dropped expectations to absorb silently
+    /// rather than reject as `UnsolicitedHeaders`. Incremented when the reactor
+    /// covers this peer's outstanding range (a `DropExpectation` for a still-pending
+    /// request): the peer's in-flight response for that range will still arrive
+    /// late, and absorbing it mirrors the reactor's old `late_covered_responses`
+    /// tolerance — a covered range is not the peer's fault.
+    late_covered_tolerance: usize,
+}
+
+/// What the most recently decoded `Headers` response means for slot bookkeeping.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum HeadersOutcome {
+    /// A non-empty response: the request is complete, free the slot.
+    Filled,
+    /// An empty response: re-fan the range after a short delay; the slot stays
+    /// occupied until the empty-retry window elapses.
+    Empty,
 }
 
 impl HsLocal {
@@ -84,6 +127,11 @@ impl HsLocal {
             advertised_tip: anchor_height,
             received_status: false,
             inbound_status_meter: RateMeter::new(inbound_status_min_interval),
+            advertised_max_headers_per_response: None,
+            in_flight: None,
+            empty_retry_until: None,
+            last_headers_outcome: None,
+            late_covered_tolerance: 0,
         }
     }
 
@@ -97,6 +145,17 @@ impl HsLocal {
         self.expected_headers.pop_front()
     }
 
+    /// Consume one late-covered tolerance credit. `true` means a `Headers` frame
+    /// with no expectation is a late response for a reactor-dropped range and
+    /// should be absorbed silently rather than rejected as unsolicited.
+    fn take_late_covered_tolerance(&mut self) -> bool {
+        if self.late_covered_tolerance == 0 {
+            return false;
+        }
+        self.late_covered_tolerance -= 1;
+        true
+    }
+
     /// Restore a solicited-response expectation that was popped for decode but
     /// whose decoded `Headers` event could not be handed to the reactor (the
     /// bounded `events` queue was full or closed). It goes back to the *front* so
@@ -106,24 +165,106 @@ impl HsLocal {
         self.expected_headers.push_front(expected);
     }
 
+    /// Apply a reactor command. The only command is a timeout `DropExpectation`:
+    /// the reactor timed out this session's outstanding request and returned the
+    /// range to the shared queue, so the routine drops the matching front
+    /// expectation and frees its outbound slot. It is idempotent — if the response
+    /// already arrived and popped the expectation, the front no longer matches and
+    /// the drop is a no-op, so a late drop cannot consume a fresh expectation. The
+    /// generation guard is enforced by the routine before this is called (the
+    /// command only reaches a session whose generation matches).
     fn handle_command(&mut self, command: HeaderSyncPeerCommand) {
         match command {
-            HeaderSyncPeerCommand::RecordExpectedHeaders(expected) => {
-                self.expected_headers.push_back(expected);
+            HeaderSyncPeerCommand::DropExpectation {
+                start_height,
+                count,
+                ..
+            } => {
+                let matches_front = self.expected_headers.front().is_some_and(|expected| {
+                    expected.start_height == start_height && expected.count == count
+                });
+                let matches_in_flight = self
+                    .in_flight
+                    .is_some_and(|range| range.start_height == start_height);
+                if matches_front {
+                    self.expected_headers.pop_front();
+                    // The peer may still send a late response for this dropped
+                    // expectation; tolerate it instead of rejecting it as
+                    // unsolicited (the drop was the reactor's covered/timeout
+                    // decision, not the peer's fault).
+                    self.late_covered_tolerance = self.late_covered_tolerance.saturating_add(1);
+                }
+                if matches_front || matches_in_flight {
+                    self.in_flight = None;
+                    self.empty_retry_until = None;
+                    metrics::counter!("sync.header.request.timeout_dropped").increment(1);
+                }
             }
         }
     }
 
     /// Record an expected `Headers` response on the requester side.
     ///
-    /// Production records this through the `RecordExpectedHeaders` command the
-    /// moment an outbound `GetHeaders` is queued. The synthetic in-process cluster
-    /// harness has no command channel, so it records the expectation directly when
-    /// it observes the outbound `GetHeaders`, keeping its per-peer ingest state in
-    /// lockstep with the production correlation FIFO.
+    /// Production records this synchronously in the routine the moment it pulls
+    /// work and sends the outbound `GetHeaders` (no command round-trip). The
+    /// synthetic in-process cluster harness has no shared queue, so it records the
+    /// expectation directly when it observes the outbound `GetHeaders`, keeping its
+    /// per-peer ingest state in lockstep with the production correlation FIFO.
     #[cfg(test)]
     pub(crate) fn record_expected(&mut self, expected: ExpectedHeadersResponse) {
         self.expected_headers.push_back(expected);
+    }
+
+    /// Test-only: perform the routine's pull-work step against `env`'s shared range
+    /// queue using this peer-local state's learned caps, recording the expected
+    /// `Headers` and marking the slot in-flight on success. Returns the
+    /// [`HeaderSyncEvent::PeerWorkAssigned`] the routine would emit so an in-process
+    /// harness can both deliver the matching `GetHeaders` (reading `start_height`/
+    /// `count` off the event) and forward the event to the reactor. Mirrors
+    /// [`HeaderSyncPeerRoutine::try_pull`] for the synthetic cluster.
+    #[cfg(test)]
+    pub(crate) fn try_pull_work(
+        &mut self,
+        env: &HsEnv,
+        peer_id: &ZakuraPeerId,
+        generation: u64,
+    ) -> Option<HeaderSyncEvent> {
+        if self.in_flight.is_some() || !self.received_status {
+            return None;
+        }
+        let max_headers_per_response = self.advertised_max_headers_per_response?;
+        let caps = PeerPullCaps {
+            advertised_tip: self.advertised_tip,
+            max_headers_per_response,
+        };
+        let work = env.schedule().take_for_peer(
+            peer_id,
+            generation,
+            caps,
+            env.network(),
+            env.max_frame_bytes(),
+        )?;
+        let expected = ExpectedHeadersResponse::new(work.range.start_height, work.count).ok()?;
+        self.expected_headers.push_back(expected);
+        self.in_flight = Some(work.range);
+        Some(HeaderSyncEvent::PeerWorkAssigned {
+            peer: peer_id.clone(),
+            generation,
+            start_height: work.range.start_height,
+            count: work.count,
+            anchor_hash: work.range.anchor_hash,
+            finalized: work.range.finalized,
+            forward: matches!(work.range.priority, RangePriority::Forward),
+        })
+    }
+
+    /// Test-only: clear the in-flight slot when a harness observes the matching
+    /// response, so the peer-local state can pull again. Mirrors the routine's
+    /// `apply_headers_outcome` slot-free for the synthetic cluster.
+    #[cfg(test)]
+    pub(crate) fn clear_in_flight(&mut self) {
+        self.in_flight = None;
+        self.empty_retry_until = None;
     }
 
     fn drain_ready_commands(&mut self) {
@@ -143,7 +284,8 @@ impl HsLocal {
 pub(crate) struct HsEnv {
     /// Handle used to forward narrowed shared-effect events to the reactor.
     handle: HeaderSyncHandle,
-    /// Active network, used by the inbound `GetHeaders` count limit.
+    /// Active network, used by the inbound `GetHeaders` count limit and by the
+    /// routine's count clamp when it pulls outbound work.
     network: Network,
     /// This node's local header-sync advertisement and serving caps.
     config: ZakuraHeaderSyncConfig,
@@ -166,6 +308,27 @@ impl HsEnv {
             config,
             max_frame_bytes,
         }
+    }
+
+    /// The shared header-sync range queue the routine pulls outbound work from.
+    pub(super) fn schedule(&self) -> &SharedHeaderRangeQueue {
+        &self.handle.schedule
+    }
+
+    /// Forward a narrowed shared-effect event to the reactor (non-fatal on a
+    /// closed/full queue).
+    pub(super) fn handle(&self) -> &HeaderSyncHandle {
+        &self.handle
+    }
+
+    /// Active network for the outbound count clamp.
+    pub(super) fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// Negotiated/local frame cap for the outbound count clamp.
+    pub(super) fn max_frame_bytes(&self) -> u32 {
+        self.max_frame_bytes
     }
 
     /// Largest inbound `GetHeaders` count this node will serve, bounded by its
@@ -307,10 +470,16 @@ pub(crate) fn decode_and_ingest(
 
     // Correlate a `Headers` response against the peer-owned expectation FIFO before
     // decode, so an over-long or otherwise malformed response is bounded by the
-    // matching `GetHeaders` count. A `Headers` frame with no expectation is
-    // unsolicited; the routine classifies it and rejects the peer.
+    // matching `GetHeaders` count. A `Headers` frame with no expectation is either a
+    // late response for a range the reactor already covered/timed-out (absorbed
+    // silently if this peer has late-covered tolerance) or genuinely unsolicited
+    // (classified and rejected).
     let expected = if is_headers {
         let Some(expected) = local.pop_expected_headers_response() else {
+            if local.take_late_covered_tolerance() {
+                metrics::counter!("sync.header.response.late_covered_dropped").increment(1);
+                return Flow::Done;
+            }
             return reject_misbehavior(
                 env,
                 &peer_id,
@@ -394,6 +563,32 @@ pub(crate) fn decode_and_ingest(
 /// covered by its own routine-harness test, so this ingest state disables it (zero
 /// interval) to keep the harness focused on reactor-side dedup; the status spam gate
 /// keeps its real interval so hostile-status e2e flows still classify spam.
+/// Test-only: build a per-peer [`Pipe`] with the production guard and shape around
+/// a routine's command receiver and shared environment. Used by the reactor test
+/// fixture to spawn real routines that share the reactor's range queue.
+#[cfg(test)]
+pub(crate) fn test_pipe(
+    peer_id: ZakuraPeerId,
+    commands_rx: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+    env: HsEnv,
+) -> Pipe<HsLocal, HsEnv> {
+    let anchor_height = env.anchor_height();
+    Pipe::new(
+        peer_id,
+        HsLocal::new(
+            commands_rx,
+            anchor_height,
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+        ),
+        env,
+        // MAX_HS_MESSAGE_BYTES is a small compile-time const that fits in u32.
+        crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+        run_inbound,
+        &PIPE_SHAPE,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn new_ingest_local(env: &HsEnv) -> HsLocal {
     let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -424,13 +619,13 @@ pub(super) fn ingest_message(
         HeaderSyncMessage::Headers {
             headers,
             body_sizes,
-        } => ingest_headers(env, peer_id, headers, body_sizes),
+        } => ingest_headers(local, env, peer_id, headers, body_sizes),
         HeaderSyncMessage::GetHeaders {
             start_height,
             count,
         } => ingest_get_headers(local, env, peer_id, start_height, count),
         HeaderSyncMessage::NewBlock(block) => forward(
-            &env.handle,
+            env.handle(),
             HeaderSyncEvent::NewBlockCandidate {
                 peer: peer_id.clone(),
                 block,
@@ -468,15 +663,19 @@ fn ingest_status(
 
     local.advertised_tip = status.tip_height;
     local.received_status = true;
+    let clamped_max_headers = clamp_advertised_range(status.max_headers_per_response);
+    // Retain the clamped per-response cap so the routine can clamp its own
+    // outbound `GetHeaders` count when it pulls work from the shared queue.
+    local.advertised_max_headers_per_response = Some(clamped_max_headers);
     let clamped = HeaderSyncStatus {
-        max_headers_per_response: clamp_advertised_range(status.max_headers_per_response),
+        max_headers_per_response: clamped_max_headers,
         max_inflight_requests: status
             .max_inflight_requests
             .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER),
         ..status
     };
     forward(
-        &env.handle,
+        env.handle(),
         HeaderSyncEvent::PeerStatusUpdated {
             peer: peer_id.clone(),
             status: clamped,
@@ -491,6 +690,7 @@ fn ingest_status(
 /// outstanding range and drives the link/stateless/checkpoint validation and
 /// commit pipeline (range bookkeeping stays reactor-side).
 fn ingest_headers(
+    local: &mut HsLocal,
     env: &HsEnv,
     peer_id: &ZakuraPeerId,
     headers: Vec<Arc<block::Header>>,
@@ -503,10 +703,23 @@ fn ingest_headers(
         // the reactor's record-only `report_misbehavior(MalformedMessage)`, so report
         // it and keep the connection (the correlated-`Headers` *decode* failure, which
         // does disconnect, is handled in `decode_and_ingest`).
+        //
+        // Treat this like a filled (terminal) response for slot purposes: the
+        // expectation was already popped during correlation, so free the slot for a
+        // fresh pull rather than stranding it.
+        local.last_headers_outcome = Some(HeadersOutcome::Filled);
         return record_misbehavior(env, peer_id, HeaderSyncMisbehavior::MalformedMessage);
     }
+    // Record the slot outcome for the routine to act on after the frame is
+    // processed: a non-empty response completes the request (free the slot); an
+    // empty one re-fans the range after a short delay (slot stays occupied).
+    local.last_headers_outcome = Some(if headers.is_empty() {
+        HeadersOutcome::Empty
+    } else {
+        HeadersOutcome::Filled
+    });
     forward(
-        &env.handle,
+        env.handle(),
         HeaderSyncEvent::PeerHeadersReceived {
             peer: peer_id.clone(),
             headers,
@@ -541,7 +754,7 @@ fn ingest_get_headers(
     }
 
     forward(
-        &env.handle,
+        env.handle(),
         HeaderSyncEvent::InboundGetHeadersRequested {
             peer: peer_id.clone(),
             start_height,
@@ -582,7 +795,7 @@ fn reject_misbehavior(
         ?error,
         "invalid Zakura header-sync message"
     );
-    let _ = env.handle.try_send(HeaderSyncEvent::PeerMisbehavior {
+    let _ = env.handle().try_send(HeaderSyncEvent::PeerMisbehavior {
         peer: peer_id.clone(),
         reason,
     });
@@ -606,7 +819,7 @@ fn record_misbehavior(
     peer_id: &ZakuraPeerId,
     reason: HeaderSyncMisbehavior,
 ) -> Flow<()> {
-    let _ = env.handle.try_send(HeaderSyncEvent::PeerMisbehavior {
+    let _ = env.handle().try_send(HeaderSyncEvent::PeerMisbehavior {
         peer: peer_id.clone(),
         reason,
     });
@@ -617,8 +830,10 @@ fn record_misbehavior(
 enum HsRoutineInput {
     /// An inbound stream-5 frame to admit, decode, correlate, and forward.
     Frame(Frame),
-    /// A peer command (e.g. `RecordExpectedHeaders`) from shared scheduling state.
+    /// A reactor command (the timeout `DropExpectation`) into this routine.
     Command(HeaderSyncPeerCommand),
+    /// The shared range queue signalled that work may be available; try to pull.
+    TryPull,
     /// Cancellation or stream close — the routine exits cleanly.
     Done,
 }
@@ -627,20 +842,21 @@ enum HsRoutineInput {
 /// loop.
 ///
 /// The routine owns the local decode/correlation state ([`HsLocal`] — the
-/// expected-`Headers` FIFO, the command receiver, the pre-decode `NewBlock` rate
-/// gate, and the peer-local advertised caps + status-spam meter), the inbound
-/// stream-guard admission, the frame decode, and the relocated peer-local protocol
-/// validation. It drives the per-peer [`Pipe`] one frame at a time, forwarding only
-/// narrowed shared-effect events to [`HeaderSyncReactor`](super::reactor); shared
-/// global scheduling, direct `GetHeaders` sends, and direct
-/// status/`NewBlock`/`Headers` response sends stay reactor-side (chunks 04/05).
+/// expected-`Headers` FIFO, the reactor command receiver, the pre-decode `NewBlock`
+/// rate gate, the peer-local advertised caps + status-spam meter, and the
+/// outbound-slot/empty-retry state), the inbound stream-guard admission, the work
+/// pull, the frame decode, and the relocated peer-local protocol validation. It
+/// drives the per-peer [`Pipe`] one frame at a time AND pulls its own outbound
+/// `GetHeaders` work from the shared range queue, forwarding only narrowed
+/// shared-effect events to [`HeaderSyncReactor`](super::reactor). Range production,
+/// commit ordering, timeouts, and direct status/`NewBlock`/`Headers`-response sends
+/// stay reactor-side (the response sends are chunk 05).
 ///
-/// Correlation-ordering invariant: a `RecordExpectedHeaders` command is enqueued
-/// synchronously the moment its outbound `GetHeaders` is queued, so it is already
-/// in this peer's command channel before any network response can return (a round
-/// trip is orders of magnitude slower than a local enqueue). The loop drains
-/// ready commands before every inbound frame, and the `biased` select prefers the
-/// command channel over `recv`, so the expectation is always popped into
+/// Work-pull invariant: the routine records its expected `Headers` response
+/// synchronously the moment it takes work from the shared queue and sends the
+/// outbound `GetHeaders`, all in one non-`await` step before yielding back to the
+/// `select!`. A network response cannot beat that local record (a round trip is
+/// orders of magnitude slower than a local push), so the expectation is always in
 /// `HsLocal.expected_headers` before the matching `Headers` frame is decoded —
 /// never the reverse, which would reject a solicited response as
 /// `UnsolicitedHeaders`.
@@ -655,17 +871,34 @@ pub(super) struct HeaderSyncPeerRoutine {
     /// The peer's service-session cancellation token. Fires on disconnect, park,
     /// or local shutdown; the routine then exits cleanly.
     cancel: CancellationToken,
+    /// The typed session this routine sends its own outbound `GetHeaders` over,
+    /// inverting the old reactor push. `None` only in unit tests that exercise the
+    /// recv loop without an outbound stream.
+    session: Option<HeaderSyncPeerSession>,
+    /// Session generation, minted once at admission. Tags every assignment and
+    /// `PeerWorkAssigned` event so a stale timeout cannot disturb a reconnected
+    /// session.
+    generation: u64,
 }
 
 impl HeaderSyncPeerRoutine {
-    /// Build the routine around a peer's pipe, its inbound reader, and its
-    /// service-session cancellation token.
+    /// Build the routine around a peer's pipe, its inbound reader, its
+    /// service-session cancellation token, the typed session it sends outbound
+    /// `GetHeaders` over, and the session generation.
     pub(super) fn new(
         pipe: Pipe<HsLocal, HsEnv>,
         recv: FramedRecv,
         cancel: CancellationToken,
+        session: Option<HeaderSyncPeerSession>,
+        generation: u64,
     ) -> Self {
-        Self { pipe, recv, cancel }
+        Self {
+            pipe,
+            recv,
+            cancel,
+            session,
+            generation,
+        }
     }
 
     /// Run the routine until stream close, cancellation, or a reject.
@@ -674,11 +907,19 @@ impl HeaderSyncPeerRoutine {
     /// mapped to a benign continue inside [`run_inbound`]); the caller composes it
     /// with [`handle_pipe_exit`](crate::zakura::handle_pipe_exit) so a protocol
     /// reject cancels the whole connection while a clean stream-end/cancel leaves
-    /// it alone.
+    /// it alone. On every exit path (clean or reject) the routine returns any
+    /// in-flight range to the shared queue via [`Drop`], so work is never stranded.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        // Pull any work that is already eligible before parking on the first wake.
+        self.try_pull();
         loop {
             self.pipe.local_mut().drain_ready_commands();
 
+            let schedule = self.pipe.env().schedule().clone();
+            // When an empty-retry window is armed, schedule a wake at its expiry so
+            // the routine re-pulls the re-fanned range without waiting for an
+            // unrelated reactor wake. Otherwise this arm is inert.
+            let empty_retry_until = self.pipe.local_mut().empty_retry_until;
             let input = {
                 let local = self.pipe.local_mut();
                 tokio::select! {
@@ -692,6 +933,13 @@ impl HeaderSyncPeerRoutine {
                         Some(frame) => HsRoutineInput::Frame(frame),
                         None => HsRoutineInput::Done,
                     },
+                    () = async {
+                        match empty_retry_until {
+                            Some(until) => tokio::time::sleep_until(until).await,
+                            None => std::future::pending().await,
+                        }
+                    } => HsRoutineInput::TryPull,
+                    () = schedule.waked() => HsRoutineInput::TryPull,
                 }
             };
 
@@ -703,10 +951,231 @@ impl HeaderSyncPeerRoutine {
                         Flow::Continue(()) | Flow::Done => {}
                         Flow::Reject(reject) => return Err(reject),
                     }
+                    // A processed `Headers` response may free or re-arm the slot;
+                    // act on the recorded outcome. Re-attempt a pull only when a
+                    // response actually completed the slot — a `Status` frame must
+                    // NOT trigger an immediate pull, because the forward range it
+                    // enables is produced by the reactor only after it processes the
+                    // `PeerStatusUpdated` this frame forwards; pulling now could take
+                    // a lower-priority backward range before the forward range
+                    // exists. The reactor's post-status `schedule()` wake drives the
+                    // forward pull instead.
+                    if self.apply_headers_outcome() {
+                        self.try_pull();
+                    }
                 }
-                HsRoutineInput::Command(command) => self.pipe.local_mut().handle_command(command),
+                HsRoutineInput::Command(command) => {
+                    // Defense in depth: only apply a command addressed to this
+                    // session's generation. The reactor already scopes its send to a
+                    // matching generation, so a mismatch should never reach here, but
+                    // dropping it keeps a misrouted command from disturbing live work.
+                    let HeaderSyncPeerCommand::DropExpectation { generation, .. } = command;
+                    if generation == self.generation {
+                        self.pipe.local_mut().handle_command(command);
+                        // A timeout `DropExpectation` frees the slot; try fresh work.
+                        self.try_pull();
+                    }
+                }
+                HsRoutineInput::TryPull => self.try_pull(),
             }
         }
+    }
+
+    /// Act on the outcome of the most recently decoded `Headers` response: a
+    /// filled response completes the request (free the slot); an empty one returns
+    /// the range to the shared queue and arms the empty-retry window so the slot
+    /// stays occupied for a short re-fan delay (mirroring the reactor's old
+    /// empty-headers re-arm). The expectation was already popped during
+    /// correlation, so only the slot/return bookkeeping is done here.
+    ///
+    /// Returns `true` only when a filled response freed the slot, signalling the
+    /// caller that an immediate re-pull is warranted; an empty response keeps the
+    /// slot occupied (the empty-retry window), so it returns `false`.
+    fn apply_headers_outcome(&mut self) -> bool {
+        let outcome = self.pipe.local_mut().last_headers_outcome.take();
+        let Some(outcome) = outcome else {
+            return false;
+        };
+        let Some(range) = self.pipe.local_mut().in_flight.take() else {
+            return false;
+        };
+        match outcome {
+            HeadersOutcome::Filled => {
+                // Request complete; the slot is free for the next pull.
+                self.pipe.local_mut().empty_retry_until = None;
+                true
+            }
+            HeadersOutcome::Empty => {
+                metrics::counter!("sync.header.response.empty_returned").increment(1);
+                self.pipe.env().schedule().return_work(
+                    self.pipe.peer_id(),
+                    self.generation,
+                    range,
+                    ReturnReason::EmptyResponse,
+                );
+                self.pipe.local_mut().empty_retry_until =
+                    Some(Instant::now() + EMPTY_HEADERS_RETRY_DELAY);
+                false
+            }
+        }
+    }
+
+    /// Try to pull one eligible range from the shared queue and request it.
+    ///
+    /// Gated by the peer-local slot/window/deadline state owned by the routine:
+    /// the peer must have sent a valid `Status` (so its advertised tip and cap are
+    /// known), the single outbound slot must be free, and any empty-retry window
+    /// must have elapsed. On a successful pull the routine records the expected
+    /// `Headers` locally, sends `GetHeaders` on its own stream, and emits
+    /// `PeerWorkAssigned` so the reactor records the matching outstanding range —
+    /// all synchronously, with no `.await`, so a response cannot beat the local
+    /// expectation.
+    fn try_pull(&mut self) {
+        // Re-arm a pull as soon as the empty-retry window elapses even with no new
+        // wake, by clearing an expired window here.
+        {
+            let local = self.pipe.local_mut();
+            if local
+                .empty_retry_until
+                .is_some_and(|until| Instant::now() >= until)
+            {
+                local.empty_retry_until = None;
+            }
+        }
+
+        let caps = {
+            let local = self.pipe.local_mut();
+            // Slot gate: one outbound request per peer; no pull while a request is
+            // in flight, before the first status, or during an empty-retry window.
+            if local.in_flight.is_some()
+                || !local.received_status
+                || local.empty_retry_until.is_some()
+            {
+                return;
+            }
+            let Some(max_headers_per_response) = local.advertised_max_headers_per_response else {
+                return;
+            };
+            PeerPullCaps {
+                advertised_tip: local.advertised_tip,
+                max_headers_per_response,
+            }
+        };
+
+        let peer_id = self.pipe.peer_id().clone();
+        let env = self.pipe.env().clone();
+        let Some(work) = env.schedule().take_for_peer(
+            &peer_id,
+            self.generation,
+            caps,
+            env.network(),
+            env.max_frame_bytes(),
+        ) else {
+            return;
+        };
+
+        // Record the expectation BEFORE sending so a response can never beat it.
+        let expected = match ExpectedHeadersResponse::new(work.range.start_height, work.count) {
+            Ok(expected) => expected,
+            Err(error) => {
+                // The clamp guarantees a bounded count, so this is unreachable; if
+                // it ever fires, return the range rather than strand it.
+                tracing::debug!(?peer_id, ?error, "invalid pulled header work; returning");
+                env.schedule().return_work(
+                    &peer_id,
+                    self.generation,
+                    work.range,
+                    ReturnReason::SendFailed,
+                );
+                return;
+            }
+        };
+
+        // Send `GetHeaders` on this peer's own stream. A send failure returns the
+        // range to the queue (it was never requested) and frees the slot.
+        if let Some(session) = &self.session {
+            if let Err(error) = session.try_send_get_headers(work.range.start_height, work.count) {
+                tracing::debug!(
+                    ?peer_id,
+                    start_height = ?work.range.start_height,
+                    count = work.count,
+                    ?error,
+                    "failed to send Zakura header-sync GetHeaders; returning work"
+                );
+                env.schedule().return_work(
+                    &peer_id,
+                    self.generation,
+                    work.range,
+                    ReturnReason::SendFailed,
+                );
+                return;
+            }
+        }
+
+        {
+            let local = self.pipe.local_mut();
+            local.expected_headers.push_back(expected);
+            local.in_flight = Some(work.range);
+        }
+        metrics::counter!("sync.header.request.sent").increment(1);
+        tracing::trace!(
+            ?peer_id,
+            start_height = ?work.range.start_height,
+            count = work.count,
+            generation = self.generation,
+            "Zakura header-sync routine sent GetHeaders and recorded expectation"
+        );
+
+        // Tell the reactor to record the matching outstanding range so its timeout,
+        // covered-range, and commit machinery stay reactor-owned. The deadline uses
+        // the per-request timeout exactly as the old reactor push did.
+        let _ = env.handle().try_send(HeaderSyncEvent::PeerWorkAssigned {
+            peer: peer_id,
+            generation: self.generation,
+            start_height: work.range.start_height,
+            count: work.count,
+            anchor_hash: work.range.anchor_hash,
+            finalized: work.range.finalized,
+            forward: matches!(work.range.priority, RangePriority::Forward),
+        });
+    }
+
+    /// Test-only: pre-record an expected `Headers` response and mark a matching
+    /// in-flight range, simulating a request the routine already sent. Lets the
+    /// recv-loop correlation tests set up a correlated response without driving a
+    /// full pull.
+    #[cfg(test)]
+    fn seed_expected(&mut self, start_height: block::Height, count: u32) {
+        let expected =
+            ExpectedHeadersResponse::new(start_height, count).expect("test count is valid");
+        let local = self.pipe.local_mut();
+        local.record_expected(expected);
+        local.in_flight = Some(RangeRequest {
+            start_height,
+            count,
+            anchor_hash: block::Hash([0; 32]),
+            finalized: false,
+            priority: RangePriority::Forward,
+        });
+    }
+}
+
+impl Drop for HeaderSyncPeerRoutine {
+    /// Return any in-flight range to the shared queue on every exit path (clean
+    /// stream close, service cancellation, protocol reject, or routine panic), so
+    /// an assigned range is never stranded. The return is generation-scoped, so a
+    /// late teardown of an OLD session cannot clear a reconnected session's work.
+    fn drop(&mut self) {
+        let Some(range) = self.pipe.local_mut().in_flight.take() else {
+            return;
+        };
+        let peer_id = self.pipe.peer_id().clone();
+        self.pipe.env().schedule().return_work(
+            &peer_id,
+            self.generation,
+            range,
+            ReturnReason::Teardown,
+        );
     }
 }
 
@@ -754,6 +1223,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                schedule: SharedHeaderRangeQueue::new(),
             },
             events_rx,
         )
@@ -779,6 +1249,7 @@ mod tests {
                 tip,
                 peers,
                 candidates,
+                schedule: SharedHeaderRangeQueue::new(),
             },
             events_rx,
         )
@@ -858,12 +1329,12 @@ mod tests {
     }
 
     /// The peer-local correlation queue is FIFO and is filled by draining ready
-    /// commands. This is the invariant [`HeaderSyncPeerRoutine`] relies on: an
-    /// expectation recorded by a `RecordExpectedHeaders` command is drained and
-    /// available to pop before the matching `Headers` response is processed.
+    /// expectations. This is the invariant [`HeaderSyncPeerRoutine`] relies on: an
+    /// expectation the routine records when it pulls work is available to pop in
+    /// FIFO order before the matching `Headers` response is processed.
     #[test]
-    fn local_correlation_queue_drains_commands_in_fifo_order() {
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    fn local_correlation_queue_records_in_fifo_order() {
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(
             commands_rx,
             block::Height(0),
@@ -873,16 +1344,10 @@ mod tests {
 
         let first = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
         let second = ExpectedHeadersResponse::new(block::Height(2), 2).expect("count is valid");
-        commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(first))
-            .expect("pipe is alive");
-        commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(second))
-            .expect("pipe is alive");
-
-        // Nothing is available until the pipe drains its ready commands.
-        assert_eq!(local.pop_expected_headers_response(), None);
-        local.drain_ready_commands();
+        // The routine records each expectation synchronously the moment it pulls
+        // and sends the matching `GetHeaders`.
+        local.record_expected(first);
+        local.record_expected(second);
 
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
@@ -974,12 +1439,9 @@ mod tests {
         // Keep `_events_rx` alive so the saturated queue rejects with `Full`
         // (a live receiver), not `Closed`.
         let (handle, _events_rx) = saturated_events_handle();
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
-        commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-            .expect("pipe is alive");
 
         // A syntactically valid one-header solicited response: it decodes against
         // the expectation and reaches the reactor forward, where the full queue
@@ -1014,9 +1476,10 @@ mod tests {
             run_inbound,
             &PIPE_SHAPE,
         );
-        // Drain the recorded expectation into `HsLocal`, mirroring the routine's
-        // pre-frame command drain so the `Headers` frame is correlated.
-        pipe.local_mut().drain_ready_commands();
+        // Record the expectation directly, as the routine does the moment it pulls
+        // work and sends the matching `GetHeaders`, so the `Headers` frame is
+        // correlated.
+        pipe.local_mut().record_expected(expected);
 
         // The decoded response cannot be delivered (events queue is full); the
         // pipe logs and continues, exactly as production does.
@@ -1084,9 +1547,11 @@ mod tests {
     use crate::zakura::{framed_channel, spawn_supervised_pipe, FramedSend};
 
     /// Build a routine around a fresh handle/commands/stream so a test can drive
-    /// its recv loop. Returns the routine, the drained reactor `events` queue, the
-    /// peer-side stream sender (closing it ends the stream), the command sender
-    /// (records expectations), and the routine's cancel token.
+    /// its recv loop. Returns the routine, the peer-side stream sender (closing it
+    /// ends the stream), and the reactor command sender (used to deliver a timeout
+    /// `DropExpectation`). The routine has no outbound session, so it does not pull;
+    /// recv-loop correlation tests seed expectations via
+    /// [`HeaderSyncPeerRoutine::seed_expected`].
     #[allow(clippy::type_complexity)]
     fn routine_with(
         handle: HeaderSyncHandle,
@@ -1117,7 +1582,7 @@ mod tests {
             run_inbound,
             &PIPE_SHAPE,
         );
-        let routine = HeaderSyncPeerRoutine::new(pipe, service_recv, cancel);
+        let routine = HeaderSyncPeerRoutine::new(pipe, service_recv, cancel, None, 0);
         (routine, peer_send, commands_tx)
     }
 
@@ -1226,17 +1691,15 @@ mod tests {
         // mapping to `SinkReject::Local` inside `forward`.
         let (handle, _events_rx) = saturated_events_handle();
         let cancel = CancellationToken::new();
-        let (routine, peer_send, commands_tx) = routine_with(handle, cancel.clone());
+        let (mut routine, peer_send, _commands_tx) = routine_with(handle, cancel.clone());
+        // Seed the expectation the routine would have recorded when it pulled and
+        // sent the matching `GetHeaders`, then run it.
+        routine.seed_expected(block::Height(1), 1);
         let run = tokio::spawn(routine.run());
 
-        // Record the expectation, then send the matching solicited response. The
-        // routine drains the command, correlates, decodes, and tries to forward —
-        // the full queue turns the forward into a `Local` reject, which the routine
-        // logs and continues past (it does not reject the peer).
-        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
-        commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-            .expect("the routine is alive");
+        // Send the matching solicited response. The routine correlates, decodes, and
+        // tries to forward — the full queue turns the forward into a `Local` reject,
+        // which the routine logs and continues past (it does not reject the peer).
         peer_send
             .send(one_header_response_frame())
             .await
@@ -1355,6 +1818,7 @@ mod tests {
             tip,
             peers,
             candidates,
+            schedule: SharedHeaderRangeQueue::new(),
         };
 
         let service_cancel = CancellationToken::new();
@@ -1409,27 +1873,26 @@ mod tests {
         );
     }
 
-    /// End-to-end through the routine recv loop: a `RecordExpectedHeaders` command
-    /// queued before the matching `Headers` frame arrives is drained and popped
-    /// before the frame is decoded, so the solicited response is correlated (it
-    /// reports `MalformedMessage` against the expectation, never the pre-correlation
+    /// End-to-end through the routine recv loop: an expectation the routine recorded
+    /// when it pulled work (seeded here) is popped before the matching `Headers` frame
+    /// is decoded, so the solicited response is correlated (it reports
+    /// `MalformedMessage` against the expectation, never the pre-correlation
     /// `UnsolicitedHeaders`). This proves the routine's ordering: the expectation is
     /// recorded before any matching frame can be decoded.
     #[tokio::test]
     async fn routine_records_expectation_before_decoding_matching_headers() {
         let (handle, mut events) = test_handle();
         let cancel = CancellationToken::new();
-        let (routine, peer_send, commands_tx) = routine_with(handle, cancel.clone());
+        let (mut routine, peer_send, _commands_tx) = routine_with(handle, cancel.clone());
+        // Seed the expectation the routine records the moment it pulls work and
+        // sends the matching `GetHeaders`, then run it and send an empty (malformed)
+        // solicited Headers frame. The routine must correlate it against the
+        // expectation: a correlated-but-malformed response reports
+        // `MalformedMessage` and rejects; an UNcorrelated one would report
+        // `UnsolicitedHeaders`.
+        routine.seed_expected(block::Height(1), 1);
         let run = tokio::spawn(routine.run());
 
-        // Record the expectation, then send an empty (malformed) solicited Headers
-        // frame. The routine must correlate it against the expectation: a
-        // correlated-but-malformed response reports `MalformedMessage` and rejects;
-        // an UNcorrelated one would report `UnsolicitedHeaders`.
-        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
-        commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-            .expect("the routine is alive");
         peer_send
             .send(headers_frame(Vec::new()))
             .await
@@ -1455,13 +1918,12 @@ mod tests {
         cancel.cancel();
     }
 
-    /// Multiple `RecordExpectedHeaders` commands the routine drains preserve FIFO
-    /// order: the first-recorded expectation is the first popped against the first
-    /// matching `Headers` frame. Driven through the routine's command drain (the
-    /// same `drain_ready_commands` the recv loop runs before each frame).
+    /// Multiple expectations the routine records preserve FIFO order: the
+    /// first-recorded expectation is the first popped against the first matching
+    /// `Headers` frame.
     #[test]
     fn routine_preserves_fifo_for_multiple_expectations() {
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(
             commands_rx,
             block::Height(0),
@@ -1473,17 +1935,268 @@ mod tests {
         let second = ExpectedHeadersResponse::new(block::Height(20), 2).expect("count is valid");
         let third = ExpectedHeadersResponse::new(block::Height(30), 3).expect("count is valid");
         for expected in [first, second, third] {
-            commands_tx
-                .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-                .expect("the routine is alive");
+            local.record_expected(expected);
         }
 
-        // The recv loop drains ready commands before touching a frame; after the
-        // drain the FIFO pops in record order.
-        local.drain_ready_commands();
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
         assert_eq!(local.pop_expected_headers_response(), Some(third));
         assert_eq!(local.pop_expected_headers_response(), None);
+    }
+
+    // ===================== routine-pulled work + strand prevention ==========
+
+    /// Build a `HeaderSyncHandle` around a caller-provided shared range queue so a
+    /// test can seed work and observe assignments/returns directly.
+    fn handle_with_queue(
+        schedule: SharedHeaderRangeQueue,
+    ) -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
+        let (events, events_rx) = mpsc::channel(16);
+        let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+        let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_candidates_tx, candidates) =
+            watch::channel(ZakuraHeaderSyncCandidateState::default());
+        (
+            HeaderSyncHandle {
+                events,
+                lifecycle,
+                tip,
+                peers,
+                candidates,
+                schedule,
+            },
+            events_rx,
+        )
+    }
+
+    fn forward_range(start: u32, count: u32) -> RangeRequest {
+        RangeRequest {
+            start_height: block::Height(start),
+            count,
+            anchor_hash: block::Hash([7; 32]),
+            finalized: false,
+            priority: RangePriority::Forward,
+        }
+    }
+
+    /// Build a routine with a real outbound session sharing `schedule`, seeded with
+    /// a status so its caps are known. Returns the routine, the queue, the events
+    /// receiver, the outbound `GetHeaders` reader, and the cancel token.
+    #[allow(clippy::type_complexity)]
+    fn pulling_routine(
+        schedule: SharedHeaderRangeQueue,
+        generation: u64,
+    ) -> (
+        HeaderSyncPeerRoutine,
+        mpsc::Receiver<HeaderSyncEvent>,
+        crate::zakura::FramedRecv,
+        CancellationToken,
+    ) {
+        let (handle, events) = handle_with_queue(schedule);
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let (_peer_send, service_recv) = crate::zakura::framed_channel(16);
+        let (outbound_send, outbound_recv) = crate::zakura::framed_channel(16);
+        let cancel = CancellationToken::new();
+        let env = HsEnv::new(
+            handle,
+            Network::Mainnet,
+            ZakuraHeaderSyncConfig::default(),
+            MAX_HS_MESSAGE_BYTES as u32,
+        );
+        let session = crate::zakura::HeaderSyncPeerSession::from_parts_with_direction(
+            peer(),
+            crate::zakura::ServicePeerDirection::Inbound,
+            outbound_send,
+            cancel.clone(),
+        );
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(
+                commands_rx,
+                block::Height(0),
+                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ),
+            env,
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        // Seed the peer-local caps as a real `Status` would, so `try_pull` is gated
+        // open. Drop the forwarded status event from the events queue afterward.
+        pipe.local_mut().received_status = true;
+        pipe.local_mut().advertised_tip = block::Height(100);
+        pipe.local_mut().advertised_max_headers_per_response = Some(100);
+        let routine = HeaderSyncPeerRoutine::new(
+            pipe,
+            service_recv,
+            cancel.clone(),
+            Some(session),
+            generation,
+        );
+        (routine, events, outbound_recv, cancel)
+    }
+
+    /// The routine pulls eligible work, records its expectation, sends `GetHeaders`
+    /// on its own stream, and emits `PeerWorkAssigned` — all before yielding, so the
+    /// expectation is recorded before any response could be decoded.
+    #[tokio::test]
+    async fn routine_pulls_work_sends_get_headers_and_records_expectation() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(1, 5));
+        let (mut routine, mut events, mut outbound, _cancel) = pulling_routine(queue.clone(), 9);
+
+        routine.try_pull();
+
+        // The expectation was recorded locally and the slot marked in-flight.
+        assert_eq!(
+            routine.pipe.local_mut().expected_headers.front(),
+            Some(&ExpectedHeadersResponse::new(block::Height(1), 5).unwrap()),
+            "the expectation is recorded synchronously at pull time"
+        );
+        assert!(routine.pipe.local_mut().in_flight.is_some());
+
+        // A `GetHeaders` frame was sent on the routine's own stream.
+        let frame = outbound.recv().await.expect("GetHeaders frame was sent");
+        assert_eq!(
+            u8::try_from(frame.message_type).ok(),
+            Some(MSG_HS_GET_HEADERS)
+        );
+
+        // `PeerWorkAssigned` was emitted for the reactor to record the outstanding.
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::PeerWorkAssigned {
+                start_height,
+                count,
+                generation,
+                ..
+            }) => {
+                assert_eq!(start_height, block::Height(1));
+                assert_eq!(count, 5);
+                assert_eq!(generation, 9);
+            }
+            other => panic!("expected PeerWorkAssigned, got {other:?}"),
+        }
+    }
+
+    /// Dropping a routine that holds in-flight work returns the range to the shared
+    /// queue, so a teardown (stream close, cancel, or panic, which all run `Drop`)
+    /// never strands an assigned range.
+    #[test]
+    fn dropping_routine_returns_in_flight_work() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(1, 5));
+        let (mut routine, _events, _outbound, _cancel) = pulling_routine(queue.clone(), 1);
+        routine.try_pull();
+        assert!(routine.pipe.local_mut().in_flight.is_some());
+        // The range is assigned to this peer while in flight.
+        assert!(queue
+            .snapshot()
+            .assigned
+            .keys()
+            .any(|range| range.start_height == block::Height(1)));
+
+        drop(routine);
+
+        // After teardown the assignment is cleared and the range is re-queued.
+        let snapshot = queue.snapshot();
+        assert!(
+            snapshot
+                .assigned
+                .get(&forward_range(1, 5))
+                .is_none_or(|peers| peers.is_empty()),
+            "teardown clears the in-flight assignment"
+        );
+        assert!(
+            snapshot
+                .forward
+                .iter()
+                .any(|range| range.start_height == block::Height(1)),
+            "teardown re-queues the in-flight range so it is never stranded"
+        );
+    }
+
+    /// Service cancellation drives the routine out of its loop, and its `Drop`
+    /// returns the in-flight range to the queue (the cancel exit path).
+    #[tokio::test]
+    async fn cancelled_routine_returns_in_flight_work_on_exit() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(1, 5));
+        let (routine, _events, _outbound, cancel) = pulling_routine(queue.clone(), 1);
+        // The routine pulls on startup; cancel it and let it run to exit + Drop.
+        cancel.cancel();
+        let run = tokio::spawn(routine.run());
+        let _ = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the cancelled routine exits promptly");
+
+        let snapshot = queue.snapshot();
+        assert!(
+            snapshot
+                .forward
+                .iter()
+                .any(|range| range.start_height == block::Height(1)),
+            "a cancelled routine returns its in-flight range"
+        );
+    }
+
+    /// A panic after the routine took work still returns the range, because `Drop`
+    /// runs during unwind.
+    #[test]
+    fn panicking_routine_returns_in_flight_work_via_drop() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(1, 5));
+        let queue_for_panic = queue.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (mut routine, _events, _outbound, _cancel) = pulling_routine(queue_for_panic, 1);
+            routine.try_pull();
+            assert!(routine.pipe.local_mut().in_flight.is_some());
+            panic!("routine panics while holding in-flight work");
+        }));
+        assert!(result.is_err(), "the closure panicked");
+
+        let snapshot = queue.snapshot();
+        assert!(
+            snapshot
+                .forward
+                .iter()
+                .any(|range| range.start_height == block::Height(1)),
+            "a panicking routine returns its in-flight range via Drop"
+        );
+    }
+
+    /// A stale-generation routine's teardown return must not clear a newer session's
+    /// live assignment for the same peer and range (reconnect generation guard).
+    #[test]
+    fn stale_generation_teardown_does_not_erase_new_session_assignment() {
+        let queue = SharedHeaderRangeQueue::new();
+        queue.ensure_forward(forward_range(1, 5));
+
+        // Old session (generation 1) takes the range, then a new session
+        // (generation 2) reconnects and takes the same range after the old one's
+        // assignment is cleared (simulating reconnect cleanup).
+        let (mut old_routine, _e1, _o1, _c1) = pulling_routine(queue.clone(), 1);
+        old_routine.try_pull();
+        // Simulate reconnect: forget the old peer's assignment, then the new session
+        // takes the range.
+        queue.forget_peer(&peer());
+        let (mut new_routine, _e2, _o2, _c2) = pulling_routine(queue.clone(), 2);
+        new_routine.try_pull();
+        assert!(new_routine.pipe.local_mut().in_flight.is_some());
+
+        // The OLD routine now tears down (Drop), returning under generation 1. The
+        // new session (generation 2) still holds the range.
+        drop(old_routine);
+
+        let snapshot = queue.snapshot();
+        let holds_new_generation = snapshot
+            .assigned
+            .get(&forward_range(1, 5))
+            .is_some_and(|peers| peers.get(&peer()) == Some(&2));
+        assert!(
+            holds_new_generation,
+            "an old session's teardown must not erase the new session's live assignment"
+        );
     }
 }

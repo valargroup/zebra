@@ -766,17 +766,21 @@ mod tests {
     };
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
-        BlockSyncStartup, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncMessage,
-        HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, ServicePeerLimits,
-        ZakuraBlockSyncConfig, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig,
-        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
-        MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+        BlockSyncStartup, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncPeerSession,
+        HeaderSyncStartup, HeaderSyncStatus, ServicePeerLimits, ZakuraBlockSyncConfig,
+        ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig,
+        ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES,
+        ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
     };
     use zebra_chain::{block, parameters::Network};
 
     struct HeaderAdvisoryFixture {
         discovery_handle: ZakuraDiscoveryHandle,
         header_sync: HeaderSyncHandle,
+        // Held to keep the header-sync reactor's action receiver alive (so its
+        // `dispatch_action` does not fail); no longer drained directly now that the
+        // routine, not the reactor, pushes outbound `GetHeaders`.
+        #[allow(dead_code)]
         header_actions: tokio::sync::mpsc::Receiver<HeaderSyncAction>,
         header_task: JoinHandle<()>,
         peer_node_id: NodeId,
@@ -1097,21 +1101,24 @@ mod tests {
             })
             .await?;
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(HeaderSyncAction::SendMessage {
-                    peer,
-                    msg: HeaderSyncMessage::GetHeaders { .. },
-                }) = fixture.header_actions.recv().await
-                {
-                    if peer == fixture.peer_id {
-                        return;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("header sync schedules a request before empty response");
+        // Routine-pulled work: the per-peer routine (not the reactor) now sends
+        // `GetHeaders` and records the expectation. This advisory-backoff test has no
+        // routine, so emit the `PeerWorkAssigned` a routine would have emitted after
+        // it pulled and sent a request, then deliver the empty response against that
+        // outstanding range — exercising the same advisory-unconfirmed path.
+        fixture
+            .header_sync
+            .send(HeaderSyncEvent::PeerWorkAssigned {
+                peer: fixture.peer_id.clone(),
+                generation: 0,
+                start_height: block::Height(1),
+                count: 1,
+                anchor_hash: block::Hash([9; 32]),
+                finalized: false,
+                forward: true,
+            })
+            .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         fixture
             .header_sync

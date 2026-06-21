@@ -152,15 +152,14 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             decode_and_ingest, new_ingest_local, spawn_header_sync_reactor, BlockApplyResult,
             BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-            BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus, DiscoveryMessage,
-            ExpectedHeadersResponse, Frame, FramedRecv, FramedSend, HeaderSyncAction,
-            HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
-            HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
-            HeaderSyncStatus, HsEnv, HsLocal, Peer, Service, ServicePeerLimits, Stream,
-            ZakuraBlockSyncConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
-            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
-            ZAKURA_STREAM_HEADER_SYNC,
+            BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus, DiscoveryMessage, Frame,
+            FramedRecv, FramedSend, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+            HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
+            HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, HsEnv, HsLocal, Peer,
+            Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraHeaderSyncConfig,
+            ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY,
+            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -530,6 +529,7 @@ mod tests {
         /// per-peer routine validation, forwarding the narrowed shared-effect events
         /// the routine emits into this node's reactor (over `ingest_env`'s handle).
         fn ingest_from(&self, source: &ZakuraPeerId, msg: HeaderSyncMessage) {
+            let is_headers = matches!(msg, HeaderSyncMessage::Headers { .. });
             let frame = msg.encode_frame().expect("test message encodes");
             let mut locals = self
                 .peer_locals
@@ -540,29 +540,39 @@ mod tests {
                 .entry(source.clone())
                 .or_insert_with(|| new_ingest_local(&env));
             let _ = decode_and_ingest(local, &self.ingest_env, source.clone(), frame);
+            // A correlated `Headers` response completes this peer's outstanding
+            // request; free the pull slot so the next pump can pull again (the
+            // production routine does this in `apply_headers_outcome`).
+            if is_headers {
+                local.clear_in_flight();
+            }
         }
 
-        /// Record an outbound `GetHeaders` expectation on the requester side so a
-        /// later `Headers` response from `peer` correlates, mirroring production's
-        /// `RecordExpectedHeaders` command path.
-        fn record_outbound_get_headers(
-            &self,
-            peer: &ZakuraPeerId,
-            start_height: block::Height,
-            count: u32,
-        ) {
-            let Ok(expected) = ExpectedHeadersResponse::new(start_height, count) else {
-                return;
+        /// Attempt to pull outbound `GetHeaders` work for every peer whose status
+        /// this node has learned, feeding the resulting `PeerWorkAssigned` to this
+        /// node's reactor. The reactor records the outstanding range and re-emits the
+        /// `SendMessage` mirror the driver delivers. This is the synthetic harness's
+        /// stand-in for the production routine's `try_pull` loop.
+        async fn pump_pull_work(&self) {
+            // Collect pull events under the lock, then send to the reactor outside it
+            // (never hold the std mutex across an `.await`).
+            let events: Vec<HeaderSyncEvent> = {
+                let mut locals = self
+                    .peer_locals
+                    .lock()
+                    .expect("test peer-locals mutex is not poisoned");
+                locals
+                    .iter_mut()
+                    .filter_map(|(peer, local)| local.try_pull_work(&self.ingest_env, peer, 0))
+                    .collect()
             };
-            let env = self.ingest_env.clone();
-            let mut locals = self
-                .peer_locals
-                .lock()
-                .expect("test peer-locals mutex is not poisoned");
-            locals
-                .entry(peer.clone())
-                .or_insert_with(|| new_ingest_local(&env))
-                .record_expected(expected);
+            for event in events {
+                // The expectation was already recorded inside `try_pull_work`; just
+                // forward the assignment so the reactor records the outstanding range
+                // and re-emits the `GetHeaders` `SendMessage` mirror the driver
+                // delivers.
+                let _ = self.handle.send(event).await;
+            }
         }
     }
 
@@ -875,20 +885,39 @@ mod tests {
         peer_to_index: HashMap<ZakuraPeerId, usize>,
     ) {
         let local = nodes[index].clone();
-        while let Some(action) = actions.recv().await {
+        // Routine-pulled work: the production routine pulls `GetHeaders` from the
+        // shared range queue when work becomes available. The synthetic harness has
+        // no routine task, so the driver itself pumps the pull for each connected
+        // peer — after every reactor action (which is what changes pullability:
+        // status applied, range committed/covered, peer connected) and on a short
+        // fallback tick that covers the post-status `schedule()` refresh that emits
+        // no observable action. Each pull records the expectation on the peer-local
+        // state and feeds `PeerWorkAssigned` to the reactor, which records the
+        // outstanding range and re-emits the `SendMessage` mirror the loop delivers.
+        let mut pump = tokio::time::interval(Duration::from_millis(2));
+        pump.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Pull any work that is already eligible at startup.
+        local.pump_pull_work().await;
+        loop {
+            let action = tokio::select! {
+                action = actions.recv() => match action {
+                    Some(action) => action,
+                    None => return,
+                },
+                _ = pump.tick() => {
+                    local.pump_pull_work().await;
+                    continue;
+                }
+            };
+            // Pump pulls after each reactor action too, so a freshly refreshed range
+            // is requested promptly rather than waiting for the next tick.
+            local.pump_pull_work().await;
             match action {
                 HeaderSyncAction::SendMessage { peer, msg } => {
+                    // For an outbound `GetHeaders` the requester-side expectation was
+                    // already recorded when the routine/pump pulled the work, so this
+                    // arm only delivers the frame to the peer node (which serves it).
                     if let Some(target) = peer_to_index.get(&peer) {
-                        // An outbound `GetHeaders` records the requester-side
-                        // expectation so the peer's later `Headers` response
-                        // correlates, mirroring production's `RecordExpectedHeaders`.
-                        if let HeaderSyncMessage::GetHeaders {
-                            start_height,
-                            count,
-                        } = &msg
-                        {
-                            local.record_outbound_get_headers(&peer, *start_height, *count);
-                        }
                         nodes[*target].ingest_from(&local.peer_id, msg);
                     } else {
                         local.sent.lock().await.push((peer, msg));

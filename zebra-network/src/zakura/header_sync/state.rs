@@ -21,7 +21,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
-    pub(super) schedule: RangeScheduler,
+    pub(super) schedule: SharedHeaderRangeQueue,
     pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
@@ -43,7 +43,7 @@ impl HeaderSyncCore {
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
             pending_new_blocks: HashSet::new(),
-            schedule: RangeScheduler::new(),
+            schedule: SharedHeaderRangeQueue::new(),
             pending_commits: HashMap::new(),
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
@@ -196,6 +196,11 @@ impl HeaderSyncAdvisoryPeerState {
 pub(super) struct PeerHeaderState {
     pub(super) session: HeaderSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
+    /// Session generation, minted once per admitted transport. The reactor tags
+    /// every `OutstandingRange` it records for this peer with this generation and
+    /// scopes its timeout `DropExpectation` to it, so a stale request belonging to
+    /// a previous session cannot drop a reconnected session's live expectation.
+    pub(super) generation: u64,
     pub(super) advertised_tip: block::Height,
     pub(super) advertised_hash: block::Hash,
     pub(super) anchor: block::Height,
@@ -213,8 +218,10 @@ pub(super) struct PeerHeaderState {
 }
 
 impl PeerHeaderState {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         session: HeaderSyncPeerSession,
+        generation: u64,
         anchor: (block::Height, block::Hash),
         local_range: u32,
         local_inflight: u16,
@@ -224,6 +231,7 @@ impl PeerHeaderState {
         Self {
             direction: session.direction(),
             session,
+            generation,
             advertised_tip: anchor.0,
             advertised_hash: anchor.1,
             anchor: anchor.0,
@@ -241,6 +249,11 @@ impl PeerHeaderState {
         }
     }
 
+    /// The reactor's free-slot count for this peer. As of routine-pulled work the
+    /// routine owns the outbound-slot decision (one in-flight request per peer via
+    /// its local `in_flight`), so the reactor no longer reads this; retained as the
+    /// authoritative definition of the per-peer effective inflight cap.
+    #[allow(dead_code)]
     pub(super) fn available_slots(&self) -> usize {
         usize::from(self.max_inflight_requests)
             .min(EFFECTIVE_HS_OUTBOUND_INFLIGHT_PER_PEER)
@@ -327,7 +340,11 @@ pub(super) struct OutstandingRange {
     pub(super) range: RangeRequest,
     pub(super) deadline: Instant,
     pub(super) expected_max_count: u32,
-    pub(super) clear_assignment_on_timeout: bool,
+    /// Session generation that requested this range. The reactor returns the range
+    /// to the shared queue under this generation on timeout and tells the routine
+    /// to drop its matching expectation; a return scoped to an old generation
+    /// cannot disturb a reconnected session's live assignment.
+    pub(super) generation: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]

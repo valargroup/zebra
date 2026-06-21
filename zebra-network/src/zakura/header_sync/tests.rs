@@ -222,6 +222,7 @@ impl RoutineHarness {
             tip,
             peers,
             candidates,
+            schedule: super::scheduler::SharedHeaderRangeQueue::new(),
         };
         let env = super::pipe::HsEnv::new(handle, network, config, LOCAL_MAX_MESSAGE_BYTES);
         let local = super::pipe::new_ingest_local(&env);
@@ -253,11 +254,38 @@ impl RoutineHarness {
     }
 }
 
+/// Per-peer test handles for a routine the fixture spawned: the stream sender the
+/// test feeds `Status`/`Headers` frames into, the routine's cancel token, and the
+/// outbound `FramedRecv` (kept alive so the routine's sends never close the
+/// channel; observation of outbound `GetHeaders` is via the reactor's test mirror).
+struct FixturePeer {
+    peer_send: crate::zakura::FramedSend,
+    cancel: CancellationToken,
+    _outbound: crate::zakura::FramedRecv,
+    _task: JoinHandle<()>,
+}
+
+impl Drop for FixturePeer {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self._task.abort();
+    }
+}
+
 struct ReactorFixture {
     handle: HeaderSyncHandle,
     actions: mpsc::Receiver<HeaderSyncAction>,
     task: JoinHandle<()>,
-    outbound_receivers: Mutex<Vec<crate::zakura::FramedRecv>>,
+    /// Network/config/frame-cap the spawned routines use for their outbound count
+    /// clamp; matched to the reactor's startup so reactor and routine agree.
+    routine_network: Network,
+    routine_config: ZakuraHeaderSyncConfig,
+    routine_max_frame_bytes: u32,
+    /// Real per-peer routines, keyed by peer id. As of routine-pulled work the
+    /// fixture drives a real `HeaderSyncPeerRoutine` per connected peer (sharing
+    /// the reactor's range queue) so it sends its own `GetHeaders`; the reactor
+    /// re-emits the test `SendMessage` mirror on `PeerWorkAssigned`.
+    peers: Mutex<std::collections::HashMap<ZakuraPeerId, FixturePeer>>,
 }
 
 impl Drop for ReactorFixture {
@@ -722,12 +750,20 @@ async fn admission_failure_after_advisory_selection_creates_no_outstanding_range
 }
 
 fn spawn_test_reactor(startup: HeaderSyncStartup) -> ReactorFixture {
+    // The spawned routines clamp their outbound count with the same network/config/
+    // frame cap the reactor was started with, so reactor and routine agree.
+    let routine_network = startup.network.clone();
+    let routine_config = startup.config.clone();
+    let routine_max_frame_bytes = startup.max_frame_bytes;
     let (handle, actions, task) = spawn_header_sync_reactor(startup).unwrap();
     ReactorFixture {
         handle,
         actions,
         task,
-        outbound_receivers: Mutex::new(Vec::new()),
+        routine_network,
+        routine_config,
+        routine_max_frame_bytes,
+        peers: Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -799,30 +835,115 @@ async fn assert_no_commit_or_misbehavior(actions: &mut mpsc::Receiver<HeaderSync
     }
 }
 
+/// Mint a unique session generation for a fixture-spawned routine. Distinct from
+/// the production `next_header_sync_generation` (which the service uses), but the
+/// only requirement is uniqueness across reconnects within a test.
+fn next_test_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 async fn connect_peer(fixture: &ReactorFixture, peer_id: ZakuraPeerId) {
     connect_peer_with_direction(fixture, peer_id, ServicePeerDirection::Inbound).await;
 }
 
+/// Spawn a real per-peer routine wired to the reactor's shared range queue and feed
+/// the reactor a `PeerConnected` for it. The returned token cancels just this
+/// routine (and matches the reactor's session cancel for park-on-reject tests).
 async fn connect_peer_with_direction(
     fixture: &ReactorFixture,
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
 ) -> CancellationToken {
-    let (send, recv) = crate::zakura::framed_channel(32);
-    fixture
-        .outbound_receivers
-        .lock()
-        .expect("test outbound receiver mutex ok")
-        .push(recv);
+    let generation = next_test_generation();
     let cancel = CancellationToken::new();
-    let session =
-        HeaderSyncPeerSession::from_parts_with_direction(peer_id, direction, send, cancel.clone());
+    let (peer_send, service_recv) = crate::zakura::framed_channel(64);
+    // The routine's outbound `GetHeaders` go here; kept alive so the channel never
+    // closes. Tests observe outbound `GetHeaders` via the reactor's test mirror.
+    let (outbound_send, outbound_recv) = crate::zakura::framed_channel(64);
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+
+    let session = HeaderSyncPeerSession::from_parts_with_commands(
+        peer_id.clone(),
+        direction,
+        generation,
+        outbound_send,
+        cancel.clone(),
+        commands_tx,
+    );
     fixture
         .handle
-        .send(HeaderSyncEvent::PeerConnected(session))
+        .send(HeaderSyncEvent::PeerConnected(session.clone()))
         .await
         .unwrap();
+
+    // Build the routine's pipe sharing the reactor's range queue (via the handle).
+    let env = super::pipe::HsEnv::new(
+        fixture.handle.clone(),
+        fixture.routine_network.clone(),
+        fixture.routine_config.clone(),
+        fixture.routine_max_frame_bytes,
+    );
+    let pipe = super::pipe::test_pipe(peer_id.clone(), commands_rx, env);
+    let routine = super::pipe::HeaderSyncPeerRoutine::new(
+        pipe,
+        service_recv,
+        cancel.clone(),
+        Some(session),
+        generation,
+    );
+    let task = tokio::spawn(async move {
+        let _ = routine.run().await;
+    });
+
+    fixture
+        .peers
+        .lock()
+        .expect("fixture peers mutex ok")
+        .insert(
+            peer_id,
+            FixturePeer {
+                peer_send,
+                cancel: cancel.clone(),
+                _outbound: outbound_recv,
+                _task: task,
+            },
+        );
     cancel
+}
+
+/// Feed an encoded stream-5 frame to a connected peer's routine and yield so the
+/// routine processes it before the test inspects reactor effects.
+async fn feed_frame(fixture: &ReactorFixture, peer_id: &ZakuraPeerId, msg: HeaderSyncMessage) {
+    let frame = msg.encode_frame().expect("message encodes");
+    let send = {
+        let peers = fixture.peers.lock().expect("fixture peers mutex ok");
+        peers
+            .get(peer_id)
+            .expect("peer is connected")
+            .peer_send
+            .clone()
+    };
+    // A parked/cancelled peer's routine has exited and dropped its recv half;
+    // feeding it a frame is then a no-op (the peer is intentionally not serviced),
+    // so tolerate a closed channel instead of panicking.
+    let _ = send.send(frame).await;
+    tokio::task::yield_now().await;
+}
+
+/// Feed a `Headers` response frame to a peer's routine. The routine correlates it
+/// against the expectation it recorded when it pulled the matching work, forwards
+/// `PeerHeadersReceived` to the reactor, and frees its outbound slot so it can pull
+/// again — exactly the production path.
+async fn respond_headers(
+    fixture: &ReactorFixture,
+    peer_id: &ZakuraPeerId,
+    headers: Vec<Arc<block::Header>>,
+) {
+    feed_frame(fixture, peer_id, headers_message(headers)).await;
+    // Let the routine forward the response and re-attempt a pull.
+    tokio::task::yield_now().await;
 }
 
 async fn advertise_tip(
@@ -854,20 +975,24 @@ async fn advertise_tip_with_hash(
     max_headers_per_response: u32,
     max_inflight_requests: u16,
 ) {
-    fixture
-        .handle
-        .send(HeaderSyncEvent::PeerStatusUpdated {
-            peer: peer_id,
-            status: HeaderSyncStatus {
-                tip_height,
-                tip_hash,
-                anchor_height,
-                max_headers_per_response,
-                max_inflight_requests,
-            },
-        })
-        .await
-        .unwrap();
+    // Feed a real `Status` frame to the peer's routine. The routine runs its
+    // peer-local validation, learns the advertised tip/cap, forwards the clamped
+    // `PeerStatusUpdated` to the reactor, and then pulls eligible work — sending its
+    // own `GetHeaders` and emitting `PeerWorkAssigned`, which the reactor mirrors.
+    feed_frame(
+        fixture,
+        &peer_id,
+        HeaderSyncMessage::Status(HeaderSyncStatus {
+            tip_height,
+            tip_hash,
+            anchor_height,
+            max_headers_per_response,
+            max_inflight_requests,
+        }),
+    )
+    .await;
+    // Give the routine a moment to forward the status and pull work.
+    tokio::task::yield_now().await;
 }
 
 #[test]
@@ -2005,14 +2130,12 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
             }
         }
     }
-    fixture
-        .handle
-        .send(narrowed_event(
-            first_peer.clone(),
-            headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
-        ))
-        .await
-        .unwrap();
+    respond_headers(
+        &fixture,
+        &first_peer,
+        vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)],
+    )
+    .await;
     loop {
         match next_non_query_action(&mut fixture.actions).await {
             HeaderSyncAction::Misbehavior { .. } => {
@@ -2134,6 +2257,7 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
     );
     let mut peer_state = super::state::PeerHeaderState::new(
         session,
+        0,
         (block::Height(0), block::Hash([0; 32])),
         DEFAULT_HS_RANGE,
         DEFAULT_HS_MAX_INFLIGHT,
@@ -3891,11 +4015,10 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
             break;
         }
     }
-    fixture
-        .handle
-        .send(narrowed_event(peer_id.clone(), headers_message(Vec::new())))
-        .await
-        .unwrap();
+    // An empty response for the connected peer's outstanding range goes through its
+    // routine: the routine returns the range to the shared queue and re-fans after
+    // its empty-retry window, producing another `GetHeaders` (no disconnect).
+    respond_headers(&fixture, &peer_id, Vec::new()).await;
     assert!(
         matches!(
             next_non_query_action(&mut fixture.actions).await,
@@ -3974,14 +4097,12 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
             next_outbound_get_headers(&mut fixture.actions).await;
         assert_eq!(start_height, block::Height(4));
         assert_eq!(count, 1);
-        fixture
-            .handle
-            .send(narrowed_event(
-                served_peer,
-                headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-            ))
-            .await
-            .unwrap();
+        respond_headers(
+            &fixture,
+            &served_peer,
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+        )
+        .await;
     }
 
     tip.changed().await.unwrap();
@@ -4055,14 +4176,12 @@ async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
             next_outbound_get_headers(&mut fixture.actions).await;
         assert_eq!(start_height, block::Height(4));
         assert_eq!(count, 1);
-        fixture
-            .handle
-            .send(narrowed_event(
-                served_peer,
-                headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-            ))
-            .await
-            .unwrap();
+        respond_headers(
+            &fixture,
+            &served_peer,
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+        )
+        .await;
     }
 
     assert!(
