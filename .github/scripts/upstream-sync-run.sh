@@ -133,6 +133,14 @@ case "$COMMAND" in
       jq -c -n \
         --arg decision "$STATUS" \
         --arg recommendation "$(jq -r '.recommendation' "$RESULT_JSON")" \
+        --arg source_repo "$(jq -r '.source_repo // ""' "$CANDIDATE_JSON")" \
+        --arg source_ref "$(jq -r '.source_ref // ""' "$CANDIDATE_JSON")" \
+        --arg source_ref_sha "$(jq -r '.source_ref_sha // ""' "$CANDIDATE_JSON")" \
+        --arg target_repo "$(jq -r '.target_repo // ""' "$CANDIDATE_JSON")" \
+        --arg target_ref "$(jq -r '.target_ref // ""' "$CANDIDATE_JSON")" \
+        --arg target_ref_sha "$(jq -r '.target_ref_sha // ""' "$CANDIDATE_JSON")" \
+        --arg first_missing_sha "$(jq -r '.first_missing_sha // ""' "$CANDIDATE_JSON")" \
+        --arg merged_at "$(jq -r '.source_pr_merged_at // ""' "$CANDIDATE_JSON")" \
         --arg title "$(jq -r '.source_pr_title' "$CANDIDATE_JSON")" \
         --arg merge_commit "$(jq -r '.source_merge_commit // ""' "$CANDIDATE_JSON")" \
         --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}" \
@@ -144,7 +152,15 @@ case "$COMMAND" in
           decision: $decision,
           confidence_percent: $confidence_percent,
           recommendation: $recommendation,
+          source_repo: $source_repo,
+          source_ref: $source_ref,
+          source_ref_sha: $source_ref_sha,
+          target_repo: $target_repo,
+          target_ref: $target_ref,
+          target_ref_sha: $target_ref_sha,
+          first_missing_sha: $first_missing_sha,
           source_title: $title,
+          source_merged_at: $merged_at,
           source_merge_commit: $merge_commit,
           run_url: $run_url
         }'

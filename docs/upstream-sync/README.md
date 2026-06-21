@@ -5,8 +5,9 @@ evaluated for `ironwood-main`.
 
 The automation is intentionally conservative:
 
-- it is manual-only in v1;
+- it runs hourly and can also be started manually;
 - it processes exactly one upstream PR per run;
+- it pauses while any generated upstream sync PR is open;
 - it triages before attempting any import;
 - Codex runs without GitHub write permissions;
 - only important production bug fixes should open draft PRs;
@@ -20,6 +21,13 @@ unless they carry an important production bug fix for this fork.
 Non-import triage decisions are recorded on the `upstream-sync/state` branch in
 `.github/upstream-sync/triage-ledger.jsonl`. This avoids churn on
 `ironwood-main` just to remember skipped upstream PRs.
+
+The state branch tracks terminal decisions per upstream PR instead of a single
+"last upstream PR seen" pointer. A single pointer would be unsafe because
+intentionally skipped upstream PRs remain absent from the fork, and upstream PR
+numbers do not perfectly describe commit order. The per-PR record lets each
+hourly run skip reviewed PRs and continue to the next oldest missing upstream
+change.
 
 ## Statuses
 

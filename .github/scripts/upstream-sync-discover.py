@@ -172,6 +172,40 @@ def exact_head_pull_requests(pulls: list[dict[str, Any]], branch: str) -> list[d
     return [pull for pull in pulls if pull.get("headRefName") == branch]
 
 
+def open_upstream_sync_prs_from_list(pulls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return open generated upstream sync PRs."""
+
+    return [
+        pull
+        for pull in pulls
+        if pull.get("state") == "OPEN"
+        and str(pull.get("headRefName", "")).startswith("upstream-sync/pr-")
+    ]
+
+
+def open_upstream_sync_prs(target_repo: str) -> list[dict[str, Any]]:
+    try:
+        pulls = run_json(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                target_repo,
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,state,url,headRefName,title",
+            ]
+        )
+    except subprocess.CalledProcessError:
+        return []
+
+    return open_upstream_sync_prs_from_list(pulls)
+
+
 def blocks_candidate(existing: dict[str, Any]) -> bool:
     """Return true when an existing PR means the upstream PR is already handled."""
 
@@ -260,6 +294,23 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
         ["git", "rev-list", "--left-right", "--count", f"{target_local_ref}...{source_local_ref}"]
     )
     ahead_count, behind_count = [int(part) for part in counts.split()]
+
+    open_sync_prs = open_upstream_sync_prs(args.target_repo)
+    if open_sync_prs and not args.candidate_pr:
+        return {
+            "status": "no_candidate",
+            "source_repo": args.source_repo,
+            "source_ref": args.source_ref,
+            "source_ref_sha": source_sha,
+            "target_repo": args.target_repo,
+            "target_ref": args.target_ref,
+            "target_ref_sha": target_sha,
+            "merge_base": merge_base,
+            "ahead_count": ahead_count,
+            "behind_count": behind_count,
+            "open_generated_pull_requests": open_sync_prs,
+            "message": "An upstream sync PR is already open for human review.",
+        }
 
     state_terminal = terminal_prs_from_state_branch(
         args.target_repo,
@@ -398,6 +449,11 @@ def write_outputs(candidate: dict[str, Any], output_dir: Path, github_output: st
         )
     else:
         summary.append(f"- Message: {candidate.get('message', '')}")
+        for pull in candidate.get("open_generated_pull_requests", []):
+            summary.append(
+                f"- Open upstream sync PR: {pull.get('url')} "
+                f"(`{pull.get('headRefName')}`)"
+            )
 
     (output_dir / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
 

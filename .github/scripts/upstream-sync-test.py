@@ -175,6 +175,13 @@ def main() -> int:
         ],
         "upstream-sync/pr-10676",
     ) == [{"number": 2, "state": "OPEN", "headRefName": "upstream-sync/pr-10676"}]
+    assert discover.open_upstream_sync_prs_from_list(
+        [
+            {"number": 1, "state": "OPEN", "headRefName": "feature/pr-10676"},
+            {"number": 2, "state": "CLOSED", "headRefName": "upstream-sync/pr-10676"},
+            {"number": 3, "state": "OPEN", "headRefName": "upstream-sync/pr-10677"},
+        ]
+    ) == [{"number": 3, "state": "OPEN", "headRefName": "upstream-sync/pr-10677"}]
     assert discover.terminal_prs_from_state_lines(
         "\n".join(
             [

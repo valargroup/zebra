@@ -1,6 +1,6 @@
-# Manual upstream PR discovery and one-at-a-time triage for the Valar Zebra fork.
+# Upstream PR discovery and one-at-a-time triage for the Valar Zebra fork.
 #
-# v1 is intentionally manual-only and capped at a single upstream PR per run.
+# v1 is capped at a single upstream PR per run, including scheduled runs.
 name: Upstream PR Triage Pilot
 
 on:
@@ -34,11 +34,13 @@ on:
         description: "Maximum candidates to process. v1 only accepts 1."
         type: string
         default: "1"
+  schedule:
+    - cron: "17 * * * *"
 
 permissions: {}
 
 concurrency:
-  group: upstream-sync-${{ github.ref }}-${{ inputs.mode }}
+  group: upstream-sync-${{ github.ref }}-${{ inputs.mode || 'open-pr' }}
   cancel-in-progress: false
 
 jobs:
@@ -57,7 +59,7 @@ jobs:
     steps:
       - name: Validate inputs
         env:
-          LIMIT: ${{ inputs.limit }}
+          LIMIT: ${{ inputs.limit || '1' }}
         run: |
           if [ "$LIMIT" != "1" ]; then
             echo "upstream-sync v1 only supports limit=1" >&2
@@ -67,7 +69,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -75,12 +77,12 @@ jobs:
         id: discover
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_REPO: ${{ inputs.source_repo }}
-          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REPO: ${{ inputs.source_repo || 'ZcashFoundation/zebra' }}
+          SOURCE_REF: ${{ inputs.source_ref || 'main' }}
           TARGET_REPO: ${{ github.repository }}
-          TARGET_REF: ${{ inputs.target_ref }}
-          CANDIDATE_PR: ${{ inputs.candidate_pr }}
-          LIMIT: ${{ inputs.limit }}
+          TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          CANDIDATE_PR: ${{ inputs.candidate_pr || '' }}
+          LIMIT: ${{ inputs.limit || '1' }}
         run: |
           .github/scripts/upstream-sync-discover.py \
             --source-repo "$SOURCE_REPO" \
@@ -106,7 +108,7 @@ jobs:
     name: Ask Codex to triage candidate
     runs-on: ubuntu-latest
     needs: discover
-    if: ${{ inputs.mode != 'discover' && needs.discover.outputs.has_candidate == 'true' }}
+    if: ${{ (inputs.mode || 'open-pr') != 'discover' && needs.discover.outputs.has_candidate == 'true' }}
     permissions:
       contents: read
       pull-requests: read
@@ -116,7 +118,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -168,7 +170,7 @@ jobs:
       - codex-patch
     if: >-
       ${{
-        inputs.mode == 'open-pr' &&
+        (inputs.mode || 'open-pr') == 'open-pr' &&
         needs.discover.outputs.has_candidate == 'true' &&
         (
           needs.codex-patch.outputs.result_status == 'already_present' ||
@@ -182,7 +184,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -201,7 +203,7 @@ jobs:
     needs:
       - discover
       - codex-patch
-    if: ${{ inputs.mode == 'open-pr' && needs.codex-patch.outputs.result_status == 'applied' }}
+    if: ${{ (inputs.mode || 'open-pr') == 'open-pr' && needs.codex-patch.outputs.result_status == 'applied' }}
     permissions:
       contents: write
       pull-requests: write
@@ -209,7 +211,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -259,7 +261,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ steps.pr-meta.outputs.branch }}
-          base: ${{ inputs.target_ref }}
+          base: ${{ inputs.target_ref || 'ironwood-main' }}
           title: ${{ steps.pr-meta.outputs.title }}
           body-path: .github/upstream-sync/work/pr-body.md
           commit-message: ${{ steps.pr-meta.outputs.title }}
