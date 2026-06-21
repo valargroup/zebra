@@ -478,6 +478,12 @@ mod tests {
         Flow::Continue(())
     }
 
+    /// An entry that locally rejects every admitted frame, modelling a service
+    /// whose backend/queue is gone (a `SinkReject::Local`, not the peer's fault).
+    fn local_reject_entry(_cx: &mut PipeCx<'_, (), ()>, _frame: Frame) -> Flow<()> {
+        Flow::Reject(SinkReject::local("test backend queue closed"))
+    }
+
     fn pass_guard() -> SessionGuard {
         // Allow message type 1, generous size cap, no byte budget.
         SessionGuard::new(&[1], 1_024, None)
@@ -661,6 +667,215 @@ mod tests {
         assert!(
             !disconnected.load(Ordering::SeqCst),
             "the panic-only disconnect hook must not fire on a normal exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_pipe_runs_teardown_and_cancels_on_normal_return() {
+        // The non-panic exit path: the pipe future returns normally (e.g. its
+        // stream closed). The `PipeTeardown` must still run `on_teardown` and
+        // cancel the service token it owns, while leaving the panic-only hook
+        // untouched.
+        let cancel = CancellationToken::new();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let teardown_flag = torn_down.clone();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panic_flag = panicked.clone();
+
+        let handle = spawn_supervised_pipe(
+            peer_id(),
+            cancel.clone(),
+            move || teardown_flag.store(true, Ordering::SeqCst),
+            move || panic_flag.store(true, Ordering::SeqCst),
+            async {},
+        );
+
+        handle.await.expect("a normal pipe exit does not panic");
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown runs on a normal pipe return"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "the service cancellation token is cancelled on a normal return"
+        );
+        // The panic-only hook is for connection-level teardown a panic requires;
+        // a clean return must not fire it.
+        assert!(
+            !panicked.load(Ordering::SeqCst),
+            "the panic-only hook must not run on a normal return"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_pipe_cancels_service_token_on_protocol_reject() {
+        // Drive a real `PipeSink::run` (the production inbound loop) through
+        // `spawn_supervised_pipe`, composing it with `handle_pipe_exit` exactly as
+        // the services do. A protocol reject (disallowed type) returns
+        // `Err(SinkReject::Protocol)` from the sink, but `spawn_supervised_pipe`'s
+        // own `PipeTeardown` always cancels the *service* token it was handed,
+        // regardless of the reject variant.
+        let service_cancel = CancellationToken::new();
+        let connection_cancel = CancellationToken::new();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let teardown_flag = torn_down.clone();
+
+        let (send, recv) = framed_channel(4);
+        let pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
+        let sink = PipeSink::new(pipe, recv, service_cancel.clone());
+        let connection_cancel_in_future = connection_cancel.clone();
+        let pipe_future = async move {
+            handle_pipe_exit("test", &connection_cancel_in_future, sink.run().await);
+        };
+
+        let handle = spawn_supervised_pipe(
+            peer_id(),
+            service_cancel.clone(),
+            move || teardown_flag.store(true, Ordering::SeqCst),
+            || {},
+            pipe_future,
+        );
+
+        // A disallowed message type is a protocol reject; closing the sender then
+        // lets the sink return after processing it.
+        send.send(frame(2)).await.expect("channel has capacity");
+        drop(send);
+
+        handle.await.expect("a protocol reject is not a panic");
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown runs on a protocol reject"
+        );
+        assert!(
+            service_cancel.is_cancelled(),
+            "the service token is cancelled on a protocol reject"
+        );
+        assert!(
+            connection_cancel.is_cancelled(),
+            "a protocol reject cancels the shared connection token"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_pipe_local_reject_leaves_connection_token_alive() {
+        // A local reject (the peer is not at fault) still cancels this peer's own
+        // service token via the `PipeTeardown`, but must NOT cancel the shared
+        // connection token: other services riding the same connection keep going.
+        let service_cancel = CancellationToken::new();
+        let connection_cancel = CancellationToken::new();
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let teardown_flag = torn_down.clone();
+
+        let (send, recv) = framed_channel(4);
+        let pipe = Pipe::new(peer_id(), (), (), pass_guard(), local_reject_entry, &SHAPE);
+        let sink = PipeSink::new(pipe, recv, service_cancel.clone());
+        let connection_cancel_in_future = connection_cancel.clone();
+        let pipe_future = async move {
+            handle_pipe_exit("test", &connection_cancel_in_future, sink.run().await);
+        };
+
+        let handle = spawn_supervised_pipe(
+            peer_id(),
+            service_cancel.clone(),
+            move || teardown_flag.store(true, Ordering::SeqCst),
+            || {},
+            pipe_future,
+        );
+
+        // An admitted frame that the entry locally rejects.
+        send.send(frame(1)).await.expect("channel has capacity");
+        drop(send);
+
+        handle.await.expect("a local reject is not a panic");
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "teardown runs on a local reject"
+        );
+        assert!(
+            service_cancel.is_cancelled(),
+            "the service token is still cancelled on a local reject"
+        );
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a local reject must not cancel the shared connection token"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_pipe_normal_stream_close_leaves_shared_connection_alive() {
+        // The clean-exit case for a multi-service connection: one service's stream
+        // ends, its sink returns `Ok(())`. The service token is cancelled (only
+        // this service parks), but the shared connection token other services ride
+        // on must stay alive.
+        let service_cancel = CancellationToken::new();
+        let connection_cancel = CancellationToken::new();
+
+        let (send, recv) = framed_channel(4);
+        let pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
+        let sink = PipeSink::new(pipe, recv, service_cancel.clone());
+        let connection_cancel_in_future = connection_cancel.clone();
+        let pipe_future = async move {
+            handle_pipe_exit("test", &connection_cancel_in_future, sink.run().await);
+        };
+
+        let handle =
+            spawn_supervised_pipe(peer_id(), service_cancel.clone(), || {}, || {}, pipe_future);
+
+        // One admitted frame, then close the stream so the sink returns Ok(()).
+        send.send(frame(1)).await.expect("channel has capacity");
+        drop(send);
+
+        handle.await.expect("a normal stream close is not a panic");
+        assert!(
+            service_cancel.is_cancelled(),
+            "the service token is cancelled when this service's stream closes"
+        );
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a clean stream close must not tear down the shared connection token"
+        );
+    }
+
+    #[test]
+    fn handle_pipe_exit_cancels_connection_on_protocol_reject() {
+        // The single decision point: a protocol reject is fatal to the whole
+        // connection, so it cancels the shared connection token.
+        let connection_cancel = CancellationToken::new();
+        handle_pipe_exit(
+            "test",
+            &connection_cancel,
+            Err(SinkReject::protocol("bad frame")),
+        );
+        assert!(
+            connection_cancel.is_cancelled(),
+            "a protocol reject cancels the connection token"
+        );
+    }
+
+    #[test]
+    fn handle_pipe_exit_leaves_connection_on_local_reject() {
+        // A local reject tears down only this stream (already handled by the
+        // per-service token), never the shared connection.
+        let connection_cancel = CancellationToken::new();
+        handle_pipe_exit(
+            "test",
+            &connection_cancel,
+            Err(SinkReject::local("closed queue")),
+        );
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a local reject must not cancel the connection token"
+        );
+    }
+
+    #[test]
+    fn handle_pipe_exit_leaves_connection_on_normal_exit() {
+        // A normal/parked exit does nothing to the connection token.
+        let connection_cancel = CancellationToken::new();
+        handle_pipe_exit("test", &connection_cancel, Ok(()));
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a normal exit must not cancel the connection token"
         );
     }
 }
