@@ -494,6 +494,16 @@ mod tests {
         }
     }
 
+    fn request_response_stream(kind: u16, capability: u64) -> Stream {
+        Stream {
+            kind,
+            version: 1,
+            frame_cap: 1024,
+            capability,
+            mode: StreamMode::RequestResponse,
+        }
+    }
+
     #[test]
     fn registry_builds_kind_and_capability_lookups() {
         let header = TestService::new("header", vec![stream(5, 0b0001), stream(6, 0b0010)]);
@@ -706,6 +716,106 @@ mod tests {
                 .as_slice(),
             &[peer]
         );
+    }
+
+    #[test]
+    fn negotiated_stream_selection_is_mutually_supported_and_mode_separated() {
+        // A service that declares both an ordered and a request/response stream,
+        // plus a second service the peer never negotiates. Negotiation must select
+        // only mutually supported capability bits, and the ordered vs
+        // request/response views must each return only their own mode.
+        let header = TestService::new(
+            "header",
+            vec![stream(5, 0b0001), request_response_stream(3, 0b0010)],
+        );
+        let discovery = TestService::new("discovery", vec![stream(4, 0b0100)]);
+        let registry = ServiceRegistry::new(vec![header.clone(), discovery.clone()])
+            .expect("test services declare unique stream kinds");
+
+        // The peer offers the two header bits plus an unsupported bit (0b1000).
+        // Only the mutually supported bits select services; the unsupported bit is
+        // masked away and discovery (0b0100) is never negotiated here.
+        let negotiated = 0b1011;
+
+        let selected: Vec<_> = registry
+            .services_for_negotiated(negotiated)
+            .iter()
+            .map(|service| service.name())
+            .collect();
+        assert_eq!(
+            selected,
+            ["header"],
+            "negotiation selects only mutually supported services, not the \
+             un-negotiated discovery service or the unsupported bit"
+        );
+
+        let ordered: Vec<_> = registry
+            .ordered_streams_for_negotiated(negotiated)
+            .iter()
+            .map(|stream| (stream.kind, stream.mode))
+            .collect();
+        assert_eq!(
+            ordered,
+            [(5, StreamMode::Ordered)],
+            "ordered view returns only the ordered stream of the negotiated service"
+        );
+
+        let request_response: Vec<_> = registry
+            .request_response_streams_for_negotiated(negotiated)
+            .iter()
+            .map(|stream| (stream.kind, stream.mode))
+            .collect();
+        assert_eq!(
+            request_response,
+            [(3, StreamMode::RequestResponse)],
+            "request/response view returns only the request/response stream"
+        );
+    }
+
+    #[test]
+    fn remove_peer_fans_out_to_every_admitted_service() {
+        // Three services all negotiated by one peer. remove_peer must reach every
+        // service that admitted the peer, so no service leaks per-peer state.
+        let header = TestService::new("header", vec![stream(5, 0b0001)]);
+        let gossip = TestService::new("gossip", vec![stream(2, 0b0010)]);
+        let discovery = TestService::new("discovery", vec![stream(4, 0b0100)]);
+        let registry =
+            ServiceRegistry::new(vec![header.clone(), gossip.clone(), discovery.clone()])
+                .expect("test services declare unique stream kinds");
+        let peer = ZakuraPeerId::new(vec![13; 32]).expect("32-byte test peer id is valid");
+
+        // Negotiate all three capability bits, so every service admits the peer.
+        registry.add_peer(Peer::new(
+            peer.clone(),
+            None,
+            0b0111,
+            HashMap::new(),
+            CancellationToken::new(),
+        ));
+        registry.remove_peer(&peer, 0b0111);
+
+        for service in [&header, &gossip, &discovery] {
+            assert_eq!(
+                service
+                    .added
+                    .lock()
+                    .expect("test mutex should not be poisoned")
+                    .as_slice(),
+                std::slice::from_ref(&peer),
+                "{} must have admitted the peer",
+                service.name
+            );
+            assert_eq!(
+                service
+                    .removed
+                    .lock()
+                    .expect("test mutex should not be poisoned")
+                    .as_slice(),
+                std::slice::from_ref(&peer),
+                "{} must receive the remove-peer fanout it admitted",
+                service.name
+            );
+        }
     }
 
     #[test]
