@@ -5,7 +5,7 @@ target_repo: valargroup/zebra
 target_ref: ironwood-main
 entries:
   - upstream_pr: 10676
-    status: pending
+    status: imported
     title: "fix(state,zebrad): fix tests"
     merged_at: "2026-06-05T16:44:38Z"
     merge_commit: 8ead00cabdf99c2eeb1f76d6c4c16a82e296770d
@@ -16,4 +16,4 @@ entries:
       - 6784f720831fe650f7d84e30e493ec27ddd37a09
       - 40eddc797106112d0a8fd906a054916c2f3d89fe
     target_branch: upstream-sync/pr-10676
-    notes: "Initial pilot candidate. The workflow should report conflicts or needs_human if this cannot be safely adapted."
+    notes: "Adapted remaining behavior. Mempool test fixes were already present in the fork using generated activation-height chains."
