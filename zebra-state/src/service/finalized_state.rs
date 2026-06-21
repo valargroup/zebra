@@ -25,7 +25,8 @@ use std::{
 };
 
 use zebra_chain::{
-    block, orchard,
+    block::{self, merkle::AuthDataRoot, Block},
+    orchard,
     parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
     parameters::Network,
     sapling,
@@ -86,6 +87,7 @@ impl VctState {
     /// Build the POC state from the config flag and the `VCT_FIXTURE` /
     /// `VCT_CAPTURE` environment variables. Returns `None` when neither
     /// capture nor fast mode is requested (the default), so there is zero overhead.
+    #[allow(clippy::unwrap_in_result)] // misconfiguration / unreadable fixture should fail loudly
     fn from_config(fast_flag: bool) -> Option<Arc<Self>> {
         // The config flag is `serde(skip)`, so for the POC harness also honor an
         // env override to enable fast mode without TOML/zebrad plumbing.
@@ -679,12 +681,14 @@ impl FinalizedState {
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
+        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
     ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (checkpoint_verified, rsp_tx) = ordered_block;
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
             note_precompute,
+            next_checkpoint,
             "commit checkpoint-verified request",
         );
 
@@ -729,6 +733,11 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
+        // POC verify-before-commit: the next checkpoint block (and its precomputed
+        // auth data root), used to verify this block's fixture roots before the fast
+        // path trusts them. `None` when there is no buffered successor (then the fast
+        // path falls back to recompute) or outside the checkpoint commit path.
+        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_anchor_roots) =
@@ -771,25 +780,47 @@ impl FinalizedState {
                     let mut fast_anchor_roots = None;
 
                     if let Some((sapling_root, orchard_root)) = vct_fast {
-                        // Still run the commitment check. It validates the history tree
-                        // (which we extend with the fixture roots) against the header, so a
-                        // wrong fixture root is caught here rather than trusted blindly.
-                        let commitment_result = COMMIT_COMPUTE_POOL.install(|| {
+                        // This block's own commitment check (validates the parent
+                        // history tree — the roots already committed).
+                        COMMIT_COMPUTE_POOL.install(|| {
                             check::block_commitment_is_valid_for_chain_history(
                                 block.clone(),
                                 &network,
                                 &history_tree,
                                 precomputed_auth_data_root,
                             )
-                        });
-                        commitment_result?;
+                        })?;
 
-                        let history_tree_mut = Arc::make_mut(&mut history_tree);
-                        history_tree_mut
+                        // Build the candidate history tree with this block's fixture
+                        // roots folded in.
+                        let mut candidate = history_tree.clone();
+                        Arc::make_mut(&mut candidate)
                             .push(&network, block.clone(), &sapling_root, &orchard_root)
                             .map_err(Arc::new)
                             .map_err(ValidateContextError::from)?;
 
+                        // Verify-before-commit: this block's roots are only committed by
+                        // the *next* block's header (the one-block lag). When a successor
+                        // is buffered, check its commitment against the candidate; a wrong
+                        // fixture root makes this fail, and we reject it (propagating the
+                        // error) before persisting. Fast mode freezes the note-commitment
+                        // frontier, so a bad root cannot be recomputed away here — verify
+                        // or refuse. The next block's auth data root is precomputed by the
+                        // checkpoint verifier, so this is cheap. With no successor yet (the
+                        // sync tip), commit on the in-arrears check above; the root is
+                        // verified when the next block arrives.
+                        if let Some((next_block, next_auth)) = &next_checkpoint {
+                            COMMIT_COMPUTE_POOL.install(|| {
+                                check::block_commitment_is_valid_for_chain_history(
+                                    next_block.clone(),
+                                    &network,
+                                    &candidate,
+                                    *next_auth,
+                                )
+                            })?;
+                        }
+
+                        history_tree = candidate;
                         if let Some(v) = &self.vct {
                             v.fast_count.fetch_add(1, Ordering::Relaxed);
                         }
@@ -807,9 +838,9 @@ impl FinalizedState {
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;
-                    // Run the two CPU-intensive operations inside the dedicated
-                    // commit-compute pool so their nested rayon work uses isolated workers instead of
-                    // contending with the verifier on the global pool.
+                        // Run the two CPU-intensive operations inside the dedicated
+                        // commit-compute pool so their nested rayon work uses isolated workers instead of
+                        // contending with the verifier on the global pool.
                         let tree_result = COMMIT_COMPUTE_POOL.install(|| {
                             rayon::in_place_scope_fifo(|scope| {
                                 scope.spawn_fifo(|_scope| {
@@ -989,6 +1020,31 @@ impl FinalizedState {
     /// precompute, whose result the fast committer would discard.
     pub(crate) fn vct_fast_enabled(&self) -> bool {
         self.vct.as_ref().is_some_and(|v| v.fast)
+    }
+
+    /// Test-only: enable verified-commitment-trees fast mode with an in-memory
+    /// fixture (instead of the `VCT_FIXTURE` file), so the fast/verify-ahead/fallback
+    /// paths can be unit tested without env vars or a synced node.
+    #[cfg(test)]
+    pub(crate) fn enable_vct_fast_fixture(
+        &mut self,
+        roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+    ) {
+        self.vct = Some(Arc::new(VctState {
+            fast: true,
+            roots,
+            capture: None,
+            fast_count: AtomicU64::new(0),
+        }));
+    }
+
+    /// Test-only: number of blocks that took the fast (skip-recompute) path so far.
+    #[cfg(test)]
+    pub(crate) fn vct_fast_count(&self) -> u64 {
+        self.vct
+            .as_ref()
+            .map(|v| v.fast_count.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// POC: log the consensus-equivalence digest (anchor sets + history root) and
