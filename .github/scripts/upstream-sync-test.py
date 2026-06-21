@@ -168,6 +168,13 @@ def main() -> int:
     assert discover.blocks_candidate(
         {"branch_exists": True, "pull_requests": [], "head_pull_requests": [{"state": "MERGED"}]}
     )
+    assert discover.exact_head_pull_requests(
+        [
+            {"number": 1, "state": "OPEN", "headRefName": "upstream-sync/pr-106760"},
+            {"number": 2, "state": "OPEN", "headRefName": "upstream-sync/pr-10676"},
+        ],
+        "upstream-sync/pr-10676",
+    ) == [{"number": 2, "state": "OPEN", "headRefName": "upstream-sync/pr-10676"}]
 
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]

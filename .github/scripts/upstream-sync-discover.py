@@ -148,8 +148,14 @@ def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, 
     return {
         "branch_exists": branch_exists,
         "pull_requests": prs,
-        "head_pull_requests": head_prs,
+        "head_pull_requests": exact_head_pull_requests(head_prs, branch),
     }
+
+
+def exact_head_pull_requests(pulls: list[dict[str, Any]], branch: str) -> list[dict[str, Any]]:
+    """Filter gh --head results to the exact branch name."""
+
+    return [pull for pull in pulls if pull.get("headRefName") == branch]
 
 
 def blocks_candidate(existing: dict[str, Any]) -> bool:

@@ -99,8 +99,8 @@ case "$COMMAND" in
           --repo "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}" \
           --state open \
           --head "$BRANCH" \
-          --json number \
-          --jq 'length'
+          --json number,headRefName \
+          | jq --arg branch "$BRANCH" '[.[] | select(.headRefName == $branch)] | length'
       )"
       if [ "$OPEN_PRS" != "0" ]; then
         echo "ERROR: refusing to delete $BRANCH because it has an open PR" >&2
