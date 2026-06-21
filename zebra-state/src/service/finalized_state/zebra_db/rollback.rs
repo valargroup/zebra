@@ -552,6 +552,9 @@ fn rebuild_history_tree_from_upgrade_activation(
         .expect("current network upgrade must have an activation height");
 
     let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, start_height)?;
+    // TODO(state split): history_rebuild_inputs_at_height will return the real
+    // per-height Ironwood root in the state split. Until then, an empty root is
+    // correct here because this layer sees no NU6.3 blocks yet (no Ironwood tree exists).
     let ironwood_root = Default::default();
     let mut history_tree =
         HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
