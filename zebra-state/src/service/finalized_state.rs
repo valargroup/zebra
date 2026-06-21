@@ -116,6 +116,7 @@ pub(crate) fn spawn_note_precompute(
 
 pub mod column_family;
 
+mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 mod zebra_db;
