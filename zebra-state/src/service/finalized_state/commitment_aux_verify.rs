@@ -23,7 +23,49 @@ use zebra_chain::{
     sapling,
 };
 
+use zebra_chain::block::{Commitment, CommitmentError};
+
 use crate::{service::check, ValidateContextError};
+
+/// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
+/// block header (design §6.1).
+///
+/// The ZIP-221 history MMR does not exist below Heartwood, so
+/// [`block_commitment_is_valid_for_chain_history`](check::block_commitment_is_valid_for_chain_history)
+/// is a no-op there and cannot authenticate the supplied roots. This fills that gap:
+///
+/// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
+///   directly, so the supplied root must equal it.
+/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the
+///   empty-tree root.
+///
+/// Heartwood and later (`ChainHistoryRoot` / `ChainHistoryBlockTxAuthCommitment` /
+/// the activation-reserved block) are authenticated by the MMR path and accepted
+/// here. Orchard does not activate until NU5 and is not committed by any header
+/// below NU5, so it is not checked here.
+pub(crate) fn verify_supplied_sapling_root_below_heartwood(
+    network: &Network,
+    block: &Block,
+    sapling_root: &sapling::tree::Root,
+) -> Result<(), ValidateContextError> {
+    let expected = match block.commitment(network)? {
+        Commitment::FinalSaplingRoot(header_root) => header_root,
+        Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
+        // Heartwood activation and later are authenticated by the MMR path.
+        _ => return Ok(()),
+    };
+
+    if sapling_root != &expected {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidFinalSaplingRoot {
+                expected: <[u8; 32]>::from(expected),
+                actual: <[u8; 32]>::from(*sapling_root),
+            },
+        ));
+    }
+
+    Ok(())
+}
 
 /// Verifies that `items` (blocks in ascending height order, each with its supplied
 /// Sapling/Orchard roots) reconstruct a ZIP-221 history MMR consistent with the
