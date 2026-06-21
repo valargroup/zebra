@@ -19,6 +19,7 @@ use tower::timeout::Timeout;
 use zebra_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
+    parameters::Network,
     serialization::ZcashDeserializeInto,
 };
 use zebra_consensus::{
@@ -1951,6 +1952,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         verifier,
         chain_tip,
         past_lookahead_limit_sender,
+        Network::Mainnet,
         sync::MIN_CONCURRENCY_LIMIT,
         Height(0),
     );
