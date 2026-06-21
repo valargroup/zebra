@@ -29,7 +29,9 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
 
         let net = Network::new_regtest(
             ConfiguredActivationHeights {
-                nu5: Some(1),
+                // Current coinbase construction can create Orchard outputs for
+                // unified miner addresses, so use the fixed Orchard circuit.
+                nu6_2: Some(1),
                 ..Default::default()
             }
             .into(),
