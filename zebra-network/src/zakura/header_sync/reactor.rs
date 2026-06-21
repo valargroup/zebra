@@ -1403,10 +1403,6 @@ impl HeaderSyncReactor {
     async fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: HeaderSyncMisbehavior) {
         // Misbehavior is record-only: trace and forward it, but never cancel the
         // session. Peer scoring no longer drives disconnects.
-        if reason == HeaderSyncMisbehavior::UnsolicitedHeaders {
-            self.trace_peer_violation(&peer, reason);
-            return;
-        }
         metrics::counter!("sync.header.peer.violation").increment(1);
         self.trace_peer_violation(&peer, reason);
         self.trace_peer_disconnect_requested(&peer, reason);
