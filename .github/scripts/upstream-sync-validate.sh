@@ -13,7 +13,7 @@ fi
 
 jq -e '
   type == "object" and
-  (.status | IN("applied", "already_present", "needs_human", "failed")) and
+  (.status | IN("applied", "already_present", "needs_human", "failed", "skipped")) and
   (.source_pr | type == "number") and
   (.confidence_percent | type == "number" and . >= 0 and . <= 100) and
   (.recommendation | type == "string" and length > 0) and

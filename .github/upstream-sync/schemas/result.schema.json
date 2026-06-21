@@ -18,7 +18,7 @@
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["applied", "already_present", "needs_human", "failed"]
+      "enum": ["applied", "already_present", "needs_human", "failed", "skipped"]
     },
     "source_pr": {
       "type": "integer",

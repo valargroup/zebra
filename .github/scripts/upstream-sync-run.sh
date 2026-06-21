@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|delete-stale-branch|write-pr-body>}"
+COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|delete-stale-branch|record-decision|write-pr-body>}"
 WORK_DIR="${UPSTREAM_SYNC_WORK_DIR:-.github/upstream-sync/work}"
 CANDIDATE_JSON="${UPSTREAM_SYNC_CANDIDATE_JSON:-${WORK_DIR}/candidate.json}"
 RESULT_JSON="${UPSTREAM_SYNC_RESULT_JSON:-${WORK_DIR}/result.json}"
@@ -112,6 +112,63 @@ case "$COMMAND" in
     else
       echo "No stale upstream sync branch to delete: $BRANCH"
     fi
+    ;;
+
+  record-decision)
+    require_file "$RESULT_JSON"
+    require_file "$CANDIDATE_JSON"
+    STATUS="$(jq -r '.status' "$RESULT_JSON")"
+    case "$STATUS" in
+      already_present|needs_human|skipped) ;;
+      *)
+        echo "No terminal triage decision to record for status: $STATUS"
+        exit 0
+        ;;
+    esac
+
+    STATE_BRANCH="${UPSTREAM_SYNC_STATE_BRANCH:-upstream-sync/state}"
+    STATE_FILE="${UPSTREAM_SYNC_STATE_FILE:-.github/upstream-sync/triage-ledger.jsonl}"
+    SOURCE_PR="$(jq -r '.source_pr' "$RESULT_JSON")"
+    RECORD="$(
+      jq -c -n \
+        --arg decision "$STATUS" \
+        --arg recommendation "$(jq -r '.recommendation' "$RESULT_JSON")" \
+        --arg title "$(jq -r '.source_pr_title' "$CANDIDATE_JSON")" \
+        --arg merge_commit "$(jq -r '.source_merge_commit // ""' "$CANDIDATE_JSON")" \
+        --arg run_url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}" \
+        --argjson upstream_pr "$SOURCE_PR" \
+        --argjson confidence_percent "$(jq -r '.confidence_percent' "$RESULT_JSON")" \
+        '{
+          schema_version: 1,
+          upstream_pr: $upstream_pr,
+          decision: $decision,
+          confidence_percent: $confidence_percent,
+          recommendation: $recommendation,
+          source_title: $title,
+          source_merge_commit: $merge_commit,
+          run_url: $run_url
+        }'
+    )"
+
+    git config user.name "github-actions[bot]"
+    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    if git ls-remote --exit-code --heads origin "$STATE_BRANCH" >/dev/null 2>&1; then
+      git fetch origin "$STATE_BRANCH"
+      git switch --force-create "$STATE_BRANCH" FETCH_HEAD
+    else
+      git switch --orphan "$STATE_BRANCH"
+      git rm -rf . >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p "$(dirname "$STATE_FILE")"
+    printf '%s\n' "$RECORD" >> "$STATE_FILE"
+    git add "$STATE_FILE"
+    if git diff --cached --quiet; then
+      echo "No triage decision changes to record"
+      exit 0
+    fi
+    git commit -m "Record upstream PR ${SOURCE_PR} ${STATUS}"
+    git push origin "HEAD:${STATE_BRANCH}"
     ;;
 
   write-pr-body)

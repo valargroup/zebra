@@ -4,7 +4,7 @@
 The script intentionally emits one candidate at a time. It uses the first
 missing upstream commit by compare order, maps that commit to its merged
 upstream PR through GitHub's commit-to-PR API, and then records the whole PR as
-the candidate.
+the candidate. Closed generated PRs count as reviewed human skips.
 """
 
 from __future__ import annotations
@@ -20,6 +20,14 @@ from typing import Any
 
 
 TERMINAL_LEDGER_STATUSES = {"imported", "skipped", "superseded"}
+TERMINAL_STATE_DECISIONS = {
+    "already_present",
+    "human_skipped",
+    "imported",
+    "needs_human",
+    "skipped",
+    "superseded",
+}
 
 
 def run(args: list[str], *, cwd: Path | None = None) -> str:
@@ -97,6 +105,36 @@ def terminal_prs_from_ledger(path: Path) -> set[int]:
     return terminal
 
 
+def terminal_prs_from_state_lines(text: str) -> set[int]:
+    terminal: set[int] = set()
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        decision = record.get("decision") or record.get("status")
+        upstream_pr = record.get("upstream_pr")
+        if decision in TERMINAL_STATE_DECISIONS and isinstance(upstream_pr, int):
+            terminal.add(upstream_pr)
+
+    return terminal
+
+
+def terminal_prs_from_state_branch(target_repo: str, branch: str, path: str) -> set[int]:
+    local_ref = "refs/remotes/upstream-sync/state"
+    try:
+        fetch_ref(target_repo, branch, local_ref)
+        text = run(["git", "show", f"{local_ref}:{path}"])
+    except subprocess.CalledProcessError:
+        return set()
+
+    return terminal_prs_from_state_lines(text)
+
+
 def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, Any]:
     branch_exists = False
     try:
@@ -161,13 +199,13 @@ def exact_head_pull_requests(pulls: list[dict[str, Any]], branch: str) -> list[d
 def blocks_candidate(existing: dict[str, Any]) -> bool:
     """Return true when an existing PR means the upstream PR is already handled."""
 
-    active_states = {"OPEN", "MERGED"}
+    handled_states = {"CLOSED", "MERGED", "OPEN"}
     tracked_prs = [
         *existing.get("pull_requests", []),
         *existing.get("head_pull_requests", []),
     ]
 
-    return any(pull.get("state") in active_states for pull in tracked_prs)
+    return any(pull.get("state") in handled_states for pull in tracked_prs)
 
 
 def write_source_diffs(source_repo: str, source_pr: int, output_dir: Path) -> None:
@@ -248,6 +286,11 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
     ahead_count, behind_count = [int(part) for part in counts.split()]
 
     ledger_terminal = terminal_prs_from_ledger(args.ledger)
+    state_terminal = terminal_prs_from_state_branch(
+        args.target_repo,
+        args.state_branch,
+        args.state_ledger,
+    )
     missing_commits = run(
         ["git", "rev-list", "--reverse", f"{target_local_ref}..{source_local_ref}"]
     ).splitlines()
@@ -264,7 +307,7 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
             if not pull:
                 continue
             pr_number = int(pull["number"])
-            if pr_number in ledger_terminal:
+            if pr_number in ledger_terminal or pr_number in state_terminal:
                 continue
             maybe_pr = pr_metadata(args.source_repo, pr_number)
             maybe_candidate = candidate_from_pr(
@@ -402,6 +445,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=Path(".github/upstream-sync/work"))
     parser.add_argument("--ledger", type=Path, default=Path("docs/upstream-sync/ledger.yml"))
+    parser.add_argument("--state-branch", default="upstream-sync/state")
+    parser.add_argument("--state-ledger", default=".github/upstream-sync/triage-ledger.jsonl")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--write-diffs", action="store_true")
     return parser.parse_args()

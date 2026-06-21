@@ -153,7 +153,7 @@ def main() -> int:
     assert not discover.blocks_candidate(
         {"branch_exists": True, "pull_requests": [], "head_pull_requests": []}
     )
-    assert not discover.blocks_candidate(
+    assert discover.blocks_candidate(
         {
             "branch_exists": False,
             "pull_requests": [{"state": "CLOSED"}],
@@ -175,6 +175,15 @@ def main() -> int:
         ],
         "upstream-sync/pr-10676",
     ) == [{"number": 2, "state": "OPEN", "headRefName": "upstream-sync/pr-10676"}]
+    assert discover.terminal_prs_from_state_lines(
+        "\n".join(
+            [
+                '{"upstream_pr": 10676, "decision": "skipped"}',
+                '{"upstream_pr": 10604, "decision": "failed"}',
+                '{"upstream_pr": 10603, "decision": "needs_human"}',
+            ]
+        )
+    ) == {10676, 10603}
 
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]
@@ -239,6 +248,9 @@ def main() -> int:
 
     no_edit_result = result_for(candidate, valid_body, status="needs_human", validation=[])
     assert_validator_passed(run_validator(output_dir, candidate_path, no_edit_result))
+
+    skipped_result = result_for(candidate, valid_body, status="skipped", validation=[])
+    assert_validator_passed(run_validator(output_dir, candidate_path, skipped_result))
 
     subprocess.check_call(["rm", "-rf", str(output_dir)])
     print("OK: fixture discovery selects upstream PR 10676")
