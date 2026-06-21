@@ -4644,7 +4644,10 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
 
 #[tokio::test]
 async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
-    let config = ZakuraBlockSyncConfig::default();
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 4,
+        ..ZakuraBlockSyncConfig::default()
+    };
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
