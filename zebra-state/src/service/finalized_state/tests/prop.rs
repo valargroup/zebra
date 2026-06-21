@@ -16,7 +16,7 @@ use crate::{
     config::Config,
     service::{
         arbitrary::PreparedChain,
-        finalized_state::{CheckpointVerifiedBlock, FinalizedState},
+        finalized_state::{commitment_aux, CheckpointVerifiedBlock, FinalizedState},
     },
     tests::FakeChainHelper,
     HashOrHeight,
@@ -476,6 +476,104 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             fast.vct_prevalidated_next = Some((Height((seed + 3) as u32), stale_hash));
             commit(&mut fast, seed + 3);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
+    });
+
+    Ok(())
+}
+
+/// Increment-3 contract proof: a roots/frontier payload **produced from a database**
+/// (the serving read path) can replace the fixture and drives the fast path to
+/// byte-identical consensus state.
+///
+/// Builds an archive/legacy state over a generated valid-commitment chain (crossing
+/// Heartwood and NU5), produces the per-block roots and final frontier from that DB
+/// via [`commitment_aux::produce_block_roots`] / [`commitment_aux::produce_final_frontiers`],
+/// then drives a fresh fast-sync state that consumes the produced payload through a
+/// [`commitment_aux::VecRootSource`]. Asserts the fast anchors + history-tree hash are
+/// byte-identical to the legacy build, and that the produced final frontier agrees with
+/// the legacy tip frontier and the produced root at the handoff height.
+///
+/// This is coverage the existing equivalence test lacks: there the roots are captured
+/// from the committer's inline-returned trees, here they come from the **DB read path**
+/// a serving node runs. No networking and no DB-format change.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
+fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            // Seed below Heartwood so the fast range creates the history tree and
+            // crosses the NU5 V1->V2 boundary, matching the equivalence test.
+            let seed = (heartwood - 1) as usize;
+
+            // Legacy/archive pass: a real DB with per-height trees, plus the golden state.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            for block in blocks.iter().take(last + 1) {
+                let cv = CheckpointVerifiedBlock::from(block.block.clone());
+                legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct round-trip legacy")
+                    .unwrap();
+            }
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+
+            // Produce the payload from the legacy DB's per-height trees (the serving read path).
+            let last_height = Height(last as u32);
+            let produced_roots = commitment_aux::produce_block_roots(
+                &legacy.db,
+                Height((seed + 1) as u32)..=last_height,
+            );
+            let produced_frontiers = commitment_aux::produce_final_frontiers(&legacy.db, last_height)
+                .expect("legacy DB has the tip frontier");
+
+            // The produced final frontier agrees with the legacy tip frontier and with the
+            // produced root at the handoff height (the two producer outputs are consistent).
+            let handoff = produced_roots.last().expect("produced a non-empty range");
+            prop_assert_eq!(produced_frontiers.sapling.root(), handoff.sapling_root, "produced sapling frontier matches the produced root at handoff");
+            prop_assert_eq!(produced_frontiers.orchard.root(), handoff.orchard_root, "produced orchard frontier matches the produced root at handoff");
+            prop_assert_eq!(produced_frontiers.sapling.root(), legacy.db.sapling_tree_by_height(&last_height).unwrap().root(), "produced sapling frontier matches legacy tip");
+            prop_assert_eq!(produced_frontiers.sprout.root(), legacy.db.sprout_tree_for_tip().root(), "produced sprout frontier matches legacy tip");
+
+            // Consume the DB-produced roots in a fresh fast-sync state.
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_source(Box::new(commitment_aux::VecRootSource::from_payload(produced_roots, None)));
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct round-trip fast")
+                    .expect("verified fast commit from DB-produced roots succeeds");
+            }
+
+            prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from DB-produced roots match legacy");
+            prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from DB-produced roots match legacy");
     });
 
     Ok(())
