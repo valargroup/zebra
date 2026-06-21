@@ -101,6 +101,25 @@ def run_write_pr_body(output_dir: Path, result: dict[str, object]) -> tuple[subp
     return process, pr_body_path
 
 
+def run_record_decision(output_dir: Path, candidate_path: Path, result: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    result_path = output_dir / "result.json"
+    result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["UPSTREAM_SYNC_RESULT_JSON"] = str(result_path)
+    env["UPSTREAM_SYNC_CANDIDATE_JSON"] = str(candidate_path)
+    return subprocess.run(
+        [
+            str(ROOT / ".github" / "scripts" / "upstream-sync-run.sh"),
+            "record-decision",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def write_pr_body(output_dir: Path, result: dict[str, object]) -> str:
     process, pr_body_path = run_write_pr_body(output_dir, result)
     if process.returncode != 0:
@@ -255,6 +274,9 @@ def main() -> int:
 
     no_edit_result = result_for(candidate, valid_body, status="needs_human", validation=[])
     assert_validator_passed(run_validator(output_dir, candidate_path, no_edit_result))
+    process = run_record_decision(output_dir, candidate_path, no_edit_result)
+    assert process.returncode == 0
+    assert "No terminal triage decision to record for status: needs_human" in process.stdout
 
     skipped_result = result_for(candidate, valid_body, status="skipped", validation=[])
     assert_validator_passed(run_validator(output_dir, candidate_path, skipped_result))

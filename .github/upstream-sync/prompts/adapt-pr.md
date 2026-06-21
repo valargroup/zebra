@@ -38,7 +38,9 @@ Rules:
 - If the source PR is already present, do not create a patch. Return
   `already_present`.
 - If the source PR cannot be adapted confidently, do not leave partial source
-  changes. Return `needs_human` and explain the blocker with file-level evidence.
+  changes. Return `needs_human` and explain the blocker with file-level
+  evidence. A zero-diff draft PR will be opened from this result for human
+  review.
 - Run targeted validation when practical. Prefer fast checks over broad test
   suites unless the candidate is small enough to validate broadly.
 - Always run `cargo fmt --all -- --check` and `git diff --check` after editing.
@@ -55,8 +57,12 @@ PR body requirements:
 - Use a conventional PR title. If the upstream title has an invalid multi-scope
   form such as `fix(state,zebrad): ...`, normalize it to a single valid scope or
   no scope.
-- For non-`applied` statuses, `pr_title` and `pr_body` are still required but
-  are triage summaries. They will not be used to open a downstream PR.
+- For `skipped` and `already_present`, `pr_title` and `pr_body` are still
+  required but are only triage summaries.
+- For `needs_human`, `pr_title` and `pr_body` will be used to open a downstream
+  draft PR with an empty commit and no file changes. Use a title such as
+  `chore(upstream): review upstream PR 10676`, and use the body to describe the
+  blocker, relevant files, risks, and what a human should decide.
 - Start the PR body with one concise confidence line:
   `AI Confidence: <confidence_percent>% - <short merge-safety recommendation>`.
 - Use concise sections: Motivation, Solution, Tests, Follow-up Work,
@@ -77,5 +83,6 @@ Status guidance:
 - `already_present`: the fork already contains the behavior and no downstream PR
   should be opened.
 - `needs_human`: the source PR is relevant but requires manual judgment or
-  conflict resolution.
+  conflict resolution. A zero-diff downstream PR should be opened for human
+  review.
 - `failed`: the task could not be evaluated.

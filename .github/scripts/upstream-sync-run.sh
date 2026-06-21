@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|delete-stale-branch|record-decision|write-pr-body>}"
+COMMAND="${1:?Usage: upstream-sync-run.sh <prepare|collect-patch|apply-patch|delete-stale-branch|record-decision|write-pr-body|create-human-review-pr>}"
 WORK_DIR="${UPSTREAM_SYNC_WORK_DIR:-.github/upstream-sync/work}"
 CANDIDATE_JSON="${UPSTREAM_SYNC_CANDIDATE_JSON:-${WORK_DIR}/candidate.json}"
 RESULT_JSON="${UPSTREAM_SYNC_RESULT_JSON:-${WORK_DIR}/result.json}"
@@ -119,7 +119,7 @@ case "$COMMAND" in
     require_file "$CANDIDATE_JSON"
     STATUS="$(jq -r '.status' "$RESULT_JSON")"
     case "$STATUS" in
-      already_present|needs_human|skipped) ;;
+      already_present|skipped) ;;
       *)
         echo "No terminal triage decision to record for status: $STATUS"
         exit 0
@@ -217,6 +217,47 @@ case "$COMMAND" in
     {
       printf 'title=%s\n' "$TITLE"
       printf 'branch=%s\n' "$BRANCH"
+    } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT must be set}"
+    ;;
+
+  create-human-review-pr)
+    require_file "$RESULT_JSON"
+    require_file "$PR_BODY_FILE"
+    STATUS="$(jq -r '.status' "$RESULT_JSON")"
+    if [ "$STATUS" != "needs_human" ]; then
+      echo "ERROR: create-human-review-pr only supports needs_human results" >&2
+      exit 1
+    fi
+
+    BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
+    TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
+    TARGET_REF="${UPSTREAM_SYNC_TARGET_REF:-ironwood-main}"
+    case "$BRANCH" in
+      upstream-sync/pr-[0-9]*) ;;
+      *)
+        echo "ERROR: refusing to create non upstream-sync PR branch: $BRANCH" >&2
+        exit 1
+        ;;
+    esac
+
+    git config user.name "github-actions[bot]"
+    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    git switch --create "$BRANCH"
+    git commit --allow-empty -m "$TITLE"
+    git push --set-upstream origin "HEAD:$BRANCH"
+    PR_URL="$(
+      gh pr create \
+        --repo "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}" \
+        --draft \
+        --base "$TARGET_REF" \
+        --head "$BRANCH" \
+        --title "$TITLE" \
+        --body-file "$PR_BODY_FILE"
+    )"
+    PR_NUMBER="${PR_URL##*/}"
+    {
+      printf 'pull_request_url=%s\n' "$PR_URL"
+      printf 'pull_request_number=%s\n' "$PR_NUMBER"
     } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT must be set}"
     ;;
 
