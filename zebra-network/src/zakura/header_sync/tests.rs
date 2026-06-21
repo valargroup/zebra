@@ -201,8 +201,8 @@ fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
 /// per-peer [`HsLocal`], then drains the narrowed shared-effect events the routine
 /// forwarded.
 struct RoutineHarness {
-    local: super::pipe::HsLocal,
-    env: super::pipe::HsEnv,
+    local: super::routine::HsLocal,
+    env: super::routine::HsEnv,
     peer: ZakuraPeerId,
     events: mpsc::Receiver<HeaderSyncEvent>,
 }
@@ -227,8 +227,8 @@ impl RoutineHarness {
             candidates,
             schedule: super::scheduler::SharedHeaderRangeQueue::new(),
         };
-        let env = super::pipe::HsEnv::new(handle, network, config, LOCAL_MAX_MESSAGE_BYTES);
-        let local = super::pipe::new_ingest_local(&env);
+        let env = super::routine::HsEnv::new(handle, network, config, LOCAL_MAX_MESSAGE_BYTES);
+        let local = super::routine::new_ingest_local(&env);
         Self {
             local,
             env,
@@ -246,10 +246,10 @@ impl RoutineHarness {
     }
 
     /// Drive one constructed message through the routine and return the resulting
-    /// [`Flow`].
-    fn ingest(&mut self, msg: HeaderSyncMessage) -> crate::zakura::Flow<()> {
+    /// [`Ingest`](crate::zakura::Ingest) outcome.
+    fn ingest(&mut self, msg: HeaderSyncMessage) -> crate::zakura::Ingest {
         let frame = msg.encode_frame().expect("message encodes");
-        super::pipe::decode_and_ingest(&mut self.local, &self.env, self.peer.clone(), frame)
+        super::routine::decode_and_ingest(&mut self.local, &self.env, self.peer.clone(), frame)
     }
 
     fn try_next_event(&mut self) -> Option<HeaderSyncEvent> {
@@ -885,16 +885,17 @@ async fn connect_peer_with_direction(
         .await
         .unwrap();
 
-    // Build the routine's pipe sharing the reactor's range queue (via the handle).
-    let env = super::pipe::HsEnv::new(
+    // Build the routine sharing the reactor's range queue (via the handle).
+    let env = super::routine::HsEnv::new(
         fixture.handle.clone(),
         fixture.routine_network.clone(),
         fixture.routine_config.clone(),
         fixture.routine_max_frame_bytes,
     );
-    let pipe = super::pipe::test_pipe(peer_id.clone(), command_receivers, env);
-    let routine = super::pipe::HeaderSyncPeerRoutine::new(
-        pipe,
+    let routine = super::routine::HeaderSyncPeerRoutine::for_test(
+        peer_id.clone(),
+        command_receivers,
+        env,
         service_recv,
         cancel.clone(),
         Some(session),
@@ -2908,7 +2909,7 @@ async fn invalid_and_malformed_new_block_report_disconnect() {
 /// Status-spam classification moved into the routine. A second non-advancing
 /// status inside the rate window is `StatusSpam`: the routine emits
 /// `PeerMisbehavior` but, matching the chunk-02 baseline's record-only handling,
-/// does NOT reject the peer — it keeps processing frames (`Flow::Continue`). The
+/// does NOT reject the peer — it keeps processing frames (`Ingest::Continue`). The
 /// first status is accepted.
 #[test]
 fn rapid_status_updates_report_status_spam_in_routine() {
@@ -2924,7 +2925,7 @@ fn rapid_status_updates_report_status_spam_in_routine() {
     };
     assert!(matches!(
         harness.ingest(status()),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     assert!(matches!(
         harness.try_next_event(),
@@ -2935,7 +2936,7 @@ fn rapid_status_updates_report_status_spam_in_routine() {
     // so the routine continues rather than tearing down the connection.
     assert!(matches!(
         harness.ingest(status()),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
@@ -3030,7 +3031,7 @@ async fn rapid_advancing_status_updates_are_not_spam() {
 /// Status-spam classification moved into the routine. A second non-tip-advancing
 /// status at the same height (only the hash churned) inside the rate window is
 /// classified `StatusSpam` by the routine, which emits `PeerMisbehavior` but keeps
-/// the connection alive (record-only at the baseline, `Flow::Continue`). The first
+/// the connection alive (record-only at the baseline, `Ingest::Continue`). The first
 /// status is accepted (`PeerStatusUpdated`).
 #[test]
 fn same_height_hash_churn_is_status_spam() {
@@ -3045,7 +3046,7 @@ fn same_height_hash_churn_is_status_spam() {
     });
     assert!(matches!(
         harness.ingest(first),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     assert!(matches!(
         harness.try_next_event(),
@@ -3061,7 +3062,7 @@ fn same_height_hash_churn_is_status_spam() {
     });
     assert!(matches!(
         harness.ingest(churned),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { peer, reason }) => {
@@ -3093,7 +3094,7 @@ fn routine_valid_status_updates_summary_via_typed_event() {
 
     assert!(matches!(
         harness.ingest(HeaderSyncMessage::Status(status)),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerStatusUpdated {
@@ -3110,7 +3111,7 @@ fn routine_valid_status_updates_summary_via_typed_event() {
 
 /// An impossible `Status` (`anchor_height > tip_height`) is `InvalidStatus`: the
 /// routine emits `PeerMisbehavior` but, matching the chunk-02 baseline's
-/// record-only handling, keeps the connection alive (`Flow::Continue`).
+/// record-only handling, keeps the connection alive (`Ingest::Continue`).
 #[test]
 fn routine_invalid_status_is_misbehavior() {
     let mut harness = RoutineHarness::new(peer(71));
@@ -3124,7 +3125,7 @@ fn routine_invalid_status_is_misbehavior() {
 
     assert!(matches!(
         harness.ingest(HeaderSyncMessage::Status(status)),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
@@ -3181,7 +3182,7 @@ fn routine_valid_get_headers_requests_backend_lookup() {
             start_height: block::Height(2),
             count: 3,
         }),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::InboundGetHeadersRequested {
@@ -3199,7 +3200,7 @@ fn routine_valid_get_headers_requests_backend_lookup() {
 /// Inbound `GetHeaders` before any status is `GetHeadersSpam` (the received-status
 /// gate the routine owns); an over-cap count is `GetHeadersTooLong`. Both operate on
 /// a DECODED `GetHeaders`, so they are record-only at the chunk-02 baseline: the
-/// routine emits `PeerMisbehavior` but keeps the connection (`Flow::Continue`).
+/// routine emits `PeerMisbehavior` but keeps the connection (`Ingest::Continue`).
 #[test]
 fn routine_get_headers_gates_status_and_count() {
     let mut harness = RoutineHarness::new(peer(74));
@@ -3210,7 +3211,7 @@ fn routine_get_headers_gates_status_and_count() {
             start_height: block::Height(1),
             count: 1,
         }),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
@@ -3239,7 +3240,7 @@ fn routine_get_headers_gates_status_and_count() {
             start_height: block::Height(1),
             count: DEFAULT_HS_RANGE + 1,
         }),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {
@@ -3260,7 +3261,7 @@ fn routine_headers_correlation_and_shape_validation() {
     let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
     assert!(matches!(
         harness.ingest(headers_message_with_sizes(vec![header.clone()], vec![0])),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerHeadersReceived {
@@ -3284,7 +3285,7 @@ fn routine_new_block_forwards_candidate() {
 
     assert!(matches!(
         harness.ingest(HeaderSyncMessage::NewBlock(block.clone())),
-        crate::zakura::Flow::Continue(())
+        crate::zakura::Ingest::Continue
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::NewBlockCandidate {
@@ -3307,7 +3308,7 @@ fn routine_malformed_frame_disconnects() {
         payload: Vec::new(),
     };
 
-    let flow = super::pipe::decode_and_ingest(
+    let flow = super::routine::decode_and_ingest(
         &mut harness.local,
         &harness.env,
         harness.peer.clone(),
@@ -3315,7 +3316,7 @@ fn routine_malformed_frame_disconnects() {
     );
     assert!(matches!(
         flow,
-        crate::zakura::Flow::Reject(crate::zakura::SinkReject::Protocol(_))
+        crate::zakura::Ingest::Reject(crate::zakura::SinkReject::Protocol(_))
     ));
     match harness.try_next_event() {
         Some(HeaderSyncEvent::PeerMisbehavior { reason, .. }) => {

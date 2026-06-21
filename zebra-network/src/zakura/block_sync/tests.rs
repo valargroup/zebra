@@ -2500,7 +2500,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     // inverted inbound flow: the per-peer pipe-routine decodes inbound frames in its own
     // task. A malformed frame is `MalformedMessage` misbehavior AND a fatal protocol
     // reject for the whole connection (the routine returns `Err(SinkReject::protocol)`,
-    // which `handle_pipe_exit` turns into a connection cancel). With real reactor
+    // which `handle_routine_exit` turns into a connection cancel). With real reactor
     // wiring the routine runs; we observe the `Misbehavior(MalformedMessage)` action
     // and the connection-cancel.
     let config = ZakuraBlockSyncConfig::default();

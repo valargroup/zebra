@@ -5,7 +5,7 @@
 //! ([`BlockSizeEstimate`]) that feeds the receive-path `SizeMismatch` tolerance
 //! check. There is no scheduler here: the per-peer routine pulls work from the
 //! [`WorkQueue`](super::work_queue::WorkQueue) and builds a request directly (see
-//! [`pipe`] for the subsystem map).
+//! [`peer_routine`](super::peer_routine) for the subsystem map).
 
 use super::{state::*, *};
 

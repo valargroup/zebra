@@ -34,8 +34,8 @@ use super::{
 mod config;
 mod error;
 mod events;
-mod pipe;
 mod reactor;
+mod routine;
 mod scheduler;
 mod service;
 mod state;
@@ -54,9 +54,9 @@ pub use events::{
     ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
     HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncStartup,
 };
-#[cfg(test)]
-pub(crate) use pipe::{decode_and_ingest, new_ingest_local, HsEnv, HsLocal};
 pub use reactor::spawn_header_sync_reactor;
+#[cfg(test)]
+pub(crate) use routine::{decode_and_ingest, new_ingest_local, HsEnv, HsLocal, Ingest};
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,

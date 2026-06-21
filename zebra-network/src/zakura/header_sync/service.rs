@@ -9,12 +9,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, pipe::*, wire::*, *};
+use super::{events::*, routine::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
-    Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC,
+    handle_routine_exit, spawn_supervised_routine, BoxRunFuture, Frame, FramedRecv, FramedSend,
+    OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerDirection, SessionGuard, Sink,
+    SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle, ZAKURA_CAP_HEADER_SYNC,
 };
 
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
@@ -646,36 +645,33 @@ impl Service for HeaderSyncService {
         // matching outstanding range (via `PeerWorkAssigned`) and keeps the
         // timeout/covered/commit machinery.
         let env = self.pipe_env();
-        let pipe = Pipe::new(
-            peer_id.clone(),
-            HsLocal::new(
-                command_receivers,
-                env.anchor_height(),
-                DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
-                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
-            ),
-            env,
-            SessionGuard::oversize_only(header_sync_guard_max_bytes()),
-            run_inbound,
-            &PIPE_SHAPE,
+        let local = HsLocal::new(
+            command_receivers,
+            env.anchor_height(),
+            DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
         );
+        let guard = SessionGuard::oversize_only(header_sync_guard_max_bytes());
         // The routine future reproduces the old sink's connection handling: a
         // protocol reject (the only way the routine returns `Err`, since
         // `run_inbound` maps a closed-queue `Local` to a benign continue)
         // cancels the *connection*, matching the old
         // `connection_cancel_token.cancel()` on `SinkReject::Protocol`. A normal
         // or parked exit leaves the connection alone.
-        let pipe_cancel_token = service_cancel_token.clone();
+        let routine_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
         let routine = HeaderSyncPeerRoutine::new(
-            pipe,
+            peer_id.clone(),
+            local,
+            env,
+            guard,
             recv,
-            pipe_cancel_token,
+            routine_cancel_token,
             Some(header_sync_session),
             generation,
         );
-        let pipe = async move {
-            handle_pipe_exit(
+        let routine_future = async move {
+            handle_routine_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
                 routine.run().await,
@@ -698,8 +694,14 @@ impl Service for HeaderSyncService {
         let on_panic = move || panic_connection_cancel_token.cancel();
 
         // Reuse the single supervised launcher; let the returned handle drop to
-        // detach the task (the `PipeTeardown` still runs on every exit path).
-        spawn_supervised_pipe(peer_id, service_cancel_token, on_teardown, on_panic, pipe);
+        // detach the task (the `PeerRoutineTeardown` still runs on every exit path).
+        spawn_supervised_routine(
+            peer_id,
+            service_cancel_token,
+            on_teardown,
+            on_panic,
+            routine_future,
+        );
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId) {
@@ -733,8 +735,8 @@ impl Service for HeaderSyncService {
             DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
         );
         match decode_and_ingest(&mut local, &env, peer_id, frame) {
-            Flow::Continue(()) | Flow::Done => Ok(()),
-            Flow::Reject(reject) => Err(reject),
+            Ingest::Continue | Ingest::Done => Ok(()),
+            Ingest::Reject(reject) => Err(reject),
         }
     }
 }

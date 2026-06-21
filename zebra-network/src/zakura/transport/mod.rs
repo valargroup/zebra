@@ -7,7 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
-mod pipe;
+mod peer_task;
 mod registry;
 mod service;
 mod session;
@@ -20,9 +20,8 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 #[allow(unused_imports)]
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
-pub(crate) use pipe::{
-    handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, Edge, Flow, Node,
-    NodeKind, Pipe, PipeCx, PipeShape,
+pub(crate) use peer_task::{
+    handle_routine_exit, spawn_supervised_peer_task, spawn_supervised_routine,
 };
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;

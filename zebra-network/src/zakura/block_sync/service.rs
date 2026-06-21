@@ -1,6 +1,6 @@
 use super::{config::*, events::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    handle_routine_exit, spawn_supervised_routine, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -395,15 +395,15 @@ impl Service for BlockSyncService {
             let connection_cancel_token = connection_cancel_token.clone();
             move || connection_cancel_token.cancel()
         };
-        // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
+        // the per-peer routine is spawned HERE (the routine spawn point), so
         // a protocol reject still cancels the whole connection via
-        // `handle_pipe_exit`. The routine owns `recv` (the transport read), decodes
+        // `handle_routine_exit`. The routine owns `recv` (the transport read), decodes
         // each frame, and runs the download/serving dispatch in its own task —
         // there is no reactor inbound demux. When the service has no reactor wiring
         // (inert/handle-less test constructors) there is no routine to run; drain
         // the stream so frames are not silently mishandled and the lifecycle still
         // flows.
-        let pipe = {
+        let routine_future = {
             let connection_cancel_token = connection_cancel_token.clone();
             let routine_wiring = self.inner.routine_wiring.clone();
             let block_sync_session = block_sync_session.clone();
@@ -434,17 +434,17 @@ impl Service for BlockSyncService {
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
-                handle_pipe_exit("block-sync", &connection_cancel_token, result);
+                handle_routine_exit("block-sync", &connection_cancel_token, result);
             }
         };
         // Let the returned handle drop to detach the supervised task (like
-        // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
-        spawn_supervised_pipe(
+        // `tokio::spawn`); the `PeerRoutineTeardown` still runs on every exit path.
+        spawn_supervised_routine(
             peer_id.clone(),
             service_cancel_token.clone(),
             on_teardown,
             on_panic,
-            pipe,
+            routine_future,
         );
 
         {

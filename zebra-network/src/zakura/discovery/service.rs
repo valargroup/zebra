@@ -17,10 +17,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, Admit, BlockSyncHandle, Frame, FramedRecv, FramedSend,
-    HeaderSyncEvent, HeaderSyncHandle, OrderedSendError, Peer, PeerStreamSession, Service,
-    ServiceAdmissionDecision, ServicePeerDirection, SessionGuard, SinkReject, Stream, StreamMode,
-    ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    handle_routine_exit, spawn_supervised_routine, Admit, BlockSyncHandle, Frame, FramedRecv,
+    FramedSend, HeaderSyncEvent, HeaderSyncHandle, OrderedSendError, Peer, PeerStreamSession,
+    Service, ServiceAdmissionDecision, ServicePeerDirection, SessionGuard, SinkReject, Stream,
+    StreamMode, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
+    ZAKURA_CAP_HEADER_SYNC,
 };
 
 use super::protocol::{
@@ -270,7 +271,7 @@ impl Service for DiscoveryService {
 
         // One supervised routine owns admission, the exchange IO, progress, the
         // settle deadline, and cleanup. A protocol reject returned from the
-        // routine cancels the whole connection via `handle_pipe_exit`; the
+        // routine cancels the whole connection via `handle_routine_exit`; the
         // routine's `Drop` guard removes admitted discovery state on every exit
         // path (normal, cancel, stream close, reject, panic). `on_panic` cancels
         // the connection so a panicked routine never leaves a half-live peer.
@@ -278,14 +279,14 @@ impl Service for DiscoveryService {
             let connection_cancel = connection_cancel.clone();
             async move {
                 let result = DiscoveryPeerRoutine::admit_and_run(inputs).await;
-                handle_pipe_exit("discovery", &connection_cancel, result);
+                handle_routine_exit("discovery", &connection_cancel, result);
             }
         };
         let on_panic = move || connection_cancel.cancel();
         // Let the returned handle drop to detach the supervised task; the
-        // `PipeTeardown` still cancels the service token and runs cleanup on every
-        // exit path.
-        spawn_supervised_pipe(peer_id, service_cancel, || {}, on_panic, pipe);
+        // `PeerRoutineTeardown` still cancels the service token and runs cleanup on
+        // every exit path.
+        spawn_supervised_routine(peer_id, service_cancel, || {}, on_panic, pipe);
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId) {
@@ -344,9 +345,10 @@ impl DiscoveryPeerRoutine {
     ///
     /// Admission happens here, inside the one supervised task, so the routine's
     /// `Drop` guard is the single owner of admitted-state cleanup. If admission is
-    /// rejected the service session is parked (the supervised pipe's `PipeTeardown`
-    /// cancels the per-service token on return) and no peer state was admitted, so
-    /// nothing leaks. A clean park returns `Ok(())`, which `handle_pipe_exit`
+    /// rejected the service session is parked (the supervised routine's
+    /// `PeerRoutineTeardown` cancels the per-service token on return) and no peer
+    /// state was admitted, so
+    /// nothing leaks. A clean park returns `Ok(())`, which `handle_routine_exit`
     /// leaves the shared connection alone for.
     async fn admit_and_run(inputs: DiscoveryRoutineInputs) -> Result<(), SinkReject> {
         let DiscoveryRoutineInputs {
@@ -1839,7 +1841,7 @@ mod tests {
 
         let panic_connection_cancel = connection_cancel.clone();
         let on_panic = move || panic_connection_cancel.cancel();
-        let handle_task = spawn_supervised_pipe(
+        let handle_task = spawn_supervised_routine(
             peer_id.clone(),
             CancellationToken::new(),
             || {},
