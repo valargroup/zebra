@@ -124,6 +124,7 @@ pub(crate) fn spawn_note_precompute(
 
 pub mod column_family;
 
+mod commitment_aux;
 mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
@@ -1078,6 +1079,18 @@ impl FinalizedState {
         roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
     ) {
         self.vct = Some(VctState::test_fixture(roots));
+    }
+
+    /// Test-only: enable fast mode reading roots/frontiers from an arbitrary
+    /// [`commitment_aux::CommitmentRootSource`] (e.g. a payload produced from a
+    /// database via [`commitment_aux::produce_block_roots`]), so the producer→consumer
+    /// round-trip can be exercised in-process.
+    #[cfg(test)]
+    pub(in crate::service::finalized_state) fn enable_vct_fast_source(
+        &mut self,
+        source: Box<dyn commitment_aux::CommitmentRootSource>,
+    ) {
+        self.vct = Some(VctState::test_with_source(source));
     }
 
     /// Test-only: like [`Self::enable_vct_fast_fixture`], but also supplies the
