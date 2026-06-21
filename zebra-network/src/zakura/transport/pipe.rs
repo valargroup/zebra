@@ -63,6 +63,13 @@ pub(crate) enum NodeKind {
     /// `Frame` to typed message.
     Decode,
     /// The single `match` on the typed message.
+    //
+    // Retained generic Pipe vocabulary: discovery's pipe (its only constructor)
+    // folded into the concrete `DiscoveryPeerRoutine`, so no live `PipeShape`
+    // currently names a `Branch` node. The variant stays for the remaining
+    // `PipeShape`-based services (header_sync) and the later effect migration;
+    // deleting generic Pipe types is a separate chunk's job.
+    #[allow(dead_code)]
     Branch,
     /// Local/shared state mutation producing an effect.
     Mutate,
