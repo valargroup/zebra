@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
 use super::{
+    config::BS_PER_BLOCK_WORST_CASE_BYTES,
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
@@ -476,7 +477,7 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed solely by the byte budget
     /// and per-peer slots — never floor-distance / near-tip lag.
     async fn try_fill(&mut self) {
-        let body_reservation = self.config.block_body_reservation_bytes();
+        let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
         // Reconcile the adaptive window's hard cap with the peer's currently
         // advertised `max_inflight_requests` (it may have grown/shrunk via a
         // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
@@ -514,11 +515,11 @@ impl PeerRoutine {
 
             // Compute this chunk's byte ceiling BEFORE taking any work, from the
             // global byte budget and this peer's per-response cap. The reservation
-            // is a configurable per-body estimate; if a body is larger, the receive
-            // path reserves the delta before buffering it. If the ceiling cannot
-            // fund even one estimated block, break and wait on the budget-capacity
-            // / work-added notifications instead of taking a chunk only to return
-            // it. Taking-then-returning would call
+            // is worst-case per block (it only ever shrinks toward the actual size
+            // on receipt, so a valid body is never dropped for a full budget). If
+            // the ceiling cannot fund even one worst-case block, break and wait on
+            // the budget-capacity / work-added notifications instead of taking a
+            // chunk only to return it. Taking-then-returning would call
             // `work.return_items` → `notify_waiters`, which re-wakes THIS routine's
             // own enabled `work_added` notification (registered before the fill) and
             // busy-loops the want-work arm (missed-wake's mirror image — a
@@ -528,12 +529,11 @@ impl PeerRoutine {
                 .budget
                 .available()
                 .min(u64::from(self.max_response_bytes.max(1)));
-            // Cap the chunk taken to what the byte ceiling can fund at the
-            // configured per-body reservation;
+            // Cap the chunk taken to what the byte ceiling can fund at worst case;
             // break (without taking) when not even one block fits, so no take/return
             // self-wake cycle can occur.
             let byte_capped_count = max_bytes
-                .checked_div(body_reservation)
+                .checked_div(worst)
                 .map(|count| usize::try_from(count).unwrap_or(usize::MAX).min(max_count))
                 .unwrap_or(max_count);
             if byte_capped_count == 0 {
@@ -581,9 +581,7 @@ impl PeerRoutine {
             // taken item fits under `max_bytes`; nothing is returned here.
             let kept_count = items.len();
 
-            let kept_count_u64 =
-                u64::try_from(kept_count).expect("block-sync request count fits in u64");
-            let reserved_bytes = body_reservation.saturating_mul(kept_count_u64);
+            let reserved_bytes = worst.saturating_mul(kept_count as u64);
             if !self.budget.try_reserve(reserved_bytes) {
                 self.return_taken_items(&items);
                 break;
@@ -601,8 +599,8 @@ impl PeerRoutine {
                 start_height: items[0].0,
                 count,
                 anchor_hash: items[0].1.hash,
-                // The reserved total (released on a send failure below);
-                // distinct from the size estimates in `expected_bytes`.
+                // The reserved worst-case total (released on a send failure
+                // below); distinct from the size estimates in `expected_bytes`.
                 estimated_bytes: reserved_bytes,
                 expected_hashes: items
                     .iter()
@@ -824,25 +822,13 @@ impl PeerRoutine {
 
         metrics::counter!("sync.block.body.received").increment(1);
         self.record_received(serialized_bytes);
-        let reserved_bytes = outstanding.reserved_bytes_for_height(height).unwrap_or(0);
-        if serialized_bytes > reserved_bytes {
-            let delta = serialized_bytes.saturating_sub(reserved_bytes);
-            if !self.budget.try_reserve(delta) {
-                tracing::debug!(
-                    peer = ?self.peer,
-                    ?height,
-                    serialized_bytes,
-                    reserved_bytes,
-                    delta,
-                    "dropping oversized block-sync body until byte budget has room"
-                );
-                self.finish_outstanding_at(index, Disposition::RetryOriginal);
-                return;
-            }
-        } else {
-            self.budget
-                .release(reserved_bytes.saturating_sub(serialized_bytes));
-        }
+        // The block reserved `BS_PER_BLOCK_WORST_CASE_BYTES` at send time; shrink
+        // to the actual size (the reservation only ever decreases, so the budget
+        // can never reject a valid body). `mark_received` then stops
+        // `reserved_bytes()` counting this height; the only bytes still held are
+        // the `serialized_bytes` carried into the reorder buffer.
+        self.budget
+            .shrink(BS_PER_BLOCK_WORST_CASE_BYTES, serialized_bytes);
         self.trace_body_received(
             height,
             serialized_bytes,

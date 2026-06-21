@@ -454,34 +454,19 @@ pub(super) struct OutstandingBlockRange {
 }
 
 impl OutstandingBlockRange {
-    /// Bytes still reserved for this request: the request's per-body reservation
-    /// for every requested height not yet received. Received heights keep their
-    /// actual serialized bytes reserved in the reorder/apply path, so timeout /
-    /// disconnect / short-response cleanup must only release unreceived heights.
+    /// Worst-case bytes still reserved for this request: the per-block worst case
+    /// for every requested height not yet received. The reservation for a request
+    /// only ever shrinks, so releasing this (on timeout/disconnect/short response)
+    /// never over-releases bytes that were already handed to the reorder buffer.
     pub(super) fn reserved_bytes(&self) -> u64 {
-        self.request
-            .expected_hashes
-            .iter()
-            .filter_map(|(height, _)| (!self.received.contains(height)).then_some(*height))
-            .filter_map(|height| self.reserved_bytes_for_height(height))
-            .sum()
-    }
-
-    pub(super) fn reserved_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        let index = self
+        let outstanding = self
             .request
             .expected_hashes
-            .iter()
-            .position(|(known_height, _)| *known_height == height)?;
-        let count = u64::try_from(self.request.expected_hashes.len())
-            .expect("block-sync request length fits in u64");
-        if count == 0 {
-            return None;
-        }
-        let base = self.request.estimated_bytes / count;
-        let remainder = self.request.estimated_bytes % count;
-        let index = u64::try_from(index).expect("block-sync request index fits in u64");
-        Some(base + u64::from(index < remainder))
+            .len()
+            .saturating_sub(self.received.len());
+        // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
+        // product cannot overflow `u64`; `saturating_mul` is belt-and-suspenders.
+        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(outstanding as u64)
     }
 
     pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
@@ -497,23 +482,17 @@ impl OutstandingBlockRange {
     }
 
     /// Mark every requested height at or below `tip` as received and return the
-    /// bytes that those newly-received heights had reserved, so the caller
-    /// releases exactly the reservation those heights still held.
+    /// worst-case bytes that those newly-received heights had reserved, so the
+    /// caller releases exactly the reservation those heights still held.
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        let newly_received: Vec<_> = self
+        let newly_received = self
             .request
             .expected_hashes
             .iter()
-            .filter_map(|(height, _)| {
-                (*height <= tip && !self.received.contains(height)).then_some(*height)
-            })
-            .collect();
-        let released = newly_received
-            .iter()
-            .filter_map(|height| self.reserved_bytes_for_height(*height))
-            .sum();
-        self.received.extend(newly_received);
-        released
+            .filter(|(height, _)| *height <= tip && self.received.insert(*height))
+            .count();
+        // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
+        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
     }
 
     pub(super) fn is_complete(&self) -> bool {

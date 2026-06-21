@@ -114,6 +114,13 @@ impl ByteBudget {
         self.inner.capacity.notify_waiters();
     }
 
+    /// Shrink a reservation from `from` to `to` bytes, releasing the difference.
+    /// Used when a received body's worst-case reservation is replaced by its
+    /// actual (smaller) size; a no-op when `to >= from`.
+    pub(crate) fn shrink(&mut self, from: u64, to: u64) {
+        self.release(from.saturating_sub(to));
+    }
+
     /// Subscribe to capacity-freed notifications. A consumer blocked on a full
     /// budget registers `subscribe_capacity().notified()` *before* re-reading
     /// `available()`/`try_reserve`, so a concurrent `release`/`shrink` can never
