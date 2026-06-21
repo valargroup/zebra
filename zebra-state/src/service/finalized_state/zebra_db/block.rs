@@ -806,6 +806,9 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
+        // POC: when `Some`, skip per-height tree writes and fold these roots into
+        // the anchor set instead (verified-commitment-trees fast path).
+        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -989,6 +992,7 @@ impl ZebraDb {
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
+            fast_anchor_roots,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1312,6 +1316,7 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         precomputed_raw_txs: Option<Vec<RawBytes>>,
+        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1328,7 +1333,12 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zebra_db, finalized);
-        self.prepare_trees_batch(zebra_db, finalized, prev_note_commitment_trees);
+        self.prepare_trees_batch(
+            zebra_db,
+            finalized,
+            prev_note_commitment_trees,
+            fast_anchor_roots,
+        );
 
         // # Consensus
         //

@@ -15,17 +15,20 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    io::{stderr, stdout, Write},
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{stderr, stdout, Read, Write},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex,
     },
 };
 
 use zebra_chain::{
-    block,
+    block, orchard,
     parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
     parameters::Network,
+    sapling,
 };
 use zebra_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
@@ -53,6 +56,108 @@ macro_rules! timed_commit_phase {
         metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
         result
     }};
+}
+
+/// Byte length of one fixture record: height (u32 LE) + sapling root + orchard root.
+const VCT_RECORD_LEN: usize = 4 + 32 + 32;
+
+/// POC state for the verified-commitment-trees experiment
+/// (`docs/design/verified-commitment-trees-poc.md`). Shared across
+/// [`FinalizedState`] clones via `Arc` so the capture sink and counters are shared.
+///
+/// This is gated behind `Config::enable_verified_commitment_trees` (fast mode) and
+/// the `VCT_FIXTURE` / `VCT_CAPTURE` environment variables. It is an
+/// experiment that trusts a recorded fixture and is NOT a shippable feature.
+#[derive(Debug)]
+pub(crate) struct VctState {
+    /// Fast mode: skip the per-block frontier recompute and fold `roots` into the
+    /// anchor set + history tree.
+    fast: bool,
+    /// Fixture roots by height (fast mode only).
+    roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+    /// Capture sink: append `(height, sapling_root, orchard_root)` per committed
+    /// checkpoint block, to record a fixture during a legacy sync.
+    capture: Option<Mutex<std::io::BufWriter<File>>>,
+    /// Count of blocks that took the fast (skip-recompute) path, for the run summary.
+    fast_count: AtomicU64,
+}
+
+impl VctState {
+    /// Build the POC state from the config flag and the `VCT_FIXTURE` /
+    /// `VCT_CAPTURE` environment variables. Returns `None` when neither
+    /// capture nor fast mode is requested (the default), so there is zero overhead.
+    fn from_config(fast_flag: bool) -> Option<Arc<Self>> {
+        // The config flag is `serde(skip)`, so for the POC harness also honor an
+        // env override to enable fast mode without TOML/zebrad plumbing.
+        let fast_flag = fast_flag || std::env::var_os("VCT_FAST").is_some();
+
+        let capture = std::env::var_os("VCT_CAPTURE").map(|path| {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("VCT_CAPTURE path must be writable");
+            Mutex::new(std::io::BufWriter::new(file))
+        });
+
+        let mut roots = HashMap::new();
+        let mut fast = false;
+        if fast_flag {
+            let path = std::env::var_os("VCT_FIXTURE")
+                .expect("enable_verified_commitment_trees requires VCT_FIXTURE");
+            let mut bytes = Vec::new();
+            File::open(&path)
+                .expect("VCT_FIXTURE must exist")
+                .read_to_end(&mut bytes)
+                .expect("VCT_FIXTURE read failed");
+            assert_eq!(
+                bytes.len() % VCT_RECORD_LEN,
+                0,
+                "corrupt VCT fixture: length not a multiple of {VCT_RECORD_LEN}"
+            );
+            for rec in bytes.chunks_exact(VCT_RECORD_LEN) {
+                let height = u32::from_le_bytes(rec[0..4].try_into().expect("4 bytes"));
+                let sap = <sapling::tree::Root as FromDisk>::from_bytes(&rec[4..36]);
+                let orch = <orchard::tree::Root as FromDisk>::from_bytes(&rec[36..68]);
+                roots.insert(height, (sap, orch));
+            }
+            fast = true;
+            tracing::info!(
+                fixture_roots = roots.len(),
+                "VCT: loaded fixture, fast (skip-recompute) mode enabled"
+            );
+        }
+
+        if capture.is_none() && !fast {
+            return None;
+        }
+        if capture.is_some() {
+            tracing::info!("VCT: capture mode enabled (recording per-block roots)");
+        }
+        Some(Arc::new(VctState {
+            fast,
+            roots,
+            capture,
+            fast_count: AtomicU64::new(0),
+        }))
+    }
+
+    /// Append a captured record for `height` (no-op outside capture mode).
+    fn capture(
+        &self,
+        height: u32,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+    ) {
+        if let Some(sink) = &self.capture {
+            let mut buf = [0u8; VCT_RECORD_LEN];
+            buf[0..4].copy_from_slice(&height.to_le_bytes());
+            buf[4..36].copy_from_slice(IntoDisk::as_bytes(sapling_root).as_ref());
+            buf[36..68].copy_from_slice(IntoDisk::as_bytes(orchard_root).as_ref());
+            let mut sink = sink.lock().expect("VCT capture mutex poisoned");
+            sink.write_all(&buf).expect("VCT capture write failed");
+        }
+    }
 }
 
 /// A dedicated rayon thread pool for checkpoint-commit treestate computation. Namely:
@@ -254,6 +359,10 @@ pub struct FinalizedState {
     #[cfg(feature = "elasticsearch")]
     /// A collection of blocks to be sent to elasticsearch as a bulk.
     pub elastic_blocks: Vec<String>,
+
+    /// POC verified-commitment-trees state (fast/capture mode), or `None` when
+    /// the experiment is off (the default). Shared across clones.
+    vct: Option<Arc<VctState>>,
 }
 
 impl FinalizedState {
@@ -374,6 +483,8 @@ impl FinalizedState {
             read_only,
         );
 
+        let vct = VctState::from_config(config.enable_verified_commitment_trees);
+
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
@@ -382,6 +493,7 @@ impl FinalizedState {
             db,
             elastic_db,
             elastic_blocks: vec![],
+            vct,
         };
 
         #[cfg(not(feature = "elasticsearch"))]
@@ -390,6 +502,7 @@ impl FinalizedState {
             checkpoint_raw_tx_retention_start: None,
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
             db,
+            vct,
         };
 
         // Pruning is a one-way storage mode. Refuse to open a database that has
@@ -617,7 +730,7 @@ impl FinalizedState {
         note_precompute: Option<BlockNotePrecompute>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
-        let (height, hash, finalized, prev_note_commitment_trees, retention) =
+        let (height, hash, finalized, prev_note_commitment_trees, retention, fast_anchor_roots) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
                     checkpoint_verified,
@@ -639,87 +752,120 @@ impl FinalizedState {
 
                     let mut note_commitment_trees = prev_note_commitment_trees.clone();
                     let network = self.network();
+                    let height = checkpoint_verified.height;
 
-                    // Run two independent CPU-intensive crypto operations concurrently
-                    // on the rayon pool (Part 1 of the checkpoint-commit parallelization):
-                    //
-                    // - updating the note commitment trees, and
-                    // - checking this block's commitment against the *parent* history tree.
-                    //
-                    // These are independent: the commitment check reads only the parent
-                    // history tree (not this block's note commitment trees), and the
-                    // history tree push below depends on both, so it runs after the join.
-                    //
-                    // The commitment check is done here (and not during semantic
-                    // validation) because it needs the history tree root, and the
-                    // checkpoint verifier doesn't run contextual validation. For
-                    // Nu5-onward the block hash commits only to non-authorizing data
-                    // (ZIP-244), so this verifies the authorizing-data commitment.
-                    #[cfg(feature = "commit-metrics")]
-                    metrics::histogram!("zebra.state.write.block_tx_count")
-                        .record(block.transactions.len() as f64);
-                    #[cfg(feature = "commit-metrics")]
-                    let _ckpt_compute = std::time::Instant::now();
-                    let mut commitment_result = None;
+                    // POC (verified-commitment-trees): in fast mode, if the fixture
+                    // supplies this height's roots, skip the per-block note-commitment
+                    // frontier recompute (`update_trees_parallel`) entirely and fold the
+                    // fixture roots into the anchor set and history leaf instead. The
+                    // frontier stays the (frozen) parent frontier; nothing below the
+                    // checkpoint reads it for consensus. See
+                    // docs/design/verified-commitment-trees-poc.md.
+                    let vct_fast = self
+                        .vct
+                        .as_ref()
+                        .filter(|v| v.fast)
+                        .and_then(|v| v.roots.get(&height.0).copied());
+
+                    let mut fast_anchor_roots = None;
+
+                    if let Some((sapling_root, orchard_root)) = vct_fast {
+                        // Still run the commitment check. It validates the history tree
+                        // (which we extend with the fixture roots) against the header, so a
+                        // wrong fixture root is caught here rather than trusted blindly.
+                        let commitment_result = COMMIT_COMPUTE_POOL.install(|| {
+                            check::block_commitment_is_valid_for_chain_history(
+                                block.clone(),
+                                &network,
+                                &history_tree,
+                                precomputed_auth_data_root,
+                            )
+                        });
+                        commitment_result?;
+
+                        let history_tree_mut = Arc::make_mut(&mut history_tree);
+                        history_tree_mut
+                            .push(&network, block.clone(), &sapling_root, &orchard_root)
+                            .map_err(Arc::new)
+                            .map_err(ValidateContextError::from)?;
+
+                        if let Some(v) = &self.vct {
+                            v.fast_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        fast_anchor_roots = Some((sapling_root, orchard_root));
+                    } else {
+                        // Legacy / capture path: recompute the note-commitment frontier.
+                        //
+                        // Run two independent CPU-intensive crypto operations concurrently
+                        // on the rayon pool: updating the note commitment trees, and
+                        // checking this block's commitment against the *parent* history
+                        // tree. They are independent; the history push below joins them.
+                        #[cfg(feature = "commit-metrics")]
+                        metrics::histogram!("zebra.state.write.block_tx_count")
+                            .record(block.transactions.len() as f64);
+                        #[cfg(feature = "commit-metrics")]
+                        let _ckpt_compute = std::time::Instant::now();
+                        let mut commitment_result = None;
                     // Run the two CPU-intensive operations inside the dedicated
                     // commit-compute pool so their nested rayon work uses isolated workers instead of
                     // contending with the verifier on the global pool.
-                    let tree_result = COMMIT_COMPUTE_POOL.install(|| {
-                        rayon::in_place_scope_fifo(|scope| {
-                            scope.spawn_fifo(|_scope| {
-                                commitment_result = Some(timed_commit_phase!(
-                                    "zebra.state.write.commitment_check.duration_seconds",
-                                    check::block_commitment_is_valid_for_chain_history(
-                                        block.clone(),
-                                        &network,
-                                        &history_tree,
-                                        precomputed_auth_data_root,
-                                    )
-                                ));
-                            });
+                        let tree_result = COMMIT_COMPUTE_POOL.install(|| {
+                            rayon::in_place_scope_fifo(|scope| {
+                                scope.spawn_fifo(|_scope| {
+                                    commitment_result = Some(timed_commit_phase!(
+                                        "zebra.state.write.commitment_check.duration_seconds",
+                                        check::block_commitment_is_valid_for_chain_history(
+                                            block.clone(),
+                                            &network,
+                                            &history_tree,
+                                            precomputed_auth_data_root,
+                                        )
+                                    ));
+                                });
 
-                            // `note_precompute`, if present and still size-matched,
-                            // lets the committer apply the precomputed subtree roots
-                            // instead of re-hashing the notes here; else hashes inline.
-                            timed_commit_phase!(
-                                "zebra.state.write.update_trees.duration_seconds",
-                                note_commitment_trees
-                                    .update_trees_parallel_with(&block, note_precompute)
-                            )
-                        })
-                    });
+                                // `note_precompute`, if present and still size-matched,
+                                // lets the committer apply the precomputed subtree roots
+                                // instead of re-hashing the notes here; else hashes inline.
+                                timed_commit_phase!(
+                                    "zebra.state.write.update_trees.duration_seconds",
+                                    note_commitment_trees
+                                        .update_trees_parallel_with(&block, note_precompute)
+                                )
+                            })
+                        });
 
-                    // Surface the tree-update error first, preserving the error
-                    // precedence of the previous sequential code.
-                    tree_result.map_err(ValidateContextError::from)?;
-                    // `rayon::in_place_scope_fifo` guarantees all spawned tasks
-                    // complete before the scope returns, so `commitment_result` is
-                    // always `Some` here: the spawned closure wrote to it before
-                    // the scope exited.
-                    commitment_result.expect("scope has already finished")?;
+                        // Surface the tree-update error first, preserving the error
+                        // precedence of the previous sequential code.
+                        tree_result.map_err(ValidateContextError::from)?;
+                        // `in_place_scope_fifo` joins all spawned tasks, so this is `Some`.
+                        commitment_result.expect("scope has already finished")?;
 
-                    // Update the history tree (depends on both operations above).
-                    let history_tree_mut = Arc::make_mut(&mut history_tree);
-                    let sapling_root = note_commitment_trees.sapling.root();
-                    let orchard_root = note_commitment_trees.orchard.root();
-                    history_tree_mut
-                        .push(&network, block.clone(), &sapling_root, &orchard_root)
-                        .map_err(Arc::new)
-                        .map_err(ValidateContextError::from)?;
+                        // Update the history tree (depends on both operations above).
+                        let history_tree_mut = Arc::make_mut(&mut history_tree);
+                        let sapling_root = note_commitment_trees.sapling.root();
+                        let orchard_root = note_commitment_trees.orchard.root();
+                        history_tree_mut
+                            .push(&network, block.clone(), &sapling_root, &orchard_root)
+                            .map_err(Arc::new)
+                            .map_err(ValidateContextError::from)?;
 
-                    // Total serial wall time of the checkpoint compute phase (note tree
-                    // update + commitment check, then history push). Compared against the
-                    // summed phase times, this shows the overlap win.
-                    #[cfg(feature = "commit-metrics")]
-                    metrics::histogram!("zebra.state.write.checkpoint_compute.duration_seconds")
+                        #[cfg(feature = "commit-metrics")]
+                        metrics::histogram!(
+                            "zebra.state.write.checkpoint_compute.duration_seconds"
+                        )
                         .record(_ckpt_compute.elapsed().as_secs_f64());
+
+                        // POC capture: record the freshly computed roots for this height.
+                        if let Some(v) = &self.vct {
+                            v.capture(height.0, &sapling_root, &orchard_root);
+                        }
+                    }
 
                     let treestate = Treestate {
                         note_commitment_trees,
                         history_tree,
                     };
 
-                    let height = checkpoint_verified.height;
                     let hash = checkpoint_verified.hash;
 
                     (
@@ -728,6 +874,7 @@ impl FinalizedState {
                         FinalizedBlock::from_checkpoint_verified(checkpoint_verified, treestate),
                         Some(prev_note_commitment_trees),
                         self.retention_plan(height, true),
+                        fast_anchor_roots,
                     )
                 }
                 FinalizableBlock::Contextual {
@@ -745,6 +892,7 @@ impl FinalizedState {
                         ),
                         prev_note_commitment_trees,
                         self.retention_plan(height, false),
+                        None,
                     )
                 }
             };
@@ -798,6 +946,7 @@ impl FinalizedState {
             &network,
             source,
             retention,
+            fast_anchor_roots,
         );
 
         if result.is_ok() {
@@ -819,6 +968,9 @@ impl FinalizedState {
                     "stopping at configured height, flushing database to disk"
                 );
 
+                // POC: emit the equivalence digest + fast-path summary before exit.
+                self.vct_log_equivalence_digest();
+
                 // We're just about to do a forced exit, so it's ok to do a forced db shutdown
                 self.db.shutdown(true);
 
@@ -832,6 +984,50 @@ impl FinalizedState {
         }
 
         result.map(|hash| (hash, note_commitment_trees))
+    }
+
+    /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path is
+    /// active, so callers (e.g. the write loop) can also skip the off-thread note
+    /// precompute, whose result the fast committer would discard.
+    pub(crate) fn vct_fast_enabled(&self) -> bool {
+        self.vct.as_ref().is_some_and(|v| v.fast)
+    }
+
+    /// POC: log the consensus-equivalence digest (anchor sets + history root) and
+    /// the fast-path block count at the stop height, so a legacy run and a fast run
+    /// can be compared. Gated by `VCT_DIGEST` so normal runs pay nothing.
+    fn vct_log_equivalence_digest(&self) {
+        if std::env::var_os("VCT_DIGEST").is_none() {
+            return;
+        }
+
+        // Flush any captured fixture so the file is complete before exit.
+        let fast_count = if let Some(v) = &self.vct {
+            if let Some(sink) = &v.capture {
+                let _ = sink.lock().expect("VCT capture mutex poisoned").flush();
+            }
+            v.fast_count.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+
+        let (
+            sapling_anchor_count,
+            sapling_anchor_digest,
+            orchard_anchor_count,
+            orchard_anchor_digest,
+        ) = self.db.vct_anchor_digest();
+        let history_root = self.db.history_tree().hash();
+
+        tracing::info!(
+            sapling_anchor_count,
+            sapling_anchor_digest,
+            orchard_anchor_count,
+            orchard_anchor_digest,
+            ?history_root,
+            vct_fast_blocks = fast_count,
+            "VCT-DIGEST"
+        );
     }
 
     #[cfg(feature = "elasticsearch")]
