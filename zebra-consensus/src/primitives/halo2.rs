@@ -94,6 +94,12 @@ lazy_static::lazy_static! {
         ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
 }
 
+#[deprecated(
+    since = "8.0.0",
+    note = "use VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD instead"
+)]
+pub use VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD as VERIFYING_KEY_POST_NU6_2;
+
 /// A Halo2 verification item, used as the request type of the service.
 ///
 /// An [`Item`] is key-agnostic: it carries only the bundle and sighash. The verifying key (pre-
@@ -247,6 +253,9 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_V5_ORCHARD_NU6_2_ONWARD: Lazy<VerifierService> =
     Lazy::new(|| batch_verifier(&VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD));
+
+#[deprecated(since = "8.0.0", note = "use VERIFIER_V5_ORCHARD_NU6_2_ONWARD instead")]
+pub use VERIFIER_V5_ORCHARD_NU6_2_ONWARD as VERIFIER_POST_NU6_2;
 
 /// Global batch verification context for **V6/Ironwood** Halo2 Action proofs.
 ///
