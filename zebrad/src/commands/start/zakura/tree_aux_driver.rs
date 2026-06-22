@@ -200,4 +200,116 @@ mod tests {
             "a non-BlockRoots response serves an empty range, not wrong data"
         );
     }
+
+    /// End-to-end serving integration: a real finalized state serves per-block roots
+    /// through the production [`StateTreeAuxPort`] → `TreeAuxService` over the real
+    /// loopback Zakura transport, and a peer's [`fetch_roots`] receives exactly what the
+    /// state serves (`ReadRequest::BlockRoots`). This joins the serving stack and the
+    /// wire on real state — the piece the in-crate unit tests (mock port / committer
+    /// PeerSource) cannot cover. The committer consumption of these roots is covered by
+    /// `vct_peer_source_filled_incrementally_drives_byte_identical_state` in `zebra-state`.
+    #[tokio::test]
+    async fn tree_aux_serves_real_state_roots_over_the_wire() -> Result<(), BoxError> {
+        use std::time::Duration;
+
+        use tower::ServiceExt;
+        use zebra_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
+        use zebra_network::zakura::{testkit::ZakuraTestNode, TreeAuxService};
+        use zebra_state::{populated_state, ReadResponse};
+
+        let _guard = zebra_test::init();
+        let network = Network::Mainnet;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        // A real finalized state with per-height trees: a contiguous mainnet prefix
+        // (genesis onward) committed as checkpoint-verified blocks.
+        let blocks: Vec<std::sync::Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+            .values()
+            .map(|bytes| {
+                std::sync::Arc::new(
+                    bytes
+                        .zcash_deserialize_into::<Block>()
+                        .expect("test vector block deserializes"),
+                )
+            })
+            .collect();
+        let tip = (blocks.len() - 1) as u32;
+        assert!(tip >= 2, "need a few blocks to serve a range");
+        let (_state, read_state, _latest_tip, _change) =
+            populated_state(blocks.clone(), &network).await;
+
+        // The roots the state serves directly for [1, tip] — the expected truth.
+        let count = tip;
+        let ReadResponse::BlockRoots(expected) = read_state
+            .clone()
+            .oneshot(ReadRequest::BlockRoots {
+                start_height: block::Height(1),
+                count,
+            })
+            .await?
+        else {
+            panic!("expected a BlockRoots response");
+        };
+        assert!(
+            !expected.is_empty(),
+            "the populated state serves roots for the range"
+        );
+
+        // Two real Zakura nodes; the server serves roots from the real state via the
+        // production port, the client only advertises the cap and requests.
+        let server = ZakuraTestNode::builder(101)
+            .max_connections_per_ip(16)
+            .service(std::sync::Arc::new(TreeAuxService::new(
+                std::sync::Arc::new(StateTreeAuxPort::new(read_state.clone())),
+            )))
+            .spawn()
+            .await?;
+        let client = ZakuraTestNode::builder(102)
+            .max_connections_per_ip(16)
+            .service(std::sync::Arc::new(TreeAuxService::new(
+                std::sync::Arc::new(StateTreeAuxPort::new(read_state.clone())),
+            )))
+            .spawn()
+            .await?;
+
+        client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+        let mut collected = Vec::new();
+        fetch_roots(
+            &client.supervisor(),
+            block::Height(1),
+            block::Height(tip),
+            |batch| collected.extend(batch),
+        )
+        .await?;
+
+        assert_eq!(
+            collected, expected,
+            "roots fetched over tree_aux match the roots the real state serves"
+        );
+
+        // Negative / safe-fallback: a range the server's state cannot serve (above the
+        // tip) yields an error from the fetch, so the driver leaves that range un-fetched
+        // and the committer keeps it on the legacy path — never wrong data.
+        let mut unavailable = Vec::new();
+        let result = fetch_roots(
+            &client.supervisor(),
+            block::Height(tip + 5),
+            block::Height(tip + 10),
+            |batch| unavailable.extend(batch),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unavailable range returns an error (the committer keeps it legacy)"
+        );
+        assert!(
+            unavailable.is_empty(),
+            "no roots are delivered for an unavailable range"
+        );
+
+        client.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
 }
