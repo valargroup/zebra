@@ -1695,6 +1695,7 @@ impl BlockSyncReactor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trace_sequencer_control_send(
         &self,
         kind: &'static str,
