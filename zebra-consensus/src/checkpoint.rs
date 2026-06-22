@@ -664,10 +664,12 @@ where
             funding_stream_values(height, &self.network, block_subsidy(height, &self.network)?)?
                 .remove(&FundingStreamReceiver::Deferred);
 
-        block.deferred_pool_balance_change = expected_deferred_amount
-            .unwrap_or_default()
-            .checked_sub(self.network.lockbox_disbursement_total_amount(height))
-            .map(DeferredPoolBalanceChange::new);
+        block.set_deferred_pool_balance_change(
+            expected_deferred_amount
+                .unwrap_or_default()
+                .checked_sub(self.network.lockbox_disbursement_total_amount(height))
+                .map(DeferredPoolBalanceChange::new),
+        );
 
         crate::block::check::merkle_root_validity(
             &self.network,

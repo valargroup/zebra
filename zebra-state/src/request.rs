@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::{Add, Deref, DerefMut, RangeInclusive},
+    ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::Arc,
 };
@@ -292,7 +292,19 @@ pub struct SemanticallyVerifiedBlock {
     /// of the single-threaded finalized committer) so the committer does not
     /// have to recompute the per-transaction auth digests on its critical path.
     /// `None` means "not precomputed"; the committer falls back to computing it.
-    pub auth_data_root: Option<AuthDataRoot>,
+    ///
+    /// # Security
+    ///
+    /// The finalized checkpoint committer **trusts** a `Some` value as the
+    /// authorizing data for the ZIP-244 `hashBlockCommitments` header check
+    /// (`check::block_commitment_is_valid_for_chain_history`), so it must always
+    /// equal `block.auth_data_root()`. To keep that invariant unforgeable this
+    /// field is crate-private: it is only ever set by the constructors in this
+    /// module, which derive it from `block`. A caller outside the crate cannot
+    /// set it, and [`CheckpointVerifiedBlock`] (the only type whose cache the
+    /// committer trusts) cannot be mutated after construction, so the cache can
+    /// never be desynced from the block it commits.
+    pub(crate) auth_data_root: Option<AuthDataRoot>,
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -557,7 +569,7 @@ impl CheckpointVerifiedBlock {
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Self {
         let mut block = Self::with_hash(block.clone(), hash.unwrap_or(block.hash()));
-        block.deferred_pool_balance_change = deferred_pool_balance_change;
+        block.set_deferred_pool_balance_change(deferred_pool_balance_change);
         block
     }
     /// Creates a block that's ready to be committed to the finalized state,
@@ -653,6 +665,34 @@ impl SemanticallyVerifiedBlock {
         }
     }
 
+    /// Creates a [`SemanticallyVerifiedBlock`] from data the semantic verifier
+    /// has already prepared, leaving the authorizing-data root unset.
+    ///
+    /// The semantic verifier binds the ZIP-244 auth-data commitment during
+    /// contextual validation and the committer recomputes it on that path, so it
+    /// is not precomputed here. This constructor exists so callers outside the
+    /// crate build the block through a checked entry point rather than a struct
+    /// literal, keeping the crate-private [`auth_data_root`](Self::auth_data_root)
+    /// cache out of their reach (see its security note).
+    pub fn from_semantic_data(
+        block: Arc<Block>,
+        hash: block::Hash,
+        height: block::Height,
+        new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        transaction_hashes: Arc<[transaction::Hash]>,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        Self {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            deferred_pool_balance_change,
+            auth_data_root: None,
+        }
+    }
+
     /// Sets the deferred balance in the block.
     pub fn with_deferred_pool_balance_change(
         mut self,
@@ -732,9 +772,28 @@ impl Deref for CheckpointVerifiedBlock {
         &self.0
     }
 }
-impl DerefMut for CheckpointVerifiedBlock {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+
+// `DerefMut` is intentionally **not** implemented for `CheckpointVerifiedBlock`.
+// The committer trusts its precomputed `auth_data_root` for the ZIP-244 header
+// commitment check, so the block bytes and the cache must stay locked together
+// after construction. Mutable deref would let a holder swap `block` (or the
+// cache) and feed the committer a root that doesn't match the block. The only
+// field the checkpoint verifier sets after construction is the deferred pool
+// balance, exposed through the narrow setter below.
+
+impl CheckpointVerifiedBlock {
+    /// Sets the deferred pool balance change computed by the checkpoint verifier
+    /// after construction.
+    ///
+    /// This is the only post-construction mutation a caller may perform; it does
+    /// not touch the block or the precomputed authorizing-data root, so the
+    /// committer's trusted cache stays bound to the block (see
+    /// [`SemanticallyVerifiedBlock::auth_data_root`]).
+    pub fn set_deferred_pool_balance_change(
+        &mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
     }
 }
 
@@ -1747,5 +1806,75 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    use super::*;
+
+    /// Loads the NU5 mainnet block 1,687,106 (its v5 transactions exercise the
+    /// ZIP-244 authorizing-data digests).
+    fn nu5_block() -> Arc<Block> {
+        Arc::new(
+            zebra_test::vectors::BLOCK_MAINNET_1687106_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("NU5 test vector block deserializes"),
+        )
+    }
+
+    /// Every [`CheckpointVerifiedBlock`] constructor must precompute the
+    /// authorizing-data root *from its own block*, so the value the finalized
+    /// committer trusts for the ZIP-244 header commitment check always matches
+    /// the block it commits. This is the invariant that makes the crate-private,
+    /// non-`DerefMut` cache safe; a constructor that set a stale or foreign root
+    /// would reopen the trust hole this guards.
+    #[test]
+    fn checkpoint_verified_block_caches_its_own_auth_data_root() {
+        let block = nu5_block();
+        let expected = Some(block.auth_data_root());
+
+        assert_eq!(
+            CheckpointVerifiedBlock::from(block.clone()).auth_data_root,
+            expected,
+            "From<Arc<Block>> must cache the block's own auth data root",
+        );
+        assert_eq!(
+            CheckpointVerifiedBlock::with_hash(block.clone(), block.hash()).auth_data_root,
+            expected,
+            "with_hash must cache the block's own auth data root",
+        );
+        assert_eq!(
+            CheckpointVerifiedBlock::new(block.clone(), None, None).auth_data_root,
+            expected,
+            "new must cache the block's own auth data root",
+        );
+    }
+
+    /// The semantic-verifier constructor leaves the cache empty: that path binds
+    /// the auth-data commitment during contextual validation, and the committer
+    /// recomputes it, so there is no precomputed value to trust.
+    #[test]
+    fn semantic_constructor_leaves_auth_data_root_unset() {
+        let block = nu5_block();
+        let hash = block.hash();
+        let height = block.coinbase_height().expect("test block has a height");
+        let (transaction_hashes, _auth_data_root, new_outputs) = prepare_block_data(&block);
+
+        let semantic = SemanticallyVerifiedBlock::from_semantic_data(
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            None,
+        );
+
+        assert_eq!(
+            semantic.auth_data_root, None,
+            "the semantic path must not precompute an auth data root the committer would trust",
+        );
     }
 }
