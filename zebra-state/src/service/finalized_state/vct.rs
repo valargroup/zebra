@@ -64,6 +64,21 @@ pub(crate) struct VctState {
     /// previous block's look-ahead already validated it (the dedup). Lets tests
     /// assert the dedup actually engages, so it can't be silently regressed.
     prevalidated_count: AtomicU64,
+    /// Capture the handoff frontier: when the (legacy-path) committer commits the block
+    /// at the target height, dump the tip treestate frontier to the file. Used to
+    /// generate a Regtest frontier fixture for `VCT_REGTEST_FRONTIER`. `(path, target)`.
+    capture_frontier: Option<(std::path::PathBuf, block::Height)>,
+}
+
+/// Read the `VCT_CAPTURE_FRONTIER` (output path) + `VCT_CAPTURE_FRONTIER_HEIGHT` (the
+/// checkpoint height to capture at) env vars, if set. Test/harness plumbing only.
+fn capture_frontier_from_env() -> Option<(std::path::PathBuf, block::Height)> {
+    let path = std::env::var_os("VCT_CAPTURE_FRONTIER")?;
+    let height: u32 = std::env::var("VCT_CAPTURE_FRONTIER_HEIGHT")
+        .expect("VCT_CAPTURE_FRONTIER requires VCT_CAPTURE_FRONTIER_HEIGHT")
+        .parse()
+        .expect("VCT_CAPTURE_FRONTIER_HEIGHT must be a u32 height");
+    Some((std::path::PathBuf::from(path), block::Height(height)))
 }
 
 /// Which commitment-root source the committer uses, resolved from the (already read)
@@ -122,6 +137,9 @@ impl VctState {
         });
 
         let legacy_opt_out = std::env::var_os("VCT_LEGACY").is_some();
+        // Frontier-capture (harness fixture generation): needs the legacy recompute to
+        // have the real tip treestate, so it implies capture mode like `VCT_CAPTURE`.
+        let capture_frontier = capture_frontier_from_env();
         // Parse the embedded handoff frontier once (None on networks without one, e.g.
         // Testnet). The decision below only needs its presence; the fixture/peer arms reuse
         // the parsed value.
@@ -129,7 +147,7 @@ impl VctState {
 
         match select_source_mode(
             fast_flag,
-            capture.is_some(),
+            capture.is_some() || capture_frontier.is_some(),
             legacy_opt_out,
             embedded.is_some(),
         ) {
@@ -169,6 +187,7 @@ impl VctState {
                     capture,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
+                    capture_frontier: None,
                 }))
             }
 
@@ -185,6 +204,7 @@ impl VctState {
                     capture,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
+                    capture_frontier,
                 }))
             }
 
@@ -208,6 +228,7 @@ impl VctState {
                     capture: None,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
+                    capture_frontier: None,
                 }))
             }
 
@@ -258,7 +279,7 @@ impl VctState {
     }
 
     /// Append a captured per-block roots record for `height` (no-op outside capture mode).
-    pub(super) fn capture(
+    pub(super) fn capture_per_height_roots(
         &self,
         height: u32,
         sapling_root: &sapling::tree::Root,
@@ -272,6 +293,37 @@ impl VctState {
             let mut sink = sink.lock().expect("VCT capture mutex poisoned");
             sink.write_all(&buf).expect("VCT capture write failed");
         }
+    }
+
+    /// When `height` is the configured capture target, dump the tip treestate frontier
+    /// to the `VCT_CAPTURE_FRONTIER` file (no-op otherwise). Generates the Regtest frontier
+    /// fixture that `VCT_REGTEST_FRONTIER` loads. Called on the legacy commit path, where
+    /// the supplied trees are the real tip treestate at `height`.
+    pub(super) fn capture_frontier_at(
+        &self,
+        height: block::Height,
+        sapling: &Arc<sapling::tree::NoteCommitmentTree>,
+        orchard: &Arc<orchard::tree::NoteCommitmentTree>,
+        sprout: &Arc<sprout::tree::NoteCommitmentTree>,
+    ) {
+        let Some((path, target)) = &self.capture_frontier else {
+            return;
+        };
+        if height != *target {
+            return;
+        }
+        let bytes = FinalFrontiers {
+            height,
+            sapling: sapling.clone(),
+            orchard: orchard.clone(),
+            sprout: sprout.clone(),
+        }
+        .to_bytes();
+        std::fs::write(path, bytes).expect("VCT_CAPTURE_FRONTIER write failed");
+        tracing::info!(
+            height = height.0,
+            "VCT: captured final frontier fixture to file"
+        );
     }
 
     /// Record that a block took the fast (skip-recompute) path.
@@ -313,6 +365,7 @@ impl VctState {
             capture: None,
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
+            capture_frontier: None,
         })
     }
 
@@ -346,14 +399,39 @@ impl VctState {
 }
 
 /// The verified final frontiers embedded for `network`, if supported.
+///
+/// Mainnet uses the constant embedded in the binary. Regtest has no fixed checkpoint —
+/// its checkpoint list is derived at runtime from the mined chain — so there is no
+/// committed frontier to embed; for deterministic e2e/integration testing of the fast
+/// path on Regtest, the frontier is instead loaded from the file named by the
+/// `VCT_REGTEST_FRONTIER` env var (the harness generates it from a synced node's tip
+/// treestate via [`VctState::capture_frontier_at`]). This is scoped to **Regtest only**
+/// and validated against the configured Regtest checkpoint height, so Mainnet always uses
+/// the embedded constant and never reads the env. Other testnets have no frontier.
 fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontiers> {
     match network {
         Network::Mainnet => Some(parse_embedded_final_frontiers(
             MAINNET_FINAL_FRONTIERS,
             network.checkpoint_list().max_height(),
         )),
+        Network::Testnet(params) if params.is_regtest() => {
+            let path = std::env::var_os("VCT_REGTEST_FRONTIER")?;
+            Some(load_frontier_file(
+                path.as_ref(),
+                network.checkpoint_list().max_height(),
+            ))
+        }
         Network::Testnet(_) => None,
     }
+}
+
+/// Load and validate a final-frontier fixture file (the Regtest path; see
+/// [`embedded_final_frontiers`]). Separated from the env read so it is unit-testable
+/// without mutating process environment variables.
+fn load_frontier_file(path: &std::ffi::OsStr, expected_height: block::Height) -> FinalFrontiers {
+    let bytes =
+        std::fs::read(path).expect("VCT_REGTEST_FRONTIER must name a readable final-frontier file");
+    parse_embedded_final_frontiers(&bytes, expected_height)
 }
 
 /// Parse embedded final frontiers and verify they match the checkpoint list.
@@ -461,5 +539,55 @@ mod tests {
             embedded_final_frontiers(&Network::new_default_testnet()).is_none(),
             "testnet has no embedded final frontier until VCT fast sync supports it"
         );
+    }
+
+    /// The Regtest frontier-file loader (the `VCT_REGTEST_FRONTIER` path) round-trips a
+    /// captured frontier and ties it to the expected checkpoint height — exercising the
+    /// producer (`to_bytes`) → loader (`load_frontier_file`) seam without env vars.
+    #[test]
+    fn load_frontier_file_round_trips_a_captured_frontier() {
+        let height = block::Height(123);
+        let bytes = FinalFrontiers {
+            height,
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        }
+        .to_bytes();
+
+        let path =
+            std::env::temp_dir().join(format!("vct-frontier-load-test-{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write temp frontier file");
+
+        let loaded = load_frontier_file(path.as_os_str(), height);
+        assert_eq!(loaded.height, height, "loaded frontier height matches");
+        assert_eq!(
+            loaded.sapling.root(),
+            sapling::tree::NoteCommitmentTree::default().root(),
+            "loaded sapling frontier round-trips"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A frontier whose height does not match the checkpoint height is rejected, so a
+    /// stale/wrong Regtest fixture cannot silently mis-seed the handoff.
+    #[test]
+    #[should_panic(expected = "embedded VCT final frontier height must match")]
+    fn load_frontier_file_rejects_height_mismatch() {
+        let bytes = FinalFrontiers {
+            height: block::Height(5),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        }
+        .to_bytes();
+        let path = std::env::temp_dir().join(format!(
+            "vct-frontier-mismatch-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).expect("write temp frontier file");
+
+        let _ = load_frontier_file(path.as_os_str(), block::Height(6));
     }
 }
