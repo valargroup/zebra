@@ -3,8 +3,8 @@ name: Sync confidence
 # Full-validation sync of two fixed mainnet windows bracketing the NU6.2 soft
 # fork, to catch consensus regressions that would break sync. Builds the test
 # image once (GHCR), then runs each window on an ephemeral DigitalOcean droplet
-# that restores cached state from Spaces. Snapshots are built by
-# sync-confidence-snapshots.yml. See docs/sync-confidence-do-setup.md.
+# that restores pruned cached state from Spaces. Snapshots are produced
+# out-of-band by make-sync-confidence-snapshots.sh. See docs/sync-confidence-do-setup.md.
 
 on:
   push:
@@ -20,7 +20,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # NOTE: keep this build job in sync with sync-confidence-snapshots.yml.
+  # NOTE: the image build here produces the same image used for snapshot generation
+  # (make-sync-confidence-snapshots.sh). Keep the build-args and Dockerfile target in sync.
   build:
     name: Build test image (GHCR)
     runs-on: ubuntu-latest
@@ -68,7 +69,6 @@ jobs:
       SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
       DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
     with:
-      mode: consume
       state_key: pre-nu62
       nextest_profile: sync-range-pre-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
@@ -86,7 +86,6 @@ jobs:
       SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
       DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
     with:
-      mode: consume
       state_key: post-nu62
       nextest_profile: sync-range-post-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"

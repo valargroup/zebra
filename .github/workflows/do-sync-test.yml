@@ -1,7 +1,7 @@
 name: DO sync test
 
-# Reusable: provisions one ephemeral nyc3 droplet, runs a sync-confidence window
-# (consume) or builds a snapshot (generate) on it, then always deletes it.
+# Reusable: provisions one ephemeral nyc3 droplet, restores a pruned cached state
+# from Spaces, runs a sync-confidence window, then always deletes the droplet.
 
 on:
   workflow_call:
@@ -9,7 +9,6 @@ on:
       nextest_profile: { required: true, type: string }
       test_variables:  { required: true, type: string }
       state_key:       { required: true, type: string }
-      mode:            { required: true, type: string }
       image_ref:       { required: true, type: string }
       droplet_size:    { required: true, type: string }
       region:          { required: false, type: string, default: nyc3 }
@@ -24,7 +23,7 @@ permissions:
 
 jobs:
   run:
-    name: ${{ inputs.mode }} ${{ inputs.state_key }}
+    name: ${{ inputs.state_key }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -90,7 +89,6 @@ jobs:
       - name: Run workload
         env:
           IP: ${{ steps.droplet.outputs.ip }}
-          MODE: ${{ inputs.mode }}
           IMAGE_REF: ${{ inputs.image_ref }}
           NEXTEST_PROFILE: ${{ inputs.nextest_profile }}
           TEST_VARIABLES: ${{ inputs.test_variables }}
@@ -106,7 +104,6 @@ jobs:
           set -euo pipefail
           umask 077
           {
-            printf 'MODE=%q\n'              "${MODE}"
             printf 'IMAGE_REF=%q\n'         "${IMAGE_REF}"
             printf 'NEXTEST_PROFILE=%q\n'   "${NEXTEST_PROFILE}"
             printf 'TEST_VARIABLES=%q\n'    "${TEST_VARIABLES}"
