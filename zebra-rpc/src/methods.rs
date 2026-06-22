@@ -2514,7 +2514,8 @@ where
             miner_params,
             mempool_txs,
             mempool_tx_deps,
-        );
+        )
+        .map_misc_error()?;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
