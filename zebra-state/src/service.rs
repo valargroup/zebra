@@ -1543,6 +1543,29 @@ impl Service<ReadRequest> for ReadStateService {
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::IsPruned => Ok(ReadResponse::IsPruned(state.db.is_pruned())),
 
+            // The verified-commitment-trees `tree_aux` serving read (design §9).
+            ReadRequest::BlockRoots {
+                start_height,
+                count,
+            } => {
+                // `produce_block_roots` reads per-height trees, so it serves only on an
+                // archive node and only within the finalized tip. A fast-synced node
+                // lacks the historical trees below its handoff (it would serve from a
+                // roots index, not yet wired), so it serves nothing here. The range is
+                // clamped to the tip; out-of-range or empty requests return no roots.
+                let roots = match state.db.finalized_tip_height() {
+                    Some(tip) if count > 0 && start_height <= tip && !state.db.is_fast_synced() => {
+                        let last = start_height.0.saturating_add(count - 1).min(tip.0);
+                        finalized_state::produce_block_roots(
+                            &state.db,
+                            start_height..=block::Height(last),
+                        )
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(ReadResponse::BlockRoots(roots))
+            }
+
             // Used by the StateService.
             ReadRequest::Tip => Ok(ReadResponse::Tip(read::tip(
                 state.latest_best_chain(),

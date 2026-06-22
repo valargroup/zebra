@@ -1212,6 +1212,18 @@ pub enum ReadRequest {
     /// with whether the database has pruned historical data.
     IsPruned,
 
+    /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
+    /// with the per-block Sapling/Orchard commitment roots for the heights
+    /// `[start_height, start_height + count)` that this node holds, in ascending height
+    /// order (the verified-commitment-trees `tree_aux` serving read). May return fewer
+    /// than `count` roots if the node does not hold the whole range.
+    BlockRoots {
+        /// First requested height.
+        start_height: block::Height,
+        /// Number of consecutive heights requested.
+        count: u32,
+    },
+
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)
     /// with the current best chain tip.
     Tip,
@@ -1586,6 +1598,7 @@ impl ReadRequest {
         match self {
             ReadRequest::UsageInfo => "usage_info",
             ReadRequest::IsPruned => "is_pruned",
+            ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
