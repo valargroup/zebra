@@ -791,6 +791,19 @@ impl FinalizedState {
                         )?;
                     }
 
+                    // Below NU5 no header commits to an Orchard root (V1 history
+                    // leaves ignore it, and there is no MMR below Heartwood), so the
+                    // commitment check and look-ahead cannot authenticate it. The
+                    // Orchard tree is empty there, so pin the supplied root to the
+                    // empty-tree root before folding it into the anchor set
+                    // (design §6.1); otherwise an untrusted source could inject a
+                    // spurious Orchard anchor legacy never produces.
+                    commitment_aux_verify::verify_supplied_orchard_root_below_nu5(
+                        &network,
+                        height,
+                        &orchard_root,
+                    )?;
+
                     // Build the candidate history tree with this block's fixture
                     // roots folded in.
                     let mut candidate = history_tree.clone();
