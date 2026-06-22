@@ -349,6 +349,14 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     NotReadyToBeCommitted,
 
+    #[error(
+        "verified-commitment-trees fast path has no valid supplied root for height \
+         {height:?}: the note-commitment frontier is frozen, so this block cannot be \
+         committed until a verifiable root is fetched from a peer (retryable)"
+    )]
+    #[non_exhaustive]
+    VctSuppliedRootUnavailable { height: block::Height },
+
     #[error("block height {candidate_height:?} is lower than the current finalized height {finalized_tip_height:?}")]
     #[non_exhaustive]
     OrphanedBlock {
