@@ -676,6 +676,52 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // handoff height itself is available.
             prop_assert!(fast.db.fast_synced_tree_unavailable(HashOrHeight::Height(Height(last as u32 - 1))), "RPC gate: below-handoff treestate is unavailable");
             prop_assert!(!fast.db.fast_synced_tree_unavailable(HashOrHeight::Height(handoff)), "RPC gate: handoff treestate is available");
+
+            // Negative: a peer can supply a wrong root exactly at the handoff height,
+            // where there is no buffered checkpoint successor to authenticate it. The
+            // final embedded frontier still binds the expected root, so the committer
+            // must reject and retry instead of panicking or writing a bad handoff.
+            let mut bad_handoff_fixture = fixture.clone();
+            let bad_handoff_entry = bad_handoff_fixture
+                .get_mut(&(last as u32))
+                .expect("fixture contains the handoff root");
+            prop_assert_ne!(bad_handoff_entry.0, Default::default(), "a post-NU5 handoff block must have a non-empty Sapling root");
+            bad_handoff_entry.0 = Default::default();
+
+            let mut bad_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            bad_handoff.enable_vct_fast_fixture_with_handoff(
+                bad_handoff_fixture,
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+            );
+
+            let mut error_height = None;
+            let mut handoff_error = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                match bad_handoff.commit_finalized_direct(cv.into(), None, None, next, "vct bad handoff") {
+                    Ok(_) => {}
+                    Err(error) => {
+                        error_height = Some(i);
+                        handoff_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            prop_assert_eq!(error_height, Some(last), "the bad handoff root is rejected at the handoff height");
+            let handoff_error = handoff_error.expect("the bad handoff root failed");
+            prop_assert!(
+                format!("{handoff_error:?}").contains("VctSuppliedRootUnavailable"),
+                "a bad handoff root returns the retryable VctSuppliedRootUnavailable error, got: {handoff_error:?}"
+            );
+            prop_assert_eq!(
+                bad_handoff.db.finalized_tip_height(),
+                Some(Height(last as u32 - 1)),
+                "the refused handoff block left state untouched"
+            );
     });
 
     Ok(())
