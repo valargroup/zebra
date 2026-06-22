@@ -197,10 +197,6 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let nu6_3_active = NetworkUpgrade::Nu6_3
-            .activation_height(net)
-            .is_some_and(|nu6_3_height| height >= nu6_3_height);
-
         match miner_params.addr() {
             Address::Unified(addr) => addr
                 .sapling()
@@ -211,18 +207,23 @@ impl TransactionTemplate<NegativeOrZero> {
                 })
                 .or_else(|| {
                     addr.orchard().and_then(|addr| {
-                        if nu6_3_active {
-                            // After NU6.3, net-new value into Orchard is forbidden
-                            // (coinbase included), so the Orchard receiver is paid via
-                            // Ironwood — which reuses the Orchard address — when Ironwood
-                            // is compiled in. Without Ironwood support, an Orchard-only
-                            // address cannot receive a coinbase reward after NU6.3.
-                            #[cfg(zcash_unstable = "nu6.3")]
-                            return add_ironwood_reward(&mut builder, addr);
-                            #[cfg(not(zcash_unstable = "nu6.3"))]
-                            return None;
+                        let upgrade = NetworkUpgrade::current(net, height);
+                        // Before NU6.3, pay the Orchard receiver via Orchard.
+                        if upgrade < NetworkUpgrade::Nu6_3 {
+                            return add_orchard_reward(&mut builder, addr);
                         }
-                        add_orchard_reward(&mut builder, addr)
+                        // From NU6.3 on, the Orchard pool is frozen
+                        // (disabled_add_to_orchard_pool). At NU6.3 the Orchard receiver is
+                        // paid via Ironwood — which reuses the Orchard address — when
+                        // Ironwood is compiled in; the verifier only accepts V6/Ironwood
+                        // coinbase outputs while NU6.3 is the current upgrade. After NU6.3
+                        // neither pool is accepted, so an Orchard-only address cannot
+                        // receive a coinbase reward.
+                        #[cfg(zcash_unstable = "nu6.3")]
+                        if upgrade == NetworkUpgrade::Nu6_3 {
+                            return add_ironwood_reward(&mut builder, addr);
+                        }
+                        None
                     })
                 }),
 
