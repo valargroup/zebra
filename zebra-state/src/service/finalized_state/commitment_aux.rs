@@ -296,9 +296,8 @@ impl CommitmentRootSource for PeerSource {
 /// minus the network: it derives each root from the stored per-height tree, exactly
 /// the value the fast path folds into the anchor set. Requires per-height trees, so
 /// `db` must be an archive/legacy database; panics on a height whose tree is absent.
-// Exercised by the round-trip test this increment; becomes the serving read path in 6a.
-#[allow(dead_code)]
-pub(super) fn produce_block_roots(
+// The `ReadRequest::BlockRoots` serving read path; also exercised by the round-trip test.
+pub(crate) fn produce_block_roots(
     db: &ZebraDb,
     range: std::ops::RangeInclusive<block::Height>,
 ) -> Vec<BlockCommitmentRoots> {
