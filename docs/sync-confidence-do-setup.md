@@ -18,11 +18,16 @@ state objects after a DB format-version bump by re-running the snapshots workflo
 ## First run
 1. Confirm 3,405,000 <= current mainnet head (else lower the post-nu62 heights in
    `zebrad/tests/acceptance.rs` + regenerate).
-2. Run **Sync confidence snapshots** (Actions -> Run workflow) to seed the two
-   state tarballs in Spaces. The post-nu62 generate job syncs genesis->3.4M and is
-   long; size its droplet for the full finalized state (see `droplet_size`).
-3. Once snapshots exist, **Sync confidence** runs on merge to `ironwood-main` and
-   via manual dispatch.
+2. Run **Sync confidence snapshots** (Actions -> Run workflow). On the very first
+   run the GHCR image package (`zebra-tests`) is created **private**, so the
+   droplet's anonymous `docker pull` fails. The package only exists after that
+   first push, so afterwards make it public: GitHub -> the org/user **Packages**
+   -> `zebra-tests` -> Package settings -> Change visibility -> **Public**. Then
+   re-run the workflow to seed the two state tarballs in Spaces. The post-nu62
+   generate job syncs genesis->3.4M and is long; size its droplet for the full
+   finalized state (see `droplet_size`).
+3. Once snapshots exist and the package is public, **Sync confidence** runs on
+   merge to `ironwood-main` and via manual dispatch.
 
 ## Cost note
 Droplets are deleted after each run (`if: always()` + a 1h orphan sweep). If a run

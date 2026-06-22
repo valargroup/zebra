@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # NOTE: keep this build job in sync with sync-confidence.yml.
   build:
     name: Build test image (GHCR)
     runs-on: ubuntu-latest
@@ -22,7 +23,8 @@ jobs:
       contents: read
       packages: write
     outputs:
-      image_ref: ${{ steps.meta.outputs.tags }}
+      # Single-valued by construction (one metadata tag rule); robust if tags are added later.
+      image_ref: ghcr.io/${{ github.repository }}-tests:${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
