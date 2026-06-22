@@ -1263,8 +1263,15 @@ pub(crate) fn service_registry(
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
+    tree_aux_port: Option<Arc<dyn super::TreeAuxStatePort>>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone(), discovery_service];
+    // The verified-commitment-trees `tree_aux` roots service, when enabled. Registering
+    // it both advertises the capability (so this node can fetch) and serves roots from
+    // local state (design §9).
+    if let Some(tree_aux_port) = tree_aux_port {
+        services.push(Arc::new(super::TreeAuxService::new(tree_aux_port)) as Arc<dyn Service>);
+    }
     if let Some(header_sync) = &header_sync {
         services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
     } else {
@@ -2435,14 +2442,18 @@ pub async fn spawn_zakura_endpoint(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
-    spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None).await
+    spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None, None).await
 }
 
 /// Start a Zakura endpoint with an externally driven header-sync reactor.
+///
+/// `tree_aux_port`, when `Some`, registers the verified-commitment-trees `tree_aux`
+/// roots service (advertising the capability and serving roots from local state).
 pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    tree_aux_port: Option<Arc<dyn super::TreeAuxStatePort>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p {
         return Ok(None);
@@ -2561,6 +2572,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
+        tree_aux_port,
     )?;
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
@@ -4876,6 +4888,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             recorder.clone(),
             test_discovery_service(&supervisor),
+            None,
         )?;
         let peer = test_peer(6);
 
@@ -5097,6 +5110,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
+            None,
         )?;
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
@@ -5177,6 +5191,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
+            None,
         )?;
         let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -5280,6 +5295,7 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
+            None,
         )?;
         let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
