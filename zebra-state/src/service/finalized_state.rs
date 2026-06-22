@@ -916,18 +916,18 @@ impl FinalizedState {
                         // as the real tip treestate via the legacy write path
                         // (`fast_anchor_roots` left `None`), so post-checkpoint
                         // semantic verification resumes from a correct frontier.
-                        assert_eq!(
-                            sapling_frontier.root(),
-                            sapling_root,
-                            "VCT handoff: supplied sapling frontier root does not match the \
-                                 verified checkpoint root"
-                        );
-                        assert_eq!(
-                            orchard_frontier.root(),
-                            orchard_root,
-                            "VCT handoff: supplied orchard frontier root does not match the \
-                                 verified checkpoint root"
-                        );
+                        if sapling_frontier.root() != sapling_root {
+                            return Err(self.vct_reject_supplied_root(
+                                height,
+                                ValidateContextError::VctSuppliedRootUnavailable { height },
+                            ));
+                        }
+                        if orchard_frontier.root() != orchard_root {
+                            return Err(self.vct_reject_supplied_root(
+                                height,
+                                ValidateContextError::VctSuppliedRootUnavailable { height },
+                            ));
+                        }
 
                         // Subtree tips are left `None`: the resuming chain recomputes
                         // them from the frontier position.
