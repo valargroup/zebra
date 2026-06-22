@@ -578,3 +578,87 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 
     Ok(())
 }
+
+/// Verified-commitment-trees consumer half of the `tree_aux` peer source (increment 6a):
+/// a [`commitment_aux::PeerSource`] **filled incrementally** by its writer handle (as the
+/// driver fills it when root ranges arrive from peers) drives the fast path to
+/// byte-identical consensus state. Same harness as the DB-produced round-trip, but the
+/// produced roots are inserted into the shared cache in two chunks via
+/// [`commitment_aux::PeerSourceWriter`] — proving the fillable, driver-facing source is a
+/// drop-in for the fixture. (The network transport that fills it is the rest of 6a.)
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] (the look-ahead) and by height
+fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+
+            // Legacy/archive pass: a real DB with per-height trees, plus the golden state.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            for block in blocks.iter().take(last + 1) {
+                let cv = CheckpointVerifiedBlock::from(block.block.clone());
+                legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct peer-source legacy")
+                    .unwrap();
+            }
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+
+            // Produce the payload from the legacy DB (the serving read path).
+            let produced_roots = commitment_aux::produce_block_roots(
+                &legacy.db,
+                Height((seed + 1) as u32)..=Height(last as u32),
+            );
+
+            // Fill the peer source incrementally via its writer, in two chunks, as the
+            // driver would when successive root ranges arrive from a peer.
+            let (peer_source, writer) = commitment_aux::PeerSource::new(None);
+            let split = produced_roots.len() / 2;
+            writer.insert_roots(produced_roots[..split].iter().cloned());
+            writer.insert_roots(produced_roots[split..].iter().cloned());
+
+            // Consume the peer-source-supplied roots in a fresh fast-sync state.
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_source(Box::new(peer_source));
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct peer-source fast")
+                    .expect("verified fast commit from peer-source roots succeeds");
+            }
+
+            prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from peer-source roots match legacy");
+            prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from peer-source roots match legacy");
+    });
+
+    Ok(())
+}
