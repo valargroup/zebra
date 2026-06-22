@@ -15,10 +15,12 @@ use super::{
     Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
+mod driver;
 mod service;
 #[cfg(test)]
 mod tests;
 mod wire;
 
+pub use driver::fetch_roots;
 pub use service::{TreeAuxService, TreeAuxStatePort};
 pub use wire::*;
