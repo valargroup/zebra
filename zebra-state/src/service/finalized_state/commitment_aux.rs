@@ -227,8 +227,6 @@ impl CommitmentRootSource for VecRootSource {
 /// reads them per height through the [`CommitmentRootSource`] seam. The handoff frontier
 /// is embedded in the binary (design §5.2), so it is held immutably here and never
 /// fetched over the network — only roots come from peers.
-// Used by the consumer round-trip test now; the `tree_aux` driver fills it in 6a.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(super) struct PeerSource {
     roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
@@ -242,7 +240,6 @@ pub(crate) struct PeerSourceWriter {
     roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
 }
 
-#[allow(dead_code)]
 impl PeerSource {
     /// Create an empty peer source and its write handle. `frontiers` is the embedded
     /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).

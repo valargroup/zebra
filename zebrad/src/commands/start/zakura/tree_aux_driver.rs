@@ -16,7 +16,7 @@ use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, paramet
 use zebra_network::zakura::{
     fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle,
 };
-use zebra_state::{ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
+use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
 
 /// Delay between driver attempts while waiting for a peer, or after a fetch error.
 const TREE_AUX_DRIVER_RETRY: Duration = Duration::from_secs(5);
@@ -25,17 +25,28 @@ const TREE_AUX_DRIVER_RETRY: Duration = Duration::from_secs(5);
 /// service ([`ReadRequest::BlockRoots`]). An archive/produced node serves the roots it
 /// derives from its per-height trees; a fast-synced node holds no per-height trees and so
 /// returns an empty (unavailable) range, which the wire layer reports as `RangeUnavailable`.
-pub(crate) struct StateTreeAuxPort {
-    read_state: ReadStateService,
+///
+/// Generic over the read service so the mapping is unit-testable with a mock; production
+/// uses the default [`ReadStateService`].
+pub(crate) struct StateTreeAuxPort<S = ReadStateService> {
+    read_state: S,
 }
 
-impl StateTreeAuxPort {
-    pub(crate) fn new(read_state: ReadStateService) -> Self {
+impl<S> StateTreeAuxPort<S> {
+    pub(crate) fn new(read_state: S) -> Self {
         Self { read_state }
     }
 }
 
-impl TreeAuxStatePort for StateTreeAuxPort {
+impl<S> TreeAuxStatePort for StateTreeAuxPort<S>
+where
+    S: Service<ReadRequest, Response = ReadResponse, Error = BoxError>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
     fn read_block_roots(
         &self,
         start_height: block::Height,
@@ -122,5 +133,70 @@ pub(crate) async fn run_tree_aux_driver(
         _ = &mut shutdown => {
             tracing::info!("tree_aux driver shutting down");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use tower::service_fn;
+    use zebra_chain::{orchard, sapling};
+
+    use super::*;
+
+    fn root_at(height: u32) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }
+    }
+
+    #[tokio::test]
+    async fn port_returns_block_roots_from_the_read_service() {
+        let held: Vec<_> = (5..8).map(root_at).collect();
+        let served = held.clone();
+        let read_state = service_fn(move |request: ReadRequest| {
+            let served = served.clone();
+            future::ready(match request {
+                ReadRequest::BlockRoots { .. } => Ok(ReadResponse::BlockRoots(served)),
+                other => Err(format!("unexpected request: {other:?}").into()),
+            })
+        });
+
+        let port = StateTreeAuxPort::new(read_state);
+        let roots = port.read_block_roots(block::Height(5), 3).await;
+
+        assert_eq!(roots, held, "the port returns the roots the read service serves");
+    }
+
+    #[tokio::test]
+    async fn port_maps_read_errors_to_an_empty_serve() {
+        // A read error must degrade to an empty (unavailable) serve, never a panic or
+        // wrong data — the client treats an empty range as unavailable.
+        let read_state = service_fn(|_request: ReadRequest| {
+            future::ready(Err::<ReadResponse, BoxError>("read failed".into()))
+        });
+
+        let port = StateTreeAuxPort::new(read_state);
+        let roots = port.read_block_roots(block::Height(5), 3).await;
+
+        assert!(roots.is_empty(), "a failed read serves an empty range");
+    }
+
+    #[tokio::test]
+    async fn port_maps_an_unexpected_response_to_an_empty_serve() {
+        let read_state = service_fn(|_request: ReadRequest| {
+            future::ready(Ok::<_, BoxError>(ReadResponse::ValidBlockProposal))
+        });
+
+        let port = StateTreeAuxPort::new(read_state);
+        let roots = port.read_block_roots(block::Height(5), 3).await;
+
+        assert!(
+            roots.is_empty(),
+            "a non-BlockRoots response serves an empty range, not wrong data"
+        );
     }
 }

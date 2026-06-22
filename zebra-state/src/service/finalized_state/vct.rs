@@ -66,10 +66,46 @@ pub(crate) struct VctState {
     prevalidated_count: AtomicU64,
 }
 
+/// Which commitment-root source the committer uses, resolved from the (already read)
+/// configuration signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceMode {
+    /// Legacy recompute committer (no VCT state).
+    Legacy,
+    /// Replay a local fixture (explicit `VCT_FAST` + `VCT_FIXTURE`).
+    Fixture,
+    /// Legacy commit that records per-block roots (explicit `VCT_CAPTURE`).
+    Capture,
+    /// Fetch per-block roots from peers — the default where embedded frontiers exist.
+    Peer,
+}
+
+/// Resolve the source precedence as a pure function, so the order — and in particular the
+/// peer-source default — is unit-testable without touching process environment variables
+/// or the embedded-frontier files. Explicit fixture wins, then explicit capture, then the
+/// peer-source default (unless opted out, or the network has no embedded frontiers).
+fn select_source_mode(
+    fast_flag: bool,
+    capture: bool,
+    legacy_opt_out: bool,
+    has_embedded_frontiers: bool,
+) -> SourceMode {
+    if fast_flag {
+        SourceMode::Fixture
+    } else if capture {
+        SourceMode::Capture
+    } else if legacy_opt_out || !has_embedded_frontiers {
+        SourceMode::Legacy
+    } else {
+        SourceMode::Peer
+    }
+}
+
 impl VctState {
-    /// Build the POC state from the config flag and the `VCT_FIXTURE` /
-    /// `VCT_CAPTURE` environment variables. Returns `None` when neither
-    /// capture nor fast mode is requested (the default), so there is zero overhead.
+    /// Build the POC state from the config flag and the `VCT_FIXTURE` / `VCT_CAPTURE` /
+    /// `VCT_LEGACY` environment variables. On networks with an embedded handoff frontier
+    /// (Mainnet) the default is the peer (`tree_aux`) source; `VCT_LEGACY` (or a network
+    /// without an embedded frontier) returns `None` for a zero-overhead legacy committer.
     #[allow(clippy::unwrap_in_result)] // misconfiguration / unreadable fixture should fail loudly
     pub(super) fn from_config(fast_flag: bool, network: &Network) -> Option<Arc<Self>> {
         // The config flag is `serde(skip)`, so for the POC harness also honor an
@@ -85,72 +121,78 @@ impl VctState {
             Mutex::new(std::io::BufWriter::new(file))
         });
 
-        // Fixture fast mode (explicit): replay per-block roots recorded in a local fixture
-        // (`VCT_FAST` + `VCT_FIXTURE`). Takes precedence over the peer-source default so a
-        // developer can pin a known fixture instead of fetching from peers.
-        if fast_flag {
-            let path = std::env::var_os("VCT_FIXTURE")
-                .expect("enable_verified_commitment_trees requires VCT_FIXTURE");
-            let mut bytes = Vec::new();
-            File::open(&path)
-                .expect("VCT_FIXTURE must exist")
-                .read_to_end(&mut bytes)
-                .expect("VCT_FIXTURE read failed");
-            assert_eq!(
-                bytes.len() % VCT_RECORD_LEN,
-                0,
-                "corrupt VCT fixture: length not a multiple of {VCT_RECORD_LEN}"
-            );
-            let mut roots = HashMap::new();
-            for rec in bytes.chunks_exact(VCT_RECORD_LEN) {
-                let height = u32::from_le_bytes(rec[0..4].try_into().expect("4 bytes"));
-                let sap = <sapling::tree::Root as FromDisk>::from_bytes(&rec[4..36]);
-                let orch = <orchard::tree::Root as FromDisk>::from_bytes(&rec[36..68]);
-                roots.insert(height, (sap, orch));
+        let legacy_opt_out = std::env::var_os("VCT_LEGACY").is_some();
+        // Parse the embedded handoff frontier once (None on networks without one, e.g.
+        // Testnet). The decision below only needs its presence; the fixture/peer arms reuse
+        // the parsed value.
+        let embedded = embedded_final_frontiers(network);
+
+        match select_source_mode(fast_flag, capture.is_some(), legacy_opt_out, embedded.is_some()) {
+            // Fixture fast mode (explicit): replay per-block roots recorded in a local
+            // fixture (`VCT_FAST` + `VCT_FIXTURE`) instead of fetching from peers.
+            SourceMode::Fixture => {
+                let path = std::env::var_os("VCT_FIXTURE")
+                    .expect("enable_verified_commitment_trees requires VCT_FIXTURE");
+                let mut bytes = Vec::new();
+                File::open(&path)
+                    .expect("VCT_FIXTURE must exist")
+                    .read_to_end(&mut bytes)
+                    .expect("VCT_FIXTURE read failed");
+                assert_eq!(
+                    bytes.len() % VCT_RECORD_LEN,
+                    0,
+                    "corrupt VCT fixture: length not a multiple of {VCT_RECORD_LEN}"
+                );
+                let mut roots = HashMap::new();
+                for rec in bytes.chunks_exact(VCT_RECORD_LEN) {
+                    let height = u32::from_le_bytes(rec[0..4].try_into().expect("4 bytes"));
+                    let sap = <sapling::tree::Root as FromDisk>::from_bytes(&rec[4..36]);
+                    let orch = <orchard::tree::Root as FromDisk>::from_bytes(&rec[36..68]);
+                    roots.insert(height, (sap, orch));
+                }
+                let parsed = embedded.unwrap_or_else(|| {
+                    panic!("VCT fast mode requires embedded final frontiers for {network}")
+                });
+                tracing::info!(
+                    handoff_height = parsed.height.0,
+                    fixture_roots = roots.len(),
+                    "VCT: loaded fixture + embedded final frontiers, fast (skip-recompute) mode enabled"
+                );
+                Some(Arc::new(VctState {
+                    fast: true,
+                    source: Box::new(FixtureSource::new(roots, Some(parsed))),
+                    capture,
+                    fast_count: AtomicU64::new(0),
+                    prevalidated_count: AtomicU64::new(0),
+                }))
             }
-            let parsed = embedded_final_frontiers(network).unwrap_or_else(|| {
-                panic!("VCT fast mode requires embedded final frontiers for {network}")
-            });
-            tracing::info!(
-                handoff_height = parsed.height.0,
-                fixture_roots = roots.len(),
-                "VCT: loaded fixture + embedded final frontiers, fast (skip-recompute) mode enabled"
-            );
-            return Some(Arc::new(VctState {
-                fast: true,
-                source: Box::new(FixtureSource::new(roots, Some(parsed))),
-                capture,
-                fast_count: AtomicU64::new(0),
-                prevalidated_count: AtomicU64::new(0),
-            }));
-        }
 
-        // Capture mode (explicit): a legacy sync that records each committed block's roots
-        // to a fixture. Recording requires the legacy recompute, so it overrides the
-        // peer-source default (which would skip the recompute and capture nothing).
-        if capture.is_some() {
-            tracing::info!("VCT: capture mode enabled (recording per-block roots, legacy commit)");
-            return Some(Arc::new(VctState {
-                fast: false,
-                source: Box::new(FixtureSource::new(HashMap::new(), None)),
-                capture,
-                fast_count: AtomicU64::new(0),
-                prevalidated_count: AtomicU64::new(0),
-            }));
-        }
+            // Capture mode (explicit): a legacy sync that records each committed block's
+            // roots to a fixture. Recording requires the legacy recompute, so it overrides
+            // the peer-source default (which would skip the recompute and capture nothing).
+            SourceMode::Capture => {
+                tracing::info!(
+                    "VCT: capture mode enabled (recording per-block roots, legacy commit)"
+                );
+                Some(Arc::new(VctState {
+                    fast: false,
+                    source: Box::new(FixtureSource::new(HashMap::new(), None)),
+                    capture,
+                    fast_count: AtomicU64::new(0),
+                    prevalidated_count: AtomicU64::new(0),
+                }))
+            }
 
-        // Default: the peer (`tree_aux`) source on any network with embedded final frontiers
-        // (Mainnet). Per-block roots arrive from peers into a shared cache filled by the
-        // driver; the committer reads them per height and folds them in, skipping the
-        // recompute. A height the peer cannot supply — or any node with no serving peers —
-        // simply stays in legacy mode, bit-identical to a legacy committer by construction
-        // (the precompute overlap is preserved for those blocks; see `vct_fast_will_apply`).
-        // Opt out with `VCT_LEGACY` for a pure legacy committer (benchmarks, capture runs).
-        if std::env::var_os("VCT_LEGACY").is_some() {
-            return None;
-        }
-        match embedded_final_frontiers(network) {
-            Some(parsed) => {
+            // Default: the peer (`tree_aux`) source on any network with embedded final
+            // frontiers (Mainnet). Per-block roots arrive from peers into a shared cache
+            // filled by the driver; the committer reads them per height and folds them in,
+            // skipping the recompute. A height the peer cannot supply — or any node with no
+            // serving peers — stays in legacy mode, bit-identical to a legacy committer by
+            // construction (the precompute overlap is preserved for those blocks; see
+            // `vct_fast_will_apply`).
+            SourceMode::Peer => {
+                let parsed = embedded
+                    .expect("peer mode is only selected when embedded frontiers are present");
                 tracing::info!(
                     handoff_height = parsed.height.0,
                     "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
@@ -163,8 +205,10 @@ impl VctState {
                     prevalidated_count: AtomicU64::new(0),
                 }))
             }
-            // No embedded frontiers (e.g. Testnet): legacy committer.
-            None => None,
+
+            // Legacy committer: `VCT_LEGACY` opt-out, or a network with no embedded
+            // frontiers. No VCT state, zero overhead.
+            SourceMode::Legacy => None,
         }
     }
 
@@ -333,6 +377,25 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_mode_precedence() {
+        use SourceMode::*;
+
+        // The flipped default: peer source wherever embedded frontiers exist (Mainnet).
+        assert_eq!(select_source_mode(false, false, false, true), Peer);
+        // No embedded frontiers (e.g. Testnet): legacy, never peer.
+        assert_eq!(select_source_mode(false, false, false, false), Legacy);
+        // `VCT_LEGACY` opt-out forces legacy even where the peer default would apply.
+        assert_eq!(select_source_mode(false, false, true, true), Legacy);
+        // Capture overrides the peer default (recording needs the legacy recompute).
+        assert_eq!(select_source_mode(false, true, false, true), Capture);
+        // Fixture fast mode takes precedence over capture and the peer default…
+        assert_eq!(select_source_mode(true, false, false, true), Fixture);
+        assert_eq!(select_source_mode(true, true, false, true), Fixture);
+        // …and over the legacy opt-out, since it is an explicit request.
+        assert_eq!(select_source_mode(true, false, true, true), Fixture);
+    }
 
     #[test]
     fn embedded_mainnet_final_frontiers_parse() {
