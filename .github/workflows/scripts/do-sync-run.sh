@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Runs ON the ephemeral DigitalOcean droplet. Pulls the prebuilt test image,
-# (consume) restores cached state from Spaces, runs the nextest profile, and
-# (generate) uploads the resulting state back to Spaces.
+# Runs ON the ephemeral DigitalOcean droplet: pulls the prebuilt test image,
+# restores the pruned cached state from Spaces, and runs the nextest profile.
+#
+# The pruned start-states are produced out-of-band (one-time, or after a DB
+# format-version bump) by make-sync-confidence-snapshots.sh.
 #
 # Config is provided via /root/run.env (sourced by the caller before exec):
-#   MODE            consume | generate
 #   IMAGE_REF       ghcr.io/valargroup/zebra-tests:sha-xxxx
 #   NEXTEST_PROFILE e.g. sync-range-pre-nu62
 #   TEST_VARIABLES  comma-separated KEY=VALUE passed into the container
@@ -30,12 +31,10 @@ CFG
 mkdir -p "${STATE_DIR}"
 docker pull "${IMAGE_REF}"
 
-if [[ "${MODE}" == "consume" ]]; then
-  echo "Downloading cached state ${OBJECT}"
-  s3cmd get "${OBJECT}" /tmp/state.tar.zst
-  tar --use-compress-program=zstd -xf /tmp/state.tar.zst -C "${STATE_DIR}"
-  rm -f /tmp/state.tar.zst
-fi
+echo "Downloading cached state ${OBJECT}"
+s3cmd get "${OBJECT}" /tmp/state.tar.zst
+tar --use-compress-program=zstd -xf /tmp/state.tar.zst -C "${STATE_DIR}"
+rm -f /tmp/state.tar.zst
 
 # The container runs as UID 10001 (zebra); make the bind mount writable by it.
 chown -R 10001:10001 "${STATE_DIR}"
@@ -45,7 +44,7 @@ ENV_FLAGS=()
 IFS=',' read -ra KVS <<< "${TEST_VARIABLES}"
 for kv in "${KVS[@]}"; do ENV_FLAGS+=( -e "${kv}" ); done
 
-set +e
+# set -e makes the script (and the SSH session, and the job) fail if the sync fails.
 docker run --rm \
   -e NEXTEST_PROFILE="${NEXTEST_PROFILE}" \
   -e FEATURES="${FEATURES}" \
@@ -53,22 +52,3 @@ docker run --rm \
   "${ENV_FLAGS[@]}" \
   -v "${STATE_DIR}:/state" \
   "${IMAGE_REF}"
-RESULT=$?
-set -e
-echo "nextest exit code: ${RESULT}"
-
-if [[ "${MODE}" == "generate" && "${RESULT}" -eq 0 ]]; then
-  # Prune old raw tx data before upload to keep the tarball (and the per-run
-  # consume download) small. This keeps all consensus state plus the last 10k
-  # blocks of tx data, which comfortably covers the 5k-block consume window.
-  # Runs as a separate container — the sync container has exited, releasing the
-  # RocksDB lock.
-  echo "Pruning state before upload"
-  docker run --rm -v "${STATE_DIR}:/state" --entrypoint zebra-prune-state "${IMAGE_REF}" \
-    --network Mainnet --cache-dir /state --tx-retention 10000 --confirm
-  echo "Uploading state to ${OBJECT}"
-  tar --use-compress-program='zstd -T0' -cf /tmp/state.tar.zst -C "${STATE_DIR}" .
-  s3cmd put /tmp/state.tar.zst "${OBJECT}"
-fi
-
-exit "${RESULT}"
