@@ -11,6 +11,7 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
+    ironwood,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
@@ -551,16 +552,35 @@ fn rebuild_history_tree_from_upgrade_activation(
         .activation_height(network)
         .expect("current network upgrade must have an activation height");
 
+    let mut ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
     let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree = HistoryTree::from_block(network, block, &sapling_root, &orchard_root)?;
+    update_ironwood_tree(&mut ironwood_tree, &block)?;
+    let ironwood_root = ironwood_tree.root();
+    let mut history_tree =
+        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, height)?;
+        update_ironwood_tree(&mut ironwood_tree, &block)?;
+        let ironwood_root = ironwood_tree.root();
 
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(history_tree)
+}
+
+fn update_ironwood_tree(
+    ironwood_tree: &mut ironwood::tree::NoteCommitmentTree,
+    block: &Block,
+) -> Result<(), NoteCommitmentTreeError> {
+    for note_commitment in block.ironwood_note_commitments() {
+        ironwood_tree
+            .append(*note_commitment)
+            .map_err(NoteCommitmentTreeError::Ironwood)?;
+    }
+
+    Ok(())
 }
 
 fn history_rebuild_inputs_at_height(
@@ -608,7 +628,8 @@ fn rebuild_treestate_to_height(
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        let ironwood_root = note_commitment_trees.ironwood.root();
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(RebuiltTreestate {

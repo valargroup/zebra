@@ -17,7 +17,7 @@ use zebra_chain::{
     block::{self, Height},
     block_info::BlockInfo,
     history_tree::HistoryTree,
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::Network,
     primitives::Groth16Proof,
@@ -143,6 +143,14 @@ pub struct ChainInner {
     pub(crate) orchard_trees_by_height:
         BTreeMap<block::Height, Arc<orchard::tree::NoteCommitmentTree>>,
 
+    /// The Ironwood note commitment tree for each height.
+    ///
+    /// When a chain is forked from the finalized tip, also contains the
+    /// finalized tip tree. This extra tree is removed when the first
+    /// non-finalized block is committed.
+    pub(crate) ironwood_trees_by_height:
+        BTreeMap<block::Height, Arc<ironwood::tree::NoteCommitmentTree>>,
+
     // History trees
     //
     /// The ZIP-221 history tree for each height, including all finalized blocks,
@@ -234,12 +242,14 @@ pub struct ChainInner {
 
 impl Chain {
     /// Create a new Chain with the given finalized tip trees and network.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         network: &Network,
         finalized_tip_height: Height,
         sprout_note_commitment_tree: Arc<sprout::tree::NoteCommitmentTree>,
         sapling_note_commitment_tree: Arc<sapling::tree::NoteCommitmentTree>,
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
+        ironwood_note_commitment_tree: Arc<ironwood::tree::NoteCommitmentTree>,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
     ) -> Self {
@@ -261,6 +271,7 @@ impl Chain {
             orchard_anchors_by_height: Default::default(),
             orchard_trees_by_height: Default::default(),
             orchard_subtrees: Default::default(),
+            ironwood_trees_by_height: Default::default(),
             sprout_nullifiers: Default::default(),
             sapling_nullifiers: Default::default(),
             orchard_nullifiers: Default::default(),
@@ -280,6 +291,7 @@ impl Chain {
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
         chain.add_sapling_tree_and_anchor(finalized_tip_height, sapling_note_commitment_tree);
         chain.add_orchard_tree_and_anchor(finalized_tip_height, orchard_note_commitment_tree);
+        chain.add_ironwood_tree(finalized_tip_height, ironwood_note_commitment_tree);
         chain.add_history_tree(finalized_tip_height, history_tree);
 
         chain
@@ -988,6 +1000,83 @@ impl Chain {
         }
     }
 
+    /// Returns the Ironwood note commitment tree for the tip.
+    ///
+    /// # Panics
+    ///
+    /// If this chain has no Ironwood trees. (This should be impossible.)
+    pub fn ironwood_note_commitment_tree_for_tip(&self) -> Arc<ironwood::tree::NoteCommitmentTree> {
+        self.ironwood_trees_by_height
+            .last_key_value()
+            .expect("only called while ironwood_trees_by_height is populated")
+            .1
+            .clone()
+    }
+
+    /// Returns the Ironwood [`NoteCommitmentTree`](ironwood::tree::NoteCommitmentTree)
+    /// specified by a [`HashOrHeight`], if it exists in the non-finalized [`Chain`].
+    pub fn ironwood_tree(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let height =
+            hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
+
+        self.ironwood_trees_by_height
+            .range(..=height)
+            .next_back()
+            .map(|(_height, tree)| tree.clone())
+    }
+
+    /// Adds the Ironwood `tree` to the tree index at `height`.
+    ///
+    /// Stores only the first tree in each series of identical trees.
+    fn add_ironwood_tree(&mut self, height: Height, tree: Arc<ironwood::tree::NoteCommitmentTree>) {
+        if height.is_min()
+            || self
+                .ironwood_tree(height.previous().expect("prev height").into())
+                .is_none_or(|prev_tree| prev_tree != tree)
+        {
+            assert_eq!(
+                self.ironwood_trees_by_height.insert(height, tree),
+                None,
+                "incorrect overwrite of ironwood tree: trees must be reverted then inserted",
+            );
+        }
+    }
+
+    /// Removes the Ironwood tree index at `height`.
+    fn remove_ironwood_tree(&mut self, position: RevertPosition, height: Height) {
+        let (removed_heights, highest_removed_tree) = if position == RevertPosition::Root {
+            (
+                self.ironwood_trees_by_height
+                    .keys()
+                    .cloned()
+                    .filter(|index_height| *index_height <= height)
+                    .collect(),
+                self.ironwood_tree(height.into()),
+            )
+        } else {
+            (vec![height], None)
+        };
+
+        for height in &removed_heights {
+            self.ironwood_trees_by_height.remove(height);
+        }
+
+        if !self.is_empty() && height < self.non_finalized_tip_height() {
+            let next_height = height
+                .next()
+                .expect("Zebra should never reach the max height in normal operation.");
+
+            self.ironwood_trees_by_height
+                .entry(next_height)
+                .or_insert_with(|| {
+                    highest_removed_tree.expect("There should be a cached removed tree.")
+                });
+        }
+    }
+
     /// Adds the Orchard `tree` to the tree and anchor indexes at `height`.
     ///
     /// `height` can be either:
@@ -1469,6 +1558,8 @@ impl Chain {
             sapling_subtree: self.sapling_subtree_for_tip(),
             orchard: self.orchard_note_commitment_tree_for_tip(),
             orchard_subtree: self.orchard_subtree_for_tip(),
+            ironwood: self.ironwood_note_commitment_tree_for_tip(),
+            ironwood_subtree: None,
         };
 
         let mut tree_result = None;
@@ -1494,6 +1585,7 @@ impl Chain {
         self.add_sprout_tree_and_anchor(height, nct.sprout);
         self.add_sapling_tree_and_anchor(height, nct.sapling);
         self.add_orchard_tree_and_anchor(height, nct.orchard);
+        self.add_ironwood_tree(height, nct.ironwood);
 
         if let Some(subtree) = nct.sapling_subtree {
             self.sapling_subtrees
@@ -1506,6 +1598,7 @@ impl Chain {
 
         let sapling_root = self.sapling_note_commitment_tree_for_tip().root();
         let orchard_root = self.orchard_note_commitment_tree_for_tip().root();
+        let ironwood_root = self.ironwood_note_commitment_tree_for_tip().root();
 
         // TODO: update the history trees in a rayon thread, if they show up in CPU profiles
         let mut history_tree = self.history_block_commitment_tree();
@@ -1516,6 +1609,7 @@ impl Chain {
                 contextually_valid.block.clone(),
                 &sapling_root,
                 &orchard_root,
+                &ironwood_root,
             )
             .map_err(Arc::new)?;
 
@@ -1852,6 +1946,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         self.remove_sprout_tree_and_anchor(position, height);
         self.remove_sapling_tree_and_anchor(position, height);
         self.remove_orchard_tree_and_anchor(position, height);
+        self.remove_ironwood_tree(position, height);
 
         // TODO: move this to the history tree UpdateWith.revert...()?
         self.remove_history_tree(position, height);

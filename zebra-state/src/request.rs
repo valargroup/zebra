@@ -350,6 +350,9 @@ impl Treestate {
                 sapling_subtree,
                 orchard,
                 orchard_subtree,
+                // TODO: (NU6.3) wire correct ironwood_root here.
+                ironwood: Default::default(),
+                ironwood_subtree: None,
             },
             history_tree,
         }
