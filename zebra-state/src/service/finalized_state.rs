@@ -971,7 +971,7 @@ impl FinalizedState {
                     // (harness fixture generation) dump the tip frontier at the configured
                     // capture height — the trees here are the real tip treestate.
                     if let Some(v) = &self.vct {
-                        v.capture(height.0, &sapling_root, &orchard_root);
+                        v.capture_per_height_roots(height.0, &sapling_root, &orchard_root);
                         v.capture_frontier_at(
                             height,
                             &note_commitment_trees.sapling,

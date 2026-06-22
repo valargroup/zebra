@@ -279,7 +279,7 @@ impl VctState {
     }
 
     /// Append a captured per-block roots record for `height` (no-op outside capture mode).
-    pub(super) fn capture(
+    pub(super) fn capture_per_height_roots(
         &self,
         height: u32,
         sapling_root: &sapling::tree::Root,
