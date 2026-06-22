@@ -1,7 +1,11 @@
 # Verified commitment trees — fast checkpoint sync
 
-> **Status:** experimental (POC), behind an opt-out. Mainnet defaults to the peer
-> (`tree_aux`) source; `VCT_LEGACY` reverts to the byte-identical legacy committer.
+> **Status:** experimental (POC). The fast verified path is the **default** whenever a node
+> syncs under checkpoint trust (`consensus.checkpoint_sync = true`) on a network with an
+> embedded handoff frontier (Mainnet) — for both the Archive and Pruned storage modes.
+> Setting `consensus.checkpoint_sync = false` is the **only** mode that fully reconstructs the
+> note-commitment trees per block (the byte-identical legacy committer). See §4.4 for the mode
+> matrix.
 >
 > **Document history.** An earlier copy of this design was kept as an untracked working
 > file and was lost when a shared worktree was cleaned. This version is rebuilt from the
@@ -33,7 +37,10 @@ or verify a root falls back to the legacy recompute, bit-identical to today.
   failure policy, the checkpoint handoff), the `tree_aux` peer transport that delivers roots,
   the serving read path, and the persistent fast-synced database format.
 - **Not a consensus change.** There are exactly two enduring code paths: the standard local
-  tree rebuild (legacy) and the fast verified path. The fixture/embedded blob, the in-process
+  tree rebuild (legacy) and the fast verified path. Which one runs is config-driven by
+  `consensus.checkpoint_sync` (§4.4); the `state.storage_mode` axis (Archive vs. Pruned) is
+  orthogonal — it controls raw-tx/index pruning, not the tree path, so both storage modes use
+  the fast path under checkpoint sync. The fixture/embedded blob, the in-process
   `VecRootSource`, and the network `PeerSource` are *sources* behind one seam (§5.3) — not
   modes.
 - **No new cryptography.** Verification reuses the existing consensus checks
@@ -95,17 +102,38 @@ A genesis-empty node still yields `Height(1)`, so "fetch from genesis" falls out
 the node really is at genesis. (Implemented in `root_fetch_start`; regression covered by
 `root_fetch_start_is_one_above_the_verified_tip`.)
 
-### 4.4 Peer source is the committer default
+### 4.4 Mode selection: fast under checkpoint sync
 
-On networks with an embedded handoff frontier (Mainnet), the committer defaults to the peer
-(`tree_aux`) source. Precedence is resolved by a pure, unit-tested `select_source_mode`
-(no process env, no embedded files in the decision):
+The fast-vs-legacy choice is driven by user-facing config, not by env vars. The two axes are
+`consensus.checkpoint_sync` (fast verified path vs. full per-block recompute) and
+`state.storage_mode` (Archive vs. Pruned, an orthogonal pruning axis). The resulting modes:
 
-1. explicit `VCT_FAST` (+ `VCT_FIXTURE`) → **fixture** replay;
-2. else explicit `VCT_CAPTURE` → **capture** (legacy commit that records roots to a fixture);
-3. else `VCT_LEGACY`, or a network with **no embedded frontier** → **legacy** (no VCT state,
-   zero overhead);
-4. else → **peer** (the default where embedded frontiers exist).
+| Mode | Config | Tree behavior |
+| --- | --- | --- |
+| **Archive** (default) | `checkpoint_sync = true`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the handoff *for now* (§7, §10). |
+| **Pruning** | `checkpoint_sync = true`, `storage_mode.pruned` | Fast — same as Archive, **plus** raw-tx/index pruning outside the retention window. |
+| **Full recompute** | `checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block. The only mode that does. |
+
+Gating fast on `checkpoint_sync` is also a correctness precondition: the embedded handoff
+frontier is pinned to the network's **full** max checkpoint height (§5.2), which only applies
+when `checkpoint_sync = true` (with it `false`, the effective max checkpoint drops to the
+Canopy mandatory checkpoint, so there is no valid handoff to resume from). zebrad mirrors
+`consensus.checkpoint_sync` into the state config at startup
+(`state_config.checkpoint_sync`), so the state makes the decision without depending on
+`zebra-consensus`.
+
+Precedence is resolved by a pure, unit-tested `select_source_mode` (no process env, no embedded
+files in the decision — `checkpoint_sync` and the embedded-frontier presence are passed in as
+plain inputs):
+
+1. test-only `VCT_FAST` (+ `VCT_FIXTURE`) → **fixture** replay;
+2. else test-only `VCT_CAPTURE` → **capture** (legacy commit that records roots to a fixture);
+3. else `checkpoint_sync = false`, or a network with **no embedded frontier** → **legacy** (no
+   VCT state, zero overhead);
+4. else → **peer** (the default under checkpoint sync where embedded frontiers exist).
+
+`VCT_FAST`/`VCT_CAPTURE`/`VCT_REGTEST_FRONTIER` remain as test scaffolding; there is no longer a
+`VCT_LEGACY` opt-out, since `checkpoint_sync = false` is the user-facing way to force legacy.
 
 ## 5. Payload, wire, and the source seam
 
@@ -291,13 +319,24 @@ logic. For a checkpoint-verified block at `height`:
 **Persistent fast-synced databases.** A persistent fast sync marks the database with a
 `fast_sync_metadata` column family recording the handoff height (DB format minor bump to
 **27.3.0**). This is a sibling to `pruning_metadata`, not a reuse — pruning drops tx bytes and
-keeps trees, fast-sync drops the per-height trees; a DB can be both. Guards: per-height tree
-reads return `None` below the handoff (before the backward search, so no stale tree and no
-panic); `z_gettreestate` returns a typed archive-mode error below the handoff; genesis-root and
-subtree format-validity checks skip fast-synced DBs; and a one-way reopen guard refuses to open
-a fast-synced DB in archive mode. Validated on a real mainnet fork: byte-identical consensus
-state 2,000 blocks past the checkpoint, archive reopen refused, pruned reopen resumes with
-0 panics.
+keeps trees, fast-sync drops the per-height trees; a DB can be both. Because fast sync is the
+default for the Archive storage mode (§4.4), a **completed** fast-synced DB (tip at/above the
+handoff) **reopens in any storage mode** — it deletes nothing, so a reopen loses no servable
+data, and `checkpoint_sync = false` simply resumes the legacy recompute from the real tip
+frontier. Guards: per-height tree reads return `None` below the handoff (before the backward
+search, so no stale tree and no panic); `z_gettreestate` returns a typed archive-mode error
+below the handoff; genesis-root and subtree format-validity checks skip fast-synced DBs.
+
+The one reopen that *is* refused is an **interrupted** fast sync (frozen frontier, tip below
+the handoff) reopened with the fast path disabled (legacy mode — `checkpoint_sync = false`, or
+no embedded frontier). The on-disk frontier is stale and no source can supply the verified
+roots, so the fail-closed policy (§8) would refuse every below-handoff block forever. The open
+guard refuses with a clear recovery path (finish the fast sync under `checkpoint_sync = true`,
+or re-sync from genesis) instead of stalling silently. This is distinct from pruning's one-way
+guard, which exists because pruning *deletes* raw tx bytes; fast sync deletes nothing, so the
+only fast-sync reopen guard is this narrow in-progress case. Validated on a real mainnet fork:
+byte-identical consensus state 2,000 blocks past the checkpoint, a completed fast-synced DB
+reopens cleanly in archive mode, pruned reopen resumes with 0 panics.
 
 ## 8. Failure policy — fail closed on a frozen frontier
 
@@ -318,8 +357,8 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   handoff) still refuses on the first post-restart height with a missing root. The frozen
   region is exactly `tip < handoff` (the handoff height itself carries the real frontier).
 
-Outside the frozen window (legacy/capture, or VCT off), a missing root is simply the ordinary
-legacy recompute — bit-identical to today. This is the safety contract: **a bad, slow, or
+Outside the frozen window (legacy/capture, or `checkpoint_sync = false`), a missing root is
+simply the ordinary legacy recompute — bit-identical to today. This is the safety contract: **a bad, slow, or
 withholding peer degrades to legacy speed or a retryable refusal, never wrong state and never
 a permanent halt.** Because coverage is known ahead of bodies (§4.2), the common case is that
 the frozen window is never entered without its roots in hand. Counters:
@@ -431,7 +470,7 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | Counter | Meaning |
 | --- | --- |
 | `state.vct.fast.block.count` | block folded supplied roots, skipped the recompute |
-| `state.vct.legacy.block.count` | block recomputed the frontier (VCT off, or fell back outside the frozen window) |
+| `state.vct.legacy.block.count` | block recomputed the frontier (`checkpoint_sync = false`, or fell back outside the frozen window) |
 | `state.vct.prevalidated.block.count` | dedup sub-case: the previous fast block's look-ahead already validated this header |
 | `state.vct.root.rejected.count` | supplied root failed verification and was evicted for re-fetch |
 | `state.vct.root.unavailable.count` | frozen-frontier height with no valid root; commit refused (retryable) |
@@ -442,7 +481,12 @@ over the wire rather than a silent legacy sync.
 ## 14. Testing strategy
 
 - **Unit:** the `BlockCommitmentRoots` and every `TreeAuxMessage` wire round-trip + DoS-bound /
-  trailing-byte rejection; `select_source_mode` precedence; the below-NU5 Orchard pin and
+  trailing-byte rejection; `select_source_mode` precedence (`checkpoint_sync = false` ⇒ legacy
+  regardless of storage mode or embedded frontier; checkpoint sync + embedded frontier ⇒ peer;
+  the `VCT_FAST`/`VCT_CAPTURE` test overrides); a completed fast-synced DB reopens in archive
+  mode (`reopening_fast_synced_database_in_archive_mode_succeeds`) while an interrupted one
+  reopened with the fast path off is refused
+  (`reopening_interrupted_fast_sync_without_a_root_source_panics`); the below-NU5 Orchard pin and
   below-Heartwood Sapling check; the `verify_commitment_roots` lag (wrong root rejected at H+1);
   the dedup (second consecutive fast block skips its check; a stale cache entry does not cause a
   false skip); the `StateTreeAuxPort` serve mapping (passthrough; error/wrong-response → empty
@@ -472,6 +516,7 @@ over the wire rather than a silent legacy sync.
 | Source seam, `PeerSource`, producers | `zebra-state/src/service/finalized_state/commitment_aux.rs` |
 | Verify-before-commit logic | `zebra-state/src/service/finalized_state/commitment_aux_verify.rs` |
 | Fixture/embedded plumbing, `select_source_mode`, counters | `zebra-state/src/service/finalized_state/vct.rs` |
+| `checkpoint_sync` mirror field (mode input) | `zebra-state/src/config.rs`; set in `zebrad/src/commands/start.rs` |
 | Embedded Mainnet frontier | `zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin` |
 | Commit-path hook, handoff, frozen-frontier policy | `zebra-state/src/service/finalized_state.rs` |
 | `BlockRoots` serving read | `zebra-state/src/service.rs` |

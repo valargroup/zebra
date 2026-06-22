@@ -743,7 +743,8 @@ impl ZebraDb {
 
     /// Returns `true` if the database was built by the verified-commitment-trees
     /// fast path, and therefore lacks per-height note-commitment trees below the
-    /// handoff height. Like pruning, this is a one-way state.
+    /// handoff height. The missing history is surfaced at the RPC boundary (§9);
+    /// it does not prevent reopening in any storage mode.
     pub fn is_fast_synced(&self) -> bool {
         self.fast_synced_below().is_some()
     }

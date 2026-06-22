@@ -15,7 +15,7 @@ use zebra_chain::{
 use zebra_test::prelude::*;
 
 use crate::{
-    config::{Config, PruningConfig, StorageMode},
+    config::Config,
     service::{
         arbitrary::PreparedChain,
         finalized_state::{commitment_aux, CheckpointVerifiedBlock, FinalizedState},
@@ -475,14 +475,13 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             let handoff_trees = handoff_trees.expect("committed the handoff block");
 
             // A persistent database so the syncing handle can be dropped and reopened by
-            // path, modelling a node restart. Pruned storage mode is required: a fast-synced
-            // database refuses to reopen in archive mode (the per-height trees were never
-            // written), exactly as in production.
+            // path, modelling a node restart. Archive storage mode (the default): fast sync
+            // is the default under checkpoint sync, and a fast-synced database reopens fine
+            // in archive mode, exactly as in production.
             let dir = TempDir::new().expect("temp dir");
             let config = Config {
                 cache_dir: dir.path().to_path_buf(),
                 ephemeral: false,
-                storage_mode: StorageMode::Pruned(PruningConfig::default()),
                 ..Config::default()
             };
 

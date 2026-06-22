@@ -235,11 +235,14 @@ pub const PRUNING_METADATA: &str = "pruning_metadata";
 /// height at which a per-height note-commitment tree is present. Per-height trees
 /// are absent for every non-genesis height strictly below it.
 ///
-/// The presence of this entry marks the database as fast-synced, which is a
-/// one-way state: the historical per-height trees were never written, so the
-/// database cannot answer historical tree/subtree RPCs below the handoff height
-/// and cannot be reopened in archive storage mode. This is orthogonal to pruning
-/// (which drops raw transactions but keeps the trees); a database can be both.
+/// The presence of this entry marks the database as fast-synced: the historical
+/// per-height trees were never written, so the database cannot answer historical
+/// tree/subtree RPCs below the handoff height (the RPC handlers return a typed
+/// archive-mode error there, §9). Fast sync is the default under checkpoint sync
+/// for both Archive and Pruned storage modes, so a fast-synced database reopens in
+/// either; the missing-history limitation is enforced at the RPC boundary, not at
+/// reopen. This is orthogonal to pruning (which drops raw transactions but keeps
+/// the trees); a database can be both.
 pub const FAST_SYNC_METADATA: &str = "fast_sync_metadata";
 
 /// The finalized part of the chain state, stored in the db.
@@ -446,7 +449,7 @@ impl FinalizedState {
             read_only,
         );
 
-        let vct = VctState::from_config(config.enable_verified_commitment_trees, network);
+        let vct = VctState::from_config(config.checkpoint_sync, network);
 
         // Re-derive the frozen-frontier flag from durable state: a fast sync
         // interrupted before the checkpoint handoff leaves the stale frozen frontier
@@ -496,17 +499,30 @@ impl FinalizedState {
             );
         }
 
-        // A verified-commitment-trees fast-synced database is likewise a one-way
-        // state: the per-height note-commitment trees below the checkpoint handoff
-        // height were never written, so it cannot serve historical tree/subtree
-        // RPCs and cannot be served as an archive node. Refuse to open it in
-        // archive mode for the same reason as pruning.
-        if config.pruning_config().is_none() && new_state.db.is_fast_synced() {
+        // A *completed* verified-commitment-trees fast sync is NOT refused here. Fast sync is
+        // the default under checkpoint sync for both Archive and Pruned storage modes, so a
+        // fast-synced database must reopen in any storage mode (the common case after the
+        // handoff marker is written). The per-height trees below the handoff were never
+        // written, so historical tree/subtree RPCs return a typed archive-mode error below the
+        // handoff (§9) — that limitation is enforced at the RPC boundary, not by refusing to
+        // reopen. (Unlike pruning, fast sync deletes nothing: reopening loses no servable data.)
+        //
+        // But an *interrupted* fast sync — frozen frontier, tip still below the handoff — can
+        // only be safely resumed by the fast path (which supplies the verified roots). The
+        // on-disk frontier is stale, so the committer fails closed on every below-handoff
+        // height with no supplied root (§8). Turning the fast path off mid-sync with
+        // `checkpoint_sync = false` selects the legacy committer (no VCT state), which can
+        // never supply those roots, so the node would refuse every block forever. Refuse to
+        // open instead, with a clear recovery path, rather than stalling silently. (A frozen
+        // marker only exists on a network with an embedded frontier, so `checkpoint_sync` is
+        // the signal here — disabling it is the only way to lose the source mid-sync.)
+        if new_state.vct_frontier_frozen && !config.checkpoint_sync {
             panic!(
-                "this database was fast-synced (verified commitment trees) and cannot be opened \
-                 in archive storage mode; the historical note-commitment trees below the \
-                 checkpoint were never written. Configure pruned storage mode \
-                 (`storage_mode.pruned`), or delete the cache directory and re-sync from genesis"
+                "this database has a fast sync in progress (verified commitment trees) that was \
+                 interrupted below the checkpoint handoff height, but `consensus.checkpoint_sync \
+                 = false` disables the fast path that supplies the verified roots needed to \
+                 resume it. Set `consensus.checkpoint_sync = true` to finish the fast sync, or \
+                 delete the cache directory and re-sync from genesis"
             );
         }
 

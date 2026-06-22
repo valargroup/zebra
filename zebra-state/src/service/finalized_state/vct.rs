@@ -43,10 +43,10 @@ const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin"
 /// [`super::FinalizedState`] clones via `Arc` so the capture sink and counters are
 /// shared.
 ///
-/// By default this uses the peer `tree_aux` source on networks with embedded final
-/// frontiers. `Config::enable_verified_commitment_trees` / `VCT_FAST` select the
-/// local fixture source, while `VCT_CAPTURE` records fixtures and `VCT_LEGACY`
-/// opts out to legacy recompute.
+/// A checkpoint-trusting sync (`checkpoint_sync = true`) uses the peer `tree_aux` source by
+/// default on networks with embedded final frontiers; `checkpoint_sync = false` opts out to
+/// the legacy per-block recompute (no VCT state). `VCT_FAST` selects the local fixture source
+/// and `VCT_CAPTURE` records fixtures — both test-only overrides.
 #[derive(Debug)]
 pub(crate) struct VctState {
     /// Fast mode: skip the per-block frontier recompute and fold the source's roots
@@ -98,19 +98,24 @@ enum SourceMode {
 
 /// Resolve the source precedence as a pure function, so the order — and in particular the
 /// peer-source default — is unit-testable without touching process environment variables
-/// or the embedded-frontier files. Explicit fixture wins, then explicit capture, then the
-/// peer-source default (unless opted out, or the network has no embedded frontiers).
+/// or the embedded-frontier files. The test-only fixture override wins, then the test-only
+/// capture override, then the config-driven decision: the fast verified path (peer source) is
+/// the default whenever the node syncs under checkpoint trust and the network has an embedded
+/// handoff frontier. `checkpoint_sync = false` is the only mode that fully reconstructs the
+/// note-commitment trees per block, so it selects the legacy recompute; a network with no
+/// embedded frontier also falls back to legacy (there is nothing to hand off to). Storage mode
+/// (Archive vs. Pruned) is orthogonal and not an input here.
 fn select_source_mode(
-    fast_flag: bool,
+    checkpoint_sync: bool,
+    fixture: bool,
     capture: bool,
-    legacy_opt_out: bool,
     has_embedded_frontiers: bool,
 ) -> SourceMode {
-    if fast_flag {
+    if fixture {
         SourceMode::Fixture
     } else if capture {
         SourceMode::Capture
-    } else if legacy_opt_out || !has_embedded_frontiers {
+    } else if !checkpoint_sync || !has_embedded_frontiers {
         SourceMode::Legacy
     } else {
         SourceMode::Peer
@@ -118,15 +123,17 @@ fn select_source_mode(
 }
 
 impl VctState {
-    /// Build the POC state from the config flag and the `VCT_FIXTURE` / `VCT_CAPTURE` /
-    /// `VCT_LEGACY` environment variables. On networks with an embedded handoff frontier
-    /// (Mainnet) the default is the peer (`tree_aux`) source; `VCT_LEGACY` (or a network
-    /// without an embedded frontier) returns `None` for a zero-overhead legacy committer.
+    /// Build the committer state from `checkpoint_sync` (the mirror of
+    /// `consensus.checkpoint_sync`) plus the test-only `VCT_FAST` / `VCT_FIXTURE` /
+    /// `VCT_CAPTURE` environment overrides. On networks with an embedded handoff frontier
+    /// (Mainnet) a checkpoint-trusting sync defaults to the peer (`tree_aux`) fast source;
+    /// `checkpoint_sync = false` (or a network without an embedded frontier) returns `None`
+    /// for a zero-overhead legacy committer that recomputes the trees per block.
     #[allow(clippy::unwrap_in_result)] // misconfiguration / unreadable fixture should fail loudly
-    pub(super) fn from_config(fast_flag: bool, network: &Network) -> Option<Arc<Self>> {
-        // The config flag is `serde(skip)`, so for the POC harness also honor an
-        // env override to enable fast mode without TOML/zebrad plumbing.
-        let fast_flag = fast_flag || std::env::var_os("VCT_FAST").is_some();
+    pub(super) fn from_config(checkpoint_sync: bool, network: &Network) -> Option<Arc<Self>> {
+        // Test-only override: replay a local fixture instead of fetching roots from peers,
+        // without standing up the network driver.
+        let fixture = std::env::var_os("VCT_FAST").is_some();
 
         let capture = std::env::var_os("VCT_CAPTURE").map(|path| {
             let file = OpenOptions::new()
@@ -137,7 +144,6 @@ impl VctState {
             Mutex::new(std::io::BufWriter::new(file))
         });
 
-        let legacy_opt_out = std::env::var_os("VCT_LEGACY").is_some();
         // Frontier-capture (harness fixture generation): needs the legacy recompute to
         // have the real tip treestate, so it implies capture mode like `VCT_CAPTURE`.
         let capture_frontier = capture_frontier_from_env();
@@ -147,16 +153,16 @@ impl VctState {
         let embedded = embedded_final_frontiers(network);
 
         match select_source_mode(
-            fast_flag,
+            checkpoint_sync,
+            fixture,
             capture.is_some() || capture_frontier.is_some(),
-            legacy_opt_out,
             embedded.is_some(),
         ) {
             // Fixture fast mode (explicit): replay per-block roots recorded in a local
             // fixture (`VCT_FAST` + `VCT_FIXTURE`) instead of fetching from peers.
             SourceMode::Fixture => {
                 let path = std::env::var_os("VCT_FIXTURE")
-                    .expect("enable_verified_commitment_trees requires VCT_FIXTURE");
+                    .expect("VCT_FAST fixture override requires VCT_FIXTURE");
                 let mut bytes = Vec::new();
                 File::open(&path)
                     .expect("VCT_FIXTURE must exist")
@@ -233,8 +239,8 @@ impl VctState {
                 }))
             }
 
-            // Legacy committer: `VCT_LEGACY` opt-out, or a network with no embedded
-            // frontiers. No VCT state, zero overhead.
+            // Legacy committer: `checkpoint_sync = false` (full per-block recompute), or a
+            // network with no embedded frontiers. No VCT state, zero overhead.
             SourceMode::Legacy => None,
         }
     }
@@ -472,20 +478,25 @@ mod tests {
     #[test]
     fn source_mode_precedence() {
         use SourceMode::*;
+        // Args are (checkpoint_sync, fixture, capture, has_embedded_frontiers).
 
-        // The flipped default: peer source wherever embedded frontiers exist (Mainnet).
-        assert_eq!(select_source_mode(false, false, false, true), Peer);
-        // No embedded frontiers (e.g. Testnet): legacy, never peer.
+        // The default: a checkpoint-trusting sync uses the peer source wherever embedded
+        // frontiers exist (Mainnet). Storage mode (Archive/Pruned) is not an input, so this
+        // covers both Archive and Pruned.
+        assert_eq!(select_source_mode(true, false, false, true), Peer);
+        // `checkpoint_sync = false` is the only mode that fully recomputes the trees: legacy,
+        // never peer, regardless of embedded frontiers.
+        assert_eq!(select_source_mode(false, false, false, true), Legacy);
         assert_eq!(select_source_mode(false, false, false, false), Legacy);
-        // `VCT_LEGACY` opt-out forces legacy even where the peer default would apply.
-        assert_eq!(select_source_mode(false, false, true, true), Legacy);
-        // Capture overrides the peer default (recording needs the legacy recompute).
-        assert_eq!(select_source_mode(false, true, false, true), Capture);
-        // Fixture fast mode takes precedence over capture and the peer default…
-        assert_eq!(select_source_mode(true, false, false, true), Fixture);
+        // No embedded frontiers (e.g. Testnet): legacy, never peer, even under checkpoint sync.
+        assert_eq!(select_source_mode(true, false, false, false), Legacy);
+        // Capture (test override) wins over the peer default (recording needs the recompute).
+        assert_eq!(select_source_mode(true, false, true, true), Capture);
+        // Fixture (test override) takes precedence over capture and the peer default…
         assert_eq!(select_source_mode(true, true, false, true), Fixture);
-        // …and over the legacy opt-out, since it is an explicit request.
-        assert_eq!(select_source_mode(true, false, true, true), Fixture);
+        assert_eq!(select_source_mode(true, true, true, true), Fixture);
+        // …and applies even when checkpoint_sync is off, since it is an explicit request.
+        assert_eq!(select_source_mode(false, true, false, true), Fixture);
     }
 
     #[test]

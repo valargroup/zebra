@@ -1129,8 +1129,7 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 }
 
 #[test]
-#[should_panic(expected = "fast-synced")]
-fn reopening_fast_synced_database_in_archive_mode_panics() {
+fn reopening_fast_synced_database_in_archive_mode_succeeds() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
 
@@ -1150,9 +1149,51 @@ fn reopening_fast_synced_database_in_archive_mode_panics() {
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
-    // Reopening in archive mode (the default) must refuse, because the per-height
-    // note-commitment trees below the handoff height were never written, so the
-    // database can't serve historical tree RPCs.
+    // Fast sync is the default under checkpoint sync for Archive mode, so reopening a
+    // fast-synced database in archive mode (the default) must succeed. Fast sync deletes
+    // nothing; the missing historical trees are surfaced at the RPC boundary, not by
+    // refusing to reopen.
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.fast_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the archive-mode reopen"
+    );
+}
+
+#[test]
+#[should_panic(expected = "interrupted below the checkpoint handoff")]
+fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // `checkpoint_sync = false` selects the legacy committer (no VCT state), so nothing can
+    // supply the verified roots an interrupted fast sync needs to resume.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: false,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_fast_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Reopening with the fast path disabled must refuse: the on-disk frontier is stale and no
+    // root source exists, so the committer would otherwise stall on every below-handoff block.
     let _state = FinalizedState::new(
         &config,
         &network,
