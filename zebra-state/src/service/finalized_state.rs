@@ -306,6 +306,26 @@ pub struct FinalizedState {
     /// Guarded by hash identity (and height monotonicity), so a stale or cloned
     /// value can never cause an incorrect skip.
     vct_prevalidated_next: Option<(block::Height, block::Hash)>,
+
+    /// `true` while a verified-commitment-trees fast sync has frozen the
+    /// note-commitment frontier — i.e. a fast block has committed but the
+    /// checkpoint handoff (which replaces the frontier with the real one) has not.
+    ///
+    /// While frozen, the running frontier is no longer the real frontier for the
+    /// heights being committed, so a legacy recompute would fold a wrong root into
+    /// the history MMR and corrupt consensus state. The committer therefore refuses
+    /// to recompute for a height with no valid supplied root in this window,
+    /// returning a retryable error instead (see `commit_finalized_direct`). Reset to
+    /// `false` at the handoff, after which legacy recompute resumes from the real
+    /// frontier.
+    ///
+    /// Seeded from durable state on open (not just within a session): a fast sync
+    /// interrupted by a restart leaves the frozen frontier persisted but the tip
+    /// below the handoff, so [`FinalizedState::new`] re-derives this flag from the
+    /// fast-sync marker. Without that, the first post-restart height with no supplied
+    /// root would legacy-recompute against the stale on-disk frontier and corrupt the
+    /// MMR — the exact hazard this flag exists to prevent.
+    vct_frontier_frozen: bool,
 }
 
 impl FinalizedState {
@@ -428,6 +448,19 @@ impl FinalizedState {
 
         let vct = VctState::from_config(config.enable_verified_commitment_trees, network);
 
+        // Re-derive the frozen-frontier flag from durable state: a fast sync
+        // interrupted before the checkpoint handoff leaves the stale frozen frontier
+        // on disk (fast commits never write per-height trees) with the tip still below
+        // the handoff. Reopening in that window must keep the committer frozen so a
+        // height with no supplied root refuses instead of legacy-recomputing against
+        // the stale frontier. The handoff height itself carries the real frontier, so
+        // `tip < handoff` (exclusive) is exactly the frozen region. Read from the
+        // fast-sync marker, not `vct`, so it holds even if VCT is disabled this run.
+        let vct_frontier_frozen = db
+            .fast_synced_below()
+            .zip(db.finalized_tip_height())
+            .is_some_and(|(handoff, tip)| tip < handoff);
+
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
@@ -438,6 +471,7 @@ impl FinalizedState {
             elastic_blocks: vec![],
             vct,
             vct_prevalidated_next: None,
+            vct_frontier_frozen,
         };
 
         #[cfg(not(feature = "elasticsearch"))]
@@ -448,6 +482,7 @@ impl FinalizedState {
             db,
             vct,
             vct_prevalidated_next: None,
+            vct_frontier_frozen,
         };
 
         // Pruning is a one-way storage mode. Refuse to open a database that has
@@ -788,7 +823,8 @@ impl FinalizedState {
                             &network,
                             &block,
                             &sapling_root,
-                        )?;
+                        )
+                        .map_err(|error| self.vct_reject_supplied_root(height, error))?;
                     }
 
                     // Below NU5 no header commits to an Orchard root (V1 history
@@ -802,7 +838,8 @@ impl FinalizedState {
                         &network,
                         height,
                         &orchard_root,
-                    )?;
+                    )
+                    .map_err(|error| self.vct_reject_supplied_root(height, error))?;
 
                     // Build the candidate history tree with this block's fixture
                     // roots folded in.
@@ -810,7 +847,8 @@ impl FinalizedState {
                     Arc::make_mut(&mut candidate)
                         .push(&network, block.clone(), &sapling_root, &orchard_root)
                         .map_err(Arc::new)
-                        .map_err(ValidateContextError::from)?;
+                        .map_err(ValidateContextError::from)
+                        .map_err(|error| self.vct_reject_supplied_root(height, error))?;
 
                     // Verify-before-commit: this block's roots are only committed by
                     // the *next* block's header (the one-block lag). When a successor
@@ -829,14 +867,19 @@ impl FinalizedState {
                     // or a non-fast/legacy block below).
                     self.vct_prevalidated_next = None;
                     if let Some((next_block, next_auth)) = &next_checkpoint {
-                        COMMIT_COMPUTE_POOL.install(|| {
-                            check::block_commitment_is_valid_for_chain_history(
-                                next_block.clone(),
-                                &network,
-                                &candidate,
-                                *next_auth,
-                            )
-                        })?;
+                        // A failure here means *this* block's supplied root made the
+                        // candidate tree inconsistent with the successor's header, so it
+                        // is this height's root that is rejected and evicted.
+                        COMMIT_COMPUTE_POOL
+                            .install(|| {
+                                check::block_commitment_is_valid_for_chain_history(
+                                    next_block.clone(),
+                                    &network,
+                                    &candidate,
+                                    *next_auth,
+                                )
+                            })
+                            .map_err(|error| self.vct_reject_supplied_root(height, error))?;
                         self.vct_prevalidated_next = Some((
                             (height + 1).expect("checkpoint block heights are valid"),
                             next_block.hash(),
@@ -895,9 +938,34 @@ impl FinalizedState {
                             orchard: orchard_frontier,
                             orchard_subtree: None,
                         };
+
+                        // The handoff writes the real final frontier as the tip
+                        // treestate, so the frontier is no longer frozen: heights at and
+                        // above the handoff resume legacy recompute from a correct frontier.
+                        self.vct_frontier_frozen = false;
                     } else {
                         fast_anchor_roots = Some((sapling_root, orchard_root));
+
+                        // A non-handoff fast block leaves the note-commitment frontier
+                        // frozen (it folds roots instead of advancing the trees), so a
+                        // later height with no valid supplied root must not legacy-recompute
+                        // against this stale frontier (see the `else` branch below).
+                        self.vct_frontier_frozen = true;
                     }
+                } else if self.vct_frontier_frozen {
+                    // Frozen-frontier safety: a fast sync has already frozen the
+                    // note-commitment frontier, but this height has no valid supplied root
+                    // (never fetched, or evicted after failing verification). Recomputing
+                    // here would fold a wrong root into the history MMR and corrupt state,
+                    // so refuse with a retryable error and leave the database untouched —
+                    // the block is committed once a verifiable root is fetched from a peer.
+                    metrics::counter!("state.vct.root.unavailable.count").increment(1);
+                    tracing::warn!(
+                        ?height,
+                        "VCT: no verifiable supplied root for a frozen-frontier height; \
+                         refusing to recompute (retryable)"
+                    );
+                    return Err(ValidateContextError::VctSuppliedRootUnavailable { height }.into());
                 } else {
                     // Not a fast block: any cached pre-validation does not apply to
                     // the next fast block (its parent frontier differs), so clear it.
@@ -1115,6 +1183,32 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
+    }
+
+    /// Reject a supplied fast-path root that failed verification for `height`.
+    ///
+    /// Evicts the bad root from the source so a re-fetch can replace it with a verifiable
+    /// one from a different peer, and returns a typed, retryable error. In fast mode the
+    /// note-commitment frontier is frozen, so the committer cannot recompute the root
+    /// locally (that would fold a wrong root into the history MMR); it must refuse and
+    /// leave the database untouched rather than persist or corrupt state. This is what
+    /// keeps a single malicious peer from halting the sync: the bad root is dropped, not
+    /// retried forever, and any honest peer's root verifies.
+    fn vct_reject_supplied_root(
+        &self,
+        height: block::Height,
+        error: ValidateContextError,
+    ) -> CommitCheckpointVerifiedError {
+        if let Some(v) = &self.vct {
+            v.invalidate_fast_root(height);
+        }
+        metrics::counter!("state.vct.root.rejected.count").increment(1);
+        tracing::warn!(
+            ?height,
+            ?error,
+            "VCT: supplied commitment root failed verification; evicted for re-fetch"
+        );
+        ValidateContextError::VctSuppliedRootUnavailable { height }.into()
     }
 
     /// Test-only: enable verified-commitment-trees fast mode with an in-memory
