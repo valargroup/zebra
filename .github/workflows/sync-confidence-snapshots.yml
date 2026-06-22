@@ -14,8 +14,34 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  build:
+    name: Build CI Docker
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/zfnd-build-docker-image.yml
+    with:
+      dockerfile_path: ./docker/Dockerfile
+      dockerfile_target: tests
+      image_name: ${{ vars.CI_IMAGE_NAME }}
+      no_cache: false
+      rust_backtrace: full
+      rust_lib_backtrace: full
+      rust_log: info
+      features: ${{ format('{0} {1}', vars.RUST_PROD_FEATURES, vars.RUST_TEST_FEATURES) }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
   generate-pre-nu62:
+    needs: [build]
     name: Generate pre-NU6.2 snapshot (height 3,358,006)
     permissions:
       contents: read
@@ -36,6 +62,7 @@ jobs:
       height_grep_text: 'current_height.*=.*Height.*\('
 
   generate-post-nu62:
+    needs: [build]
     name: Generate post-NU6.2 snapshot (height 3,400,000)
     permissions:
       contents: read
