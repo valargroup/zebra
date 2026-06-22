@@ -60,9 +60,10 @@ use crate::{
         ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
         CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
-        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, MAX_TA_MESSAGE_BYTES, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_STREAM_TREE_AUX,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -3367,6 +3368,10 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
+/// Maximum response frames a generic (non-legacy) request/response stream may return.
+/// `tree_aux` answers with a single frame; a small bound guards against a runaway peer.
+const MAX_GENERIC_RESPONSE_FRAMES: usize = 4;
+
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
@@ -3376,7 +3381,16 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    // The legacy request stream validates responses with a legacy-message-specific
+    // budget. Generic request/response streams (e.g. `tree_aux`) read response frames
+    // bounded only by the stream's frame cap and a small response-frame count.
+    let mut legacy_state = if stream_kind == ZAKURA_STREAM_TREE_AUX {
+        None
+    } else {
+        Some(LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(message_type, &payload, limits)?,
+        ))
+    };
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -3413,7 +3427,7 @@ async fn write_outbound_request_frame_inner(
     let _ = send.finish();
 
     let mut frames = Vec::new();
-    let mut state = LegacyResponseReadState::new(budget);
+    let mut generic_frame_count = 0usize;
     loop {
         match read_frame(
             &mut recv,
@@ -3427,11 +3441,22 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                state.validate_frame(request_id, &frame)?;
+                if let Some(state) = legacy_state.as_mut() {
+                    state.validate_frame(request_id, &frame)?;
+                } else {
+                    generic_frame_count += 1;
+                    if generic_frame_count > MAX_GENERIC_RESPONSE_FRAMES {
+                        return Err(OutboundRequestError::Fatal(
+                            "generic request/response exceeded the response frame limit".into(),
+                        ));
+                    }
+                }
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                state.finish()?;
+                if let Some(state) = legacy_state.take() {
+                    state.finish()?;
+                }
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
@@ -4028,6 +4053,12 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
             limits.max_frame_bytes.min(header_sync_cap)
         }
         ZAKURA_STREAM_BLOCK_SYNC => limits.max_frame_bytes.min(MAX_BS_FRAME_BYTES),
+        ZAKURA_STREAM_TREE_AUX => {
+            let tree_aux_cap =
+                u32::try_from(MAX_TA_MESSAGE_BYTES.saturating_add(FRAME_HEADER_BYTES))
+                    .expect("tree-aux frame cap fits in u32");
+            limits.max_frame_bytes.min(tree_aux_cap)
+        }
         _ => limits.max_frame_bytes.min(LOCAL_MAX_CONTROL_FRAME_BYTES),
     }
     .max(1)
