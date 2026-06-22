@@ -1,0 +1,54 @@
+name: Sync confidence
+
+# Semantically verifies two fixed windows of real mainnet blocks that bracket the
+# NU6.2 soft fork, to catch consensus/verification regressions that would break
+# our ability to sync. Each window restores a fresh disk from an immutable
+# per-window snapshot image, syncs ~5k blocks with full validation, and asserts it
+# reaches the configured stop height with a contextually-verified commit.
+#
+# Snapshot images are built rarely by `sync-confidence-snapshots.yml`.
+
+on:
+  push:
+    branches:
+      - ironwood-main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  pre-nu62:
+    name: Sync range pre-NU6.2 (full validation)
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    secrets:
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+    with:
+      app_name: zebrad
+      test_id: sync-range-pre-nu62
+      test_description: Full-validation sync of ~5k mainnet blocks below NU6.2
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=sync-range-pre-nu62,TEST_SYNC_RANGE=1"
+      network: Mainnet
+      needs_zebra_state: true
+      saves_to_disk: false
+      disk_suffix: synctest-pre-nu62
+
+  post-nu62:
+    name: Sync range post-NU6.2 (full validation)
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    secrets:
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+    with:
+      app_name: zebrad
+      test_id: sync-range-post-nu62
+      test_description: Full-validation sync of ~5k mainnet blocks above NU6.2
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=sync-range-post-nu62,TEST_SYNC_RANGE=1"
+      network: Mainnet
+      needs_zebra_state: true
+      saves_to_disk: false
+      disk_suffix: synctest-post-nu62
