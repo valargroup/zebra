@@ -168,6 +168,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -285,6 +286,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -408,6 +410,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -514,6 +517,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -604,6 +608,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
