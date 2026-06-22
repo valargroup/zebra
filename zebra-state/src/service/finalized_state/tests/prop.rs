@@ -2,6 +2,8 @@
 
 use std::env;
 
+use tempfile::TempDir;
+
 use zebra_chain::{
     block::Height,
     parameters::{
@@ -13,7 +15,7 @@ use zebra_chain::{
 use zebra_test::prelude::*;
 
 use crate::{
-    config::Config,
+    config::{Config, PruningConfig, StorageMode},
     service::{
         arbitrary::PreparedChain,
         finalized_state::{commitment_aux, CheckpointVerifiedBlock, FinalizedState},
@@ -290,6 +292,268 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                 }
             }
             prop_assert_eq!(orchard_error_height, Some(bad_orchard_height), "a wrong below-NU5 orchard root is rejected at its own commit");
+    });
+
+    Ok(())
+}
+
+/// A verified-commitment-trees fast sync must never legacy-recompute a height whose
+/// supplied root is missing once the note-commitment frontier is frozen: the running
+/// frontier is no longer the real one, so recomputing would fold a wrong root into the
+/// history MMR and silently corrupt consensus state (a peer that omits a height — see the
+/// driver's gap handling — could trigger this). Instead the committer must refuse with the
+/// retryable `VctSuppliedRootUnavailable` error and leave the database untouched, so the
+/// block can be committed later from a fetched root. This guards the liveness/no-corruption
+/// half of the peer-source fast path (the bad-root rejection half is covered by
+/// `vct_fast_path_matches_legacy_and_rejects_wrong_roots`).
+#[test]
+#[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and the fixture by height
+fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+
+            // Record the per-block roots for the fast range as the fixture.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct hole legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+            }
+
+            // Punch a hole: drop a post-NU5 height's root from the fixture, simulating a
+            // peer that omitted it (or a root evicted after failing verification). Earlier
+            // fast blocks freeze the frontier, so this height has no real frontier to
+            // recompute against.
+            let hole = (nu5 + 1) as usize;
+            prop_assert!(hole > seed && hole < last, "the hole must be inside the fast range");
+            fixture.remove(&(hole as u32));
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_fixture(fixture);
+
+            let mut error_height = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                match fast.commit_finalized_direct(cv.into(), None, None, next, "vct hole fast") {
+                    Ok(_) => {}
+                    Err(error) => {
+                        // The refusal is the typed, retryable error — not a generic
+                        // invalid-block error and not silent corruption.
+                        prop_assert!(
+                            format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                            "a frozen-frontier hole returns the retryable VctSuppliedRootUnavailable error, got: {error:?}"
+                        );
+                        error_height = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            prop_assert_eq!(error_height, Some(hole), "the commit refuses at the hole height, not before or after");
+            // Nothing at or past the hole was persisted: the tip is the last block before
+            // the hole, so no corrupt MMR leaf was written.
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((hole - 1) as u32)),
+                "the database tip stays just below the hole — the refused block left state untouched"
+            );
+    });
+
+    Ok(())
+}
+
+/// The frozen-frontier guard must survive a restart. A fast sync interrupted before the
+/// checkpoint handoff leaves the stale frozen frontier persisted (fast commits never write
+/// per-height trees) with the tip still below the handoff, but the in-memory `frozen` flag
+/// is rebuilt from scratch on open. If it came back `false`, the first post-restart height
+/// with no supplied root would legacy-recompute against the stale on-disk frontier and
+/// corrupt the history MMR — the exact hazard the in-session guard prevents
+/// (`vct_frozen_frontier_hole_refuses_instead_of_recomputing`). So `FinalizedState::new`
+/// re-derives the flag from the durable fast-sync marker. This reopens the database between
+/// freezing and the hole, and asserts that the very first commit of the new session (no
+/// prior fast block to re-arm the flag in-session) still refuses with the retryable
+/// `VctSuppliedRootUnavailable`, leaves state untouched, and commits once the root arrives.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and the fixture by height
+fn vct_frozen_frontier_survives_reopen() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let handoff_height = nu5 + 3;
+            let last = handoff_height as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+
+            // Stop the fast sync two blocks below the handoff, so the tip is inside the
+            // frozen region and there is room for the hole at `stop + 1` (still below the
+            // handoff, where the real frontier would have been written).
+            let stop = (handoff_height - 2) as usize;
+            let hole = stop + 1;
+            prop_assert!(seed < stop && hole < last, "the hole must sit inside the frozen fast range");
+
+            // Legacy golden pass over [0, last]: the per-block fixture for the fast range
+            // and the real final frontiers at the handoff (needed to configure fast mode).
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            let mut handoff_trees = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct reopen legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+                if i == last {
+                    handoff_trees = Some(trees);
+                }
+            }
+            let handoff_trees = handoff_trees.expect("committed the handoff block");
+
+            // A persistent database so the syncing handle can be dropped and reopened by
+            // path, modelling a node restart. Pruned storage mode is required: a fast-synced
+            // database refuses to reopen in archive mode (the per-height trees were never
+            // written), exactly as in production.
+            let dir = TempDir::new().expect("temp dir");
+            let config = Config {
+                cache_dir: dir.path().to_path_buf(),
+                ephemeral: false,
+                storage_mode: StorageMode::Pruned(PruningConfig::default()),
+                ..Config::default()
+            };
+
+            // Session 1: a genesis-start fast sync interrupted at `stop`, two blocks below
+            // the handoff. The fast commits write the fast-sync marker but no per-height
+            // trees, so the on-disk frontier is frozen and the tip is below the handoff.
+            {
+                let mut fast = FinalizedState::new(&config, &network, #[cfg(feature = "elasticsearch")] false);
+                fast.enable_vct_fast_fixture_with_handoff(
+                    fixture.clone(),
+                    Height(handoff_height),
+                    handoff_trees.sapling.clone(),
+                    handoff_trees.orchard.clone(),
+                    handoff_trees.sprout.clone(),
+                );
+                for i in 0..=stop {
+                    let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                    let next = (i < stop).then(|| (blocks[i + 1].block.clone(), None));
+                    fast.commit_finalized_direct(cv.into(), None, None, next, "vct reopen fast")
+                        .expect("verified fast commit succeeds");
+                }
+                prop_assert_eq!(fast.vct_fast_synced_below(), Some(Height(handoff_height)), "the interrupted sync left the fast-sync marker");
+                prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height(stop as u32)), "the tip is parked below the handoff");
+                // Drop releases the database lock for the reopen below.
+            }
+
+            // Session 2 (restart): reopen the same database, then punch a hole at the next
+            // height (a peer that omitted it, or a root evicted after failing verification).
+            let mut reopened = FinalizedState::new(&config, &network, #[cfg(feature = "elasticsearch")] false);
+            prop_assert_eq!(reopened.vct_fast_synced_below(), Some(Height(handoff_height)), "the marker is still durable after reopen");
+
+            let mut holed = fixture.clone();
+            holed.remove(&(hole as u32));
+            reopened.enable_vct_fast_fixture_with_handoff(
+                holed,
+                Height(handoff_height),
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+            );
+
+            // The very first commit of the new session is the hole. No fast block has run
+            // since the reopen, so the only thing that can arm the guard is the flag seeded
+            // from the durable marker. Before the fix it came back `false` and this would
+            // legacy-recompute against the stale frontier; now it refuses.
+            let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
+            let next = Some((blocks[hole + 1].block.clone(), None));
+            let error = reopened
+                .commit_finalized_direct(cv.into(), None, None, next, "vct reopen hole")
+                .expect_err("a frozen-frontier hole must refuse after reopen, not recompute");
+            prop_assert!(
+                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                "the reopened committer returns the retryable VctSuppliedRootUnavailable, got: {error:?}"
+            );
+            prop_assert_eq!(reopened.db.finalized_tip_height(), Some(Height(stop as u32)), "the refused block left the reopened state untouched");
+
+            // Retryable: once a verifiable root for the hole is supplied, the same height
+            // commits and the tip advances — the refusal was a stall, not a permanent wedge.
+            reopened.enable_vct_fast_fixture_with_handoff(
+                fixture.clone(),
+                Height(handoff_height),
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+            );
+            let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
+            let next = Some((blocks[hole + 1].block.clone(), None));
+            reopened
+                .commit_finalized_direct(cv.into(), None, None, next, "vct reopen refill")
+                .expect("the height commits once its root is fetched");
+            prop_assert_eq!(reopened.db.finalized_tip_height(), Some(Height(hole as u32)), "the tip advances past the former hole once the root arrives");
     });
 
     Ok(())

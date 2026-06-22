@@ -125,6 +125,15 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
 
     /// The verified final frontiers at the handoff height, if supplied.
     fn final_frontiers(&self) -> Option<&FinalFrontiers>;
+
+    /// Discard the supplied root for `height` so a later [`fast_root`](Self::fast_root)
+    /// returns `None` for it.
+    ///
+    /// Called by the committer when a supplied root fails verification: dropping the bad
+    /// root un-poisons the cache so a re-fetch from a different peer can replace it, rather
+    /// than the committer re-reading the same rejected root forever. The default is a no-op
+    /// (a local fixture is trusted and not re-fetched); only the peer source overrides it.
+    fn invalidate(&self, _height: block::Height) {}
 }
 
 /// The shared in-memory representation behind the concrete sources: a height→roots
@@ -307,6 +316,14 @@ impl CommitmentRootSource for PeerSource {
     fn final_frontiers(&self) -> Option<&FinalFrontiers> {
         self.frontiers.as_ref()
     }
+    fn invalidate(&self, height: block::Height) {
+        // Drop the rejected root so the next read misses and the driver can re-fetch a
+        // (verifiable) replacement for this height from another peer.
+        self.roots
+            .write()
+            .expect("peer source roots lock poisoned")
+            .remove(&height.0);
+    }
 }
 
 /// Produce the per-block roots payload for `range` from `db`'s per-height trees.
@@ -429,6 +446,32 @@ mod tests {
             source.handoff_height(),
             Some(block::Height(11)),
             "handoff height comes from the supplied frontiers"
+        );
+    }
+
+    /// `invalidate` drops a peer-supplied root so a later read misses it, letting the
+    /// driver re-fetch a verifiable replacement from another peer. This un-poisons the
+    /// cache after a bad root is rejected by the committer, so one malicious peer cannot
+    /// wedge the same rejected root in place forever.
+    #[test]
+    fn peer_source_invalidate_evicts_a_root() {
+        let (source, writer) = PeerSource::new(None);
+        writer.insert_roots([BlockCommitmentRoots {
+            height: block::Height(42),
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }]);
+
+        assert!(
+            source.fast_root(block::Height(42)).is_some(),
+            "the inserted root is present before eviction"
+        );
+
+        source.invalidate(block::Height(42));
+
+        assert!(
+            source.fast_root(block::Height(42)).is_none(),
+            "an evicted root is gone, so the next read misses and a re-fetch can replace it"
         );
     }
 }

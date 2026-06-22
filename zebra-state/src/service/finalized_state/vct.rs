@@ -256,6 +256,13 @@ impl VctState {
         self.source.fast_root(height)
     }
 
+    /// Discard the supplied root for `height` after it failed verification, so a re-fetch
+    /// can replace it (no-op for a trusted local fixture). See
+    /// [`CommitmentRootSource::invalidate`](super::commitment_aux::CommitmentRootSource::invalidate).
+    pub(super) fn invalidate_fast_root(&self, height: block::Height) {
+        self.source.invalidate(height);
+    }
+
     /// The checkpoint handoff height: the boundary below which the fast path skips
     /// per-height note-commitment trees. `None` unless final frontiers are loaded.
     pub(super) fn fast_sync_handoff_height(&self) -> Option<block::Height> {
