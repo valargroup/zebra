@@ -63,9 +63,24 @@ impl BlockSyncPeerSession {
         self.cancel_token.clone()
     }
 
+    /// Current free slots in this peer's bounded outbound stream queue.
+    pub fn outbound_capacity(&self) -> usize {
+        self.send.capacity()
+    }
+
+    /// Total slots in this peer's bounded outbound stream queue.
+    pub fn outbound_max_capacity(&self) -> usize {
+        self.send.max_capacity()
+    }
+
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
         self.try_send_message(BlockSyncMessage::Status(status))
+    }
+
+    /// Send a typed status advertisement, waiting for transport queue capacity.
+    pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
+        self.send_message(BlockSyncMessage::Status(status)).await
     }
 
     /// Send a typed block range request.
