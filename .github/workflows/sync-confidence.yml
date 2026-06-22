@@ -1,12 +1,10 @@
 name: Sync confidence
 
-# Semantically verifies two fixed windows of real mainnet blocks that bracket the
-# NU6.2 soft fork, to catch consensus/verification regressions that would break
-# our ability to sync. Each window restores a fresh disk from an immutable
-# per-window snapshot image, syncs ~5k blocks with full validation, and asserts it
-# reaches the configured stop height with a contextually-verified commit.
-#
-# Snapshot images are built rarely by `sync-confidence-snapshots.yml`.
+# Full-validation sync of two fixed mainnet windows bracketing the NU6.2 soft
+# fork, to catch consensus regressions that would break sync. Builds the test
+# image once (GHCR), then runs each window on an ephemeral DigitalOcean droplet
+# that restores cached state from Spaces. Snapshots are built by
+# sync-confidence-snapshots.yml. See docs/sync-confidence-do-setup.md.
 
 on:
   push:
@@ -22,60 +20,72 @@ concurrency:
 
 jobs:
   build:
-    name: Build CI Docker
+    name: Build test image (GHCR)
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
-      pull-requests: write
-      statuses: write
-    uses: ./.github/workflows/zfnd-build-docker-image.yml
-    with:
-      dockerfile_path: ./docker/Dockerfile
-      dockerfile_target: tests
-      image_name: ${{ vars.CI_IMAGE_NAME }}
-      no_cache: false
-      rust_backtrace: full
-      rust_lib_backtrace: full
-      rust_log: info
-      features: ${{ format('{0} {1}', vars.RUST_PROD_FEATURES, vars.RUST_TEST_FEATURES) }}
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      packages: write
+    outputs:
+      image_ref: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
+        with:
+          images: ghcr.io/${{ github.repository }}-tests
+          tags: type=sha,prefix=sha-,format=short
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: tests
+          platforms: linux/amd64
+          build-args: FEATURES=default-release-binaries
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   pre-nu62:
-    needs: [build]
-    name: Sync range pre-NU6.2 (full validation)
+    needs: build
     permissions:
       contents: read
-      id-token: write
-    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    uses: ./.github/workflows/do-sync-test.yml
     secrets:
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
+      SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
     with:
-      app_name: zebrad
-      test_id: sync-range-pre-nu62
-      test_description: Full-validation sync of ~5k mainnet blocks below NU6.2
-      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=sync-range-pre-nu62,TEST_SYNC_RANGE=1"
-      network: Mainnet
-      needs_zebra_state: true
-      saves_to_disk: false
-      disk_suffix: synctest-pre-nu62
+      mode: consume
+      state_key: pre-nu62
+      nextest_profile: sync-range-pre-nu62
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      image_ref: ${{ needs.build.outputs.image_ref }}
+      droplet_size: s-8vcpu-16gb
 
   post-nu62:
-    needs: [build]
-    name: Sync range post-NU6.2 (full validation)
+    needs: build
     permissions:
       contents: read
-      id-token: write
-    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    uses: ./.github/workflows/do-sync-test.yml
     secrets:
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
+      SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
     with:
-      app_name: zebrad
-      test_id: sync-range-post-nu62
-      test_description: Full-validation sync of ~5k mainnet blocks above NU6.2
-      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=sync-range-post-nu62,TEST_SYNC_RANGE=1"
-      network: Mainnet
-      needs_zebra_state: true
-      saves_to_disk: false
-      disk_suffix: synctest-post-nu62
+      mode: consume
+      state_key: post-nu62
+      nextest_profile: sync-range-post-nu62
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      image_ref: ${{ needs.build.outputs.image_ref }}
+      droplet_size: s-8vcpu-16gb
