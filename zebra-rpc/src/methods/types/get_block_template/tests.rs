@@ -5,7 +5,7 @@ use std::iter;
 use zebra_chain::amount::Amount;
 
 use strum::IntoEnumIterator;
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, UnifiedAddress};
 
 use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -93,4 +93,52 @@ fn coinbase() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn coinbase_builds_for_orchard_only_unified_address_after_nu6_3() {
+    let net = nu6_3_testnet();
+    let nu6_3_height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+
+    let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
+
+    TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
+        .expect("Orchard-only unified addresses build Ironwood coinbase rewards after NU6.3");
+}
+
+fn nu6_3_testnet() -> Network {
+    testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(5),
+            nu5: Some(6),
+            nu6: Some(7),
+            nu6_1: Some(8),
+            nu6_3: Some(9),
+            ..Default::default()
+        })
+        .expect("configured activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured network is valid")
+}
+
+fn orchard_only_unified_address() -> UnifiedAddress {
+    let orchard_spending_key = Option::<orchard::keys::SpendingKey>::from(
+        orchard::keys::SpendingKey::from_bytes([0u8; 32]),
+    )
+    .expect("test Orchard spending key is valid");
+    let orchard_full_viewing_key = orchard::keys::FullViewingKey::from(&orchard_spending_key);
+    let orchard_address = orchard_full_viewing_key.address_at(
+        orchard::keys::DiversifierIndex::from([0u8; 11]),
+        orchard::keys::Scope::External,
+    );
+
+    UnifiedAddress::from_receivers(Some(orchard_address), None, None)
+        .expect("Orchard-only unified addresses are valid")
 }
