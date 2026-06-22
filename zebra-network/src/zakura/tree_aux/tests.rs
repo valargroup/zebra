@@ -148,3 +148,69 @@ async fn client_driver_fetches_a_root_range_over_tree_aux() -> Result<(), BoxErr
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn client_driver_rejects_gapped_root_batches() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let served: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let server = tree_aux_node(5, served).await?;
+    let client = tree_aux_node(6, Vec::new()).await?;
+
+    client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    let result = fetch_roots(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |batch| collected.extend(batch),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a peer response that skips the requested first height is rejected"
+    );
+    assert!(
+        collected.is_empty(),
+        "gapped roots are not delivered to the sink"
+    );
+
+    client.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let gapped: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let bad_server = tree_aux_node(7, gapped).await?;
+    let good_server = tree_aux_node(8, expected.clone()).await?;
+    let client = tree_aux_node(9, Vec::new()).await?;
+
+    client.connect_native(&bad_server, CONNECT_TIMEOUT).await?;
+    client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    fetch_roots(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |batch| collected.extend(batch),
+    )
+    .await?;
+
+    assert_eq!(
+        collected, expected,
+        "the client skips an unusable tree_aux peer and fetches roots from another peer"
+    );
+
+    client.shutdown().await;
+    good_server.shutdown().await;
+    bad_server.shutdown().await;
+    Ok(())
+}
