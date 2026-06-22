@@ -967,9 +967,17 @@ impl FinalizedState {
                     metrics::histogram!("zebra.state.write.checkpoint_compute.duration_seconds")
                         .record(_ckpt_compute.elapsed().as_secs_f64());
 
-                    // POC capture: record the freshly computed roots for this height.
+                    // POC capture: record the freshly computed roots for this height, and
+                    // (harness fixture generation) dump the tip frontier at the configured
+                    // capture height — the trees here are the real tip treestate.
                     if let Some(v) = &self.vct {
                         v.capture(height.0, &sapling_root, &orchard_root);
+                        v.capture_frontier_at(
+                            height,
+                            &note_commitment_trees.sapling,
+                            &note_commitment_trees.orchard,
+                            &note_commitment_trees.sprout,
+                        );
                     }
                 }
 
