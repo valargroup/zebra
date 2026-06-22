@@ -15,7 +15,10 @@
 //! DB-produced payload be fed back through the fast path in-process (the round-trip
 //! that proves producer and consumer agree, with no networking).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use zebra_chain::{block, orchard, sapling, sprout};
 
@@ -23,18 +26,10 @@ use zebra_chain::{block, orchard, sapling, sprout};
 use super::IntoDisk;
 use super::{FromDisk, ZebraDb};
 
-/// Per-block verified commitment roots — the essential fast-path payload
-/// (design §5.1). One entry per height; the root is the treestate root as of
-/// end-of-block-`height`.
-// Produced/consumed by the round-trip test this increment; becomes the wire payload
-// over `tree_aux` in increment 6a.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(super) struct BlockCommitmentRoots {
-    pub(super) height: block::Height,
-    pub(super) sapling_root: sapling::tree::Root,
-    pub(super) orchard_root: orchard::tree::Root,
-}
+/// Per-block verified commitment roots — the essential fast-path payload (design §5.1),
+/// the wire payload carried over `tree_aux` (increment 6a). Defined in `zebra-chain` so
+/// `zebra-network` and `zebra-state` share it without a dependency cycle.
+pub(super) use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
 /// The verified final note-commitment frontiers at the checkpoint handoff height
 /// (design §5.2).
@@ -222,6 +217,76 @@ impl CommitmentRootSource for VecRootSource {
     }
     fn final_frontiers(&self) -> Option<&FinalFrontiers> {
         self.0.final_frontiers()
+    }
+}
+
+/// A fillable [`CommitmentRootSource`] backed by a shared, height-keyed roots cache.
+///
+/// The `tree_aux` driver (increment 6a) writes verified roots into the cache *ahead of*
+/// the committer via [`PeerSourceWriter`], as ranges arrive from peers; the committer
+/// reads them per height through the [`CommitmentRootSource`] seam. The handoff frontier
+/// is embedded in the binary (design §5.2), so it is held immutably here and never
+/// fetched over the network — only roots come from peers.
+// Used by the consumer round-trip test now; the `tree_aux` driver fills it in 6a.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(super) struct PeerSource {
+    roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
+    frontiers: Option<FinalFrontiers>,
+}
+
+/// Write handle for a [`PeerSource`]: the driver fills the shared cache as verified root
+/// ranges arrive. Cloneable so the driver and source share one cache.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(super) struct PeerSourceWriter {
+    roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
+}
+
+#[allow(dead_code)]
+impl PeerSource {
+    /// Create an empty peer source and its write handle. `frontiers` is the embedded
+    /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).
+    pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceWriter) {
+        let roots = Arc::new(RwLock::new(HashMap::new()));
+        (
+            PeerSource {
+                roots: Arc::clone(&roots),
+                frontiers,
+            },
+            PeerSourceWriter { roots },
+        )
+    }
+}
+
+#[allow(dead_code)]
+impl PeerSourceWriter {
+    /// Insert verified roots fetched for a range into the shared cache (idempotent;
+    /// last write wins per height).
+    pub(super) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
+        let mut map = self.roots.write().expect("peer source roots lock poisoned");
+        for r in roots {
+            map.insert(r.height.0, (r.sapling_root, r.orchard_root));
+        }
+    }
+}
+
+impl CommitmentRootSource for PeerSource {
+    fn fast_root(
+        &self,
+        height: block::Height,
+    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+        self.roots
+            .read()
+            .expect("peer source roots lock poisoned")
+            .get(&height.0)
+            .copied()
+    }
+    fn handoff_height(&self) -> Option<block::Height> {
+        self.frontiers.as_ref().map(|f| f.height)
+    }
+    fn final_frontiers(&self) -> Option<&FinalFrontiers> {
+        self.frontiers.as_ref()
     }
 }
 
