@@ -761,6 +761,10 @@ impl FinalizedState {
                         if let Some(v) = &self.vct {
                             v.record_prevalidated();
                         }
+                        // Observability: the previous fast block's look-ahead already
+                        // validated this header, so its commitment check was skipped (the
+                        // dedup). A subset of `state.vct.fast.block.count`.
+                        metrics::counter!("state.vct.prevalidated.block.count").increment(1);
                     } else {
                         COMMIT_COMPUTE_POOL.install(|| {
                             check::block_commitment_is_valid_for_chain_history(
@@ -830,6 +834,11 @@ impl FinalizedState {
                     if let Some(v) = &self.vct {
                         v.record_fast_block();
                     }
+                    // Observability: this block folded supplied roots and skipped the
+                    // note-commitment frontier recompute (the verified-commitment-trees
+                    // fast path). Paired with `state.vct.legacy.block.count` below, this
+                    // gives a live fast-vs-legacy ratio.
+                    metrics::counter!("state.vct.fast.block.count").increment(1);
 
                     // When final frontiers are loaded, this is a persistent fast
                     // sync: mark the database fast-synced (per-height trees absent
@@ -880,6 +889,11 @@ impl FinalizedState {
                     // Not a fast block: any cached pre-validation does not apply to
                     // the next fast block (its parent frontier differs), so clear it.
                     self.vct_prevalidated_next = None;
+
+                    // Observability: this block recomputed the note-commitment frontier
+                    // (the legacy path) — either VCT is off, or the fast path's roots were
+                    // unavailable for this height and it safely fell back.
+                    metrics::counter!("state.vct.legacy.block.count").increment(1);
 
                     // Legacy / capture path: recompute the note-commitment frontier.
                     //
