@@ -23,7 +23,7 @@ use zebra_chain::{
     orchard,
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
-        Network,
+        Network, NetworkUpgrade,
     },
     primitives::ed25519,
     sapling::ValueCommitment,
@@ -34,10 +34,6 @@ use zebra_chain::{
 use zebra_consensus::{error::TransactionError, funding_stream_address};
 use zebra_script::Sigops;
 use zebra_state::IntoDisk;
-
-// Only used to route post-NU6.3 coinbase rewards to Ironwood, which is gated on this cfg.
-#[cfg(zcash_unstable = "nu6.3")]
-use zebra_chain::parameters::NetworkUpgrade;
 
 use super::zec::Zec;
 use super::{super::opthex, get_block_template::MinerParams};
@@ -201,7 +197,6 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        #[cfg(zcash_unstable = "nu6.3")]
         let nu6_3_active = NetworkUpgrade::Nu6_3
             .activation_height(net)
             .is_some_and(|nu6_3_height| height >= nu6_3_height);
@@ -216,12 +211,16 @@ impl TransactionTemplate<NegativeOrZero> {
                 })
                 .or_else(|| {
                     addr.orchard().and_then(|addr| {
-                        // After NU6.3, net-new value into Orchard is forbidden (coinbase
-                        // included), so the Orchard receiver is paid via Ironwood, which
-                        // reuses the Orchard address. Before NU6.3, pay Orchard as before.
-                        #[cfg(zcash_unstable = "nu6.3")]
                         if nu6_3_active {
+                            // After NU6.3, net-new value into Orchard is forbidden
+                            // (coinbase included), so the Orchard receiver is paid via
+                            // Ironwood — which reuses the Orchard address — when Ironwood
+                            // is compiled in. Without Ironwood support, an Orchard-only
+                            // address cannot receive a coinbase reward after NU6.3.
+                            #[cfg(zcash_unstable = "nu6.3")]
                             return add_ironwood_reward(&mut builder, addr);
+                            #[cfg(not(zcash_unstable = "nu6.3"))]
+                            return None;
                         }
                         add_orchard_reward(&mut builder, addr)
                     })
