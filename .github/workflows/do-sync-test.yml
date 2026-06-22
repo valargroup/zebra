@@ -1,0 +1,113 @@
+name: DO sync test
+
+# Reusable: provisions one ephemeral nyc3 droplet, runs a sync-confidence window
+# (consume) or builds a snapshot (generate) on it, then always deletes it.
+
+on:
+  workflow_call:
+    inputs:
+      nextest_profile: { required: true, type: string }
+      test_variables:  { required: true, type: string }
+      state_key:       { required: true, type: string }
+      mode:            { required: true, type: string }
+      image_ref:       { required: true, type: string }
+      droplet_size:    { required: true, type: string }
+      region:          { required: false, type: string, default: nyc3 }
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: { required: true }
+      SPACES_ACCESS_KEY:         { required: true }
+      SPACES_SECRET_KEY:         { required: true }
+      DO_SSH_PRIVATE_KEY:        { required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ inputs.mode }} ${{ inputs.state_key }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install doctl, s3cmd, zstd
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          sudo apt-get update -qq && sudo apt-get install -y -qq s3cmd zstd
+          doctl auth init -t "${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}"
+
+      - name: Compute state version
+        id: ver
+        run: |
+          echo "v=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zebra-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Write SSH key
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${{ secrets.DO_SSH_PRIVATE_KEY }}" > /tmp/do_ssh
+
+      - name: Create droplet
+        id: droplet
+        run: |
+          set -euo pipefail
+          NAME="sync-conf-${{ inputs.state_key }}-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"
+          doctl compute droplet create "$NAME" \
+            --region "${{ inputs.region }}" \
+            --size "${{ inputs.droplet_size }}" \
+            --image docker-20-04 \
+            --ssh-keys "${{ vars.DO_SSH_KEY_FINGERPRINT }}" \
+            --tag-name sync-confidence-ci \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+          echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/do_ssh "root@${{ steps.droplet.outputs.ip }}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Run workload
+        run: |
+          set -euo pipefail
+          IP="${{ steps.droplet.outputs.ip }}"
+          umask 077
+          cat > /tmp/run.env <<EOF
+          MODE=${{ inputs.mode }}
+          IMAGE_REF=${{ inputs.image_ref }}
+          NEXTEST_PROFILE=${{ inputs.nextest_profile }}
+          TEST_VARIABLES=${{ inputs.test_variables }}
+          STATE_KEY=${{ inputs.state_key }}
+          STATE_VERSION=${{ steps.ver.outputs.v }}
+          FEATURES=default-release-binaries
+          SPACES_BUCKET=${{ vars.SPACES_BUCKET }}
+          SPACES_REGION=${{ inputs.region }}
+          SPACES_ACCESS_KEY=${{ secrets.SPACES_ACCESS_KEY }}
+          SPACES_SECRET_KEY=${{ secrets.SPACES_SECRET_KEY }}
+          EOF
+          scp -o StrictHostKeyChecking=no -i /tmp/do_ssh \
+            /tmp/run.env .github/workflows/scripts/do-sync-run.sh "root@${IP}:/root/"
+          ssh -o StrictHostKeyChecking=no -i /tmp/do_ssh "root@${IP}" \
+            'set -a; . /root/run.env; set +a; bash /root/do-sync-run.sh'
+
+      - name: Destroy droplet + sweep orphans
+        if: always()
+        run: |
+          set +e
+          if [ -n "${{ steps.droplet.outputs.id }}" ]; then
+            doctl compute droplet delete "${{ steps.droplet.outputs.id }}" -f
+          fi
+          # Backstop: delete any sync-confidence-ci droplet older than 3h.
+          doctl compute droplet list --tag-name sync-confidence-ci --format ID,Created --no-header | \
+          while read -r id created; do
+            age=$(( $(date +%s) - $(date -d "$created" +%s) ))
+            [ "$age" -gt 10800 ] && doctl compute droplet delete "$id" -f
+          done
+          true
