@@ -19,7 +19,7 @@ use zebra_chain::{
     block::{Block, Height},
     history_tree::HistoryTree,
     orchard,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     sapling,
 };
 
@@ -41,8 +41,8 @@ use crate::{service::check, ValidateContextError};
 ///
 /// Heartwood and later (`ChainHistoryRoot` / `ChainHistoryBlockTxAuthCommitment` /
 /// the activation-reserved block) are authenticated by the MMR path and accepted
-/// here. Orchard does not activate until NU5 and is not committed by any header
-/// below NU5, so it is not checked here.
+/// here. The Orchard root below NU5 is pinned separately by
+/// [`verify_supplied_orchard_root_below_nu5`].
 pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     network: &Network,
     block: &Block,
@@ -60,6 +60,44 @@ pub(crate) fn verify_supplied_sapling_root_below_heartwood(
             CommitmentError::InvalidFinalSaplingRoot {
                 expected: <[u8; 32]>::from(expected),
                 actual: <[u8; 32]>::from(*sapling_root),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
+/// Verifies a supplied Orchard root for a *pre-NU5* block (design §6.1).
+///
+/// The Orchard tree does not activate until NU5, and no header below NU5 commits to an
+/// Orchard root: the ZIP-221 V1 history leaf (Heartwood..Canopy) *ignores* the Orchard
+/// root entirely (`zcash_history.rs`, `V1::block_to_history_node`), and below Heartwood
+/// there is no MMR at all. So the MMR path that authenticates Orchard roots from NU5
+/// onward cannot vouch for any root below NU5 — yet the fast path folds the supplied
+/// Orchard root into the anchor set for every block. Without this check an untrusted
+/// source could inject an arbitrary Orchard anchor below NU5 that the legacy recompute
+/// path never produces, breaking the §11 trust boundary and consensus equivalence.
+///
+/// Below NU5 the Orchard tree is always the empty default, so the supplied root must
+/// equal the empty-tree root. At and above NU5 activation the MMR path authenticates
+/// the root, so this accepts.
+pub(crate) fn verify_supplied_orchard_root_below_nu5(
+    network: &Network,
+    height: Height,
+    orchard_root: &orchard::tree::Root,
+) -> Result<(), ValidateContextError> {
+    // At/above NU5 the ZIP-221 V2 MMR commits to the Orchard root, so it is
+    // authenticated there, not here.
+    if Some(height) >= NetworkUpgrade::Nu5.activation_height(network) {
+        return Ok(());
+    }
+
+    let expected = orchard::tree::NoteCommitmentTree::default().root();
+    if orchard_root != &expected {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidPreNu5OrchardRoot {
+                expected: <[u8; 32]>::from(expected),
+                actual: <[u8; 32]>::from(*orchard_root),
             },
         ));
     }
@@ -130,6 +168,61 @@ mod tests {
         );
         HistoryTree::from_block(&Mainnet, genesis, &Default::default(), &Default::default())
             .expect("empty history tree for a pre-Heartwood block")
+    }
+
+    /// A distinct, valid Orchard root that is *not* the empty-tree root, for the
+    /// negative cases. Zero is a valid Pallas base field element, and the empty
+    /// Orchard tree root is an uncommitted-leaf hash, so the two differ.
+    fn non_empty_orchard_root() -> orchard::tree::Root {
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = orchard::tree::Root::try_from([0u8; 32])
+            .expect("zero is a valid pallas base field element");
+        assert_ne!(
+            wrong, empty,
+            "the negative cases need a root distinct from the empty-tree root"
+        );
+        wrong
+    }
+
+    /// Below NU5 the supplied Orchard root must equal the empty-tree root (no header
+    /// commits to it there), and any other root is rejected. At/above NU5 the MMR
+    /// authenticates it, so this check accepts unconditionally.
+    #[test]
+    fn pins_orchard_root_to_empty_below_nu5_and_defers_above() {
+        let nu5 = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5");
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = non_empty_orchard_root();
+
+        // Below NU5: the empty root is accepted, a non-empty root is rejected.
+        let pre_nu5 = Height(nu5.0 - 1);
+        verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &empty)
+            .expect("the empty-tree root is accepted below NU5");
+        let error = verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &wrong)
+            .expect_err("a non-empty orchard root must be rejected below NU5");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidPreNu5OrchardRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
+        );
+
+        // Pre-Sapling/Heartwood (well below NU5) is also pinned to empty.
+        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(1), &empty)
+            .expect("the empty-tree root is accepted at low heights");
+        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(1), &wrong)
+            .expect_err("a non-empty orchard root must be rejected at low heights");
+
+        // At and above NU5 the MMR path authenticates the root, so even a non-empty
+        // root is accepted here (it is checked elsewhere).
+        verify_supplied_orchard_root_below_nu5(&Mainnet, nu5, &wrong)
+            .expect("at NU5 the root is authenticated by the MMR, not pinned here");
+        verify_supplied_orchard_root_below_nu5(&Mainnet, Height(nu5.0 + 1), &wrong)
+            .expect("above NU5 the root is authenticated by the MMR, not pinned here");
     }
 
     /// The verifier confirms real Sapling roots over the Heartwood activation and its

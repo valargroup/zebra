@@ -396,6 +396,16 @@ pub enum CommitmentError {
         actual: [u8; 32],
     },
 
+    #[error(
+        "invalid pre-NU5 orchard root: expected the empty-tree root {:?}, actual: {:?}",
+        hex::encode(expected),
+        hex::encode(actual)
+    )]
+    InvalidPreNu5OrchardRoot {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
     #[error("missing required block height: block commitments can't be parsed without a block height, block hash: {block_hash:?}")]
     MissingBlockHeight { block_hash: block::Hash },
 
