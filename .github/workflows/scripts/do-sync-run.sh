@@ -58,6 +58,14 @@ set -e
 echo "nextest exit code: ${RESULT}"
 
 if [[ "${MODE}" == "generate" && "${RESULT}" -eq 0 ]]; then
+  # Prune old raw tx data before upload to keep the tarball (and the per-run
+  # consume download) small. This keeps all consensus state plus the last 10k
+  # blocks of tx data, which comfortably covers the 5k-block consume window.
+  # Runs as a separate container — the sync container has exited, releasing the
+  # RocksDB lock.
+  echo "Pruning state before upload"
+  docker run --rm -v "${STATE_DIR}:/state" --entrypoint zebra-prune-state "${IMAGE_REF}" \
+    --network Mainnet --cache-dir /state --tx-retention 10000 --confirm
   echo "Uploading state to ${OBJECT}"
   tar --use-compress-program='zstd -T0' -cf /tmp/state.tar.zst -C "${STATE_DIR}" .
   s3cmd put /tmp/state.tar.zst "${OBJECT}"
