@@ -428,19 +428,15 @@ fn window_request(height: u32) -> OutstandingBlockRange {
 #[test]
 fn peer_outbound_request_window_halves_on_timeout_and_grows_on_success() {
     let mut window = download_window();
+    let max_inflight =
+        usize::try_from(MAX_BS_INFLIGHT_REQUESTS).expect("test max inflight fits usize");
     window.max_inflight_requests = MAX_BS_INFLIGHT_REQUESTS;
-    window.outbound_request_window = usize::from(MAX_BS_INFLIGHT_REQUESTS);
+    window.outbound_request_window = max_inflight;
     window.outstanding.push(window_request(1));
-    assert_eq!(
-        window.available_slots(),
-        usize::from(MAX_BS_INFLIGHT_REQUESTS) - 1
-    );
+    assert_eq!(window.available_slots(), max_inflight - 1);
 
     window.reduce_outbound_window_after_timeout();
-    assert_eq!(
-        window.outbound_request_window,
-        usize::from(MAX_BS_INFLIGHT_REQUESTS) / 2
-    );
+    assert_eq!(window.outbound_request_window, max_inflight / 2);
 
     for _ in 0..16 {
         window.reduce_outbound_window_after_timeout();
@@ -453,12 +449,9 @@ fn peer_outbound_request_window_halves_on_timeout_and_grows_on_success() {
     window.increase_outbound_window_after_success();
     assert_eq!(window.outbound_request_window, 65);
 
-    window.outbound_request_window = usize::from(MAX_BS_INFLIGHT_REQUESTS);
+    window.outbound_request_window = max_inflight;
     window.increase_outbound_window_after_success();
-    assert_eq!(
-        window.outbound_request_window,
-        usize::from(MAX_BS_INFLIGHT_REQUESTS)
-    );
+    assert_eq!(window.outbound_request_window, max_inflight);
 }
 
 #[test]
@@ -535,7 +528,7 @@ async fn connect_peer_with_status(
     byte: u8,
     servable_high: block::Height,
     tip_hash: block::Hash,
-    max_inflight_requests: u16,
+    max_inflight_requests: u32,
     max_response_bytes: u32,
 ) -> (ZakuraPeerId, FramedSend, FramedRecv) {
     connect_peer_with_status_message(
@@ -617,7 +610,7 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
     assert_eq!(default.max_blocks_per_response, 1);
-    assert_eq!(default.max_inflight_requests, 2048);
+    assert_eq!(default.max_inflight_requests, 24_000);
     assert_eq!(
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
@@ -826,7 +819,7 @@ fn status_decode_clamps_peer_capacity_advertisements() {
         .zcash_serialize(&mut payload)
         .expect("hash serializes");
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u16::MAX.to_le_bytes());
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
     let BlockSyncMessage::Status(status) =

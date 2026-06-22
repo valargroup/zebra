@@ -10,10 +10,9 @@
 //! `outstanding`, the adaptive outbound window + timeout-recovery slots,
 //! `received_status`/servable caps, and the want-work fill loop.
 //!
-//! The one throughput-critical effect: the matched-body
-//! `sequencer_input.send(AcceptBody).await` runs in this per-peer task, so a
-//! slow verifier (Sequencer backpressure) stalls only one routine, not the whole
-//! fleet. The download decision gates **only** on the byte budget + per-peer
+//! The one throughput-critical effect: the matched-body `sequencer_input.send(..).await`
+//! runs in this per-peer task, so a slow verifier (Sequencer backpressure)
+//! stalls only one routine, not the whole fleet. The download decision gates **only** on the byte budget + per-peer
 //! slots: `take_in_range(servable_low, servable_high, n)` uses `servable_high`
 //! as the *only* upper bound.
 //!
@@ -39,7 +38,7 @@ use super::{
         block_sync_message_label, bs_insert_height, bs_insert_peer, bs_insert_u64, tolerated_bytes,
     },
     request::BlockRangeRequest,
-    sequencer_task::{SequencedBody, SequencerInput, SequencerView},
+    sequencer_task::{SequencedBody, SequencerView},
     state::{DownloadWindow, OutstandingBlockRange, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
@@ -47,7 +46,7 @@ use super::{
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
-    Admit, FramedRecv, SinkReject,
+    Admit, FramedRecv, OrderedSendError, SinkReject,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
@@ -63,6 +62,8 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 /// negligible against real sync timescales, and the height stays `pending` and
 /// fully contestable by every other peer throughout.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
+/// Poll interval while this peer's outbound stream queue is full.
+const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Outcome classification for finishing an outstanding request (ported verbatim
 /// from the reactor's `OutstandingRangeDisposition`).
@@ -126,7 +127,7 @@ pub(super) struct PeerRoutine {
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
     received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
-    sequencer_input: mpsc::Sender<SequencerInput>,
+    sequencer_input: mpsc::Sender<SequencedBody>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
@@ -159,7 +160,7 @@ impl PeerRoutine {
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
         received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
-        sequencer_input: mpsc::Sender<SequencerInput>,
+        sequencer_input: mpsc::Sender<SequencedBody>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         view: watch::Receiver<SequencerView>,
@@ -235,16 +236,21 @@ impl PeerRoutine {
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
 
-            self.try_fill().await;
+            if self.session.outbound_capacity() > 0 {
+                self.try_fill().await;
+            }
+            let outbound_has_capacity = self.session.outbound_capacity() > 0;
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep();
             tokio::pin!(timeout);
+            let outbound_capacity = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
+            tokio::pin!(outbound_capacity);
 
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv() => {
+                frame = self.recv.recv(), if outbound_has_capacity => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -273,6 +279,7 @@ impl PeerRoutine {
                 _ = &mut available => {
                     self.trace_wake("work_added");
                 }
+                _ = &mut outbound_capacity, if !outbound_has_capacity => {}
             }
         }
     }
@@ -624,10 +631,13 @@ impl PeerRoutine {
                     ?error,
                     "failed to queue Zakura block-sync GetBlocks"
                 );
-                self.session.cancel_token().cancel();
                 self.budget.release(request.estimated_bytes);
                 // Nothing was received, so return every taken height to the queue.
                 self.return_taken_items(&items);
+                if matches!(error, OrderedSendError::Full) {
+                    break;
+                }
+                self.session.cancel_token().cancel();
                 break;
             }
 
@@ -855,16 +865,24 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
-        let _ = self
+        let received_at = Instant::now();
+        let sequencer_send_started = Instant::now();
+        let send_result = self
             .sequencer_input
-            .send(SequencerInput::AcceptBody(SequencedBody {
+            .send(SequencedBody {
                 height,
                 hash,
                 block,
                 bytes: serialized_bytes,
                 peer: self.peer.clone(),
-            }))
+                received_at,
+            })
             .await;
+        self.trace_body_sequencer_sent(
+            height,
+            sequencer_send_started.elapsed(),
+            send_result.is_ok(),
+        );
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -949,13 +967,14 @@ impl PeerRoutine {
 
         let _ = self
             .sequencer_input
-            .send(SequencerInput::AcceptBody(SequencedBody {
+            .send(SequencedBody {
                 height,
                 hash,
                 block,
                 bytes: serialized_bytes,
                 peer: self.peer.clone(),
-            }))
+                received_at: Instant::now(),
+            })
             .await;
         true
     }
@@ -1292,6 +1311,16 @@ impl PeerRoutine {
             bs_insert_height(row, bs_trace::HEIGHT, height);
             bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, serialized_bytes);
             bs_insert_u64(row, bs_trace::BUDGET_RESERVED_AFTER, self.budget.reserved());
+            bs_insert_u64(
+                row,
+                "sequencer_input_capacity",
+                u64::try_from(self.sequencer_input.capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_max_capacity",
+                u64::try_from(self.sequencer_input.max_capacity()).unwrap_or(u64::MAX),
+            );
             if let Some(request_start_height) = request_start_height {
                 bs_insert_height(row, "request_start", request_start_height);
             }
@@ -1301,6 +1330,19 @@ impl PeerRoutine {
             if let Some(request_elapsed_ms) = request_elapsed_ms {
                 bs_insert_u64(row, "request_elapsed_ms", request_elapsed_ms);
             }
+        });
+    }
+
+    fn trace_body_sequencer_sent(&self, height: block::Height, elapsed: Duration, ok: bool) {
+        self.emit(bs_trace::BLOCK_BODY_SEQUENCER_SENT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(
+                row,
+                "sequencer_send_elapsed_us",
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+            row.insert("ok".to_string(), serde_json::Value::Bool(ok));
         });
     }
 

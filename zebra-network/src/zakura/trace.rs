@@ -230,6 +230,12 @@ pub mod block_sync_trace {
     pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
     /// Body received from a peer.
     pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
+    /// Body handed from a peer routine to the sequencer input channel.
+    pub const BLOCK_BODY_SEQUENCER_SENT: &str = "block_body_sequencer_sent";
+    /// Sequencer task accepted a received body from its input channel.
+    pub const BLOCK_BODY_ACCEPTED: &str = "block_body_accepted";
+    /// Reactor attempted or completed a control send to the Sequencer task.
+    pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
     /// Body submitted to the verifier for commit.
     pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
     /// Verifier finished applying a submitted body.
