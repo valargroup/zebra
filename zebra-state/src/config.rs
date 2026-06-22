@@ -110,12 +110,20 @@ pub struct Config {
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
-    /// Override for fast mode: skip
-    /// the per-block note-commitment frontier recompute below the last checkpoint,
-    /// folding fixture-supplied roots into the anchor set and history tree instead
-    /// Default is false.
+    /// Mirror of `consensus.checkpoint_sync`, set by zebrad at startup.
+    ///
+    /// When `true` (the default), a node syncing under checkpoint trust uses the fast
+    /// verified-commitment-trees path below the last checkpoint: per-block Sapling/Orchard
+    /// roots are verified against the committed headers and folded into the anchor set and
+    /// history tree, skipping the per-block frontier recompute. When `false`, the node fully
+    /// reconstructs the note-commitment trees per block (the legacy recompute) — the only
+    /// mode that does so. This is orthogonal to [`storage_mode`](Self::storage_mode): both
+    /// Archive and Pruned use the fast path under checkpoint sync.
+    ///
+    /// Skipped in serde because it is not an independent state setting — it tracks the
+    /// consensus option, so the generic Zebra state config does not expose a duplicate.
     #[serde(skip)]
-    pub enable_verified_commitment_trees: bool,
+    pub checkpoint_sync: bool,
 
     /// Whether to delete the old database directories when present.
     ///
@@ -409,7 +417,7 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             enable_zakura_header_seed_from_committed_blocks: false,
-            enable_verified_commitment_trees: false,
+            checkpoint_sync: true,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
