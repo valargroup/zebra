@@ -8,7 +8,8 @@
 //! roots travel over the wire.
 //!
 //! Runs when the state committer exposes a `tree_aux` roots writer. On Mainnet this
-//! is the default fast path; `VCT_LEGACY` opts out to the legacy recompute path.
+//! is the default fast path under checkpoint sync; `consensus.checkpoint_sync = false`
+//! opts out to the legacy recompute path.
 
 use std::time::Duration;
 
