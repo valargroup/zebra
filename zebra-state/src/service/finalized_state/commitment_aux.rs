@@ -22,9 +22,7 @@ use std::{
 
 use zebra_chain::{block, orchard, sapling, sprout};
 
-#[cfg(test)]
-use super::IntoDisk;
-use super::{FromDisk, ZebraDb};
+use super::{FromDisk, IntoDisk, ZebraDb};
 
 /// Per-block verified commitment roots — the essential fast-path payload (design §5.1),
 /// the wire payload carried over `tree_aux` (increment 6a). Defined in `zebra-chain` so
@@ -50,8 +48,8 @@ pub(super) struct FinalFrontiers {
 
 impl FinalFrontiers {
     /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
-    /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes.
-    #[cfg(test)]
+    /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes. Used to
+    /// capture a Regtest handoff frontier at test/dev time (see `vct::capture_frontier_at`).
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.height.0.to_le_bytes());
