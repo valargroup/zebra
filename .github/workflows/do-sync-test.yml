@@ -97,6 +97,8 @@ jobs:
           STATE_KEY: ${{ inputs.state_key }}
           STATE_VERSION: ${{ steps.ver.outputs.v }}
           SPACES_BUCKET: ${{ vars.SPACES_BUCKET }}
+          # The Space must live in the same region as the droplet; if you override
+          # `region`, the SPACES_BUCKET must also be in that region.
           SPACES_REGION: ${{ inputs.region }}
           SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
           SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
