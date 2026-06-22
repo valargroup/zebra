@@ -1387,7 +1387,8 @@ fn sync_past_mandatory_checkpoint_testnet() -> Result<()> {
 /// validation, stopping at `stop_height`.
 ///
 /// The cached state must already be synced to the window's start height — in CI it
-/// is restored from a snapshot disk (see `sync-confidence-snapshots.yml`). Because
+/// is restored from a pruned snapshot in Spaces (produced out-of-band by
+/// `make-sync-confidence-snapshots.sh`). Because
 /// both sync-confidence windows lie above the top compiled checkpoint (3,358,006),
 /// every block in the window is contextually verified, so this asserts the run
 /// finishes with a `contextually-verified` commit at `stop_height`.
