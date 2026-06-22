@@ -294,8 +294,8 @@ pub struct FinalizedState {
     /// A collection of blocks to be sent to elasticsearch as a bulk.
     pub elastic_blocks: Vec<String>,
 
-    /// POC verified-commitment-trees state (fast/capture mode), or `None` when
-    /// the experiment is off (the default). Shared across clones.
+    /// Verified-commitment-trees state (peer/fixture/capture mode), or `None`
+    /// when legacy recompute is selected. Shared across clones.
     vct: Option<Arc<VctState>>,
 
     /// POC verify-before-commit dedup. Holds the `(height, hash)` of the next

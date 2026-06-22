@@ -88,8 +88,8 @@ pub use service::{
 /// Write handle for the verified-commitment-trees `tree_aux` peer source: the node's
 /// `tree_aux` driver fills the committer's per-block-root cache through this as verified
 /// root ranges arrive from peers. Available only when the committer was built in peer
-/// mode (the `VCT_PEER` experiment toggle); [`tree_aux_roots_writer`] returns `None`
-/// otherwise.
+/// mode, which is the default on networks with embedded final frontiers;
+/// [`tree_aux_roots_writer`] returns `None` for legacy/capture/fixture modes.
 #[derive(Clone, Debug)]
 pub struct TreeAuxRootsWriter(service::finalized_state::PeerSourceWriter);
 

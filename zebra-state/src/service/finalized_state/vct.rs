@@ -3,10 +3,10 @@
 //! This module holds the fixture/embedded-frontier *plumbing* for the
 //! verified-commitment-trees fast path: loading the per-block roots fixture
 //! (`VCT_FIXTURE`), loading the final frontiers embedded in the binary, capturing
-//! per-block roots during a legacy sync, and the run counters. It is gated behind
-//! `Config::enable_verified_commitment_trees` / the `VCT_*` environment variables and
-//! is **experiment scaffolding, not a shippable feature** — the local files stand in
-//! for the eventual `tree_aux` peer source.
+//! per-block roots during a legacy sync, and the run counters. On networks with an
+//! embedded handoff frontier, the default source is the peer `tree_aux` source; the
+//! `VCT_*` environment variables select local fixture/capture modes or opt out to
+//! legacy recompute.
 //!
 //! [`super`] (`finalized_state.rs`) holds only the commit-path hook (the checkpoint
 //! handoff write and the fast-sync marker); everything about *where the data comes
@@ -43,9 +43,10 @@ const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin"
 /// [`super::FinalizedState`] clones via `Arc` so the capture sink and counters are
 /// shared.
 ///
-/// This is gated behind `Config::enable_verified_commitment_trees` (fast mode) and
-/// the `VCT_FIXTURE` / `VCT_CAPTURE` environment variables. It is an experiment that
-/// trusts a recorded fixture and is NOT a shippable feature.
+/// By default this uses the peer `tree_aux` source on networks with embedded final
+/// frontiers. `Config::enable_verified_commitment_trees` / `VCT_FAST` select the
+/// local fixture source, while `VCT_CAPTURE` records fixtures and `VCT_LEGACY`
+/// opts out to legacy recompute.
 #[derive(Debug)]
 pub(crate) struct VctState {
     /// Fast mode: skip the per-block frontier recompute and fold the source's roots
