@@ -544,6 +544,10 @@ impl StartCmd {
 
         let mut state_config = config.state.clone();
         state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+        // The state's fast-vs-legacy commitment-tree decision tracks the consensus
+        // checkpoint-sync option: fast verified path under checkpoint trust, full per-block
+        // recompute when checkpoint sync is disabled.
+        state_config.checkpoint_sync = config.consensus.checkpoint_sync;
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(
