@@ -231,10 +231,10 @@ const SYNC_RANGE_PRE_NU62_STOP_HEIGHT: block::Height = block::Height(3_363_006);
 
 /// Stop height for the `post-nu62` sync-confidence window.
 ///
-/// 5,000 blocks above the window start (3,400,000), which is ~35k blocks above the
+/// 5,000 blocks above the window start (3,375,000), which is ~10k blocks above the
 /// NU6.2 mainnet activation height (3,364,600), so the window exercises current
 /// post-NU6.2 consensus rules under full validation.
-const SYNC_RANGE_POST_NU62_STOP_HEIGHT: block::Height = block::Height(3_405_000);
+const SYNC_RANGE_POST_NU62_STOP_HEIGHT: block::Height = block::Height(3_380_000);
 
 #[test]
 fn generate_no_args() -> Result<()> {
@@ -1425,7 +1425,7 @@ fn sync_range_pre_nu62() -> Result<()> {
 }
 
 /// Full-validation sync of ~5k mainnet blocks above NU6.2, from a cached state at
-/// height 3,400,000.
+/// height 3,375,000.
 ///
 /// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
 /// via the `sync-range-post-nu62` nextest profile.
@@ -1466,7 +1466,7 @@ fn generate_snapshot_pre_nu62() -> Result<()> {
     )
 }
 
-/// Build a cached state at mainnet height 3,400,000 for the `post-nu62`
+/// Build a cached state at mainnet height 3,375,000 for the `post-nu62`
 /// sync-confidence window. Checkpoints up to 3,358,006, then full validation.
 ///
 /// Skipped unless `TEST_GENERATE_SYNC_RANGE_SNAPSHOT` is set. Run via the
@@ -1483,7 +1483,7 @@ fn generate_snapshot_post_nu62() -> Result<()> {
     let _init_guard = zebra_test::init();
     create_cached_database_height(
         &Mainnet,
-        block::Height(3_400_000),
+        block::Height(3_375_000),
         // Use checkpoints up to the ceiling; blocks above it are validated fully.
         true,
         STOP_AT_HEIGHT_REGEX,

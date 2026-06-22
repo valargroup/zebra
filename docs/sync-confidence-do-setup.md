@@ -16,7 +16,7 @@ state objects after a DB format-version bump by re-running the snapshots workflo
   `doctl compute ssh-key list`).
 
 ## First run
-1. Confirm 3,405,000 <= current mainnet head (else lower the post-nu62 heights in
+1. Confirm 3,380,000 <= current mainnet head (else lower the post-nu62 heights in
    `zebrad/tests/acceptance.rs` + regenerate).
 2. Run **Sync confidence snapshots** (Actions -> Run workflow). On the very first
    run the GHCR image package (`zebra-tests`) is created **private**, so the
