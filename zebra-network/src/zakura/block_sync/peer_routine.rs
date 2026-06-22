@@ -42,7 +42,7 @@ use super::{
     state::{DownloadWindow, OutstandingBlockRange, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
-    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace,
+    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
@@ -64,6 +64,18 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
+    frame.payload.first().copied() == Some(MSG_BS_BLOCK)
+}
+
+fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| Some(current.saturating_sub(bytes)),
+    );
+}
 
 /// Outcome classification for finishing an outstanding request (ported verbatim
 /// from the reactor's `OutstandingRangeDisposition`).
@@ -128,6 +140,7 @@ pub(super) struct PeerRoutine {
     registry: Arc<PeerRegistry>,
     received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
+    sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
@@ -161,6 +174,7 @@ impl PeerRoutine {
         registry: Arc<PeerRegistry>,
         received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
+        sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         view: watch::Receiver<SequencerView>,
@@ -201,6 +215,7 @@ impl PeerRoutine {
             registry,
             received_throughput,
             sequencer_input,
+            sequencer_input_bytes,
             actions,
             routine_to_reactor,
             view,
@@ -310,6 +325,11 @@ impl PeerRoutine {
         }
 
         let frame_payload_bytes = frame.payload.len();
+        let body_permit = if is_block_frame(&frame) {
+            Some(self.reserve_body_decode_permit().await?)
+        } else {
+            None
+        };
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
         let msg = match BlockSyncMessage::decode_frame(frame) {
@@ -352,7 +372,7 @@ impl PeerRoutine {
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
-                self.handle_body(block, body_wire_bytes).await;
+                self.handle_body(block, body_wire_bytes, body_permit).await;
             }
             BlockSyncMessage::BlocksDone {
                 start_height,
@@ -364,6 +384,21 @@ impl PeerRoutine {
             } => self.handle_range_unavailable(start_height).await,
         }
         Ok(())
+    }
+
+    async fn reserve_body_decode_permit(
+        &self,
+    ) -> Result<mpsc::OwnedPermit<SequencedBody>, SinkReject> {
+        let capacity_before = self.sequencer_input.capacity();
+        let started = Instant::now();
+        let permit = self
+            .sequencer_input
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| SinkReject::local("block-sync sequencer body input closed"))?;
+        self.trace_body_decode_permit(started.elapsed(), capacity_before);
+        Ok(permit)
     }
 
     /// Apply this peer's `Status` locally (servable range, caps, `received_status`)
@@ -758,7 +793,12 @@ impl PeerRoutine {
 
     // ===================== inbound matched body (ports `handle_block`) ======
 
-    async fn handle_body(&mut self, block: Arc<block::Block>, body_wire_bytes: Option<u64>) {
+    async fn handle_body(
+        &mut self,
+        block: Arc<block::Block>,
+        body_wire_bytes: Option<u64>,
+        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+    ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
             self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
@@ -772,7 +812,13 @@ impl PeerRoutine {
                 return;
             }
             if self
-                .accept_unmatched_queued_body(height, hash, block.clone(), body_wire_bytes)
+                .accept_unmatched_queued_body(
+                    height,
+                    hash,
+                    block.clone(),
+                    body_wire_bytes,
+                    body_permit,
+                )
                 .await
             {
                 return;
@@ -865,24 +911,8 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
-        let received_at = Instant::now();
-        let sequencer_send_started = Instant::now();
-        let send_result = self
-            .sequencer_input
-            .send(SequencedBody {
-                height,
-                hash,
-                block,
-                bytes: serialized_bytes,
-                peer: self.peer.clone(),
-                received_at,
-            })
+        self.forward_body_to_sequencer(height, hash, block, serialized_bytes, body_permit)
             .await;
-        self.trace_body_sequencer_sent(
-            height,
-            sequencer_send_started.elapsed(),
-            send_result.is_ok(),
-        );
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -905,6 +935,43 @@ impl PeerRoutine {
         true
     }
 
+    async fn forward_body_to_sequencer(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+        block: Arc<block::Block>,
+        serialized_bytes: u64,
+        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+    ) {
+        let received_at = Instant::now();
+        let sequencer_send_started = Instant::now();
+        let body = SequencedBody {
+            height,
+            hash,
+            block,
+            bytes: serialized_bytes,
+            peer: self.peer.clone(),
+            received_at,
+        };
+
+        let ok = if let Some(permit) = body_permit {
+            self.sequencer_input_bytes
+                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
+            permit.send(body);
+            true
+        } else {
+            self.sequencer_input_bytes
+                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
+            let send_result = self.sequencer_input.send(body).await;
+            if send_result.is_err() {
+                release_counter_bytes(&self.sequencer_input_bytes, serialized_bytes);
+            }
+            send_result.is_ok()
+        };
+
+        self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
+    }
+
     /// Ported from the reactor's `accept_unmatched_queued_body`, minus the
     /// disconnected-peer branch (a routine only runs for a live peer): a queued
     /// height served by a peer that lost its original requester returns to the
@@ -916,6 +983,7 @@ impl PeerRoutine {
         hash: block::Hash,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
+        body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -965,16 +1033,7 @@ impl PeerRoutine {
         // later duplicate.
         let _ = self.work.take_in_range(height, height, 1);
 
-        let _ = self
-            .sequencer_input
-            .send(SequencedBody {
-                height,
-                hash,
-                block,
-                bytes: serialized_bytes,
-                peer: self.peer.clone(),
-                received_at: Instant::now(),
-            })
+        self.forward_body_to_sequencer(height, hash, block, serialized_bytes, body_permit)
             .await;
         true
     }
@@ -1343,6 +1402,27 @@ impl PeerRoutine {
                 u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
             );
             row.insert("ok".to_string(), serde_json::Value::Bool(ok));
+        });
+    }
+
+    fn trace_body_decode_permit(&self, elapsed: Duration, capacity_before: usize) {
+        self.emit(bs_trace::BLOCK_BODY_DECODE_PERMIT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            bs_insert_u64(
+                row,
+                "decode_permit_wait_us",
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_capacity_before",
+                u64::try_from(capacity_before).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_max_capacity",
+                u64::try_from(self.sequencer_input.max_capacity()).unwrap_or(u64::MAX),
+            );
         });
     }
 

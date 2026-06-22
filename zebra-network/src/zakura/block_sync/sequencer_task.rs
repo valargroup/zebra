@@ -96,7 +96,10 @@ pub(super) struct SequencerView {
     pub(super) reorder_len: u64,
     pub(super) applying_len: u64,
     pub(super) reorder_buffered_bytes: u64,
+    pub(super) applying_buffered_bytes: u64,
+    pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
+    pub(super) submitted_applying_bytes: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -113,7 +116,10 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         reorder_len: 0,
         applying_len: 0,
         reorder_buffered_bytes: 0,
+        applying_buffered_bytes: 0,
+        unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
+        submitted_applying_bytes: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -137,6 +143,7 @@ pub(super) struct SequencerTask {
     reaction_epoch: u64,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     trace: ZakuraTrace,
@@ -153,6 +160,7 @@ impl SequencerTask {
         frontiers: BlockSyncFrontiers,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+        body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -169,6 +177,7 @@ impl SequencerTask {
             reaction_epoch: 0,
             body_input_rx,
             control_input_rx,
+            body_input_bytes,
             view_tx,
             action_send_timeout,
             trace,
@@ -189,6 +198,7 @@ impl SequencerTask {
                 }
 
                 Some(body) = self.body_input_rx.recv() => {
+                    self.release_body_input_bytes(body.bytes);
                     self.handle_accept_body(body).await;
                     self.publish_view();
                 }
@@ -239,6 +249,14 @@ impl SequencerTask {
                     .await
             }
         }
+    }
+
+    fn release_body_input_bytes(&self, bytes: u64) {
+        let _ = self.body_input_bytes.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        );
     }
 
     /// Body-acceptance tail (verbatim from `handle_block` ~885-907 and
@@ -619,7 +637,10 @@ impl SequencerTask {
             reorder_len: self.sequencer.reorder_len() as u64,
             applying_len: self.sequencer.applying_len() as u64,
             reorder_buffered_bytes: self.sequencer.reorder_buffered_bytes(),
+            applying_buffered_bytes: self.sequencer.applying_buffered_bytes(),
+            unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
+            submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         });

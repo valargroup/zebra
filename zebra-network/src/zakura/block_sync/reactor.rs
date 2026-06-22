@@ -96,6 +96,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
+    let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
     let sequencer_task = SequencerTask::new(
@@ -107,6 +108,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         sequencer_body_input_rx,
         sequencer_control_rx,
+        sequencer_input_bytes.clone(),
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
@@ -131,6 +133,7 @@ pub fn spawn_block_sync_reactor(
         registry: registry.clone(),
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
+        sequencer_input_bytes: sequencer_input_bytes.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
@@ -165,6 +168,7 @@ pub fn spawn_block_sync_reactor(
         status: status_tx,
         candidates: candidates_tx,
         sequencer_input: sequencer_input_tx,
+        sequencer_input_bytes,
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
@@ -205,6 +209,8 @@ pub(super) struct BlockSyncReactor {
     /// Bounded body channel to the Sequencer task. Only per-peer routines send
     /// downloaded bodies here; the reactor keeps a sender clone for diagnostics.
     sequencer_input: mpsc::Sender<SequencedBody>,
+    /// Serialized bytes currently queued in [`sequencer_input`].
+    sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
@@ -1458,6 +1464,52 @@ impl BlockSyncReactor {
                 self.state.budget.available(),
             );
             bs_insert_u64(row, bs_trace::BUDGET_RESERVED, self.state.budget.reserved());
+            let sequencer_input_queued_bytes = self
+                .sequencer_input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
+            let sequencer_input_capacity = self.sequencer_input.capacity();
+            let sequencer_input_queued_blocks =
+                sequencer_input_max_capacity.saturating_sub(sequencer_input_capacity);
+            bs_insert_u64(
+                row,
+                "sequencer_input_queued_bytes",
+                sequencer_input_queued_bytes,
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_queued_blocks",
+                sequencer_input_queued_blocks as u64,
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_capacity",
+                sequencer_input_capacity as u64,
+            );
+            bs_insert_u64(
+                row,
+                "sequencer_input_max_capacity",
+                sequencer_input_max_capacity as u64,
+            );
+            bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
+            bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
+            bs_insert_u64(
+                row,
+                "unsubmitted_applying_count",
+                view.unsubmitted_applying_count,
+            );
+            bs_insert_u64(
+                row,
+                "submitted_applying_bytes",
+                view.submitted_applying_bytes,
+            );
+            bs_insert_u64(
+                row,
+                "retained_pipeline_wire_bytes",
+                sequencer_input_queued_bytes
+                    .saturating_add(view.reorder_buffered_bytes)
+                    .saturating_add(view.applying_buffered_bytes),
+            );
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
             bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
             // Peers that could be issued work but have no free slots are

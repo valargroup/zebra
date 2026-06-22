@@ -10,13 +10,13 @@ pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Outbound scheduling starts at this window and adjusts per peer based on
 /// request timeouts, while peer advertisements can still allow growth up to
 /// [`MAX_BS_INFLIGHT_REQUESTS`].
-pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 24_000;
+pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 2_048;
 /// Maximum peer-advertised in-flight request count accepted by this node.
 pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 240_000;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves this much per requested block at send time and only ever
@@ -31,7 +31,7 @@ pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// The checkpoint verifier resolves a checkpoint window only after the whole
 /// window is queued, so this defaults to one maximum checkpoint gap.
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    10 * zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default block-sync status refresh interval reserved for later advertisement.
