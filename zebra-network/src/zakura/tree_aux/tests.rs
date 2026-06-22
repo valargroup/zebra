@@ -10,7 +10,8 @@ use std::{sync::Arc, time::Duration};
 use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
 
 use super::{
-    fetch_roots, TreeAuxMessage, TreeAuxService, TreeAuxStatePort, ZAKURA_STREAM_TREE_AUX,
+    fetch_roots, BoxRunFuture, TreeAuxMessage, TreeAuxService, TreeAuxStatePort,
+    ZAKURA_STREAM_TREE_AUX,
 };
 use crate::{zakura::testkit::ZakuraTestNode, BoxError};
 
@@ -24,12 +25,14 @@ impl TreeAuxStatePort for InMemoryPort {
         &self,
         start_height: block::Height,
         count: u32,
-    ) -> Vec<BlockCommitmentRoots> {
-        self.0
+    ) -> BoxRunFuture<'static, Vec<BlockCommitmentRoots>> {
+        let roots: Vec<_> = self
+            .0
             .iter()
             .filter(|r| r.height >= start_height && r.height.0 < start_height.0 + count)
             .cloned()
-            .collect()
+            .collect();
+        Box::pin(async move { roots })
     }
 }
 

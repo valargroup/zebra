@@ -18,8 +18,9 @@ use super::{
 
 /// The local-state read path the `tree_aux` server uses to answer `GetRoots`.
 ///
-/// Implemented by the node (in `zebrad`) over `zebra-state`'s `produce_block_roots`;
-/// kept as a trait so `zebra-network` does not depend on `zebra-state`.
+/// Implemented by the node (in `zebrad`) over `zebra-state`'s async read service
+/// (`ReadRequest::BlockRoots`); kept as a trait so `zebra-network` does not depend on
+/// `zebra-state`. Async because the state read goes through the buffered read service.
 pub trait TreeAuxStatePort: Send + Sync + 'static {
     /// Return the per-block roots for `[start_height, start_height + count)` that this
     /// node can serve, in ascending height order. May return fewer than `count` (or an
@@ -28,7 +29,7 @@ pub trait TreeAuxStatePort: Send + Sync + 'static {
         &self,
         start_height: block::Height,
         count: u32,
-    ) -> Vec<BlockCommitmentRoots>;
+    ) -> BoxRunFuture<'static, Vec<BlockCommitmentRoots>>;
 }
 
 /// Advisory frame cap; the authoritative inbound cap is `app_frame_cap_for_stream_kind`.
@@ -113,7 +114,7 @@ impl RequestResponseService for TreeAuxService {
             let fit_by_bytes = (max_message_bytes as usize / 68).max(1) as u32;
             let count = count.min(MAX_TA_ROOTS_PER_REQUEST).min(fit_by_bytes);
 
-            let roots = self.port.read_block_roots(start_height, count);
+            let roots = self.port.read_block_roots(start_height, count).await;
             let response = if roots.is_empty() {
                 TreeAuxMessage::RangeUnavailable {
                     start_height,
@@ -143,12 +144,14 @@ mod tests {
             &self,
             start_height: block::Height,
             count: u32,
-        ) -> Vec<BlockCommitmentRoots> {
-            self.0
+        ) -> BoxRunFuture<'static, Vec<BlockCommitmentRoots>> {
+            let roots: Vec<_> = self
+                .0
                 .iter()
                 .filter(|r| r.height >= start_height && r.height.0 < start_height.0 + count)
                 .cloned()
-                .collect()
+                .collect();
+            Box::pin(async move { roots })
         }
     }
 
