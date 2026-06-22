@@ -168,6 +168,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -175,7 +176,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
         .to_network()
         .expect("failed to build configured network");
     let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
         .ok()
@@ -258,6 +259,37 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                 }
             }
             prop_assert_eq!(error_height, Some(bad_height), "a wrong fixture root is rejected at its own commit");
+
+            // Negative (Orchard, below NU5): no header commits to an Orchard root below
+            // NU5 (V1 history leaves ignore it; no MMR below Heartwood), so the fast path
+            // pins it to the empty-tree root. Corrupt a below-NU5 fixture Orchard root to
+            // a non-empty value. Unlike the Sapling MMR path (one-block lag), this is a
+            // direct check, so it is rejected at the block's *own* commit — closing the
+            // hole where an untrusted source injects a spurious Orchard anchor.
+            let bad_orchard_height = (nu5 - 1) as usize;
+            prop_assert!(bad_orchard_height > seed, "the corrupted height must be in the fast range");
+            let empty_orchard = zebra_chain::orchard::tree::NoteCommitmentTree::default().root();
+            let wrong_orchard = zebra_chain::orchard::tree::Root::try_from([0u8; 32])
+                .expect("zero is a valid pallas base field element");
+            prop_assert_ne!(wrong_orchard, empty_orchard, "the wrong root must differ from the empty-tree root");
+
+            let mut bad_orchard_fixture = fixture.clone();
+            let bad_orchard_entry = bad_orchard_fixture.get_mut(&(bad_orchard_height as u32)).unwrap();
+            prop_assert_eq!(bad_orchard_entry.1, empty_orchard, "a below-NU5 block has the empty Orchard root");
+            bad_orchard_entry.1 = wrong_orchard;
+
+            let mut bad_orchard = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            bad_orchard.enable_vct_fast_fixture(bad_orchard_fixture);
+            let mut orchard_error_height = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                if bad_orchard.commit_finalized_direct(cv.into(), None, None, next, "vct bad orchard").is_err() {
+                    orchard_error_height = Some(i);
+                    break;
+                }
+            }
+            prop_assert_eq!(orchard_error_height, Some(bad_orchard_height), "a wrong below-NU5 orchard root is rejected at its own commit");
     });
 
     Ok(())
@@ -285,6 +317,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -292,7 +325,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
         .to_network()
         .expect("failed to build configured network");
     let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
         .ok()
@@ -408,6 +441,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -415,7 +449,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
         .to_network()
         .expect("failed to build configured network");
     let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
@@ -514,6 +548,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -521,7 +556,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
         .to_network()
         .expect("failed to build configured network");
     let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
@@ -604,6 +639,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             nu6: Some(40),
             nu6_1: Some(45),
             nu6_2: Some(47),
+            nu6_3: Some(48),
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
@@ -611,7 +647,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
         .to_network()
         .expect("failed to build configured network");
     let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
 
     proptest!(ProptestConfig::with_cases(1),
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
