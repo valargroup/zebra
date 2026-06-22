@@ -1442,6 +1442,54 @@ fn sync_range_post_nu62() -> Result<()> {
     sync_confidence_range(SYNC_RANGE_POST_NU62_STOP_HEIGHT)
 }
 
+/// Build a cached state at the top mainnet checkpoint (3,358,006) for the
+/// `pre-nu62` sync-confidence window. Checkpoint sync, so this is fast.
+///
+/// Skipped unless `TEST_GENERATE_SYNC_RANGE_SNAPSHOT` is set. Run via the
+/// `generate-snapshot-pre-nu62` nextest profile in `sync-confidence-snapshots.yml`.
+#[allow(dead_code)]
+#[test]
+fn generate_snapshot_pre_nu62() -> Result<()> {
+    if std::env::var("TEST_GENERATE_SYNC_RANGE_SNAPSHOT").is_err() {
+        tracing::warn!(
+            "Skipped generate_snapshot_pre_nu62, set the TEST_GENERATE_SYNC_RANGE_SNAPSHOT environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    create_cached_database_height(
+        &Mainnet,
+        block::Height(3_358_006),
+        // Use checkpoints to reach the ceiling quickly.
+        true,
+        STOP_AT_HEIGHT_REGEX,
+    )
+}
+
+/// Build a cached state at mainnet height 3,400,000 for the `post-nu62`
+/// sync-confidence window. Checkpoints up to 3,358,006, then full validation.
+///
+/// Skipped unless `TEST_GENERATE_SYNC_RANGE_SNAPSHOT` is set. Run via the
+/// `generate-snapshot-post-nu62` nextest profile in `sync-confidence-snapshots.yml`.
+#[allow(dead_code)]
+#[test]
+fn generate_snapshot_post_nu62() -> Result<()> {
+    if std::env::var("TEST_GENERATE_SYNC_RANGE_SNAPSHOT").is_err() {
+        tracing::warn!(
+            "Skipped generate_snapshot_post_nu62, set the TEST_GENERATE_SYNC_RANGE_SNAPSHOT environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    create_cached_database_height(
+        &Mainnet,
+        block::Height(3_400_000),
+        // Use checkpoints up to the ceiling; blocks above it are validated fully.
+        true,
+        STOP_AT_HEIGHT_REGEX,
+    )
+}
+
 /// Test if `zebrad` can fully sync the chain on mainnet.
 ///
 /// This test takes a long time to run, so we don't run it by default. This test is only executed
