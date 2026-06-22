@@ -9,7 +9,9 @@ use std::{sync::Arc, time::Duration};
 
 use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
 
-use super::{TreeAuxMessage, TreeAuxService, TreeAuxStatePort, ZAKURA_STREAM_TREE_AUX};
+use super::{
+    fetch_roots, TreeAuxMessage, TreeAuxService, TreeAuxStatePort, ZAKURA_STREAM_TREE_AUX,
+};
 use crate::{zakura::testkit::ZakuraTestNode, BoxError};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,6 +106,40 @@ async fn two_nodes_exchange_roots_over_tree_aux() -> Result<(), BoxError> {
         }
         other => panic!("expected Roots over the wire, got {other:?}"),
     }
+
+    client.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// The client driver ([`fetch_roots`]) pulls a multi-request height range from a peer
+/// and delivers it to a sink — the path the node wires to a `PeerSource`. Exercises the
+/// fetch loop (range advance) over the real transport, beyond a single manual request.
+#[tokio::test]
+async fn client_driver_fetches_a_root_range_over_tree_aux() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let served: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let server = tree_aux_node(3, served.clone()).await?;
+    let client = tree_aux_node(4, Vec::new()).await?;
+
+    client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+    // The driver fetches the whole range; the sink collects each delivered batch (as the
+    // node would write each batch into a PeerSource).
+    let mut collected = Vec::new();
+    fetch_roots(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |batch| collected.extend(batch),
+    )
+    .await?;
+
+    assert_eq!(
+        collected, served,
+        "the driver fetched the full range over the wire, matching the server's holdings"
+    );
 
     client.shutdown().await;
     server.shutdown().await;
