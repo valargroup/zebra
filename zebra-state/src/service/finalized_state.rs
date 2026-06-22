@@ -133,6 +133,10 @@ mod zebra_db;
 
 use vct::VctState;
 
+/// The verified-commitment-trees `tree_aux` serving read path (design §9): the per-block
+/// commitment roots for a height range, derived from the per-height trees.
+pub(crate) use commitment_aux::produce_block_roots;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 
