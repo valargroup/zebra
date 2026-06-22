@@ -452,8 +452,13 @@ impl WriteBlockWorkerTask {
             }
             // POC: in verified-commitment-trees fast mode the committer skips the
             // note-commitment frontier entirely, so the off-thread precompute would
-            // just be discarded heat. Skip spawning it so the CPU saving is real.
-            if !finalized_state.vct_fast_enabled() {
+            // just be discarded heat. Skip it only when the *next* block will actually
+            // take the fast path (its roots are already supplied); a legacy-fallback block
+            // (no peer roots yet, or never) still gets the precompute overlap.
+            let next_takes_fast_path = finalized_lookahead
+                .front()
+                .is_some_and(|next| finalized_state.vct_fast_will_apply(next.0.height));
+            if !next_takes_fast_path {
                 if let (Some(trees), Some(next)) = (
                     prev_finalized_note_commitment_trees.as_ref(),
                     finalized_lookahead.front(),
