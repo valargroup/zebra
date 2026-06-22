@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - ironwood-main
+      - adam/sync-confidence-ci # TEMP: branch validation; remove before merge to main
   workflow_dispatch:
 
 permissions: {}

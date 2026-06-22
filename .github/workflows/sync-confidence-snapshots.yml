@@ -2,11 +2,14 @@ name: Sync confidence snapshots
 
 # Manually-run: builds the cached-state tarballs (in Spaces) that
 # sync-confidence.yml restores from. Re-run after the DB format version changes
-# (state objects are keyed by version). post-nu62 syncs genesis->3,400,000 and is
+# (state objects are keyed by version). post-nu62 syncs genesis->3,375,000 and is
 # long-running, so size its droplet for the full finalized state.
 
 on:
   workflow_dispatch:
+  push: # TEMP: branch validation; remove before merge to main
+    branches:
+      - adam/sync-confidence-ci
 
 permissions: {}
 
