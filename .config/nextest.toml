@@ -79,6 +79,26 @@ default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_mainn
 slow-timeout = { period = "60m", terminate-after = 2 }
 default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_testnet)'
 
+[profile.sync-range-pre-nu62]
+slow-timeout = { period = "60m", terminate-after = 2 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=sync_range_pre_nu62)'
+
+[profile.sync-range-post-nu62]
+slow-timeout = { period = "60m", terminate-after = 2 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=sync_range_post_nu62)'
+
+[profile.generate-snapshot-pre-nu62]
+slow-timeout = { period = "240m", terminate-after = 1 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=generate_snapshot_pre_nu62)'
+
+[profile.generate-snapshot-post-nu62]
+slow-timeout = { period = "600m", terminate-after = 1 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=generate_snapshot_post_nu62)'
+
 [profile.generate-checkpoints-mainnet]
 slow-timeout = { period = "90m", terminate-after = 1 }
 success-output = "immediate"
