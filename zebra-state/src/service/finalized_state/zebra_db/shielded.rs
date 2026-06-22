@@ -474,15 +474,14 @@ impl ZebraDb {
     // Ironwood trees
 
     /// Returns the Ironwood note commitment tree of the finalized tip or the
-    /// empty tree if the state is empty.
+    /// empty tree if the state is empty or Ironwood is not active.
     pub fn ironwood_tree_for_tip(&self) -> Arc<ironwood::tree::NoteCommitmentTree> {
         let height = match self.finalized_tip_height() {
             Some(h) => h,
             None => return Default::default(),
         };
 
-        self.ironwood_tree_by_height(&height)
-            .expect("Ironwood note commitment tree must exist if there is a finalized tip")
+        self.ironwood_tree_by_height(&height).unwrap_or_default()
     }
 
     /// Returns the Ironwood note commitment tree matching the given block height,
@@ -500,12 +499,11 @@ impl ZebraDb {
 
         let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
 
-        let (_first_duplicate_height, tree) = self
-            .db
-            .zs_prev_key_value_back_from(&ironwood_trees, height)
-            .expect(
-                "Ironwood note commitment trees must exist for all heights below the finalized tip",
-            );
+        let Some((_first_duplicate_height, tree)) =
+            self.db.zs_prev_key_value_back_from(&ironwood_trees, height)
+        else {
+            return Some(Default::default());
+        };
 
         Some(Arc::new(tree))
     }
@@ -705,7 +703,7 @@ impl DiskWriteBatch {
         }
 
         // Store the Ironwood tree, anchor, and any new subtrees only if they have changed.
-        if height.is_min() || prev_ironwood_tree != note_commitment_trees.ironwood {
+        if prev_ironwood_tree != note_commitment_trees.ironwood {
             self.create_ironwood_tree(zebra_db, height, &note_commitment_trees.ironwood);
 
             if let Some(subtree) = note_commitment_trees.ironwood_subtree {
