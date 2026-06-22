@@ -110,13 +110,10 @@ pub struct Config {
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
-    /// POC: skip the per-block note-commitment frontier recompute below the last
-    /// checkpoint, folding fixture-supplied roots into the anchor set and history
-    /// tree instead (see `docs/design/verified-commitment-trees-poc.md`).
-    ///
-    /// Default off. This is an experiment behind a flag; it trusts a recorded
-    /// fixture (path in `VCT_FIXTURE`) and is NOT shippable. `serde(skip)`
-    /// so it is not a user-facing setting.
+    /// Override for fast mode: skip
+    /// the per-block note-commitment frontier recompute below the last checkpoint,
+    /// folding fixture-supplied roots into the anchor set and history tree instead
+    /// Default is false.
     #[serde(skip)]
     pub enable_verified_commitment_trees: bool,
 
