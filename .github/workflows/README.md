@@ -162,8 +162,7 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Deploy integration tests** (`zfnd-deploy-integration-tests-gcp.yml`): Orchestrates GCP VMs and test runs
 - **Deploy nodes** (`zfnd-deploy-nodes-gcp.yml`): Provision long-lived nodes
 - **Delete GCP resources** (`zfnd-delete-gcp-resources.yml`): Cleanup utilities
-- **Sync confidence snapshots** (`sync-confidence-snapshots.yml`): Manually builds the Spaces cached-state tarballs the Sync Confidence job restores from (rerun after a database format version bump).
-- **DO sync test** (`do-sync-test.yml`): Reusable - provisions one ephemeral DO droplet, runs a sync-confidence window (consume) or builds a snapshot (generate), then deletes the droplet.
+- **DO sync test** (`do-sync-test.yml`): Reusable - provisions one ephemeral DO droplet, restores a pruned cached state from Spaces, runs a sync-confidence window, then deletes the droplet.
 - Helper scripts in `.github/workflows/scripts/` used by the above
 
 ## Test Execution Strategy

@@ -15,19 +15,20 @@ state objects after a DB format-version bump by re-running the snapshots workflo
   in DO (`doctl compute ssh-key import ci-key --public-key-file ci-key.pub`, then
   `doctl compute ssh-key list`).
 
-## First run
-1. Confirm 3,380,000 <= current mainnet head (else lower the post-nu62 heights in
-   `zebrad/tests/acceptance.rs` + regenerate).
-2. Run **Sync confidence snapshots** (Actions -> Run workflow). On the very first
-   run the GHCR image package (`zebra-tests`) is created **private**, so the
-   droplet's anonymous `docker pull` fails. The package only exists after that
-   first push, so afterwards make it public: GitHub -> the org/user **Packages**
-   -> `zebra-tests` -> Package settings -> Change visibility -> **Public**. Then
-   re-run the workflow to seed the two state tarballs in Spaces. The post-nu62
-   generate job syncs genesis->3.4M and is long; size its droplet for the full
-   finalized state (see `droplet_size`).
-3. Once snapshots exist and the package is public, **Sync confidence** runs on
-   merge to `ironwood-main` and via manual dispatch.
+## Seed the snapshots (one-time, and after a DB format-version bump)
+1. On a host with ~750 GB-1 TB of free disk and the Zebra build deps, run
+   `.github/workflows/scripts/make-sync-confidence-snapshots.sh` (point `SNAP_URL`
+   at a recent full mainnet snapshot, `REPO` at this checkout, and configure
+   `s3cmd` for the destination Space). It rewinds the snapshot to each window
+   start, prunes, and uploads `pre-nu62`/`post-nu62` tarballs to the Space.
+2. Make the GHCR image public: GitHub -> the org's **Packages** -> `zebra-tests`
+   -> Package settings -> Change visibility -> **Public** (created on the first
+   `Sync confidence` run; droplets pull it anonymously).
+
+## Running
+Once the snapshots exist and the package is public, **Sync confidence** runs on
+merge to `ironwood-main` and via manual dispatch; each window restores its pruned
+tarball and syncs its 5k-block range.
 
 ## Cost note
 Droplets are deleted after each run (`if: always()` + a 1h orphan sweep). If a run
