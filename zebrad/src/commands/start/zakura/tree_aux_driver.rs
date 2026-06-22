@@ -2,7 +2,7 @@
 //!
 //! Serving side: [`StateTreeAuxPort`] answers inbound `GetRoots` from local state via
 //! [`ReadRequest::BlockRoots`]. Client side: [`run_tree_aux_driver`] fetches the per-block
-//! commitment roots for the genesis→checkpoint range from a peer and writes them into the
+//! commitment roots for the verified-tip→checkpoint range from a peer and writes them into the
 //! committer's cache ([`TreeAuxRootsWriter`]) *ahead of* body commit, so the fast path can
 //! fold them in at commit time. The handoff frontier is embedded in the binary, so only
 //! roots travel over the wire.
@@ -16,6 +16,8 @@ use tower::{Service, ServiceExt};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zebra_network::zakura::{fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle};
 use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
+
+use super::frontier::verified_block_tip_from_state;
 
 /// Delay between driver attempts while waiting for a peer, or after a fetch error.
 const TREE_AUX_DRIVER_RETRY: Duration = Duration::from_secs(5);
@@ -82,20 +84,35 @@ where
     }
 }
 
-/// Fetch the genesis→checkpoint per-block roots from a peer into the committer's cache.
+/// Fetch the verified-tip→checkpoint per-block roots from a peer into the committer's cache.
 ///
-/// Minimal POC driver: once an outbound peer is available, fetch the whole checkpoint
-/// range and write each batch into `writer` ahead of body commit, then stop. Retries on a
-/// fetch error or while no peer is connected. Because header sync runs ahead of bodies,
-/// the cache is filled before the committer reaches a height; a height the peer cannot
-/// supply simply stays in legacy mode (safe by construction — never wrong state).
+/// Once an outbound peer is available, fetch the roots the committer still
+/// needs — the range from this node's verified tip up to the checkpoint — and write each batch
+/// into `writer` ahead of body commit, then stop. Retries on a fetch error or while no peer is
+/// connected. Because header sync runs ahead of bodies, the cache is filled before the committer
+/// reaches a height; a height the peer cannot supply simply stays in legacy mode (safe by
+/// construction — never wrong state).
+///
+/// The fetch starts at `verified_tip + 1`, not genesis: heights at or below the verified tip are
+/// already committed, so their roots are never looked up. Fetching from genesis on a node that
+/// starts above it (e.g. a snapshot) would spend the whole fetch on already-committed heights and
+/// never cache the window roots before the committer reaches them — every block would then fall
+/// back to legacy recompute.
 pub(crate) async fn run_tree_aux_driver(
     supervisor: ZakuraSupervisorHandle,
     writer: TreeAuxRootsWriter,
     network: Network,
+    read_state: ReadStateService,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     let handoff = network.checkpoint_list().max_height();
+
+    // The first root the committer still needs: one above the current verified tip. Read once at
+    // startup; the fetched range stays a superset of what the committer will commit even if it
+    // advances meanwhile (extra cached roots below its position are harmless).
+    let finalized_tip = read_state_tip(&read_state, ReadRequest::FinalizedTip).await;
+    let tip = read_state_tip(&read_state, ReadRequest::Tip).await;
+    let from = root_fetch_start(finalized_tip, tip, &network);
 
     let driver = async {
         loop {
@@ -105,7 +122,7 @@ pub(crate) async fn run_tree_aux_driver(
                 continue;
             }
 
-            let result = fetch_roots(&supervisor, block::Height(1), handoff, |batch| {
+            let result = fetch_roots(&supervisor, from, handoff, |batch| {
                 writer.insert_roots(batch);
             })
             .await;
@@ -113,8 +130,9 @@ pub(crate) async fn run_tree_aux_driver(
             match result {
                 Ok(()) => {
                     tracing::info!(
+                        from_height = from.0,
                         handoff_height = handoff.0,
-                        "tree_aux: fetched genesis→checkpoint roots from peer into the committer cache"
+                        "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
                     );
                     break;
                 }
@@ -131,6 +149,40 @@ pub(crate) async fn run_tree_aux_driver(
         _ = driver => {}
         _ = &mut shutdown => {
             tracing::info!("tree_aux driver shutting down");
+        }
+    }
+}
+
+/// The first height the committer still needs roots for: one above the node's verified tip
+/// (`max(finalized_tip, best_tip)`). Heights at or below the verified tip are already committed, so
+/// their roots are never looked up — re-fetching them is wasted and, on a node that starts well
+/// above genesis, starves the roots it actually needs. Returns `Height(1)` only for a genesis-empty
+/// node, i.e. "fetch from genesis" falls out exactly when the node really is at genesis.
+fn root_fetch_start(
+    finalized_tip: Option<(block::Height, block::Hash)>,
+    tip: Option<(block::Height, block::Hash)>,
+    network: &Network,
+) -> block::Height {
+    let empty_state_tip = (block::Height(0), network.genesis_hash());
+    let (verified_tip, _) = verified_block_tip_from_state(finalized_tip, tip, empty_state_tip);
+    block::Height(verified_tip.0.saturating_add(1))
+}
+
+/// Read a finalized/verified tip height+hash via a one-shot state read, returning `None` on any
+/// error or unexpected response (the caller then treats the tip as the empty-state genesis).
+async fn read_state_tip(
+    read_state: &ReadStateService,
+    request: ReadRequest,
+) -> Option<(block::Height, block::Hash)> {
+    match read_state.clone().oneshot(request).await {
+        Ok(ReadResponse::FinalizedTip(tip)) | Ok(ReadResponse::Tip(tip)) => tip,
+        Ok(response) => {
+            tracing::warn!(?response, "tree_aux: unexpected tip response");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(?error, "tree_aux: failed to read tip for root-fetch start");
+            None
         }
     }
 }
@@ -312,5 +364,30 @@ mod tests {
         client.shutdown().await;
         server.shutdown().await;
         Ok(())
+    }
+
+    #[test]
+    fn root_fetch_start_is_one_above_the_verified_tip() {
+        let net = Network::Mainnet;
+        let h = block::Height;
+        // The hash is irrelevant to the height math; reuse the genesis hash.
+        let at = |n| Some((h(n), net.genesis_hash()));
+
+        // Genesis-empty node: fetch from height 1 — the only case where "from genesis" is correct.
+        assert_eq!(root_fetch_start(None, None, &net), h(1));
+
+        // Snapshot node at T (finalized == best tip): fetch from T + 1, NOT genesis. This is the
+        // regression this guards: the old driver hard-coded Height(1), refetching ~T already-held
+        // roots and starving the window the committer actually needs.
+        assert_eq!(
+            root_fetch_start(at(3_338_006), at(3_338_006), &net),
+            h(3_338_007)
+        );
+
+        // Non-finalized blocks above the finalized tip: the verified tip is the higher best tip.
+        assert_eq!(root_fetch_start(at(100), at(105), &net), h(106));
+
+        // Finalized tip above the best-chain tip: use the finalized tip.
+        assert_eq!(root_fetch_start(at(200), at(150), &net), h(201));
     }
 }
