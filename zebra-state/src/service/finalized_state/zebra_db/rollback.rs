@@ -27,7 +27,7 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::{
         finalized_state::{
-            disk_db::{DiskWriteBatch, WriteDisk},
+            disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
             disk_format::{
                 transparent::{
                     AddressBalanceLocation, AddressTransaction, AddressUnspentOutput,
@@ -470,6 +470,12 @@ fn prepare_rollback(
         removed_blocks.push(semantically_verified);
     }
 
+    // The Zakura header store races ahead of the body chain and is keyed independently of the
+    // block CFs above, so roll it back too: otherwise the rolled-back database keeps a Zakura
+    // header tip far above the new body tip, which starves Zakura block-sync (the floor body
+    // becomes un-requestable; see BUG_SUMMARY.md / `delete_zakura_headers_above`).
+    delete_zakura_headers_above(db, &mut batch, options.target_height);
+
     let target_treestate = prepare_target_treestate(
         db,
         network,
@@ -841,6 +847,38 @@ fn delete_shielded_block(db: &ZebraDb, batch: &mut DiskWriteBatch, block: &Block
         for nullifier in transaction.orchard_nullifiers() {
             batch.zs_delete(&orchard_nullifiers, nullifier);
         }
+    }
+}
+
+/// Roll the Zakura header store back so it is consistent with `target_height`.
+///
+/// The block CFs rolled back above are keyed by the body chain, but the Zakura header store
+/// (`zakura_header_*`) is maintained independently and races ahead of bodies. Rollback otherwise
+/// leaves it untouched, so a rolled-back database keeps header rows — and a `BestHeaderTip` — far
+/// above the new body tip. That inconsistency starves Zakura block-sync: `missing_block_bodies`
+/// only offers heights that already have a stored header, so the contiguous floor body
+/// (`target_height + 1`) is never requestable and body-sync stalls until it times out and falls
+/// back to legacy ChainSync. Delete every Zakura header entry above `target_height`, scanning from
+/// the (possibly higher) Zakura header tip down.
+fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_height: Height) {
+    let hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+    let height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
+    let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+    let body_size_by_height = db.db.cf_handle("zakura_header_body_size_by_height").unwrap();
+
+    let Some((tip_height, _tip_hash)) =
+        db.db.zs_last_key_value::<_, Height, block::Hash>(&hash_by_height)
+    else {
+        return;
+    };
+
+    for height in ((target_height.0 + 1)..=tip_height.0).map(Height) {
+        if let Some(hash) = db.db.zs_get::<_, _, block::Hash>(&hash_by_height, &height) {
+            batch.zs_delete(&height_by_hash, hash);
+        }
+        batch.zs_delete(&hash_by_height, height);
+        batch.zs_delete(&header_by_height, height);
+        batch.zs_delete(&body_size_by_height, height);
     }
 }
 
