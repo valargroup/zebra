@@ -1,0 +1,57 @@
+name: Sync confidence snapshots
+
+# Builds the cached-state snapshot disks that `sync-confidence.yml` restores from.
+# Run manually to seed the disks the first time, and again after the database
+# format version (LOCAL_STATE_VERSION in zebra-state/src/constants.rs) changes —
+# disk images are keyed by state version, so a bump invalidates the old images.
+#
+# pre-nu62 is a fast checkpoint sync to 3,358,006.
+# post-nu62 syncs to 3,400,000 (checkpoints to 3,358,006, then ~42k full-validation
+# blocks) and can run for a while; it is marked is_long_test.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  generate-pre-nu62:
+    name: Generate pre-NU6.2 snapshot (height 3,358,006)
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    secrets:
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+    with:
+      app_name: zebrad
+      test_id: generate-snapshot-pre-nu62
+      test_description: Build cached state at the top mainnet checkpoint (3,358,006)
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=generate-snapshot-pre-nu62,TEST_GENERATE_SYNC_RANGE_SNAPSHOT=1"
+      network: Mainnet
+      needs_zebra_state: false
+      saves_to_disk: true
+      force_save_to_disk: true
+      disk_suffix: synctest-pre-nu62
+      height_grep_text: 'current_height.*=.*Height.*\('
+
+  generate-post-nu62:
+    name: Generate post-NU6.2 snapshot (height 3,400,000)
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
+    secrets:
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+    with:
+      app_name: zebrad
+      test_id: generate-snapshot-post-nu62
+      test_description: Build cached state at mainnet height 3,400,000
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=generate-snapshot-post-nu62,TEST_GENERATE_SYNC_RANGE_SNAPSHOT=1"
+      network: Mainnet
+      needs_zebra_state: false
+      saves_to_disk: true
+      force_save_to_disk: true
+      disk_suffix: synctest-post-nu62
+      is_long_test: true
+      height_grep_text: 'current_height.*=.*Height.*\('
