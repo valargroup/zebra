@@ -7,7 +7,8 @@
 //! fold them in at commit time. The handoff frontier is embedded in the binary, so only
 //! roots travel over the wire.
 //!
-//! Gated on the `VCT_PEER` experiment toggle; a no-op in the default configuration.
+//! Runs when the state committer exposes a `tree_aux` roots writer. On Mainnet this
+//! is the default fast path; `VCT_LEGACY` opts out to the legacy recompute path.
 
 use std::time::Duration;
 
