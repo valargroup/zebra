@@ -16,6 +16,8 @@ use super::{
 };
 
 mod service;
+#[cfg(test)]
+mod tests;
 mod wire;
 
 pub use service::{TreeAuxService, TreeAuxStatePort};
