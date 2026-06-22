@@ -4,6 +4,7 @@ use std::{
     fmt,
     future::Future,
     mem,
+    ops::Deref,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -99,8 +100,19 @@ lazy_static::lazy_static! {
     since = "8.0.0",
     note = "use VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD instead"
 )]
-pub static VERIFYING_KEY_POST_NU6_2: Lazy<ItemVerifyingKey> =
-    Lazy::new(|| ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2));
+pub static VERIFYING_KEY_POST_NU6_2: DeprecatedPostNu6_2VerifyingKey =
+    DeprecatedPostNu6_2VerifyingKey;
+
+/// Compatibility wrapper for the deprecated post-NU6.2 verifying key name.
+pub struct DeprecatedPostNu6_2VerifyingKey;
+
+impl Deref for DeprecatedPostNu6_2VerifyingKey {
+    type Target = ItemVerifyingKey;
+
+    fn deref(&self) -> &Self::Target {
+        &VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD
+    }
+}
 
 /// A Halo2 verification item, used as the request type of the service.
 ///
@@ -258,8 +270,18 @@ pub static VERIFIER_V5_ORCHARD_NU6_2_ONWARD: Lazy<VerifierService> =
 
 /// Deprecated compatibility name for [`VERIFIER_V5_ORCHARD_NU6_2_ONWARD`].
 #[deprecated(since = "8.0.0", note = "use VERIFIER_V5_ORCHARD_NU6_2_ONWARD instead")]
-pub static VERIFIER_POST_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD));
+pub static VERIFIER_POST_NU6_2: DeprecatedPostNu6_2Verifier = DeprecatedPostNu6_2Verifier;
+
+/// Compatibility wrapper for the deprecated post-NU6.2 verifier name.
+pub struct DeprecatedPostNu6_2Verifier;
+
+impl Deref for DeprecatedPostNu6_2Verifier {
+    type Target = VerifierService;
+
+    fn deref(&self) -> &Self::Target {
+        &VERIFIER_V5_ORCHARD_NU6_2_ONWARD
+    }
+}
 
 /// Global batch verification context for **V6/Ironwood** Halo2 Action proofs.
 ///

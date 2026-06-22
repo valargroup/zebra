@@ -109,6 +109,24 @@ async fn verifier_routes_each_transaction_format_to_the_correct_key() {
     let v6_orchard_and_ironwood_nu6_3_onward: &'static super::VerifierService =
         &VERIFIER_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD;
 
+    #[allow(deprecated)]
+    {
+        assert!(
+            std::ptr::eq(
+                &*super::VERIFYING_KEY_POST_NU6_2,
+                &*VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD
+            ),
+            "deprecated post-NU6.2 key name must deref to the V5 Orchard NU6.2+ key"
+        );
+
+        assert!(
+            std::ptr::eq(&*super::VERIFIER_POST_NU6_2, v5_orchard_nu6_2_onward),
+            "deprecated post-NU6.2 verifier name must deref to the V5 Orchard NU6.2+ verifier"
+        );
+
+        let _: super::VerifierService = super::VERIFIER_POST_NU6_2.clone();
+    }
+
     // Everything before NU6.2 (including upgrades from before Orchard existed) routes to the
     // insecure key, which is the only key any pre-NU6.2 Orchard history verifies under.
     for nu in [
