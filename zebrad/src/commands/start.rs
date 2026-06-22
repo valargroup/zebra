@@ -704,6 +704,7 @@ impl StartCmd {
                             endpoint.supervisor(),
                             writer,
                             config.network.network.clone(),
+                            read_only_state_service.clone(),
                             shutdown.clone().cancelled_owned(),
                         )
                         .in_current_span(),
