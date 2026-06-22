@@ -28,7 +28,7 @@ use zebra_chain::parallel::tree::NoteCommitmentTrees;
 use zebra_chain::{block, orchard, parameters::Network, sapling, sprout};
 
 use super::{
-    commitment_aux::{CommitmentRootSource, FinalFrontiers, FixtureSource},
+    commitment_aux::{install_peer_source, CommitmentRootSource, FinalFrontiers, FixtureSource},
     FromDisk, IntoDisk,
 };
 
@@ -85,9 +85,9 @@ impl VctState {
             Mutex::new(std::io::BufWriter::new(file))
         });
 
-        let mut roots = HashMap::new();
-        let mut fast = false;
-        let mut frontiers = None;
+        // Fixture fast mode (explicit): replay per-block roots recorded in a local fixture
+        // (`VCT_FAST` + `VCT_FIXTURE`). Takes precedence over the peer-source default so a
+        // developer can pin a known fixture instead of fetching from peers.
         if fast_flag {
             let path = std::env::var_os("VCT_FIXTURE")
                 .expect("enable_verified_commitment_trees requires VCT_FIXTURE");
@@ -101,42 +101,71 @@ impl VctState {
                 0,
                 "corrupt VCT fixture: length not a multiple of {VCT_RECORD_LEN}"
             );
+            let mut roots = HashMap::new();
             for rec in bytes.chunks_exact(VCT_RECORD_LEN) {
                 let height = u32::from_le_bytes(rec[0..4].try_into().expect("4 bytes"));
                 let sap = <sapling::tree::Root as FromDisk>::from_bytes(&rec[4..36]);
                 let orch = <orchard::tree::Root as FromDisk>::from_bytes(&rec[36..68]);
                 roots.insert(height, (sap, orch));
             }
-            fast = true;
-
             let parsed = embedded_final_frontiers(network).unwrap_or_else(|| {
                 panic!("VCT fast mode requires embedded final frontiers for {network}")
             });
             tracing::info!(
                 handoff_height = parsed.height.0,
-                "VCT: loaded embedded final frontiers, checkpoint handoff enabled"
-            );
-            frontiers = Some(parsed);
-
-            tracing::info!(
                 fixture_roots = roots.len(),
-                "VCT: loaded fixture, fast (skip-recompute) mode enabled"
+                "VCT: loaded fixture + embedded final frontiers, fast (skip-recompute) mode enabled"
             );
+            return Some(Arc::new(VctState {
+                fast: true,
+                source: Box::new(FixtureSource::new(roots, Some(parsed))),
+                capture,
+                fast_count: AtomicU64::new(0),
+                prevalidated_count: AtomicU64::new(0),
+            }));
         }
 
-        if capture.is_none() && !fast {
+        // Capture mode (explicit): a legacy sync that records each committed block's roots
+        // to a fixture. Recording requires the legacy recompute, so it overrides the
+        // peer-source default (which would skip the recompute and capture nothing).
+        if capture.is_some() {
+            tracing::info!("VCT: capture mode enabled (recording per-block roots, legacy commit)");
+            return Some(Arc::new(VctState {
+                fast: false,
+                source: Box::new(FixtureSource::new(HashMap::new(), None)),
+                capture,
+                fast_count: AtomicU64::new(0),
+                prevalidated_count: AtomicU64::new(0),
+            }));
+        }
+
+        // Default: the peer (`tree_aux`) source on any network with embedded final frontiers
+        // (Mainnet). Per-block roots arrive from peers into a shared cache filled by the
+        // driver; the committer reads them per height and folds them in, skipping the
+        // recompute. A height the peer cannot supply — or any node with no serving peers —
+        // simply stays in legacy mode, bit-identical to a legacy committer by construction
+        // (the precompute overlap is preserved for those blocks; see `vct_fast_will_apply`).
+        // Opt out with `VCT_LEGACY` for a pure legacy committer (benchmarks, capture runs).
+        if std::env::var_os("VCT_LEGACY").is_some() {
             return None;
         }
-        if capture.is_some() {
-            tracing::info!("VCT: capture mode enabled (recording per-block roots)");
+        match embedded_final_frontiers(network) {
+            Some(parsed) => {
+                tracing::info!(
+                    handoff_height = parsed.height.0,
+                    "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
+                );
+                Some(Arc::new(VctState {
+                    fast: true,
+                    source: Box::new(install_peer_source(Some(parsed))),
+                    capture: None,
+                    fast_count: AtomicU64::new(0),
+                    prevalidated_count: AtomicU64::new(0),
+                }))
+            }
+            // No embedded frontiers (e.g. Testnet): legacy committer.
+            None => None,
         }
-        Some(Arc::new(VctState {
-            fast,
-            source: Box::new(FixtureSource::new(roots, frontiers)),
-            capture,
-            fast_count: AtomicU64::new(0),
-            prevalidated_count: AtomicU64::new(0),
-        }))
     }
 
     /// `true` when the fast (skip-recompute) path is active.

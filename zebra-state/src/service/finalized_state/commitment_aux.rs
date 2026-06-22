@@ -17,7 +17,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 use zebra_chain::{block, orchard, sapling, sprout};
@@ -237,9 +237,8 @@ pub(super) struct PeerSource {
 
 /// Write handle for a [`PeerSource`]: the driver fills the shared cache as verified root
 /// ranges arrive. Cloneable so the driver and source share one cache.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(super) struct PeerSourceWriter {
+pub(crate) struct PeerSourceWriter {
     roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
 }
 
@@ -259,16 +258,41 @@ impl PeerSource {
     }
 }
 
-#[allow(dead_code)]
 impl PeerSourceWriter {
     /// Insert verified roots fetched for a range into the shared cache (idempotent;
     /// last write wins per height).
-    pub(super) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
+    pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
         let mut map = self.roots.write().expect("peer source roots lock poisoned");
         for r in roots {
             map.insert(r.height.0, (r.sapling_root, r.orchard_root));
         }
     }
+}
+
+/// Process-global handle to the live peer-source writer, published once when the
+/// committer is built in peer (`tree_aux`) mode. The `tree_aux` driver in `zebrad`
+/// fetches it to fill the committer's root cache as ranges arrive from peers.
+///
+/// A process global (rather than threading a writer return value back out through the
+/// state-service init) keeps the experimental verified-commitment-trees wiring off the
+/// production state-init signatures, matching the env-driven style of [`super::vct`].
+static PEER_ROOTS_WRITER: OnceLock<PeerSourceWriter> = OnceLock::new();
+
+/// Build a [`PeerSource`] over the embedded handoff `frontiers` and publish its writer
+/// globally so the `tree_aux` driver can fill it. Returns the source for the committer.
+///
+/// First writer wins: a second committer build (e.g. a test re-init in the same process)
+/// reuses the originally published cache handle, so the driver and committer never split.
+pub(super) fn install_peer_source(frontiers: Option<FinalFrontiers>) -> PeerSource {
+    let (source, writer) = PeerSource::new(frontiers);
+    let _ = PEER_ROOTS_WRITER.set(writer);
+    source
+}
+
+/// The live peer-source writer, if the committer was built in peer (`tree_aux`) mode.
+/// Used by the `tree_aux` driver to write fetched root ranges into the committer's cache.
+pub(crate) fn peer_roots_writer() -> Option<PeerSourceWriter> {
+    PEER_ROOTS_WRITER.get().cloned()
 }
 
 impl CommitmentRootSource for PeerSource {

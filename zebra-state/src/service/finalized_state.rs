@@ -137,6 +137,10 @@ use vct::VctState;
 /// commitment roots for a height range, derived from the per-height trees.
 pub(crate) use commitment_aux::produce_block_roots;
 
+/// The verified-commitment-trees `tree_aux` peer-source write handle and its global
+/// accessor: the driver in `zebrad` fills the committer's root cache through this.
+pub(crate) use commitment_aux::{peer_roots_writer, PeerSourceWriter};
+
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 
@@ -1064,11 +1068,15 @@ impl FinalizedState {
         result.map(|hash| (hash, note_commitment_trees))
     }
 
-    /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path is
-    /// active, so callers (e.g. the write loop) can also skip the off-thread note
-    /// precompute, whose result the fast committer would discard.
-    pub(crate) fn vct_fast_enabled(&self) -> bool {
-        self.vct.as_ref().is_some_and(|v| v.is_fast())
+    /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will
+    /// apply to `height` — i.e. fast mode is active *and* the source already holds this
+    /// height's roots, so the committer will fold them in and skip the frontier recompute.
+    /// The write loop uses this to skip the off-thread note precompute only when its result
+    /// would be discarded; a legacy-fallback block (root not supplied) still precomputes.
+    pub(crate) fn vct_fast_will_apply(&self, height: block::Height) -> bool {
+        self.vct
+            .as_ref()
+            .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
     }
 
     /// Test-only: enable verified-commitment-trees fast mode with an in-memory

@@ -10,6 +10,7 @@ use zebra_network::zakura::{
 pub(crate) mod block_sync_driver;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
+pub(crate) mod tree_aux_driver;
 
 pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub(crate) use header_sync_driver::{
     drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
     zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
 };
+pub(crate) use tree_aux_driver::{run_tree_aux_driver, StateTreeAuxPort};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
