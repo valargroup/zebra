@@ -21,6 +21,7 @@ use zebra_chain::{
     block::Height,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
+    parameters::NetworkUpgrade,
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::Transaction,
@@ -678,6 +679,11 @@ impl DiskWriteBatch {
             || zebra_db.ironwood_tree_for_tip(),
             |prev_trees| prev_trees.ironwood.clone(),
         );
+        let ironwood_activation_height =
+            NetworkUpgrade::Nu6_3.activation_height(&zebra_db.network());
+        let is_ironwood_active = ironwood_activation_height
+            .is_some_and(|activation_height| *height >= activation_height);
+        let is_ironwood_activation_height = ironwood_activation_height == Some(*height);
 
         // Update the Sprout tree and store its anchor only if it has changed
         if height.is_min() || prev_sprout_tree != note_commitment_trees.sprout {
@@ -703,7 +709,10 @@ impl DiskWriteBatch {
         }
 
         // Store the Ironwood tree, anchor, and any new subtrees only if they have changed.
-        if prev_ironwood_tree != note_commitment_trees.ironwood {
+        if is_ironwood_active
+            && (is_ironwood_activation_height
+                || prev_ironwood_tree != note_commitment_trees.ironwood)
+        {
             self.create_ironwood_tree(zebra_db, height, &note_commitment_trees.ironwood);
 
             if let Some(subtree) = note_commitment_trees.ironwood_subtree {

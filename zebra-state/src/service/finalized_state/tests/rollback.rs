@@ -1127,11 +1127,10 @@ fn rollback_prunes_subtrees_above_target() {
     );
 }
 
-/// If Ironwood has activated but no Ironwood note has changed the tree yet, finalized state can
-/// legitimately have no Ironwood tree rows. Rollback should rebuild history roots using the empty
-/// Ironwood root in that activation window.
+/// When Ironwood activates, finalized state stores the empty tree and anchor even before any
+/// Ironwood note changes the tree. Rollback should preserve that activation-window empty root.
 #[test]
-fn modern_rollback_uses_empty_ironwood_root_when_tree_is_absent() -> Result<()> {
+fn modern_rollback_preserves_empty_ironwood_activation_tree() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     let network = modern_rollback_network();
@@ -1158,11 +1157,22 @@ fn modern_rollback_uses_empty_ironwood_root_when_tree_is_absent() -> Result<()> 
 
             {
                 let db = open_unchecked_db(&config, &network);
+                let Some((height, ironwood_tree)) =
+                    db.ironwood_tree_by_height_range(..=target_height).last()
+                else {
+                    prop_assert!(false, "NU6.3 activation stores the empty Ironwood tree");
+                    return Ok(());
+                };
+
+                prop_assert_eq!(height, target_height);
+                prop_assert_eq!(
+                    ironwood_tree.root(),
+                    ironwood::tree::NoteCommitmentTree::default().root(),
+                    "activation Ironwood tree is empty"
+                );
                 prop_assert!(
-                    db.ironwood_tree_by_height_range(..=target_height)
-                        .next()
-                        .is_none(),
-                    "test setup should not store Ironwood rows before the first Ironwood note"
+                    db.contains_ironwood_anchor(&ironwood_tree.root()),
+                    "activation Ironwood anchor is indexed"
                 );
             }
 
@@ -1175,14 +1185,14 @@ fn modern_rollback_uses_empty_ironwood_root_when_tree_is_absent() -> Result<()> 
                     max_checkpoint_height: None,
                 },
             )
-            .expect("rollback succeeds with no stored Ironwood tree rows");
+            .expect("rollback succeeds in the empty Ironwood activation window");
 
             let rolled = open_unchecked_db(&config, &network);
             prop_assert_eq!(rolled.tip().map(|(height, _hash)| height), Some(target_height));
             prop_assert_eq!(
                 rolled.ironwood_tree_for_tip().root(),
                 ironwood::tree::NoteCommitmentTree::default().root(),
-                "missing Ironwood tree rows resolve to the empty tree"
+                "rollback preserves the empty Ironwood activation tree"
             );
         }
     );
