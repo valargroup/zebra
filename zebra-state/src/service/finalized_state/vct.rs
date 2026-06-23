@@ -290,6 +290,19 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
 mod tests {
     use super::*;
 
+    const EXPECTED_MAINNET_FINAL_SAPLING_ROOT: [u8; 32] = [
+        5, 88, 219, 64, 134, 21, 57, 124, 234, 59, 83, 8, 7, 143, 19, 29, 247, 58, 105, 80, 119,
+        139, 242, 243, 206, 137, 211, 94, 151, 126, 154, 13,
+    ];
+    const EXPECTED_MAINNET_FINAL_ORCHARD_ROOT: [u8; 32] = [
+        177, 173, 139, 203, 63, 186, 47, 172, 148, 107, 150, 204, 211, 212, 33, 155, 172, 108, 132,
+        148, 70, 210, 120, 97, 219, 160, 58, 242, 198, 124, 44, 3,
+    ];
+    const EXPECTED_MAINNET_FINAL_SPROUT_ROOT: [u8; 32] = [
+        77, 239, 224, 205, 90, 67, 51, 216, 15, 139, 120, 78, 55, 17, 177, 22, 246, 34, 206, 184,
+        49, 7, 97, 172, 28, 178, 69, 208, 13, 101, 55, 169,
+    ];
+
     #[test]
     fn source_mode_precedence() {
         use SourceMode::*;
@@ -317,9 +330,21 @@ mod tests {
             Network::Mainnet.checkpoint_list().max_height(),
             "embedded frontier is tied to the last mainnet checkpoint"
         );
-        let _sapling_root = frontiers.sapling.root();
-        let _orchard_root = frontiers.orchard.root();
-        let _sprout_root = frontiers.sprout.root();
+        assert_eq!(
+            <[u8; 32]>::from(frontiers.sapling.root()),
+            EXPECTED_MAINNET_FINAL_SAPLING_ROOT,
+            "embedded mainnet final Sapling frontier root is pinned"
+        );
+        assert_eq!(
+            <[u8; 32]>::from(frontiers.orchard.root()),
+            EXPECTED_MAINNET_FINAL_ORCHARD_ROOT,
+            "embedded mainnet final Orchard frontier root is pinned"
+        );
+        assert_eq!(
+            <[u8; 32]>::from(frontiers.sprout.root()),
+            EXPECTED_MAINNET_FINAL_SPROUT_ROOT,
+            "embedded mainnet final Sprout frontier root is pinned"
+        );
     }
 
     #[test]
