@@ -125,8 +125,10 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
 ) -> Result<(), ValidateContextError> {
     // At/above NU5 the ZIP-221 V2 MMR commits to the Orchard root, so it is
     // authenticated there, not here.
-    if Some(height) >= NetworkUpgrade::Nu5.activation_height(network) {
-        return Ok(());
+    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
+        if height >= nu5_height {
+            return Ok(());
+        }
     }
 
     let expected = orchard::tree::NoteCommitmentTree::default().root();
@@ -214,7 +216,11 @@ mod tests {
 
     use zebra_chain::{
         block::Block,
-        parameters::{Network::Mainnet, NetworkUpgrade},
+        parameters::{
+            testnet::{ConfiguredActivationHeights, RegtestParameters},
+            Network::Mainnet,
+            NetworkUpgrade,
+        },
         serialization::ZcashDeserializeInto,
     };
 
@@ -290,6 +296,33 @@ mod tests {
             .expect("at NU5 the root is authenticated by the MMR, not pinned here");
         verify_supplied_orchard_root_below_nu5(&Mainnet, Height(nu5.0 + 1), &wrong)
             .expect("above NU5 the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_orchard_root_to_empty_when_nu5_is_unconfigured() {
+        let network = zebra_chain::parameters::Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = non_empty_orchard_root();
+
+        verify_supplied_orchard_root_below_nu5(&network, Height(1), &empty)
+            .expect("the empty-tree root is accepted when NU5 is unconfigured");
+        let error = verify_supplied_orchard_root_below_nu5(&network, Height(1), &wrong)
+            .expect_err("a non-empty orchard root must be rejected when NU5 is unconfigured");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidPreNu5OrchardRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
+        );
     }
 
     /// The verifier confirms real Sapling roots over the Heartwood activation and its
