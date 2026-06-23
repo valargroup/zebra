@@ -3710,7 +3710,8 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 #[tokio::test]
 async fn reactor_accepts_unmatched_body_for_queued_height() {
     let blocks = mainnet_blocks_1_to_3();
-    let config = immediate_body_download_config();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes = u64::from(block_size(&blocks[0]));
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -5273,10 +5274,14 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         }
     });
 
-    let mut requests = Vec::new();
+    let mut requests: Vec<(block::Height, u32)> = Vec::new();
     let mut submitted = std::collections::HashSet::new();
     let primed = tokio::time::timeout(Duration::from_secs(40), async {
-        while requests.len() < 4 || !prefix.is_subset(&submitted) {
+        while !prefix.is_subset(&submitted)
+            || !requests.iter().any(|(start, count)| {
+                *start <= block::Height(HOLE_START) && start.0.saturating_add(*count) > HOLE_END
+            })
+        {
             // The old peer's `GetBlocks` arrive on its own real outbound (reading
             // that stream proves they targeted it); needed-block queries and
             // submissions come over the action channel.
