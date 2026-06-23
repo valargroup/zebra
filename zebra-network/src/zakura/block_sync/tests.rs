@@ -3784,7 +3784,7 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 }
 
 #[tokio::test]
-async fn reactor_accepts_unmatched_body_for_queued_height() {
+async fn reactor_accepts_body_for_queued_height_when_request_races_ahead() {
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
@@ -3816,26 +3816,33 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
         .await
         .expect("needed metadata queues");
 
-    // No GetBlocks may issue (the body must stay queued without an outstanding
-    // request); a request would land on this peer's own real outbound.
-    let no_getblocks = tokio::time::timeout(Duration::from_millis(100), async {
+    // Size-estimate scheduling can request the first oversized item for progress
+    // before the body arrives. Both the matched-request and unmatched-queued paths
+    // must accept this body without misbehavior.
+    let maybe_getblocks = tokio::time::timeout(Duration::from_millis(100), async {
         loop {
             if let Some(frame) = outbound_rx.recv().await {
-                if let BlockSyncMessage::GetBlocks { .. } =
-                    BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
-                {
-                    return;
+                let message =
+                    BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes");
+                if matches!(message, BlockSyncMessage::GetBlocks { .. }) {
+                    return Some(message);
                 }
             } else {
-                return;
+                return None;
             }
         }
     })
     .await;
-    assert!(
-        no_getblocks.is_err(),
-        "test setup requires the body to remain queued without an outstanding request",
-    );
+    if let Ok(Some(message)) = maybe_getblocks {
+        assert_eq!(
+            message,
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            },
+            "the request race must stay scoped to the queued height",
+        );
+    }
 
     inbound_tx
         .send(
@@ -3844,7 +3851,7 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
                 .expect("block encodes"),
         )
         .await
-        .expect("unmatched queued block queues");
+        .expect("queued block response queues");
 
     let submitted = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -3854,7 +3861,7 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
         }
     })
     .await
-    .expect("unmatched queued body is submitted");
+    .expect("queued body is submitted");
     assert_eq!(submitted, blocks[0].hash());
 
     reactor_task.abort();
@@ -3868,8 +3875,8 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
 // so once the peer disconnects its stream is closed and the routine has exited —
 // there is no transport over which a late body could arrive, and no reactor inbound
 // demux to accept one. The live-peer unmatched-queued-body acceptance is still
-// covered by `reactor_accepts_unmatched_body_for_queued_height` (the routine's
-// `accept_unmatched_queued_body`, driven by a real inbound frame just above).
+// covered by `reactor_accepts_body_for_queued_height_when_request_races_ahead`
+// (driven by a real inbound frame just above).
 
 #[tokio::test]
 async fn reactor_queries_needed_blocks_above_submitted_floor() {
@@ -5386,9 +5393,8 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
 
 #[tokio::test]
 async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer() {
-    // Worst-case reservation caps a request at ~16 blocks (down from 128), so the
-    // priming prefix is kept short enough to submit within the priming window
-    // while still placing the hole behind several scheduled requests.
+    // The priming prefix is kept short enough to submit within the priming window
+    // while still placing the hole inside an outstanding request.
     const FIRST_NEEDED: u32 = 801;
     const PREFIX_END: u32 = 864;
     const HOLE_START: u32 = 865;
@@ -5416,9 +5422,8 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
-    // Worst-case reservation caps a request at ~16 blocks, so the prefix needs
-    // more concurrent requests; keep the outbound queue wide enough that a fill
-    // pass never overflows it and cancels the peer.
+    // Keep the outbound queue wide enough that a fill pass never overflows it and
+    // cancels the peer.
     config.peer_limits.outbound_queue_depth = 128;
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(BEST_HEADER_TIP), block::Hash([10; 32])));
@@ -5444,9 +5449,6 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
             servable_high: block::Height(LAST_METADATA),
             tip_hash: block_at(LAST_METADATA).hash(),
             max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST,
-            // Worst-case reservation caps a request at `max_response_bytes /
-            // MAX_BLOCK_BYTES` (~16) blocks, so allow more concurrent requests to
-            // cover the checkpoint prefix within the priming window.
             max_inflight_requests: 8,
             max_response_bytes: MAX_BS_RESPONSE_BYTES,
         },
@@ -5472,10 +5474,14 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         }
     });
 
-    let mut requests = Vec::new();
+    let mut requests: Vec<(block::Height, u32)> = Vec::new();
     let mut submitted = std::collections::HashSet::new();
     let primed = tokio::time::timeout(Duration::from_secs(40), async {
-        while requests.len() < 4 || !prefix.is_subset(&submitted) {
+        while !prefix.is_subset(&submitted)
+            || !requests.iter().any(|(start, count)| {
+                *start <= block::Height(HOLE_START) && start.0.saturating_add(*count) > HOLE_END
+            })
+        {
             // The old peer's `GetBlocks` arrive on its own real outbound (reading
             // that stream proves they targeted it); needed-block queries and
             // submissions come over the action channel.
