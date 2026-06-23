@@ -716,6 +716,9 @@ impl TreeAuxPeerPolicy {
     /// returned so the state cache can bulk-evict the poisoned window instead of grinding
     /// through one rejected height per commit attempt. A peer is disconnected only after
     /// repeat offenses in the decay window; a first offense is cooldown-only.
+    // The `expect` below is on `Instant + minute-scale Duration`, which is always representable;
+    // it is an invariant assertion, not a fallible result this `Option` fn should propagate.
+    #[allow(clippy::unwrap_in_result)]
     fn mark_rejected_supplier(
         &mut self,
         height: block::Height,
@@ -981,13 +984,13 @@ mod tests {
             })
         });
 
-        Ok(ZakuraTestNode::builder(seed)
+        ZakuraTestNode::builder(seed)
             .max_connections_per_ip(16)
             .service(Arc::new(TreeAuxService::new(Arc::new(
                 StateTreeAuxPort::new(read_state),
             ))))
             .spawn()
-            .await?)
+            .await
     }
 
     async fn wait_for_outbound_peer_count(

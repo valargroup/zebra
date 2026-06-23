@@ -22,6 +22,73 @@
 > here (§5.1, §5.2, §5.4, §6.1, §9, §11, …) are the ones the source comments cite, so a
 > `design §N` reference in the code resolves to the section of the same number below.
 
+## Overview (start here)
+
+**What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling and Orchard
+note-commitment trees for every block just to learn each block's treestate root — the single
+biggest CPU cost of checkpoint sync. Verified commitment trees (VCT) instead **fetch the
+per-block roots from peers**, **verify each one against the headers the node already trusts**,
+fold them straight into the anchor set and history tree, and **skip the rebuild**. At the
+checkpoint handoff an **embedded final frontier** (verified against that block's proven root) is
+written so normal per-block verification resumes above the checkpoint. Result: same consensus
+state as the legacy committer, far less work — and no new cryptography.
+
+**The one invariant that makes it safe:** *no root influences consensus state until it has been
+authenticated against a header commitment.* Everything else (the transport, the cache, the peer
+policy) is plumbing around that invariant. A root that cannot be obtained or verified is refused,
+never guessed — inside the post-fold "frozen" window the committer **fails closed** rather than
+recomputing against a now-stale frontier (§8).
+
+**Data flow (fetch + commit path):**
+
+```text
+header sync (runs ahead of bodies)
+   │ validated headers
+   ▼
+tree_aux driver (zebrad) ──GetRoots──▶ peers ──Roots──▶ verify batch shape; hedge slow peers;
+   │                                                     demote soft-failers / exclude liars (§8.1)
+   │ stage whole window, publish only on full success, bounded ahead of commit (§4.2–4.3)
+   ▼
+PeerSource cache (zebra-state)  ◀──invalidate / evict-committed── finalized committer
+   │ fast_root(height)
+   ▼
+finalized committer: verify-before-commit (§6) ──fold roots, skip recompute──▶ DB
+   │ at the handoff height: verify + write the embedded final frontier ──▶ resume legacy recompute
+```
+
+**Serving path (how a node answers other nodes' fetches):**
+
+```text
+peer GetRoots ─▶ TreeAuxService (zebra-network) ─▶ StateTreeAuxPort (zebrad)
+   ─▶ ReadRequest::BlockRoots ─▶ commitment_roots_by_height index (fast nodes) or per-height trees (archive)
+```
+
+**Lifecycle of one fast sync.** (1) Node starts under `consensus.checkpoint_sync = true` on
+Mainnet → the committer is built in peer mode (§4.4). (2) The driver fetches roots for
+`[verified_tip+1, handoff]` in bounded windows, ahead of the committer (§4.3). (3) Each
+checkpoint block: look up its root; verify it (own header now, successor header next block, plus
+the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (§6, §7). (4) At
+the handoff height, verify and write the embedded frontier and unfreeze. (5) Above the handoff,
+ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in
+the frozen window parks the block and refetches; it never writes wrong state.
+
+**Glossary.**
+
+| Term | Meaning |
+| --- | --- |
+| **Checkpoint sync** | `consensus.checkpoint_sync = true`: trust the embedded checkpoint list for headers/PoW up to the max checkpoint. Precondition for VCT. |
+| **Handoff height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
+| **Fast root** | A peer-supplied `(sapling_root, orchard_root)` for one height, folded in after verification instead of being recomputed. |
+| **Final frontier** | The real Sapling/Orchard/Sprout note-commitment trees at the handoff height, embedded in the binary (§5.2) and written as the tip treestate at handoff. |
+| **Frozen frontier** | The window `tip < handoff` during a fast sync where the on-disk frontier is intentionally stale (roots folded, trees not advanced). Legacy recompute here would corrupt state, so the committer fails closed (§8). |
+| **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
+| **Fail closed** | In the frozen window, refuse the commit (retryable) rather than recompute or guess (§8). |
+| **Provenance / cooldown / demotion** | Driver-side peer policy (§8.1): which peer supplied each root, hard-failure cooldown + escalating disconnect for liars, soft-failure back-of-rotation demotion for slow/withholding peers. |
+| **Hedge** | Tied request strategy (§5.4): query one peer, add another only if it is slow, to bound stalls without tripling load. |
+| **Kill switch** | `consensus.disable_vct_fast_sync = true`: keep checkpoint sync but force the legacy committer (§4.4). |
+
+For where each piece lives in the tree, see the file map (§15).
+
 ## 1. Goal
 
 Let a node sync the chain up to the last checkpoint **without recomputing the Sapling and
@@ -255,11 +322,16 @@ memory is bounded even when peers serve roots faster than blocks commit to disk.
   when it holds nothing. The response is additionally bounded by the negotiated frame/message
   caps (`effective_response_payload_bytes`), so it never overruns a smaller peer cap.
 - **Client** (`fetch_roots` / `fetch_roots_with_peer`): issues bounded `GetRoots` requests and
-  advances by the last height each peer returns. For each sub-range, it hedges across up to
-  three preferred peers concurrently and accepts the first valid response, so a slow peer does
-  not impose a full per-peer timeout before an honest hedged peer can answer. If all hedged
-  peers fail, the sub-range returns an error and the caller retries later with rotation/demotion
-  state instead of walking the whole peer set in one attempt. Short contiguous responses are
+  advances by the last height each peer returns. For each sub-range it uses a **tied (deferred)
+  hedge**: it sends to one preferred peer and launches another only if the previous one has not
+  answered within `TREE_AUX_HEDGE_DELAY` (currently 2s), up to `TREE_AUX_HEDGE_PEERS` (3) in
+  flight; it accepts the first valid response and drops (cancels) the losing requests. A fast
+  failure advances to the next peer immediately rather than waiting out the delay. So the happy
+  path costs a single request — hedging only spends extra requests against a genuinely slow or
+  withholding peer — while a slow peer no longer imposes a full per-peer timeout before an honest
+  hedged peer can answer. If all peers in the bounded hedge fail, the sub-range returns an error
+  and the caller retries later with rotation/demotion state instead of walking the whole peer set
+  in one attempt. Short contiguous responses are
   accepted only when they meet a minimum-progress threshold (currently at least one quarter of
   the requested count, rounded up), so a peer cannot turn a 4000-root request into thousands of
   one-root round trips. Any unavailable/malformed/out-of-range/low-progress sub-range returns

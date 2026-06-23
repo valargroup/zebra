@@ -422,16 +422,19 @@ fn validate_contiguous_roots(
         return Err("peer returned an empty Roots batch".into());
     }
 
-    let root_count =
-        u32::try_from(roots.len()).expect("tree_aux root batch length fits in u32 after decoding");
-    if root_count > count {
+    // Compare in `usize`: a peer's batch length is bounded by `MAX_TA_ROOTS_PER_REQUEST`, so
+    // widening `count` (u32 -> usize is lossless on Zebra's >= 32-bit platforms) avoids a
+    // fallible length cast in this `Result`-returning validator.
+    let root_count = roots.len();
+    let count_usize = count as usize;
+    if root_count > count_usize {
         return Err(format!("peer returned {root_count} roots for a {count}-root request").into());
     }
 
     // Until peer Status narrows requests to each peer's servable range, this can reject an
     // honest peer whose range ends early. Treating that as a soft failure bounds slow-prefix
     // amplification without affecting small tail requests.
-    let minimum_progress = count.div_ceil(TREE_AUX_MIN_PROGRESS_DENOMINATOR);
+    let minimum_progress = count.div_ceil(TREE_AUX_MIN_PROGRESS_DENOMINATOR) as usize;
     if root_count < minimum_progress {
         return Err(format!(
             "peer returned {root_count} roots for a {count}-root request, below the {minimum_progress}-root minimum progress threshold"
@@ -439,12 +442,10 @@ fn validate_contiguous_roots(
         .into());
     }
 
-    for (index, root) in roots.iter().enumerate() {
-        let index =
-            u32::try_from(index).expect("tree_aux root batch index fits in u32 after decoding");
-        let expected = next
-            .checked_add(index)
-            .ok_or_else(|| -> BoxError { "tree_aux expected root height overflow".into() })?;
+    // Walk a running expected height instead of an index cast, so each returned height must be
+    // exactly `next, next + 1, …`.
+    let mut expected = next;
+    for root in roots {
         if root.height.0 != expected {
             return Err(format!(
                 "peer returned non-contiguous tree_aux roots: expected {:?}, got {:?}",
@@ -453,6 +454,9 @@ fn validate_contiguous_roots(
             )
             .into());
         }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| -> BoxError { "tree_aux expected root height overflow".into() })?;
     }
 
     Ok(())
