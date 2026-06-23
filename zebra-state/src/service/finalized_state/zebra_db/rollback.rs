@@ -545,6 +545,61 @@ fn block_has_sprout_commitments(block: &Block) -> bool {
     block.sprout_note_commitments().next().is_some()
 }
 
+/// Blocking DB-open repair for an incompatible stored `history_tree`.
+///
+/// If the stored tip history tree cannot be decoded by the current code, rebuild it from the
+/// finalized blocks plus Sapling/Orchard roots using the same algorithm rollback uses, then write
+/// it back before the background format-validity check can read the old value.
+///
+/// The roots come from the compact per-height root index when present, so post-index VCT
+/// fast-synced databases can be repaired without historical tree rows. Pre-index archive
+/// databases fall back to deriving roots from per-height trees. Databases missing both sources
+/// fail closed with remediation instead of attempting a partial rebuild.
+pub(crate) fn repair_tip_history_tree_if_incompatible(db: &ZebraDb, network: &Network) {
+    let Some(tip_height) = db.finalized_tip_height() else {
+        return;
+    };
+    // Pre-Heartwood (no history tree) needs no repair.
+    if NetworkUpgrade::current(network, tip_height) < NetworkUpgrade::Heartwood {
+        return;
+    }
+    // Healthy DBs (the common case) decode fine: no-op, no rebuild.
+    if let Err(error) = db.check_tip_history_tree_decodes() {
+        tracing::warn!(
+            ?tip_height,
+            ?error,
+            "stored history tree is incompatible with this binary; rebuilding it from finalized \
+             blocks and commitment roots before startup"
+        );
+    } else {
+        return;
+    }
+
+    match rebuild_history_tree_from_upgrade_activation(db, network, tip_height) {
+        Ok(rebuilt) => {
+            let mut batch = DiskWriteBatch::new();
+            batch.update_history_tree(db, &rebuilt);
+            db.write_batch(batch)
+                .expect("history-tree repair batch write should succeed");
+            tracing::info!(
+                ?tip_height,
+                history_root = ?rebuilt.hash(),
+                "history-tree repair complete; rebuilt tip tree written in the current format"
+            );
+        }
+        Err(error) => {
+            panic!(
+                "cannot repair the incompatible history tree at tip {tip_height:?}: {error}. \
+                 The repair requires finalized block bodies plus Sapling/Orchard roots from the \
+                 current network-upgrade activation height through the tip. Roots can come from \
+                 `commitment_roots_by_height` or from per-height trees. If this database predates \
+                 the root index and is VCT fast-synced or pruned, re-sync from genesis or repair \
+                 from an archive-capable database."
+            );
+        }
+    }
+}
+
 fn rebuild_history_tree_from_upgrade_activation(
     db: &ZebraDb,
     network: &Network,
@@ -586,6 +641,15 @@ fn history_rebuild_inputs_at_height(
     let block = db
         .block(height.into())
         .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
+
+    if let Some(roots) = db
+        .commitment_roots_by_height_range(height..=height)
+        .into_iter()
+        .next()
+    {
+        return Ok((block, roots.sapling_root, roots.orchard_root));
+    }
+
     let sapling_root = db
         .sapling_tree_by_height(&height)
         .ok_or(RollbackFinalizedStateError::MissingSaplingTree { height })?

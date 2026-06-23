@@ -51,6 +51,11 @@ pub struct HistoryTreeParts {
 }
 
 impl HistoryTreeParts {
+    /// Deserializes history tree parts from raw database bytes.
+    pub(crate) fn from_bytes_result(bytes: impl AsRef<[u8]>) -> Result<Self, bincode::Error> {
+        bincode::DefaultOptions::new().deserialize(bytes.as_ref())
+    }
+
     /// Converts [`HistoryTreeParts`] to a [`NonEmptyHistoryTree`].
     pub(crate) fn with_network(
         self,
@@ -89,8 +94,7 @@ impl IntoDisk for HistoryTreeParts {
 
 impl FromDisk for HistoryTreeParts {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        bincode::DefaultOptions::new()
-            .deserialize(bytes.as_ref())
+        Self::from_bytes_result(bytes)
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }
