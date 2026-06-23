@@ -1545,7 +1545,7 @@ impl DiskWriteBatch {
         // verbatim. The serialized bytes are inserted in height/index order below.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
-        // the multithreading overhead. Small blocks serialize sequentially (see
+        // the fork-join cost; small blocks serialize sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
             Vec::new()
