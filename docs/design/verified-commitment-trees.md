@@ -334,20 +334,17 @@ keeps trees, fast-sync drops the per-height trees; a DB can be both. Because fas
 default for the Archive storage mode (§4.4), a **completed** fast-synced DB (tip at/above the
 handoff) **reopens in any storage mode** — it deletes nothing, so a reopen loses no servable
 data, and `checkpoint_sync = false` simply resumes the legacy recompute from the real tip
-frontier. Guards: per-height tree reads return `None` below the handoff (before the backward
-search, so no stale tree and no panic); `z_gettreestate` returns a typed archive-mode error
-below the handoff; genesis-root and subtree format-validity checks skip fast-synced DBs.
+frontier.
 
-The one reopen that *is* refused is an **interrupted** fast sync (frozen frontier, tip below
-the handoff) reopened with the fast path disabled (legacy mode — `checkpoint_sync = false`, or
-no embedded frontier). The on-disk frontier is stale and no source can supply the verified
-roots, so the fail-closed policy (§8) would refuse every below-handoff block forever. The open
-guard refuses with a clear recovery path (finish the fast sync under `checkpoint_sync = true`,
-or re-sync from genesis) instead of stalling silently. This is distinct from pruning's one-way
-guard, which exists because pruning *deletes* raw tx bytes; fast sync deletes nothing, so the
-only fast-sync reopen guard is this narrow in-progress case. Validated on a real mainnet fork:
-byte-identical consensus state 2,000 blocks past the checkpoint, a completed fast-synced DB
-reopens cleanly in archive mode, pruned reopen resumes with 0 panics.
+The one reopen that *is* refused is an **interrupted** fast sync (frozen frontier, tip below the
+handoff) reopened with the fast path disabled (legacy mode — `checkpoint_sync = false`, or no
+embedded frontier). The on-disk frontier is stale and no source can supply the verified roots,
+so the fail-closed policy (§8) would refuse every below-handoff block forever. The open guard
+refuses with a clear recovery path (finish the fast sync under `checkpoint_sync = true`, or
+re-sync from genesis) instead of stalling silently. Guards: per-height tree reads return `None`
+below the handoff (before the backward search, so no stale tree and no panic); `z_gettreestate`
+returns a typed archive-mode error below the handoff; genesis-root and subtree format-validity
+checks skip fast-synced DBs.
 
 ## 8. Failure policy — fail closed on a frozen frontier
 
@@ -401,9 +398,8 @@ A node serves roots from local state via `ReadRequest::BlockRoots { start_height
 `produce_block_roots`. The handler:
 
 - clamps the range to the finalized tip;
-- serves **nothing** on a fast-synced node (it lacks the historical per-height trees below its
-  handoff and would serve from a roots index, not yet wired) — so it never panics on absent
-  trees;
+- serves from the compact `commitment_roots_by_height` index on fast-synced nodes, so nodes that
+  lack historical per-height trees below the handoff can still serve root ranges;
 - returns an empty vec for out-of-range/empty requests.
 
 `zebra-network`'s `TreeAuxService` reads through `TreeAuxStatePort`, an async trait the node
@@ -413,12 +409,11 @@ dependency on `zebra-state`. The port maps read errors and wrong responses to an
 
 ## 10. Serving availability (open design concern)
 
-As nodes fast-sync, fewer nodes can *serve* roots: `produce_block_roots` derives them from
-per-height trees, which a fast-synced node deliberately never built below its handoff. Only
-archive/produced nodes can serve today. This is a value-at-scale concern, **not a safety one**
-— a client that finds no serving peer degrades to legacy speed before freeze or waits on targeted
-root refetches in the frozen window; it does not corrupt state. Two mechanisms address it, in
-order of cost:
+Fast-synced nodes serve roots from `commitment_roots_by_height`, while older archive-produced
+nodes can still derive roots from per-height trees. This keeps the root-serving fleet available
+as more nodes fast-sync. A client that finds no serving peer degrades to legacy speed before
+freeze or waits on targeted root refetches in the frozen window; it does not corrupt state. Two
+mechanisms address it, in order of cost:
 
 - **Roots-index CF (lightweight, preferred).** A fast node already verified every root it
   folded in. Persisting them into a compact column family (~68 bytes/block, ~200 MB for all of
