@@ -425,7 +425,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         },
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     }
 }
 
@@ -2198,7 +2198,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         request,
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     }
 }
 
@@ -2328,7 +2328,7 @@ fn underestimated_body_is_buffered_without_budget_drop() {
         request,
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     };
     assert_eq!(budget.reserved(), worst);
 
