@@ -642,6 +642,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 fast.vct_fast_needs_successor(Height(tip_target as u32)),
                 "an untrusted peer tip root needs successor verification"
             );
+            let pre_deferral_prevalidated = fast.vct_prevalidated_count();
             let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
             let error = fast
                 .commit_finalized_direct(cv.into(), None, None, None, "vct defer tip no successor")
@@ -659,6 +660,12 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 Some(Height((tip_target - 1) as u32)),
                 "the deferred block left the database untouched"
             );
+            let after_deferral_prevalidated = fast.vct_prevalidated_count();
+            prop_assert_eq!(
+                after_deferral_prevalidated,
+                pre_deferral_prevalidated + 1,
+                "the deferred attempt uses the predecessor look-ahead"
+            );
 
             // Once a successor is buffered, the very same height commits and the tip advances:
             // the deferral was a wait, not a permanent stall.
@@ -666,6 +673,11 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             let next = Some((blocks[tip_target + 1].block.clone(), None));
             fast.commit_finalized_direct(cv.into(), None, None, next, "vct defer tip with successor")
                 .expect("the deferred height commits once its successor is buffered");
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                after_deferral_prevalidated + 1,
+                "the retry reuses the preserved predecessor look-ahead"
+            );
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
                 Some(Height(tip_target as u32)),

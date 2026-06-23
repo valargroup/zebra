@@ -24,8 +24,10 @@ use std::{
 
 use zebra_chain::{
     block::{self, merkle::AuthDataRoot, Block},
+    orchard,
     parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
     parameters::Network,
+    sapling,
 };
 use zebra_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
@@ -858,10 +860,10 @@ impl FinalizedState {
                             )
                         })
                         .map_err(|(_fail_height, error)| {
+                            self.vct_prevalidated_next = None;
                             self.vct_reject_supplied_root(height, error)
                         })?;
 
-                    self.vct_prevalidated_next = None;
                     if let Some((next_block, _next_auth)) = &next_checkpoint {
                         self.vct_prevalidated_next = Some((
                             (height + 1).expect("checkpoint block heights are valid"),
@@ -881,6 +883,8 @@ impl FinalizedState {
                             height,
                         }
                         .into());
+                    } else {
+                        self.vct_prevalidated_next = None;
                     }
 
                     history_tree = Arc::new(candidate);
@@ -907,18 +911,13 @@ impl FinalizedState {
                         // as the real tip treestate via the legacy write path
                         // (`fast_anchor_roots` left `None`), so post-checkpoint
                         // semantic verification resumes from a correct frontier.
-                        if sapling_frontier.root() != sapling_root {
-                            return Err(self.vct_reject_supplied_root(
-                                height,
-                                ValidateContextError::VctSuppliedRootUnavailable { height },
-                            ));
-                        }
-                        if orchard_frontier.root() != orchard_root {
-                            return Err(self.vct_reject_supplied_root(
-                                height,
-                                ValidateContextError::VctSuppliedRootUnavailable { height },
-                            ));
-                        }
+                        self.vct_verify_handoff_frontier_roots(
+                            height,
+                            &sapling_frontier,
+                            &orchard_frontier,
+                            &sapling_root,
+                            &orchard_root,
+                        )?;
 
                         // Subtree tips are left `None`: the resuming chain recomputes
                         // them from the frontier position.
@@ -1209,6 +1208,26 @@ impl FinalizedState {
             ?height,
             "VCT: requested peer root refetch before the peer-source signal was installed"
         );
+    }
+
+    /// Verify checkpoint handoff frontiers against this block's supplied roots.
+    fn vct_verify_handoff_frontier_roots(
+        &mut self,
+        height: block::Height,
+        sapling_frontier: &sapling::tree::NoteCommitmentTree,
+        orchard_frontier: &orchard::tree::NoteCommitmentTree,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+    ) -> Result<(), CommitCheckpointVerifiedError> {
+        if sapling_frontier.root() != *sapling_root || orchard_frontier.root() != *orchard_root {
+            self.vct_prevalidated_next = None;
+            return Err(self.vct_reject_supplied_root(
+                height,
+                ValidateContextError::VctSuppliedRootUnavailable { height },
+            ));
+        }
+
+        Ok(())
     }
 
     /// Reject a supplied fast-path root that failed verification for `height`.
