@@ -394,18 +394,20 @@ impl CommitmentRootSource for VecRootSource {
 /// A fillable [`CommitmentRootSource`] backed by a shared, height-keyed roots cache.
 ///
 /// The `tree_aux` driver (increment 6a) writes verified roots into the cache *ahead of*
-/// the committer via [`PeerSourceWriter`], as ranges arrive from peers; the committer
-/// reads them per height through the [`CommitmentRootSource`] seam. The handoff frontier
-/// is embedded in the binary (design §5.2), so it is held immutably here and never
-/// fetched over the network — only roots come from peers.
+/// the committer via [`PeerSourceWriter`], after staging the initial range to completion
+/// or when serving targeted refetches. The committer reads them per height through the
+/// [`CommitmentRootSource`] seam. The handoff frontier is embedded in the binary
+/// (design §5.2), so it is held immutably here and never fetched over the network —
+/// only roots come from peers.
 #[derive(Debug)]
 pub(super) struct PeerSource {
     cache: Arc<RwLock<PeerRootsCache>>,
     frontiers: Option<FinalFrontiers>,
 }
 
-/// Write handle for a [`PeerSource`]: the driver fills the shared cache as verified root
-/// ranges arrive. Cloneable so the driver and source share one cache.
+/// Write handle for a [`PeerSource`]: the driver fills the shared cache after verified root
+/// ranges are complete, or for targeted single-height refetches. Cloneable so the driver
+/// and source share one cache.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerSourceWriter {
     cache: Arc<RwLock<PeerRootsCache>>,
