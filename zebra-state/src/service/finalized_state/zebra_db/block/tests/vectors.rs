@@ -1287,7 +1287,7 @@ fn missing_pruning_metadata_cf_is_archive_database() {
 /// POC (verified-commitment-trees): the anchor-only fast write produces the same
 /// `sapling_anchors` / `orchard_anchors` contents as the legacy full write, while
 /// skipping the per-height note-commitment tree CFs, and is idempotent.
-/// See `docs/design/verified-commitment-trees-poc.md`.
+/// See `docs/design/verified-commitment-trees.md`.
 #[test]
 fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
     use zebra_chain::{orchard, sapling};
