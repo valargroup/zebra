@@ -1107,6 +1107,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
 /// - **Stale-cache guard:** a cache entry with the right height but the *wrong*
 ///   hash must not trigger a skip — the guard forces the own check to run, so a
 ///   stale or mismatched entry can never let an unverified block through.
+/// - **Wrapper-hash guard:** a public `CheckpointVerifiedBlock::with_hash` caller
+///   cannot replay a stale cached successor hash onto a different block.
 #[test]
 fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -1137,12 +1139,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
-            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0 as usize;
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
 
-            // Seed just before Heartwood so the fast range creates the history tree,
-            // then operate on four consecutive fast blocks. The dedup is era-agnostic;
-            // the cross-boundary coverage lives in the proptest above.
-            let seed = heartwood - 1;
+            // Seed just before NU5, then operate on four consecutive fast blocks so
+            // the forged-wrapper regression exercises `hashBlockCommitments`.
+            let seed = nu5 - 2;
             let last = seed + 4;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
@@ -1193,6 +1194,129 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             fast.vct_prevalidated_next = Some((Height((seed + 3) as u32), stale_hash));
             commit(&mut fast, seed + 3);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
+
+            // Public wrapper-hash guard: the stale cache records a real look-ahead
+            // hash, but a caller-controlled checkpoint wrapper tries to replay that
+            // hash onto a different block whose own NU5 header commitment is invalid.
+            // The skip must compare the cache against the wrapped block's real hash,
+            // not the wrapper hash, so the bad commitment is checked and rejected.
+            let forged_wrapper_hash = blocks[seed + 2].hash;
+            let bad_block = blocks[seed + 4].block.clone().set_block_commitment([0x42; 32]);
+            let bad_block_hash = bad_block.hash();
+            prop_assert_ne!(
+                forged_wrapper_hash,
+                bad_block_hash,
+                "the forged wrapper hash must differ from the bad block's real hash",
+            );
+            fast.vct_prevalidated_next =
+                Some((Height((seed + 4) as u32), forged_wrapper_hash));
+            let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
+            let error = fast
+                .commit_finalized_direct(forged.into(), None, None, None, "vct forged wrapper hash")
+                .expect_err("a forged wrapper hash must not skip the bad block's own commitment check");
+            prop_assert!(
+                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                "the forged wrapper hash path must reject the bad commitment, got: {error:?}",
+            );
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                1,
+                "the forged wrapper hash must not increment the prevalidated count",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 3) as u32)),
+                "the rejected forged block must leave finalized state untouched",
+            );
+    });
+
+    Ok(())
+}
+
+/// Clearing a cached VCT successor prevalidation must disarm exactly one possible
+/// skip without disabling the normal dedup optimization for future contiguous fast
+/// blocks. This covers the write-loop reset/drop behavior indirectly: those paths
+/// call `clear_vct_prevalidated_next()` when buffered checkpoint state is discarded.
+#[test]
+fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
+            let seed = nu5 - 2;
+            let last = seed + 5;
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
+
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
+                let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct clear legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+            }
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_fixture(fixture);
+
+            let commit = |fast: &mut FinalizedState, i: usize| {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = Some((blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct clear fast")
+                    .expect("verified fast commit succeeds");
+            };
+
+            for i in 0..=seed {
+                commit(&mut fast, i);
+            }
+            commit(&mut fast, seed + 1);
+            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "first fast block runs its own check");
+
+            commit(&mut fast, seed + 2);
+            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "second fast block uses predecessor look-ahead");
+
+            fast.clear_vct_prevalidated_next();
+            commit(&mut fast, seed + 3);
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                1,
+                "clearing the cache forces the next fast block to run its own check",
+            );
+
+            commit(&mut fast, seed + 4);
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                2,
+                "normal successor dedup resumes after the cleared block commits",
+            );
     });
 
     Ok(())

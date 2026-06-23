@@ -450,6 +450,7 @@ impl WriteBlockWorkerTask {
                 // only fall back anyway, but cancelling stops the wasted hashing).
                 cancel_pending_precompute(&mut pending_precompute);
                 finalized_lookahead.clear();
+                finalized_state.clear_vct_prevalidated_next();
 
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
                 std::mem::drop(ordered_block);
@@ -625,6 +626,7 @@ impl WriteBlockWorkerTask {
                     // hashing the discarded child, and clear the look-ahead.
                     cancel_pending_precompute(&mut pending_precompute);
                     finalized_lookahead.clear();
+                    finalized_state.clear_vct_prevalidated_next();
 
                     // The last block in the queue failed, so we can't commit the next block.
                     // Instead, we need to reset the state queue,

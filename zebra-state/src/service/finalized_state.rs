@@ -824,8 +824,8 @@ impl FinalizedState {
                     // This block's own commitment check is identical to the
                     // previous fast block's look-ahead. When that look-ahead
                     // already validated this exact header, skip the duplicate.
-                    let prevalidated =
-                        self.vct_prevalidated_next == Some((height, checkpoint_verified.hash));
+                    let block_hash = block.hash();
+                    let prevalidated = self.vct_prevalidated_next == Some((height, block_hash));
                     if prevalidated {
                         if let Some(v) = &self.vct {
                             v.record_prevalidated();
@@ -1190,6 +1190,15 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
+    }
+
+    /// Clears any cached successor prevalidation.
+    ///
+    /// The finalized write loop calls this when it discards checkpoint queue state, so a
+    /// look-ahead header that no longer corresponds to the next committed block cannot
+    /// authorize a later fast-path skip.
+    pub(crate) fn clear_vct_prevalidated_next(&mut self) {
+        self.vct_prevalidated_next = None;
     }
 
     /// `true` when committing `height` on the fast path needs a buffered successor before
