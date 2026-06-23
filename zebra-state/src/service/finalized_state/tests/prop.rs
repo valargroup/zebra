@@ -16,15 +16,11 @@ use zebra_chain::{
 use zebra_test::prelude::*;
 
 use crate::{
-    config::Config,
-    service::{
-        arbitrary::PreparedChain,
-        finalized_state::{
-            commitment_aux, validate_final_frontiers_bytes, CheckpointVerifiedBlock, FinalizedState,
-        },
-    },
-    tests::FakeChainHelper,
-    HashOrHeight,
+    config::Config, service::arbitrary::PreparedChain, tests::FakeChainHelper, HashOrHeight,
+};
+
+use super::super::{
+    commitment_aux, vct::validate_final_frontiers_bytes, CheckpointVerifiedBlock, FinalizedState,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1234,6 +1230,166 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 Some(Height(last as u32 - 1)),
                 "the refused handoff block left state untouched"
             );
+    });
+
+    Ok(())
+}
+
+/// Switching between the rollout fast path and the manual recompute path is safe at the
+/// committed-state boundaries: after the handoff writes the real frontier, legacy recompute can
+/// resume from that frontier; before any fast commit has frozen the frontier, a later fast sync
+/// can consume verified roots for future heights.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
+fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let handoff_index = (nu5 + 3) as usize;
+            let post_handoff_tip = handoff_index + 2;
+            prop_assert!(blocks.len() > post_handoff_tip, "generated chain unexpectedly short");
+            let handoff = Height(handoff_index as u32);
+            let seed = (heartwood - 1) as usize;
+
+            // Legacy golden pass over the full range: source fast roots and final frontiers, then
+            // compare both switching scenarios against this byte-identical manual recompute.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut fixture = std::collections::HashMap::new();
+            let mut handoff_trees = None;
+            for i in 0..=post_handoff_tip {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct switch legacy")
+                    .unwrap();
+                if i > seed && i <= handoff_index {
+                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                }
+                if i == handoff_index {
+                    handoff_trees = Some(trees);
+                }
+            }
+            let golden_anchors = legacy.db.vct_anchor_digest();
+            let golden_history = legacy.db.history_tree().hash();
+            let golden_tip = legacy.db.note_commitment_trees_for_tip();
+            let handoff_trees = handoff_trees.expect("committed the handoff block");
+
+            // Fast -> manual: complete the fast handoff, reopen with the force-disable knob, and
+            // keep checkpoint sync enabled while post-handoff blocks recompute from the real
+            // frontier written at the handoff.
+            let fast_to_manual_dir = TempDir::new().expect("temp dir");
+            let fast_config = Config {
+                cache_dir: fast_to_manual_dir.path().to_path_buf(),
+                ephemeral: false,
+                ..Config::default()
+            };
+            {
+                let mut fast = FinalizedState::new(&fast_config, &network, #[cfg(feature = "elasticsearch")] false);
+                enable_vct_test_fixture_source_with_handoff(
+                    &mut fast,
+                    fixture.clone(),
+                    handoff,
+                    handoff_trees.sapling.clone(),
+                    handoff_trees.orchard.clone(),
+                    handoff_trees.sprout.clone(),
+                );
+                for i in 0..=handoff_index {
+                    let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                    let next = (i < handoff_index).then(|| (blocks[i + 1].block.clone(), None));
+                    fast.commit_finalized_direct(cv.into(), None, None, next, "vct switch fast prefix")
+                        .expect("verified fast prefix commits");
+                }
+                prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");
+            }
+
+            let manual_config = Config {
+                disable_vct_fast_sync: true,
+                ..fast_config
+            };
+            let mut manual = FinalizedState::new(&manual_config, &network, #[cfg(feature = "elasticsearch")] false);
+            for i in (handoff_index + 1)..=post_handoff_tip {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                manual
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct switch manual suffix")
+                    .expect("manual suffix commits after fast handoff");
+            }
+            let manual_tip = manual.db.note_commitment_trees_for_tip();
+            prop_assert_eq!(manual.db.vct_anchor_digest(), golden_anchors, "fast-to-manual anchors match legacy");
+            prop_assert_eq!(manual.db.history_tree().hash(), golden_history, "fast-to-manual history matches legacy");
+            prop_assert_eq!(manual_tip.sapling.root(), golden_tip.sapling.root(), "fast-to-manual sapling tip matches legacy");
+            prop_assert_eq!(manual_tip.orchard.root(), golden_tip.orchard.root(), "fast-to-manual orchard tip matches legacy");
+            prop_assert_eq!(manual_tip.sprout.root(), golden_tip.sprout.root(), "fast-to-manual sprout tip matches legacy");
+
+            // Manual -> fast: commit a prefix with the force-disable knob before any fast block
+            // can freeze the frontier, then reopen and consume verified roots through the handoff.
+            let manual_to_fast_dir = TempDir::new().expect("temp dir");
+            let manual_prefix_config = Config {
+                cache_dir: manual_to_fast_dir.path().to_path_buf(),
+                ephemeral: false,
+                disable_vct_fast_sync: true,
+                ..Config::default()
+            };
+            {
+                let mut manual_prefix = FinalizedState::new(&manual_prefix_config, &network, #[cfg(feature = "elasticsearch")] false);
+                for i in 0..=seed {
+                    let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                    manual_prefix
+                        .commit_finalized_direct(cv.into(), None, None, None, "vct switch manual prefix")
+                        .expect("manual prefix commits");
+                }
+            }
+
+            let fast_suffix_config = Config {
+                disable_vct_fast_sync: false,
+                ..manual_prefix_config
+            };
+            let mut fast_suffix = FinalizedState::new(&fast_suffix_config, &network, #[cfg(feature = "elasticsearch")] false);
+            enable_vct_test_fixture_source_with_handoff(
+                &mut fast_suffix,
+                fixture,
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+            );
+            for i in (seed + 1)..=post_handoff_tip {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < post_handoff_tip).then(|| (blocks[i + 1].block.clone(), None));
+                fast_suffix
+                    .commit_finalized_direct(cv.into(), None, None, next, "vct switch fast suffix")
+                    .expect("fast suffix commits after manual prefix");
+            }
+            let fast_suffix_tip = fast_suffix.db.note_commitment_trees_for_tip();
+            prop_assert_eq!(fast_suffix.db.vct_anchor_digest(), golden_anchors, "manual-to-fast anchors match legacy");
+            prop_assert_eq!(fast_suffix.db.history_tree().hash(), golden_history, "manual-to-fast history matches legacy");
+            prop_assert_eq!(fast_suffix_tip.sapling.root(), golden_tip.sapling.root(), "manual-to-fast sapling tip matches legacy");
+            prop_assert_eq!(fast_suffix_tip.orchard.root(), golden_tip.orchard.root(), "manual-to-fast orchard tip matches legacy");
+            prop_assert_eq!(fast_suffix_tip.sprout.root(), golden_tip.sprout.root(), "manual-to-fast sprout tip matches legacy");
     });
 
     Ok(())

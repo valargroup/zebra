@@ -462,7 +462,11 @@ impl FinalizedState {
             read_only,
         );
 
-        let vct = VctState::from_config(config.checkpoint_sync, network);
+        let vct = VctState::from_config(
+            config.checkpoint_sync,
+            config.disable_vct_fast_sync,
+            network,
+        );
 
         // Re-derive the frozen-frontier flag from durable state: a fast sync
         // interrupted before the checkpoint handoff leaves the stale frozen frontier
@@ -515,19 +519,17 @@ impl FinalizedState {
         // An *interrupted* fast sync — frozen frontier, tip still below the handoff — can
         // only be safely resumed by the fast path (which supplies the verified roots). The
         // on-disk frontier is stale, so the committer fails closed on every below-handoff
-        // height with no supplied root (§8). Turning the fast path off mid-sync with
-        // `checkpoint_sync = false` selects the legacy committer (no VCT state), which can
-        // never supply those roots, so the node would refuse every block forever. Refuse to
-        // open instead, with a clear recovery path, rather than stalling silently. (A frozen
-        // marker only exists on a network with an embedded frontier, so `checkpoint_sync` is
-        // the signal here — disabling it is the only way to lose the source mid-sync.)
-        if new_state.vct_frontier_frozen && !config.checkpoint_sync {
+        // height with no supplied root (§8). Reopening without a VCT root source selects the
+        // legacy committer, which can never supply those roots, so the node would refuse every
+        // block forever. Refuse to open instead, with a clear recovery path, rather than
+        // stalling silently.
+        if new_state.vct_frontier_frozen && new_state.vct.is_none() {
             panic!(
                 "this database has a fast sync in progress (verified commitment trees) that was \
-                 interrupted below the checkpoint handoff height, but `consensus.checkpoint_sync \
-                 = false` disables the fast path that supplies the verified roots needed to \
-                 resume it. Set `consensus.checkpoint_sync = true` to finish the fast sync, or \
-                 delete the cache directory and re-sync from genesis"
+                 interrupted below the checkpoint handoff height, but the fast path that supplies \
+                 the verified roots needed to resume it is disabled. Set \
+                 `consensus.checkpoint_sync = true` and `consensus.disable_vct_fast_sync = false` to \
+                 finish the fast sync, or delete the cache directory and re-sync from genesis"
             );
         }
 

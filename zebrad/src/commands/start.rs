@@ -544,10 +544,10 @@ impl StartCmd {
 
         let mut state_config = config.state.clone();
         state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
-        // The state's fast-vs-legacy commitment-tree decision tracks the consensus
-        // checkpoint-sync option: fast verified path under checkpoint trust, full per-block
-        // recompute when checkpoint sync is disabled.
+        // State owns the VCT commit path, but users configure its checkpoint-sync controls
+        // together under `[consensus]`.
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
+        state_config.disable_vct_fast_sync = config.consensus.disable_vct_fast_sync;
 
         let (
             state_service,

@@ -8,7 +8,7 @@
 //!
 //! Runs when the state committer exposes a `tree_aux` roots writer. On Mainnet this
 //! is the default fast path under checkpoint sync; `consensus.checkpoint_sync = false`
-//! opts out to the legacy recompute path.
+//! or `consensus.disable_vct_fast_sync = true` selects the legacy recompute path.
 
 use std::time::Duration;
 

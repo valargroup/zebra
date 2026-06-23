@@ -1149,10 +1149,13 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
-    // Fast sync is the default under checkpoint sync for Archive mode, so reopening a
-    // fast-synced database in archive mode (the default) must succeed. Fast sync deletes
-    // nothing; the missing historical trees are surfaced at the RPC boundary, not by
-    // refusing to reopen.
+    // A completed fast-synced database can reopen in archive mode even when the initial-rollout
+    // force-disable knob selects manual recomputation. Fast sync deletes nothing; the missing
+    // historical trees are surfaced at the RPC boundary, not by refusing to reopen.
+    let config = Config {
+        disable_vct_fast_sync: true,
+        ..config
+    };
     let reopened = FinalizedState::new(
         &config,
         &network,
@@ -1164,6 +1167,50 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
         reopened.db.fast_synced_below(),
         Some(Height(2)),
         "the fast-sync marker is preserved across the archive-mode reopen"
+    );
+}
+
+#[test]
+fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }),
+        ..Config::default()
+    };
+
+    // Commit blocks, write a completed fast-sync marker below the tip, then drop the handle to
+    // release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_fast_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Pruning only removes historical raw transaction bytes; it does not make a completed
+    // fast-sync marker unsafe to reopen with VCT force-disabled.
+    let config = Config {
+        disable_vct_fast_sync: true,
+        ..config
+    };
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.fast_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the pruned-mode reopen"
     );
 }
 
@@ -1194,6 +1241,41 @@ fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
 
     // Reopening with the fast path disabled must refuse: the on-disk frontier is stale and no
     // root source exists, so the committer would otherwise stall on every below-handoff block.
+    let _state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+}
+
+#[test]
+#[should_panic(expected = "interrupted below the checkpoint handoff")]
+fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // Keep checkpoint sync enabled, but force-disable the VCT source. This should be just as
+    // unsafe as disabling checkpoint sync when the database is below a durable fast-sync marker.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        disable_vct_fast_sync: true,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_fast_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Reopening with the VCT force-disable knob must refuse: the on-disk frontier is stale and
+    // no root source exists, so the committer would otherwise stall on every below-handoff block.
     let _state = FinalizedState::new(
         &config,
         &network,
