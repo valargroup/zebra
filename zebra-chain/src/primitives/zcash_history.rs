@@ -68,6 +68,33 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Builds an [`Entry`] from the meaningful prefix of a history-tree entry that was serialized by
+    /// an *older* Zebra version whose `zcash_history::MAX_ENTRY_SIZE` was smaller.
+    ///
+    /// An [`Entry`] is a fixed-size, zero-padded buffer: a leaf/node `kind` byte, optional child
+    /// links, then the version's node data, followed by zero padding out to `MAX_ENTRY_SIZE`. The
+    /// inner `zcash_history::Entry` reader (`Entry::read`/`from_bytes`) consumes exactly the bytes of
+    /// that meaningful prefix and ignores the trailing padding, so copying an older, shorter buffer
+    /// into the front of a current-width, zero-initialized buffer yields an entry the current reader
+    /// parses identically. (The consensus branch id is supplied by the reader, not stored in the
+    /// buffer, so it is unaffected.)
+    ///
+    /// `old_bytes` must be no longer than the current [`zcash_history::MAX_ENTRY_SIZE`]; that holds
+    /// for any pre-Ironwood entry, whose buffer was strictly smaller than the current one. Returns
+    /// `None` otherwise rather than truncating, so a future width *shrink* (which must never happen
+    /// for a consensus-fixed format, but is checked defensively) cannot silently corrupt an entry.
+    pub fn from_smaller_format_bytes(old_bytes: &[u8]) -> Option<Self> {
+        if old_bytes.len() > zcash_history::MAX_ENTRY_SIZE {
+            return None;
+        }
+
+        let mut inner = [0u8; zcash_history::MAX_ENTRY_SIZE];
+        inner[..old_bytes.len()].copy_from_slice(old_bytes);
+        Some(Entry { inner })
+    }
+}
+
+impl Entry {
     /// Create a leaf Entry for the given block, its network, and the root of its
     /// note commitment trees.
     ///

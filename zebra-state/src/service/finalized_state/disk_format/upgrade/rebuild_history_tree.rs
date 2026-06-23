@@ -50,7 +50,11 @@ use zebra_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::chain::HistoryTreeParts, DiskWriteBatch, ZebraDb,
+    disk_format::{
+        chain::{reencode_old_format_history_tree_parts, HistoryTreeParts},
+        RawBytes,
+    },
+    DiskWriteBatch, ZebraDb,
 };
 
 use super::{CancelFormatChange, DiskFormatUpgrade};
@@ -173,7 +177,21 @@ pub(crate) fn rebuild_tip_history_tree_if_needed(
 
     let network = db.network();
 
-    let Some(history_tree) = rebuild_tip_history_tree(db, &network, tip_height)? else {
+    let history_tree = match rebuild_tip_history_tree(db, &network, tip_height) {
+        Ok(history_tree) => history_tree,
+        Err(RebuildError::MissingData { height }) => {
+            // The from-blocks rebuild needs historical blocks and note commitment trees that a
+            // database pruned before the Ironwood bump no longer has. But a pre-Ironwood tip tree is
+            // made of V1/V2 entries whose node data is consensus-fixed, so we can repair the entry
+            // *in place* by re-encoding the still-present old-format blob in the current `Entry`
+            // width, without reading any block. This is provably equivalent to the from-blocks
+            // rebuild: same peaks bytes, same `size`, same `current_height`, hence the same MMR root.
+            return reencode_tip_history_tree_in_place(db)
+                .ok_or(RebuildError::MissingData { height });
+        }
+    };
+
+    let Some(history_tree) = history_tree else {
         // Pre-Heartwood tips have no history tree, so there is nothing to rebuild. (Any stale entry
         // would be deleted rather than rewritten, but pre-Heartwood databases never wrote one.)
         return Ok(());
@@ -187,6 +205,40 @@ pub(crate) fn rebuild_tip_history_tree_if_needed(
         .expect("rewriting the tip history tree in the current format should always succeed");
 
     Ok(())
+}
+
+/// Repairs the tip history-tree entry *in place* by re-encoding the stored pre-Ironwood blob in the
+/// current `Entry` format, without reading any block.
+///
+/// This is the fallback used when the from-blocks rebuild reports [`RebuildError::MissingData`] (a
+/// database pruned before the Ironwood bump). It reads the raw old-format entry, re-encodes it (only
+/// the per-entry zero padding changes; the consensus-fixed node data is copied verbatim), writes it
+/// back under the `()` key, and confirms it now reads in the current format.
+///
+/// Returns `Some(())` on success, or `None` if the entry is absent or cannot be re-encoded (e.g. it
+/// is corrupt rather than merely old-format). The caller turns `None` back into the original
+/// `MissingData` error, so a genuinely unrecoverable database still fails loudly.
+#[allow(clippy::unwrap_in_result)]
+fn reencode_tip_history_tree_in_place(db: &ZebraDb) -> Option<()> {
+    let raw_entry = db.raw_history_tree_value_cf().zs_get(&())?;
+    let reencoded = reencode_old_format_history_tree_parts(raw_entry.raw_bytes())?;
+
+    let mut batch = DiskWriteBatch::new();
+    let _ = db
+        .raw_history_tree_value_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_insert(&(), &RawBytes::new_raw_bytes(reencoded));
+    db.write_batch(batch)
+        .expect("rewriting the re-encoded tip history tree should always succeed");
+
+    // The re-encoded entry must now be readable in the current format; if not, treat the repair as
+    // failed so the caller surfaces the fatal pruned-database error rather than marking the database
+    // upgraded with an unreadable entry.
+    if needs_rebuild(db) {
+        return None;
+    }
+
+    Some(())
 }
 
 /// Returns `true` if the tip history tree entry exists but cannot be deserialized in the current
