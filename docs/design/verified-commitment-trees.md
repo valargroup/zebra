@@ -275,8 +275,11 @@ fast block already ran as its look-ahead one commit earlier. The committer cache
 look-ahead result as `(next_height, next_hash)` and skips a block's own check when the prior
 look-ahead validated exactly it. The guard is hash identity and heights are monotonic, so a
 stale or cloned cache entry can never cause a false skip. Steady state drops from two
-commitment checks per block to one (legacy parity) while still attesting every root; the cache
-is cleared on the no-successor sync tip and on legacy blocks. The dedup is observable
+commitment checks per block to one (legacy parity) while still attesting every root before it
+is persisted. A non-handoff fast block with no buffered successor is deferred by the write
+worker until the successor arrives; the checkpoint handoff is the only no-successor fast commit
+because the embedded final frontier independently authenticates that height's roots. The cache
+is cleared on handoff and on legacy blocks. The dedup is observable
 (`state.vct.prevalidated.block.count`) so it cannot silently regress.
 
 ### 6.3 The auth-data-root cache lock
@@ -304,17 +307,25 @@ logic. For a checkpoint-verified block at `height`:
    - run the own-commitment check unless the dedup (§6.2) already validated it;
    - apply the direct below-Heartwood/below-NU5 checks (§6.1);
    - build a candidate history tree with the roots folded in (`HistoryTree::push`);
-   - **verify-before-commit:** if the successor is buffered, check its commitment against the
+   - **verify-before-commit:** either check the buffered successor's commitment against the
      candidate (the one-block-lag confirmation) and cache `(height+1, next_hash)` as
-     pre-validated; a failure means *this* height's root is bad → reject and evict (§8);
+     pre-validated, or, at the checkpoint handoff only, verify the embedded final frontiers
+     against this height's roots; a failure means *this* height's root is bad → reject and
+     evict (§8);
    - fold the roots into the anchor set, skip the frontier recompute, and **freeze** the
-     note-commitment frontier (`vct_frontier_frozen = true`).
+     note-commitment frontier (`vct_frontier_frozen = true`) for non-handoff fast blocks.
 3. **Checkpoint handoff** (when `height` is the handoff height): verify the embedded frontier
    against this block's verified root (`frontier.root() == verified root`; collision resistance
    makes the root a binding commitment to the frontier), write it as the real tip treestate via
    the normal write path, and **unfreeze** — heights at/above the handoff resume legacy
    recompute from a correct frontier.
 4. **If not supplied:** §8.
+
+The write worker enforces the successor side of this contract before calling the committer: if
+a queued checkpoint block would take the fast path, is not the handoff height, and has no
+buffered successor yet, it is parked locally and retried when another checkpoint block arrives.
+It is not reported through the invalid-block reset path, because no verification failure has
+occurred — the needed `H+1` witness is merely not buffered yet.
 
 **Persistent fast-synced databases.** A persistent fast sync marks the database with a
 `fast_sync_metadata` column family recording the handoff height (DB format minor bump to
@@ -352,6 +363,10 @@ So the committer **fails closed** rather than falling back to recompute (commit 
 - A frozen-frontier height with **no** valid supplied root (never fetched, or just evicted)
   refuses with the same retryable error and leaves the database untouched. The block commits
   once a verifiable root is fetched.
+- A non-handoff fast block with a valid supplied root but **no buffered successor** is not a
+  root failure: the write worker defers it locally until `H+1` is available to authenticate
+  the candidate history tree. If a direct committer caller bypasses that deferral, the
+  committer still fails closed before writing.
 - The frozen flag is **seeded from the durable fast-sync marker on open**, not just tracked
   in-session: a fast sync interrupted by a restart (frozen frontier persisted, tip below the
   handoff) still refuses on the first post-restart height with a missing root. The frozen
