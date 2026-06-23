@@ -11,8 +11,8 @@ checkpoint handoff an **embedded final frontier** (verified against that block's
 written so normal per-block verification resumes above the checkpoint. Result: same consensus
 state as the legacy committer, far less work — and no new cryptography.
 
-**The one invariant that makes it safe:** *no root influences consensus state until it has been
-authenticated against a header commitment.* Everything else (the transport, the cache, the peer
+**The one invariant that makes it safe:** _no root influences consensus state until it has been
+authenticated against a header commitment._ Everything else (the transport, the cache, the peer
 policy) is plumbing around that invariant. A root that cannot be obtained or verified is refused,
 never guessed — inside the post-fold "frozen" window the committer **fails closed** rather than
 recomputing against a now-stale frontier (§8).
@@ -96,7 +96,7 @@ or verify a root falls back to the legacy recompute, bit-identical to today.
   (`consensus.disable_vct_fast_sync`; §4.4); the `state.storage_mode` axis (Archive vs. Pruned)
   is orthogonal — it controls raw-tx/index pruning, not the tree path, so both storage modes
   use the fast path under checkpoint sync unless force-disabled. The network `PeerSource` and
-  crate-local test fixtures are *sources* behind one seam (§5.3) — not modes.
+  crate-local test fixtures are _sources_ behind one seam (§5.3) — not modes.
 - **No new cryptography.** Verification reuses the existing consensus checks
   (`block_commitment_is_valid_for_chain_history`, `HistoryTree::push`); see §6.
 - **Out of scope for the fast lane:** historical tree/subtree RPCs (`z_gettreestate`,
@@ -114,7 +114,7 @@ block headers** via the ZIP-221 ChainHistory MMR: a block's header commitment bi
 history tree as of its parent, and each history-tree leaf is built from the block body plus
 that block's Sapling/Orchard roots.
 
-That is the lever: if a node is *handed* the per-block roots, it can fold them straight into
+That is the lever: if a node is _handed_ the per-block roots, it can fold them straight into
 the anchor set and history MMR and **confirm them against the headers it already trusts**,
 skipping the frontier recompute entirely — without weakening any consensus check.
 
@@ -127,15 +127,15 @@ The fast path needs two things, and they are sourced differently:
 - **Per-block roots travel over the network.** `BlockCommitmentRoots { height, sapling_root,
   orchard_root }` (§5.1) is the only `tree_aux` wire payload.
 - **The final frontier is embedded in the binary** (§5.2), refreshed per release like a
-  checkpoint, *not* sent on the wire. So `tree_aux` is a **roots-only** stream: there is no
+  checkpoint, _not_ sent on the wire. So `tree_aux` is a **roots-only** stream: there is no
   `GetFinalFrontiers`/`FinalFrontiers` message and no frontier-serving path to attack or
   keep available.
 
 ### 4.2 Header-sync alignment
 
 Commitment roots are header-adjacent verified metadata, not body data: tiny, verified against
-the header chain, servable only by a node holding the validated headers, and needed *buffered
-ahead of* the committer. So `tree_aux` is a **separate Zakura stream** (its own capability
+the header chain, servable only by a node holding the validated headers, and needed _buffered
+ahead of_ the committer. So `tree_aux` is a **separate Zakura stream** (its own capability
 bit) **templated and timed on `header_sync`, not `block_sync`** — driven ahead of body
 download. The driver stages fetched batches and only publishes them to the committer cache after
 the whole verified-tip-to-handoff range succeeds, so a range's coverage is known before any of
@@ -173,7 +173,7 @@ orthogonal pruning axis). The resulting modes:
 
 | Mode | Config | Tree behavior |
 | --- | --- | --- |
-| **Archive** (default) | `consensus.checkpoint_sync = true`, `consensus.disable_vct_fast_sync = false`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the handoff *for now* (§7, §10). |
+| **Archive** (default) | `consensus.checkpoint_sync = true`, `consensus.disable_vct_fast_sync = false`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the handoff _for now_ (§7, §10). |
 | **Pruning** | `consensus.checkpoint_sync = true`, `consensus.disable_vct_fast_sync = false`, `storage_mode.pruned` | Fast — same as Archive, **plus** raw-tx/index pruning outside the retention window. |
 | **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.disable_vct_fast_sync = true` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard trees per block. |
 | **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block, using only mandatory checkpoints. |
@@ -237,7 +237,7 @@ by the maintenance tool described in §16.
 
 ### 5.3 The `CommitmentRootSource` seam
 
-`CommitmentRootSource` (`zebra-state/.../finalized_state/commitment_aux.rs`) abstracts *where*
+`CommitmentRootSource` (`zebra-state/.../finalized_state/commitment_aux.rs`) abstracts _where_
 the fast path's roots and handoff frontier come from. The committer (`VctState.source`) reads
 through this one seam regardless of source:
 
@@ -329,7 +329,7 @@ node's own checkpoint-committed headers. The logic lives in
 `finalized_state/commitment_aux_verify.rs` and reuses the existing consensus check
 `block_commitment_is_valid_for_chain_history` plus `HistoryTree::push` — **no new crypto**.
 
-A block's header commitment binds the history tree *as of its parent*, so the root supplied
+A block's header commitment binds the history tree _as of its parent_, so the root supplied
 for height `H` is folded into a candidate history tree and confirmed when `H+1`'s commitment
 is checked against that candidate. A wrong root makes that check fail and the block is
 **rejected, not recomputed** (§8). The standalone `verify_commitment_roots` returns the first
@@ -345,7 +345,7 @@ The ZIP-221 MMR does not authenticate everything, so two gaps are closed by dire
   yet, so the header's `FinalSaplingRoot` is compared directly; pre-Sapling the root must be
   the empty-tree root. At/above Heartwood the MMR path authenticates it.
 - **Orchard below NU5** (`verify_supplied_orchard_root_below_nu5`): the V1 history leaf
-  (Heartwood..Canopy) *ignores* the Orchard root and there is no MMR below Heartwood, so no
+  (Heartwood..Canopy) _ignores_ the Orchard root and there is no MMR below Heartwood, so no
   header commits to an Orchard root below NU5 — yet the fast path folds the supplied Orchard
   root into the anchor set for every block. The Orchard tree is provably empty there (no
   Orchard actions are allowed), so the supplied root is pinned to the empty-tree root. Without
@@ -356,7 +356,7 @@ The ZIP-221 MMR does not authenticate everything, so two gaps are closed by dire
 
 ### 6.2 The one-block lag and the dedup
 
-A block's own commitment check `C(X, T_{X-1})` is the *identical* computation the previous
+A block's own commitment check `C(X, T_{X-1})` is the _identical_ computation the previous
 fast block already ran as its look-ahead one commit earlier. The committer caches the
 look-ahead result as `(next_height, next_hash)` and skips a block's own check when the prior
 look-ahead validated exactly it. The guard is hash identity and heights are monotonic, so a
@@ -372,8 +372,8 @@ is cleared on handoff and on legacy blocks. The dedup is observable
 
 The NU5+ commitment check trusts a precomputed `AuthDataRoot` carried on
 `CheckpointVerifiedBlock` (so the single-threaded committer does not recompute it). Every
-cached value is computed from the block by the constructors, so it is correct *by
-construction* — but the public API previously let it be desynced after construction
+cached value is computed from the block by the constructors, so it is correct _by
+construction_ — but the public API previously let it be desynced after construction
 (`pub auth_data_root`, `DerefMut`, both re-exported). A holder could swap the block while
 keeping a stale root, and a header matching the stale root would finalize a block without
 proving the header binds the block's actual authorizing data. The (block, auth-data-root) pair
@@ -384,7 +384,7 @@ is now locked together: `auth_data_root` is `pub(crate)`, `CheckpointVerifiedBlo
 
 ## 7. The fast commit path and checkpoint handoff
 
-The commit-path hook lives in `finalized_state.rs`; everything about *where data comes from*
+The commit-path hook lives in `finalized_state.rs`; everything about _where data comes from_
 lives in the `vct` and `commitment_aux` submodules, so the commit path holds only the handoff
 logic. For a checkpoint-verified block at `height`:
 
@@ -396,7 +396,7 @@ logic. For a checkpoint-verified block at `height`:
    - **verify-before-commit:** either check the buffered successor's commitment against the
      candidate (the one-block-lag confirmation) and cache `(height+1, next_hash)` as
      pre-validated, or, at the checkpoint handoff only, verify the embedded final frontiers
-     against this height's roots; a failure means *this* height's root is bad → reject and
+     against this height's roots; a failure means _this_ height's root is bad → reject and
      evict (§8);
    - fold the roots into the anchor set, skip the frontier recompute, and **freeze** the
      note-commitment frontier (`vct_frontier_frozen = true`) for non-handoff fast blocks.
@@ -422,7 +422,7 @@ DB (tip at/above the handoff) **reopens in any storage mode** — a reopen loses
 and `consensus.disable_vct_fast_sync = true` or `consensus.checkpoint_sync = false` simply resumes
 the legacy recompute from the real tip frontier.
 
-The one reopen that *is* refused is an **interrupted** fast sync (frozen frontier, tip below the
+The one reopen that _is_ refused is an **interrupted** fast sync (frozen frontier, tip below the
 handoff) reopened with the fast path disabled (legacy mode —
 `consensus.disable_vct_fast_sync = true`, `consensus.checkpoint_sync = false`, or no embedded
 frontier). The on-disk frontier is stale and no source can supply the verified roots, so the
@@ -437,10 +437,10 @@ genesis-root and subtree format-validity checks skip fast-synced DBs.
 
 While the frontier is frozen (a fast sync has folded roots but the handoff has not yet written
 the real frontier), the on-disk frontier is **stale**. A legacy recompute in that window would
-extend the stale frontier and fold a *wrong* root into the MMR — corrupting consensus state.
+extend the stale frontier and fold a _wrong_ root into the MMR — corrupting consensus state.
 So the committer **fails closed** rather than falling back to recompute (commit #211):
 
-- A supplied root that fails *any* verification step is **evicted** from its source (so a
+- A supplied root that fails _any_ verification step is **evicted** from its source (so a
   re-fetch from another peer can replace it) and the commit is **refused** with the typed,
   **retryable** `VctSuppliedRootUnavailable { height }` error — not retried against the same
   rejected root forever, and not recomputed locally.
@@ -562,7 +562,7 @@ mechanisms address it, in order of cost:
 - **Roots-index CF (lightweight, preferred).** A fast node already verified every root it
   folded in. Persisting them into a compact column family (~68 bytes/block, ~200 MB for all of
   Mainnet) lets it serve them without per-height trees, at near-zero extra cost. A background
-  task can backfill missing lower ranges by fetching *roots* (not bodies), so even a
+  task can backfill missing lower ranges by fetching _roots_ (not bodies), so even a
   snapshot-started node becomes a full-range roots server cheaply. This is the targeted fix for
   the §4.3 / §10 availability gap.
 - **Indexing-follower resync (heavyweight, opt-in).** Rebuild the per-height trees off the
