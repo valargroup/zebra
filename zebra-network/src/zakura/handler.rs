@@ -3443,7 +3443,7 @@ async fn write_outbound_request_frame_inner(
     loop {
         match read_frame(
             &mut recv,
-            app_frame_cap_for_stream_kind(&limits, stream_kind),
+            inbound_frame_cap_for_stream_kind(&limits, stream_kind),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -4076,18 +4076,15 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
     .max(1)
 }
 
-/// Frame cap for reading on an admitted inbound stream, never larger than the
+/// Frame cap for reading frames received from a peer, never larger than the
 /// message cap allows.
 ///
-/// On an admitted ordered/request stream a frame payload *is* the message, so
-/// `admit_inbound_message` rejects any payload over `max_message_bytes`. A peer
-/// can negotiate `max_frame_bytes > max_message_bytes` (the two caps are clamped
-/// independently in `ZakuraLocalLimits::clamp`), so the cap handed to
-/// `read_frame` must also be limited to the message size. Otherwise a frame whose
-/// `payload_len` falls between the two limits is allocated and read in full by
-/// `read_frame` before `admit_inbound_message` rejects it as oversize, letting a
-/// peer force per-frame allocation/I/O up to the larger frame cap across many
-/// streams.
+/// On ordered/request streams and requester-side responses, a frame payload *is*
+/// the message. A peer can negotiate `max_frame_bytes > max_message_bytes` (the
+/// two caps are clamped independently in `ZakuraLocalLimits::clamp`), so the cap
+/// handed to `read_frame` must also be limited to the message size. Otherwise a
+/// frame whose `payload_len` falls between the two limits is allocated and read
+/// in full before the later message-level validation rejects or decodes it.
 fn inbound_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
     let frame_header_bytes =
         u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");
