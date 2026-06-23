@@ -1405,12 +1405,10 @@ impl DiskWriteBatch {
 
         // Serialize the raw transaction bytes up front: on heavy shielded blocks
         // this serialization dominates the per-block write cost, and each
-        // transaction serializes independently. The result is byte-identical to
-        // inserting the transactions directly, because `RawBytes` is stored
-        // verbatim. The serialized bytes are inserted in height/index order below.
+        // transaction serializes independently.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
-        // the fork-join cost; small blocks serialize sequentially (see
+        // the multi-threading overhead. Small blocks serialize sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
             Vec::new()
