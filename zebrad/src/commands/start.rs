@@ -549,15 +549,20 @@ impl StartCmd {
         // recompute when checkpoint sync is disabled.
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
 
-        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zebra_state::init(
-                state_config,
-                &config.network.network,
-                max_checkpoint_height,
-                config.sync.checkpoint_verify_concurrency_limit
-                    * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-            )
-            .await;
+        let (
+            state_service,
+            read_only_state_service,
+            latest_chain_tip,
+            chain_tip_change,
+            tree_aux_roots_writer,
+        ) = zebra_state::init(
+            state_config,
+            &config.network.network,
+            max_checkpoint_height,
+            config.sync.checkpoint_verify_concurrency_limit
+                * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+        )
+        .await;
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -698,7 +703,7 @@ impl StartCmd {
                 // committer is built in peer mode (the default where embedded final
                 // frontiers exist), fetch the checkpoint roots from a peer into the
                 // committer's cache, ahead of body commit.
-                if let Some(writer) = zebra_state::tree_aux_roots_writer() {
+                if let Some(writer) = tree_aux_roots_writer {
                     let tree_aux_task = tokio::spawn(
                         run_tree_aux_driver(
                             endpoint.supervisor(),

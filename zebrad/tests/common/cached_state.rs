@@ -146,7 +146,9 @@ pub async fn start_state_service_with_cache_dir(
     };
 
     // These tests don't need UTXOs to be verified efficiently, because they use cached states.
-    Ok(zebra_state::init(config, network, Height::MAX, 0).await)
+    let (state, read_state, latest_chain_tip, chain_tip_change, _) =
+        zebra_state::init(config, network, Height::MAX, 0).await;
+    Ok((state, read_state, latest_chain_tip, chain_tip_change))
 }
 
 /// Loads the finalized tip height from the state stored in a specified directory.

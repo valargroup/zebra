@@ -788,7 +788,7 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
+        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change, _) =
             zebra_state::init(state_config.clone(), &network, Height::MAX, 0).await;
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
@@ -902,7 +902,7 @@ async fn setup(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, _) =
         zebra_state::init(state_config.clone(), &network, Height::MAX, 0).await;
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);

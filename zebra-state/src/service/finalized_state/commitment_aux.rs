@@ -17,7 +17,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
 };
 
 use tokio::sync::broadcast;
@@ -269,6 +269,16 @@ pub(crate) struct PeerSourceWriter {
     cache: Arc<RwLock<PeerRootsCache>>,
 }
 
+/// Per-state driver handle for a [`PeerSource`].
+///
+/// The `tree_aux` driver writes verified roots through [`Self::insert_roots`] and subscribes
+/// to targeted refetch requests from the committer through [`Self::subscribe_refetch`].
+#[derive(Clone, Debug)]
+pub(crate) struct PeerSourceHandle {
+    writer: PeerSourceWriter,
+    refetch_sender: broadcast::Sender<block::Height>,
+}
+
 /// Shared peer-source cache state.
 #[derive(Debug, Default)]
 struct PeerRootsCache {
@@ -277,16 +287,22 @@ struct PeerRootsCache {
 }
 
 impl PeerSource {
-    /// Create an empty peer source and its write handle. `frontiers` is the embedded
+    /// Create an empty peer source and its driver handle. `frontiers` is the embedded
     /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).
-    pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceWriter) {
+    pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceHandle) {
         let cache = Arc::new(RwLock::new(PeerRootsCache::default()));
+        let writer = PeerSourceWriter {
+            cache: Arc::clone(&cache),
+        };
         (
             PeerSource {
                 cache: Arc::clone(&cache),
                 frontiers,
             },
-            PeerSourceWriter { cache },
+            PeerSourceHandle {
+                writer,
+                refetch_sender: broadcast::channel(64).0,
+            },
         )
     }
 }
@@ -313,57 +329,26 @@ impl PeerSourceWriter {
     }
 }
 
-/// Process-global handle to the live peer-source writer, published once when the
-/// committer is built in peer (`tree_aux`) mode. The `tree_aux` driver in `zebrad`
-/// fetches it to fill the committer's root cache as ranges arrive from peers.
-///
-/// A process global (rather than threading a writer return value back out through the
-/// state-service init) keeps the experimental verified-commitment-trees wiring off the
-/// production state-init signatures, matching the env-driven style of [`super::vct`].
-static PEER_ROOTS_WRITER: OnceLock<PeerSourceWriter> = OnceLock::new();
+impl PeerSourceHandle {
+    /// Insert verified roots fetched for a range into the shared cache.
+    pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
+        self.writer.insert_roots(roots);
+    }
 
-/// Process-global signal used by the finalized committer to request a targeted root refetch.
-static PEER_ROOT_REFETCH: OnceLock<broadcast::Sender<block::Height>> = OnceLock::new();
+    /// Subscribe to targeted peer-root refetch requests.
+    pub(crate) fn subscribe_refetch(&self) -> broadcast::Receiver<block::Height> {
+        self.refetch_sender.subscribe()
+    }
 
-/// Build a [`PeerSource`] over the embedded handoff `frontiers` and publish its writer
-/// globally so the `tree_aux` driver can fill it. Returns the source for the committer.
-///
-/// First writer wins: a second committer build (e.g. a test re-init in the same process)
-/// reuses the originally published cache handle, so the driver and committer never split.
-pub(super) fn install_peer_source(frontiers: Option<FinalFrontiers>) -> PeerSource {
-    let (source, writer) = PeerSource::new(frontiers);
-    let _ = PEER_ROOTS_WRITER.set(writer);
-    let _ = PEER_ROOT_REFETCH.set(broadcast::channel(64).0);
-    source
-}
-
-/// The live peer-source writer, if the committer was built in peer (`tree_aux`) mode.
-/// Used by the `tree_aux` driver to write fetched root ranges into the committer's cache.
-pub(crate) fn peer_roots_writer() -> Option<PeerSourceWriter> {
-    PEER_ROOTS_WRITER.get().cloned()
-}
-
-/// Subscribe to targeted peer-root refetch requests.
-pub(crate) fn peer_root_refetch_receiver() -> Option<broadcast::Receiver<block::Height>> {
-    PEER_ROOT_REFETCH.get().map(|sender| sender.subscribe())
-}
-
-/// Request a targeted peer-root refetch for `height`.
-pub(crate) fn request_peer_root_refetch(height: block::Height) {
-    if let Some(sender) = PEER_ROOT_REFETCH.get() {
-        if sender.send(height).is_err() {
+    /// Request a targeted peer-root refetch for `height`.
+    pub(crate) fn request_refetch(&self, height: block::Height) {
+        if self.refetch_sender.send(height).is_err() {
             metrics::counter!("state.vct.root.refetch.no_receiver.count").increment(1);
             tracing::debug!(
                 ?height,
                 "VCT: requested peer root refetch but no tree_aux driver is subscribed"
             );
         }
-    } else {
-        metrics::counter!("state.vct.root.refetch.no_sender.count").increment(1);
-        tracing::debug!(
-            ?height,
-            "VCT: requested peer root refetch before the peer-source signal was installed"
-        );
     }
 }
 
@@ -567,6 +552,48 @@ mod tests {
         assert!(
             source.fast_root(block::Height(42)).is_none(),
             "an evicted root is gone, so the next read misses and a re-fetch can replace it"
+        );
+    }
+
+    /// Each peer source owns its cache and refetch signal. This is the property the
+    /// per-state handle replaces the old process-global `OnceLock` publishing with.
+    #[test]
+    fn peer_source_handles_are_isolated_per_state() {
+        let (source_a, handle_a) = PeerSource::new(None);
+        let (source_b, handle_b) = PeerSource::new(None);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        handle_a.insert_roots([BlockCommitmentRoots {
+            height: block::Height(42),
+            sapling_root: empty_sapling_root,
+            orchard_root: empty_orchard_root,
+        }]);
+
+        assert!(
+            source_a.fast_root(block::Height(42)).is_some(),
+            "the first peer source sees roots inserted through its own handle"
+        );
+        assert!(
+            source_b.fast_root(block::Height(42)).is_none(),
+            "a second peer source in the same process has an independent cache"
+        );
+
+        let mut refetch_a = handle_a.subscribe_refetch();
+        let mut refetch_b = handle_b.subscribe_refetch();
+        handle_a.request_refetch(block::Height(42));
+
+        assert_eq!(
+            refetch_a.try_recv(),
+            Ok(block::Height(42)),
+            "the first handle receives its own refetch request"
+        );
+        assert!(
+            matches!(
+                refetch_b.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "the second handle does not receive another state's refetch request"
         );
     }
 
