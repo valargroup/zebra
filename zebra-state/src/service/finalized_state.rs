@@ -725,11 +725,10 @@ impl FinalizedState {
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
         // Build and write the block's RocksDB batch inside the dedicated
-        // commit-compute pool. Like the note-commitment tree update above, the
-        // per-block serialization done here (raw transaction bytes and the block
-        // size) is parallelized with rayon; running it in the isolated pool keeps
-        // those workers from contending with the download/verification pipeline
-        // on the global pool.
+        // commit-compute pool. The par-iter calls inside write_block end up scheduled
+        // on a separate pool from global (which is used by download/verify pipeline).
+        // This leads to less contention and more throughput, as benchmarked over the
+        // sand-blasting region.
         let network = self.network();
         let result = COMMIT_COMPUTE_POOL.install(|| {
             self.db.write_block(
