@@ -12,6 +12,7 @@
 
 use std::{iter, path::Path, sync::Arc};
 
+use proptest::prelude::*;
 use zebra_chain::{
     block::{
         self,
@@ -204,6 +205,45 @@ fn header_range_commit_merges_same_header_advertised_body_size_by_max() {
     assert_eq!(state.advertised_body_size(Height(1)), Some(999_999));
 }
 
+proptest! {
+    #[test]
+    fn same_hash_header_commits_keep_max_advertised_body_size(
+        body_sizes in prop::collection::vec(any::<u32>(), 1..16),
+    ) {
+        let _init_guard = zebra_test::init();
+        let (state, genesis, block1) = mainnet_state_with_genesis();
+
+        for body_size in &body_sizes {
+            commit_single_header_with_size(&state, genesis.hash(), &block1.header, *body_size);
+        }
+
+        let expected = body_sizes
+            .into_iter()
+            .max()
+            .filter(|body_size| *body_size != 0);
+        prop_assert_eq!(state.advertised_body_size(Height(1)), expected);
+    }
+}
+
+#[test]
+fn same_hash_header_commits_keep_max_advertised_regardless_of_arrival_order() {
+    let _init_guard = zebra_test::init();
+
+    for (first_size, second_size) in [(654_321, 0), (0, 654_321)] {
+        let (state, genesis, block1) = mainnet_state_with_genesis();
+
+        commit_single_header_with_size(&state, genesis.hash(), &block1.header, first_size);
+        commit_single_header_with_size(&state, genesis.hash(), &block1.header, second_size);
+
+        assert_eq!(
+            state.advertised_body_size(Height(1)),
+            Some(654_321),
+            "max nonzero advertised size must survive arrival order \
+             (first={first_size}, second={second_size})",
+        );
+    }
+}
+
 #[test]
 fn header_range_reorg_resets_advertised_body_sizes() {
     let _init_guard = zebra_test::init();
@@ -230,6 +270,45 @@ fn header_range_reorg_resets_advertised_body_sizes() {
     assert_eq!(state.advertised_body_size(Height(1)), None);
     assert_eq!(state.advertised_body_size(Height(2)), None);
     assert_eq!(state.advertised_body_size(Height(3)), Some(333));
+}
+
+#[test]
+fn different_hash_reorg_does_not_resurface_stale_advertised_max() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+    let block3 = mainnet_block(3);
+
+    let headers = vec![block1.header.clone(), block2.header.clone()];
+    commit_header_range_with_sizes(&state, genesis.hash(), &headers, &[700_000, 900_000]);
+    assert_eq!(state.advertised_body_size(Height(1)), Some(700_000));
+    assert_eq!(state.advertised_body_size(Height(2)), Some(900_000));
+
+    let alternate_block2 = alternate_header(block1.hash(), &block2.header, 1);
+    let alternate_block2_hash = block::Hash::from(&*alternate_block2);
+    let alternate_block3 = alternate_header(alternate_block2_hash, &block3.header, 2);
+    let replacement_headers = vec![alternate_block2, alternate_block3];
+
+    commit_header_range_with_sizes(&state, block1.hash(), &replacement_headers, &[111_111, 0]);
+
+    assert_eq!(state.advertised_body_size(Height(1)), Some(700_000));
+    assert_eq!(
+        state.advertised_body_size(Height(2)),
+        Some(111_111),
+        "reorged H2 must use the new chain's size, not the old hash's stale max",
+    );
+    assert_eq!(
+        state.advertised_body_size(Height(3)),
+        None,
+        "reorged H3 reported 0, so no advertised size may be stored",
+    );
+
+    commit_single_header_with_size(&state, block1.hash(), &replacement_headers[0], 0);
+    assert_eq!(
+        state.advertised_body_size(Height(2)),
+        Some(111_111),
+        "same-hash 0 recommit must keep the new chain's max, never the old chain's",
+    );
 }
 
 #[test]
@@ -1244,15 +1323,33 @@ fn commit_header_range(
     anchor: block::Hash,
     headers: &[Arc<block::Header>],
 ) -> block::Hash {
-    let mut batch = DiskWriteBatch::new();
     let body_sizes = vec![0; headers.len()];
+    commit_header_range_with_sizes(state, anchor, headers, &body_sizes)
+}
+
+fn commit_header_range_with_sizes(
+    state: &ZebraDb,
+    anchor: block::Hash,
+    headers: &[Arc<block::Header>],
+    body_sizes: &[u32],
+) -> block::Hash {
+    let mut batch = DiskWriteBatch::new();
     let committed_hash = batch
-        .prepare_header_range_batch(state, anchor, headers, &body_sizes)
+        .prepare_header_range_batch(state, anchor, headers, body_sizes)
         .expect("header range is valid");
     state
         .write_batch(batch)
         .expect("header range batch writes successfully");
     committed_hash
+}
+
+fn commit_single_header_with_size(
+    state: &ZebraDb,
+    anchor: block::Hash,
+    header: &Arc<block::Header>,
+    body_size: u32,
+) -> block::Hash {
+    commit_header_range_with_sizes(state, anchor, std::slice::from_ref(header), &[body_size])
 }
 
 fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {
