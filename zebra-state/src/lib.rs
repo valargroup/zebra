@@ -101,6 +101,11 @@ impl TreeAuxRootsWriter {
         self.0.insert_roots(roots);
     }
 
+    /// The highest finalized height whose peer roots have been evicted from the cache.
+    pub fn committed_through(&self) -> Option<zebra_chain::block::Height> {
+        self.0.committed_through()
+    }
+
     /// Subscribe to targeted `tree_aux` root refetch requests from the state committer.
     pub fn subscribe_refetch(
         &self,

@@ -14,13 +14,21 @@ use std::time::Duration;
 
 use tower::{Service, ServiceExt};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
-use zebra_network::zakura::{fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle};
+use zebra_network::zakura::{
+    fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle, MAX_TA_ROOTS_PER_REQUEST,
+};
 use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
 
 use super::frontier::verified_block_tip_from_state;
 
 /// Delay between driver attempts while waiting for a peer, or after a fetch error.
 const TREE_AUX_DRIVER_RETRY: Duration = Duration::from_secs(5);
+
+/// Number of peer-root request batches the driver may keep ahead of committed state.
+const TREE_AUX_FETCH_AHEAD_BATCHES: u32 = 16;
+
+/// Maximum speculative peer roots held in the committer cache ahead of finalized progress.
+const TREE_AUX_FETCH_AHEAD_ROOTS: u32 = MAX_TA_ROOTS_PER_REQUEST * TREE_AUX_FETCH_AHEAD_BATCHES;
 
 /// Serves inbound `tree_aux` `GetRoots` from local finalized state, through the read
 /// service ([`ReadRequest::BlockRoots`]). An archive/produced node serves the roots it
@@ -87,11 +95,11 @@ where
 /// Fetch and refetch verified-tip→checkpoint per-block roots from peers into the committer cache.
 ///
 /// Once an outbound peer is available, fetch the roots the committer still needs — the range from
-/// this node's verified tip up to the checkpoint — and publish them to `writer` only after the
-/// whole initial range has been fetched. The driver then stays alive for targeted root-refetch
-/// requests from the committer: a frozen-frontier root miss parks the checkpoint block, asks this
-/// driver to refill that height from peers, and retries the same commit without resetting the block
-/// queue.
+/// this node's verified tip up to the checkpoint — in bounded windows tied to committed progress.
+/// Each window is published to `writer` only after that window has been fetched completely. The
+/// driver then stays alive for targeted root-refetch requests from the committer: a frozen-frontier
+/// root miss parks the checkpoint block, asks this driver to refill that height from peers, and
+/// retries the same commit without resetting the block queue.
 ///
 /// The fetch starts at `verified_tip + 1`, not genesis: heights at or below the verified tip are
 /// already committed, so their roots are never looked up. Fetching from genesis on a node that
@@ -118,6 +126,7 @@ pub(crate) async fn run_tree_aux_driver(
 
     let driver = async {
         let mut initial_fetch_complete = false;
+        let mut next_fetch = from;
 
         loop {
             // Wait for an outbound peer before issuing requests (fetch_roots needs one).
@@ -127,10 +136,60 @@ pub(crate) async fn run_tree_aux_driver(
             }
 
             if !initial_fetch_complete {
+                if next_fetch > handoff {
+                    tracing::info!(
+                        from_height = from.0,
+                        handoff_height = handoff.0,
+                        "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
+                    );
+                    initial_fetch_complete = true;
+                    continue;
+                }
+
+                let committed_through = writer.committed_through();
+                if let Some(committed_height) = committed_through {
+                    if next_fetch <= committed_height {
+                        let Some(next_height) = committed_height.0.checked_add(1) else {
+                            initial_fetch_complete = true;
+                            continue;
+                        };
+                        next_fetch = block::Height(next_height);
+                        if next_fetch > handoff {
+                            continue;
+                        }
+                    }
+                }
+
+                let Some((window_from, window_to)) = next_fetch_window(
+                    from,
+                    next_fetch,
+                    handoff,
+                    committed_through,
+                    TREE_AUX_FETCH_AHEAD_ROOTS,
+                ) else {
+                    if let Some(rx) = &mut refetch_rx {
+                        let mut refetch_closed = false;
+                        tokio::select! {
+                            _ = tokio::time::sleep(TREE_AUX_DRIVER_RETRY) => {}
+                            request = rx.recv() => {
+                                refetch_closed = handle_refetch_request(request, &supervisor, &writer)
+                                    .await
+                                    .is_err();
+                            }
+                        }
+                        if refetch_closed {
+                            refetch_rx = None;
+                        }
+                    } else {
+                        tokio::time::sleep(TREE_AUX_DRIVER_RETRY).await;
+                    }
+                    continue;
+                };
+
                 let (result, refetch_closed) = if let Some(rx) = &mut refetch_rx {
                     let mut refetch_closed = false;
                     let result = tokio::select! {
-                        result = fetch_roots_into_writer(&supervisor, &writer, from, handoff) => {
+                        result = fetch_roots_into_writer(&supervisor, &writer, window_from, window_to) => {
                             Some(result)
                         }
                         request = rx.recv() => {
@@ -143,7 +202,10 @@ pub(crate) async fn run_tree_aux_driver(
                     (result, refetch_closed)
                 } else {
                     (
-                        Some(fetch_roots_into_writer(&supervisor, &writer, from, handoff).await),
+                        Some(
+                            fetch_roots_into_writer(&supervisor, &writer, window_from, window_to)
+                                .await,
+                        ),
                         false,
                     )
                 };
@@ -157,12 +219,27 @@ pub(crate) async fn run_tree_aux_driver(
 
                 match result {
                     Ok(()) => {
-                        tracing::info!(
-                            from_height = from.0,
-                            handoff_height = handoff.0,
-                            "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
+                        tracing::debug!(
+                            from_height = window_from.0,
+                            to_height = window_to.0,
+                            committed_through = ?writer.committed_through(),
+                            "tree_aux: fetched bounded peer-root window into the committer cache"
                         );
-                        initial_fetch_complete = true;
+                        if window_to >= handoff {
+                            initial_fetch_complete = true;
+                            tracing::info!(
+                                from_height = from.0,
+                                handoff_height = handoff.0,
+                                "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
+                            );
+                        } else {
+                            next_fetch = block::Height(
+                                window_to
+                                    .0
+                                    .checked_add(1)
+                                    .expect("window end is below handoff, so next height exists"),
+                            );
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(?error, "tree_aux: root fetch failed, retrying");
@@ -194,6 +271,40 @@ pub(crate) async fn run_tree_aux_driver(
             tracing::info!("tree_aux driver shutting down");
         }
     }
+}
+
+/// Return the next bounded fetch window, if committed progress has opened one.
+fn next_fetch_window(
+    from: block::Height,
+    next_fetch: block::Height,
+    handoff: block::Height,
+    committed_through: Option<block::Height>,
+    fetch_ahead_roots: u32,
+) -> Option<(block::Height, block::Height)> {
+    if next_fetch > handoff {
+        return None;
+    }
+
+    let window_end = fetch_window_end(from, handoff, committed_through, fetch_ahead_roots);
+    (next_fetch <= window_end).then_some((next_fetch, window_end))
+}
+
+/// Highest root the driver may fetch while staying within the fetch-ahead cap.
+fn fetch_window_end(
+    from: block::Height,
+    handoff: block::Height,
+    committed_through: Option<block::Height>,
+    fetch_ahead_roots: u32,
+) -> block::Height {
+    let committed_floor = committed_through
+        .map(|height| height.0)
+        .unwrap_or_else(|| from.0.saturating_sub(1));
+
+    block::Height(
+        committed_floor
+            .saturating_add(fetch_ahead_roots)
+            .min(handoff.0),
+    )
 }
 
 /// Fetch `[from, to]` roots and insert the complete range into the committer's peer cache.
@@ -517,6 +628,81 @@ mod tests {
 
         // Finalized tip above the best-chain tip: use the finalized tip.
         assert_eq!(root_fetch_start(at(200), at(150), &net), h(201));
+    }
+
+    #[test]
+    fn fetch_window_starts_ahead_of_initial_tip() {
+        let h = block::Height;
+
+        assert_eq!(
+            fetch_window_end(h(10), h(100), None, 16),
+            h(25),
+            "without a commit watermark, the window starts one below the initial fetch height"
+        );
+        assert_eq!(
+            next_fetch_window(h(10), h(10), h(100), None, 16),
+            Some((h(10), h(25))),
+            "the initial fetch fills only the bounded fetch-ahead window"
+        );
+    }
+
+    #[test]
+    fn fetch_window_waits_until_commits_open_room() {
+        let h = block::Height;
+
+        assert_eq!(
+            next_fetch_window(h(10), h(26), h(100), None, 16),
+            None,
+            "a full fetch-ahead window blocks further prefetch"
+        );
+        assert_eq!(
+            next_fetch_window(h(10), h(26), h(100), Some(h(10)), 16),
+            Some((h(26), h(26))),
+            "committing one height opens room for one more fetched root"
+        );
+        assert_eq!(
+            next_fetch_window(h(10), h(27), h(100), Some(h(20)), 16),
+            Some((h(27), h(36))),
+            "additional commit progress opens a larger contiguous window"
+        );
+    }
+
+    #[test]
+    fn fetch_window_does_not_go_behind_next_fetch() {
+        let h = block::Height;
+
+        assert_eq!(
+            next_fetch_window(h(100), h(100), h(200), Some(h(10)), 16),
+            None,
+            "a stale watermark below the startup fetch height does not fetch below next_fetch"
+        );
+    }
+
+    #[test]
+    fn fetch_window_clamps_at_handoff() {
+        let h = block::Height;
+
+        assert_eq!(
+            next_fetch_window(h(10), h(10), h(20), None, 16),
+            Some((h(10), h(20))),
+            "the bounded window never extends past the checkpoint handoff"
+        );
+        assert_eq!(
+            next_fetch_window(h(10), h(21), h(20), Some(h(20)), 16),
+            None,
+            "there is no fetch window after the handoff"
+        );
+    }
+
+    #[test]
+    fn fetch_window_uses_saturating_height_math() {
+        let h = block::Height;
+
+        assert_eq!(
+            fetch_window_end(h(u32::MAX - 5), h(u32::MAX), None, 16),
+            h(u32::MAX),
+            "fetch-ahead arithmetic saturates before clamping to the handoff"
+        );
     }
 
     #[test]

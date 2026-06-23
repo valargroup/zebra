@@ -471,12 +471,26 @@ impl PeerSourceWriter {
                 .insert(r.height.0, (r.sapling_root, r.orchard_root));
         }
     }
+
+    /// The highest finalized height whose peer roots have been evicted from the cache.
+    fn committed_through(&self) -> Option<block::Height> {
+        self.cache
+            .read()
+            .expect("peer source roots lock poisoned")
+            .committed_through
+            .map(block::Height)
+    }
 }
 
 impl PeerSourceHandle {
     /// Insert verified roots fetched for a range into the shared cache.
     pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
         self.writer.insert_roots(roots);
+    }
+
+    /// The highest finalized height whose peer roots have been evicted from the cache.
+    pub(crate) fn committed_through(&self) -> Option<block::Height> {
+        self.writer.committed_through()
     }
 
     /// Subscribe to targeted peer-root refetch requests.
@@ -750,6 +764,12 @@ mod tests {
         let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
         let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
 
+        assert_eq!(
+            writer.committed_through(),
+            None,
+            "a fresh peer source has no committed watermark"
+        );
+
         writer.insert_roots((40..=44).map(|height| BlockCommitmentRoots {
             height: block::Height(height),
             sapling_root: empty_sapling_root,
@@ -757,6 +777,12 @@ mod tests {
         }));
 
         source.evict_committed_through(block::Height(42));
+
+        assert_eq!(
+            writer.committed_through(),
+            Some(block::Height(42)),
+            "the writer exposes the cache eviction watermark to the fetch driver"
+        );
 
         assert!(
             source.fast_root(block::Height(40)).is_none(),
@@ -784,6 +810,14 @@ mod tests {
         assert!(
             source.fast_root(block::Height(43)).is_some(),
             "late inserts above the committed height are still cached"
+        );
+
+        source.evict_committed_through(block::Height(41));
+
+        assert_eq!(
+            writer.committed_through(),
+            Some(block::Height(42)),
+            "committed watermark never regresses"
         );
     }
 
