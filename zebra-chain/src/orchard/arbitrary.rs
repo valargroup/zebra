@@ -126,7 +126,9 @@ pub(crate) fn pre_nu6_3_flags_strategy() -> BoxedStrategy<Flags> {
         Just(Flags::ENABLED),
         Just(Flags::SPENDS_DISABLED),
         Just(Flags::OUTPUTS_DISABLED),
-        Just(Flags::from_parts(false, false)),
+        Just(Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false
+        )),
     ]
     .boxed()
 }

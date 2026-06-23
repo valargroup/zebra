@@ -1095,7 +1095,9 @@ pub fn insert_fake_orchard_shielded_data(
 
     // Place the dummy action inside the Orchard shielded data
     let dummy_shielded_data = orchard::ShieldedData {
-        flags: orchard::Flags::from_parts(false, false),
+        flags: orchard::Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false,
+        ),
         value_balance: Amount::try_from(0).expect("invalid transaction amount"),
         shared_anchor: orchard::tree::Root::default(),
         proof: Halo2Proof(vec![]),

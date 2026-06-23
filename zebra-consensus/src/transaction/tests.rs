@@ -97,7 +97,9 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
             })
             .expect("V5 tx with only Orchard shielded data");
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false,
+        );
 
         // The check will fail if the transaction has no flags
         assert_eq!(
@@ -408,7 +410,9 @@ fn v5_transaction_with_orchard_actions_has_flags() {
             })
             .expect("V5 tx with only Orchard actions");
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false,
+        );
 
         // The check will fail if the transaction has no flags
         assert_eq!(
@@ -420,13 +424,17 @@ fn v5_transaction_with_orchard_actions_has_flags() {
         tx.orchard_shielded_data_mut().unwrap().flags = Flags::OUTPUTS_DISABLED;
         assert!(check::has_enough_orchard_flags(&tx).is_ok());
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false,
+        );
 
         // If we add ENABLE_OUTPUTS flag instead, it will pass.
         tx.orchard_shielded_data_mut().unwrap().flags = Flags::SPENDS_DISABLED;
         assert!(check::has_enough_orchard_flags(&tx).is_ok());
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(
+            /* spends_enabled */ false, /* outputs_enabled */ false,
+        );
 
         // If we add BOTH ENABLE_SPENDS and ENABLE_OUTPUTS flags it will pass.
         tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLED;
