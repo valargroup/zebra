@@ -360,6 +360,7 @@ impl WriteBlockWorkerTask {
         // a block that will never be committed.
         let mut pending_precompute: Option<PendingPrecompute> = None;
         let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
+        let mut retry_finalized_block: Option<QueuedCheckpointVerified> = None;
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -379,7 +380,10 @@ impl WriteBlockWorkerTask {
                 Err(TryRecvError::Disconnected) => {}
             }
 
-            let ordered_block = match finalized_lookahead.pop_front() {
+            let ordered_block = match retry_finalized_block
+                .take()
+                .or_else(|| finalized_lookahead.pop_front())
+            {
                 Some(block) => block,
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
@@ -430,6 +434,32 @@ impl WriteBlockWorkerTask {
                 continue;
             }
 
+            // Peek the next block and start its precompute, so the heavy hashing
+            // overlaps this block's commit. Its start sizes are the current tree
+            // sizes plus this block's note counts (the sizes after this block).
+            if finalized_lookahead.is_empty() {
+                if let Ok(next) = finalized_block_write_receiver.try_recv() {
+                    finalized_lookahead.push_back(next);
+                }
+            }
+
+            // A non-handoff VCT fast block's supplied roots are authenticated by
+            // its successor's header. If the successor is not buffered yet, keep
+            // this block local and wait instead of surfacing a checkpoint commit
+            // error through the invalid-block reset path.
+            if finalized_lookahead.is_empty()
+                && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
+            {
+                tracing::trace!(
+                    height = ?ordered_block.0.height,
+                    hash = ?ordered_block.0.hash,
+                    "VCT: deferring fast checkpoint commit until successor is buffered"
+                );
+                retry_finalized_block = Some(ordered_block);
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
+
             // Use the precompute for this block if we started it last iteration and
             // it is for this exact block; otherwise cancel it (so the spawned task
             // stops) and let the committer hash inline.
@@ -442,14 +472,6 @@ impl WriteBlockWorkerTask {
                 None => None,
             };
 
-            // Peek the next block and start its precompute, so the heavy hashing
-            // overlaps this block's commit. Its start sizes are the current tree
-            // sizes plus this block's note counts (the sizes after this block).
-            if finalized_lookahead.is_empty() {
-                if let Ok(next) = finalized_block_write_receiver.try_recv() {
-                    finalized_lookahead.push_back(next);
-                }
-            }
             // POC: in verified-commitment-trees fast mode the committer skips the
             // note-commitment frontier entirely, so the off-thread precompute would
             // just be discarded heat. Skip it only when the *next* block will actually
