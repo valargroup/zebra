@@ -1824,10 +1824,21 @@ impl DiskWriteBatch {
         }
 
         for (height, hash, header, body_size) in validated_headers {
+            let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
+            let advertised_body_size = match (
+                same_header,
+                zebra_db.advertised_body_size(height),
+                AdvertisedBodySize::new(body_size).map(AdvertisedBodySize::get),
+            ) {
+                (true, existing, Some(new)) => Some(existing.unwrap_or(0).max(new)),
+                (true, existing, None) => existing,
+                (false, _existing, new) => new,
+            };
+
             self.zs_insert(&header_by_height, height, header);
             self.zs_insert(&hash_by_height, height, hash);
             self.zs_insert(&height_by_hash, hash, height);
-            if let Some(body_size) = AdvertisedBodySize::new(body_size) {
+            if let Some(body_size) = advertised_body_size.and_then(AdvertisedBodySize::new) {
                 self.zs_insert(&body_size_by_height, height, body_size);
             } else {
                 self.zs_delete(&body_size_by_height, height);

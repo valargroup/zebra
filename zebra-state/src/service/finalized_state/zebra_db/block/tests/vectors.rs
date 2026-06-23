@@ -152,6 +152,87 @@ fn header_range_commit_stores_advertised_body_sizes_with_zero_as_unknown() {
 }
 
 #[test]
+fn header_range_commit_merges_same_header_advertised_body_size_by_max() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[123_456],
+        )
+        .expect("block 1 header links to genesis and has valid context");
+    state.write_batch(batch).expect("header batch writes");
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+        )
+        .expect("same block 1 header can refresh its advertised body size");
+    state.write_batch(batch).expect("header batch writes");
+    assert_eq!(state.advertised_body_size(Height(1)), Some(123_456));
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[999_999],
+        )
+        .expect("same block 1 header can refresh its advertised body size");
+    state.write_batch(batch).expect("header batch writes");
+    assert_eq!(state.advertised_body_size(Height(1)), Some(999_999));
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[100],
+        )
+        .expect("same block 1 header can refresh its advertised body size");
+    state.write_batch(batch).expect("header batch writes");
+    assert_eq!(state.advertised_body_size(Height(1)), Some(999_999));
+}
+
+#[test]
+fn header_range_reorg_resets_advertised_body_sizes() {
+    let _init_guard = zebra_test::init();
+    let genesis = mainnet_block(0);
+    let network = no_extra_checkpoint_test_network(genesis.hash());
+    let state = state_with_genesis(&network, genesis.clone());
+
+    let original = synthetic_headers_from_state(&state, Height(0), genesis.hash(), 2, 1);
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(&state, genesis.hash(), &original, &[111, 222])
+        .expect("original synthetic headers are valid");
+    state.write_batch(batch).expect("header batch writes");
+    assert_eq!(state.advertised_body_size(Height(1)), Some(111));
+    assert_eq!(state.advertised_body_size(Height(2)), Some(222));
+
+    let replacement = synthetic_headers_from_state(&state, Height(0), genesis.hash(), 3, 9);
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(&state, genesis.hash(), &replacement, &[0, 0, 333])
+        .expect("higher-work replacement synthetic headers are valid");
+    state.write_batch(batch).expect("header batch writes");
+
+    assert_eq!(state.advertised_body_size(Height(1)), None);
+    assert_eq!(state.advertised_body_size(Height(2)), None);
+    assert_eq!(state.advertised_body_size(Height(3)), Some(333));
+}
+
+#[test]
 fn block_size_hints_prefer_confirmed_block_info_over_advertised_hint() {
     let _init_guard = zebra_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();
@@ -191,6 +272,35 @@ fn block_size_hints_prefer_confirmed_block_info_over_advertised_hint() {
             1,
         ),
         vec![(Height(1), Some(block1_size))],
+    );
+}
+
+#[test]
+fn block_size_hints_exclude_advertised_hints() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[999_999],
+        )
+        .expect("block 1 header links to genesis and has valid context");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    assert_eq!(
+        crate::service::read::block_size_hints(
+            None::<Arc<crate::service::non_finalized_state::Chain>>,
+            &state,
+            Height(1),
+            1,
+        ),
+        vec![(Height(1), None)],
     );
 }
 
