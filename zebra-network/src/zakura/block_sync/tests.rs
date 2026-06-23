@@ -610,7 +610,7 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
     assert_eq!(default.max_blocks_per_response, 1);
-    assert_eq!(default.max_inflight_requests, 2_048);
+    assert_eq!(default.max_inflight_requests, 4_048);
     assert_eq!(
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
