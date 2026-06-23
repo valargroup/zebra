@@ -214,6 +214,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
+    // Verified-commitment-trees serving index
+    COMMITMENT_ROOTS_BY_HEIGHT,
     // Storage policy
     PRUNING_METADATA,
     FAST_SYNC_METADATA,
@@ -246,6 +248,20 @@ pub const PRUNING_METADATA: &str = "pruning_metadata";
 /// reopen. This is orthogonal to pruning (which drops raw transactions but keeps
 /// the trees); a database can be both.
 pub const FAST_SYNC_METADATA: &str = "fast_sync_metadata";
+
+/// The name of the column family holding the per-height Sapling/Orchard note-commitment
+/// roots, keyed by [`block::Height`].
+///
+/// This is the verified-commitment-trees serving index (design §4): a compact
+/// `height -> (sapling_root, orchard_root)` map (64 bytes/height) that **every** node
+/// persists for each committed block, on both the fast and legacy commit paths. Its purpose
+/// is to let a fast-synced node — which folds verified roots in but writes no per-height
+/// note-commitment trees — still answer the `tree_aux` `BlockRoots` read, so the
+/// root-serving fleet does not collapse as nodes adopt fast sync. The roots are the same
+/// values a legacy node derives from its per-height trees via `produce_block_roots`; serving
+/// reads this index first and falls back to the trees only for databases written before the
+/// index existed.
+pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
 
 /// The finalized part of the chain state, stored in the db.
 ///

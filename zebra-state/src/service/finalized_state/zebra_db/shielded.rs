@@ -17,10 +17,12 @@ use std::{
     sync::Arc,
 };
 
+use std::ops::RangeInclusive;
+
 use zebra_chain::{
     block::Height,
     orchard,
-    parallel::tree::NoteCommitmentTrees,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::Transaction,
@@ -30,8 +32,9 @@ use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{shielded::CommitmentRootsByHeight, RawBytes},
         zebra_db::ZebraDb,
+        COMMITMENT_ROOTS_BY_HEIGHT,
     },
     TransactionLocation,
 };
@@ -114,6 +117,38 @@ impl ZebraDb {
     pub fn contains_orchard_anchor(&self, orchard_anchor: &orchard::tree::Root) -> bool {
         let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
         self.db.zs_contains(&orchard_anchors, &orchard_anchor)
+    }
+
+    /// Returns the per-block Sapling/Orchard commitment roots stored in the
+    /// `commitment_roots_by_height` serving index for the **contiguous** prefix of `range`
+    /// that is present, in ascending height order (design §4).
+    ///
+    /// Reads stop at the first absent height, so the result is always a gap-free run from
+    /// `range.start()` — exactly what the `tree_aux` `BlockRoots` serve and `fetch_roots`
+    /// client expect. A node populates this index for every block it commits (fast or
+    /// legacy), so a fast-synced node — which holds no per-height trees — can still serve
+    /// roots here. Returns an empty vec for a database written before the index existed
+    /// (e.g. a pre-index archive node), where the caller falls back to `produce_block_roots`.
+    pub fn commitment_roots_by_height_range(
+        &self,
+        range: RangeInclusive<Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        let mut roots = Vec::new();
+        for height in (range.start().0..=range.end().0).map(Height) {
+            let Some(value) = self
+                .db
+                .zs_get::<_, _, CommitmentRootsByHeight>(&cf, &height)
+            else {
+                break;
+            };
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: value.sapling,
+                orchard_root: value.orchard,
+            });
+        }
+        roots
     }
 
     /// POC: returns `(sapling_count, sapling_digest, orchard_count, orchard_digest)`,
@@ -653,6 +688,10 @@ impl DiskWriteBatch {
         if let Some((sapling_root, orchard_root)) = fast_anchor_roots {
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);
+            // Persist the per-height roots into the serving index even though no per-height
+            // tree is written, so this fast-synced node can still serve `tree_aux` roots
+            // (design §4); otherwise the root-serving fleet collapses as nodes fast-sync.
+            self.insert_commitment_roots_by_height(zebra_db, *height, &sapling_root, &orchard_root);
             self.update_history_tree(zebra_db, history_tree);
             return;
         }
@@ -692,6 +731,17 @@ impl DiskWriteBatch {
                 self.insert_orchard_subtree(zebra_db, &subtree);
             }
         }
+
+        // Persist the per-height roots into the serving index for *every* committed height
+        // (not just when a tree changed — the index must be gap-free for contiguous serving),
+        // so a legacy/archive node serves `tree_aux` roots from the compact index too, and a
+        // node that later fast-syncs above this height already has the lower range covered.
+        self.insert_commitment_roots_by_height(
+            zebra_db,
+            *height,
+            &note_commitment_trees.sapling.root(),
+            &note_commitment_trees.orchard.root(),
+        );
 
         self.update_history_tree(zebra_db, history_tree);
     }
@@ -765,6 +815,46 @@ impl DiskWriteBatch {
     pub fn insert_sapling_anchor(&mut self, zebra_db: &ZebraDb, root: &sapling::tree::Root) {
         let sapling_anchors = zebra_db.db.cf_handle("sapling_anchors").unwrap();
         self.zs_insert(&sapling_anchors, root, ());
+    }
+
+    /// Inserts the per-height Sapling/Orchard commitment roots into the
+    /// `commitment_roots_by_height` serving index (design §4).
+    ///
+    /// Written on every committed block, fast or legacy, so any node — including a
+    /// fast-synced node that holds no per-height trees — can serve the `tree_aux`
+    /// `BlockRoots` read from this compact 64-byte-per-height index. Idempotent
+    /// (re-inserting the same height overwrites with the identical value).
+    pub fn insert_commitment_roots_by_height(
+        &mut self,
+        zebra_db: &ZebraDb,
+        height: Height,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+    ) {
+        let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        self.zs_insert(
+            &cf,
+            height,
+            CommitmentRootsByHeight {
+                sapling: *sapling_root,
+                orchard: *orchard_root,
+            },
+        );
+    }
+
+    /// Deletes the commitment-roots serving-index entries in `[from, to)`.
+    ///
+    /// Used by the finalized rollback to truncate the index above the rollback target, the
+    /// same way the per-height trees and anchors above the target are removed, so a
+    /// rolled-back database does not retain root entries for heights it no longer holds.
+    pub fn delete_range_commitment_roots_by_height(
+        &mut self,
+        zebra_db: &ZebraDb,
+        from: &Height,
+        to: &Height,
+    ) {
+        let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        self.zs_delete_range(&cf, from, to);
     }
 
     /// Records the verified-commitment-trees fast-sync marker: per-height

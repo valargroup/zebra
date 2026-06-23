@@ -968,6 +968,12 @@ fn prune_tree_indexes(
         batch.delete_orchard_anchor(db, &tree.root());
     }
 
+    // Truncate the per-height commitment-roots serving index above the target too, the same
+    // as the per-height trees above. Rollbacks stay near the tip (above the handoff), where
+    // the index and the trees both have entries; deleting [target+1, MAX) keeps the index
+    // from serving roots for heights the rolled-back database no longer holds.
+    batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
+
     // Delete every sapling/orchard subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
     // (the exclusive end of the single-index delete range) cannot overflow.
