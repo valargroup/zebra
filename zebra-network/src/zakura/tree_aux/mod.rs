@@ -21,6 +21,9 @@ mod service;
 mod tests;
 mod wire;
 
-pub use driver::{fetch_roots, fetch_roots_with_peer, PeerRootBatch};
+pub use driver::{
+    fetch_roots, fetch_roots_with_peer, PeerFetchEvent, PeerFetchStatus, PeerPreference,
+    PeerRootBatch,
+};
 pub use service::{TreeAuxService, TreeAuxStatePort};
 pub use wire::*;

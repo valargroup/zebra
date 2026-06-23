@@ -6,9 +6,10 @@
 //! state port; the client issues a real `GetRoots` request and receives `Roots`.
 
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -16,8 +17,9 @@ use std::{
 use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
 
 use super::{
-    fetch_roots, fetch_roots_with_peer, BoxRunFuture, TreeAuxMessage, TreeAuxService,
-    TreeAuxStatePort, MAX_TA_MESSAGE_BYTES, ZAKURA_CAP_TREE_AUX, ZAKURA_STREAM_TREE_AUX,
+    fetch_roots, fetch_roots_with_peer, BoxRunFuture, PeerFetchStatus, PeerPreference,
+    TreeAuxMessage, TreeAuxService, TreeAuxStatePort, MAX_TA_MESSAGE_BYTES, ZAKURA_CAP_TREE_AUX,
+    ZAKURA_STREAM_TREE_AUX,
 };
 use crate::{
     zakura::{
@@ -35,6 +37,7 @@ const LARGE_MAX_FRAME_BYTES: u32 = 64 * 1024;
 struct InMemoryPort {
     roots: Vec<BlockCommitmentRoots>,
     requests: Option<Arc<AtomicUsize>>,
+    delay: Option<Duration>,
 }
 
 impl TreeAuxStatePort for InMemoryPort {
@@ -52,7 +55,14 @@ impl TreeAuxStatePort for InMemoryPort {
             .filter(|r| r.height >= start_height && r.height.0 < start_height.0 + count)
             .cloned()
             .collect();
-        Box::pin(async move { roots })
+        let delay = self.delay;
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            roots
+        })
     }
 }
 
@@ -76,12 +86,22 @@ async fn tree_aux_node_with_counter(
     held: Vec<BlockCommitmentRoots>,
     requests: Option<Arc<AtomicUsize>>,
 ) -> Result<ZakuraTestNode, BoxError> {
+    tree_aux_node_with_counter_and_delay(seed, held, requests, None).await
+}
+
+async fn tree_aux_node_with_counter_and_delay(
+    seed: u64,
+    held: Vec<BlockCommitmentRoots>,
+    requests: Option<Arc<AtomicUsize>>,
+    delay: Option<Duration>,
+) -> Result<ZakuraTestNode, BoxError> {
     ZakuraTestNode::builder(seed)
         // Both nodes share 127.0.0.1, so raise the per-IP cap above the default of 1.
         .max_connections_per_ip(16)
         .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort {
             roots: held,
             requests,
+            delay,
         }))))
         .spawn()
         .await
@@ -98,6 +118,7 @@ async fn tree_aux_node_with_limits(seed: u64) -> Result<ZakuraTestNode, BoxError
         .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort {
             roots: Vec::new(),
             requests: None,
+            delay: None,
         }))))
         .spawn()
         .await
@@ -305,7 +326,8 @@ async fn client_driver_reports_root_batch_provenance() -> Result<(), BoxError> {
         &client.supervisor(),
         block::Height(1_687_104),
         block::Height(1_687_203),
-        |_| false,
+        |_| PeerPreference::Normal,
+        |_| {},
         |batch| {
             suppliers.push(batch.peer_id);
             collected.extend(batch.roots);
@@ -367,25 +389,27 @@ async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxEr
     let bad_server = tree_aux_node_with_counter(7, gapped, Some(Arc::clone(&bad_requests))).await?;
     let good_server = tree_aux_node(8, expected.clone()).await?;
     let client = tree_aux_node(9, Vec::new()).await?;
+    let bad_peer_id = ZakuraPeerId::new(bad_server.node_addr().await.node_id.as_bytes().to_vec())?;
 
     client.connect_native(&bad_server, CONNECT_TIMEOUT).await?;
     client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
 
     let mut collected = Vec::new();
-    for _ in 0..8 {
-        collected.clear();
-        fetch_roots(
-            &client.supervisor(),
-            block::Height(1_687_104),
-            block::Height(1_687_203),
-            |batch| collected.extend(batch),
-        )
-        .await?;
-
-        if bad_requests.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-    }
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| {
+            if peer_id == &bad_peer_id {
+                PeerPreference::Normal
+            } else {
+                PeerPreference::Demoted
+            }
+        },
+        |_| {},
+        |batch| collected.extend(batch.roots),
+    )
+    .await?;
 
     assert_eq!(
         collected, expected,
@@ -399,6 +423,304 @@ async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxEr
     client.shutdown().await;
     good_server.shutdown().await;
     bad_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_demotes_soft_failed_tree_aux_peer() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let gapped: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let bad_requests = Arc::new(AtomicUsize::new(0));
+    let good_requests = Arc::new(AtomicUsize::new(0));
+    let bad_server =
+        tree_aux_node_with_counter(19, gapped, Some(Arc::clone(&bad_requests))).await?;
+    let good_server =
+        tree_aux_node_with_counter(20, expected.clone(), Some(Arc::clone(&good_requests))).await?;
+    let client = tree_aux_node(21, Vec::new()).await?;
+    let bad_peer_id = ZakuraPeerId::new(bad_server.node_addr().await.node_id.as_bytes().to_vec())?;
+    let demoted = Mutex::new(HashSet::new());
+
+    client.connect_native(&bad_server, CONNECT_TIMEOUT).await?;
+    client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| {
+            if peer_id == &bad_peer_id {
+                PeerPreference::Normal
+            } else {
+                PeerPreference::Demoted
+            }
+        },
+        |event| {
+            if matches!(event.status, PeerFetchStatus::SoftFailure { .. }) {
+                demoted
+                    .lock()
+                    .expect("test demotion set mutex is not poisoned")
+                    .insert(event.peer_id);
+            }
+        },
+        |batch| collected.extend(batch.roots),
+    )
+    .await?;
+
+    assert!(
+        demoted
+            .lock()
+            .expect("test demotion set mutex is not poisoned")
+            .contains(&bad_peer_id),
+        "the malformed peer is recorded as soft-demoted after its failed response"
+    );
+    assert_eq!(
+        collected, expected,
+        "the initial fetch still falls back to the healthy peer"
+    );
+
+    bad_requests.store(0, Ordering::Relaxed);
+    good_requests.store(0, Ordering::Relaxed);
+    collected.clear();
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| {
+            if demoted
+                .lock()
+                .expect("test demotion set mutex is not poisoned")
+                .contains(peer_id)
+            {
+                PeerPreference::Demoted
+            } else {
+                PeerPreference::Normal
+            }
+        },
+        |_event| {},
+        |batch| collected.extend(batch.roots),
+    )
+    .await?;
+
+    assert_eq!(
+        collected, expected,
+        "demoting a soft-failed peer preserves successful fetches"
+    );
+    assert!(
+        good_requests.load(Ordering::Relaxed) > 0,
+        "the healthy peer serves the next request even when demoted fallback is hedged"
+    );
+
+    client.shutdown().await;
+    good_server.shutdown().await;
+    bad_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_hedges_tree_aux_fetches() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let slow_requests = Arc::new(AtomicUsize::new(0));
+    let fast_requests = Arc::new(AtomicUsize::new(0));
+    let slow_server = tree_aux_node_with_counter_and_delay(
+        22,
+        expected.clone(),
+        Some(Arc::clone(&slow_requests)),
+        Some(Duration::from_secs(3)),
+    )
+    .await?;
+    let fast_server =
+        tree_aux_node_with_counter(23, expected.clone(), Some(Arc::clone(&fast_requests))).await?;
+    let client = tree_aux_node(24, Vec::new()).await?;
+    let slow_peer_id =
+        ZakuraPeerId::new(slow_server.node_addr().await.node_id.as_bytes().to_vec())?;
+
+    client.connect_native(&slow_server, CONNECT_TIMEOUT).await?;
+    client.connect_native(&fast_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        fetch_roots_with_peer(
+            &client.supervisor(),
+            block::Height(1_687_104),
+            block::Height(1_687_203),
+            |peer_id| {
+                if peer_id == &slow_peer_id {
+                    PeerPreference::Normal
+                } else {
+                    PeerPreference::Demoted
+                }
+            },
+            |_| {},
+            |batch| collected.extend(batch.roots),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| -> BoxError { "hedged tree_aux fetch waited for the slow peer".into() })??;
+
+    assert_eq!(
+        collected, expected,
+        "the hedged fetch accepts the fast peer's valid response"
+    );
+    assert!(
+        slow_requests.load(Ordering::Relaxed) > 0,
+        "the slow preferred peer was included in the hedge"
+    );
+    assert!(
+        fast_requests.load(Ordering::Relaxed) > 0,
+        "the fast fallback peer was queried concurrently"
+    );
+
+    collected.clear();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        fetch_roots_with_peer(
+            &client.supervisor(),
+            block::Height(1_687_104),
+            block::Height(1_687_203),
+            |peer_id| {
+                if peer_id == &slow_peer_id {
+                    PeerPreference::Normal
+                } else {
+                    PeerPreference::Excluded
+                }
+            },
+            |_| {},
+            |batch| collected.extend(batch.roots),
+        )
+        .await
+    })
+    .await
+    .map_err(|_| -> BoxError { "slow peer was unusable after losing a hedged request".into() })??;
+    assert_eq!(
+        collected, expected,
+        "a peer remains usable after its losing hedged request is cancelled"
+    );
+
+    client.shutdown().await;
+    fast_server.shutdown().await;
+    slow_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_bounds_tree_aux_hedge_width() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let gapped: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let bad_requests = Arc::new(AtomicUsize::new(0));
+    let good_requests = Arc::new(AtomicUsize::new(0));
+    let bad_server_a =
+        tree_aux_node_with_counter(25, gapped.clone(), Some(Arc::clone(&bad_requests))).await?;
+    let bad_server_b =
+        tree_aux_node_with_counter(26, gapped.clone(), Some(Arc::clone(&bad_requests))).await?;
+    let bad_server_c =
+        tree_aux_node_with_counter(27, gapped, Some(Arc::clone(&bad_requests))).await?;
+    let good_server =
+        tree_aux_node_with_counter(28, expected.clone(), Some(Arc::clone(&good_requests))).await?;
+    let client = tree_aux_node(29, Vec::new()).await?;
+    let bad_peer_ids = HashSet::from([
+        ZakuraPeerId::new(bad_server_a.node_addr().await.node_id.as_bytes().to_vec())?,
+        ZakuraPeerId::new(bad_server_b.node_addr().await.node_id.as_bytes().to_vec())?,
+        ZakuraPeerId::new(bad_server_c.node_addr().await.node_id.as_bytes().to_vec())?,
+    ]);
+    let demoted = Mutex::new(HashSet::new());
+
+    client
+        .connect_native(&bad_server_a, CONNECT_TIMEOUT)
+        .await?;
+    client
+        .connect_native(&bad_server_b, CONNECT_TIMEOUT)
+        .await?;
+    client
+        .connect_native(&bad_server_c, CONNECT_TIMEOUT)
+        .await?;
+    client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    let result = fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| {
+            if bad_peer_ids.contains(peer_id) {
+                PeerPreference::Normal
+            } else {
+                PeerPreference::Demoted
+            }
+        },
+        |event| {
+            if matches!(event.status, PeerFetchStatus::SoftFailure { .. }) {
+                demoted
+                    .lock()
+                    .expect("test demotion set mutex is not poisoned")
+                    .insert(event.peer_id);
+            }
+        },
+        |batch| collected.extend(batch.roots),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "one tree_aux fetch attempt only races the bounded preferred hedge"
+    );
+    assert!(
+        bad_requests.load(Ordering::Relaxed) > 0,
+        "the preferred failing peers were queried"
+    );
+    assert_eq!(
+        good_requests.load(Ordering::Relaxed),
+        0,
+        "peers outside the first hedge are left for a later rotated retry"
+    );
+    assert!(
+        collected.is_empty(),
+        "no roots are delivered when the bounded hedge fails"
+    );
+
+    bad_requests.store(0, Ordering::Relaxed);
+    good_requests.store(0, Ordering::Relaxed);
+    collected.clear();
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| {
+            if demoted
+                .lock()
+                .expect("test demotion set mutex is not poisoned")
+                .contains(peer_id)
+            {
+                PeerPreference::Demoted
+            } else {
+                PeerPreference::Normal
+            }
+        },
+        |_| {},
+        |batch| collected.extend(batch.roots),
+    )
+    .await?;
+
+    assert_eq!(
+        collected, expected,
+        "after the first hedge soft-fails, retry surfaces the fourth honest peer"
+    );
+    assert!(
+        good_requests.load(Ordering::Relaxed) > 0,
+        "the fourth honest peer is queried on retry"
+    );
+
+    client.shutdown().await;
+    good_server.shutdown().await;
+    bad_server_c.shutdown().await;
+    bad_server_b.shutdown().await;
+    bad_server_a.shutdown().await;
     Ok(())
 }
 
@@ -422,7 +744,14 @@ async fn client_driver_skips_excluded_tree_aux_peer() -> Result<(), BoxError> {
         &client.supervisor(),
         block::Height(1_687_104),
         block::Height(1_687_203),
-        |peer_id| peer_id == &bad_peer_id,
+        |peer_id| {
+            if peer_id == &bad_peer_id {
+                PeerPreference::Excluded
+            } else {
+                PeerPreference::Normal
+            }
+        },
+        |_| {},
         |batch| collected.extend(batch.roots),
     )
     .await?;
@@ -458,7 +787,8 @@ async fn client_driver_errors_when_all_tree_aux_peers_are_excluded() -> Result<(
         &client.supervisor(),
         block::Height(1_687_104),
         block::Height(1_687_203),
-        |_peer_id| true,
+        |_peer_id| PeerPreference::Excluded,
+        |_| {},
         |batch| collected.extend(batch.roots),
     )
     .await;

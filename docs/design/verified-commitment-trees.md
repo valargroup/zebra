@@ -245,10 +245,18 @@ memory is bounded even when peers serve roots faster than blocks commit to disk.
   when it holds nothing. The response is additionally bounded by the negotiated frame/message
   caps (`effective_response_payload_bytes`), so it never overruns a smaller peer cap.
 - **Client** (`fetch_roots` / `fetch_roots_with_peer`): issues bounded `GetRoots` requests and
-  advances by the last height each peer returns. Any unavailable/malformed/out-of-range
-  sub-range returns an error; the caller treats that range as un-fetched and leaves it on the
-  legacy path. The provenance-preserving helper returns the supplier `ZakuraPeerId` for each
-  accepted batch and accepts a skip predicate so the `zebrad` policy can avoid hard-failed peers.
+  advances by the last height each peer returns. For each sub-range, it hedges across up to
+  three preferred peers concurrently and accepts the first valid response, so a slow peer does
+  not impose a full per-peer timeout before an honest hedged peer can answer. If all hedged
+  peers fail, the sub-range returns an error and the caller retries later with rotation/demotion
+  state instead of walking the whole peer set in one attempt. Short contiguous responses are
+  accepted only when they meet a minimum-progress threshold (currently at least one quarter of
+  the requested count, rounded up), so a peer cannot turn a 4000-root request into thousands of
+  one-root round trips. Any unavailable/malformed/out-of-range/low-progress sub-range returns
+  an error; the caller treats that range as un-fetched and leaves it on the legacy path. The
+  provenance-preserving helper returns the supplier `ZakuraPeerId` for each accepted batch,
+  accepts a peer-selection policy, and reports per-peer request outcomes so the `zebrad` policy
+  can avoid hard-failed peers while only demoting soft-failed peers.
 
 The outbound path in `zebra-network` is stream-kind-aware: a `tree_aux` `GetRoots` is read with
 the generic stream frame budget rather than being validated as a legacy request message (which
@@ -428,17 +436,26 @@ dependency on `zebra-network` peer types. Peer attribution therefore lives in th
 4. If the committer rejects height `H` and requests a targeted refetch, the driver looks up the
    last supplier of `H`. If there is no provenance (the root was never supplied, or the request
    is stale), no peer is blamed.
-5. If a supplier is found, every still-cached height from that supplier is bulk-evicted through
+5. Independently, peer request failures that are not state-verified bad content — timeouts,
+   `RangeUnavailable`, malformed frames, or badly shaped batches — are recorded as **soft**
+   failures. They move the peer behind normal peers for a short demotion window but do not evict
+   cached roots, increment hard-failure counters, or disconnect the peer. A successful later
+   response clears that soft state, and all-demoted peer sets remain selectable as fallback.
+6. If a supplier is found, every still-cached height from that supplier is bulk-evicted through
    `TreeAuxRootsWriter::invalidate_roots`, and the supplier enters a bounded hard-failure
-   cooldown. Refetches exclude peers in that cooldown via the `fetch_roots_with_peer` skip
-   predicate.
-6. The driver keeps a per-peer offense record beyond the cooldown. A first offense is
+   cooldown. Refetches exclude peers in that cooldown via the `fetch_roots_with_peer` selection
+   policy; hard exclusion overrides any soft-demotion state.
+7. The driver keeps a per-peer offense record beyond the cooldown. A first offense is
    cooldown-only; repeated offenses in the decay window escalate to a whole-peer disconnect.
 
 The current policy uses a 5-minute `tree_aux` cooldown, disconnects on the third hard failure in
 one streak, and decays the streak after 30 minutes without another hard failure. A cooldown must
 expire before an honest scheduling path can select the peer again, so three offenses represent
 "lied, cooled down, came back and lied again, cooled down, came back and lied a third time."
+Soft failures use a 1-minute back-of-rotation demotion and decay after 5 minutes without another
+soft failure; they are liveness hints, not evidence that the peer supplied invalid root content.
+This improves steady-state selection after a slow or withholding peer is observed, while hedged
+requests cap cold-peer-set stalls when a good peer is in the first hedge group.
 
 This closes the honest-peer-available liveness loop: a well-shaped but lying peer can cause one
 retryable refusal, then its cached window is dropped and the same height is refetched from a
@@ -454,6 +471,9 @@ body delivered through block sync; it is post-fetch root metadata verified by th
 This policy still cannot guarantee liveness under a true eclipse where every selectable peer
 lies, withholds, or is excluded. In that case the node remains fail-closed: no wrong state is
 written, the root stays retryable, and the stall metrics/logs surface the unservable height.
+Hedging is bounded to the first few preferred peers for each sub-range, so a cold rotation can
+still miss an honest peer outside the first hedge group on one attempt, but it no longer walks
+the whole peer set one 30-second timeout at a time.
 
 ## 9. The serving read path (`BlockRoots` / `TreeAuxStatePort`)
 

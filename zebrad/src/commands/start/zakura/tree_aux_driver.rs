@@ -12,14 +12,15 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
 use tower::{Service, ServiceExt};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zebra_network::zakura::{
-    fetch_roots_with_peer, BoxRunFuture, TreeAuxStatePort, ZakuraPeerId, ZakuraSupervisorHandle,
-    MAX_TA_ROOTS_PER_REQUEST,
+    fetch_roots_with_peer, BoxRunFuture, PeerFetchEvent, PeerFetchStatus, PeerPreference,
+    TreeAuxStatePort, ZakuraPeerId, ZakuraSupervisorHandle, MAX_TA_ROOTS_PER_REQUEST,
 };
 use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
 
@@ -37,6 +38,9 @@ const TREE_AUX_FETCH_AHEAD_ROOTS: u32 = MAX_TA_ROOTS_PER_REQUEST * TREE_AUX_FETC
 /// How long a peer that supplied a verification-failing root is skipped by `tree_aux`.
 const TREE_AUX_HARD_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
+/// How long a peer with a soft fetch failure is moved behind normal peers.
+const TREE_AUX_SOFT_FAILURE_DEMOTION: Duration = Duration::from_secs(60);
+
 /// Hard failures in one decay window before the driver disconnects the Zakura peer.
 ///
 /// Three offenses means a peer was cooled down, became selectable again, and supplied
@@ -50,6 +54,9 @@ const TREE_AUX_DISCONNECT_AFTER_FAILURES: u32 = 3;
 /// otherwise a persistent liar would decay before reaching the disconnect threshold.
 const TREE_AUX_OFFENSE_DECAY: Duration = Duration::from_secs(30 * 60);
 
+/// How long soft fetch failures keep a peer's demotion record alive.
+const TREE_AUX_SOFT_FAILURE_DECAY: Duration = Duration::from_secs(5 * 60);
+
 /// Maximum remembered peer-root provenance entries.
 ///
 /// `TREE_AUX_FETCH_AHEAD_ROOTS + MAX_TA_ROOTS_PER_REQUEST` fits in `usize` because Zebra's
@@ -59,6 +66,9 @@ const TREE_AUX_PROVENANCE_CAPACITY: usize =
 
 /// Maximum peers kept in the local hard-failure table.
 const TREE_AUX_FAILURE_CAPACITY: usize = 1024;
+
+/// Maximum peers kept in the local soft-failure table.
+const TREE_AUX_SOFT_FAILURE_CAPACITY: usize = 1024;
 
 /// Serves inbound `tree_aux` `GetRoots` from local finalized state, through the read
 /// service ([`ReadRequest::BlockRoots`]). An archive/produced node serves the roots it
@@ -376,13 +386,27 @@ async fn fetch_roots_into_writer(
     let mut staged = Vec::new();
     let mut provenance = Vec::new();
     peer_policy.prune_committed(writer.committed_through());
+    // The fetch API needs two synchronous callbacks with mutable policy access. This lock is
+    // local and uncontended; it only keeps the spawned driver future `Send`.
+    let peer_policy = Mutex::new(peer_policy);
     // Keep partial batches private: if the fetch errors or this future is cancelled by
     // `select!`, the staged prefix drops here without reaching `PeerSource`.
     let result = fetch_roots_with_peer(
         supervisor,
         from,
         to,
-        |peer_id| peer_policy.is_excluded(peer_id, Instant::now()),
+        |peer_id| {
+            peer_policy
+                .lock()
+                .expect("tree_aux peer policy mutex is not poisoned")
+                .peer_preference(peer_id, Instant::now())
+        },
+        |event| {
+            peer_policy
+                .lock()
+                .expect("tree_aux peer policy mutex is not poisoned")
+                .record_fetch_event(event, Instant::now());
+        },
         |batch| {
             provenance.extend(
                 batch
@@ -395,7 +419,10 @@ async fn fetch_roots_into_writer(
     )
     .await;
     insert_staged_roots_after_success(staged, provenance, result, |roots, provenance| {
-        peer_policy.record_inserted_roots(provenance, writer.committed_through(), Instant::now());
+        peer_policy
+            .lock()
+            .expect("tree_aux peer policy mutex is not poisoned")
+            .record_inserted_roots(provenance, writer.committed_through(), Instant::now());
         writer.insert_roots(roots);
     })
 }
@@ -535,6 +562,7 @@ where
 struct TreeAuxPeerPolicy {
     suppliers_by_height: BTreeMap<u32, ZakuraPeerId>,
     hard_failed: HashMap<ZakuraPeerId, PeerFailure>,
+    soft_failed: HashMap<ZakuraPeerId, PeerSoftFailure>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -548,6 +576,14 @@ struct PeerFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PeerSoftFailure {
+    /// Demoted behind normal peers until this instant.
+    demote_until: Instant,
+    /// Most recent soft-failure time; clears the record after [`TREE_AUX_SOFT_FAILURE_DECAY`].
+    last_failure: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RejectedSupplier {
     peer_id: ZakuraPeerId,
     heights: Vec<block::Height>,
@@ -556,6 +592,27 @@ struct RejectedSupplier {
 }
 
 impl TreeAuxPeerPolicy {
+    /// Return the selection preference for `peer_id` under the current peer policy.
+    ///
+    /// Hard failures exclude a peer from `tree_aux` selection. Soft failures only move a peer
+    /// behind normal peers, so they remain available if every normal peer is also unusable.
+    fn peer_preference(&mut self, peer_id: &ZakuraPeerId, now: Instant) -> PeerPreference {
+        if self.is_excluded(peer_id, now) {
+            return PeerPreference::Excluded;
+        }
+
+        self.prune_soft_failure_records(now);
+        if self
+            .soft_failed
+            .get(peer_id)
+            .is_some_and(|failure| now < failure.demote_until)
+        {
+            PeerPreference::Demoted
+        } else {
+            PeerPreference::Normal
+        }
+    }
+
     /// Returns true when `peer_id` is in a live hard-failure cooldown.
     ///
     /// Expired offense records are pruned before the check, but cooldown-expired records are
@@ -579,6 +636,48 @@ impl TreeAuxPeerPolicy {
             .filter_map(|(peer_id, failure)| (now < failure.cooldown_until).then_some(peer_id))
             .cloned()
             .collect()
+    }
+
+    /// Record the outcome of one peer request.
+    fn record_fetch_event(&mut self, event: PeerFetchEvent, now: Instant) {
+        match event.status {
+            PeerFetchStatus::Success => self.clear_soft_failure(&event.peer_id, now),
+            PeerFetchStatus::SoftFailure { error } => {
+                metrics::counter!("tree_aux.peer.soft_failure.count").increment(1);
+                tracing::debug!(
+                    peer_id = ?event.peer_id,
+                    height = ?event.height,
+                    event.count,
+                    error,
+                    "tree_aux: demoting peer after soft fetch failure"
+                );
+                self.record_soft_failure(event.peer_id, now);
+            }
+        }
+    }
+
+    /// Move a soft-failing peer behind normal peers for a short window.
+    fn record_soft_failure(&mut self, peer_id: ZakuraPeerId, now: Instant) {
+        self.prune_soft_failure_records(now);
+        if self.is_excluded(&peer_id, now) {
+            return;
+        }
+
+        let failure = self.soft_failed.entry(peer_id).or_insert(PeerSoftFailure {
+            demote_until: now,
+            last_failure: now,
+        });
+        failure.last_failure = now;
+        failure.demote_until = now
+            .checked_add(TREE_AUX_SOFT_FAILURE_DEMOTION)
+            .expect("tree_aux soft demotion duration is representable");
+        self.bound_soft_failures();
+        self.set_active_soft_demotion_gauge(now);
+    }
+
+    fn clear_soft_failure(&mut self, peer_id: &ZakuraPeerId, now: Instant) {
+        self.soft_failed.remove(peer_id);
+        self.set_active_soft_demotion_gauge(now);
     }
 
     /// Record peer provenance for roots that are about to be inserted into the state cache.
@@ -625,6 +724,7 @@ impl TreeAuxPeerPolicy {
         self.prune_offense_records(now);
         let peer_id = self.suppliers_by_height.get(&height.0)?.clone();
         let heights = self.remove_supplier_heights(&peer_id);
+        self.soft_failed.remove(&peer_id);
         let failure = self
             .hard_failed
             .entry(peer_id.clone())
@@ -642,6 +742,7 @@ impl TreeAuxPeerPolicy {
         let should_disconnect = offenses >= TREE_AUX_DISCONNECT_AFTER_FAILURES;
         self.bound_cooldowns();
         self.set_active_cooldown_gauge(now);
+        self.set_active_soft_demotion_gauge(now);
         Some(RejectedSupplier {
             peer_id,
             heights,
@@ -678,6 +779,17 @@ impl TreeAuxPeerPolicy {
         self.set_active_cooldown_gauge(now);
     }
 
+    /// Remove soft-failure records whose streak fully decayed.
+    fn prune_soft_failure_records(&mut self, now: Instant) {
+        self.soft_failed.retain(|_peer_id, failure| {
+            failure
+                .last_failure
+                .checked_add(TREE_AUX_SOFT_FAILURE_DECAY)
+                .is_some_and(|expires_at| now < expires_at)
+        });
+        self.set_active_soft_demotion_gauge(now);
+    }
+
     /// Keep the failure table bounded by dropping records closest to full decay.
     fn bound_cooldowns(&mut self) {
         if self.hard_failed.len() <= TREE_AUX_FAILURE_CAPACITY {
@@ -706,6 +818,34 @@ impl TreeAuxPeerPolicy {
         }
     }
 
+    /// Keep the soft-failure table bounded by dropping records closest to full decay.
+    fn bound_soft_failures(&mut self) {
+        if self.soft_failed.len() <= TREE_AUX_SOFT_FAILURE_CAPACITY {
+            return;
+        }
+
+        let mut expirations: Vec<_> = self
+            .soft_failed
+            .iter()
+            .map(|(peer_id, failure)| {
+                (
+                    peer_id.clone(),
+                    failure
+                        .last_failure
+                        .checked_add(TREE_AUX_SOFT_FAILURE_DECAY)
+                        .expect("tree_aux soft-failure decay duration is representable"),
+                )
+            })
+            .collect();
+        expirations.sort_by_key(|(_peer_id, expires_at)| *expires_at);
+        for (peer_id, _) in expirations
+            .into_iter()
+            .take(self.soft_failed.len() - TREE_AUX_SOFT_FAILURE_CAPACITY)
+        {
+            self.soft_failed.remove(&peer_id);
+        }
+    }
+
     fn remove_supplier_heights(&mut self, peer_id: &ZakuraPeerId) -> Vec<block::Height> {
         let heights: Vec<_> = self
             .suppliers_by_height
@@ -731,6 +871,17 @@ impl TreeAuxPeerPolicy {
         // The failure table is bounded by `TREE_AUX_FAILURE_CAPACITY`, far below f64's
         // exact integer range.
         metrics::gauge!("tree_aux.peer.cooldown.active").set(active as f64);
+    }
+
+    fn set_active_soft_demotion_gauge(&self, now: Instant) {
+        let active = self
+            .soft_failed
+            .values()
+            .filter(|failure| now < failure.demote_until)
+            .count();
+        // The soft-failure table is bounded by `TREE_AUX_SOFT_FAILURE_CAPACITY`, far below
+        // f64's exact integer range.
+        metrics::gauge!("tree_aux.peer.soft_demoted.active").set(active as f64);
     }
 }
 
@@ -1456,6 +1607,108 @@ mod tests {
         assert!(
             policy.is_excluded(&bad_peer, now),
             "the hard-failed supplier remains in the cooldown set"
+        );
+    }
+
+    #[test]
+    fn soft_failure_demotes_peer_then_expires() {
+        let mut policy = TreeAuxPeerPolicy::default();
+        let soft_peer = peer_id(5);
+        let now = Instant::now();
+
+        policy.record_fetch_event(
+            PeerFetchEvent {
+                peer_id: soft_peer.clone(),
+                height: block::Height(42),
+                count: 1,
+                status: PeerFetchStatus::SoftFailure {
+                    error: "peer cannot serve tree_aux roots".to_string(),
+                },
+            },
+            now,
+        );
+
+        assert_eq!(
+            policy.peer_preference(&soft_peer, now),
+            PeerPreference::Demoted,
+            "a soft failure moves the peer behind normal peers"
+        );
+        assert_eq!(
+            policy.peer_preference(
+                &soft_peer,
+                add_duration(now, TREE_AUX_SOFT_FAILURE_DEMOTION + Duration::from_secs(1))
+            ),
+            PeerPreference::Normal,
+            "soft demotion is temporary"
+        );
+    }
+
+    #[test]
+    fn successful_fetch_clears_soft_demotion() {
+        let mut policy = TreeAuxPeerPolicy::default();
+        let soft_peer = peer_id(6);
+        let now = Instant::now();
+
+        policy.record_soft_failure(soft_peer.clone(), now);
+        policy.record_fetch_event(
+            PeerFetchEvent {
+                peer_id: soft_peer.clone(),
+                height: block::Height(42),
+                count: 1,
+                status: PeerFetchStatus::Success,
+            },
+            now,
+        );
+
+        assert_eq!(
+            policy.peer_preference(&soft_peer, now),
+            PeerPreference::Normal,
+            "a well-shaped response clears the peer's soft-failure state"
+        );
+    }
+
+    #[test]
+    fn hard_failure_overrides_soft_demotion() {
+        let mut policy = TreeAuxPeerPolicy::default();
+        let bad_peer = peer_id(7);
+        let now = Instant::now();
+
+        policy.record_soft_failure(bad_peer.clone(), now);
+        policy.record_inserted_roots([(block::Height(42), bad_peer.clone())], None, now);
+        policy
+            .mark_rejected_supplier(block::Height(42), now)
+            .expect("the rejected height has provenance");
+
+        assert_eq!(
+            policy.peer_preference(&bad_peer, now),
+            PeerPreference::Excluded,
+            "verification failures exclude peers even if they were only soft-demoted before"
+        );
+        assert!(
+            !policy.soft_failed.contains_key(&bad_peer),
+            "hard failure removes stale soft-failure state for the same peer"
+        );
+    }
+
+    #[test]
+    fn soft_failure_table_is_bounded() {
+        let mut policy = TreeAuxPeerPolicy::default();
+        let now = Instant::now();
+
+        for seed in 0..=TREE_AUX_SOFT_FAILURE_CAPACITY {
+            let seed = u32::try_from(seed).expect("test seed fits in u32");
+            let mut bytes = vec![0; 32];
+            bytes[..4].copy_from_slice(&seed.to_le_bytes());
+            policy.record_soft_failure(
+                ZakuraPeerId::new(bytes).expect("test peer id is within bounds"),
+                now,
+            );
+        }
+
+        assert_eq!(
+            policy.soft_failed.len(),
+            TREE_AUX_SOFT_FAILURE_CAPACITY,
+            "soft-failure memory remains bounded"
         );
     }
 

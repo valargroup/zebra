@@ -12,6 +12,10 @@ use std::{
     time::Duration,
 };
 
+use futures::{
+    stream::{FuturesUnordered, StreamExt},
+    FutureExt,
+};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 
 use super::{TreeAuxMessage, MAX_TA_ROOTS_PER_REQUEST, ZAKURA_STREAM_TREE_AUX};
@@ -29,6 +33,18 @@ static NEXT_TREE_AUX_PEER_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// sub-range, especially when a frozen-frontier refetch is needed to unblock the committer.
 const TREE_AUX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Minimum fraction of a requested batch a peer must return to make useful progress.
+///
+/// This keeps honest partial responses and final small ranges valid, while rejecting lazy
+/// one-root replies to large requests that would amplify the fetch into thousands of round trips.
+const TREE_AUX_MIN_PROGRESS_DENOMINATOR: u32 = 4;
+
+/// Number of peers queried concurrently for one bounded root request.
+const TREE_AUX_HEDGE_PEERS: usize = 3;
+
+/// Delay before adding another peer to a still-unanswered hedged request.
+const TREE_AUX_HEDGE_DELAY: Duration = Duration::from_secs(2);
+
 /// One contiguous root batch and the peer that supplied it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerRootBatch {
@@ -36,6 +52,42 @@ pub struct PeerRootBatch {
     pub peer_id: ZakuraPeerId,
     /// Contiguous roots returned by `peer_id`.
     pub roots: Vec<BlockCommitmentRoots>,
+}
+
+/// Caller preference for selecting a peer for one `tree_aux` request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PeerPreference {
+    /// Try this peer in the normal rotated order.
+    Normal,
+    /// Keep this peer eligible, but try normal peers first.
+    Demoted,
+    /// Do not query this peer for this request.
+    Excluded,
+}
+
+/// Result of one peer request attempt, reported to the caller's local peer policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerFetchEvent {
+    /// Peer that was queried.
+    pub peer_id: ZakuraPeerId,
+    /// First requested height.
+    pub height: block::Height,
+    /// Requested root count.
+    pub count: u32,
+    /// Transport/request outcome for this peer.
+    pub status: PeerFetchStatus,
+}
+
+/// Outcome for a peer queried by `tree_aux`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerFetchStatus {
+    /// The peer supplied a well-shaped root batch.
+    Success,
+    /// The peer could not serve this request, but its content has not failed state verification.
+    SoftFailure {
+        /// Human-readable request error.
+        error: String,
+    },
 }
 
 /// Fetch verified per-block commitment roots for `[start, end]` from connected peers,
@@ -58,65 +110,52 @@ pub async fn fetch_roots<F>(
 where
     F: FnMut(Vec<BlockCommitmentRoots>),
 {
-    fetch_roots_with_peer(supervisor, start, end, |_| false, |batch| sink(batch.roots)).await
+    fetch_roots_with_peer(
+        supervisor,
+        start,
+        end,
+        |_| PeerPreference::Normal,
+        |_| {},
+        |batch| sink(batch.roots),
+    )
+    .await
 }
 
 /// Fetch roots like [`fetch_roots`], but preserve the supplying peer for each batch.
 ///
-/// `skip_peer` lets callers apply local peer policy, for example excluding a peer whose
-/// previously supplied root failed state verification. If every connected peer is skipped
-/// or unusable, the range remains un-fetched and the caller retries later.
-pub async fn fetch_roots_with_peer<F, S>(
+/// `peer_preference` lets callers apply local peer policy, for example excluding a peer whose
+/// previously supplied root failed state verification, or demoting peers that repeatedly time out
+/// or withhold roots. If every connected peer is excluded or unusable, the range remains
+/// un-fetched and the caller retries later.
+pub async fn fetch_roots_with_peer<F, S, E>(
     supervisor: &ZakuraSupervisorHandle,
     start: block::Height,
     end: block::Height,
-    mut skip_peer: S,
+    mut peer_preference: S,
+    mut peer_event: E,
     mut sink: F,
 ) -> Result<(), BoxError>
 where
     F: FnMut(PeerRootBatch),
-    S: FnMut(&ZakuraPeerId) -> bool,
+    S: FnMut(&ZakuraPeerId) -> PeerPreference,
+    E: FnMut(PeerFetchEvent),
 {
     let mut next = start.0;
     while next <= end.0 {
         let count = (end.0 - next + 1).min(MAX_TA_ROOTS_PER_REQUEST);
-        let mut handles = supervisor.outbound_peer_handles().await;
-        handles.retain(|handle| !skip_peer(handle.peer_id()));
+        let handles = ordered_peer_handles(
+            supervisor.outbound_peer_handles().await,
+            NEXT_TREE_AUX_PEER_OFFSET.fetch_add(1, Ordering::Relaxed),
+            &mut peer_preference,
+        );
         if handles.is_empty() {
             return Err("no selectable connected tree_aux peer".into());
         }
 
-        let offset = rotated_peer_offset(
-            NEXT_TREE_AUX_PEER_OFFSET.fetch_add(1, Ordering::Relaxed),
-            handles.len(),
-        );
-        handles.rotate_left(offset);
+        let (batch, last_error) =
+            request_roots_from_hedged_peers(handles, next, count, &mut peer_event).await;
 
-        let mut last_error = None;
-        let mut fetched_roots = None;
-        for handle in handles {
-            match request_roots_from_peer(&handle, next, count).await {
-                Ok(roots) => {
-                    fetched_roots = Some(PeerRootBatch {
-                        peer_id: handle.peer_id().clone(),
-                        roots,
-                    });
-                    break;
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        peer_id = ?handle.peer_id(),
-                        ?error,
-                        height = next,
-                        count,
-                        "tree_aux peer could not serve roots, trying another peer"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        let batch = fetched_roots.ok_or_else(|| -> BoxError {
+        let batch = batch.ok_or_else(|| -> BoxError {
             last_error.unwrap_or_else(|| "no connected tree_aux peer could serve roots".into())
         })?;
         let last = batch
@@ -132,6 +171,178 @@ where
     }
 
     Ok(())
+}
+
+/// Request one batch from the first bounded group of preferred peers.
+async fn request_roots_from_hedged_peers<E>(
+    handles: Vec<ZakuraPeerHandle>,
+    next: u32,
+    count: u32,
+    peer_event: &mut E,
+) -> (Option<PeerRootBatch>, Option<BoxError>)
+where
+    E: FnMut(PeerFetchEvent),
+{
+    let mut last_error = None;
+    let mut handles = handles.into_iter().take(TREE_AUX_HEDGE_PEERS);
+    let mut requests = FuturesUnordered::new();
+    let mut can_launch_more = true;
+
+    if let Some(handle) = handles.next() {
+        requests.push(request_roots_from_owned_peer(handle, next, count).boxed());
+    }
+
+    loop {
+        if requests.is_empty() {
+            return (None, last_error);
+        }
+
+        let result = if can_launch_more {
+            let hedge_delay = tokio::time::sleep(TREE_AUX_HEDGE_DELAY);
+            tokio::pin!(hedge_delay);
+
+            tokio::select! {
+                result = requests.next() => result,
+                () = &mut hedge_delay => {
+                    match handles.next() {
+                        Some(handle) => {
+                            requests.push(request_roots_from_owned_peer(handle, next, count).boxed());
+                        }
+                        None => can_launch_more = false,
+                    }
+                    continue;
+                }
+            }
+        } else {
+            requests.next().await
+        };
+
+        let Some((peer_id, result)) = result else {
+            return (None, last_error);
+        };
+
+        if let Some(batch) =
+            handle_peer_request_result(peer_id, result, next, count, peer_event, &mut last_error)
+        {
+            // Each Zakura request owns its own request/response stream; dropping `requests`
+            // cancels only the losing hedged waits, not a shared per-peer response slot.
+            return (Some(batch), last_error);
+        }
+
+        if requests.is_empty() && can_launch_more {
+            match handles.next() {
+                Some(handle) => {
+                    requests.push(request_roots_from_owned_peer(handle, next, count).boxed());
+                }
+                None => can_launch_more = false,
+            }
+        }
+    }
+}
+
+async fn request_roots_from_owned_peer(
+    handle: ZakuraPeerHandle,
+    next: u32,
+    count: u32,
+) -> (ZakuraPeerId, Result<Vec<BlockCommitmentRoots>, BoxError>) {
+    let peer_id = handle.peer_id().clone();
+    let result = request_roots_from_peer(&handle, next, count).await;
+    (peer_id, result)
+}
+
+fn handle_peer_request_result<E>(
+    peer_id: ZakuraPeerId,
+    result: Result<Vec<BlockCommitmentRoots>, BoxError>,
+    next: u32,
+    count: u32,
+    peer_event: &mut E,
+    last_error: &mut Option<BoxError>,
+) -> Option<PeerRootBatch>
+where
+    E: FnMut(PeerFetchEvent),
+{
+    match result {
+        Ok(roots) => {
+            peer_event(PeerFetchEvent {
+                peer_id: peer_id.clone(),
+                height: block::Height(next),
+                count,
+                status: PeerFetchStatus::Success,
+            });
+            Some(PeerRootBatch { peer_id, roots })
+        }
+        Err(error) => {
+            peer_event(PeerFetchEvent {
+                peer_id: peer_id.clone(),
+                height: block::Height(next),
+                count,
+                status: PeerFetchStatus::SoftFailure {
+                    error: error.to_string(),
+                },
+            });
+            tracing::debug!(
+                ?peer_id,
+                ?error,
+                height = next,
+                count,
+                "tree_aux peer could not serve roots, trying another peer"
+            );
+            *last_error = Some(error);
+            None
+        }
+    }
+}
+
+/// Order peers by caller preference, preserving fallback to demoted peers.
+fn ordered_peer_handles<S>(
+    handles: Vec<ZakuraPeerHandle>,
+    request_index: u64,
+    peer_preference: &mut S,
+) -> Vec<ZakuraPeerHandle>
+where
+    S: FnMut(&ZakuraPeerId) -> PeerPreference,
+{
+    ordered_peers(
+        handles,
+        request_index,
+        |handle| handle.peer_id(),
+        peer_preference,
+    )
+}
+
+fn ordered_peers<T, S, I>(
+    peers: Vec<T>,
+    request_index: u64,
+    peer_id: I,
+    peer_preference: &mut S,
+) -> Vec<T>
+where
+    S: FnMut(&ZakuraPeerId) -> PeerPreference,
+    I: Fn(&T) -> &ZakuraPeerId,
+{
+    let mut normal = Vec::new();
+    let mut demoted = Vec::new();
+
+    for peer in peers {
+        match peer_preference(peer_id(&peer)) {
+            PeerPreference::Normal => normal.push(peer),
+            PeerPreference::Demoted => demoted.push(peer),
+            PeerPreference::Excluded => {}
+        }
+    }
+
+    rotate_peer_group(&mut normal, request_index);
+    rotate_peer_group(&mut demoted, request_index);
+    normal.extend(demoted);
+    normal
+}
+
+fn rotate_peer_group<T>(peers: &mut [T], request_index: u64) {
+    if peers.is_empty() {
+        return;
+    }
+
+    peers.rotate_left(rotated_peer_offset(request_index, peers.len()));
 }
 
 /// Return the left-rotation offset for one root request over `peer_count` peers.
@@ -198,9 +409,10 @@ async fn request_roots_from_peer(
 
 /// Validate that a peer returned a non-empty, in-order prefix of the requested range.
 ///
-/// Short batches are allowed so a peer can make partial progress, but each returned
-/// height must be exactly `next..next + roots.len()`. Gaps are rejected here instead of
-/// being inserted into the peer root cache and surfacing later as frozen-frontier misses.
+/// Short batches are allowed so a peer can make bounded partial progress, but each returned
+/// height must be exactly `next..next + roots.len()` and a large request must return a useful
+/// fraction of the range. Gaps are rejected here instead of being inserted into the peer root
+/// cache and surfacing later as frozen-frontier misses.
 fn validate_contiguous_roots(
     roots: &[BlockCommitmentRoots],
     next: u32,
@@ -214,6 +426,17 @@ fn validate_contiguous_roots(
         u32::try_from(roots.len()).expect("tree_aux root batch length fits in u32 after decoding");
     if root_count > count {
         return Err(format!("peer returned {root_count} roots for a {count}-root request").into());
+    }
+
+    // Until peer Status narrows requests to each peer's servable range, this can reject an
+    // honest peer whose range ends early. Treating that as a soft failure bounds slow-prefix
+    // amplification without affecting small tail requests.
+    let minimum_progress = count.div_ceil(TREE_AUX_MIN_PROGRESS_DENOMINATOR);
+    if root_count < minimum_progress {
+        return Err(format!(
+            "peer returned {root_count} roots for a {count}-root request, below the {minimum_progress}-root minimum progress threshold"
+        )
+        .into());
     }
 
     for (index, root) in roots.iter().enumerate() {
@@ -249,6 +472,10 @@ mod tests {
         }
     }
 
+    fn peer_id(seed: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![seed; 32]).expect("test peer id is within bounds")
+    }
+
     #[test]
     fn rotated_peer_offset_wraps_by_peer_count() {
         assert_eq!(rotated_peer_offset(0, 3), 0);
@@ -259,12 +486,94 @@ mod tests {
     }
 
     #[test]
+    fn ordered_peers_try_normal_before_demoted() {
+        let normal_a = peer_id(1);
+        let demoted = peer_id(2);
+        let normal_b = peer_id(3);
+        let peers = vec![normal_a.clone(), demoted.clone(), normal_b.clone()];
+
+        let ordered = ordered_peers(peers, 0, |peer_id| peer_id, &mut |peer_id| {
+            if peer_id == &demoted {
+                PeerPreference::Demoted
+            } else {
+                PeerPreference::Normal
+            }
+        });
+
+        assert_eq!(
+            ordered,
+            vec![normal_a, normal_b, demoted],
+            "soft-demoted peers are kept as fallback after normal peers"
+        );
+    }
+
+    #[test]
+    fn ordered_peers_keep_demoted_eligible_when_all_are_demoted() {
+        let peer_a = peer_id(1);
+        let peer_b = peer_id(2);
+        let peers = vec![peer_a.clone(), peer_b.clone()];
+
+        let ordered = ordered_peers(peers, 1, |peer_id| peer_id, &mut |_peer_id| {
+            PeerPreference::Demoted
+        });
+
+        assert_eq!(
+            ordered,
+            vec![peer_b, peer_a],
+            "all-demoted peer sets remain selectable and keep rotating"
+        );
+    }
+
+    #[test]
+    fn ordered_peers_drop_excluded_peers() {
+        let normal = peer_id(1);
+        let excluded = peer_id(2);
+        let demoted = peer_id(3);
+        let peers = vec![normal.clone(), excluded.clone(), demoted.clone()];
+
+        let ordered = ordered_peers(peers, 0, |peer_id| peer_id, &mut |peer_id| {
+            if peer_id == &excluded {
+                PeerPreference::Excluded
+            } else if peer_id == &demoted {
+                PeerPreference::Demoted
+            } else {
+                PeerPreference::Normal
+            }
+        });
+
+        assert_eq!(
+            ordered,
+            vec![normal, demoted],
+            "excluded peers are not queried even when demoted peers remain eligible"
+        );
+    }
+
+    #[test]
     fn validate_contiguous_roots_accepts_short_prefix() -> Result<(), BoxError> {
         let roots = vec![root_at(10), root_at(11)];
 
         validate_contiguous_roots(&roots, 10, 4)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn validate_contiguous_roots_accepts_small_tail_progress() -> Result<(), BoxError> {
+        let roots = vec![root_at(10)];
+
+        validate_contiguous_roots(&roots, 10, 1)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn validate_contiguous_roots_rejects_tiny_large_request_prefix() {
+        let roots = vec![root_at(10)];
+
+        assert!(
+            validate_contiguous_roots(&roots, 10, MAX_TA_ROOTS_PER_REQUEST).is_err(),
+            "one-root replies to large tree_aux requests do not make enough progress"
+        );
     }
 
     #[test]
