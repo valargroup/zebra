@@ -39,10 +39,9 @@ pub mod metrics;
 /// preparation work (raw-transaction serialization and block-size summation) is
 /// run on the rayon pool instead of sequentially.
 ///
-/// Below this, the rayon fork-join cost (waking workers, distributing the items,
-/// and joining) outweighs the work itself. The parallel path is a clear win for
-/// the large blocks in the heavy shielded region; for the small blocks of the
-/// early chain it is pure overhead, so those run sequentially.
+/// Below this, the rayon multi-threading overhead (waking workers, distributing the items,
+/// and joining) outweighs the work itself.
+/// The value was chosen by benchmarking over the sand-blasting region.
 pub(crate) const PARALLEL_BLOCK_TX_THRESHOLD: usize = 16;
 
 pub mod prune;
