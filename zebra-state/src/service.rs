@@ -59,6 +59,7 @@ use crate::{
     },
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
     Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
+    TreeAuxRootsWriter,
 };
 
 pub mod block_iter;
@@ -327,7 +328,13 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+    ) -> (
+        Self,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        Option<TreeAuxRootsWriter>,
+    ) {
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -350,6 +357,9 @@ impl StateService {
             .await
             .expect("failed to join blocking task")
         };
+        let tree_aux_roots_writer = finalized_state
+            .tree_aux_roots_handle()
+            .map(TreeAuxRootsWriter);
 
         // # Correctness
         //
@@ -493,7 +503,13 @@ impl StateService {
             }
         });
 
-        (state, read_service, latest_chain_tip, chain_tip_change)
+        (
+            state,
+            read_service,
+            latest_chain_tip,
+            chain_tip_change,
+            tree_aux_roots_writer,
+        )
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -2048,7 +2064,7 @@ impl Service<ReadRequest> for ReadStateService {
 
 /// Initialize a state service from the provided [`Config`].
 /// Returns a boxed state service, a read-only state service,
-/// and receivers for state chain tip updates.
+/// receivers for state chain tip updates, and a `tree_aux` roots writer if peer mode is active.
 ///
 /// Each `network` has its own separate on-disk database.
 ///
@@ -2071,21 +2087,28 @@ pub async fn init(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
+    Option<TreeAuxRootsWriter>,
 ) {
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(
-            config,
-            network,
-            max_checkpoint_height,
-            checkpoint_verify_concurrency_limit,
-        )
-        .await;
+    let (
+        state_service,
+        read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+        tree_aux_roots_writer,
+    ) = StateService::new(
+        config,
+        network,
+        max_checkpoint_height,
+        checkpoint_verify_concurrency_limit,
+    )
+    .await;
 
     (
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
+        tree_aux_roots_writer,
     )
 }
 
@@ -2148,7 +2171,7 @@ pub async fn init_test(
 ) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
+    let (state_service, _, _, _, _) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     Buffer::new(BoxService::new(state_service), 1)
@@ -2169,7 +2192,7 @@ pub async fn init_test_services(
 ) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);

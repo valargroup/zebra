@@ -138,10 +138,8 @@ use vct::VctState;
 pub(crate) use commitment_aux::produce_block_roots;
 
 /// The verified-commitment-trees `tree_aux` peer-source write handle, root-refetch
-/// signal, and their global accessors.
-pub(crate) use commitment_aux::{
-    peer_root_refetch_receiver, peer_roots_writer, request_peer_root_refetch, PeerSourceWriter,
-};
+/// signal, and their per-state accessors.
+pub(crate) use commitment_aux::PeerSourceHandle;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -1211,6 +1209,28 @@ impl FinalizedState {
                     >= zebra_chain::parameters::NetworkUpgrade::Heartwood
                         .activation_height(&self.network())
         })
+    }
+
+    /// The per-state `tree_aux` peer-source driver handle, if peer mode is active.
+    pub(crate) fn tree_aux_roots_handle(&self) -> Option<PeerSourceHandle> {
+        self.vct.as_ref().and_then(|v| v.peer_source_handle())
+    }
+
+    /// Request a targeted peer-root refetch for `height`.
+    pub(crate) fn request_vct_peer_root_refetch(&self, height: block::Height) {
+        if self
+            .vct
+            .as_ref()
+            .is_some_and(|v| v.request_peer_root_refetch(height))
+        {
+            return;
+        }
+
+        metrics::counter!("state.vct.root.refetch.no_sender.count").increment(1);
+        tracing::debug!(
+            ?height,
+            "VCT: requested peer root refetch before the peer-source signal was installed"
+        );
     }
 
     /// Reject a supplied fast-path root that failed verification for `height`.

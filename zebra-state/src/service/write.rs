@@ -26,9 +26,7 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{
-            request_peer_root_refetch, spawn_note_precompute, FinalizedState, ZebraDb,
-        },
+        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -566,7 +564,7 @@ impl WriteBlockWorkerTask {
                         metrics::counter!("state.vct.root.retry.count").increment(1);
                         let needs_refetch = error.vct_supplied_root_unavailable_height();
                         if let Some(refetch_height) = needs_refetch {
-                            request_peer_root_refetch(refetch_height);
+                            finalized_state.request_vct_peer_root_refetch(refetch_height);
                         }
 
                         // Escalate a stall that persists on the same height past the warn

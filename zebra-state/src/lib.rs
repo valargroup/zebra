@@ -88,10 +88,9 @@ pub use service::{
 /// Write handle for the verified-commitment-trees `tree_aux` peer source: the node's
 /// `tree_aux` driver fills the committer's per-block-root cache through this as verified
 /// root ranges arrive from peers. Available only when the committer was built in peer
-/// mode, which is the default on networks with embedded final frontiers;
-/// [`tree_aux_roots_writer`] returns `None` for legacy/capture/fixture modes.
+/// mode, which is the default on networks with embedded final frontiers.
 #[derive(Clone, Debug)]
-pub struct TreeAuxRootsWriter(service::finalized_state::PeerSourceWriter);
+pub struct TreeAuxRootsWriter(service::finalized_state::PeerSourceHandle);
 
 impl TreeAuxRootsWriter {
     /// Insert a batch of verified per-block roots into the committer's cache.
@@ -101,18 +100,13 @@ impl TreeAuxRootsWriter {
     ) {
         self.0.insert_roots(roots);
     }
-}
 
-/// The live [`TreeAuxRootsWriter`] when the committer is running in `tree_aux` peer mode,
-/// or `None` in the default (legacy) configuration.
-pub fn tree_aux_roots_writer() -> Option<TreeAuxRootsWriter> {
-    service::finalized_state::peer_roots_writer().map(TreeAuxRootsWriter)
-}
-
-/// Subscribe to targeted `tree_aux` root refetch requests from the state committer.
-pub fn tree_aux_root_refetch_receiver(
-) -> Option<tokio::sync::broadcast::Receiver<zebra_chain::block::Height>> {
-    service::finalized_state::peer_root_refetch_receiver()
+    /// Subscribe to targeted `tree_aux` root refetch requests from the state committer.
+    pub fn subscribe_refetch(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<zebra_chain::block::Height> {
+        self.0.subscribe_refetch()
+    }
 }
 
 // Allow use in external tests

@@ -199,10 +199,10 @@ height)`) derives the same payload from a database's per-height trees — the se
 (§9), minus the network. The producer→`PeerSource`→committer round-trip proving producer and
 consumer agree is `vct_db_produced_payload_round_trips`.
 
-A process-global `OnceLock` (`PEER_ROOTS_WRITER`, exposed as `TreeAuxRootsWriter`) publishes
-the committer's writer so the `zebrad` driver and the committer share one cache without
-threading the writer through the production state-init signatures. First writer wins, so a
-test re-init in the same process never splits the driver and committer.
+Peer mode creates a per-state `TreeAuxRootsWriter` alongside the committer's `PeerSource`.
+`zebra_state::init` returns that handle to `zebrad`, which passes it to the `tree_aux` driver.
+The same handle also carries targeted refetch subscriptions, so each state instance pairs its
+committer, root cache, and driver without process-global state.
 
 ### 5.4 The `tree_aux` Zakura stream
 
