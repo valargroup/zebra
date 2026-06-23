@@ -487,7 +487,8 @@ fn load_frontier_file(path: &std::ffi::OsStr, expected_height: block::Height) ->
 
 /// Parse embedded final frontiers and verify they match the checkpoint list.
 fn parse_embedded_final_frontiers(bytes: &[u8], expected_height: block::Height) -> FinalFrontiers {
-    let parsed = FinalFrontiers::from_bytes(bytes);
+    let parsed = FinalFrontiers::from_bytes(bytes)
+        .unwrap_or_else(|error| panic!("invalid VCT final frontier bytes: {error}"));
     assert_eq!(
         parsed.height, expected_height,
         "embedded VCT final frontier height must match the network's max checkpoint height"
@@ -556,7 +557,8 @@ mod tests {
         let height = block::Height(3_358_006);
         let trees = NoteCommitmentTrees::default();
 
-        let parsed = FinalFrontiers::from_bytes(&final_frontiers_bytes(height, &trees));
+        let parsed = FinalFrontiers::from_bytes(&final_frontiers_bytes(height, &trees))
+            .expect("captured final frontiers should parse");
 
         assert_eq!(parsed.height, height, "captured height round-trips");
         assert_eq!(
@@ -587,6 +589,80 @@ mod tests {
         };
 
         let _ = parse_embedded_final_frontiers(&frontiers.to_bytes(), block::Height(2));
+    }
+
+    #[test]
+    fn final_frontiers_parser_rejects_short_height() {
+        let error =
+            FinalFrontiers::from_bytes(&[0, 1, 2]).expect_err("short height should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "missing final frontier height: expected 4 bytes, got 3"
+        );
+    }
+
+    #[test]
+    fn final_frontiers_parser_rejects_missing_tree_length() {
+        let bytes = block::Height(1).0.to_le_bytes();
+
+        let error =
+            FinalFrontiers::from_bytes(&bytes).expect_err("missing length should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "missing sapling frontier length prefix at byte 4: expected 4 bytes, got 0"
+        );
+    }
+
+    #[test]
+    fn final_frontiers_parser_rejects_truncated_tree_blob() {
+        let mut bytes = block::Height(1).0.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1]);
+
+        let error =
+            FinalFrontiers::from_bytes(&bytes).expect_err("truncated blob should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "truncated sapling frontier blob at byte 8: length prefix says 3 bytes, but only 2 remain"
+        );
+    }
+
+    #[test]
+    fn final_frontiers_parser_rejects_trailing_bytes() {
+        let bytes = FinalFrontiers {
+            height: block::Height(1),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        }
+        .to_bytes()
+        .into_iter()
+        .chain([0])
+        .collect::<Vec<_>>();
+
+        let error =
+            FinalFrontiers::from_bytes(&bytes).expect_err("trailing bytes should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unexpected trailing final frontier bytes at byte {}: 1 bytes",
+                bytes.len() - 1
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid VCT final frontier bytes: truncated sapling frontier blob")]
+    fn embedded_final_frontiers_reject_malformed_bytes_with_context() {
+        let mut bytes = block::Height(1).0.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1]);
+
+        let _ = parse_embedded_final_frontiers(&bytes, block::Height(1));
     }
 
     #[test]
