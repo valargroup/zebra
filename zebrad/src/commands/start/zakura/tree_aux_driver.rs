@@ -38,9 +38,16 @@ const TREE_AUX_FETCH_AHEAD_ROOTS: u32 = MAX_TA_ROOTS_PER_REQUEST * TREE_AUX_FETC
 const TREE_AUX_HARD_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Hard failures in one decay window before the driver disconnects the Zakura peer.
+///
+/// Three offenses means a peer was cooled down, became selectable again, and supplied
+/// bad roots repeatedly. This catches slow-drip liars without dropping the whole Zakura
+/// connection for a one-off corrupt root index.
 const TREE_AUX_DISCONNECT_AFTER_FAILURES: u32 = 3;
 
 /// How long repeat hard failures count toward disconnect escalation.
+///
+/// Must exceed the time needed to accumulate repeat offenses through multiple cooldowns,
+/// otherwise a persistent liar would decay before reaching the disconnect threshold.
 const TREE_AUX_OFFENSE_DECAY: Duration = Duration::from_secs(30 * 60);
 
 /// Maximum remembered peer-root provenance entries.

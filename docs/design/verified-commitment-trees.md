@@ -448,6 +448,8 @@ If the same peer returns after cooldown and lies repeatedly before the offense r
 escalated disconnect is whole-peer, not stream-local. Root verification happens after fetch in
 state, outside Zakura block-sync's existing consensus-rejection scoring path, so the driver uses
 a local `tree_aux` cooldown for selection and drops the connection only for persistent offenders.
+This policy is kept separate from block-sync scoring because the rejected datum is not a block
+body delivered through block sync; it is post-fetch root metadata verified by the state committer.
 
 This policy still cannot guarantee liveness under a true eclipse where every selectable peer
 lies, withholds, or is excluded. In that case the node remains fail-closed: no wrong state is
