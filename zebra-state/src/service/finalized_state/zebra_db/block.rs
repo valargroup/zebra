@@ -1431,8 +1431,7 @@ impl DiskWriteBatch {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
-            // keeps historical transaction data for this height (then
-            // `raw_transactions` holds the pre-serialized bytes in order).
+            // keeps historical transaction data for this height.
             if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
                 self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
