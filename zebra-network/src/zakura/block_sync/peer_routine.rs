@@ -24,7 +24,7 @@
 //! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
 //! task's own `FramedRecv` rather than a `PeerInput` channel.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -39,7 +39,7 @@ use super::{
     },
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
-    state::{DownloadWindow, OutstandingBlockRange, ThroughputMeter},
+    state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
@@ -687,7 +687,7 @@ impl PeerRoutine {
                 request,
                 queued_at,
                 deadline,
-                received: HashSet::new(),
+                received: ReceivedBlockTracker::default(),
             });
             self.publish_outstanding();
             self.trace_get_blocks_sent(

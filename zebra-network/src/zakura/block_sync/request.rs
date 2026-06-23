@@ -54,6 +54,12 @@ impl BlockRangeRequest {
         self.start_height <= height && height <= self.end_height()
     }
 
+    pub(super) fn offset_for_height(&self, height: block::Height) -> Option<u32> {
+        self.contains(height)
+            .then(|| height.0.checked_sub(self.start_height.0))
+            .flatten()
+    }
+
     pub(super) fn expected_hash(&self, height: block::Height) -> Option<block::Hash> {
         self.expected_blocks
             .iter()
