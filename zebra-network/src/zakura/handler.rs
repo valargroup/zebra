@@ -68,12 +68,12 @@ use crate::{
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 
-/// Conservative default for total Zakura connections when P2P v2 is enabled.
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 32;
-/// Conservative default for simultaneous Zakura control handshakes.
-pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 8;
-/// Conservative default for stream-open churn per connection.
-pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
+/// Default total Zakura connections when P2P v2 is enabled.
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
+/// Default simultaneous Zakura control handshakes.
+pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 32;
+/// Default stream-open churn per connection.
+pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 32;
 /// Per-kind inbound message rate per connection.
 ///
 /// This is a generous universal cap: block-sync legitimately delivers
@@ -112,11 +112,11 @@ pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10)
 /// reclaim the slot without disturbing active transfers.
 pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// QUIC stream receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 3 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC send window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
