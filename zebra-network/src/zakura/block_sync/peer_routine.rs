@@ -37,6 +37,7 @@ use super::{
     reactor::{
         block_sync_message_label, bs_insert_height, bs_insert_peer, bs_insert_u64, tolerated_bytes,
     },
+    reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
     state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter},
@@ -332,25 +333,26 @@ impl PeerRoutine {
         };
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
-        let msg = match BlockSyncMessage::decode_frame(frame) {
-            Ok(msg) => msg,
-            Err(error) => {
-                // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                // protocol reject for the whole connection (matches the previous
-                // `run_peer` decode-error path). Report via the shared channel,
-                // then reject; the report is best-effort and never blocks.
-                let protocol_error =
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::Misbehavior {
-                        peer: self.peer.clone(),
-                        reason: BlockSyncMisbehavior::MalformedMessage,
-                    });
-                return Err(SinkReject::protocol(protocol_error));
-            }
-        };
+        let (msg, raw_block_payload) =
+            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    // A malformed frame is `MalformedMessage` misbehavior AND a fatal
+                    // protocol reject for the whole connection (matches the previous
+                    // `run_peer` decode-error path). Report via the shared channel,
+                    // then reject; the report is best-effort and never blocks.
+                    let protocol_error =
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                    tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::Misbehavior {
+                            peer: self.peer.clone(),
+                            reason: BlockSyncMisbehavior::MalformedMessage,
+                        });
+                    return Err(SinkReject::protocol(protocol_error));
+                }
+            };
         let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
         self.trace_message_received(&msg);
 
@@ -372,7 +374,8 @@ impl PeerRoutine {
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
-                self.handle_body(block, body_wire_bytes, body_permit).await;
+                self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
+                    .await;
             }
             BlockSyncMessage::BlocksDone {
                 start_height,
@@ -798,6 +801,7 @@ impl PeerRoutine {
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        raw_block_payload: Option<Arc<[u8]>>,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -818,6 +822,7 @@ impl PeerRoutine {
                     block.clone(),
                     body_wire_bytes,
                     body_permit,
+                    raw_block_payload.clone(),
                 )
                 .await
             {
@@ -911,7 +916,10 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
-        self.forward_body_to_sequencer(height, hash, block, serialized_bytes, body_permit)
+        let body = raw_block_payload
+            .map(BufferedBlockBody::RawFramePayload)
+            .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
+        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
@@ -939,7 +947,7 @@ impl PeerRoutine {
         &self,
         height: block::Height,
         hash: block::Hash,
-        block: Arc<block::Block>,
+        body: BufferedBlockBody,
         serialized_bytes: u64,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
@@ -948,7 +956,7 @@ impl PeerRoutine {
         let body = SequencedBody {
             height,
             hash,
-            block,
+            body,
             bytes: serialized_bytes,
             peer: self.peer.clone(),
             received_at,
@@ -984,6 +992,7 @@ impl PeerRoutine {
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        raw_block_payload: Option<Arc<[u8]>>,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -1033,7 +1042,10 @@ impl PeerRoutine {
         // later duplicate.
         let _ = self.work.take_in_range(height, height, 1);
 
-        self.forward_body_to_sequencer(height, hash, block, serialized_bytes, body_permit)
+        let body = raw_block_payload
+            .map(BufferedBlockBody::RawFramePayload)
+            .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
+        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
         true
     }

@@ -17,6 +17,7 @@
 use super::{
     events::*,
     reactor::{bs_insert_height, bs_insert_u64},
+    reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
     work_queue::WorkQueue,
@@ -31,7 +32,7 @@ use super::{
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
-    pub(super) block: Arc<block::Block>,
+    pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
@@ -264,10 +265,10 @@ impl SequencerTask {
     /// `Redundant`, then drain ready prefix into applying and submit.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
-        let outcome = match self.sequencer.accept_body(
+        let outcome = match self.sequencer.accept_buffered_body(
             body.height,
             body.hash,
-            body.block,
+            body.body,
             body.bytes,
             body.peer,
         ) {
