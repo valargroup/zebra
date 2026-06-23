@@ -392,9 +392,8 @@ where
             .and_then(|chain| chain.as_ref().block_info(height.into()))
             .or_else(|| db.block_info(height.into()))
             .map(|info| info.size());
-        let size = confirmed_size.or_else(|| db.advertised_body_size(height));
 
-        hints.push((height, size));
+        hints.push((height, confirmed_size));
     }
 
     hints
