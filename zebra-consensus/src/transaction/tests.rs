@@ -276,6 +276,38 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
+fn ironwood_cross_address_flag_is_required_after_nu6_3() {
+    let ironwood_without_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::CROSS_ADDRESS_DISABLED,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::ironwood_cross_address_enabled(&ironwood_without_cross_address),
+        Err(TransactionError::IronwoodDoesNotHaveEnableCrossAddress)
+    );
+
+    let ironwood_with_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::SPENDS_DISABLED,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::ironwood_cross_address_enabled(&ironwood_with_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
 fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu6_3_test_network_and_height();
     let tx = v6_pool_flow_transaction(
@@ -4163,10 +4195,10 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
     }
 }
 
-/// Test that V6 Ironwood coinbase outputs use the NU6.3 flag format during zero-key recovery.
+/// Test that V6 Ironwood coinbase outputs reject Orchard note encryption.
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
-fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
+fn coinbase_outputs_reject_v2_orchard_notes_for_v6_ironwood() {
     let (network, height) = nu6_3_test_network_and_height();
 
     for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter() {
@@ -4209,7 +4241,7 @@ fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
 
         assert_eq!(
             check::coinbase_outputs_are_decryptable(&transaction, &network, height),
-            Ok(())
+            Err(TransactionError::CoinbaseOutputsNotDecryptable)
         );
     }
 }
