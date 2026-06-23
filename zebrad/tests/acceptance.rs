@@ -1251,6 +1251,8 @@ fn create_cached_database(network: Network) -> Result<()> {
         height,
         // Use checkpoints to increase sync performance while caching the database
         true,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're still using checkpoints when we finish the cached sync
         &checkpoint_stop_regex,
     )
@@ -1267,6 +1269,8 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
         height.unwrap(),
         // Test full validation by turning checkpoints off
         false,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're doing full validation when we finish the cached sync
         &full_validation_stop_regex,
     )
@@ -1296,6 +1300,8 @@ fn full_sync_test(network: Network, timeout_argument_name: &str) -> Result<()> {
             block::Height::MAX,
             // Use the checkpoints to sync quickly, then do full validation until the chain tip
             true,
+            // Archive storage: keep all transaction data in the cached database.
+            zebra_state::StorageMode::Archive,
             // Finish when we reach the chain tip
             SYNC_FINISHED_REGEX,
         )
@@ -1403,6 +1409,11 @@ fn sync_confidence_range(stop_height: block::Height) -> Result<()> {
         stop_height,
         // Full validation: do not use the optional checkpoints.
         false,
+        // The sync-confidence snapshots are pruned, so the consumer must open the
+        // database in pruned storage mode (archive mode refuses a pruned database).
+        zebra_state::StorageMode::Pruned(zebra_state::PruningConfig {
+            tx_retention: zebra_state::constants::min_pruning_retention(&network),
+        }),
         &full_validation_stop_regex,
     )
 }
