@@ -802,7 +802,7 @@ impl FinalizedState {
                 // fixture roots into the anchor set and history leaf instead. The
                 // frontier stays the (frozen) parent frontier; nothing below the
                 // checkpoint reads it for consensus. See
-                // docs/design/verified-commitment-trees-poc.md.
+                // docs/design/verified-commitment-trees.md.
                 let vct_fast = self.vct.as_ref().and_then(|v| v.fast_root(height));
 
                 // The checkpoint handoff height (boundary below which the fast
