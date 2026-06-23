@@ -628,8 +628,8 @@ Independent of the fast path but on the same branch, `rollback_finalized_state` 
 back the Zakura header store (`delete_zakura_headers_above`). The header store races ahead of
 the body chain and is keyed independently; leaving it untouched on a rollback kept a
 `BestHeaderTip` above the new body tip, which stalled body sync (the contiguous floor body was
-never requestable) until the 5-minute timeout fell back to legacy ChainSync. (Commits #198,
-#202.)
+never requestable) until the 5-minute timeout fell back to legacy ChainSync.
+(Commits #198 and #202.)
 
 ## 13. Observability
 
