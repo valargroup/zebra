@@ -4,7 +4,7 @@ ARG UBUNTU_IMAGE=ubuntu:22.04
 FROM ${UBUNTU_IMAGE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.91.0
 ARG FEATURES="default-release-binaries"
 # Custom rustc cfgs that gate the NU6.3 consensus paths.
 # ARG RUSTFLAGS='--cfg zcash_unstable="nu6.3"'
@@ -24,6 +24,7 @@ RUN apt-get update && \
 
 ENV CARGO_HOME=/root/.cargo
 ENV RUSTUP_HOME=/root/.rustup
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
