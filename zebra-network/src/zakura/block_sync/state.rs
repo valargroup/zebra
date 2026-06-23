@@ -308,17 +308,28 @@ pub(super) struct DownloadWindow {
     pub(super) outbound_request_window: usize,
     pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Instant of the last timeout-driven window reduction, so reductions can be
+    /// rate-limited to at most once per cooldown (the "leave room before
+    /// adjusting concurrency" band).
+    last_window_reduction: Option<Instant>,
 }
 
 impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         let max_inflight_requests = config.advertised_max_inflight_requests();
+        // Slow-start: open at the configured initial window (clamped to the
+        // advertised hard cap) and grow toward the cap on success, rather than
+        // opening at the full `max_inflight`.
+        let initial_window = config
+            .initial_inflight_requests
+            .clamp(1, max_inflight_requests);
         Self {
             max_inflight_requests,
-            outbound_request_window: usize::try_from(max_inflight_requests)
-                .expect("u32 max inflight requests fits in usize on supported targets"),
+            outbound_request_window: usize::try_from(initial_window)
+                .expect("u32 initial inflight requests fits in usize on supported targets"),
             timeout_recovery_slots: 0,
             outstanding: Vec::new(),
+            last_window_reduction: None,
         }
     }
 
@@ -340,6 +351,24 @@ impl DownloadWindow {
             .timeout_recovery_slots
             .saturating_add(1)
             .min(self.hard_outbound_capacity());
+    }
+
+    /// Reduce the window after a timeout, but at most once per `cooldown`, so a
+    /// burst of timeouts re-requests every block yet cannot collapse concurrency
+    /// (the "leave room before adjusting" band). Returns whether it reduced.
+    pub(super) fn reduce_outbound_window_after_timeout_throttled(
+        &mut self,
+        now: Instant,
+        cooldown: Duration,
+    ) -> bool {
+        if let Some(last) = self.last_window_reduction {
+            if now.saturating_duration_since(last) < cooldown {
+                return false;
+            }
+        }
+        self.last_window_reduction = Some(now);
+        self.reduce_outbound_window_after_timeout();
+        true
     }
 
     pub(super) fn increase_outbound_window_after_success(&mut self) {

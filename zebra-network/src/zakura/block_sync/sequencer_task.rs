@@ -24,6 +24,53 @@ use super::{
     *,
 };
 
+/// How often the Sequencer task checks whether the byte budget is starving the
+/// commit-unblocking (lowest pending) height and sheds the speculative top of the
+/// reorder buffer to fund it. Bounds the recovery latency when no bodies are
+/// flowing to trigger the inline check (e.g. once outstanding requests drain).
+const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Favor the lowest re-requestable height over the speculative high tail.
+///
+/// While the byte budget cannot fund even one worst-case request yet the lowest
+/// needed height (the commit-unblocking floor gap) is pending *below* the highest
+/// buffered body, drop that top body: release its bytes to the budget and return
+/// its height to `pending` (it was held, hence in `work.in_flight` per the
+/// `held ⟺ in_flight` invariant) for later re-fetch. Because another top can
+/// always be shed, a low retry never blocks on budget — the floor can never wedge
+/// behind a full buffer — and under a stall the speculative tail is shed and the
+/// chain fills bottom-up, which also bounds the reorder backlog. Returns whether
+/// it shed anything.
+pub(super) fn shed_top_for_floor_starvation(
+    budget: &mut ByteBudget,
+    work: &WorkQueue,
+    sequencer: &mut Sequencer,
+) -> bool {
+    let worst = super::config::BS_PER_BLOCK_WORST_CASE_BYTES;
+    let mut shed_any = false;
+    while budget.available() < worst {
+        let Some(lowest_pending) = work.min_pending() else {
+            break;
+        };
+        let Some(top) = sequencer.reorder_max_height() else {
+            break;
+        };
+        // Only shed a body that sits above a starved lower height: we trade a
+        // far-from-floor body for the ability to fetch a nearer, higher-value one.
+        if lowest_pending >= top {
+            break;
+        }
+        let freed = sequencer.drop_reorder_from(top);
+        if freed == 0 {
+            break;
+        }
+        budget.release(freed);
+        work.return_items([top]);
+        shed_any = true;
+    }
+    shed_any
+}
+
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
@@ -186,25 +233,60 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
+        // Periodic shed backstop: catches budget starvation of the floor even when
+        // no bodies/control events are arriving to trigger the inline checks.
+        let mut shed_tick = tokio::time::interval(FLOOR_STARVATION_SHED_INTERVAL);
+        shed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Track input closure explicitly: the always-ready shed timer means the
+        // `select!` never falls through to an `else`, so shut down only once both
+        // input channels have closed.
+        let mut control_open = true;
+        let mut body_open = true;
         loop {
+            if !control_open && !body_open {
+                break;
+            }
             tokio::select! {
                 biased;
 
-                Some(input) = self.control_input_rx.recv() => {
-                    let needs_reaction = self.handle_control_input(input).await;
-                    if needs_reaction {
-                        self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                input = self.control_input_rx.recv(), if control_open => {
+                    match input {
+                        Some(input) => {
+                            let needs_reaction = self.handle_control_input(input).await;
+                            if needs_reaction {
+                                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                            }
+                            self.publish_view();
+                        }
+                        None => control_open = false,
                     }
-                    self.publish_view();
                 }
 
-                Some(body) = self.body_input_rx.recv() => {
-                    self.release_body_input_bytes(body.bytes);
-                    self.handle_accept_body(body).await;
-                    self.publish_view();
+                body = self.body_input_rx.recv(), if body_open => {
+                    match body {
+                        Some(body) => {
+                            self.release_body_input_bytes(body.bytes);
+                            self.handle_accept_body(body).await;
+                            shed_top_for_floor_starvation(
+                                &mut self.budget,
+                                &self.work,
+                                &mut self.sequencer,
+                            );
+                            self.publish_view();
+                        }
+                        None => body_open = false,
+                    }
                 }
 
-                else => break,
+                _ = shed_tick.tick() => {
+                    if shed_top_for_floor_starvation(
+                        &mut self.budget,
+                        &self.work,
+                        &mut self.sequencer,
+                    ) {
+                        self.publish_view();
+                    }
+                }
             }
         }
     }

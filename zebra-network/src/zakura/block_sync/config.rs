@@ -11,6 +11,13 @@ pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// request timeouts, while peer advertisements can still allow growth up to
 /// [`MAX_BS_INFLIGHT_REQUESTS`].
 pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 128;
+/// Initial per-peer outbound request window (slow-start point).
+///
+/// The adaptive window starts here and grows toward the peer-advertised hard cap
+/// on successful responses, rather than opening at the full `max_inflight`. This
+/// keeps the opening burst modest so a peer is not flooded before its latency is
+/// known.
+pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 /// Maximum peer-advertised in-flight request count accepted by this node.
 pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 16_384;
 /// Default total response byte target advertised per range response.
@@ -33,7 +40,7 @@ pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 /// Default block-sync request timeout.
-pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default block-sync status refresh interval reserved for later advertisement.
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Default tolerated size-hint deviation percentage reserved for later soft scoring.
@@ -119,6 +126,9 @@ pub struct ZakuraBlockSyncConfig {
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
     pub max_inflight_requests: u32,
+    /// Initial per-peer outbound request window (slow-start point); grows toward
+    /// the advertised hard cap on success. Clamped to `[1, max_inflight_requests]`.
+    pub initial_inflight_requests: u32,
     /// Maximum total response bytes this node advertises per `GetBlocks` response.
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for in-flight and buffered block bodies.
@@ -154,6 +164,7 @@ impl Default for ZakuraBlockSyncConfig {
             replace_legacy_syncer: false,
             max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
+            initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
