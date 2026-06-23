@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Precompute checkpoint-zone auth data roots before finalized-state commitment,
+  and reuse the shared txid/auth-digest conversion while preparing semantic block
+  data. This moves ZIP-244 authorizing-data commitment work off the finalized
+  committer's critical path when available, while preserving the existing
+  recompute fallback.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both
