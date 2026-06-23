@@ -145,6 +145,7 @@ impl CopyStateCmd {
             _target_read_only_state_service,
             _target_latest_chain_tip,
             _target_chain_tip_change,
+            _target_tree_aux_roots_writer,
         ) = new_zs::init(target_config.clone(), network, Height::MAX, 0).await;
 
         let elapsed = target_start_time.elapsed();

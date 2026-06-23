@@ -1935,7 +1935,7 @@ async fn setup_with_mempool_config(
 
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, _) =
         zebra_state::init(state_config, network, Height::MAX, 0).await;
     let mut state_service = ServiceBuilder::new().buffer(10).service(state);
 

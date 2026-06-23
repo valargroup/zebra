@@ -47,7 +47,7 @@ use crate::{
             IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, FAST_SYNC_METADATA, PRUNING_METADATA,
+        FromDisk, RawBytes, FAST_SYNC_METADATA, PRUNING_METADATA,
     },
     HashOrHeight,
 };
@@ -1032,10 +1032,9 @@ impl ZebraDb {
             address_balances,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
-            retention.stores_raw_transactions(),
+            store_raw_txs,
             fast_anchor_roots,
             fast_sync_below,
-            store_raw_txs,
             precomputed_raw_txs,
         )?;
 

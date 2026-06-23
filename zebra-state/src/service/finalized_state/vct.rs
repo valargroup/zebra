@@ -28,7 +28,9 @@ use zebra_chain::parallel::tree::NoteCommitmentTrees;
 use zebra_chain::{block, orchard, parameters::Network, sapling, sprout};
 
 use super::{
-    commitment_aux::{install_peer_source, CommitmentRootSource, FinalFrontiers, FixtureSource},
+    commitment_aux::{
+        CommitmentRootSource, FinalFrontiers, FixtureSource, PeerSource, PeerSourceHandle,
+    },
     FromDisk, IntoDisk,
 };
 
@@ -69,6 +71,8 @@ pub(crate) struct VctState {
     /// at the target height, dump the tip treestate frontier to the file. Used to
     /// generate a Regtest frontier fixture for `VCT_REGTEST_FRONTIER`. `(path, target)`.
     capture_frontier: Option<(std::path::PathBuf, block::Height)>,
+    /// Per-state `tree_aux` driver handle, present only for the peer source.
+    peer_source_handle: Option<PeerSourceHandle>,
 }
 
 /// Read the `VCT_CAPTURE_FRONTIER` (output path) + `VCT_CAPTURE_FRONTIER_HEIGHT` (the
@@ -195,6 +199,7 @@ impl VctState {
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
                     capture_frontier: None,
+                    peer_source_handle: None,
                 }))
             }
 
@@ -212,6 +217,7 @@ impl VctState {
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
                     capture_frontier,
+                    peer_source_handle: None,
                 }))
             }
 
@@ -229,13 +235,15 @@ impl VctState {
                     handoff_height = parsed.height.0,
                     "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
                 );
+                let (source, peer_source_handle) = PeerSource::new(Some(parsed));
                 Some(Arc::new(VctState {
                     fast: true,
-                    source: Box::new(install_peer_source(Some(parsed))),
+                    source: Box::new(source),
                     capture: None,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
                     capture_frontier: None,
+                    peer_source_handle: Some(peer_source_handle),
                 }))
             }
 
@@ -255,6 +263,22 @@ impl VctState {
     /// [`CommitmentRootSource::requires_verified_successor`](super::commitment_aux::CommitmentRootSource::requires_verified_successor).
     pub(super) fn requires_verified_successor(&self) -> bool {
         self.source.requires_verified_successor()
+    }
+
+    /// The per-state peer-source driver handle, if this committer uses the `tree_aux`
+    /// peer source.
+    pub(super) fn peer_source_handle(&self) -> Option<PeerSourceHandle> {
+        self.peer_source_handle.clone()
+    }
+
+    /// Request a targeted peer-root refetch for `height`.
+    pub(super) fn request_peer_root_refetch(&self, height: block::Height) -> bool {
+        let Some(handle) = &self.peer_source_handle else {
+            return false;
+        };
+
+        handle.request_refetch(height);
+        true
     }
 
     /// The supplied roots for `height`, when fast mode has a fixture entry for it
@@ -392,6 +416,7 @@ impl VctState {
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
             capture_frontier: None,
+            peer_source_handle: None,
         })
     }
 

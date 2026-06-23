@@ -16,10 +16,7 @@ use std::time::Duration;
 use tower::{Service, ServiceExt};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zebra_network::zakura::{fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle};
-use zebra_state::{
-    tree_aux_root_refetch_receiver, BoxError, ReadRequest, ReadResponse, ReadStateService,
-    TreeAuxRootsWriter,
-};
+use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
 
 use super::frontier::verified_block_tip_from_state;
 
@@ -117,7 +114,7 @@ pub(crate) async fn run_tree_aux_driver(
     let tip = read_state_tip(&read_state, ReadRequest::Tip).await;
     let from = root_fetch_start(finalized_tip, tip, &network);
 
-    let mut refetch_rx = tree_aux_root_refetch_receiver();
+    let mut refetch_rx = Some(writer.subscribe_refetch());
 
     let driver = async {
         let mut initial_fetch_complete = false;
