@@ -5,7 +5,13 @@
 //! verified-commitment-trees peer source. The server serves roots from an in-memory
 //! state port; the client issues a real `GetRoots` request and receives `Roots`.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
 
@@ -18,7 +24,10 @@ use crate::{zakura::testkit::ZakuraTestNode, BoxError};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An in-memory `tree_aux` state port over a fixed set of roots (the server's holdings).
-struct InMemoryPort(Vec<BlockCommitmentRoots>);
+struct InMemoryPort {
+    roots: Vec<BlockCommitmentRoots>,
+    requests: Option<Arc<AtomicUsize>>,
+}
 
 impl TreeAuxStatePort for InMemoryPort {
     fn read_block_roots(
@@ -26,8 +35,11 @@ impl TreeAuxStatePort for InMemoryPort {
         start_height: block::Height,
         count: u32,
     ) -> BoxRunFuture<'static, Vec<BlockCommitmentRoots>> {
+        if let Some(requests) = &self.requests {
+            requests.fetch_add(1, Ordering::Relaxed);
+        }
         let roots: Vec<_> = self
-            .0
+            .roots
             .iter()
             .filter(|r| r.height >= start_height && r.height.0 < start_height.0 + count)
             .cloned()
@@ -48,10 +60,21 @@ async fn tree_aux_node(
     seed: u64,
     held: Vec<BlockCommitmentRoots>,
 ) -> Result<ZakuraTestNode, BoxError> {
+    tree_aux_node_with_counter(seed, held, None).await
+}
+
+async fn tree_aux_node_with_counter(
+    seed: u64,
+    held: Vec<BlockCommitmentRoots>,
+    requests: Option<Arc<AtomicUsize>>,
+) -> Result<ZakuraTestNode, BoxError> {
     ZakuraTestNode::builder(seed)
         // Both nodes share 127.0.0.1, so raise the per-IP cap above the default of 1.
         .max_connections_per_ip(16)
-        .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort(held)))))
+        .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort {
+            roots: held,
+            requests,
+        }))))
         .spawn()
         .await
 }
@@ -146,5 +169,79 @@ async fn client_driver_fetches_a_root_range_over_tree_aux() -> Result<(), BoxErr
 
     client.shutdown().await;
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_rejects_gapped_root_batches() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let served: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let server = tree_aux_node(5, served).await?;
+    let client = tree_aux_node(6, Vec::new()).await?;
+
+    client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    let result = fetch_roots(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |batch| collected.extend(batch),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a peer response that skips the requested first height is rejected"
+    );
+    assert!(
+        collected.is_empty(),
+        "gapped roots are not delivered to the sink"
+    );
+
+    client.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let gapped: Vec<_> = (1_687_105..1_687_204).map(root_at).collect();
+    let bad_requests = Arc::new(AtomicUsize::new(0));
+    let bad_server = tree_aux_node_with_counter(7, gapped, Some(Arc::clone(&bad_requests))).await?;
+    let good_server = tree_aux_node(8, expected.clone()).await?;
+    let client = tree_aux_node(9, Vec::new()).await?;
+
+    client.connect_native(&bad_server, CONNECT_TIMEOUT).await?;
+    client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    for _ in 0..2 {
+        collected.clear();
+        fetch_roots(
+            &client.supervisor(),
+            block::Height(1_687_104),
+            block::Height(1_687_203),
+            |batch| collected.extend(batch),
+        )
+        .await?;
+    }
+
+    assert_eq!(
+        collected, expected,
+        "the client skips an unusable tree_aux peer and fetches roots from another peer"
+    );
+    assert!(
+        bad_requests.load(Ordering::Relaxed) > 0,
+        "the unusable peer was actually queried before the client fell back"
+    );
+
+    client.shutdown().await;
+    good_server.shutdown().await;
+    bad_server.shutdown().await;
     Ok(())
 }

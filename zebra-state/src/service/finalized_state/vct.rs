@@ -250,6 +250,13 @@ impl VctState {
         self.fast
     }
 
+    /// `true` when this source's roots are untrusted, so the committer must confirm each
+    /// against a buffered successor before committing it (the peer source). See
+    /// [`CommitmentRootSource::requires_verified_successor`](super::commitment_aux::CommitmentRootSource::requires_verified_successor).
+    pub(super) fn requires_verified_successor(&self) -> bool {
+        self.source.requires_verified_successor()
+    }
+
     /// The supplied roots for `height`, when fast mode has a fixture entry for it
     /// (the signal that this block takes the fast path).
     pub(super) fn fast_root(

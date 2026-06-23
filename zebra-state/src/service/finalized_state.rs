@@ -137,9 +137,11 @@ use vct::VctState;
 /// commitment roots for a height range, derived from the per-height trees.
 pub(crate) use commitment_aux::produce_block_roots;
 
-/// The verified-commitment-trees `tree_aux` peer-source write handle and its global
-/// accessor: the driver in `zebrad` fills the committer's root cache through this.
-pub(crate) use commitment_aux::{peer_roots_writer, PeerSourceWriter};
+/// The verified-commitment-trees `tree_aux` peer-source write handle, root-refetch
+/// signal, and their global accessors.
+pub(crate) use commitment_aux::{
+    peer_root_refetch_receiver, peer_roots_writer, request_peer_root_refetch, PeerSourceWriter,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -689,7 +691,10 @@ impl FinalizedState {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
-    ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    > {
         let (checkpoint_verified, rsp_tx) = ordered_block;
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
@@ -716,9 +721,13 @@ impl FinalizedState {
                 .set(checkpoint_verified.height.0 as f64);
         };
 
-        let _ = rsp_tx.send(result.clone().map(|(hash, _)| hash));
-
-        result.map(|(_hash, note_commitment_trees)| (checkpoint_verified, note_commitment_trees))
+        match result {
+            Ok((hash, note_commitment_trees)) => {
+                let _ = rsp_tx.send(Ok(hash));
+                Ok((checkpoint_verified, note_commitment_trees))
+            }
+            Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+        }
     }
 
     /// Immediately commit a `finalized` block to the finalized state.
@@ -876,11 +885,25 @@ impl FinalizedState {
                         .map_err(|error| self.vct_reject_supplied_root(height, error))?;
 
                     // Verify-before-commit: this block's roots are only committed by
-                    // the *next* block's header (the one-block lag). For ordinary fast
-                    // blocks, a successor must be buffered so we can check its
-                    // commitment against the candidate before persisting. At the
-                    // checkpoint handoff, the embedded final frontiers provide the
-                    // independent authority instead.
+                    // the *next* block's header (the one-block lag). When a successor
+                    // is buffered, check its commitment against the candidate; a wrong
+                    // fixture root makes this fail, and we reject it (propagating the
+                    // error) before persisting. Fast mode freezes the note-commitment
+                    // frontier, so a bad root cannot be recomputed away here — verify
+                    // or refuse. The next block's auth data root is precomputed by the
+                    // checkpoint verifier, so this is cheap.
+                    //
+                    // With no successor buffered, this block's own root cannot be
+                    // confirmed here. For an *untrusted* (peer) source we must not commit
+                    // it on faith: a wrong root would be detected only at the next block,
+                    // by which point it is irreversibly on disk and wedges the sync (the
+                    // mis-attributed eviction can never undo it). So defer — refuse
+                    // retryably and let the write loop re-commit once the successor is
+                    // buffered (it always arrives below the handoff; the handoff block
+                    // itself is exempt — its root is pinned to the embedded frontier
+                    // below — and below Heartwood the root is verified directly above, so
+                    // neither needs a successor). A trusted local fixture is not
+                    // adversarial and commits its tip root on the in-arrears check.
                     //
                     // This same check is the successor's own commitment check, so on
                     // success record `(next_height, next_hash)` as pre-validated to
@@ -905,16 +928,24 @@ impl FinalizedState {
                             (height + 1).expect("checkpoint block heights are valid"),
                             next_block.hash(),
                         ));
-                    } else if handoff_frontiers.is_none() {
-                        metrics::counter!("state.vct.root.unavailable.count").increment(1);
-                        tracing::warn!(
-                            ?height,
-                            "VCT: no buffered successor to verify supplied roots before commit; \
-                             deferring fast checkpoint commit"
-                        );
-                        return Err(
-                            ValidateContextError::VctSuppliedRootUnavailable { height }.into()
-                        );
+                    } else if self
+                        .vct
+                        .as_ref()
+                        .is_some_and(|v| v.requires_verified_successor())
+                        && handoff_height != Some(height)
+                        && Some(height)
+                            >= zebra_chain::parameters::NetworkUpgrade::Heartwood
+                                .activation_height(&network)
+                    {
+                        // Untrusted root at/above Heartwood, no successor to confirm it,
+                        // not the handoff: defer rather than persist it unverified. Leaves
+                        // the database untouched; the block re-commits once the successor
+                        // is buffered.
+                        metrics::counter!("state.vct.root.await_successor.count").increment(1);
+                        return Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
+                            height,
+                        }
+                        .into());
                     }
 
                     history_tree = candidate;
@@ -1207,17 +1238,22 @@ impl FinalizedState {
             .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
     }
 
-    /// vct_fast_needs_successor is `true` when committing `height` on the fast path needs a buffered
-    /// successor before it can safely persist this block's supplied roots.
+    /// `true` when committing `height` on the fast path needs a buffered successor before
+    /// it can safely persist this block's supplied roots.
     ///
-    /// The checkpoint handoff is the only fast-path height that can commit without
-    /// a successor: its embedded final frontiers are verified against this block's
-    /// roots before the real tip treestate is written.
+    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
+    /// checkpoint handoff is exempt because its embedded final frontiers are verified
+    /// against this block's roots before the real tip treestate is written; trusted
+    /// local fixtures can commit their tip root on the in-arrears check.
     pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
         self.vct.as_ref().is_some_and(|v| {
             v.is_fast()
                 && v.fast_root(height).is_some()
+                && v.requires_verified_successor()
                 && v.final_frontiers_for_handoff(height).is_none()
+                && Some(height)
+                    >= zebra_chain::parameters::NetworkUpgrade::Heartwood
+                        .activation_height(&self.network())
         })
     }
 

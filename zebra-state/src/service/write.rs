@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use indexmap::IndexMap;
@@ -26,7 +26,9 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
+        finalized_state::{
+            request_peer_root_refetch, spawn_note_precompute, FinalizedState, ZebraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -49,6 +51,22 @@ type PendingPrecompute = (
     crossbeam_channel::Receiver<BlockNotePrecompute>,
     Arc<AtomicBool>,
 );
+
+/// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
+const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Delay between retryable VCT await-successor commit attempts. Shorter than
+/// [`VCT_ROOT_RETRY_WAIT`]: the root is already cached and only the next block needs to be
+/// downloaded into the look-ahead, so a tighter poll keeps the one-block commit lag small.
+const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
+
+/// How long a single checkpoint height may stay stuck on a retryable VCT root stall before
+/// the committer escalates to an error-level log and a `state.vct.root.stalled.height` gauge.
+/// Transient waits (a successor still downloading, a root still in flight) clear well within
+/// this; staying stuck past it means no peer can serve a root the frozen frontier requires,
+/// and — by design — the committer will not recompute against the stale frontier, so the node
+/// cannot advance until a peer supplies it. Surfacing that loudly is the operator's only signal.
+const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Cancels and drops a pending look-ahead precompute, if any.
 ///
@@ -362,6 +380,12 @@ impl WriteBlockWorkerTask {
         let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
         let mut retry_finalized_block: Option<QueuedCheckpointVerified> = None;
 
+        // Tracks how long the committer has been stuck retrying a single VCT root stall, so a
+        // genuine stall (no peer can serve a frozen-frontier height) escalates to a loud,
+        // observable signal while a transient wait stays quiet. `(height, first-seen)`.
+        let mut vct_root_stall: Option<(Height, Instant)> = None;
+        let mut vct_root_stall_logged = false;
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
@@ -503,21 +527,99 @@ impl WriteBlockWorkerTask {
             let next_checkpoint = finalized_lookahead
                 .front()
                 .map(|next| (next.0.block.clone(), next.0.auth_data_root));
+            let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
+            let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
             // Try committing the block
             match finalized_state.commit_finalized(
                 ordered_block,
-                prev_finalized_note_commitment_trees.take(),
+                prev_note_commitment_trees,
                 note_precompute,
                 next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // A successful commit clears any VCT root stall: log recovery and reset
+                    // the stalled-height gauge if it had been raised.
+                    if vct_root_stall.is_some() {
+                        if vct_root_stall_logged {
+                            info!(
+                                stalled_height = ?vct_root_stall.map(|(h, _)| h),
+                                "VCT: checkpoint commit recovered; the stalled height now has a verifiable supplied root"
+                            );
+                            metrics::gauge!("state.vct.root.stalled.height").set(0.0);
+                        }
+                        vct_root_stall = None;
+                        vct_root_stall_logged = false;
+                    }
+
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
-                Err(error) => {
+                Err((ordered_block, error)) => {
+                    // Retryable VCT root stalls (an absent/evicted root, or one not yet
+                    // verifiable for lack of a buffered successor) park-and-retry the same
+                    // block in place rather than resetting the queue. Only an absent root
+                    // needs a peer refetch; an await-successor stall just waits for the next
+                    // block to be downloaded into the look-ahead, so it polls faster.
+                    if let Some(height) = error.vct_retryable_height() {
+                        metrics::counter!("state.vct.root.retry.count").increment(1);
+                        let needs_refetch = error.vct_supplied_root_unavailable_height();
+                        if let Some(refetch_height) = needs_refetch {
+                            request_peer_root_refetch(refetch_height);
+                        }
+
+                        // Escalate a stall that persists on the same height past the warn
+                        // threshold: a transient wait resolves in a few polls and stays
+                        // quiet, but a height stuck longer means no peer can serve a root the
+                        // frozen frontier requires — the node will not advance (it will not,
+                        // by design, recompute against the stale frontier). Surface it loudly.
+                        match vct_root_stall {
+                            Some((stuck, _)) if stuck == height => {}
+                            _ => {
+                                vct_root_stall = Some((height, Instant::now()));
+                                vct_root_stall_logged = false;
+                            }
+                        }
+                        if !vct_root_stall_logged
+                            && vct_root_stall.is_some_and(|(_, since)| {
+                                since.elapsed() >= VCT_ROOT_STALL_WARN_AFTER
+                            })
+                        {
+                            tracing::error!(
+                                ?height,
+                                awaiting_refetch = needs_refetch.is_some(),
+                                stalled_for = ?VCT_ROOT_STALL_WARN_AFTER,
+                                "VCT: checkpoint commit stalled with no verifiable supplied root; \
+                                 the node cannot advance until a peer serves this height (it will \
+                                 not recompute against the frozen frontier)"
+                            );
+                            metrics::gauge!("state.vct.root.stalled.height")
+                                .set(f64::from(height.0));
+                            vct_root_stall_logged = true;
+                        } else {
+                            tracing::warn!(
+                                ?height,
+                                block_height = ?ordered_block.0.height,
+                                block_hash = ?ordered_block.0.hash,
+                                awaiting_refetch = needs_refetch.is_some(),
+                                "VCT: supplied root not yet verifiable; retrying checkpoint commit in place"
+                            );
+                        }
+
+                        prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
+                        retry_finalized_block = Some(ordered_block);
+                        cancel_pending_precompute(&mut pending_precompute);
+                        std::thread::park_timeout(if needs_refetch.is_some() {
+                            VCT_ROOT_RETRY_WAIT
+                        } else {
+                            VCT_AWAIT_SUCCESSOR_WAIT
+                        });
+                        continue;
+                    }
+
                     let finalized_tip = finalized_state.db.tip();
+                    let _ = ordered_block.1.send(Err(error.clone()));
 
                     // The commit failed and the queue is being reset, so any
                     // look-ahead precompute is for a block that will not be
