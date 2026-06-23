@@ -1,27 +1,5 @@
 # Verified commitment trees — fast checkpoint sync
 
-> **Status & default decision.** The fast verified path is the **default** whenever a node
-> syncs under checkpoint trust (`consensus.checkpoint_sync = true`) on a network with an
-> embedded handoff frontier (Mainnet) — for both the Archive and Pruned storage modes. This
-> default-on posture is an **explicit, deliberate decision**, not an experimental default that
-> slipped in: it is justified by the verify-before-commit safety contract (§6, §11), the
-> fail-closed-on-frozen-frontier policy (§8), the byte-identical-to-legacy equivalence proven by
-> automated tests (§14), and the adversarial peer policy (§11, §12 increment 6b) being in place.
-> The committer never lets an unverified or unobtainable root influence consensus state, so a
-> bad/missing root degrades to a bounded refetch/refusal rather than wrong state.
->
-> The escape hatch is first-class, not a workaround: `consensus.disable_vct_fast_sync = true`
-> keeps checkpoint sync enabled while fully reconstructing the note-commitment trees per block
-> (the byte-identical legacy committer), so any operator can opt out without giving up checkpoint
-> sync. See §4.4 for the mode matrix. (The implementation remains a recent addition; treat the
-> kill switch as the supported rollback if a node ever needs the legacy committer.)
->
-> **Document history.** An earlier copy of this design was kept as an untracked working
-> file and was lost when a shared worktree was cleaned. This version is rebuilt from the
-> PR #189 commit history and *reconciled against the merged code* — the section numbers
-> here (§5.1, §5.2, §5.4, §6.1, §9, §11, …) are the ones the source comments cite, so a
-> `design §N` reference in the code resolves to the section of the same number below.
-
 ## Overview (start here)
 
 **What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling and Orchard
