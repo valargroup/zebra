@@ -11,11 +11,19 @@ use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots
 
 use super::{
     fetch_roots, BoxRunFuture, TreeAuxMessage, TreeAuxService, TreeAuxStatePort,
-    ZAKURA_STREAM_TREE_AUX,
+    MAX_TA_MESSAGE_BYTES, ZAKURA_CAP_TREE_AUX, ZAKURA_STREAM_TREE_AUX,
 };
-use crate::{zakura::testkit::ZakuraTestNode, BoxError};
+use crate::{
+    zakura::{
+        testkit::{HostilePeer, ZakuraTestNode},
+        Frame, ZakuraLocalLimits, ZakuraPeerHandle, FRAME_HEADER_BYTES,
+    },
+    BoxError, Config,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SMALL_MAX_MESSAGE_BYTES: u32 = 256;
+const LARGE_MAX_FRAME_BYTES: u32 = 64 * 1024;
 
 /// An in-memory `tree_aux` state port over a fixed set of roots (the server's holdings).
 struct InMemoryPort(Vec<BlockCommitmentRoots>);
@@ -54,6 +62,36 @@ async fn tree_aux_node(
         .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort(held)))))
         .spawn()
         .await
+}
+
+async fn tree_aux_node_with_limits(seed: u64) -> Result<ZakuraTestNode, BoxError> {
+    let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+    limits.max_message_bytes = SMALL_MAX_MESSAGE_BYTES;
+    limits.max_frame_bytes = LARGE_MAX_FRAME_BYTES;
+
+    ZakuraTestNode::builder(seed)
+        .limits(limits)
+        .max_connections_per_ip(16)
+        .service(Arc::new(TreeAuxService::new(Arc::new(InMemoryPort {
+            roots: Vec::new(),
+            requests: None,
+        }))))
+        .spawn()
+        .await
+}
+
+async fn next_outbound_handle(node: &ZakuraTestNode) -> Result<ZakuraPeerHandle, BoxError> {
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        loop {
+            if let Some(handle) = node.supervisor().outbound_peer_handles().await.pop() {
+                return handle;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| -> BoxError { "timed out waiting for an outbound tree_aux peer".into() })
 }
 
 #[tokio::test]
@@ -112,6 +150,85 @@ async fn two_nodes_exchange_roots_over_tree_aux() -> Result<(), BoxError> {
 
     client.shutdown().await;
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hostile_tree_aux_response_above_message_cap_is_rejected() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let victim = tree_aux_node_with_limits(10).await?;
+    let hostile =
+        HostilePeer::connect_native_with_capabilities(&victim, 11, ZAKURA_CAP_TREE_AUX).await?;
+    let handle = next_outbound_handle(&victim).await?;
+
+    let mut oversized_roots = Vec::new();
+    let mut height = 1_687_104u32;
+    let response_frame = loop {
+        oversized_roots.push(root_at(height));
+        let candidate = TreeAuxMessage::Roots {
+            roots: oversized_roots.clone(),
+        }
+        .encode_frame()
+        .expect("candidate tree_aux roots frame encodes under the hard tree_aux limit");
+
+        if candidate.payload.len()
+            > usize::try_from(SMALL_MAX_MESSAGE_BYTES).expect("test message cap fits usize")
+        {
+            assert!(
+                candidate.payload.len() <= MAX_TA_MESSAGE_BYTES,
+                "candidate must stay within the hard tree_aux payload limit"
+            );
+            assert!(
+                candidate.payload.len().saturating_add(FRAME_HEADER_BYTES)
+                    <= usize::try_from(LARGE_MAX_FRAME_BYTES).expect("test frame cap fits usize"),
+                "candidate must still fit the negotiated frame cap"
+            );
+            break candidate;
+        }
+
+        height += 1;
+    };
+
+    let responder = hostile.respond_to_next_request_with(|_request_id| {
+        vec![Frame {
+            message_type: response_frame.message_type,
+            flags: response_frame.flags,
+            payload: response_frame.payload.clone(),
+        }]
+    });
+
+    let request = async {
+        let get_roots = TreeAuxMessage::GetRoots {
+            start_height: oversized_roots
+                .first()
+                .expect("oversized batch has at least one root")
+                .height,
+            count: u32::try_from(oversized_roots.len()).expect("batch length fits in u32"),
+        }
+        .encode_frame()
+        .expect("GetRoots request encodes");
+
+        handle
+            .request(
+                ZAKURA_STREAM_TREE_AUX,
+                7,
+                get_roots.message_type,
+                get_roots.flags,
+                get_roots.payload,
+            )
+            .await
+    };
+
+    let (request_result, responder_result) = tokio::join!(request, responder);
+    responder_result?;
+    assert!(
+        request_result.is_err(),
+        "tree_aux requester must reject a response payload above negotiated max_message_bytes"
+    );
+
+    hostile.shutdown().await;
+    victim.shutdown().await;
     Ok(())
 }
 
