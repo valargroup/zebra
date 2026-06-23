@@ -98,6 +98,23 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   duplicate-peer handling scaffolding.
 - Added bounded Zakura header-sync stream-5 wire messages, stateless header
   validation, and the default `network.zakura.header_sync` config surface.
+- Verified-commitment-trees fast checkpoint sync. Below the last checkpoint Zebra
+  now fetches per-block Sapling/Orchard commitment roots from peers over a new
+  header-sync-aligned `tree_aux` stream, verifies each root against the node's own
+  checkpoint-committed block headers (the ZIP-221 ChainHistory MMR plus direct
+  below-Heartwood/below-NU5 checks), and folds the verified roots into the anchor
+  set and history tree — skipping the per-block note-commitment frontier recompute
+  that dominates checkpoint-sync CPU cost. At the checkpoint handoff an embedded
+  final frontier, verified against that block's proven root, is written as the tip
+  treestate and normal per-block recompute resumes. The resulting consensus state
+  is byte-identical to the legacy recompute; a root that cannot be obtained or
+  verified is rejected rather than recomputed against the stale frozen frontier, so
+  no untrusted data can influence consensus state. This is the default whenever
+  `consensus.checkpoint_sync = true` on a network with an embedded handoff frontier
+  (Mainnet), for both Archive and Pruned storage modes. The new
+  `consensus.disable_vct_fast_sync` flag (default `false`) keeps checkpoint sync
+  enabled while forcing the legacy per-block recompute. Bumps the state database
+  format to 27.3.0 (new column families only; no data migration).
 - Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.

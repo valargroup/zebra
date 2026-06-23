@@ -793,18 +793,23 @@ impl FinalizedState {
                 let network = self.network();
                 let height = checkpoint_verified.height;
 
-                // POC (verified-commitment-trees): in fast mode, if the fixture
-                // supplies this height's roots, skip the per-block note-commitment
-                // frontier recompute (`update_trees_parallel`) entirely and fold the
-                // fixture roots into the anchor set and history leaf instead. The
-                // frontier stays the (frozen) parent frontier; nothing below the
-                // checkpoint reads it for consensus. See
-                // docs/design/verified-commitment-trees.md.
-                let vct_fast = self.vct.as_ref().and_then(|v| v.fast_root(height));
-
                 // The checkpoint handoff height (boundary below which the fast
                 // path skips per-height trees), when final frontiers are loaded.
                 let handoff_height = self.vct.as_ref().and_then(|v| v.fast_sync_handoff_height());
+
+                // In fast mode, if the source has this height's roots at or below the
+                // handoff, skip the per-block note-commitment frontier recompute
+                // (`update_trees_parallel`) entirely and fold the supplied roots into the
+                // anchor set and history leaf instead. The frontier stays the (frozen)
+                // parent frontier; nothing below the checkpoint reads it for consensus.
+                // See docs/design/verified-commitment-trees.md.
+                let vct_fast = self.vct.as_ref().and_then(|v| {
+                    if handoff_height.is_some_and(|handoff| height > handoff) {
+                        None
+                    } else {
+                        v.fast_root(height)
+                    }
+                });
 
                 let mut fast_anchor_roots = None;
                 // `Some(C)` for fast blocks of a persistent fast sync; written

@@ -1282,6 +1282,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
             let mut fixture = std::collections::HashMap::new();
             let mut handoff_trees = None;
+            let mut post_handoff_roots = None;
             for i in 0..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
@@ -1292,12 +1293,15 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 }
                 if i == handoff_index {
                     handoff_trees = Some(trees);
+                } else if i == handoff_index + 1 {
+                    post_handoff_roots = Some((trees.sapling.root(), trees.orchard.root()));
                 }
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
             let golden_history = legacy.db.history_tree().hash();
             let golden_tip = legacy.db.note_commitment_trees_for_tip();
             let handoff_trees = handoff_trees.expect("committed the handoff block");
+            let post_handoff_roots = post_handoff_roots.expect("committed a post-handoff block");
 
             // Fast -> manual: complete the fast handoff, reopen with the force-disable knob, and
             // keep checkpoint sync enabled while post-handoff blocks recompute from the real
@@ -1369,9 +1373,21 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 ..manual_prefix_config
             };
             let mut fast_suffix = FinalizedState::new(&fast_suffix_config, &network, #[cfg(feature = "elasticsearch")] false);
+            let mut guarded_fixture = fixture;
+            // A stale or over-eager peer cache entry above the handoff must be ignored so
+            // the committer resumes legacy recompute from the real handoff frontier.
+            prop_assert_ne!(
+                post_handoff_roots.0,
+                Default::default(),
+                "a post-NU5 post-handoff block must have a non-empty Sapling root",
+            );
+            guarded_fixture.insert(
+                (handoff_index + 1) as u32,
+                (Default::default(), post_handoff_roots.1),
+            );
             enable_vct_test_fixture_source_with_handoff(
                 &mut fast_suffix,
-                fixture,
+                guarded_fixture,
                 handoff,
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
@@ -1384,6 +1400,11 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, next, "vct switch fast suffix")
                     .expect("fast suffix commits after manual prefix");
             }
+            prop_assert_eq!(
+                fast_suffix.vct_fast_count(),
+                (handoff_index - seed) as u64,
+                "an above-handoff cached root must not keep the committer on the fast path",
+            );
             let fast_suffix_tip = fast_suffix.db.note_commitment_trees_for_tip();
             prop_assert_eq!(fast_suffix.db.vct_anchor_digest(), golden_anchors, "manual-to-fast anchors match legacy");
             prop_assert_eq!(fast_suffix.db.history_tree().hash(), golden_history, "manual-to-fast history matches legacy");

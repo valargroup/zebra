@@ -1,11 +1,20 @@
 # Verified commitment trees — fast checkpoint sync
 
-> **Status:** experimental (POC). The fast verified path is the **default** whenever a node
+> **Status & default decision.** The fast verified path is the **default** whenever a node
 > syncs under checkpoint trust (`consensus.checkpoint_sync = true`) on a network with an
-> embedded handoff frontier (Mainnet) — for both the Archive and Pruned storage modes.
-> During the initial rollout, `consensus.disable_vct_fast_sync = true` is a force-disable
-> opportunity that keeps checkpoint sync enabled while fully reconstructing the note-commitment
-> trees per block (the byte-identical legacy committer). See §4.4 for the mode matrix.
+> embedded handoff frontier (Mainnet) — for both the Archive and Pruned storage modes. This
+> default-on posture is an **explicit, deliberate decision**, not an experimental default that
+> slipped in: it is justified by the verify-before-commit safety contract (§6, §11), the
+> fail-closed-on-frozen-frontier policy (§8), the byte-identical-to-legacy equivalence proven by
+> automated tests (§14), and the adversarial peer policy (§11, §12 increment 6b) being in place.
+> The committer never lets an unverified or unobtainable root influence consensus state, so a
+> bad/missing root degrades to a bounded refetch/refusal rather than wrong state.
+>
+> The escape hatch is first-class, not a workaround: `consensus.disable_vct_fast_sync = true`
+> keeps checkpoint sync enabled while fully reconstructing the note-commitment trees per block
+> (the byte-identical legacy committer), so any operator can opt out without giving up checkpoint
+> sync. See §4.4 for the mode matrix. (The implementation remains a recent addition; treat the
+> kill switch as the supported rollback if a node ever needs the legacy committer.)
 >
 > **Document history.** An earlier copy of this design was kept as an untracked working
 > file and was lost when a shared worktree was cleaned. This version is rebuilt from the
@@ -142,9 +151,10 @@ embedded-frontier presence are passed in as plain inputs):
 
 The earlier file-backed checkpoint/fixture root source (`VCT_FAST`/`VCT_FIXTURE`) and capture
 mode (`VCT_CAPTURE`) were transient integration scaffolding before peer delivery existed and
-have been removed. `VCT_REGTEST_FRONTIER` remains as a Regtest final-frontier test hook. During
-the initial rollout, `consensus.disable_vct_fast_sync = true` is the user-facing way to force
-legacy without disabling checkpoint sync.
+have been removed. `VCT_REGTEST_FRONTIER` remains as a Regtest final-frontier test hook.
+`consensus.disable_vct_fast_sync = true` is the supported user-facing way to force the legacy
+committer without disabling checkpoint sync (the deliberate opt-out for the default-on path; see
+the status note at the top of this document).
 
 ## 5. Payload, wire, and the source seam
 
