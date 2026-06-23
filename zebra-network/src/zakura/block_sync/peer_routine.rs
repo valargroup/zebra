@@ -742,7 +742,6 @@ impl PeerRoutine {
         let mut index = 0;
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].deadline <= now {
-                self.window.reduce_outbound_window_after_timeout();
                 timed_out.push(self.window.outstanding.remove(index));
             } else {
                 index += 1;
@@ -751,6 +750,12 @@ impl PeerRoutine {
         if timed_out.is_empty() {
             return;
         }
+        // Back off concurrency at most once per `request_timeout`: a burst of
+        // timeouts re-requests every block (below) but cannot collapse the window.
+        // Previously every individual timeout halved it, which the shorter timeout
+        // would amplify into a collapse.
+        self.window
+            .reduce_outbound_window_after_timeout_throttled(now, self.config.request_timeout);
         for outstanding in &timed_out {
             self.budget.release(outstanding.reserved_bytes());
             // Return only the unreceived heights — received ones are buffered (in

@@ -133,6 +133,11 @@ impl Sequencer {
         self.reorder.buffered_bytes()
     }
 
+    /// Highest buffered reorder height, for shed-for-floor-starvation.
+    pub(super) fn reorder_max_height(&self) -> Option<block::Height> {
+        self.reorder.max_height()
+    }
+
     pub(super) fn unsubmitted_applying_count(&self) -> usize {
         self.applying
             .values()
