@@ -1,6 +1,6 @@
 //! Randomised property tests for the finalized state.
 
-use std::{collections::HashMap, env, sync::Arc};
+use std::{collections::HashMap, env, fs, sync::Arc};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -19,7 +19,9 @@ use crate::{
     config::Config,
     service::{
         arbitrary::PreparedChain,
-        finalized_state::{commitment_aux, CheckpointVerifiedBlock, FinalizedState},
+        finalized_state::{
+            commitment_aux, validate_final_frontiers_bytes, CheckpointVerifiedBlock, FinalizedState,
+        },
     },
     tests::FakeChainHelper,
     HashOrHeight,
@@ -65,6 +67,87 @@ fn enable_vct_test_fixture_source_with_handoff(
         )),
         false,
     );
+}
+
+#[test]
+fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let last = (nu5 + 3) as usize;
+            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            let height = Height(last as u32);
+
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            for block in blocks.iter().take(last + 1) {
+                let cv = CheckpointVerifiedBlock::from(block.block.clone());
+                legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct frontier bytes legacy")
+                    .unwrap();
+            }
+
+            let bytes = commitment_aux::produce_final_frontiers_bytes(&legacy.db, height)
+                .expect("legacy DB has final frontiers at the requested height");
+            let temp_dir = TempDir::new().expect("temp dir");
+            let path = temp_dir.path().join("frontier.bin");
+            fs::write(&path, &bytes).expect("frontier bytes write to temp file");
+
+            let bytes_from_file = fs::read(&path).expect("frontier bytes read from temp file");
+            validate_final_frontiers_bytes(&bytes_from_file, height)
+                .expect("generated frontier bytes pass node loader validation");
+
+            let parsed = commitment_aux::FinalFrontiers::from_bytes(&bytes_from_file)
+                .expect("validated bytes parse as final frontiers");
+            prop_assert_eq!(parsed.height, height, "frontier height round-trips");
+            prop_assert_eq!(
+                parsed.sapling.root(),
+                legacy.db.sapling_tree_by_height(&height).unwrap().root(),
+                "parsed Sapling frontier matches the DB tree at the requested height"
+            );
+            prop_assert_eq!(
+                parsed.orchard.root(),
+                legacy.db.orchard_tree_by_height(&height).unwrap().root(),
+                "parsed Orchard frontier matches the DB tree at the requested height"
+            );
+            prop_assert_eq!(
+                parsed.sprout.root(),
+                legacy.db.sprout_tree_for_tip().root(),
+                "parsed Sprout frontier matches the DB tip tree"
+            );
+
+            let wrong_height = Height(height.0.checked_add(1).expect("test height is in range"));
+            prop_assert!(
+                validate_final_frontiers_bytes(&bytes_from_file, wrong_height).is_err(),
+                "node loader validation rejects a frontier whose height does not match the checkpoint"
+            );
+    });
+
+    Ok(())
 }
 
 #[test]

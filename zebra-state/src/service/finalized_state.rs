@@ -131,6 +131,9 @@ use vct::VctState;
 /// commitment roots for a height range, derived from the per-height trees.
 pub(crate) use commitment_aux::produce_block_roots;
 
+pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
+
 /// The verified-commitment-trees `tree_aux` peer-source write handle, root-refetch
 /// signal, and their per-state accessors.
 pub(crate) use commitment_aux::PeerSourceHandle;

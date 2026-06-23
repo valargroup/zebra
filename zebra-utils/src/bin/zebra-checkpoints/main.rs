@@ -8,7 +8,7 @@
 //! zebra-consensus accepts an ordered list of checkpoints, starting with the
 //! genesis block. Checkpoint heights can be chosen arbitrarily.
 
-use std::{ffi::OsString, process::Stdio};
+use std::{ffi::OsString, path::Path, process::Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -23,6 +23,7 @@ use structopt::StructOpt;
 
 use zebra_chain::{
     block::{self, Block, Height, HeightDiff, TryIntoHeight},
+    parameters::Network,
     serialization::ZcashDeserializeInto,
     transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
@@ -34,7 +35,7 @@ use zebra_utils::init_tracing;
 
 pub mod args;
 
-use args::{Args, Backend, Transport};
+use args::{Args, Backend, FrontierHeight, Transport};
 
 /// Make an RPC call based on `our_args` and `rpc_command`, and return the response as a [`Value`].
 async fn rpc_output<M, I>(our_args: &Args, method: M, params: I) -> Result<Value>
@@ -133,6 +134,47 @@ where
         .unwrap_or_else(|_error| Value::String(response.trim().to_string()));
 
     Ok(response)
+}
+
+/// Write the Mainnet VCT final-frontier artifact for `frontier_height`.
+#[allow(clippy::print_stderr)]
+fn write_mainnet_frontier(
+    frontier_output: &Path,
+    state_cache_dir: &Path,
+    frontier_height: Height,
+) -> Result<()> {
+    let config = zebra_state::Config {
+        cache_dir: state_cache_dir.to_path_buf(),
+        ephemeral: false,
+        ..zebra_state::Config::default()
+    };
+
+    let (_read_state, db, _non_finalized_state_sender) =
+        zebra_state::init_read_only(config, &Network::Mainnet);
+    let bytes = zebra_state::produce_final_frontiers_bytes(&db, frontier_height)?;
+    zebra_state::validate_final_frontiers_bytes(&bytes, frontier_height)?;
+    std::fs::write(frontier_output, &bytes)?;
+
+    eprintln!(
+        "Wrote Mainnet VCT final frontier for height {:?} to {}",
+        frontier_height,
+        frontier_output.display()
+    );
+
+    Ok(())
+}
+
+fn resolve_frontier_height(
+    selection: &FrontierHeight,
+    last_checkpoint_height: Height,
+) -> Result<Height> {
+    match selection {
+        FrontierHeight::Auto if last_checkpoint_height == Height::MIN => Err(eyre!(
+            "--frontier-height auto requires at least one generated checkpoint above genesis"
+        )),
+        FrontierHeight::Auto => Ok(last_checkpoint_height),
+        FrontierHeight::Explicit(height) => Ok(*height),
+    }
 }
 
 /// Process entry point for `zebra-checkpoints`
@@ -281,5 +323,34 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(frontier_output) = &args.mainnet_frontier_output {
+        let state_cache_dir = args.state_cache_dir.as_deref().ok_or_else(|| {
+            eyre!("--state-cache-dir is required when --mainnet-frontier-output is supplied")
+        })?;
+        let frontier_height =
+            resolve_frontier_height(&args.frontier_height, last_checkpoint_height)?;
+
+        write_mainnet_frontier(frontier_output, state_cache_dir, frontier_height)
+            .with_suggestion(|| "Hint: run this against a synced Mainnet Zebra state")?;
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontier_height_auto_requires_a_generated_checkpoint() {
+        assert!(resolve_frontier_height(&FrontierHeight::Auto, Height::MIN).is_err());
+        assert_eq!(
+            resolve_frontier_height(&FrontierHeight::Auto, Height(100)).unwrap(),
+            Height(100)
+        );
+        assert_eq!(
+            resolve_frontier_height(&FrontierHeight::Explicit(Height(42)), Height::MIN).unwrap(),
+            Height(42)
+        );
+    }
 }

@@ -15,6 +15,7 @@ use std::sync::{
     Arc,
 };
 
+use thiserror::Error;
 #[cfg(test)]
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
 use zebra_chain::{
@@ -27,6 +28,26 @@ use super::commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource, Pe
 
 /// Embedded verified final note-commitment frontiers for Mainnet.
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
+
+/// Errors validating serialized VCT final-frontier bytes.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum FinalFrontiersValidationError {
+    /// The bytes could not be parsed as [`FinalFrontiers`].
+    #[error("invalid VCT final frontier bytes: {error}")]
+    InvalidBytes {
+        /// The parser error message.
+        error: String,
+    },
+
+    /// The serialized frontier height does not match the expected checkpoint handoff height.
+    #[error("embedded VCT final frontier height must match the network's max checkpoint height")]
+    HeightMismatch {
+        /// Height encoded in the serialized frontier.
+        actual: block::Height,
+        /// Expected checkpoint handoff height.
+        expected: block::Height,
+    },
+}
 
 /// POC state for the verified-commitment-trees experiment
 /// (`docs/design/verified-commitment-trees.md`). Shared across
@@ -154,6 +175,15 @@ impl VctState {
         if !self.fast {
             return None;
         }
+
+        if self
+            .source
+            .handoff_height()
+            .is_some_and(|handoff| height > handoff)
+        {
+            return None;
+        }
+
         self.source.fast_root(height)
     }
 
@@ -291,13 +321,35 @@ fn load_frontier_file(path: &std::ffi::OsStr, expected_height: block::Height) ->
 
 /// Parse embedded final frontiers and verify they match the checkpoint list.
 fn parse_embedded_final_frontiers(bytes: &[u8], expected_height: block::Height) -> FinalFrontiers {
-    let parsed = FinalFrontiers::from_bytes(bytes)
-        .unwrap_or_else(|error| panic!("invalid VCT final frontier bytes: {error}"));
-    assert_eq!(
-        parsed.height, expected_height,
-        "embedded VCT final frontier height must match the network's max checkpoint height"
-    );
-    parsed
+    parse_final_frontiers_bytes(bytes, expected_height).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn parse_final_frontiers_bytes(
+    bytes: &[u8],
+    expected_height: block::Height,
+) -> Result<FinalFrontiers, FinalFrontiersValidationError> {
+    let parsed = FinalFrontiers::from_bytes(bytes).map_err(|error| {
+        FinalFrontiersValidationError::InvalidBytes {
+            error: error.to_string(),
+        }
+    })?;
+
+    if parsed.height != expected_height {
+        return Err(FinalFrontiersValidationError::HeightMismatch {
+            actual: parsed.height,
+            expected: expected_height,
+        });
+    }
+
+    Ok(parsed)
+}
+
+/// Validate serialized VCT final-frontier bytes against an expected checkpoint handoff height.
+pub fn validate_final_frontiers_bytes(
+    bytes: &[u8],
+    expected_height: block::Height,
+) -> Result<(), FinalFrontiersValidationError> {
+    parse_final_frontiers_bytes(bytes, expected_height).map(|_| ())
 }
 
 /// Test/developer helper for producing embedded final-frontier bytes from a
@@ -378,6 +430,49 @@ mod tests {
         assert!(
             untrusted.fast_root_needs_successor(height, &network),
             "untrusted roots defer until a buffered successor verifies them"
+        );
+    }
+
+    #[test]
+    fn fast_root_is_bounded_by_handoff_height() {
+        let handoff = block::Height(10);
+        let after_handoff = (handoff + 1).expect("test height is valid");
+        let roots = std::collections::HashMap::from([
+            (handoff.0, (Default::default(), Default::default())),
+            (after_handoff.0, (Default::default(), Default::default())),
+        ]);
+        let frontiers = FinalFrontiers {
+            height: handoff,
+            sapling: Arc::new(sapling::tree::NoteCommitmentTree::default()),
+            orchard: Arc::new(orchard::tree::NoteCommitmentTree::default()),
+            sprout: Arc::new(sprout::tree::NoteCommitmentTree::default()),
+        };
+
+        let bounded = VctState::test_with_source(
+            Box::new(super::super::commitment_aux::FixtureSource::new(
+                roots.clone(),
+                Some(frontiers),
+            )),
+            false,
+        );
+        assert!(
+            bounded.fast_root(handoff).is_some(),
+            "the handoff root remains fast-path eligible"
+        );
+        assert!(
+            bounded.fast_root(after_handoff).is_none(),
+            "roots above the handoff are ignored"
+        );
+
+        let unbounded = VctState::test_with_source(
+            Box::new(super::super::commitment_aux::FixtureSource::new(
+                roots, None,
+            )),
+            false,
+        );
+        assert!(
+            unbounded.fast_root(after_handoff).is_some(),
+            "sources without a handoff keep the existing fixture behavior"
         );
     }
 

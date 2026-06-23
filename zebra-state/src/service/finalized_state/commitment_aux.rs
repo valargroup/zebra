@@ -19,12 +19,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use thiserror::Error;
 use tokio::sync::broadcast;
 use zebra_chain::{block, orchard, sapling, sprout};
 
-#[cfg(test)]
-use super::IntoDisk;
-use super::{FromDisk, ZebraDb};
+use super::{FromDisk, IntoDisk, ZebraDb};
 
 /// Per-block verified commitment roots — the essential fast-path payload (design §5.1),
 /// the wire payload carried over `tree_aux` (increment 6a). Defined in `zebra-chain` so
@@ -46,6 +45,24 @@ pub(super) struct FinalFrontiers {
     pub(super) sapling: Arc<sapling::tree::NoteCommitmentTree>,
     pub(super) orchard: Arc<orchard::tree::NoteCommitmentTree>,
     pub(super) sprout: Arc<sprout::tree::NoteCommitmentTree>,
+}
+
+/// Errors producing [`FinalFrontiers`] from a finalized database.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum FinalFrontiersGenerationError {
+    /// The database has no Sapling tree at the requested height.
+    #[error("missing Sapling final frontier tree at height {height:?}")]
+    MissingSaplingTree {
+        /// The requested final frontier height.
+        height: block::Height,
+    },
+
+    /// The database has no Orchard tree at the requested height.
+    #[error("missing Orchard final frontier tree at height {height:?}")]
+    MissingOrchardTree {
+        /// The requested final frontier height.
+        height: block::Height,
+    },
 }
 
 /// Errors parsing [`FinalFrontiers`] from the embedded/frontier-file byte format.
@@ -139,7 +156,6 @@ impl FinalFrontiers {
     /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
     /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes. Used to
     /// create embedded or test final-frontier fixtures.
-    #[cfg(test)]
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.height.0.to_le_bytes());
@@ -541,20 +557,38 @@ pub(crate) fn produce_block_roots(
     roots
 }
 
-/// Produce the final frontiers at `height` from `db`'s per-height trees. Sprout is frozen
-/// far below any modern checkpoint, so the tip Sprout tree is the frontier at `height`.
-/// Returns `None` if `height` is above the database tip.
-#[cfg(test)]
+/// Produce the final frontiers at `height` from `db`'s per-height trees.
+///
+/// Sprout is frozen far below any modern checkpoint, so the tip Sprout tree is the frontier at
+/// `height`.
 pub(super) fn produce_final_frontiers(
     db: &ZebraDb,
     height: block::Height,
-) -> Option<FinalFrontiers> {
-    Some(FinalFrontiers {
+) -> Result<FinalFrontiers, FinalFrontiersGenerationError> {
+    let sapling = db
+        .sapling_tree_by_height(&height)
+        .ok_or(FinalFrontiersGenerationError::MissingSaplingTree { height })?;
+    let orchard = db
+        .orchard_tree_by_height(&height)
+        .ok_or(FinalFrontiersGenerationError::MissingOrchardTree { height })?;
+
+    Ok(FinalFrontiers {
         height,
-        sapling: db.sapling_tree_by_height(&height)?,
-        orchard: db.orchard_tree_by_height(&height)?,
+        sapling,
+        orchard,
         sprout: db.sprout_tree_for_tip(),
     })
+}
+
+/// Produce serialized final-frontier bytes for the checkpoint handoff at `height`.
+///
+/// These bytes use the same format as the embedded `mainnet-frontier.bin` file consumed by
+/// [`super::vct`].
+pub fn produce_final_frontiers_bytes(
+    db: &ZebraDb,
+    height: block::Height,
+) -> Result<Vec<u8>, FinalFrontiersGenerationError> {
+    Ok(produce_final_frontiers(db, height)?.to_bytes())
 }
 
 #[cfg(test)]
