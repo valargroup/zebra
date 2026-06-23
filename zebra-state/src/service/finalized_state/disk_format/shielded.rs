@@ -87,6 +87,42 @@ impl FromDisk for orchard::tree::Root {
     }
 }
 
+/// The per-height Sapling and Orchard note-commitment roots, as stored in the
+/// `commitment_roots_by_height` index (keyed by [`Height`]).
+///
+/// Every node persists this 64-byte value for each committed block — including a
+/// verified-commitment-trees fast-synced node, which folds these roots in but writes no
+/// per-height note-commitment trees. It lets such a node still serve the `tree_aux`
+/// `BlockRoots` read from a compact index rather than from the (absent) trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitmentRootsByHeight {
+    /// The Sapling note-commitment tree root at this height.
+    pub sapling: sapling::tree::Root,
+    /// The Orchard note-commitment tree root at this height.
+    pub orchard: orchard::tree::Root,
+}
+
+impl IntoDisk for CommitmentRootsByHeight {
+    type Bytes = [u8; 64];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&IntoDisk::as_bytes(&self.sapling));
+        out[32..].copy_from_slice(&IntoDisk::as_bytes(&self.orchard));
+        out
+    }
+}
+
+impl FromDisk for CommitmentRootsByHeight {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        CommitmentRootsByHeight {
+            sapling: sapling::tree::Root::from_bytes(&bytes[..32]),
+            orchard: orchard::tree::Root::from_bytes(&bytes[32..]),
+        }
+    }
+}
+
 impl IntoDisk for NoteCommitmentSubtreeIndex {
     type Bytes = [u8; 2];
 

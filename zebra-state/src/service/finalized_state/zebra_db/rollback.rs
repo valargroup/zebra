@@ -11,11 +11,13 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
+    orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
         Network, NetworkUpgrade,
     },
+    sapling,
     subtree::NoteCommitmentSubtreeIndex,
     transaction,
     transparent::{self, Input},
@@ -29,6 +31,7 @@ use crate::{
         finalized_state::{
             disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
             disk_format::{
+                shielded::CommitmentRootsByHeight,
                 transparent::{
                     AddressBalanceLocation, AddressTransaction, AddressUnspentOutput,
                     OutputLocation,
@@ -40,7 +43,7 @@ use crate::{
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZebraDb,
             },
-            STATE_COLUMN_FAMILIES_IN_CODE,
+            COMMITMENT_ROOTS_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -946,6 +949,8 @@ fn prune_tree_indexes(
     target_height: Height,
     retained_sprout_roots: &Option<HashSet<zebra_chain::sprout::tree::Root>>,
 ) {
+    let retained_shielded_roots = retained_shielded_roots(db, target_height);
+
     let sapling_trees: BTreeMap<_, _> = db
         .sapling_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
@@ -953,8 +958,11 @@ fn prune_tree_indexes(
         ))
         .collect();
     for (height, tree) in sapling_trees {
+        let root = tree.root();
         batch.delete_sapling_tree(db, &height);
-        batch.delete_sapling_anchor(db, &tree.root());
+        if !retained_shielded_roots.sapling.contains(&root) {
+            batch.delete_sapling_anchor(db, &root);
+        }
     }
 
     let orchard_trees: BTreeMap<_, _> = db
@@ -964,9 +972,21 @@ fn prune_tree_indexes(
         ))
         .collect();
     for (height, tree) in orchard_trees {
+        let root = tree.root();
         batch.delete_orchard_tree(db, &height);
-        batch.delete_orchard_anchor(db, &tree.root());
+        if !retained_shielded_roots.orchard.contains(&root) {
+            batch.delete_orchard_anchor(db, &root);
+        }
     }
+
+    // Fast-sync writes anchors and this root index without writing per-height trees. Use the
+    // index to remove anchors introduced only by rolled-back fast-path heights before truncating
+    // it, but retain any repeated root that is still valid at or below the target.
+    prune_fast_commitment_anchors_from_index(db, batch, target_height, &retained_shielded_roots);
+
+    // Truncate the per-height commitment-roots serving index above the target, so a rolled-back
+    // database does not serve roots for heights it no longer holds.
+    batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
 
     // Delete every sapling/orchard subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
@@ -1003,6 +1023,66 @@ fn prune_tree_indexes(
     batch.delete_range_sprout_tree(db, &next_height, &Height::MAX);
 }
 
+#[derive(Default)]
+struct RetainedShieldedRoots {
+    sapling: HashSet<sapling::tree::Root>,
+    orchard: HashSet<orchard::tree::Root>,
+}
+
+fn retained_shielded_roots(db: &ZebraDb, target_height: Height) -> RetainedShieldedRoots {
+    let mut retained = RetainedShieldedRoots::default();
+
+    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+    for (_height, roots) in db
+        .db
+        .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(
+            &commitment_roots_by_height,
+            ..=target_height,
+        )
+    {
+        retained.sapling.insert(roots.sapling);
+        retained.orchard.insert(roots.orchard);
+    }
+
+    for (_height, tree) in db.sapling_tree_by_height_range(..=target_height) {
+        retained.sapling.insert(tree.root());
+    }
+
+    for (_height, tree) in db.orchard_tree_by_height_range(..=target_height) {
+        retained.orchard.insert(tree.root());
+    }
+
+    retained
+}
+
+fn prune_fast_commitment_anchors_from_index(
+    db: &ZebraDb,
+    batch: &mut DiskWriteBatch,
+    target_height: Height,
+    retained_roots: &RetainedShieldedRoots,
+) {
+    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+    let rolled_back_roots: BTreeMap<_, CommitmentRootsByHeight> = db
+        .db
+        .zs_forward_range_iter(
+            &commitment_roots_by_height,
+            (
+                std::ops::Bound::Excluded(target_height),
+                std::ops::Bound::Unbounded,
+            ),
+        )
+        .collect();
+
+    for (_height, roots) in rolled_back_roots {
+        if !retained_roots.sapling.contains(&roots.sapling) {
+            batch.delete_sapling_anchor(db, &roots.sapling);
+        }
+        if !retained_roots.orchard.contains(&roots.orchard) {
+            batch.delete_orchard_anchor(db, &roots.orchard);
+        }
+    }
+}
+
 fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
@@ -1021,16 +1101,9 @@ mod tests {
 
     use super::*;
 
-    /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
-    /// including the hash→height index, while leaving rows at or below the target intact. This
-    /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip
-    /// instead of stalling on an un-requestable floor (see the function doc).
-    #[test]
-    fn delete_zakura_headers_above_truncates_the_header_store() {
-        let _init_guard = zebra_test::init();
-
+    fn ephemeral_mainnet_db() -> ZebraDb {
         let network = Network::Mainnet;
-        let db = ZebraDb::new(
+        ZebraDb::new(
             &Config::ephemeral(),
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -1040,7 +1113,118 @@ mod tests {
                 .iter()
                 .map(ToString::to_string),
             false,
+        )
+    }
+
+    fn sapling_note_commitment(value: u64) -> sapling::tree::NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<sapling::tree::NoteCommitmentUpdate>::from(
+            sapling::tree::NoteCommitmentUpdate::from_bytes(&bytes),
+        )
+        .expect("small little-endian integers are canonical Jubjub field elements")
+    }
+
+    fn sapling_root(value: u64) -> sapling::tree::Root {
+        let mut tree = sapling::tree::NoteCommitmentTree::default();
+        tree.append(sapling_note_commitment(value))
+            .expect("single-note Sapling tree is not full");
+        tree.root()
+    }
+
+    fn orchard_root(value: u64) -> orchard::tree::Root {
+        let mut tree = orchard::tree::NoteCommitmentTree::default();
+        tree.append(halo2::pasta::pallas::Base::from(value))
+            .expect("single-note Orchard tree is not full");
+        tree.root()
+    }
+
+    /// Fast-path VCT commits write Sapling/Orchard anchors and the compact
+    /// `commitment_roots_by_height` index, but skip per-height tree rows. Rollback must
+    /// therefore prune stale anchors from the index before truncating it; otherwise anchors
+    /// from rolled-back fast commits stay valid for contextual verification.
+    #[test]
+    fn prune_tree_indexes_drops_fast_index_anchors_above_target() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let retained_sapling = sapling_root(1);
+        let removed_sapling = sapling_root(2);
+        let retained_orchard = orchard_root(1);
+        let removed_orchard = orchard_root(2);
+
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&db, &retained_sapling);
+        batch.insert_sapling_anchor(&db, &removed_sapling);
+        batch.insert_orchard_anchor(&db, &retained_orchard);
+        batch.insert_orchard_anchor(&db, &removed_orchard);
+
+        // Heights 1 and 2 are retained. Height 3 is rolled back and has a unique stale
+        // anchor. Height 4 is also rolled back, but repeats the retained root, so its anchor
+        // must remain valid after the index row is truncated.
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(1),
+            &retained_sapling,
+            &retained_orchard,
         );
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(2),
+            &retained_sapling,
+            &retained_orchard,
+        );
+        batch.insert_commitment_roots_by_height(&db, Height(3), &removed_sapling, &removed_orchard);
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(4),
+            &retained_sapling,
+            &retained_orchard,
+        );
+        db.write_batch(batch)
+            .expect("seeding fast-path roots succeeds");
+
+        let mut batch = DiskWriteBatch::new();
+        prune_tree_indexes(&db, &mut batch, Height(2), &None);
+        db.write_batch(batch)
+            .expect("pruning fast-path roots succeeds");
+
+        assert!(
+            db.contains_sapling_anchor(&retained_sapling),
+            "rollback retains Sapling anchors still valid at or below the target"
+        );
+        assert!(
+            db.contains_orchard_anchor(&retained_orchard),
+            "rollback retains Orchard anchors still valid at or below the target"
+        );
+        assert!(
+            !db.contains_sapling_anchor(&removed_sapling),
+            "rollback removes Sapling anchors introduced only by rolled-back fast commits"
+        );
+        assert!(
+            !db.contains_orchard_anchor(&removed_orchard),
+            "rollback removes Orchard anchors introduced only by rolled-back fast commits"
+        );
+        assert_eq!(
+            db.commitment_roots_by_height_range(Height(1)..=Height(4))
+                .into_iter()
+                .map(|roots| roots.height)
+                .collect::<Vec<_>>(),
+            vec![Height(1), Height(2)],
+            "rollback truncates the serving index above the target"
+        );
+    }
+
+    /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
+    /// including the hash→height index, while leaving rows at or below the target intact. This
+    /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip
+    /// instead of stalling on an un-requestable floor (see the function doc).
+    #[test]
+    fn delete_zakura_headers_above_truncates_the_header_store() {
+        let _init_guard = zebra_test::init();
+
+        let db = ephemeral_mainnet_db();
 
         // A real header value for `zakura_header_by_height`; the height math is what matters, so
         // every seeded height can reuse the same header.
@@ -1145,18 +1329,7 @@ mod tests {
     fn delete_zakura_headers_above_is_a_noop_on_an_empty_store() {
         let _init_guard = zebra_test::init();
 
-        let network = Network::Mainnet;
-        let db = ZebraDb::new(
-            &Config::ephemeral(),
-            STATE_DATABASE_KIND,
-            &state_database_format_version_in_code(),
-            &network,
-            true,
-            STATE_COLUMN_FAMILIES_IN_CODE
-                .iter()
-                .map(ToString::to_string),
-            false,
-        );
+        let db = ephemeral_mainnet_db();
 
         let mut batch = DiskWriteBatch::new();
         delete_zakura_headers_above(&db, &mut batch, Height(3));
