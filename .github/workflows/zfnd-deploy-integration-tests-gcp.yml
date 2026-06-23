@@ -394,6 +394,7 @@ jobs:
           CONTAINER_ID: ${{ steps.find-container.outputs.CONTAINER_ID }}
           INSTANCE_NAME: ${{ inputs.test_id }}-${{ env.GITHUB_REF_SLUG_URL }}-${{ env.GITHUB_SHA_SHORT }}
           GCP_ZONE: ${{ vars.GCP_ZONE }}
+          CAPTURE_MAINNET_FRONTIER: ${{ contains(inputs.test_id, 'mainnet') }}
         run: |
           gcloud compute ssh "${INSTANCE_NAME}" \
             --zone "${GCP_ZONE}" \
@@ -403,7 +404,7 @@ jobs:
             --command="
             sudo docker logs ${CONTAINER_ID} 2>&1 | grep -oE '[0-9]+ [0-9a-f]{64}' > /tmp/checkpoints.txt;
             echo \"Captured \$(wc -l < /tmp/checkpoints.txt) checkpoint lines\";
-            if echo '${{ inputs.test_id }}' | grep -qi 'mainnet'; then
+            if [ \"${CAPTURE_MAINNET_FRONTIER}\" = 'true' ]; then
               sudo docker cp ${CONTAINER_ID}:/tmp/mainnet-frontier.bin /tmp/mainnet-frontier.bin;
               test -s /tmp/mainnet-frontier.bin;
               echo \"Captured Mainnet VCT frontier artifact\";
