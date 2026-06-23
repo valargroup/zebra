@@ -530,7 +530,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 count: 2,
             })
             .await?,
-        ReadResponse::BlockSizeHints(vec![(Height(1), Some(999_999)), (Height(2), None)]),
+        ReadResponse::BlockSizeHints(vec![(Height(1), None), (Height(2), None)]),
     );
 
     assert_eq!(

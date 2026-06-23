@@ -1320,8 +1320,8 @@ pub enum ReadRequest {
 
     /// Returns scheduling-only body-size hints for a contiguous height range.
     ///
-    /// Confirmed committed block sizes win over untrusted advertised header
-    /// hints. Unknown advertised sizes are returned as `None`.
+    /// Only confirmed committed block sizes are returned. Unknown sizes are
+    /// returned as `None`.
     BlockSizeHints {
         /// First height to read.
         from: block::Height,

@@ -731,6 +731,10 @@ pub(crate) fn body_sizes_for_served_header_range(
     header_heights
         .into_iter()
         .map(|height| {
+            if height < start {
+                return 0;
+            }
+
             let Some(offset) = usize::try_from(height - start).ok() else {
                 return 0;
             };
