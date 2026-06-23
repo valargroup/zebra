@@ -63,7 +63,7 @@ fn ironwood_v6_tx(
         sapling_shielded_data: None,
         orchard_shielded_data: None,
         ironwood_shielded_data: Some(ironwood::ShieldedData {
-            flags: orchard::Flags::ENABLE_SPENDS,
+            flags: orchard::Flags::OUTPUTS_DISABLED,
             value_balance: Amount::zero(),
             shared_anchor: tree::Root::default(),
             proof: Halo2Proof(vec![0; 4992]),
