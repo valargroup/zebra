@@ -1031,6 +1031,18 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             prop_assert!(fast.db.sapling_tree_by_height(&handoff).is_some(), "handoff sapling tree is present");
             prop_assert!(fast.db.orchard_tree_by_height(&handoff).is_some(), "handoff orchard tree is present");
 
+            // Root-serving index (design §4): the fast-synced node holds no per-height trees
+            // below the handoff (asserted just above), yet it must still serve `tree_aux`
+            // roots for that range so the root-serving fleet does not collapse as nodes
+            // fast-sync. Those roots come from the compact `commitment_roots_by_height` index
+            // the fast path persists per block, and they match exactly the roots the
+            // legacy/archive node derives from its per-height trees.
+            let below_handoff = Height((seed + 1) as u32)..=Height(last as u32 - 1);
+            let served = fast.db.commitment_roots_by_height_range(below_handoff.clone());
+            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff);
+            prop_assert!(!served.is_empty(), "a fast-synced node serves below-handoff roots from the index");
+            prop_assert_eq!(served, expected, "index-served roots match the legacy per-height-tree roots");
+
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
             // handoff height itself is available.
