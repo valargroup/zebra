@@ -16,7 +16,10 @@ use std::time::Duration;
 use tower::{Service, ServiceExt};
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zebra_network::zakura::{fetch_roots, BoxRunFuture, TreeAuxStatePort, ZakuraSupervisorHandle};
-use zebra_state::{BoxError, ReadRequest, ReadResponse, ReadStateService, TreeAuxRootsWriter};
+use zebra_state::{
+    tree_aux_root_refetch_receiver, BoxError, ReadRequest, ReadResponse, ReadStateService,
+    TreeAuxRootsWriter,
+};
 
 use super::frontier::verified_block_tip_from_state;
 
@@ -85,14 +88,13 @@ where
     }
 }
 
-/// Fetch the verified-tip→checkpoint per-block roots from a peer into the committer's cache.
+/// Fetch and refetch verified-tip→checkpoint per-block roots from peers into the committer cache.
 ///
-/// Once an outbound peer is available, fetch the roots the committer still
-/// needs — the range from this node's verified tip up to the checkpoint — and write each batch
-/// into `writer` ahead of body commit, then stop. Retries on a fetch error or while no peer is
-/// connected. Because header sync runs ahead of bodies, the cache is filled before the committer
-/// reaches a height; a height the peer cannot supply simply stays in legacy mode (safe by
-/// construction — never wrong state).
+/// Once an outbound peer is available, fetch the roots the committer still needs — the range from
+/// this node's verified tip up to the checkpoint — and write each batch into `writer` ahead of
+/// body commit. The driver then stays alive for targeted root-refetch requests from the committer:
+/// a frozen-frontier root miss parks the checkpoint block, asks this driver to refill that height
+/// from peers, and retries the same commit without resetting the block queue.
 ///
 /// The fetch starts at `verified_tip + 1`, not genesis: heights at or below the verified tip are
 /// already committed, so their roots are never looked up. Fetching from genesis on a node that
@@ -115,7 +117,11 @@ pub(crate) async fn run_tree_aux_driver(
     let tip = read_state_tip(&read_state, ReadRequest::Tip).await;
     let from = root_fetch_start(finalized_tip, tip, &network);
 
+    let mut refetch_rx = tree_aux_root_refetch_receiver();
+
     let driver = async {
+        let mut initial_fetch_complete = false;
+
         loop {
             // Wait for an outbound peer before issuing requests (fetch_roots needs one).
             if supervisor.outbound_peer_handles().await.is_empty() {
@@ -123,24 +129,63 @@ pub(crate) async fn run_tree_aux_driver(
                 continue;
             }
 
-            let result = fetch_roots(&supervisor, from, handoff, |batch| {
-                writer.insert_roots(batch);
-            })
-            .await;
+            if !initial_fetch_complete {
+                let (result, refetch_closed) = if let Some(rx) = &mut refetch_rx {
+                    let mut refetch_closed = false;
+                    let result = tokio::select! {
+                        result = fetch_roots_into_writer(&supervisor, &writer, from, handoff) => {
+                            Some(result)
+                        }
+                        request = rx.recv() => {
+                            refetch_closed = handle_refetch_request(request, &supervisor, &writer)
+                                .await
+                                .is_err();
+                            None
+                        }
+                    };
+                    (result, refetch_closed)
+                } else {
+                    (
+                        Some(fetch_roots_into_writer(&supervisor, &writer, from, handoff).await),
+                        false,
+                    )
+                };
+                if refetch_closed {
+                    refetch_rx = None;
+                }
 
-            match result {
-                Ok(()) => {
-                    tracing::info!(
-                        from_height = from.0,
-                        handoff_height = handoff.0,
-                        "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
-                    );
-                    break;
+                let Some(result) = result else {
+                    continue;
+                };
+
+                match result {
+                    Ok(()) => {
+                        tracing::info!(
+                            from_height = from.0,
+                            handoff_height = handoff.0,
+                            "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
+                        );
+                        initial_fetch_complete = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "tree_aux: root fetch failed, retrying");
+                        tokio::time::sleep(TREE_AUX_DRIVER_RETRY).await;
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(?error, "tree_aux: root fetch failed, retrying");
-                    tokio::time::sleep(TREE_AUX_DRIVER_RETRY).await;
-                }
+
+                continue;
+            }
+
+            let Some(rx) = &mut refetch_rx else {
+                tokio::time::sleep(TREE_AUX_DRIVER_RETRY).await;
+                continue;
+            };
+
+            if handle_refetch_request(rx.recv().await, &supervisor, &writer)
+                .await
+                .is_err()
+            {
+                break;
             }
         }
     };
@@ -151,6 +196,72 @@ pub(crate) async fn run_tree_aux_driver(
         _ = &mut shutdown => {
             tracing::info!("tree_aux driver shutting down");
         }
+    }
+}
+
+/// Fetch `[from, to]` roots and insert every returned batch into the committer's peer cache.
+///
+/// This is the write side of the `tree_aux` source: `fetch_roots` validates the transport
+/// response shape, then the writer makes those roots visible to the finalized committer. The
+/// roots are still untrusted here; the committer verifies them against checkpoint headers.
+async fn fetch_roots_into_writer(
+    supervisor: &ZakuraSupervisorHandle,
+    writer: &TreeAuxRootsWriter,
+    from: block::Height,
+    to: block::Height,
+) -> Result<(), BoxError> {
+    fetch_roots(supervisor, from, to, |batch| writer.insert_roots(batch)).await
+}
+
+/// Handle one targeted root-refetch request from the finalized committer.
+///
+/// A concrete height requests an immediate one-root fetch into `writer`. Lagged requests are
+/// recoverable because later retry iterations can send the height again; a closed channel means
+/// the peer-source committer is gone, so the driver can stop waiting for refetches.
+async fn handle_refetch_request(
+    request: Result<block::Height, tokio::sync::broadcast::error::RecvError>,
+    supervisor: &ZakuraSupervisorHandle,
+    writer: &TreeAuxRootsWriter,
+) -> Result<(), ()> {
+    handle_refetch_request_with_fetch(request, |height| async move {
+        fetch_roots_into_writer(supervisor, writer, height, height).await
+    })
+    .await
+}
+
+/// Testable core of [`handle_refetch_request`], with the peer fetch supplied by the caller.
+async fn handle_refetch_request_with_fetch<F, Fut>(
+    request: Result<block::Height, tokio::sync::broadcast::error::RecvError>,
+    fetch_height: F,
+) -> Result<(), ()>
+where
+    F: FnOnce(block::Height) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BoxError>>,
+{
+    match request {
+        Ok(height) => {
+            let result = fetch_height(height).await;
+            match result {
+                Ok(()) => tracing::info!(
+                    ?height,
+                    "tree_aux: fetched retryable missing root into the committer cache"
+                ),
+                Err(error) => tracing::warn!(
+                    ?height,
+                    ?error,
+                    "tree_aux: retryable missing root fetch failed"
+                ),
+            }
+            Ok(())
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            tracing::warn!(
+                skipped,
+                "tree_aux: missed root refetch requests, continuing with latest requests"
+            );
+            Ok(())
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => Err(()),
     }
 }
 
@@ -390,5 +501,82 @@ mod tests {
 
         // Finalized tip above the best-chain tip: use the finalized tip.
         assert_eq!(root_fetch_start(at(200), at(150), &net), h(201));
+    }
+
+    #[tokio::test]
+    async fn refetch_request_fetches_requested_height() {
+        let mut fetched = None;
+
+        let result = handle_refetch_request_with_fetch(Ok(block::Height(42)), |height| {
+            fetched = Some(height);
+            future::ready(Ok(()))
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a fetched refetch height keeps the driver alive"
+        );
+        assert_eq!(
+            fetched,
+            Some(block::Height(42)),
+            "the refetch handler fetches exactly the requested height"
+        );
+    }
+
+    #[tokio::test]
+    async fn refetch_request_keeps_running_after_fetch_error() {
+        let result = handle_refetch_request_with_fetch(Ok(block::Height(42)), |_height| {
+            future::ready(Err::<(), BoxError>("fetch failed".into()))
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a peer fetch error is retryable and keeps the driver subscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn refetch_request_ignores_lagged_notifications() {
+        let mut fetched = false;
+
+        let result = handle_refetch_request_with_fetch(
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(3)),
+            |_height| {
+                fetched = true;
+                future::ready(Ok(()))
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "lagged notifications are recoverable because future retries can resend heights"
+        );
+        assert!(
+            !fetched,
+            "lagged notifications do not fetch an unknown height"
+        );
+    }
+
+    #[tokio::test]
+    async fn refetch_request_stops_after_closed_channel() {
+        let mut fetched = false;
+
+        let result = handle_refetch_request_with_fetch(
+            Err(tokio::sync::broadcast::error::RecvError::Closed),
+            |_height| {
+                fetched = true;
+                future::ready(Ok(()))
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a closed refetch channel tells the driver there are no more refetch requests"
+        );
+        assert!(!fetched, "closed channels do not fetch an unknown height");
     }
 }

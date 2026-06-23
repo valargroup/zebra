@@ -109,6 +109,12 @@ pub fn tree_aux_roots_writer() -> Option<TreeAuxRootsWriter> {
     service::finalized_state::peer_roots_writer().map(TreeAuxRootsWriter)
 }
 
+/// Subscribe to targeted `tree_aux` root refetch requests from the state committer.
+pub fn tree_aux_root_refetch_receiver(
+) -> Option<tokio::sync::broadcast::Receiver<zebra_chain::block::Height>> {
+    service::finalized_state::peer_root_refetch_receiver()
+}
+
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{

@@ -373,12 +373,26 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   region is exactly `tip < handoff` (the handoff height itself carries the real frontier).
 
 Outside the frozen window (legacy/capture, or `checkpoint_sync = false`), a missing root is
-simply the ordinary legacy recompute — bit-identical to today. This is the safety contract: **a bad, slow, or
-withholding peer degrades to legacy speed or a retryable refusal, never wrong state and never
-a permanent halt.** Because coverage is known ahead of bodies (§4.2), the common case is that
+simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
+missing root parks the current checkpoint block, requests a targeted `tree_aux` refetch from
+peers, and retries the same commit once the cache is refilled — **without resetting the block
+queue**. A peer-supplied root that has no buffered successor to confirm it against the header
+chain (the one-block lag) is likewise **deferred, not committed on faith**: an untrusted tip
+root is rejected before it is persisted, rather than one block too late (when it would be
+irreversibly on disk and could wedge the sync). A trusted local fixture is exempt and commits
+its tip root on the in-arrears check. This is the safety contract: **a bad, slow, or
+withholding peer degrades to legacy speed before freeze, or to a bounded wait/refetch loop
+inside the frozen window; it never writes wrong state and does not reset the block queue for
+root availability.** A height that stays stuck on a retryable stall past a threshold escalates
+to an error-level log and the `state.vct.root.stalled.height` gauge, so a genuinely unservable
+root surfaces loudly instead of a silent stall. Because coverage is known ahead of bodies
+(§4.2), the common case is that
 the frozen window is never entered without its roots in hand. Counters:
 `state.vct.root.rejected.count` (evicted after failing verification),
-`state.vct.root.unavailable.count` (frozen-frontier hole refused).
+`state.vct.root.unavailable.count` (frozen-frontier hole refused),
+`state.vct.root.await_successor.count` (deferred for a missing successor),
+`state.vct.root.retry.count` (park-and-retry attempts), and the
+`state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
 
 ## 9. The serving read path (`BlockRoots` / `TreeAuxStatePort`)
 
@@ -402,8 +416,9 @@ dependency on `zebra-state`. The port maps read errors and wrong responses to an
 As nodes fast-sync, fewer nodes can *serve* roots: `produce_block_roots` derives them from
 per-height trees, which a fast-synced node deliberately never built below its handoff. Only
 archive/produced nodes can serve today. This is a value-at-scale concern, **not a safety one**
-— a client that finds no serving peer degrades to legacy speed (or a retryable refusal in the
-frozen window), it does not corrupt state. Two mechanisms address it, in order of cost:
+— a client that finds no serving peer degrades to legacy speed before freeze or waits on targeted
+root refetches in the frozen window; it does not corrupt state. Two mechanisms address it, in
+order of cost:
 
 - **Roots-index CF (lightweight, preferred).** A fast node already verified every root it
   folded in. Persisting them into a compact column family (~68 bytes/block, ~200 MB for all of
