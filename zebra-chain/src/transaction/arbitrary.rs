@@ -702,7 +702,7 @@ impl Arbitrary for orchard::ShieldedData {
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         (
-            orchard_flags_pre_nu6_3_strategy(),
+            crate::orchard::arbitrary::pre_nu6_3_flags_strategy(),
             any::<Amount>(),
             any::<orchard::tree::Root>(),
             vec(
@@ -746,10 +746,6 @@ impl Arbitrary for orchard::ShieldedData {
     }
 
     type Strategy = BoxedStrategy<Self>;
-}
-
-fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<orchard::Flags> {
-    crate::orchard::arbitrary::pre_nu6_3_flags_strategy()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
