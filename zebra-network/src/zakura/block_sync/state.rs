@@ -465,7 +465,7 @@ impl OutstandingBlockRange {
     pub(super) fn reserved_bytes(&self) -> u64 {
         let outstanding = self
             .request
-            .expected_hashes
+            .expected_blocks
             .len()
             .saturating_sub(self.received.len());
         // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
@@ -491,16 +491,16 @@ impl OutstandingBlockRange {
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
         let newly_received = self
             .request
-            .expected_hashes
+            .expected_blocks
             .iter()
-            .filter(|(height, _)| *height <= tip && self.received.insert(*height))
+            .filter(|expected| expected.height <= tip && self.received.insert(expected.height))
             .count();
         // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
         BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.received.len() == self.request.expected_hashes.len()
+        self.received.len() == self.request.expected_blocks.len()
     }
 }
 
