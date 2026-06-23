@@ -16,13 +16,13 @@ use std::{
 use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
 
 use super::{
-    fetch_roots, BoxRunFuture, TreeAuxMessage, TreeAuxService, TreeAuxStatePort,
-    MAX_TA_MESSAGE_BYTES, ZAKURA_CAP_TREE_AUX, ZAKURA_STREAM_TREE_AUX,
+    fetch_roots, fetch_roots_with_peer, BoxRunFuture, TreeAuxMessage, TreeAuxService,
+    TreeAuxStatePort, MAX_TA_MESSAGE_BYTES, ZAKURA_CAP_TREE_AUX, ZAKURA_STREAM_TREE_AUX,
 };
 use crate::{
     zakura::{
         testkit::{HostilePeer, ZakuraTestNode},
-        Frame, ZakuraLocalLimits, ZakuraPeerHandle, FRAME_HEADER_BYTES,
+        Frame, ZakuraLocalLimits, ZakuraPeerHandle, ZakuraPeerId, FRAME_HEADER_BYTES,
     },
     BoxError, Config,
 };
@@ -289,6 +289,42 @@ async fn client_driver_fetches_a_root_range_over_tree_aux() -> Result<(), BoxErr
 }
 
 #[tokio::test]
+async fn client_driver_reports_root_batch_provenance() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let served: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let server = tree_aux_node(12, served.clone()).await?;
+    let client = tree_aux_node(13, Vec::new()).await?;
+    let server_peer_id = ZakuraPeerId::new(server.node_addr().await.node_id.as_bytes().to_vec())?;
+
+    client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    let mut suppliers = Vec::new();
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |_| false,
+        |batch| {
+            suppliers.push(batch.peer_id);
+            collected.extend(batch.roots);
+        },
+    )
+    .await?;
+
+    assert_eq!(collected, served, "all roots are fetched from the server");
+    assert!(
+        suppliers.iter().all(|peer_id| peer_id == &server_peer_id),
+        "each delivered batch records the peer that supplied it"
+    );
+
+    client.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn client_driver_rejects_gapped_root_batches() -> Result<(), BoxError> {
     let _guard = zebra_test::init();
 
@@ -336,7 +372,7 @@ async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxEr
     client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
 
     let mut collected = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..8 {
         collected.clear();
         fetch_roots(
             &client.supervisor(),
@@ -345,6 +381,10 @@ async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxEr
             |batch| collected.extend(batch),
         )
         .await?;
+
+        if bad_requests.load(Ordering::Relaxed) > 0 {
+            break;
+        }
     }
 
     assert_eq!(
@@ -359,5 +399,80 @@ async fn client_driver_falls_back_to_another_tree_aux_peer() -> Result<(), BoxEr
     client.shutdown().await;
     good_server.shutdown().await;
     bad_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_skips_excluded_tree_aux_peer() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let expected: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let bad_requests = Arc::new(AtomicUsize::new(0));
+    let bad_server =
+        tree_aux_node_with_counter(14, expected.clone(), Some(Arc::clone(&bad_requests))).await?;
+    let good_server = tree_aux_node(15, expected.clone()).await?;
+    let client = tree_aux_node(16, Vec::new()).await?;
+    let bad_peer_id = ZakuraPeerId::new(bad_server.node_addr().await.node_id.as_bytes().to_vec())?;
+
+    client.connect_native(&bad_server, CONNECT_TIMEOUT).await?;
+    client.connect_native(&good_server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |peer_id| peer_id == &bad_peer_id,
+        |batch| collected.extend(batch.roots),
+    )
+    .await?;
+
+    assert_eq!(
+        collected, expected,
+        "the client fetches from a non-excluded peer"
+    );
+    assert_eq!(
+        bad_requests.load(Ordering::Relaxed),
+        0,
+        "excluded tree_aux peers are not queried"
+    );
+
+    client.shutdown().await;
+    good_server.shutdown().await;
+    bad_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_driver_errors_when_all_tree_aux_peers_are_excluded() -> Result<(), BoxError> {
+    let _guard = zebra_test::init();
+
+    let served: Vec<_> = (1_687_104..1_687_204).map(root_at).collect();
+    let server = tree_aux_node(17, served).await?;
+    let client = tree_aux_node(18, Vec::new()).await?;
+
+    client.connect_native(&server, CONNECT_TIMEOUT).await?;
+
+    let mut collected = Vec::new();
+    let result = fetch_roots_with_peer(
+        &client.supervisor(),
+        block::Height(1_687_104),
+        block::Height(1_687_203),
+        |_peer_id| true,
+        |batch| collected.extend(batch.roots),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an eclipsed or fully excluded peer set leaves the range un-fetched"
+    );
+    assert!(
+        collected.is_empty(),
+        "no roots are accepted when every candidate is excluded"
+    );
+
+    client.shutdown().await;
+    server.shutdown().await;
     Ok(())
 }

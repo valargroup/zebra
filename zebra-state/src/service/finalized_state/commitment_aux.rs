@@ -442,6 +442,14 @@ impl PeerSourceWriter {
         }
     }
 
+    /// Remove peer-supplied roots at `heights` from the shared cache.
+    fn invalidate_roots(&self, heights: impl IntoIterator<Item = block::Height>) {
+        let mut cache = self.cache.write().expect("peer source roots lock poisoned");
+        for height in heights {
+            cache.roots.remove(&height.0);
+        }
+    }
+
     /// The highest finalized height whose peer roots have been evicted from the cache.
     fn committed_through(&self) -> Option<block::Height> {
         self.cache
@@ -456,6 +464,11 @@ impl PeerSourceHandle {
     /// Insert verified roots fetched for a range into the shared cache.
     pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
         self.writer.insert_roots(roots);
+    }
+
+    /// Remove peer-supplied roots at `heights` from the shared cache.
+    pub(crate) fn invalidate_roots(&self, heights: impl IntoIterator<Item = block::Height>) {
+        self.writer.invalidate_roots(heights);
     }
 
     /// The highest finalized height whose peer roots have been evicted from the cache.
@@ -694,6 +707,41 @@ mod tests {
         assert!(
             source.fast_root(block::Height(42)).is_none(),
             "an evicted root is gone, so the next read misses and a re-fetch can replace it"
+        );
+    }
+
+    /// Bulk invalidation drops every still-cached root named by the driver after it
+    /// identifies a bad supplier, so a poisoned fetch window is retried from another peer
+    /// instead of failing one height at a time.
+    #[test]
+    fn peer_source_bulk_invalidate_evicts_multiple_roots() {
+        let (source, writer) = PeerSource::new(None);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        writer.insert_roots((40..=44).map(|height| BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: empty_sapling_root,
+            orchard_root: empty_orchard_root,
+        }));
+
+        writer.invalidate_roots([block::Height(41), block::Height(43)]);
+
+        assert!(
+            source.fast_root(block::Height(40)).is_some(),
+            "roots outside the invalidation set stay cached"
+        );
+        assert!(
+            source.fast_root(block::Height(41)).is_none(),
+            "the first invalidated height is evicted"
+        );
+        assert!(
+            source.fast_root(block::Height(43)).is_none(),
+            "the second invalidated height is evicted"
+        );
+        assert!(
+            source.fast_root(block::Height(44)).is_some(),
+            "higher roots outside the invalidation set stay cached"
         );
     }
 

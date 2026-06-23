@@ -214,7 +214,9 @@ Peer mode creates a per-state `TreeAuxRootsWriter` alongside the committer's `Pe
 The driver stages each bounded fetch window locally and publishes it atomically after that
 window succeeds; the same handle also exposes the committed-root eviction watermark and carries
 targeted refetch subscriptions, so each state instance pairs its committer, root cache, and
-driver without process-global state.
+driver without process-global state. The state cache deliberately stores no peer identity:
+root provenance and peer-exclusion policy live in the `zebrad` driver (§8.1), preserving the
+`zebra-state` / `zebra-network` crate boundary.
 
 ### 5.4 The `tree_aux` Zakura stream
 
@@ -242,9 +244,11 @@ memory is bounded even when peers serve roots faster than blocks commit to disk.
   from local state through `TreeAuxStatePort` (§9), and returns `Roots` — or `RangeUnavailable`
   when it holds nothing. The response is additionally bounded by the negotiated frame/message
   caps (`effective_response_payload_bytes`), so it never overruns a smaller peer cap.
-- **Client** (`fetch_roots`): issues bounded `GetRoots` requests and advances by the last
-  height each peer returns. Any unavailable/malformed/out-of-range sub-range returns an error;
-  the caller treats that range as un-fetched and leaves it on the legacy path.
+- **Client** (`fetch_roots` / `fetch_roots_with_peer`): issues bounded `GetRoots` requests and
+  advances by the last height each peer returns. Any unavailable/malformed/out-of-range
+  sub-range returns an error; the caller treats that range as un-fetched and leaves it on the
+  legacy path. The provenance-preserving helper returns the supplier `ZakuraPeerId` for each
+  accepted batch and accepts a skip predicate so the `zebrad` policy can avoid hard-failed peers.
 
 The outbound path in `zebra-network` is stream-kind-aware: a `tree_aux` `GetRoots` is read with
 the generic stream frame budget rather than being validated as a legacy request message (which
@@ -406,6 +410,49 @@ its roots in hand. Counters:
 `state.vct.root.retry.count` (park-and-retry attempts), and the
 `state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
 
+### 8.1 Adversarial peer policy (increment 6b)
+
+The committer only reports root failures by height, and `zebra-state` intentionally has no
+dependency on `zebra-network` peer types. Peer attribution therefore lives in the `zebrad`
+`tree_aux` driver:
+
+1. `zebra-network::zakura::fetch_roots_with_peer` returns each contiguous root batch with the
+   authenticated `ZakuraPeerId` that supplied it.
+2. The `zebrad` driver stages both roots and `(height, peer_id)` provenance for the requested
+   range. After the full range succeeds, it records provenance **before** publishing roots to
+   `TreeAuxRootsWriter`, so the committer cannot observe a root before the driver knows its
+   supplier.
+3. The driver keeps a bounded side table keyed by height (`TREE_AUX_FETCH_AHEAD_ROOTS +
+   MAX_TA_ROOTS_PER_REQUEST`) and prunes entries at or below the committed-root eviction
+   watermark.
+4. If the committer rejects height `H` and requests a targeted refetch, the driver looks up the
+   last supplier of `H`. If there is no provenance (the root was never supplied, or the request
+   is stale), no peer is blamed.
+5. If a supplier is found, every still-cached height from that supplier is bulk-evicted through
+   `TreeAuxRootsWriter::invalidate_roots`, and the supplier enters a bounded hard-failure
+   cooldown. Refetches exclude peers in that cooldown via the `fetch_roots_with_peer` skip
+   predicate.
+6. The driver keeps a per-peer offense record beyond the cooldown. A first offense is
+   cooldown-only; repeated offenses in the decay window escalate to a whole-peer disconnect.
+
+The current policy uses a 5-minute `tree_aux` cooldown, disconnects on the third hard failure in
+one streak, and decays the streak after 30 minutes without another hard failure. A cooldown must
+expire before an honest scheduling path can select the peer again, so three offenses represent
+"lied, cooled down, came back and lied again, cooled down, came back and lied a third time."
+
+This closes the honest-peer-available liveness loop: a well-shaped but lying peer can cause one
+retryable refusal, then its cached window is dropped and the same height is refetched from a
+different peer. The initial response is intentionally scoped: bulk eviction clears the poisoned
+window and the cooldown avoids reselection, but the peer can keep serving other Zakura streams.
+If the same peer returns after cooldown and lies repeatedly before the offense record decays, the
+escalated disconnect is whole-peer, not stream-local. Root verification happens after fetch in
+state, outside Zakura block-sync's existing consensus-rejection scoring path, so the driver uses
+a local `tree_aux` cooldown for selection and drops the connection only for persistent offenders.
+
+This policy still cannot guarantee liveness under a true eclipse where every selectable peer
+lies, withholds, or is excluded. In that case the node remains fail-closed: no wrong state is
+written, the root stays retryable, and the stall metrics/logs surface the unservable height.
+
 ## 9. The serving read path (`BlockRoots` / `TreeAuxStatePort`)
 
 A node serves roots from local state via `ReadRequest::BlockRoots { start_height, count }` →
@@ -457,16 +504,14 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   MMR cannot vouch for. Skipping either would let an untrusted source inject an anchor the
   legacy recompute never produces — a consensus-equivalence break, not just a slowdown.
 - The frozen-frontier fail-closed policy (§8) means a hostile root never corrupts state: it is
-  evicted and refused. Eviction + retryable error is what prevents a single malicious peer from
-  halting the sync — the bad root is dropped, and any honest peer's root verifies.
+  evicted and refused. The driver-side peer policy (§8.1) maps rejected heights back to their
+  suppliers, bulk-evicts the supplier's cached roots, excludes the supplier from `tree_aux`, and
+  disconnects repeat offenders. This prevents one lying-but-well-formed peer from grinding the
+  sync height by height when honest peers are available.
 - DoS bounds on the `tree_aux` codec (§5.4), the no-preallocate-from-count decode, and the
   fetch-ahead cap protect the serving and client paths from unbounded memory growth.
 - The auth-data-root cache lock (§6.3) closes a cross-crate API hole that could otherwise
   finalize a block without binding its authorizing data.
-
-The remaining adversarial work — wiring verification failures into Zakura's peer-reputation /
-reject machinery (downscore + re-request from a different peer, with a hostile-peer test matrix)
-— is increment 6b (§12).
 
 ## 12. Increment roadmap
 
@@ -478,14 +523,14 @@ reject machinery (downscore + re-request from a different peer, with a hostile-p
   peer-source default on Mainnet — the first point at which real nodes obtain roots over the
   network. The initial peer fetch is bounded by finalized commit progress, so peer delivery
   cannot fill the cache with the entire checkpoint range. Deferred follow-ups: tighter
-  integration with live header-sync progress; multi-peer fanout/straggler hedging; the
-  adversarial peer policy (6b); the fast-node roots-index serving CF (§10) and an RLE wire
-  encoding.
-- **Increment 6b — adversarial peer policy.** Wire `tree_aux` verification failures into
-  peer-reputation / reject machinery: downscore the offender and re-request from a different
-  peer (bounded retries, peer diversity), with the §8 refusal as the backstop. The
-  security-critical increment, with its own hostile-peer matrix (wrong roots / truncated range /
-  mismatched MMR / withholding / eclipse → reject, re-request, recover).
+  integration with live header-sync progress; multi-peer fanout/straggler hedging; and an RLE
+  wire encoding.
+- **Increment 6b — adversarial peer policy (done).** Verification failures stay consensus-local
+  in state, but the `zebrad` driver records height→peer provenance for roots it publishes. A
+  rejected height bulk-evicts all cached roots from that supplier, puts the supplier in a
+  `tree_aux` hard-failure cooldown, and re-requests from another selectable peer. Repeated
+  offenses in the decay window escalate to disconnecting the active Zakura peer. The §8 refusal
+  remains the backstop for withholding and eclipse cases.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.
@@ -508,13 +553,16 @@ never requestable) until the 5-minute timeout fell back to legacy ChainSync. (Co
 
 Live commit-path counters distinguish the fast and legacy paths and the failure modes:
 
-| Counter | Meaning |
+| Metric | Meaning |
 | --- | --- |
 | `state.vct.fast.block.count` | block folded supplied roots, skipped the recompute |
 | `state.vct.legacy.block.count` | block recomputed the frontier (`consensus.disable_vct_fast_sync = true`, `consensus.checkpoint_sync = false`, or fell back outside the frozen window) |
 | `state.vct.prevalidated.block.count` | dedup sub-case: the previous fast block's look-ahead already validated this header |
 | `state.vct.root.rejected.count` | supplied root failed verification and was evicted for re-fetch |
 | `state.vct.root.unavailable.count` | frozen-frontier height with no valid root; commit refused (retryable) |
+| `tree_aux.peer.hard_failure.count` | driver attributed a rejected root to a supplier and cooled it down |
+| `tree_aux.peer.disconnect.count` | repeat root-supplier failures escalated to a whole-peer disconnect |
+| `tree_aux.peer.cooldown.active` | number of peers currently excluded by the driver-side hard-failure cooldown |
 
 The fast-vs-legacy ratio is the signal an integration test asserts to prove roots actually came
 over the wire rather than a silent legacy sync.
@@ -532,16 +580,26 @@ over the wire rather than a silent legacy sync.
   below-Heartwood Sapling check; the `verify_commitment_roots` lag (wrong root rejected at H+1);
   the dedup (second consecutive fast block skips its check; a stale cache entry does not cause a
   false skip); the `StateTreeAuxPort` serve mapping (passthrough; error/wrong-response → empty
-  range); `PeerSource::invalidate` eviction; and the in-process producer →
-  `PeerSource` → committer byte-identical equivalence.
+  range); `PeerSource::invalidate` and bulk `TreeAuxRootsWriter::invalidate_roots` eviction; the
+  driver-owned provenance/failure table (committed pruning, capacity bounds, unknown-height
+  no-blame, cooldown expiry with offense retention, offense decay, disconnect escalation, and
+  all-heights-from-supplier rejection); and the in-process producer → `PeerSource` → committer
+  byte-identical equivalence.
 - **Frozen-frontier proptests:** a frozen-frontier hole returns the retryable
   `VctSuppliedRootUnavailable` and leaves the DB untouched; a reopened committer (frozen marker
   persisted) still refuses on the first post-restart missing root.
 - **Two-node transport:** `two_nodes_exchange_roots_over_tree_aux` (cap negotiation + fetch),
-  `client_driver_fetches_a_root_range_over_tree_aux`, and
+  `client_driver_fetches_a_root_range_over_tree_aux`,
+  `client_driver_reports_root_batch_provenance`, `client_driver_skips_excluded_tree_aux_peer`,
+  `client_driver_errors_when_all_tree_aux_peers_are_excluded`, and
   `tree_aux_serves_real_state_roots_over_the_wire` (a real `populated_state` finalized DB serves
   through the production `StateTreeAuxPort` → `TreeAuxService` over the real loopback transport;
   an above-tip range errors so the committer keeps it legacy).
+- **Adversarial peer policy integration:**
+  `tree_aux_policy_disconnects_rejected_supplier_and_refetches_from_another_peer` drives the
+  production `handle_refetch_request` path with real loopback Zakura peers, a real
+  `TreeAuxRootsWriter`, driver-side provenance, repeat-offender whole-peer disconnect,
+  replacement-peer refetch, and bulk invalidation of the rejected supplier's cached roots.
 - **Driver resource bounds:** pure window-math tests cover initial fetch-ahead, handoff
   clamping, saturation, and waiting until the committed-root watermark opens more cache room;
   peer-source tests assert the watermark starts empty, advances on committed-root eviction, and
@@ -559,7 +617,7 @@ over the wire rather than a silent legacy sync.
 | Area | File |
 | --- | --- |
 | Wire payload (`BlockCommitmentRoots`) | `zebra-chain/src/parallel/commitment_aux.rs` |
-| Source seam, `PeerSource`, producers | `zebra-state/src/service/finalized_state/commitment_aux.rs` |
+| Source seam, `PeerSource`, producers, bulk root invalidation | `zebra-state/src/service/finalized_state/commitment_aux.rs` |
 | Verify-before-commit logic | `zebra-state/src/service/finalized_state/commitment_aux_verify.rs` |
 | Embedded frontier plumbing, `select_source_mode`, counters | `zebra-state/src/service/finalized_state/vct.rs` |
 | `checkpoint_sync` mirror field (mode input) | `zebra-state/src/config.rs`; set in `zebrad/src/commands/start.rs` |
@@ -568,8 +626,8 @@ over the wire rather than a silent legacy sync.
 | `BlockRoots` serving read | `zebra-state/src/service.rs` |
 | `tree_aux` wire codec | `zebra-network/src/zakura/tree_aux/wire.rs` |
 | `tree_aux` serving service + `TreeAuxStatePort` | `zebra-network/src/zakura/tree_aux/service.rs` |
-| `tree_aux` client driver (`fetch_roots`) | `zebra-network/src/zakura/tree_aux/driver.rs` |
-| Serving port + peer-source driver wiring | `zebrad/src/commands/start/zakura/tree_aux_driver.rs` |
+| `tree_aux` client driver (`fetch_roots`, `fetch_roots_with_peer`) | `zebra-network/src/zakura/tree_aux/driver.rs` |
+| Serving port, peer-source driver wiring, driver-side provenance/cooldown policy | `zebrad/src/commands/start/zakura/tree_aux_driver.rs` |
 
 ## 16. Frontier regeneration tool
 

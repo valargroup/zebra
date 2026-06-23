@@ -105,6 +105,15 @@ impl TreeAuxRootsWriter {
         self.0.insert_roots(roots);
     }
 
+    /// Remove peer-supplied roots from the committer cache.
+    ///
+    /// Used by the `tree_aux` driver when one peer-supplied root fails verification:
+    /// all still-cached roots from that same supplier are dropped so the committer does
+    /// not grind through the poisoned window one height at a time.
+    pub fn invalidate_roots(&self, heights: impl IntoIterator<Item = zebra_chain::block::Height>) {
+        self.0.invalidate_roots(heights);
+    }
+
     /// The highest finalized height whose peer roots have been evicted from the cache.
     pub fn committed_through(&self) -> Option<zebra_chain::block::Height> {
         self.0.committed_through()
@@ -123,7 +132,7 @@ impl TreeAuxRootsWriter {
 pub use service::{
     arbitrary::{populated_state, CHAIN_TIP_UPDATE_WAIT_LIMIT},
     finalized_state::{RawBytes, KV, MAX_ON_DISK_HEIGHT},
-    init_test, init_test_services,
+    init_test, init_test_services, init_test_services_with_tree_aux_writer,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]

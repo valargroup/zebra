@@ -2169,12 +2169,9 @@ pub fn spawn_init_read_only(
 pub async fn init_test(
     network: &Network,
 ) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
-    // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
-    //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+    let (state_service, _, _, _, _) = init_test_services_inner(network).await;
 
-    Buffer::new(BoxService::new(state_service), 1)
+    state_service
 }
 
 /// Initializes a state service with an ephemeral [`Config`] and a buffer with a single slot,
@@ -2190,9 +2187,47 @@ pub async fn init_test_services(
     LatestChainTip,
     ChainTipChange,
 ) {
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _) =
+        init_test_services_inner(network).await;
+
+    (
+        state_service,
+        read_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+    )
+}
+
+/// Initializes a state service with an ephemeral [`Config`] and returns its optional
+/// `tree_aux` roots writer for integration tests that need to exercise the peer source.
+///
+/// This is the same setup as [`init_test_services`], with the test-only writer included.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub async fn init_test_services_with_tree_aux_writer(
+    network: &Network,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    ReadStateService,
+    LatestChainTip,
+    ChainTipChange,
+    Option<TreeAuxRootsWriter>,
+) {
+    init_test_services_inner(network).await
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+async fn init_test_services_inner(
+    network: &Network,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    ReadStateService,
+    LatestChainTip,
+    ChainTipChange,
+    Option<TreeAuxRootsWriter>,
+) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _) =
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, tree_aux_writer) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
@@ -2202,5 +2237,6 @@ pub async fn init_test_services(
         read_state_service,
         latest_chain_tip,
         chain_tip_change,
+        tree_aux_writer,
     )
 }

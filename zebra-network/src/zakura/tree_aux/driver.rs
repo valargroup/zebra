@@ -16,7 +16,7 @@ use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 
 use super::{TreeAuxMessage, MAX_TA_ROOTS_PER_REQUEST, ZAKURA_STREAM_TREE_AUX};
 use crate::{
-    zakura::{ZakuraPeerHandle, ZakuraSupervisorHandle},
+    zakura::{ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle},
     BoxError,
 };
 
@@ -28,6 +28,15 @@ static NEXT_TREE_AUX_PEER_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// A stalled peer must not block the client from trying other connected peers for the same
 /// sub-range, especially when a frozen-frontier refetch is needed to unblock the committer.
 const TREE_AUX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One contiguous root batch and the peer that supplied it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerRootBatch {
+    /// Authenticated peer that supplied `roots`.
+    pub peer_id: ZakuraPeerId,
+    /// Contiguous roots returned by `peer_id`.
+    pub roots: Vec<BlockCommitmentRoots>,
+}
 
 /// Fetch verified per-block commitment roots for `[start, end]` from connected peers,
 /// delivering each received contiguous batch to `sink`.
@@ -49,12 +58,32 @@ pub async fn fetch_roots<F>(
 where
     F: FnMut(Vec<BlockCommitmentRoots>),
 {
+    fetch_roots_with_peer(supervisor, start, end, |_| false, |batch| sink(batch.roots)).await
+}
+
+/// Fetch roots like [`fetch_roots`], but preserve the supplying peer for each batch.
+///
+/// `skip_peer` lets callers apply local peer policy, for example excluding a peer whose
+/// previously supplied root failed state verification. If every connected peer is skipped
+/// or unusable, the range remains un-fetched and the caller retries later.
+pub async fn fetch_roots_with_peer<F, S>(
+    supervisor: &ZakuraSupervisorHandle,
+    start: block::Height,
+    end: block::Height,
+    mut skip_peer: S,
+    mut sink: F,
+) -> Result<(), BoxError>
+where
+    F: FnMut(PeerRootBatch),
+    S: FnMut(&ZakuraPeerId) -> bool,
+{
     let mut next = start.0;
     while next <= end.0 {
         let count = (end.0 - next + 1).min(MAX_TA_ROOTS_PER_REQUEST);
         let mut handles = supervisor.outbound_peer_handles().await;
+        handles.retain(|handle| !skip_peer(handle.peer_id()));
         if handles.is_empty() {
-            return Err("no connected tree_aux peer".into());
+            return Err("no selectable connected tree_aux peer".into());
         }
 
         let offset = rotated_peer_offset(
@@ -68,7 +97,10 @@ where
         for handle in handles {
             match request_roots_from_peer(&handle, next, count).await {
                 Ok(roots) => {
-                    fetched_roots = Some(roots);
+                    fetched_roots = Some(PeerRootBatch {
+                        peer_id: handle.peer_id().clone(),
+                        roots,
+                    });
                     break;
                 }
                 Err(error) => {
@@ -84,15 +116,16 @@ where
             }
         }
 
-        let roots = fetched_roots.ok_or_else(|| -> BoxError {
+        let batch = fetched_roots.ok_or_else(|| -> BoxError {
             last_error.unwrap_or_else(|| "no connected tree_aux peer could serve roots".into())
         })?;
-        let last = roots
+        let last = batch
+            .roots
             .last()
             .expect("validated tree_aux roots are non-empty")
             .height
             .0;
-        sink(roots);
+        sink(batch);
         next = last
             .checked_add(1)
             .ok_or_else(|| -> BoxError { "tree_aux root height overflow".into() })?;
