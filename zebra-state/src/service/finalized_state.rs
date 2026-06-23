@@ -821,22 +821,26 @@ impl FinalizedState {
         let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
-        // commit-compute pool. Like the note-commitment tree update above, the
-        // per-block serialization done here (raw transaction bytes and the block
-        // size) can run on rayon; running it in the isolated pool keeps those
-        // workers from contending with the download/verification pipeline on the
-        // global pool.
+        // Run `write_block` directly on the committer thread rather than entering the
+        // dedicated commit-compute pool via `install()`.
+        //
+        // The committer is not a member of `COMMIT_COMPUTE_POOL`, so `install()` is a
+        // synchronous cross-thread handoff: the committer parks until a pool worker
+        // picks up the job, runs it, and signals back. The look-ahead note-commitment
+        // precompute (`spawn_note_precompute`) keeps those workers busy, so the handoff
+        // waits on a contended pool, and that wait dominates the isolation it was meant
+        // to provide for `write_block`'s internal rayon (`join`/`par_iter`). Running
+        // `write_block` here removes the per-block round-trip; its internal rayon uses
+        // the global pool instead. Measured net win on the sandblast region (see PR).
         let network = self.network();
-        let result = COMMIT_COMPUTE_POOL.install(|| {
-            self.db.write_block(
-                finalized,
-                prev_note_commitment_trees,
-                &network,
-                source,
-                retention,
-                None,
-            )
-        });
+        let result = self.db.write_block(
+            finalized,
+            prev_note_commitment_trees,
+            &network,
+            source,
+            retention,
+            None,
+        );
 
         if result.is_ok() {
             if retention.clears_archive_backlog() {
