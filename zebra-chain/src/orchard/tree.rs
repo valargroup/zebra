@@ -812,19 +812,46 @@ mod tests {
         }
     }
 
+    /// Field elements that exercise the full 255-bit width of `pallas::Base`,
+    /// which the small-integer `node(..)` helper never reaches (it only sets the
+    /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
+    /// cached domain must stay byte-identical on these too. `from_raw` reduces
+    /// mod the field modulus, so every value here is canonical.
+    fn full_width_field_elements() -> Vec<pallas::Base> {
+        vec![
+            // p - 1: the largest canonical field element.
+            pallas::Base::zero() - pallas::Base::one(),
+            // p - 2.
+            pallas::Base::zero() - pallas::Base::from(2),
+            // All bits set in the raw limbs, then reduced mod p.
+            pallas::Base::from_raw([u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+            // Only the high limb set.
+            pallas::Base::from_raw([0, 0, 0, u64::MAX]),
+            // A scattered full-width value.
+            pallas::Base::from_raw([
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+                0xdead_beef_cafe_babe,
+                0x0f1e_2d3c_4b5a_6978,
+            ]),
+        ]
+    }
+
     /// The cached-domain `merkle_crh_orchard` must produce byte-identical output
     /// to recomputing the `HashDomain` from scratch on every call, across all
-    /// layers and a spread of input values (including edge cases).
+    /// layers and a spread of input values — small integers, edge cases, and
+    /// full-width field elements.
     #[test]
     fn cached_domain_merkle_crh_matches_fresh_domain() {
-        let values = [0u64, 1, 2, 7, 65_535, u64::MAX];
+        let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
+            .iter()
+            .map(|&v| node(v).0)
+            .collect();
+        values.extend(full_width_field_elements());
 
         for layer in 0..MERKLE_DEPTH {
             for &left in &values {
                 for &right in &values {
-                    let left = node(left).0;
-                    let right = node(right).0;
-
                     assert_eq!(
                         merkle_crh_orchard(layer, left, right).to_repr(),
                         merkle_crh_orchard_uncached(layer, left, right).to_repr(),
@@ -832,6 +859,28 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    proptest::proptest! {
+        /// Randomized differential check: across random layers and random
+        /// full-width field elements (raw limbs reduced mod p), the cached
+        /// domain must stay byte-identical to a freshly rebuilt one. This covers
+        /// the whole input domain that the fixed table above only samples.
+        #[test]
+        fn cached_domain_merkle_crh_matches_fresh_domain_random(
+            layer in 0u8..MERKLE_DEPTH,
+            left_limbs in proptest::prelude::any::<[u64; 4]>(),
+            right_limbs in proptest::prelude::any::<[u64; 4]>(),
+        ) {
+            let left = pallas::Base::from_raw(left_limbs);
+            let right = pallas::Base::from_raw(right_limbs);
+
+            proptest::prop_assert_eq!(
+                merkle_crh_orchard(layer, left, right).to_repr(),
+                merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                "cached domain must match fresh domain at layer {}", layer
+            );
         }
     }
 
