@@ -1548,18 +1548,26 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // `produce_block_roots` reads per-height trees, so it serves only on an
-                // archive node and only within the finalized tip. A fast-synced node
-                // lacks the historical trees below its handoff (it would serve from a
-                // roots index, not yet wired), so it serves nothing here. The range is
-                // clamped to the tip; out-of-range or empty requests return no roots.
+                // Serve from the compact `commitment_roots_by_height` index, which every
+                // node persists for each committed block — including a fast-synced node that
+                // holds no per-height trees (design §4). This is what keeps the root-serving
+                // fleet from collapsing as nodes adopt fast sync. For a database written
+                // before the index existed (a pre-index archive node), the index is empty, so
+                // fall back to deriving the roots from the per-height trees when present. The
+                // range is clamped to the tip; out-of-range or empty requests return no roots.
                 let roots = match state.db.finalized_tip_height() {
-                    Some(tip) if count > 0 && start_height <= tip && !state.db.is_fast_synced() => {
+                    Some(tip) if count > 0 && start_height <= tip => {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
-                        finalized_state::produce_block_roots(
-                            &state.db,
-                            start_height..=block::Height(last),
-                        )
+                        let range = start_height..=block::Height(last);
+                        let indexed = state.db.commitment_roots_by_height_range(range.clone());
+                        if !indexed.is_empty() || state.db.is_fast_synced() {
+                            // Indexed roots (the common path), or a fast-synced node whose only
+                            // possible source is the index — never the absent per-height trees.
+                            indexed
+                        } else {
+                            // Pre-index archive database: derive from the per-height trees.
+                            finalized_state::produce_block_roots(&state.db, range)
+                        }
                     }
                     _ => Vec::new(),
                 };
