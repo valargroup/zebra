@@ -151,8 +151,7 @@ async fn client_driver_fetches_a_root_range_over_tree_aux() -> Result<(), BoxErr
 
     client.connect_native(&server, CONNECT_TIMEOUT).await?;
 
-    // The driver fetches the whole range; the sink collects each delivered batch (as the
-    // node would write each batch into a PeerSource).
+    // The network fetch loop streams the whole range; the sink collects each delivered batch.
     let mut collected = Vec::new();
     fetch_roots(
         &client.supervisor(),
