@@ -3804,7 +3804,8 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 #[tokio::test]
 async fn reactor_accepts_body_for_queued_height_when_request_races_ahead() {
     let blocks = mainnet_blocks_1_to_3();
-    let config = immediate_body_download_config();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes = u64::from(block_size(&blocks[0]));
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
