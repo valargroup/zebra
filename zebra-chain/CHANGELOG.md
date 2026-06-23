@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - V6 Orchard and Ironwood transaction parsing now accepts the NU6.3
   `enableCrossAddress` flag while preserving V5 reserved-bit enforcement.
+- `orchard::Flags` / `ironwood::Flags` are now re-exported from the `orchard`
+  crate instead of redefined in `zebra-chain`: the old bitflags constants/methods
+  (`ENABLE_SPENDS`, `ENABLE_OUTPUTS`, `.bits()`) and hand-rolled serde are
+  replaced by orchard's `Flags` API (`ENABLED` / `SPENDS_DISABLED` /
+  `OUTPUTS_DISABLED` / `CROSS_ADDRESS_DISABLED`, the `*_enabled()` accessors,
+  `to_byte` / `from_byte`). `BundleFormat` is re-exported too; on-wire encoding
+  is unchanged.
 - Use `zcash_history::V3` from NU6.3 onward so chain history leaves commit to
   Ironwood note commitment tree roots and Ironwood transaction counts.
 - `HistoryTree`, `NonEmptyHistoryTree`, and `zcash_history::Tree` constructors
