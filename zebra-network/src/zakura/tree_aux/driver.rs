@@ -6,7 +6,10 @@
 //! seam it uses for the fixture. Run *ahead of* body download (header-sync-aligned), so
 //! a range's coverage is known before it is committed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use zebra_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
 
@@ -18,6 +21,12 @@ use crate::{
 
 static NEXT_TREE_AUX_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_TREE_AUX_PEER_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Per-peer timeout for one bounded `tree_aux` root request.
+///
+/// A stalled peer must not block the client from trying other connected peers for the same
+/// sub-range, especially when a frozen-frontier refetch is needed to unblock the committer.
+const TREE_AUX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fetch verified per-block commitment roots for `[start, end]` from connected peers,
 /// delivering each received contiguous batch to `sink`.
@@ -119,15 +128,20 @@ async fn request_roots_from_peer(
     .map_err(|error| -> BoxError { format!("encoding GetRoots failed: {error}").into() })?;
 
     let request_id = NEXT_TREE_AUX_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let frames = handle
-        .request(
+    let frames = tokio::time::timeout(
+        TREE_AUX_REQUEST_TIMEOUT,
+        handle.request(
             ZAKURA_STREAM_TREE_AUX,
             request_id,
             request.message_type,
             request.flags,
             request.payload,
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|_| -> BoxError {
+        format!("tree_aux peer request timed out after {TREE_AUX_REQUEST_TIMEOUT:?}").into()
+    })??;
 
     let frame = frames
         .into_iter()

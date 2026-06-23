@@ -636,6 +636,129 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
     Ok(())
 }
 
+/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects and
+/// evicts the bad cached value, leaves the database parked below the height, then commits the
+/// same block once the `tree_aux` driver refills that height with a verifiable root.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
+fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
+    use crate::service::finalized_state::commitment_aux::PeerSource;
+    use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
+
+    let _init_guard = zebra_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+            let target = (nu5 + 1) as usize;
+            prop_assert!(blocks.len() > target + 1, "generated chain unexpectedly short");
+            let seed = (heartwood - 1) as usize;
+
+            // Source the true roots from a legacy pass, then poison the target height exactly
+            // as a malicious peer would. Earlier roots are correct so the frontier freezes
+            // before the bad root is encountered.
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            let mut peer_roots = Vec::new();
+            let mut correct_target_root = None;
+            for i in 0..=target {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, None, "vct refill legacy")
+                    .unwrap();
+                if i > seed {
+                    let root = BlockCommitmentRoots {
+                        height: Height(i as u32),
+                        sapling_root: trees.sapling.root(),
+                        orchard_root: trees.orchard.root(),
+                    };
+                    if i == target {
+                        correct_target_root = Some(root.clone());
+                        let mut poisoned = root;
+                        prop_assert_ne!(
+                            poisoned.sapling_root,
+                            Default::default(),
+                            "a V2 target block must have a non-empty Sapling root"
+                        );
+                        poisoned.sapling_root = Default::default();
+                        peer_roots.push(poisoned);
+                    } else {
+                        peer_roots.push(root);
+                    }
+                }
+            }
+            let correct_target_root = correct_target_root.expect("target root was produced");
+
+            let (source, writer) = PeerSource::new(None);
+            writer.insert_roots(peer_roots);
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            fast.enable_vct_fast_source(Box::new(source));
+
+            for i in 0..target {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = Some((blocks[i + 1].block.clone(), None));
+                fast.commit_finalized_direct(cv.into(), None, None, next, "vct refill pre-target")
+                    .expect("pre-target fast commits succeed");
+            }
+            prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height((target - 1) as u32)));
+
+            let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
+            let next = Some((blocks[target + 1].block.clone(), None));
+            let error = fast
+                .commit_finalized_direct(cv.into(), None, None, next.clone(), "vct poisoned target")
+                .expect_err("the poisoned peer root must be rejected before commit");
+            prop_assert_eq!(
+                error.vct_supplied_root_unavailable_height(),
+                Some(Height(target as u32)),
+                "the bad root is exposed as a retryable refetch for its own height"
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((target - 1) as u32)),
+                "the rejected root left the database parked below the target"
+            );
+
+            // Simulate the `tree_aux` driver refilling the evicted height from another peer.
+            writer.insert_roots([correct_target_root]);
+
+            let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
+            fast.commit_finalized_direct(cv.into(), None, None, next, "vct refilled target")
+                .expect("the same height commits once the peer cache is refilled");
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height(target as u32)),
+                "the refilled root unblocks the parked height"
+            );
+    });
+
+    Ok(())
+}
+
 /// The frozen-frontier guard must survive a restart. A fast sync interrupted before the
 /// checkpoint handoff leaves the stale frozen frontier persisted (fast commits never write
 /// per-height trees) with the tip still below the handoff, but the in-memory `frozen` flag

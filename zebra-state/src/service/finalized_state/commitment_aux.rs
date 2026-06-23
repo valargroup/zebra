@@ -326,7 +326,19 @@ pub(crate) fn peer_root_refetch_receiver() -> Option<broadcast::Receiver<block::
 /// Request a targeted peer-root refetch for `height`.
 pub(crate) fn request_peer_root_refetch(height: block::Height) {
     if let Some(sender) = PEER_ROOT_REFETCH.get() {
-        let _ = sender.send(height);
+        if sender.send(height).is_err() {
+            metrics::counter!("state.vct.root.refetch.no_receiver.count").increment(1);
+            tracing::debug!(
+                ?height,
+                "VCT: requested peer root refetch but no tree_aux driver is subscribed"
+            );
+        }
+    } else {
+        metrics::counter!("state.vct.root.refetch.no_sender.count").increment(1);
+        tracing::debug!(
+            ?height,
+            "VCT: requested peer root refetch before the peer-source signal was installed"
+        );
     }
 }
 
