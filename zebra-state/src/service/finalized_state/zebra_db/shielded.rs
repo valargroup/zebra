@@ -155,7 +155,7 @@ impl ZebraDb {
     /// a deterministic, order-independent digest of the Sapling and Orchard anchor
     /// sets. Two syncs that produce the same anchor sets produce the same digest,
     /// even if one took the fast (skip-recompute) path. See
-    /// `docs/design/verified-commitment-trees-poc.md`.
+    /// `docs/design/verified-commitment-trees.md`.
     pub fn vct_anchor_digest(&self) -> (u64, u64, u64, u64) {
         use crate::service::finalized_state::IntoDisk;
         use std::collections::hash_map::DefaultHasher;
@@ -684,7 +684,7 @@ impl DiskWriteBatch {
         // the (already-extended) history tree; skip the per-height Sapling/Orchard
         // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
         // modern checkpoint, so it is correctly left untouched here.
-        // See docs/design/verified-commitment-trees-poc.md.
+        // See docs/design/verified-commitment-trees.md.
         if let Some((sapling_root, orchard_root)) = fast_anchor_roots {
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);

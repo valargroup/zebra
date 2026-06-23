@@ -421,30 +421,34 @@ impl CommitmentRootSource for PeerSource {
 ///
 /// This is the serving read path (the future `TreeAuxStatePort::read_block_roots`),
 /// minus the network: it derives each root from the stored per-height tree, exactly
-/// the value the fast path folds into the anchor set. Requires per-height trees, so
-/// `db` must be an archive/legacy database; panics on a height whose tree is absent.
+/// the value the fast path folds into the anchor set. It requires per-height trees, so
+/// the caller restricts it to a non-fast-synced (archive/pre-index) database within the
+/// tip, where the trees are present. As defense-in-depth on this peer-triggered read, a
+/// height whose tree is unexpectedly absent stops the scan and serves the contiguous
+/// prefix collected so far rather than panicking; the wire client validates contiguity
+/// and treats a short batch as partial progress.
 // The `ReadRequest::BlockRoots` serving read path; also exercised by the round-trip test.
 pub(crate) fn produce_block_roots(
     db: &ZebraDb,
     range: std::ops::RangeInclusive<block::Height>,
 ) -> Vec<BlockCommitmentRoots> {
     let (start, end) = (range.start().0, range.end().0);
-    (start..=end)
-        .map(|h| {
-            let height = block::Height(h);
-            BlockCommitmentRoots {
-                height,
-                sapling_root: db
-                    .sapling_tree_by_height(&height)
-                    .expect("archive database has a per-height Sapling tree below the tip")
-                    .root(),
-                orchard_root: db
-                    .orchard_tree_by_height(&height)
-                    .expect("archive database has a per-height Orchard tree below the tip")
-                    .root(),
-            }
-        })
-        .collect()
+    let mut roots = Vec::new();
+    for h in start..=end {
+        let height = block::Height(h);
+        let (Some(sapling), Some(orchard)) = (
+            db.sapling_tree_by_height(&height),
+            db.orchard_tree_by_height(&height),
+        ) else {
+            break;
+        };
+        roots.push(BlockCommitmentRoots {
+            height,
+            sapling_root: sapling.root(),
+            orchard_root: orchard.root(),
+        });
+    }
+    roots
 }
 
 /// Produce the final frontiers at `height` from `db`'s per-height trees (the future

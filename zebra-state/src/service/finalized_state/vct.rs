@@ -39,7 +39,7 @@ const VCT_RECORD_LEN: usize = 4 + 32 + 32;
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
 
 /// POC state for the verified-commitment-trees experiment
-/// (`docs/design/verified-commitment-trees-poc.md`). Shared across
+/// (`docs/design/verified-commitment-trees.md`). Shared across
 /// [`super::FinalizedState`] clones via `Arc` so the capture sink and counters are
 /// shared.
 ///
