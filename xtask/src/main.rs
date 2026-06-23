@@ -9,7 +9,7 @@ use std::{
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
-const DEFAULT_RUST_VERSION: &str = "1.91";
+const DEFAULT_RUST_VERSION: &str = "1.91.0";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
 const OUTPUT_BINARY_NAME: &str = "zebrad";
 
