@@ -16,7 +16,11 @@ pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 240_000;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+///
+/// The budget is charged in serialized body bytes, but decoded `Block`s retained
+/// in the commit pipeline use materially more resident memory. Keep the default
+/// below the host memory ceiling while preserving high request concurrency.
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves this much per requested block at send time and only ever
