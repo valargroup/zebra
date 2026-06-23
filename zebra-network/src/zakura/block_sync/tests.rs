@@ -963,6 +963,95 @@ fn work_queue_take_respects_servable_range_contiguity_and_max() {
 }
 
 #[test]
+fn work_queue_budgeted_take_respects_count_cap() {
+    let queue = work_queue_with(
+        0,
+        (1..=4).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+
+    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(4), 2, u64::MAX);
+
+    assert_eq!(
+        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn work_queue_budgeted_take_respects_estimated_byte_cap() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(100)),
+            needed(2, BlockSizeEstimate::Advertised(150)),
+            needed(3, BlockSizeEstimate::Advertised(1)),
+        ],
+    );
+
+    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(3), 3, 250);
+
+    assert_eq!(
+        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(queue.pending_contains(block::Height(3)));
+}
+
+#[test]
+fn work_queue_budgeted_take_stops_at_gaps() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(10, BlockSizeEstimate::Advertised(100)),
+            needed(11, BlockSizeEstimate::Advertised(100)),
+            needed(13, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+
+    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(13), 3, u64::MAX);
+
+    assert_eq!(
+        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        vec![10, 11]
+    );
+    assert!(queue.pending_contains(block::Height(13)));
+}
+
+#[test]
+fn work_queue_budgeted_take_takes_one_oversized_first_item_for_progress() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(500)),
+            needed(2, BlockSizeEstimate::Advertised(1)),
+        ],
+    );
+
+    let taken = queue.take_in_range_budgeted(block::Height(1), block::Height(2), 2, 100);
+
+    assert_eq!(
+        taken.iter().map(|(height, _)| height.0).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(taken[0].1.estimated_bytes, 500);
+    assert!(queue.pending_contains(block::Height(2)));
+}
+
+#[test]
+fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
+    let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
+
+    let taken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].1.estimated_bytes, 12_345);
+
+    queue.return_items([block::Height(10)]);
+    let retaken = queue.take_in_range_budgeted(block::Height(10), block::Height(10), 1, 1);
+    assert_eq!(retaken.len(), 1);
+    assert_eq!(retaken[0].1.estimated_bytes, 12_345);
+}
+
+#[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
     // The committed floor is NOT an upper bound on a take: a peer fetches as far
     // above the floor as its servable range allows.
@@ -1221,7 +1310,7 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
             (1..=4)
                 .map(|height| BlockSyncBlockMeta {
                     height: block::Height(height),
-                    hash: block::Hash([height as u8; 32]),
+                    hash: block::Hash([u8::try_from(height).expect("test height fits u8"); 32]),
                     size: BlockSizeEstimate::Advertised(1_000),
                 })
                 .collect(),
@@ -4437,6 +4526,129 @@ async fn reactor_reserves_worst_case_per_block_not_size_hint() {
         "the request must be bounded to {budget_blocks} worst-case blocks by the global \
          byte budget, proving the reservation is worst-case-per-block and not the 1 KiB \
          advertised size hint",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_packs_small_estimates_under_peer_response_byte_cap() {
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 4 * BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_blocks_per_response: 4,
+        ..ZakuraBlockSyncConfig::default()
+    };
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let one_worst_case_response =
+        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).expect("worst-case block size fits u32");
+    let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
+        &service,
+        &mut actions,
+        52,
+        BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(4),
+            tip_hash: block::Hash([4; 32]),
+            max_blocks_per_response: 4,
+            max_inflight_requests: 1,
+            max_response_bytes: one_worst_case_response,
+        },
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            (1..=4)
+                .map(|height| BlockSyncBlockMeta {
+                    height: block::Height(height),
+                    hash: block::Hash([height as u8; 32]),
+                    size: BlockSizeEstimate::Advertised(1_000),
+                })
+                .collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(
+        count, 4,
+        "small advertised estimates should pack more than the one worst-case block \
+         allowed by the peer response byte cap",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_tiny_estimates_do_not_exceed_one_worst_case_budget_block() {
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_blocks_per_response: 4,
+        ..ZakuraBlockSyncConfig::default()
+    };
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
+        &service,
+        &mut actions,
+        53,
+        BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(4),
+            tip_hash: block::Hash([4; 32]),
+            max_blocks_per_response: 4,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        },
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            (1..=4)
+                .map(|height| BlockSyncBlockMeta {
+                    height: block::Height(height),
+                    hash: block::Hash([u8::try_from(height).expect("test height fits u8"); 32]),
+                    size: BlockSizeEstimate::Advertised(1),
+                })
+                .collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(
+        count, 1,
+        "only one worst-case block of global budget is available, regardless of tiny estimates",
     );
 
     reactor_task.abort();

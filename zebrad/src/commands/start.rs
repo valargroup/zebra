@@ -2198,6 +2198,15 @@ mod zakura_header_sync_driver_tests {
             body_sizes_for_served_header_range(start, header_heights, &[]),
             vec![0, 0, 0, 0],
         );
+
+        assert_eq!(
+            body_sizes_for_served_header_range(
+                start,
+                [block::Height(9), block::Height(10)],
+                &body_size_hints,
+            ),
+            vec![0, 100],
+        );
     }
 
     #[test]
