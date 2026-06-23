@@ -7,16 +7,19 @@
 //! tree roots and rewriting it in the current format.
 //!
 //! This test can't open a real pre-Ironwood on-disk database here (that runs on a droplet with a
-//! snapshot), so it verifies the two load-bearing properties locally:
+//! snapshot), so it reproduces the failure mode locally and verifies the load-bearing properties:
 //!
 //! 1. The rebuild reproduces the *exact same* chain-history MMR root that was stored — this is the
-//!    consensus-correctness guarantee.
+//!    consensus-correctness guarantee. This is checked both by calling the rebuild directly
+//!    (bypassing the up-front "needs rebuild?" check), and by corrupting the stored entry into an
+//!    unreadable old-format blob and driving the real synchronous repair path end to end.
 //! 2. The rebuild detects that a database already written in the current format does not need
-//!    repair, so it never touches a healthy database.
+//!    repair, so it never touches a healthy database (including an empty one).
+//! 3. A database that needs a rebuild but is missing the historical data the rebuild reads (a
+//!    database pruned before the Ironwood bump) fails with a clear, explained error rather than an
+//!    opaque panic.
 
 use std::env;
-
-use crossbeam_channel::bounded;
 
 use zebra_chain::{
     block::Height,
@@ -33,8 +36,8 @@ use crate::{
     service::{
         arbitrary::PreparedChain,
         finalized_state::{
-            disk_format::upgrade::{rebuild_history_tree, DiskFormatUpgrade},
-            CheckpointVerifiedBlock, FinalizedState,
+            disk_format::{upgrade::rebuild_history_tree, RawBytes},
+            CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
         },
     },
     SemanticallyVerifiedBlock,
@@ -104,6 +107,41 @@ fn sync_to(network: &Network, blocks: &[SemanticallyVerifiedBlock]) -> Finalized
     state
 }
 
+/// Overwrites the stored tip history-tree entry with an unreadable, old-format-style blob.
+///
+/// Reproduces the on-disk state of a pre-Ironwood database: the entry exists but can no longer be
+/// deserialized in the current `Entry` format. We do this by truncating the real current-format
+/// bytes, which makes the bincode reader hit end-of-input partway through an `Entry` — exactly the
+/// `UnexpectedEof` failure the larger Ironwood `MAX_ENTRY_SIZE` produces when it reads a smaller
+/// stored entry.
+fn corrupt_tip_history_tree_to_old_format(db: &crate::service::finalized_state::ZebraDb) {
+    let raw_entry = db
+        .raw_history_tree_value_cf()
+        .zs_get(&())
+        .expect("a synced post-Heartwood database has a stored tip history tree entry");
+
+    let mut truncated = raw_entry.raw_bytes().clone();
+    assert!(
+        !truncated.is_empty(),
+        "the stored history tree entry should have a non-empty serialization to truncate",
+    );
+    // Drop the final byte so the reader runs out of input mid-entry.
+    truncated.pop();
+
+    let mut batch = DiskWriteBatch::new();
+    let _ = db
+        .raw_history_tree_value_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_insert(&(), &RawBytes::new_raw_bytes(truncated));
+    db.write_batch(batch)
+        .expect("writing a synthetic old-format history tree entry succeeds");
+
+    assert!(
+        rebuild_history_tree::needs_rebuild(db),
+        "the corrupted entry must be detected as needing a rebuild",
+    );
+}
+
 #[test]
 fn rebuild_reproduces_stored_history_root() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -128,6 +166,10 @@ fn rebuild_reproduces_stored_history_root() -> Result<()> {
             let state = sync_to(&network, &synced);
             let db = &state.db;
 
+            let tip_height = db
+                .finalized_tip_height()
+                .expect("synced database has a finalized tip");
+
             // The stored tip history root is the ground truth a fresh sync produced.
             let stored_root = db.history_tree().hash();
             prop_assert!(
@@ -142,32 +184,38 @@ fn rebuild_reproduces_stored_history_root() -> Result<()> {
                 "a freshly synced database should already be in the current history tree format",
             );
 
-            // Running the upgrade rebuilds the tip tree from blocks and note commitment roots. The
-            // rebuilt tree must produce the identical MMR root, which is the consensus-correctness
-            // guarantee. (The run is exercised here even though no rewrite is strictly needed,
-            // confirming it never reads or corrupts a current-format entry.)
-            let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
-            rebuild_history_tree::Upgrade
-                .run(
-                    db.finalized_tip_height()
-                        .expect("synced database has a finalized tip"),
-                    db,
-                    &never_cancel_receiver,
-                )
-                .expect("history tree rebuild upgrade should not be cancelled");
-
-            let rebuilt_root = db.history_tree().hash();
-
+            // Property 1, directly: rebuilding from blocks and note commitment roots (exercising the
+            // activation-height selection and the push loop) reproduces the identical MMR root. This
+            // bypasses the up-front "needs rebuild?" check so the rebuild always runs.
+            let rebuilt = rebuild_history_tree::rebuild_tip_history_tree(db, &network, tip_height)
+                .expect("rebuild from a fully synced database should not be missing any data")
+                .expect("a Heartwood-onward tip should rebuild a non-empty history tree");
             prop_assert_eq!(
-                rebuilt_root,
+                rebuilt.hash(),
                 stored_root,
-                "rebuilt history tree root must match the originally stored root",
+                "the directly rebuilt history tree root must match the originally stored root",
             );
 
-            // The upgrade's own validity check must pass after running.
+            // Property 1, end to end: corrupt the stored entry into an unreadable old-format blob,
+            // then run the real synchronous repair path. It must rewrite the entry so it reads back
+            // in the current format, with the same root, and pass the upgrade's validity check.
+            corrupt_tip_history_tree_to_old_format(db);
+
+            rebuild_history_tree::rebuild_tip_history_tree_if_needed(db, tip_height)
+                .expect("repairing a fully synced database should not be missing any data");
+
+            prop_assert!(
+                !rebuild_history_tree::needs_rebuild(db),
+                "the entry must be readable in the current format after the repair",
+            );
             prop_assert!(
                 rebuild_history_tree::quick_check(db).is_ok(),
-                "history tree should be readable in the current format after the rebuild",
+                "history tree should pass its validity check after the repair",
+            );
+            prop_assert_eq!(
+                db.history_tree().hash(),
+                stored_root,
+                "the repaired history tree root must match the originally stored root",
             );
         }
     );
@@ -176,7 +224,7 @@ fn rebuild_reproduces_stored_history_root() -> Result<()> {
 }
 
 /// An empty database has no history tree entry, so the upgrade detects nothing to rebuild and the
-/// validity check passes.
+/// repair is a no-op.
 #[test]
 fn rebuild_is_noop_on_empty_database() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -191,17 +239,71 @@ fn rebuild_is_noop_on_empty_database() -> Result<()> {
         "an empty database has no history tree entry to rebuild",
     );
 
-    let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
-    // An empty database has no finalized tip; the upgrade framework skips empty databases before
-    // calling `run`, but `run` is exercised directly here using the genesis height as a stand-in to
+    // An empty database has no finalized tip; the open path skips the synchronous repair when there
+    // is no tip, but the repair is exercised directly here using the genesis height as a stand-in to
     // confirm it does nothing when there is no entry.
-    rebuild_history_tree::Upgrade
-        .run(Height(0), db, &never_cancel_receiver)
-        .expect("history tree rebuild upgrade should not be cancelled");
+    rebuild_history_tree::rebuild_tip_history_tree_if_needed(db, Height(0))
+        .expect("an empty database needs no rebuild");
 
     assert!(
         rebuild_history_tree::quick_check(db).is_ok(),
         "an empty database passes the history tree validity check",
+    );
+
+    Ok(())
+}
+
+/// A database that needs a rebuild but is missing the historical blocks the rebuild reads (a
+/// database pruned before the Ironwood bump) fails with a clear, explained error rather than an
+/// opaque `.expect()` panic.
+#[test]
+fn rebuild_fails_clearly_on_pruned_old_format_database() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = rebuild_test_network();
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, Some(2), true);
+
+    proptest!(
+        ProptestConfig::with_cases(proptest_cases()),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())| {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            prop_assume!(synced.len() > 8);
+
+            let state = sync_to(&network, &synced);
+            let db = &state.db;
+
+            let tip_height = db
+                .finalized_tip_height()
+                .expect("synced database has a finalized tip");
+
+            // Make the tip entry need a rebuild, then delete a block the rebuild requires. The
+            // history tree resets at the current network upgrade's activation height, so deleting a
+            // block at or after that height removes data the rebuild reads. Heartwood activates at
+            // height 5 and the post-NU5 tip's history window starts at the most recent upgrade
+            // activation, so the block just below the tip is always within the rebuild range.
+            corrupt_tip_history_tree_to_old_format(db);
+
+            let missing_height = Height(tip_height.0 - 1);
+            let mut batch = DiskWriteBatch::new();
+            batch.delete_block_header(db, missing_height);
+            db.write_batch(batch)
+                .expect("deleting a block header to simulate a pruned database succeeds");
+
+            let result = rebuild_history_tree::rebuild_tip_history_tree_if_needed(db, tip_height);
+
+            prop_assert!(
+                matches!(
+                    result,
+                    Err(rebuild_history_tree::RebuildError::MissingData { .. })
+                ),
+                "a pruned old-format database must fail the rebuild with a clear MissingData error, \
+                 got: {result:?}",
+            );
+        }
     );
 
     Ok(())

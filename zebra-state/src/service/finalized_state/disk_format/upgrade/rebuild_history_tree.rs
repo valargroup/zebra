@@ -12,7 +12,8 @@
 //! Ironwood `MAX_ENTRY_SIZE` bump stored each `Entry` at the *smaller* size. The new code reads the
 //! *larger* fixed array per entry, overrunning the bincode stream and panicking with
 //! `Io(UnexpectedEof)` the first time anything deserializes the history-tree column family (for
-//! example in `history_trees_full_tip` during `format_validity_checks_detailed`).
+//! example in `history_tree()` during backup restore, in the block-write task, or in the
+//! `z_gettreestate` RPC).
 //!
 //! Because bincode is not self-describing and uses varint encoding here, there is no clean way to
 //! detect-and-read the old layout in place. Instead, this upgrade *rebuilds* the single tip tree
@@ -22,15 +23,23 @@
 //! byte-for-byte equivalent in consensus terms (same `peaks`, same `size`, same root) to the tree a
 //! fresh sync would produce.
 //!
-//! [`crate::service::finalized_state::disk_format::upgrade::DbFormatChange::apply_format_upgrade`]
-//! runs this upgrade's [`run`](Upgrade::run) before any validity check reads the column family, so
-//! the unreadable entry is replaced before it is ever deserialized.
+//! # When the rebuild runs
+//!
+//! The rebuild MUST complete before any reader deserializes the history-tree column family.
+//! [`run`](Upgrade::run) is invoked from the *background* format-upgrade thread, which races
+//! synchronous readers that run during state open (backup restore, the block-write task, the
+//! `z_gettreestate` RPC). So the rebuild is actually performed *synchronously* while the database is
+//! being opened, by [`rebuild_tip_history_tree_if_needed`], before the background thread is spawned
+//! and before any reader runs. By the time [`run`](Upgrade::run) executes in the background,
+//! [`needs_rebuild`] is already `false`, so [`run`](Upgrade::run) is a no-op that only participates
+//! in version-marking and validation in the normal upgrade loop.
 
 use std::sync::Arc;
 
 use bincode::Options as _;
 use crossbeam_channel::Receiver;
 use semver::Version;
+use thiserror::Error;
 
 use zebra_chain::{
     block::{Block, Height},
@@ -46,16 +55,50 @@ use crate::service::finalized_state::{
 
 use super::{CancelFormatChange, DiskFormatUpgrade};
 
+/// An error that prevents the tip history tree from being rebuilt.
+#[derive(Debug, Error)]
+pub enum RebuildError {
+    /// A block, or a note commitment tree, required to rebuild the history tree is missing from the
+    /// database.
+    ///
+    /// This happens when a database has an old-format (pre-Ironwood) history-tree entry — so it
+    /// needs a rebuild — but was *pruned* before the Ironwood bump, dropping the historical blocks
+    /// or trees the rebuild reads. Such a database cannot be repaired in place.
+    #[error(
+        "cannot rebuild the tip history tree: the data at height {height:?} needed for the rebuild \
+         is missing, which happens on a database that was pruned before the Ironwood upgrade. \
+         Delete the cache directory and re-sync from genesis to recover."
+    )]
+    MissingData {
+        /// The height whose block or note commitment tree could not be found.
+        height: Height,
+    },
+}
+
 /// Implements [`DiskFormatUpgrade`] for rebuilding the tip history tree in the current `Entry`
 /// format.
+///
+/// This upgrade is the capstone of the bump to database format major version 28: the Ironwood tree,
+/// value pool, and index data are backfilled by earlier upgrades, and this upgrade rebuilds the
+/// stored history tree entry so it uses the Ironwood-capable entry size. Its [`version`] is
+/// therefore the in-code format version, so an upgraded database ends at the running version and the
+/// standalone rollback/prune tools (which require an exact version match) accept it.
+///
+/// [`version`]: Upgrade::version
 pub struct Upgrade;
 
 impl DiskFormatUpgrade for Upgrade {
     fn version(&self) -> Version {
-        // Comes after the Ironwood activation-tree upgrade (28.0.0), which is the upgrade that
-        // bumped `zcash_history` and grew `MAX_ENTRY_SIZE`, making older history-tree entries
-        // unreadable.
-        Version::new(28, 1, 0)
+        // The capstone of the bump to format major version 28: this is the in-code format version,
+        // so an upgraded database lands at the running version. See the type-level docs.
+        //
+        // We take only the major.minor.patch and drop any build metadata (the `indexer` build tag),
+        // matching every other `version()` here. Build metadata on the on-disk version is managed
+        // separately by `apply_format_upgrade` (it is added/removed depending on the `indexer`
+        // feature), and excluding it keeps this upgrade's declared version exactly equal to the
+        // value the version-ordering checks and the standalone tools compare against.
+        let in_code = crate::constants::state_database_format_version_in_code();
+        Version::new(in_code.major, in_code.minor, in_code.patch)
     }
 
     fn description(&self) -> &'static str {
@@ -74,34 +117,18 @@ impl DiskFormatUpgrade for Upgrade {
             return Err(CancelFormatChange);
         }
 
-        // Nothing to rebuild if the tip tree is already readable in the current format. This is the
-        // case for databases that were created or last written by code with the current
-        // `MAX_ENTRY_SIZE`, including pruned databases that may be missing the historical blocks the
-        // rebuild would need.
-        if !needs_rebuild(db) {
-            return Ok(());
+        // The tip tree is rebuilt synchronously while the database is opened (see
+        // `rebuild_tip_history_tree_if_needed`), so by the time this runs in the background upgrade
+        // thread there is normally nothing to do. This call is kept for idempotency and to handle
+        // the (unreachable in production) case where the synchronous rebuild was skipped.
+        if let Err(err @ RebuildError::MissingData { .. }) =
+            rebuild_tip_history_tree_if_needed(db, initial_tip_height)
+        {
+            // A pruned old-format database can't be rebuilt. Surface it as a loud, explained panic
+            // rather than marking the database as upgraded with an unreadable entry. (The
+            // synchronous open path returns this same error before this point in production.)
+            panic!("{err}");
         }
-
-        let network = db.network();
-
-        let Some(history_tree) = rebuild_tip_history_tree(db, &network, initial_tip_height) else {
-            // Pre-Heartwood tips have no history tree, so there is nothing to rebuild. (Any stale
-            // entry would be deleted rather than rewritten, but pre-Heartwood databases never wrote
-            // one.)
-            return Ok(());
-        };
-
-        // Return before writing if the upgrade is cancelled.
-        if cancel_receiver.try_recv().is_ok() {
-            return Err(CancelFormatChange);
-        }
-
-        // Writing the tree back to the database re-serializes it in the current `Entry` format,
-        // overwriting the unreadable old-format entry under the same `()` key.
-        let mut batch = DiskWriteBatch::new();
-        batch.update_history_tree(db, &history_tree);
-        db.write_batch(batch)
-            .expect("rewriting the tip history tree in the current format should always succeed");
 
         Ok(())
     }
@@ -114,6 +141,52 @@ impl DiskFormatUpgrade for Upgrade {
     ) -> Result<Result<(), String>, CancelFormatChange> {
         Ok(quick_check(db))
     }
+}
+
+/// Rebuilds the tip history tree in the current `Entry` format if the stored entry is in an older,
+/// unreadable format, writing the rebuilt tree back under the same `()` key.
+///
+/// This is called *synchronously* while the database is being opened, before any code path
+/// deserializes the history-tree column family, so the unreadable entry is replaced before it can
+/// trigger a panic. It is a no-op for databases that are already in the current format (including
+/// newly created and freshly synced databases), so it is safe to call unconditionally on the node's
+/// open path.
+///
+/// # Errors
+///
+/// Returns [`RebuildError::MissingData`] if a block or note commitment tree the rebuild needs is
+/// absent (a database pruned before the Ironwood bump). The caller should treat this as fatal and
+/// ask the operator to delete and re-sync, because the database has an unreadable history-tree entry
+/// that cannot be repaired.
+#[allow(clippy::unwrap_in_result)]
+pub(crate) fn rebuild_tip_history_tree_if_needed(
+    db: &ZebraDb,
+    tip_height: Height,
+) -> Result<(), RebuildError> {
+    // Nothing to rebuild if the tip tree is already readable in the current format. This is the
+    // case for databases that were created or last written by code with the current
+    // `MAX_ENTRY_SIZE`, including freshly synced databases and pruned databases written after the
+    // Ironwood bump.
+    if !needs_rebuild(db) {
+        return Ok(());
+    }
+
+    let network = db.network();
+
+    let Some(history_tree) = rebuild_tip_history_tree(db, &network, tip_height)? else {
+        // Pre-Heartwood tips have no history tree, so there is nothing to rebuild. (Any stale entry
+        // would be deleted rather than rewritten, but pre-Heartwood databases never wrote one.)
+        return Ok(());
+    };
+
+    // Writing the tree back to the database re-serializes it in the current `Entry` format,
+    // overwriting the unreadable old-format entry under the same `()` key.
+    let mut batch = DiskWriteBatch::new();
+    batch.update_history_tree(db, &history_tree);
+    db.write_batch(batch)
+        .expect("rewriting the tip history tree in the current format should always succeed");
+
+    Ok(())
 }
 
 /// Returns `true` if the tip history tree entry exists but cannot be deserialized in the current
@@ -136,21 +209,33 @@ pub(crate) fn needs_rebuild(db: &ZebraDb) -> bool {
 /// Rebuilds the finalized tip history tree from finalized blocks and the per-height note commitment
 /// tree roots.
 ///
-/// Returns `None` if the tip is pre-Heartwood, where no history tree exists.
+/// Returns `Ok(None)` if the tip is pre-Heartwood, where no history tree exists.
 ///
 /// The history tree resets at every network upgrade boundary, so the tip tree only contains blocks
 /// from the current network upgrade's activation height up to the tip. Rebuilding from that
 /// activation height reproduces the identical tree.
+///
+/// This mirrors the rollback tool's `rebuild_history_tree_from_upgrade_activation`, so the rebuilt
+/// tree matches the tree a fresh sync produces.
+///
+/// # Errors
+///
+/// Returns [`RebuildError::MissingData`] if a block or note commitment tree needed for the rebuild
+/// is missing (a database pruned before the Ironwood bump).
+//
+// The `.expect()`s below are on genuine invariants of a finalized, already-validated chain (the
+// activation height exists, and the history tree always accepts a finalized block), not on the
+// missing-data condition, which is reported via `RebuildError`.
 #[allow(clippy::unwrap_in_result)]
-fn rebuild_tip_history_tree(
+pub(crate) fn rebuild_tip_history_tree(
     db: &ZebraDb,
     network: &Network,
     tip_height: Height,
-) -> Option<HistoryTree> {
+) -> Result<Option<HistoryTree>, RebuildError> {
     let network_upgrade = NetworkUpgrade::current(network, tip_height);
 
     if network_upgrade < NetworkUpgrade::Heartwood {
-        return None;
+        return Ok(None);
     }
 
     let start_height = network_upgrade
@@ -158,21 +243,21 @@ fn rebuild_tip_history_tree(
         .expect("network upgrades at or after Heartwood have an activation height");
 
     let (block, sapling_root, orchard_root, ironwood_root) =
-        history_rebuild_inputs_at_height(db, start_height);
+        history_rebuild_inputs_at_height(db, start_height)?;
     let mut history_tree =
         HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)
             .expect("rebuilding the tip history tree from a finalized block should always succeed");
 
     for height in ((start_height.0 + 1)..=tip_height.0).map(Height) {
         let (block, sapling_root, orchard_root, ironwood_root) =
-            history_rebuild_inputs_at_height(db, height);
+            history_rebuild_inputs_at_height(db, height)?;
 
         history_tree
             .push(network, block, &sapling_root, &orchard_root, &ironwood_root)
             .expect("pushing a finalized block onto the tip history tree should always succeed");
     }
 
-    Some(history_tree)
+    Ok(Some(history_tree))
 }
 
 /// Loads the block and the Sapling, Orchard, and Ironwood note commitment tree roots at `height`,
@@ -180,25 +265,35 @@ fn rebuild_tip_history_tree(
 ///
 /// This reads only column families that are unaffected by the `Entry` format change, so it works on
 /// a database whose history-tree column family is in the old format.
+///
+/// # Errors
+///
+/// Returns [`RebuildError::MissingData`] if the block or a note commitment tree at `height` is
+/// absent. This happens on a database that was pruned before the Ironwood bump: it still has an
+/// old-format history-tree entry (so a rebuild is needed) but no longer has the historical data the
+/// rebuild requires.
 fn history_rebuild_inputs_at_height(
     db: &ZebraDb,
     height: Height,
-) -> (
-    Arc<Block>,
-    sapling::tree::Root,
-    orchard::tree::Root,
-    ironwood::tree::Root,
-) {
+) -> Result<
+    (
+        Arc<Block>,
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    ),
+    RebuildError,
+> {
     let block = db
         .block(height.into())
-        .expect("history tree rebuild requires every finalized block up to the tip");
+        .ok_or(RebuildError::MissingData { height })?;
     let sapling_root = db
         .sapling_tree_by_height(&height)
-        .expect("history tree rebuild requires the Sapling tree at every height up to the tip")
+        .ok_or(RebuildError::MissingData { height })?
         .root();
     let orchard_root = db
         .orchard_tree_by_height(&height)
-        .expect("history tree rebuild requires the Orchard tree at every height up to the tip")
+        .ok_or(RebuildError::MissingData { height })?
         .root();
     // Ironwood trees are only stored from the Ironwood activation height onwards, and are
     // de-duplicated, so search backwards for the most recent one. Before Ironwood activation the
@@ -208,7 +303,7 @@ fn history_rebuild_inputs_at_height(
         None => Default::default(),
     };
 
-    (block, sapling_root, orchard_root, ironwood_root)
+    Ok((block, sapling_root, orchard_root, ironwood_root))
 }
 
 /// Quickly checks that the tip history tree can be read in the current format.
