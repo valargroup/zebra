@@ -136,6 +136,13 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// (a local fixture is trusted and not re-fetched); only the peer source overrides it.
     fn invalidate(&self, _height: block::Height) {}
 
+    /// Discard roots for heights that have already been committed.
+    ///
+    /// Called after the database write succeeds, so retry paths still keep roots needed
+    /// for an uncommitted block. The default is a no-op for finite local fixtures; the
+    /// peer source uses this to keep its live fetch-ahead cache bounded during sync.
+    fn evict_committed_through(&self, _height: block::Height) {}
+
     /// Whether the committer must confirm each supplied root against a *buffered successor*
     /// before committing it (the one-block-lag verification, design §6).
     ///
@@ -251,7 +258,7 @@ impl CommitmentRootSource for VecRootSource {
 /// fetched over the network — only roots come from peers.
 #[derive(Debug)]
 pub(super) struct PeerSource {
-    roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
+    cache: Arc<RwLock<PeerRootsCache>>,
     frontiers: Option<FinalFrontiers>,
 }
 
@@ -259,31 +266,49 @@ pub(super) struct PeerSource {
 /// ranges arrive. Cloneable so the driver and source share one cache.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerSourceWriter {
-    roots: Arc<RwLock<HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>>>,
+    cache: Arc<RwLock<PeerRootsCache>>,
+}
+
+/// Shared peer-source cache state.
+#[derive(Debug, Default)]
+struct PeerRootsCache {
+    roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+    committed_through: Option<u32>,
 }
 
 impl PeerSource {
     /// Create an empty peer source and its write handle. `frontiers` is the embedded
     /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).
     pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceWriter) {
-        let roots = Arc::new(RwLock::new(HashMap::new()));
+        let cache = Arc::new(RwLock::new(PeerRootsCache::default()));
         (
             PeerSource {
-                roots: Arc::clone(&roots),
+                cache: Arc::clone(&cache),
                 frontiers,
             },
-            PeerSourceWriter { roots },
+            PeerSourceWriter { cache },
         )
     }
 }
 
 impl PeerSourceWriter {
-    /// Insert verified roots fetched for a range into the shared cache (idempotent;
-    /// last write wins per height).
+    /// Insert verified roots fetched for a range into the shared cache.
+    ///
+    /// Last write wins per uncommitted height; roots at already-committed heights are
+    /// ignored so stale refetches cannot grow the cache below the finalized tip.
     pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
-        let mut map = self.roots.write().expect("peer source roots lock poisoned");
+        let mut cache = self.cache.write().expect("peer source roots lock poisoned");
         for r in roots {
-            map.insert(r.height.0, (r.sapling_root, r.orchard_root));
+            if cache
+                .committed_through
+                .is_some_and(|height| r.height.0 <= height)
+            {
+                continue;
+            }
+
+            cache
+                .roots
+                .insert(r.height.0, (r.sapling_root, r.orchard_root));
         }
     }
 }
@@ -347,9 +372,10 @@ impl CommitmentRootSource for PeerSource {
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
-        self.roots
+        self.cache
             .read()
             .expect("peer source roots lock poisoned")
+            .roots
             .get(&height.0)
             .copied()
     }
@@ -362,10 +388,25 @@ impl CommitmentRootSource for PeerSource {
     fn invalidate(&self, height: block::Height) {
         // Drop the rejected root so the next read misses and the driver can re-fetch a
         // (verifiable) replacement for this height from another peer.
-        self.roots
+        self.cache
             .write()
             .expect("peer source roots lock poisoned")
+            .roots
             .remove(&height.0);
+    }
+
+    fn evict_committed_through(&self, height: block::Height) {
+        let mut cache = self.cache.write().expect("peer source roots lock poisoned");
+        let start = cache
+            .committed_through
+            .map_or(0, |height| height.saturating_add(1));
+
+        if start <= height.0 {
+            for cached_height in start..=height.0 {
+                cache.roots.remove(&cached_height);
+            }
+            cache.committed_through = Some(height.0);
+        }
     }
 
     fn requires_verified_successor(&self) -> bool {
@@ -522,6 +563,51 @@ mod tests {
         assert!(
             source.fast_root(block::Height(42)).is_none(),
             "an evicted root is gone, so the next read misses and a re-fetch can replace it"
+        );
+    }
+
+    /// After a block commits, the peer source drops all roots through that height while
+    /// retaining fetch-ahead roots the committer still needs.
+    #[test]
+    fn peer_source_evicts_committed_roots_only() {
+        let (source, writer) = PeerSource::new(None);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        writer.insert_roots((40..=44).map(|height| BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: empty_sapling_root,
+            orchard_root: empty_orchard_root,
+        }));
+
+        source.evict_committed_through(block::Height(42));
+
+        assert!(
+            source.fast_root(block::Height(40)).is_none(),
+            "roots below the committed height are evicted"
+        );
+        assert!(
+            source.fast_root(block::Height(42)).is_none(),
+            "the committed height's root is evicted"
+        );
+        assert!(
+            source.fast_root(block::Height(43)).is_some(),
+            "fetch-ahead roots remain cached"
+        );
+
+        writer.insert_roots((41..=43).map(|height| BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: empty_sapling_root,
+            orchard_root: empty_orchard_root,
+        }));
+
+        assert!(
+            source.fast_root(block::Height(41)).is_none(),
+            "late inserts at already-committed heights are ignored"
+        );
+        assert!(
+            source.fast_root(block::Height(43)).is_some(),
+            "late inserts above the committed height are still cached"
         );
     }
 

@@ -1148,6 +1148,10 @@ impl FinalizedState {
         });
 
         if result.is_ok() {
+            if let Some(vct) = &self.vct {
+                vct.evict_committed_roots_through(height);
+            }
+
             if retention.clears_archive_backlog() {
                 self.checkpoint_raw_tx_archive_backlog
                     .store(false, Ordering::Relaxed);
