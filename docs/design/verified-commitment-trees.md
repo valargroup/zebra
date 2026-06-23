@@ -343,12 +343,12 @@ occurred — the needed `H+1` witness is merely not buffered yet.
 
 **Persistent fast-synced databases.** A persistent fast sync marks the database with a
 `fast_sync_metadata` column family recording the handoff height (DB format minor bump to
-**27.3.0**). This is a sibling to `pruning_metadata`, not a reuse — pruning drops tx bytes and
-keeps trees, fast-sync drops the per-height trees; a DB can be both. Because fast sync deletes
-nothing, a **completed** fast-synced DB (tip at/above the handoff) **reopens in any storage
-mode** — a reopen loses no servable data, and `consensus.disable_vct_fast_sync = true` or
-`consensus.checkpoint_sync = false` simply resumes the legacy recompute from the real tip
-frontier.
+**27.3.0**, consolidated with the roots serving index and history-tree repair). This is a sibling
+to `pruning_metadata`, not a reuse — pruning drops tx bytes and keeps trees, fast-sync drops the
+per-height trees; a DB can be both. Because fast sync deletes nothing, a **completed** fast-synced
+DB (tip at/above the handoff) **reopens in any storage mode** — a reopen loses no servable data,
+and `consensus.disable_vct_fast_sync = true` or `consensus.checkpoint_sync = false` simply resumes
+the legacy recompute from the real tip frontier.
 
 The one reopen that *is* refused is an **interrupted** fast sync (frozen frontier, tip below the
 handoff) reopened with the fast path disabled (legacy mode —

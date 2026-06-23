@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Extended value-pool disk serialization with an Ironwood slot after the
-  deferred pool, and bumped the state database format version to `27.3.0`.
+- Extended value-pool disk serialization with an Ironwood slot after the deferred pool, and
+  consolidated the current verified-commitment-trees state database format changes under
+  version `27.3.0`.
 
 ## [8.0.0] - 2026-06-02
 

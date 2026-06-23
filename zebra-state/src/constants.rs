@@ -92,14 +92,17 @@ const DATABASE_FORMAT_VERSION: u64 = 27;
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
-/// Version 4 adds the `commitment_roots_by_height` serving index (verified-commitment-trees
-/// design §4): a compact per-height `(sapling_root, orchard_root)` map every node writes so a
-/// fast-synced node can serve `tree_aux` roots without per-height trees. New databases populate
-/// it going forward; existing ones open with it empty and serve from per-height trees as before.
+/// Version 3 adds the verified-commitment-trees state format:
+/// - the `fast_sync_metadata` column family, which records fast-sync handoff state,
+/// - the `commitment_roots_by_height` serving index (design §4), a compact per-height
+///   `(sapling_root, orchard_root)` map every node writes so a fast-synced node can serve
+///   `tree_aux` roots without per-height trees, and
+/// - the on-open repair for incompatible stored history-tree bytes before background format
+///   checks read the tip tree.
 ///
-/// Version 5 repairs incompatible stored history-tree bytes on open before background format
-/// checks read the tip tree.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 5;
+/// New databases populate the serving index going forward; existing ones open with it empty and
+/// serve from per-height trees as before.
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 3;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

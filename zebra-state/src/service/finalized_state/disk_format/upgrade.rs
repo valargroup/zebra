@@ -111,18 +111,10 @@ fn format_upgrades(
             Version::new(27, 2, 0),
         )),
         Box::new(no_migration::NoMigration::new(
-            "add fast-sync metadata column family",
+            "add verified-commitment-trees metadata, serving index, and history tree repair",
             Version::new(27, 3, 0),
         )),
-        Box::new(no_migration::NoMigration::new(
-            "add commitment roots by height column family",
-            Version::new(27, 4, 0),
-        )),
-        Box::new(no_migration::NoMigration::new(
-            "repair incompatible history tree serialization on open",
-            Version::new(27, 5, 0),
-        )),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
+    ] as [Box<dyn DiskFormatUpgrade>; 8])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -897,25 +889,14 @@ fn zakura_header_body_size_cf_upgrade_is_no_migration() {
 fn fast_sync_metadata_cf_upgrade_is_no_migration() {
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 2, 0))).collect();
 
-    assert_eq!(upgrades.len(), 3);
+    assert_eq!(upgrades.len(), 1);
     assert_eq!(upgrades[0].version(), Version::new(27, 3, 0));
     assert!(!upgrades[0].needs_migration());
 }
 
 #[test]
-fn commitment_roots_by_height_cf_upgrade_is_no_migration() {
+fn vct_format_changes_are_consolidated_under_27_3_0() {
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 2);
-    assert_eq!(upgrades[0].version(), Version::new(27, 4, 0));
-    assert!(!upgrades[0].needs_migration());
-}
-
-#[test]
-fn history_tree_repair_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 4, 0))).collect();
-
-    assert_eq!(upgrades.len(), 1);
-    assert_eq!(upgrades[0].version(), Version::new(27, 5, 0));
-    assert!(!upgrades[0].needs_migration());
+    assert!(upgrades.is_empty());
 }
