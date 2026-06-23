@@ -740,10 +740,11 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
-        // POC verify-before-commit: the next checkpoint block (and its precomputed
+        // The next checkpoint block (and its precomputed
         // auth data root), used to verify this block's fixture roots before the fast
-        // path trusts them. `None` when there is no buffered successor (then the fast
-        // path falls back to recompute) or outside the checkpoint commit path.
+        // path trusts them. `None` is only valid for fast blocks at the checkpoint
+        // handoff, where the embedded final frontiers independently authenticate
+        // this height's roots, or outside the checkpoint commit path.
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
@@ -797,6 +798,14 @@ impl FinalizedState {
                 let mut fast_sync_below = None;
 
                 if let Some((sapling_root, orchard_root)) = vct_fast {
+                    // The handoff frontiers are the only non-successor authority that
+                    // can authenticate this block's own supplied roots before they are
+                    // persisted.
+                    let handoff_frontiers = self
+                        .vct
+                        .as_ref()
+                        .and_then(|v| v.final_frontiers_for_handoff(height));
+
                     // This block's own commitment check validates the parent
                     // history tree (the roots already committed). It is the
                     // *identical* computation to the previous fast block's
@@ -867,19 +876,15 @@ impl FinalizedState {
                         .map_err(|error| self.vct_reject_supplied_root(height, error))?;
 
                     // Verify-before-commit: this block's roots are only committed by
-                    // the *next* block's header (the one-block lag). When a successor
-                    // is buffered, check its commitment against the candidate; a wrong
-                    // fixture root makes this fail, and we reject it (propagating the
-                    // error) before persisting. Fast mode freezes the note-commitment
-                    // frontier, so a bad root cannot be recomputed away here — verify
-                    // or refuse. The next block's auth data root is precomputed by the
-                    // checkpoint verifier, so this is cheap. With no successor yet (the
-                    // sync tip), commit on the in-arrears check above; the root is
-                    // verified when the next block arrives.
+                    // the *next* block's header (the one-block lag). For ordinary fast
+                    // blocks, a successor must be buffered so we can check its
+                    // commitment against the candidate before persisting. At the
+                    // checkpoint handoff, the embedded final frontiers provide the
+                    // independent authority instead.
                     //
                     // This same check is the successor's own commitment check, so on
                     // success record `(next_height, next_hash)` as pre-validated to
-                    // skip the duplicate next call. Clear it otherwise (no successor,
+                    // skip the duplicate next call. Clear it otherwise (handoff,
                     // or a non-fast/legacy block below).
                     self.vct_prevalidated_next = None;
                     if let Some((next_block, next_auth)) = &next_checkpoint {
@@ -900,6 +905,16 @@ impl FinalizedState {
                             (height + 1).expect("checkpoint block heights are valid"),
                             next_block.hash(),
                         ));
+                    } else if handoff_frontiers.is_none() {
+                        metrics::counter!("state.vct.root.unavailable.count").increment(1);
+                        tracing::warn!(
+                            ?height,
+                            "VCT: no buffered successor to verify supplied roots before commit; \
+                             deferring fast checkpoint commit"
+                        );
+                        return Err(
+                            ValidateContextError::VctSuppliedRootUnavailable { height }.into()
+                        );
                     }
 
                     history_tree = candidate;
@@ -916,12 +931,6 @@ impl FinalizedState {
                     // sync: mark the database fast-synced (per-height trees absent
                     // below the handoff height).
                     fast_sync_below = handoff_height;
-
-                    // Pull the verified frontiers for the handoff height, if any.
-                    let handoff_frontiers = self
-                        .vct
-                        .as_ref()
-                        .and_then(|v| v.final_frontiers_for_handoff(height));
 
                     if let Some((sapling_frontier, orchard_frontier, sprout_frontier)) =
                         handoff_frontiers
@@ -1195,6 +1204,20 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
+    }
+
+    /// vct_fast_needs_successor is `true` when committing `height` on the fast path needs a buffered
+    /// successor before it can safely persist this block's supplied roots.
+    ///
+    /// The checkpoint handoff is the only fast-path height that can commit without
+    /// a successor: its embedded final frontiers are verified against this block's
+    /// roots before the real tip treestate is written.
+    pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
+        self.vct.as_ref().is_some_and(|v| {
+            v.is_fast()
+                && v.fast_root(height).is_some()
+                && v.final_frontiers_for_handoff(height).is_none()
+        })
     }
 
     /// Reject a supplied fast-path root that failed verification for `height`.

@@ -151,8 +151,8 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
 /// sets + history root) as the legacy recompute path across all upgrade boundaries,
 /// and a wrong fixture root is rejected (verify-before-commit) rather than persisted.
 /// Exercises: a below-Heartwood seed, history-tree creation at Heartwood, the NU5
-/// V1->V2 transition, verify-ahead against the buffered successor, the in-arrears
-/// commit of the tip block (no successor), and rejection of a corrupted root.
+/// V1->V2 transition, verify-ahead against the buffered successor, the no-successor
+/// guard for non-handoff fast blocks, and rejection of a corrupted root.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
 fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
@@ -195,7 +195,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // the tip we compare at. Chains are far longer than this
             // (MAX_PARTIAL_CHAIN_BLOCKS), so this is a plain assertion, not a discard.
             let last = (nu5 + 3) as usize;
-            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
             // The fast path runs below the checkpoint, seeded from an already-committed
             // tip. Seed just before Heartwood so the fast range creates the history tree
@@ -219,14 +219,14 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let golden_history = legacy.db.history_tree().hash();
 
             // Fast pass over [0, last] with the correct fixture: genesis..=seed recompute
-            // (no fixture entry); seed+1..=last-1 verify-ahead against their buffered
-            // successor; the tip (`last`) commits on the in-arrears check (next = None).
-            // Every fast-eligible block takes the fast path, and the result equals legacy.
+            // (no fixture entry); seed+1..=last verify-ahead against their buffered
+            // successor. Every fast-eligible block takes the fast path, and the result
+            // equals legacy.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
             fast.enable_vct_fast_fixture(fixture.clone());
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 fast.commit_finalized_direct(cv.into(), None, None, next, "vct fast")
                     .expect("verified fast commit succeeds");
             }
@@ -237,6 +237,32 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // first fast block runs its own commitment check; every later fast block
             // was already validated by its predecessor's look-ahead, so it is skipped.
             prop_assert_eq!(fast.vct_prevalidated_count(), (last - seed - 1) as u64, "every fast block after the first skips its redundant own commitment check");
+
+            // A non-handoff fast block with no successor must not be persisted: its own
+            // supplied roots are only authenticated by the next block's header.
+            let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            no_successor.enable_vct_fast_fixture(fixture.clone());
+            for i in 0..last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = Some((blocks[i + 1].block.clone(), None));
+                no_successor
+                    .commit_finalized_direct(cv.into(), None, None, next, "vct no-successor seed")
+                    .expect("verified fast commit succeeds with successor");
+            }
+            prop_assert!(no_successor.vct_fast_needs_successor(Height(last as u32)), "a non-handoff fast root needs successor verification");
+            let cv = CheckpointVerifiedBlock::from(blocks[last].block.clone());
+            let no_successor_error = no_successor
+                .commit_finalized_direct(cv.into(), None, None, None, "vct no-successor guard")
+                .expect_err("non-handoff fast commit without successor must refuse");
+            prop_assert!(
+                format!("{no_successor_error:?}").contains("VctSuppliedRootUnavailable"),
+                "the no-successor guard returns the retryable VCT error, got: {no_successor_error:?}"
+            );
+            prop_assert_eq!(
+                no_successor.db.finalized_tip_height(),
+                Some(Height((last - 1) as u32)),
+                "the refused no-successor block left state untouched"
+            );
 
             // Negative: corrupt the fixture Sapling root at a V2 (post-NU5) height with a
             // distinct value (the empty root; a V2 block has a non-empty Sapling tree).
@@ -254,7 +280,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let mut error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 if bad.commit_finalized_direct(cv.into(), None, None, next, "vct bad").is_err() {
                     error_height = Some(i);
                     break;
@@ -285,7 +311,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let mut orchard_error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 if bad_orchard.commit_finalized_direct(cv.into(), None, None, next, "vct bad orchard").is_err() {
                     orchard_error_height = Some(i);
                     break;
@@ -340,7 +366,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
             let last = (nu5 + 3) as usize;
-            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
             let seed = (heartwood - 1) as usize;
 
             // Record the per-block roots for the fast range as the fixture.
@@ -499,7 +525,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 );
                 for i in 0..=stop {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = (i < stop).then(|| (blocks[i + 1].block.clone(), None));
+                    let next = Some((blocks[i + 1].block.clone(), None));
                     fast.commit_finalized_direct(cv.into(), None, None, next, "vct reopen fast")
                         .expect("verified fast commit succeeds");
                 }
@@ -642,6 +668,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
             );
+            prop_assert!(!fast.vct_fast_needs_successor(handoff), "the trusted handoff frontier authenticates the handoff root without a successor");
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
@@ -771,7 +798,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             // the cross-boundary coverage lives in the proptest above.
             let seed = heartwood - 1;
             let last = seed + 4;
-            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
             // Legacy pass to record the correct per-block roots as the fixture.
             let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
@@ -792,7 +819,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             // Commit block `i` with its real successor as the one-block look-ahead.
             let commit = |fast: &mut FinalizedState, i: usize| {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 fast.commit_finalized_direct(cv.into(), None, None, next, "vct dedup fast")
                     .expect("verified fast commit succeeds");
             };
@@ -874,7 +901,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
             let last = (nu5 + 3) as usize;
-            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
             // Seed below Heartwood so the fast range creates the history tree and
             // crosses the NU5 V1->V2 boundary, matching the equivalence test.
             let seed = (heartwood - 1) as usize;
@@ -912,7 +939,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             fast.enable_vct_fast_source(Box::new(commitment_aux::VecRootSource::from_payload(produced_roots, None)));
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 fast.commit_finalized_direct(cv.into(), None, None, next, "vct round-trip fast")
                     .expect("verified fast commit from DB-produced roots succeeds");
             }
@@ -965,7 +992,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
             let last = (nu5 + 3) as usize;
-            prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
             let seed = (heartwood - 1) as usize;
 
             // Legacy/archive pass: a real DB with per-height trees, plus the golden state.
@@ -997,7 +1024,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             fast.enable_vct_fast_source(Box::new(peer_source));
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
+                let next = Some((blocks[i + 1].block.clone(), None));
                 fast.commit_finalized_direct(cv.into(), None, None, next, "vct peer-source fast")
                     .expect("verified fast commit from peer-source roots succeeds");
             }
