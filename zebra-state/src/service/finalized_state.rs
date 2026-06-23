@@ -33,14 +33,6 @@ use zebra_db::{
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
 
-// The verified-commitment-trees test helpers (`enable_vct_fast_fixture*`) take
-// note-commitment-tree types; these are otherwise only referenced from the `vct`
-// submodule now.
-#[cfg(test)]
-use std::collections::HashMap;
-#[cfg(test)]
-use zebra_chain::{orchard, sapling, sprout};
-
 use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
@@ -1037,19 +1029,6 @@ impl FinalizedState {
                     #[cfg(feature = "commit-metrics")]
                     metrics::histogram!("zebra.state.write.checkpoint_compute.duration_seconds")
                         .record(_ckpt_compute.elapsed().as_secs_f64());
-
-                    // POC capture: record the freshly computed roots for this height, and
-                    // (harness fixture generation) dump the tip frontier at the configured
-                    // capture height — the trees here are the real tip treestate.
-                    if let Some(v) = &self.vct {
-                        v.capture_per_height_roots(height.0, &sapling_root, &orchard_root);
-                        v.capture_frontier_at(
-                            height,
-                            &note_commitment_trees.sapling,
-                            &note_commitment_trees.orchard,
-                            &note_commitment_trees.sprout,
-                        );
-                    }
                 }
 
                 let treestate = Treestate {
@@ -1268,17 +1247,6 @@ impl FinalizedState {
         ValidateContextError::VctSuppliedRootUnavailable { height }.into()
     }
 
-    /// Test-only: enable verified-commitment-trees fast mode with an in-memory
-    /// fixture (instead of the `VCT_FIXTURE` file), so the fast/verify-ahead/fallback
-    /// paths can be unit tested without env vars or a synced node.
-    #[cfg(test)]
-    pub(crate) fn enable_vct_fast_fixture(
-        &mut self,
-        roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
-    ) {
-        self.vct = Some(VctState::test_fixture(roots));
-    }
-
     /// Test-only: enable fast mode reading roots/frontiers from an arbitrary
     /// [`commitment_aux::CommitmentRootSource`] (e.g. a payload produced from a
     /// database via [`commitment_aux::produce_block_roots`]), so the producer→consumer
@@ -1289,27 +1257,6 @@ impl FinalizedState {
         source: Box<dyn commitment_aux::CommitmentRootSource>,
     ) {
         self.vct = Some(VctState::test_with_source(source));
-    }
-
-    /// Test-only: like [`Self::enable_vct_fast_fixture`], but also supplies the
-    /// final frontiers at `handoff_height`, so the checkpoint handoff (verify +
-    /// write the real treestate + set the fast-sync marker) can be unit tested.
-    #[cfg(test)]
-    pub(crate) fn enable_vct_fast_fixture_with_handoff(
-        &mut self,
-        roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
-        handoff_height: block::Height,
-        sapling: Arc<sapling::tree::NoteCommitmentTree>,
-        orchard: Arc<orchard::tree::NoteCommitmentTree>,
-        sprout: Arc<sprout::tree::NoteCommitmentTree>,
-    ) {
-        self.vct = Some(VctState::test_fixture_with_handoff(
-            roots,
-            handoff_height,
-            sapling,
-            orchard,
-            sprout,
-        ));
     }
 
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.
@@ -1342,9 +1289,7 @@ impl FinalizedState {
             return;
         }
 
-        // Flush any captured fixture so the file is complete before exit.
         let fast_count = if let Some(v) = &self.vct {
-            v.flush_capture();
             v.fast_count()
         } else {
             0

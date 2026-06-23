@@ -4,16 +4,14 @@
 //! The fast path consumes per-block Sapling/Orchard roots and a final frontier at the
 //! checkpoint handoff. *Where* that data comes from is abstracted behind
 //! [`CommitmentRootSource`], so the committer reads through one seam regardless of
-//! source. Today the only source is the fixture/embedded scaffolding ([`FixtureSource`],
-//! loaded in [`super::vct`]); the destination is a transport-backed `PeerSource` over
-//! `tree_aux` (increment 6a). This is *not* a new mode — it is the same fast verified
-//! path, with its source factored out.
+//! source. The production source is the transport-backed [`PeerSource`] over `tree_aux`;
+//! tests use a crate-local fixture source over the same `RootMap` shape.
 //!
 //! It also provides the **producer** half ([`produce_block_roots`] /
 //! [`produce_final_frontiers`]): deriving the same payload from an existing database's
-//! per-height trees. That is the read path a serving node runs, and it lets a
-//! DB-produced payload be fed back through the fast path in-process (the round-trip
-//! that proves producer and consumer agree, with no networking).
+//! per-height trees. That is the read path a serving node runs, and tests can feed the
+//! DB-produced payload back through the fast path in-process to prove producer and
+//! consumer agreement without networking.
 
 use std::{
     collections::HashMap,
@@ -24,7 +22,9 @@ use std::{
 use tokio::sync::broadcast;
 use zebra_chain::{block, orchard, sapling, sprout};
 
-use super::{FromDisk, IntoDisk, ZebraDb};
+#[cfg(test)]
+use super::IntoDisk;
+use super::{FromDisk, ZebraDb};
 
 /// Per-block verified commitment roots — the essential fast-path payload (design §5.1),
 /// the wire payload carried over `tree_aux` (increment 6a). Defined in `zebra-chain` so
@@ -138,7 +138,8 @@ impl std::error::Error for FinalFrontiersParseError {}
 impl FinalFrontiers {
     /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
     /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes. Used to
-    /// capture a Regtest handoff frontier at test/dev time (see `vct::capture_frontier_at`).
+    /// create embedded or test final-frontier fixtures.
+    #[cfg(test)]
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.height.0.to_le_bytes());
@@ -251,10 +252,10 @@ impl FinalFrontiers {
 ///
 /// One enduring seam, two enduring data paths: the standard/legacy path rebuilds
 /// trees locally and never consults a source; the fast verified path reads roots
-/// from *some* source and verifies them against the headers. [`FixtureSource`] is
-/// today's scaffolding behind this trait; a transport-backed `PeerSource` over
-/// `tree_aux` replaces it later (increment 6a). The trait carries no trust: every
-/// supplied root is verified against the checkpoint-committed headers before commit.
+/// from *some* source and verifies them against the headers. The production source is
+/// [`PeerSource`]; tests may install a trusted local source to isolate committer
+/// behavior. The trait carries no trust by itself: every supplied root is verified
+/// against the checkpoint-committed headers before commit.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
     fn fast_root(
@@ -275,13 +276,13 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// Called by the committer when a supplied root fails verification: dropping the bad
     /// root un-poisons the cache so a re-fetch from a different peer can replace it, rather
     /// than the committer re-reading the same rejected root forever. The default is a no-op
-    /// (a local fixture is trusted and not re-fetched); only the peer source overrides it.
+    /// for test-only local sources; the peer source overrides it.
     fn invalidate(&self, _height: block::Height) {}
 
     /// Discard roots for heights that have already been committed.
     ///
     /// Called after the database write succeeds, so retry paths still keep roots needed
-    /// for an uncommitted block. The default is a no-op for finite local fixtures; the
+    /// for an uncommitted block. The default is a no-op for test-only local sources; the
     /// peer source uses this to keep its live fetch-ahead cache bounded during sync.
     fn evict_committed_through(&self, _height: block::Height) {}
 
@@ -293,8 +294,8 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// block later — by which point it is irreversibly on disk. For an **untrusted** source
     /// (peers), a single wrong tip root would then wedge the sync with no recovery, so the
     /// committer must instead *defer* such a block until its successor is buffered. Returns
-    /// `true` for the peer source; the default `false` is for a trusted local fixture, which
-    /// is not adversarial and may commit its tip root on the in-arrears check (design §2.4).
+    /// `true` for the peer source; the default `false` is for trusted test-only sources,
+    /// which are not adversarial and may commit a tip root on the in-arrears check.
     fn requires_verified_successor(&self) -> bool {
         false
     }
@@ -302,12 +303,14 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
 
 /// The shared in-memory representation behind the concrete sources: a height→roots
 /// map plus the optional handoff frontiers.
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct RootMap {
     roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
     frontiers: Option<FinalFrontiers>,
 }
 
+#[cfg(test)]
 impl RootMap {
     fn fast_root(
         &self,
@@ -325,11 +328,12 @@ impl RootMap {
     }
 }
 
-/// Today's scaffolding source: roots loaded from the `VCT_FIXTURE` file and frontiers
-/// embedded in the binary (see [`super::vct`]). Stands in for the eventual peer source.
+/// Test-only local source over a height-keyed roots map.
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct FixtureSource(RootMap);
 
+#[cfg(test)]
 impl FixtureSource {
     pub(super) fn new(
         roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
@@ -339,44 +343,8 @@ impl FixtureSource {
     }
 }
 
+#[cfg(test)]
 impl CommitmentRootSource for FixtureSource {
-    fn fast_root(
-        &self,
-        height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
-        self.0.fast_root(height)
-    }
-    fn handoff_height(&self) -> Option<block::Height> {
-        self.0.handoff_height()
-    }
-    fn final_frontiers(&self) -> Option<&FinalFrontiers> {
-        self.0.final_frontiers()
-    }
-}
-
-/// An in-memory source built from a produced payload (a `Vec<BlockCommitmentRoots>`
-/// plus optional handoff frontiers). Adapts producer output back into a
-/// [`CommitmentRootSource`] for the in-process round-trip and, later, the peer driver.
-// Exercised by the round-trip test this increment; the peer driver uses it in 6a.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(super) struct VecRootSource(RootMap);
-
-#[allow(dead_code)]
-impl VecRootSource {
-    pub(super) fn from_payload(
-        roots: Vec<BlockCommitmentRoots>,
-        frontiers: Option<FinalFrontiers>,
-    ) -> Self {
-        let roots = roots
-            .into_iter()
-            .map(|r| (r.height.0, (r.sapling_root, r.orchard_root)))
-            .collect();
-        VecRootSource(RootMap { roots, frontiers })
-    }
-}
-
-impl CommitmentRootSource for VecRootSource {
     fn fast_root(
         &self,
         height: block::Height,
@@ -594,12 +562,10 @@ pub(crate) fn produce_block_roots(
     roots
 }
 
-/// Produce the final frontiers at `height` from `db`'s per-height trees (the future
-/// `TreeAuxStatePort::read_final_frontiers`). Sprout is frozen far below any modern
-/// checkpoint, so the tip Sprout tree is the frontier at `height`. Returns `None`
-/// if `height` is above the database tip.
-// Exercised by the round-trip test this increment; becomes the serving read path in 6a.
-#[allow(dead_code)]
+/// Produce the final frontiers at `height` from `db`'s per-height trees. Sprout is frozen
+/// far below any modern checkpoint, so the tip Sprout tree is the frontier at `height`.
+/// Returns `None` if `height` is above the database tip.
+#[cfg(test)]
 pub(super) fn produce_final_frontiers(
     db: &ZebraDb,
     height: block::Height,
@@ -648,10 +614,10 @@ mod tests {
         );
     }
 
-    /// `VecRootSource` from a produced payload looks up roots by height and exposes
+    /// The test fixture source looks up produced roots by height and exposes
     /// the handoff frontier — the consumer view of producer output.
     #[test]
-    fn vec_root_source_round_trips_payload() {
+    fn fixture_source_round_trips_payload() {
         let roots = vec![
             BlockCommitmentRoots {
                 height: block::Height(10),
@@ -664,6 +630,10 @@ mod tests {
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
             },
         ];
+        let roots = roots
+            .into_iter()
+            .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
+            .collect();
         let frontiers = FinalFrontiers {
             height: block::Height(11),
             sapling: Arc::new(Default::default()),
@@ -671,7 +641,7 @@ mod tests {
             sprout: Arc::new(Default::default()),
         };
 
-        let source = VecRootSource::from_payload(roots, Some(frontiers));
+        let source = FixtureSource::new(roots, Some(frontiers));
 
         assert!(
             source.fast_root(block::Height(10)).is_some(),

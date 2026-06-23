@@ -40,9 +40,8 @@ or verify a root falls back to the legacy recompute, bit-identical to today.
   tree rebuild (legacy) and the fast verified path. Which one runs is config-driven by
   `consensus.checkpoint_sync` (§4.4); the `state.storage_mode` axis (Archive vs. Pruned) is
   orthogonal — it controls raw-tx/index pruning, not the tree path, so both storage modes use
-  the fast path under checkpoint sync. The fixture/embedded blob, the in-process
-  `VecRootSource`, and the network `PeerSource` are *sources* behind one seam (§5.3) — not
-  modes.
+  the fast path under checkpoint sync. The network `PeerSource` and crate-local test fixtures
+  are *sources* behind one seam (§5.3) — not modes.
 - **No new cryptography.** Verification reuses the existing consensus checks
   (`block_commitment_is_valid_for_chain_history`, `HistoryTree::push`); see §6.
 - **Out of scope for the fast lane:** historical tree/subtree RPCs (`z_gettreestate`,
@@ -134,14 +133,15 @@ Precedence is resolved by a pure, unit-tested `select_source_mode` (no process e
 files in the decision — `checkpoint_sync` and the embedded-frontier presence are passed in as
 plain inputs):
 
-1. test-only `VCT_FAST` (+ `VCT_FIXTURE`) → **fixture** replay;
-2. else test-only `VCT_CAPTURE` → **capture** (legacy commit that records roots to a fixture);
-3. else `checkpoint_sync = false`, or a network with **no embedded frontier** → **legacy** (no
+1. `checkpoint_sync = false`, or a network with **no embedded frontier** → **legacy** (no
    VCT state, zero overhead);
-4. else → **peer** (the default under checkpoint sync where embedded frontiers exist).
+2. else → **peer** (the default under checkpoint sync where embedded frontiers exist).
 
-`VCT_FAST`/`VCT_CAPTURE`/`VCT_REGTEST_FRONTIER` remain as test scaffolding; there is no longer a
-`VCT_LEGACY` opt-out, since `checkpoint_sync = false` is the user-facing way to force legacy.
+The earlier file-backed checkpoint/fixture root source (`VCT_FAST`/`VCT_FIXTURE`) and capture
+mode (`VCT_CAPTURE`) were transient integration scaffolding before peer delivery existed and
+have been removed. `VCT_REGTEST_FRONTIER` remains as a Regtest final-frontier test hook; there
+is no longer a `VCT_LEGACY` opt-out, since `checkpoint_sync = false` is the user-facing way to
+force legacy.
 
 ## 5. Payload, wire, and the source seam
 
@@ -174,8 +174,6 @@ tied to the network's max checkpoint height (validated on load:
   to embed; for deterministic e2e testing the frontier is loaded from the file named by
   `VCT_REGTEST_FRONTIER` and validated against the Regtest checkpoint height. This is scoped to
   Regtest only — Mainnet always uses the embedded constant and never reads the env.
-  `VCT_CAPTURE_FRONTIER` (+ `VCT_CAPTURE_FRONTIER_HEIGHT`) dumps a synced node's tip frontier to
-  generate that fixture.
 
 ### 5.3 The `CommitmentRootSource` seam
 
@@ -192,15 +190,14 @@ fn invalidate(&self, height);   // drop a rejected root so a re-fetch can replac
 
 Implementations:
 
-- `FixtureSource` — roots from the `VCT_FIXTURE` file + the embedded frontier (today's
-  scaffolding).
-- `VecRootSource` — an in-process payload (used for the producer→consumer round-trip test).
 - `PeerSource` — a fillable, transport-backed cache (the production default). Its
   `PeerSourceWriter` is filled by the `tree_aux` driver only after the initial requested range
   has been fully fetched; the committer reads it per height. The handoff frontier is held
   immutably from the embedded constant, so only roots come from the network. `invalidate` evicts
   a rejected root from the cache so the next read misses and a re-fetch from another peer can
   replace it (the key to not letting one malicious peer wedge a bad root in place — §8, §11).
+- `FixtureSource` — a crate-local `#[cfg(test)]` source over the same height→roots map, used only
+  to isolate committer behavior and DB-produced payload round trips without networking.
 
 The **producer** half (`produce_block_roots(db, range)` / `produce_final_frontiers(db,
 height)`) derives the same payload from a database's per-height trees — the serving read path
@@ -381,15 +378,15 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   handoff) still refuses on the first post-restart height with a missing root. The frozen
   region is exactly `tip < handoff` (the handoff height itself carries the real frontier).
 
-Outside the frozen window (legacy/capture, or `checkpoint_sync = false`), a missing root is
+Outside the frozen window (`checkpoint_sync = false` / legacy), a missing root is
 simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
 missing root parks the current checkpoint block, requests a targeted `tree_aux` refetch from
 peers, and retries the same commit once the cache is refilled — **without resetting the block
 queue**. A peer-supplied root that has no buffered successor to confirm it against the header
 chain (the one-block lag) is likewise **deferred, not committed on faith**: an untrusted tip
 root is rejected before it is persisted, rather than one block too late (when it would be
-irreversibly on disk and could wedge the sync). A trusted local fixture is exempt and commits
-its tip root on the in-arrears check. This is the safety contract: **a bad, slow, or
+irreversibly on disk and could wedge the sync). Test-only trusted local sources are exempt and
+commit a tip root on the in-arrears check. This is the safety contract: **a bad, slow, or
 withholding peer cannot publish an incomplete initial prefix; after freeze, a later bad or
 missing refetch never writes wrong state and does not reset the block queue for root
 availability.** A height that stays stuck on a retryable stall past a threshold escalates
@@ -467,9 +464,9 @@ reject machinery (downscore + re-request from a different peer, with a hostile-p
 
 ## 12. Increment roadmap
 
-- **Increments 0–5 (done):** the fast path proven end-to-end from a local source — the source
-  seam, verify-before-commit against headers, the frontier-recompute skip, and the verified
-  checkpoint handoff with persistent fast-synced databases.
+- **Increments 0–5 (done):** the fast path proven end-to-end from a local test source — the
+  source seam, verify-before-commit against headers, the frontier-recompute skip, and the
+  verified checkpoint handoff with persistent fast-synced databases.
 - **Increment 6a — peer source: fetch + serve (happy-path POC, this PR).** The `tree_aux`
   stream (roots-only), the `TreeAuxStatePort` serving side, the driver + `PeerSource`, and the
   peer-source default on Mainnet — the first point at which real nodes obtain roots over the
@@ -520,8 +517,8 @@ over the wire rather than a silent legacy sync.
 
 - **Unit:** the `BlockCommitmentRoots` and every `TreeAuxMessage` wire round-trip + DoS-bound /
   trailing-byte rejection; `select_source_mode` precedence (`checkpoint_sync = false` ⇒ legacy
-  regardless of storage mode or embedded frontier; checkpoint sync + embedded frontier ⇒ peer;
-  the `VCT_FAST`/`VCT_CAPTURE` test overrides); a completed fast-synced DB reopens in archive
+  regardless of storage mode or embedded frontier; checkpoint sync + embedded frontier ⇒ peer);
+  a completed fast-synced DB reopens in archive
   mode (`reopening_fast_synced_database_in_archive_mode_succeeds`) while an interrupted one
   reopened with the fast path off is refused
   (`reopening_interrupted_fast_sync_without_a_root_source_panics`); the below-NU5 Orchard pin and
@@ -557,7 +554,7 @@ over the wire rather than a silent legacy sync.
 | Wire payload (`BlockCommitmentRoots`) | `zebra-chain/src/parallel/commitment_aux.rs` |
 | Source seam, `PeerSource`, producers | `zebra-state/src/service/finalized_state/commitment_aux.rs` |
 | Verify-before-commit logic | `zebra-state/src/service/finalized_state/commitment_aux_verify.rs` |
-| Fixture/embedded plumbing, `select_source_mode`, counters | `zebra-state/src/service/finalized_state/vct.rs` |
+| Embedded frontier plumbing, `select_source_mode`, counters | `zebra-state/src/service/finalized_state/vct.rs` |
 | `checkpoint_sync` mirror field (mode input) | `zebra-state/src/config.rs`; set in `zebrad/src/commands/start.rs` |
 | Embedded Mainnet frontier | `zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin` |
 | Commit-path hook, handoff, frozen-frontier policy | `zebra-state/src/service/finalized_state.rs` |

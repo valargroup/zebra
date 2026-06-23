@@ -1,6 +1,6 @@
 //! Randomised property tests for the finalized state.
 
-use std::env;
+use std::{collections::HashMap, env, sync::Arc};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -26,6 +26,40 @@ use crate::{
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
+
+type TestRootMap = HashMap<
+    u32,
+    (
+        zebra_chain::sapling::tree::Root,
+        zebra_chain::orchard::tree::Root,
+    ),
+>;
+type SaplingTree = Arc<zebra_chain::sapling::tree::NoteCommitmentTree>;
+type OrchardTree = Arc<zebra_chain::orchard::tree::NoteCommitmentTree>;
+type SproutTree = Arc<zebra_chain::sprout::tree::NoteCommitmentTree>;
+
+fn enable_vct_test_fixture_source(state: &mut FinalizedState, roots: TestRootMap) {
+    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(roots, None)));
+}
+
+fn enable_vct_test_fixture_source_with_handoff(
+    state: &mut FinalizedState,
+    roots: TestRootMap,
+    handoff_height: Height,
+    sapling: SaplingTree,
+    orchard: OrchardTree,
+    sprout: SproutTree,
+) {
+    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(
+        roots,
+        Some(commitment_aux::FinalFrontiers {
+            height: handoff_height,
+            sapling,
+            orchard,
+            sprout,
+        }),
+    )));
+}
 
 #[test]
 fn blocks_with_v5_transactions() -> Result<()> {
@@ -224,7 +258,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // successor. Every fast-eligible block takes the fast path, and the result
             // equals legacy.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture(fixture.clone());
+            enable_vct_test_fixture_source(&mut fast, fixture.clone());
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = Some((blocks[i + 1].block.clone(), None));
@@ -242,7 +276,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // A trusted local fixture may commit its tip root without a successor: it is
             // not adversarial and the root is checked in arrears when a successor arrives.
             let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            no_successor.enable_vct_fast_fixture(fixture.clone());
+            enable_vct_test_fixture_source(&mut no_successor, fixture.clone());
             for i in 0..last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = Some((blocks[i + 1].block.clone(), None));
@@ -273,7 +307,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             bad_entry.0 = Default::default();
 
             let mut bad = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            bad.enable_vct_fast_fixture(bad_fixture);
+            enable_vct_test_fixture_source(&mut bad, bad_fixture);
             let mut error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -304,7 +338,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             bad_orchard_entry.1 = wrong_orchard;
 
             let mut bad_orchard = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            bad_orchard.enable_vct_fast_fixture(bad_orchard_fixture);
+            enable_vct_test_fixture_source(&mut bad_orchard, bad_orchard_fixture);
             let mut orchard_error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -388,7 +422,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             fixture.remove(&(hole as u32));
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture(fixture);
+            enable_vct_test_fixture_source(&mut fast, fixture);
 
             let mut error_height = None;
             for i in 0..=last {
@@ -479,7 +513,7 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             fixture.remove(&(hole as u32));
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture(fixture);
+            enable_vct_test_fixture_source(&mut fast, fixture);
 
             for i in 0..hole {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -850,7 +884,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             // trees, so the on-disk frontier is frozen and the tip is below the handoff.
             {
                 let mut fast = FinalizedState::new(&config, &network, #[cfg(feature = "elasticsearch")] false);
-                fast.enable_vct_fast_fixture_with_handoff(
+                enable_vct_test_fixture_source_with_handoff(
+                    &mut fast,
                     fixture.clone(),
                     Height(handoff_height),
                     handoff_trees.sapling.clone(),
@@ -875,7 +910,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 
             let mut holed = fixture.clone();
             holed.remove(&(hole as u32));
-            reopened.enable_vct_fast_fixture_with_handoff(
+            enable_vct_test_fixture_source_with_handoff(
+                &mut reopened,
                 holed,
                 Height(handoff_height),
                 handoff_trees.sapling.clone(),
@@ -900,7 +936,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 
             // Retryable: once a verifiable root for the hole is supplied, the same height
             // commits and the tip advances — the refusal was a stall, not a permanent wedge.
-            reopened.enable_vct_fast_fixture_with_handoff(
+            enable_vct_test_fixture_source_with_handoff(
+                &mut reopened,
                 fixture.clone(),
                 Height(handoff_height),
                 handoff_trees.sapling.clone(),
@@ -995,7 +1032,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // Fast genesis-start pass over [0, last], supplying the verified frontiers
             // for the handoff at `last`.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture_with_handoff(
+            enable_vct_test_fixture_source_with_handoff(
+                &mut fast,
                 fixture.clone(),
                 handoff,
                 handoff_trees.sapling.clone(),
@@ -1061,7 +1099,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             bad_handoff_entry.0 = Default::default();
 
             let mut bad_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            bad_handoff.enable_vct_fast_fixture_with_handoff(
+            enable_vct_test_fixture_source_with_handoff(
+                &mut bad_handoff,
                 bad_handoff_fixture,
                 handoff,
                 handoff_trees.sapling.clone(),
@@ -1161,7 +1200,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             }
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture(fixture);
+            enable_vct_test_fixture_source(&mut fast, fixture);
 
             // Commit block `i` with its real successor as the one-block look-ahead.
             let commit = |fast: &mut FinalizedState, i: usize| {
@@ -1285,7 +1324,7 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
             }
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_fixture(fixture);
+            enable_vct_test_fixture_source(&mut fast, fixture);
 
             let commit = |fast: &mut FinalizedState, i: usize| {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -1329,8 +1368,8 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
 /// Builds an archive/legacy state over a generated valid-commitment chain (crossing
 /// Heartwood and NU5), produces the per-block roots and final frontier from that DB
 /// via [`commitment_aux::produce_block_roots`] / [`commitment_aux::produce_final_frontiers`],
-/// then drives a fresh fast-sync state that consumes the produced payload through a
-/// [`commitment_aux::VecRootSource`]. Asserts the fast anchors + history-tree hash are
+/// then drives a fresh fast-sync state that consumes the produced payload through the
+/// test-only [`commitment_aux::FixtureSource`]. Asserts the fast anchors + history-tree hash are
 /// byte-identical to the legacy build, and that the produced final frontier agrees with
 /// the legacy tip frontier and the produced root at the handoff height.
 ///
@@ -1406,7 +1445,14 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 
             // Consume the DB-produced roots in a fresh fast-sync state.
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(commitment_aux::VecRootSource::from_payload(produced_roots, None)));
+            let produced_roots = produced_roots
+                .into_iter()
+                .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
+                .collect();
+            fast.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(
+                produced_roots,
+                None,
+            )));
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = Some((blocks[i + 1].block.clone(), None));
