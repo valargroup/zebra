@@ -4,9 +4,8 @@
 //! This is the "verify" half of the verified-commitment-trees design
 //! (`docs/design/verified-commitment-trees.md` §6): given a sequence of per-block
 //! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
-//! they reconstruct a history tree consistent with the header commitments. It does
-//! not commit anything and does not change the commit path; it is the logic a later
-//! verify-before-commit step will wrap.
+//! they reconstruct a history tree consistent with the header commitments. The
+//! commit path uses this module before persisting supplied roots.
 //!
 //! It reuses the existing consensus check
 //! ([`block_commitment_is_valid_for_chain_history`](crate::service::check::block_commitment_is_valid_for_chain_history))
@@ -16,7 +15,7 @@
 use std::sync::Arc;
 
 use zebra_chain::{
-    block::{Block, Height},
+    block::{merkle::AuthDataRoot, Block, Height},
     history_tree::HistoryTree,
     orchard,
     parameters::{Network, NetworkUpgrade},
@@ -26,6 +25,44 @@ use zebra_chain::{
 use zebra_chain::block::{Commitment, CommitmentError};
 
 use crate::{service::check, ValidateContextError};
+
+/// One block-sized step in supplied commitment-root verification.
+#[derive(Clone, Debug)]
+pub(crate) struct CommitmentRootVerification {
+    pub(crate) block: Arc<Block>,
+    pub(crate) roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+    pub(crate) precomputed_auth_data_root: Option<AuthDataRoot>,
+    pub(crate) skip_parent_check: bool,
+}
+
+impl CommitmentRootVerification {
+    pub(crate) fn with_roots(
+        block: Arc<Block>,
+        sapling_root: sapling::tree::Root,
+        orchard_root: orchard::tree::Root,
+        precomputed_auth_data_root: Option<AuthDataRoot>,
+        skip_parent_check: bool,
+    ) -> Self {
+        CommitmentRootVerification {
+            block,
+            roots: Some((sapling_root, orchard_root)),
+            precomputed_auth_data_root,
+            skip_parent_check,
+        }
+    }
+
+    pub(crate) fn header_only(
+        block: Arc<Block>,
+        precomputed_auth_data_root: Option<AuthDataRoot>,
+    ) -> Self {
+        CommitmentRootVerification {
+            block,
+            roots: None,
+            precomputed_auth_data_root,
+            skip_parent_check: false,
+        }
+    }
+}
 
 /// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
 /// block header (design §6.1).
@@ -105,9 +142,10 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
     Ok(())
 }
 
-/// Verifies that `items` (blocks in ascending height order, each with its supplied
-/// Sapling/Orchard roots) reconstruct a ZIP-221 history MMR consistent with the
-/// block header commitments, starting from `tree` (the parent block's history tree).
+/// Verifies that `items` (blocks in ascending height order, with supplied
+/// Sapling/Orchard roots when they should be folded in) reconstruct a ZIP-221
+/// history MMR consistent with the block header commitments, starting from `tree`
+/// (the parent block's history tree).
 ///
 /// Returns the final history tree on success, or `(height, error)` for the first
 /// block whose header commitment rejects the roots folded in so far.
@@ -118,28 +156,49 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
 /// supplied for height `H` is only confirmed when height `H + 1` is processed. Over a
 /// contiguous range `[start..=end]` this therefore confirms the roots at
 /// `[start..=end - 1]`; pass the block at `end + 1` to confirm the root at `end`.
-#[allow(dead_code)] // POC scaffold: exercised by tests; wired into the commit path in a later increment.
 pub(crate) fn verify_commitment_roots<I>(
     network: &Network,
     mut tree: HistoryTree,
     items: I,
 ) -> Result<HistoryTree, (Height, ValidateContextError)>
 where
-    I: IntoIterator<Item = (Arc<Block>, sapling::tree::Root, orchard::tree::Root)>,
+    I: IntoIterator<Item = CommitmentRootVerification>,
 {
-    for (block, sapling_root, orchard_root) in items {
+    for item in items {
+        let CommitmentRootVerification {
+            block,
+            roots,
+            precomputed_auth_data_root,
+            skip_parent_check,
+        } = item;
+
         let height = block
             .coinbase_height()
             .expect("checkpoint-verified blocks have a coinbase height");
 
         // Validate this block's header commitment against the current (parent) tree,
-        // i.e. against every root already folded in. `None` lets the check compute
-        // `block.auth_data_root()` itself; it is only used on the NU5+ path.
-        check::block_commitment_is_valid_for_chain_history(block.clone(), network, &tree, None)
+        // i.e. against every root already folded in.
+        if !skip_parent_check {
+            check::block_commitment_is_valid_for_chain_history(
+                block.clone(),
+                network,
+                &tree,
+                precomputed_auth_data_root,
+            )
+            .map_err(|error| (height, error))?;
+        }
+
+        let Some((sapling_root, orchard_root)) = roots else {
+            continue;
+        };
+
+        verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
             .map_err(|error| (height, error))?;
 
-        // Fold this block's supplied roots into the running MMR (builds the leaf from
-        // the block body tx-counts + the roots).
+        // Fold this block's supplied roots into the running MMR (builds the leaf
+        // from the block body tx-counts + the roots).
         tree.push(network, block, &sapling_root, &orchard_root)
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
@@ -182,6 +241,14 @@ mod tests {
             "the negative cases need a root distinct from the empty-tree root"
         );
         wrong
+    }
+
+    fn verification_item(
+        block: Arc<Block>,
+        sapling_root: sapling::tree::Root,
+        orchard_root: orchard::tree::Root,
+    ) -> CommitmentRootVerification {
+        CommitmentRootVerification::with_roots(block, sapling_root, orchard_root, None, false)
     }
 
     /// Below NU5 the supplied Orchard root must equal the empty-tree root (no header
@@ -254,15 +321,12 @@ mod tests {
         let next_block = block_at(activation + 1);
         let act_root = root_at(activation);
         let next_root = root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
 
         // Positive: the real roots reconstruct a tree the next block's header commits to.
         let ok_items = vec![
-            (act_block.clone(), act_root, orchard::tree::Root::default()),
-            (
-                next_block.clone(),
-                next_root,
-                orchard::tree::Root::default(),
-            ),
+            verification_item(act_block.clone(), act_root, empty_orchard_root),
+            verification_item(next_block.clone(), next_root, empty_orchard_root),
         ];
         verify_commitment_roots(&Mainnet, empty_history_tree(), ok_items)
             .expect("real roots verify against the headers");
@@ -272,8 +336,8 @@ mod tests {
         // following block's commitment is checked.
         assert_ne!(act_root, next_root, "test needs two distinct roots");
         let bad_items = vec![
-            (act_block, next_root, orchard::tree::Root::default()),
-            (next_block, next_root, orchard::tree::Root::default()),
+            verification_item(act_block, next_root, empty_orchard_root),
+            verification_item(next_block, next_root, empty_orchard_root),
         ];
         let (fail_height, _error) =
             verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)
@@ -360,7 +424,7 @@ mod tests {
 
         // Build (block, sapling_root, orchard_root) for [start..=end+1]; the +1 block
         // confirms the in-range root at `end` via the one-block lag.
-        let item_at = |h: u32| -> (Arc<Block>, sapling::tree::Root, orchard::tree::Root) {
+        let item_at = |h: u32| -> CommitmentRootVerification {
             let block = archive_db
                 .block(Height(h).into())
                 .expect("archive fork has the block");
@@ -372,7 +436,7 @@ mod tests {
                 .orchard_tree_by_height(&Height(h))
                 .expect("archive fork has the per-height Orchard tree")
                 .root();
-            (block, sapling_root, orchard_root)
+            verification_item(block, sapling_root, orchard_root)
         };
         let items: Vec<_> = (start..=end + 1).map(item_at).collect();
 
@@ -386,13 +450,21 @@ mod tests {
         // expect rejection at H+1.
         let bad_offset = 5_000usize;
         let bad_height = start + bad_offset as u32;
-        let wrong_root = items[0].1;
+        let wrong_root = items[0].roots.expect("test verification item has roots").0;
         let mut bad_items = items;
         assert_ne!(
-            bad_items[bad_offset].1, wrong_root,
+            bad_items[bad_offset]
+                .roots
+                .expect("test verification item has roots")
+                .0,
+            wrong_root,
             "need a distinct wrong root"
         );
-        bad_items[bad_offset].1 = wrong_root;
+        bad_items[bad_offset]
+            .roots
+            .as_mut()
+            .expect("test verification item has roots")
+            .0 = wrong_root;
         let (fail_height, _error) = verify_commitment_roots(&Mainnet, seed, bad_items)
             .expect_err("a wrong NU5 root must be rejected");
         assert_eq!(
