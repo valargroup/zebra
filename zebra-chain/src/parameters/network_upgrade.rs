@@ -239,7 +239,7 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     // This placeholder matches the placeholder `BranchId::Nu6_3 = 0xffff_ffff`
     // in our Ironwood librustzcash, so that `Transaction::to_librustzcash`
     // resolves v6 transactions to the fork's NU6.3 branch id.
-    #[cfg(any(test, feature = "zebra-test"))]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     (Nu6_3, ConsensusBranchId(0xffffffff)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     (Nu7, ConsensusBranchId(0xfffffffe)),
