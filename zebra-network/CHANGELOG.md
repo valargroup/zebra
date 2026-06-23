@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the `MemoryLimit` config type (a bare byte count or `"auto"`, defaulting
+  to `"auto"`) for `ZakuraBlockSyncConfig::max_inflight_block_bytes`, plus the
+  injectable `MemoryProbe` trait and `resolve_ceiling`/`ResolvedZakuraBlockSyncConfig`
+  resolution machinery. The probe trait carries no `sysinfo` dependency; the
+  cgroup-aware production probe lives in `zebrad`. The block-sync runtime now
+  consumes the resolved config, so `MemoryLimit::Auto` never reaches the byte
+  budget. (AI assistance: implemented with Claude.)
 - Added `zebra_network::zakura`, a default-off iroh scaffold that exposes a
   relay/discovery-off endpoint builder and reserves the persistent Zakura iroh
   node secret-key path and config field.

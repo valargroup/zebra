@@ -111,8 +111,16 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
+    assert!(
+        !config.v2_p2p,
+        "P2P v2 initialization requires a resolved Zakura block-sync config; \
+         call init_with_zakura_header_sync"
+    );
+    let block_sync_config =
+        crate::zakura::ResolvedZakuraBlockSyncConfig::disabled(config.zakura.block_sync.clone());
     let (peer_set, address_book, misbehavior_tx, _zakura_endpoint) = init_with_zakura_header_sync(
         config,
+        block_sync_config,
         inbound_service,
         latest_chain_tip,
         user_agent,
@@ -127,6 +135,7 @@ where
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
 pub async fn init_with_zakura_header_sync<S, C>(
     config: Config,
+    block_sync_config: crate::zakura::ResolvedZakuraBlockSyncConfig,
     inbound_service: S,
     latest_chain_tip: C,
     user_agent: String,
@@ -156,6 +165,7 @@ where
     let inbound_for_zakura_sink = inbound_service.clone();
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_header_sync_driver(
         &config,
+        block_sync_config,
         move |supervisor, trace| {
             Arc::new(crate::zakura::LegacyGossipSink::spawn_with_trace(
                 inbound_for_zakura_sink,

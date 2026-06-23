@@ -48,7 +48,11 @@ mod tests;
 mod wire;
 mod work_queue;
 
-pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    resolve_ceiling, BlockSyncStatus, CeilingSource, MemoryLimit, MemoryProbe, ResolvedCeiling,
+    ResolvedZakuraBlockSyncConfig, ZakuraBlockSyncConfig, AUTO_FRACTION_DEN, AUTO_FRACTION_NUM,
+    MAX_BS_RESPONSE_BYTES, MAX_CEILING, MIN_CEILING, SAFE_FRACTION_DEN, SAFE_FRACTION_NUM,
+};
 pub use error::BlockSyncWireError;
 pub use events::{
     BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,

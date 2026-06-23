@@ -169,6 +169,32 @@ fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
     config.v2_p2p
 }
 
+/// Resolve the block-sync in-flight memory ceiling against real, cgroup-aware
+/// system RAM.
+///
+/// This is the production seam where `"auto"` becomes a concrete value and an
+/// unsafe explicit value is clamped (both logged). The returned resolved config
+/// is the only block-sync config type accepted by the p2p runtime, so
+/// `MemoryLimit::Auto` cannot reach `ByteBudget`. Standalone (Plan A) the
+/// oversubscription factor is `1.0`; at integration with the sibling plan zebrad
+/// will pass the configured factor.
+fn resolve_block_sync_memory_ceiling(
+    config: &zebra_network::Config,
+) -> zebra_network::zakura::ResolvedZakuraBlockSyncConfig {
+    use crate::components::memory_probe::SysinfoProbe;
+
+    // Plan A standalone: the sibling plan's oversubscription factor defaults to 1.0.
+    const OVERSUBSCRIPTION_FACTOR: f64 = 1.0;
+
+    let probe = SysinfoProbe::new();
+    let resolved = config
+        .zakura
+        .block_sync
+        .clone()
+        .resolve(OVERSUBSCRIPTION_FACTOR, &probe);
+    resolved
+}
+
 #[cfg(not(target_os = "linux"))]
 fn check_tcp_slow_start_after_idle() {}
 
@@ -627,9 +653,17 @@ impl StartCmd {
             PeerServices::NODE_NETWORK
         };
 
+        // Resolve the block-sync in-flight memory ceiling against real (cgroup-aware)
+        // system RAM before the network endpoint is built. This turns a configured
+        // `"auto"` (or an over-large explicit value) into a concrete, RAM-safe byte
+        // count, so `MemoryLimit::Auto` never reaches the p2p runtime. Standalone
+        // (Plan A) the oversubscription factor is the constant 1.0.
+        let block_sync_config = resolve_block_sync_memory_ceiling(&config.network);
+
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zebra_network::init_with_zakura_header_sync(
                 config.network.clone(),
+                block_sync_config,
                 inbound,
                 latest_chain_tip.clone(),
                 user_agent(),
@@ -1357,6 +1391,15 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
+
+    fn resolved_block_sync_config(
+        config: zebra_network::zakura::ZakuraBlockSyncConfig,
+    ) -> zebra_network::zakura::ResolvedZakuraBlockSyncConfig {
+        zebra_network::zakura::ResolvedZakuraBlockSyncConfig::from_resolved_ceiling(
+            config,
+            zebra_network::zakura::MAX_CEILING,
+        )
+    }
 
     #[test]
     fn zcashd_compat_flag_applies_rpc_guardrails() {
@@ -2105,7 +2148,7 @@ mod zakura_header_sync_driver_tests {
             },
             (block::Height(0), block::Hash([0; 32])),
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         )
     }
 
@@ -2915,7 +2958,7 @@ mod zakura_header_sync_driver_tests {
             initial_frontiers,
             (block::Height(3), block::Hash([3; 32])),
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         startup.trace = trace.clone();
         let (block_sync, mut reactor_actions, reactor_task) =
@@ -3565,7 +3608,7 @@ mod zakura_header_sync_driver_tests {
             },
             (block::Height(10), block::Hash([10; 32])),
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
@@ -3954,7 +3997,7 @@ mod zakura_header_sync_driver_tests {
             },
             (block::Height(10), block::Hash([10; 32])),
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
@@ -4085,7 +4128,7 @@ mod zakura_header_sync_driver_tests {
             },
             (block::Height(10), block::Hash([10; 32])),
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
@@ -4645,7 +4688,7 @@ mod zakura_header_sync_driver_tests {
             },
             best_header_tip,
             tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         let (stale_block_sync, mut stale_actions, stale_reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
@@ -4765,7 +4808,7 @@ mod zakura_header_sync_driver_tests {
             restart_frontiers,
             best_header_tip,
             restart_tip_rx,
-            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+            resolved_block_sync_config(zebra_network::zakura::ZakuraBlockSyncConfig::default()),
         );
         let (_fresh_block_sync, mut fresh_actions, fresh_reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(restart_startup);

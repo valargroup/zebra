@@ -22,8 +22,8 @@ use super::{await_until, ZakuraTestCluster, ZakuraTestNode};
 use crate::{
     zakura::{
         BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, HeaderSyncFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
-        ZakuraLocalLimits,
+        BlockSyncFrontiers, HeaderSyncFrontiers, MemoryLimit, ServicePeerLimits,
+        ZakuraBlockSyncConfig, ZakuraLocalLimits,
     },
     BoxError, Config,
 };
@@ -362,7 +362,7 @@ impl HarnessConfig {
         ZakuraBlockSyncConfig {
             max_blocks_per_response: self.max_blocks_per_response,
             max_inflight_requests: self.max_inflight,
-            max_inflight_block_bytes: u64::MAX,
+            max_inflight_block_bytes: MemoryLimit::Bytes(u64::MAX),
             max_submitted_block_applies: usize::from(self.max_inflight)
                 .saturating_mul(
                     usize::try_from(self.max_blocks_per_response).expect("u32 fits usize"),

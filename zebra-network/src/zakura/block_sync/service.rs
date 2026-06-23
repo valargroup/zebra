@@ -172,7 +172,7 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
-    config: ZakuraBlockSyncConfig,
+    config: ResolvedZakuraBlockSyncConfig,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
     /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
@@ -190,14 +190,17 @@ struct BlockSyncPeerRecord {
 }
 
 impl BlockSyncService {
-    pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
+    pub(crate) fn new(config: impl IntoResolvedZakuraBlockSyncConfig) -> Self {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
-    pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
+    pub(crate) fn new_with_handle(
+        config: impl IntoResolvedZakuraBlockSyncConfig,
+        handle: BlockSyncHandle,
+    ) -> Self {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
-                config,
+                config: config.into_resolved(),
                 lifecycle: handle.lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
                 peers: StdMutex::new(HashMap::new()),
@@ -209,9 +212,10 @@ impl BlockSyncService {
     }
 
     pub(crate) fn new_with_header_tip(
-        config: ZakuraBlockSyncConfig,
+        config: impl IntoResolvedZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
     ) -> Self {
+        let config = config.into_resolved();
         let best_header_tip = *header_tip.borrow();
         let startup = BlockSyncStartup::new(
             BlockSyncFrontiers {
@@ -247,6 +251,7 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
     ) -> (Self, mpsc::Receiver<BlockSyncEvent>) {
         let (events, event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        let config = ResolvedZakuraBlockSyncConfig::for_test(config);
         let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
         let events_for_lifecycle = events.clone();
         tokio::spawn(async move {
@@ -275,7 +280,7 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
         handle: BlockSyncHandle,
     ) -> Self {
-        Self::new_with_handle(config, handle)
+        Self::new_with_handle(ResolvedZakuraBlockSyncConfig::for_test(config), handle)
     }
 
     #[cfg(test)]

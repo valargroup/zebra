@@ -53,13 +53,14 @@ use crate::{
         BlockSyncService, BlockSyncStartup, Clock, Frame, FramedRecv, FramedSend, Frontier,
         FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
-        Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
-        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
-        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
-        CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
+        ResolvedZakuraBlockSyncConfig, Service, ServicePeerDirection, ServiceRegistry,
+        ServiceStream, SinkReject, Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits,
+        ZakuraBlockSyncConfig, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
+        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
+        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraSyncExchange,
+        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
         ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
@@ -1259,7 +1260,7 @@ pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    block_sync_config: ZakuraBlockSyncConfig,
+    block_sync_config: ResolvedZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
@@ -2432,14 +2433,17 @@ fn bind_native_endpoint(
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
+    block_sync_config: ResolvedZakuraBlockSyncConfig,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
-    spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None).await
+    spawn_zakura_endpoint_with_header_sync_driver(config, block_sync_config, sink_factory, None)
+        .await
 }
 
 /// Start a Zakura endpoint with an externally driven header-sync reactor.
 pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
+    block_sync_config: ResolvedZakuraBlockSyncConfig,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
@@ -2538,7 +2542,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
                 },
                 best_header_tip,
                 frontier_updates,
-                config.zakura.block_sync.clone(),
+                block_sync_config.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
@@ -2557,7 +2561,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         &supervisor,
         Some(header_sync.clone()),
         block_sync.clone(),
-        config.zakura.block_sync.clone(),
+        block_sync_config,
         legacy_service,
         discovery_service,
     )?;
@@ -4289,6 +4293,10 @@ mod tests {
     };
     use zebra_test::vectors::BLOCK_TESTNET_141042_BYTES;
 
+    fn test_resolved_block_sync_config(config: &Config) -> ResolvedZakuraBlockSyncConfig {
+        ResolvedZakuraBlockSyncConfig::for_test(config.zakura.block_sync.clone())
+    }
+
     /// With no configured `zakura.listen_addr`, the native endpoint must bind
     /// loopback-only. Otherwise iroh's default bind (`0.0.0.0:0` / `[::]:0`)
     /// exposes the experimental P2P_V2_ALPN handshake/session surface on every
@@ -4638,9 +4646,11 @@ mod tests {
             ..Config::default()
         };
 
-        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?;
 
         assert!(endpoint.is_none());
@@ -4652,9 +4662,11 @@ mod tests {
         let _guard = zebra_test::init();
         let config = Config::default();
 
-        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?
         .expect("v2_p2p is enabled by default");
 
@@ -4666,9 +4678,12 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_stops_header_sync_task() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let endpoint = spawn_zakura_endpoint(&Config::default(), |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let config = Config::default();
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?
         .expect("v2_p2p is enabled by default");
         let header_sync = endpoint
@@ -4701,9 +4716,12 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_stops_maintained_native_dial_loop() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let endpoint = spawn_zakura_endpoint(&Config::default(), |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let config = Config::default();
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?
         .expect("v2_p2p is enabled by default");
 
@@ -4739,9 +4757,11 @@ mod tests {
     async fn endpoint_shutdown_stops_discovery_candidate_dialer() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let config = Config::default();
-        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?
         .expect("v2_p2p is enabled by default");
 
@@ -4791,9 +4811,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_legacy_upgrade_does_not_leak_maintained_dial() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let endpoint = spawn_zakura_endpoint(&Config::default(), |_supervisor, _trace| {
-            Arc::new(NoopService) as Arc<dyn Service>
-        })
+        let config = Config::default();
+        let endpoint = spawn_zakura_endpoint(
+            &config,
+            test_resolved_block_sync_config(&config),
+            |_supervisor, _trace| Arc::new(NoopService) as Arc<dyn Service>,
+        )
         .await?
         .expect("v2_p2p is enabled by default");
 
@@ -4842,7 +4865,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
-            ZakuraBlockSyncConfig::default(),
+            test_resolved_block_sync_config(&Config::default()),
             recorder.clone(),
             test_discovery_service(&supervisor),
         )?;
@@ -5063,7 +5086,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
-            ZakuraBlockSyncConfig::default(),
+            test_resolved_block_sync_config(&Config::default()),
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
         )?;
@@ -5143,7 +5166,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
-            ZakuraBlockSyncConfig::default(),
+            test_resolved_block_sync_config(&Config::default()),
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;
@@ -5246,7 +5269,7 @@ mod tests {
             &supervisor,
             Some(header_sync.clone()),
             None,
-            ZakuraBlockSyncConfig::default(),
+            test_resolved_block_sync_config(&Config::default()),
             Arc::new(RecordingService::default()),
             discovery_service,
         )?;

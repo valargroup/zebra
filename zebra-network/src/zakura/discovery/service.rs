@@ -747,10 +747,11 @@ mod tests {
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
         BlockSyncStartup, HeaderSyncAction, HeaderSyncFrontiers, HeaderSyncMessage,
-        HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, ServicePeerLimits,
-        ZakuraBlockSyncConfig, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig,
-        ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, LOCAL_MAX_MESSAGE_BYTES,
-        MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+        HeaderSyncPeerSession, HeaderSyncStartup, HeaderSyncStatus, ResolvedZakuraBlockSyncConfig,
+        ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
+        ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
+        LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
     };
     use zebra_chain::{block, parameters::Network};
 
@@ -1175,7 +1176,7 @@ mod tests {
                 },
                 (block::Height(5), block::Hash([5; 32])),
                 tip_rx,
-                ZakuraBlockSyncConfig::default(),
+                ResolvedZakuraBlockSyncConfig::for_test(ZakuraBlockSyncConfig::default()),
             ));
         let service = DiscoveryService::with_sync_services(
             discovery_handle,

@@ -16,10 +16,10 @@ use crate::{
         discovery::build_discovery_handle, service_registry, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncStartup, DiscoveryService, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncHandle, HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle,
-        ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace,
-        P2P_V2_ALPN,
+        HeaderSyncHandle, HeaderSyncStartup, ResolvedZakuraBlockSyncConfig, Service,
+        ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint, ZakuraHandshakeConfig,
+        ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler,
+        ZakuraServiceId, ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -426,6 +426,8 @@ impl ZakuraTestNodeBuilder {
             header_sync_actions = Some((shutdown, actions));
             header_sync_handle = Some(handle.clone());
 
+            let block_sync_config =
+                ResolvedZakuraBlockSyncConfig::for_test(self.block_sync_config.clone());
             let mut startup = BlockSyncStartup::new(
                 BlockSyncFrontiers {
                     finalized_height: frontiers.finalized_height,
@@ -434,7 +436,7 @@ impl ZakuraTestNodeBuilder {
                 },
                 best_header_tip.unwrap_or(anchor),
                 handle.subscribe_tip(),
-                self.block_sync_config.clone(),
+                block_sync_config,
             );
             let shutdown = header_sync_actions
                 .as_ref()
@@ -467,7 +469,7 @@ impl ZakuraTestNodeBuilder {
             &supervisor,
             header_sync,
             block_sync_handle.clone(),
-            self.block_sync_config.clone(),
+            ResolvedZakuraBlockSyncConfig::for_test(self.block_sync_config.clone()),
             base_service,
             discovery_service,
         )?;

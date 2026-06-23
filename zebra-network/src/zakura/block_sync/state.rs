@@ -38,8 +38,10 @@ pub struct BlockSyncStartup {
     pub header_tip: Option<watch::Receiver<(block::Height, block::Hash)>>,
     /// Shared sync exchange frontier stream used as the moving body-download target.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
-    /// Local stream-6 configuration.
-    pub config: ZakuraBlockSyncConfig,
+    /// Local stream-6 configuration, with the in-flight memory ceiling already
+    /// resolved to a concrete byte count (so [`MemoryLimit::Auto`] never reaches
+    /// the runtime).
+    pub config: ResolvedZakuraBlockSyncConfig,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
     pub shutdown: CancellationToken,
     /// Enables query actions for state-backed metadata.
@@ -50,36 +52,79 @@ pub struct BlockSyncStartup {
 
 impl BlockSyncStartup {
     /// Build block-sync startup config from durable/frontier facts.
+    #[cfg(not(test))]
     pub fn new(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
-        config: ZakuraBlockSyncConfig,
+        config: ResolvedZakuraBlockSyncConfig,
     ) -> Self {
-        Self {
+        Self::new_inner(frontiers, best_header_tip, Some(header_tip), None, config)
+    }
+
+    /// Build block-sync startup config from durable/frontier facts.
+    #[cfg(test)]
+    pub fn new(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        header_tip: watch::Receiver<(block::Height, block::Hash)>,
+        config: impl IntoResolvedZakuraBlockSyncConfig,
+    ) -> Self {
+        Self::new_inner(
             frontiers,
             best_header_tip,
-            header_tip: Some(header_tip),
-            frontier_updates: None,
-            config,
-            shutdown: CancellationToken::new(),
-            state_queries_enabled: true,
-            trace: ZakuraTrace::noop(),
-        }
+            Some(header_tip),
+            None,
+            config.into_resolved(),
+        )
     }
 
     /// Build block-sync startup config from shared sync exchange frontiers.
+    #[cfg(not(test))]
     pub fn new_with_exchange(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         frontier_updates: watch::Receiver<FrontierUpdate>,
-        config: ZakuraBlockSyncConfig,
+        config: ResolvedZakuraBlockSyncConfig,
+    ) -> Self {
+        Self::new_inner(
+            frontiers,
+            best_header_tip,
+            None,
+            Some(frontier_updates),
+            config,
+        )
+    }
+
+    /// Build block-sync startup config from shared sync exchange frontiers.
+    #[cfg(test)]
+    pub fn new_with_exchange(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        frontier_updates: watch::Receiver<FrontierUpdate>,
+        config: impl IntoResolvedZakuraBlockSyncConfig,
+    ) -> Self {
+        Self::new_inner(
+            frontiers,
+            best_header_tip,
+            None,
+            Some(frontier_updates),
+            config.into_resolved(),
+        )
+    }
+
+    fn new_inner(
+        frontiers: BlockSyncFrontiers,
+        best_header_tip: (block::Height, block::Hash),
+        header_tip: Option<watch::Receiver<(block::Height, block::Hash)>>,
+        frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
+        config: ResolvedZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             frontiers,
             best_header_tip,
-            header_tip: None,
-            frontier_updates: Some(frontier_updates),
+            header_tip,
+            frontier_updates,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -102,7 +147,7 @@ impl BlockSyncStartup {
         }
     }
 
-    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn inert(config: impl IntoResolvedZakuraBlockSyncConfig) -> Self {
         Self {
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
@@ -112,7 +157,7 @@ impl BlockSyncStartup {
             best_header_tip: (block::Height::MIN, block::Hash([0; 32])),
             header_tip: None,
             frontier_updates: None,
-            config,
+            config: config.into_resolved(),
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
@@ -144,7 +189,7 @@ pub struct BlockSyncHandle {
 /// `service::add_peer`.
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
-    pub(super) config: ZakuraBlockSyncConfig,
+    pub(super) config: ResolvedZakuraBlockSyncConfig,
     pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
@@ -310,7 +355,7 @@ pub(super) struct DownloadWindow {
 }
 
 impl DownloadWindow {
-    pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn new(config: &impl BlockSyncConfigAccess) -> Self {
         let max_inflight_requests = config.advertised_max_inflight_requests();
         Self {
             max_inflight_requests,
@@ -402,11 +447,11 @@ pub(super) struct PeerBlockState {
 }
 
 impl PeerBlockState {
-    pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn new(session: BlockSyncPeerSession, config: &impl BlockSyncConfigAccess) -> Self {
         Self {
             direction: session.direction(),
             session,
-            refresh_meter: RateMeter::new(config.status_refresh_interval),
+            refresh_meter: RateMeter::new(config.status_refresh_interval()),
             served_blocks_inflight: 0,
             served_block_requests: VecDeque::new(),
         }

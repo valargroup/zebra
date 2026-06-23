@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- The Zakura block-sync in-flight memory ceiling
+  (`network.zakura.block_sync.max_inflight_block_bytes`) now defaults to `"auto"`,
+  which derives a safe, cgroup-aware ceiling from real system RAM at startup
+  (one quarter of available RAM, clamped between a one-protocol-max-request floor
+  of 256 MB and the previous flat default of 8 GiB). Behavior change: small and
+  containerized hosts now get a **lower** ceiling than the old flat 8 GiB, and a
+  container can no longer auto-provision above its cgroup `memory.max`. An
+  explicit byte value is still accepted but is clamped down (with a warning) when
+  it would exceed half of total RAM. The resolved ceiling, its source, the
+  system figures, and the effective worst-case bound are logged at startup.
+  (AI assistance: implemented with Claude.)
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Reject transactions that add net value to the Orchard pool after NU6.3

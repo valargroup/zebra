@@ -7,6 +7,7 @@
 
 pub mod health;
 pub mod inbound;
+pub mod memory_probe;
 #[allow(missing_docs)]
 pub mod mempool;
 pub mod metrics;

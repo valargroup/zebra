@@ -211,7 +211,9 @@ async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
         cache_dir: crate::config::CacheDir::disabled(),
         ..test_config(true)
     };
-    crate::zakura::spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+    let block_sync_config =
+        crate::zakura::ResolvedZakuraBlockSyncConfig::for_test(config.zakura.block_sync.clone());
+    crate::zakura::spawn_zakura_endpoint(&config, block_sync_config, |_supervisor, _trace| {
         Arc::new(DropSink) as Arc<dyn ZakuraService>
     })
     .await

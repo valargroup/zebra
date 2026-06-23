@@ -1501,7 +1501,7 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -2782,7 +2782,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -2938,7 +2938,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 4;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 4);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -3100,7 +3100,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     let mut config = immediate_body_download_config();
     // Budget holds exactly one worst-case share, so a hint-sized re-reservation
     // would have left no headroom for an underestimated body.
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -3362,7 +3362,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -3795,7 +3795,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -3939,7 +3939,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -4175,7 +4175,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // that body releases budget (shrink + commit) and the routine must issue the
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES);
     config.max_blocks_per_response = 1;
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
@@ -4384,7 +4384,9 @@ async fn reactor_reserves_worst_case_per_block_not_size_hint() {
     // the request would be 16 blocks.
     let budget_blocks = 3u32;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: MemoryLimit::Bytes(
+            u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
+        ),
         // Generous per-request block count (the default is 1) so the count cap is
         // not the binding constraint — the byte budget is.
         max_blocks_per_response: 16,
@@ -4782,7 +4784,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     config.peer_limits.inbound_queue_depth = 1;
     // Hold the whole flood in flight at once so nothing pauses on the byte
     // budget; the inbound flood, not the budget, is what this test exercises.
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(u64::MAX);
     // A dropped body must not be quietly re-requested and healed before the
     // deadline — that would hide the very regression this test guards.
     config.request_timeout = Duration::from_secs(300);
@@ -5207,7 +5209,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 
     let mut config = immediate_body_download_config();
     config.fanout = 1;
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
@@ -5432,7 +5434,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 #[tokio::test]
 async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -5565,7 +5567,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_submitted_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -5693,7 +5695,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -5787,7 +5789,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -5896,7 +5898,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
 #[tokio::test]
 async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_flight_apply() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -6278,7 +6280,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 #[tokio::test]
 async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -6461,7 +6463,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
 
     for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
         let mut config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
+            max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 3),
             ..immediate_body_download_config()
         };
         config.peer_limits.outbound_queue_depth = 16;
@@ -6817,7 +6819,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 #[tokio::test]
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -7350,7 +7352,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
 async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     let request_bytes: u32 = 10_000;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
 
@@ -8227,8 +8229,9 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for exactly the three in-flight bodies.
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
@@ -8317,7 +8320,7 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
 async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(u64::MAX);
     config.max_submitted_block_applies = 2;
     config.request_timeout = Duration::from_secs(300);
 
@@ -9371,7 +9374,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     let blocks = mainnet_blocks_1_to_3();
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.max_inflight_block_bytes = MemoryLimit::Bytes(BS_PER_BLOCK_WORST_CASE_BYTES * 2);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = BlockSyncStartup::new(

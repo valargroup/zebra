@@ -155,10 +155,11 @@ mod tests {
             BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
-            HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            HeaderSyncStatus, MemoryLimit, Peer, Service, ServicePeerLimits, Stream,
+            ZakuraBlockSyncConfig, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -1504,7 +1505,7 @@ mod tests {
 
         let block_sync_config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 3,
-            max_inflight_block_bytes: u64::MAX,
+            max_inflight_block_bytes: MemoryLimit::Bytes(u64::MAX),
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
                 inbound_queue_depth: 1,

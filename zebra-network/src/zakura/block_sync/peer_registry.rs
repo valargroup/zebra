@@ -27,7 +27,10 @@ use std::{
 use zebra_chain::block;
 
 use super::{
-    config::{clamp_advertised_blocks, clamp_advertised_inflight, clamp_advertised_response_bytes},
+    config::{
+        clamp_advertised_blocks, clamp_advertised_inflight, clamp_advertised_response_bytes,
+        BlockSyncConfigAccess,
+    },
     state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER,
     BlockSyncStatus, ServicePeerDirection, ZakuraPeerId,
 };
@@ -64,7 +67,7 @@ pub(super) struct Entry {
 impl Entry {
     fn new(
         direction: ServicePeerDirection,
-        config: &super::ZakuraBlockSyncConfig,
+        config: &impl BlockSyncConfigAccess,
         generation: u64,
     ) -> Self {
         Self {
@@ -133,7 +136,7 @@ impl PeerRegistry {
         &self,
         peer: &ZakuraPeerId,
         direction: ServicePeerDirection,
-        config: &super::ZakuraBlockSyncConfig,
+        config: &impl BlockSyncConfigAccess,
     ) -> u64 {
         let generation = self
             .next_generation

@@ -101,6 +101,7 @@ criterion = { workspace = true }
 static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 zebra-chain = { path = "../zebra-chain", features = ["proptest-impl"] }
 zebra-test = { path = "../zebra-test/" }

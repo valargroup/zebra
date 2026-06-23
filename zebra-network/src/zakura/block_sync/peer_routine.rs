@@ -43,7 +43,7 @@ use super::{
     state::{DownloadWindow, OutstandingBlockRange, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
-    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace,
+    ResolvedZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
@@ -81,7 +81,7 @@ enum Disposition {
 pub(super) struct PeerRoutine {
     peer: ZakuraPeerId,
     session: BlockSyncPeerSession,
-    config: ZakuraBlockSyncConfig,
+    config: ResolvedZakuraBlockSyncConfig,
 
     // ---- transport inbound (the pipe half) ----
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
@@ -153,7 +153,7 @@ impl PeerRoutine {
         peer: ZakuraPeerId,
         session: BlockSyncPeerSession,
         recv: FramedRecv,
-        config: ZakuraBlockSyncConfig,
+        config: ResolvedZakuraBlockSyncConfig,
         generation: u64,
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,

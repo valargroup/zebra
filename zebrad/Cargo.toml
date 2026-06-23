@@ -197,6 +197,13 @@ metrics = { workspace = true }
 dirs = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 sha2 = { workspace = true }
+# System-memory probe for the auto block-sync in-flight ceiling. Pinned to 0.33
+# because: (a) `available_memory()` reports `MemAvailable` (not "free") at this
+# series, (b) it exposes `System::cgroup_limits()` so the probe is container-aware,
+# and (c) its MSRV (1.74) is well under the workspace MSRV (1.91). MIT licensed.
+# Default features pull in disk/network/component probing we never use, so disable
+# them and keep only the system (memory) component.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 tempfile = { workspace = true }
 flate2 = "1.1.9"
 tar = "0.4.46"
