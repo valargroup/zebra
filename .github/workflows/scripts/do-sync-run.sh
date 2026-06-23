@@ -16,9 +16,13 @@
 set -euo pipefail
 
 # The DigitalOcean docker-20-04 image ships Docker but not s3cmd/zstd; install them.
+# A freshly-booted droplet runs apt at boot (cloud-init / unattended-upgrades), so wait for
+# that to finish and release the dpkg/apt lock (and pass a lock timeout) instead of racing it.
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq s3cmd zstd
+cloud-init status --wait >/dev/null 2>&1 || true
+for _ in $(seq 1 120); do pgrep -x apt-get >/dev/null || break; sleep 5; done
+apt-get -o DPkg::Lock::Timeout=600 update -qq
+apt-get -o DPkg::Lock::Timeout=600 install -y -qq s3cmd zstd
 
 STATE_DIR=/mnt/zebra-state
 OBJECT="s3://${SPACES_BUCKET}/sync-confidence/state/v${STATE_VERSION}/mainnet/${STATE_KEY}.tar.zst"
