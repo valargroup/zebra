@@ -44,6 +44,7 @@ use crate::{
         disk_format::{
             block::TransactionLocation,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, RawBytes, PRUNING_METADATA,
@@ -839,35 +840,63 @@ impl ZebraDb {
             .flat_map(|input| input.outpoint())
             .collect();
 
-        let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
-            if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
-                use rayon::prelude::*;
-                outpoints
-                    .into_par_iter()
-                    .map(|outpoint| {
-                        read_spent_utxo(
-                            self,
-                            finalized.height,
-                            outpoint,
-                            &tx_hash_indexes,
-                            &finalized.new_outputs,
-                        )
-                    })
-                    .collect()
-            } else {
-                outpoints
-                    .into_iter()
-                    .map(|outpoint| {
-                        read_spent_utxo(
-                            self,
-                            finalized.height,
-                            outpoint,
-                            &tx_hash_indexes,
-                            &finalized.new_outputs,
-                        )
-                    })
-                    .collect()
-            };
+        // Serialize the raw transaction bytes for `tx_by_loc` concurrently with the
+        // spent-UTXO reads. Serialization is CPU-bound while the reads wait on disk,
+        // so overlapping them keeps the raw-tx serialization off the committer's
+        // serial critical path. The bytes are handed to `prepare_block_batch`; if
+        // `None` it serializes inline (e.g. the semantic path).
+        let store_raw_txs = retention.stores_raw_transactions();
+        let db: &ZebraDb = self;
+        let (spent_utxos, precomputed_raw_txs): (
+            Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
+            Option<Vec<RawBytes>>,
+        ) = rayon::join(
+            || {
+                if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                    use rayon::prelude::*;
+                    outpoints
+                        .into_par_iter()
+                        .map(|outpoint| {
+                            read_spent_utxo(
+                                db,
+                                finalized.height,
+                                outpoint,
+                                &tx_hash_indexes,
+                                &finalized.new_outputs,
+                            )
+                        })
+                        .collect()
+                } else {
+                    outpoints
+                        .into_iter()
+                        .map(|outpoint| {
+                            read_spent_utxo(
+                                db,
+                                finalized.height,
+                                outpoint,
+                                &tx_hash_indexes,
+                                &finalized.new_outputs,
+                            )
+                        })
+                        .collect()
+                }
+            },
+            || {
+                if store_raw_txs {
+                    use rayon::prelude::*;
+                    Some(
+                        finalized
+                            .block
+                            .transactions
+                            .par_iter()
+                            .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            },
+        );
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -959,7 +988,8 @@ impl ZebraDb {
             address_balances,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
-            retention.stores_raw_transactions(),
+            store_raw_txs,
+            precomputed_raw_txs,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1282,12 +1312,14 @@ impl DiskWriteBatch {
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
+        precomputed_raw_txs: Option<Vec<RawBytes>>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zebra_db,
             finalized,
             store_raw_transactions,
+            precomputed_raw_txs,
         )?;
 
         // The consensus rules are silent on shielded transactions in the genesis block,
@@ -1406,6 +1438,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         store_raw_transactions: bool,
+        precomputed_raw_txs: Option<Vec<RawBytes>>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         let db = &zebra_db.db;
 
@@ -1454,13 +1487,19 @@ impl DiskWriteBatch {
 
         // Serialize the raw transaction bytes up front: on heavy shielded blocks
         // this serialization dominates the per-block write cost, and each
-        // transaction serializes independently.
+        // transaction serializes independently. The result is byte-identical to
+        // inserting the transactions directly, because `RawBytes` is stored
+        // verbatim. The serialized bytes are inserted in height/index order below.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
         // the multithreading overhead. Small blocks serialize sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
             Vec::new()
+        } else if let Some(precomputed) = precomputed_raw_txs {
+            // Serialized off the committer's critical path (overlapped with the
+            // spent-UTXO reads in `write_block`); use those bytes directly.
+            precomputed
         } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
             use rayon::prelude::*;
             block
@@ -1480,7 +1519,8 @@ impl DiskWriteBatch {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
-            // keeps historical transaction data for this height.
+            // keeps historical transaction data for this height (then
+            // `raw_transactions` holds the pre-serialized bytes in order).
             if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
                 self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
