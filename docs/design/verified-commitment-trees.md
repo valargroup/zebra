@@ -103,6 +103,13 @@ A genesis-empty node still yields `Height(1)`, so "fetch from genesis" falls out
 the node really is at genesis. (Implemented in `root_fetch_start`; regression covered by
 `root_fetch_start_is_one_above_the_verified_tip`.)
 
+The driver also bounds how far peer delivery may run ahead of finalized commits. It fetches
+only up to `committed_through + TREE_AUX_FETCH_AHEAD_ROOTS`, where `committed_through` is the
+peer-source eviction watermark advanced after successful database writes. If the next fetch
+cursor is beyond that cap, the driver waits for commit progress while still servicing targeted
+root refetch requests. This keeps the live `PeerSource` cache bounded by the fetch-ahead
+window plus transient retry/refetch data, rather than by the whole checkpoint range.
+
 ### 4.4 Mode selection: fast under checkpoint sync
 
 The fast-vs-legacy choice is driven by user-facing config, not by env vars. The two axes are
@@ -202,9 +209,10 @@ consumer agree is `vct_db_produced_payload_round_trips`.
 
 Peer mode creates a per-state `TreeAuxRootsWriter` alongside the committer's `PeerSource`.
 `zebra_state::init` returns that handle to `zebrad`, which passes it to the `tree_aux` driver.
-The driver stages the initial fetch locally and publishes it atomically after full-range success;
-the same handle also carries targeted refetch subscriptions, so each state instance pairs its
-committer, root cache, and driver without process-global state.
+The driver stages each bounded fetch window locally and publishes it atomically after that
+window succeeds; the same handle also exposes the committed-root eviction watermark and carries
+targeted refetch subscriptions, so each state instance pairs its committer, root cache, and
+driver without process-global state.
 
 ### 5.4 The `tree_aux` Zakura stream
 
@@ -224,7 +232,9 @@ start_height, count }`, `Roots { roots }`, `RangeUnavailable { start_height, cou
 DoS bounds: `MAX_TA_ROOTS_PER_REQUEST = 4000` and `MAX_TA_MESSAGE_BYTES = 1 MiB`, enforced on
 both encode and decode; the decoder also rejects unknown message types, unsupported frame
 flags, and trailing bytes, and **never preallocates from the untrusted count** (it grows the
-vec as roots are read).
+vec as roots are read). Client-side, the `tree_aux` driver also caps speculative fetch-ahead
+to a fixed number of these request batches beyond the committer's eviction watermark, so cache
+memory is bounded even when peers serve roots faster than blocks commit to disk.
 
 - **Server** (`TreeAuxService`, a `RequestResponseService`): decodes a `GetRoots`, reads roots
   from local state through `TreeAuxStatePort` (§9), and returns `Roots` — or `RangeUnavailable`
@@ -446,8 +456,8 @@ commitment before it influences the anchor set or the history MMR.** Consequence
 - The frozen-frontier fail-closed policy (§8) means a hostile root never corrupts state: it is
   evicted and refused. Eviction + retryable error is what prevents a single malicious peer from
   halting the sync — the bad root is dropped, and any honest peer's root verifies.
-- DoS bounds on the `tree_aux` codec (§5.4) and the no-preallocate-from-count decode protect the
-  serving and client paths.
+- DoS bounds on the `tree_aux` codec (§5.4), the no-preallocate-from-count decode, and the
+  fetch-ahead cap protect the serving and client paths from unbounded memory growth.
 - The auth-data-root cache lock (§6.3) closes a cross-crate API hole that could otherwise
   finalize a block without binding its authorizing data.
 
@@ -463,10 +473,11 @@ reject machinery (downscore + re-request from a different peer, with a hostile-p
 - **Increment 6a — peer source: fetch + serve (happy-path POC, this PR).** The `tree_aux`
   stream (roots-only), the `TreeAuxStatePort` serving side, the driver + `PeerSource`, and the
   peer-source default on Mainnet — the first point at which real nodes obtain roots over the
-  network. Deferred follow-ups: driving the fetch incrementally off live header-sync progress
-  (safety does not depend on it — an unarrived root stays in the legacy/refusal path);
-  multi-peer fanout/straggler hedging; the adversarial peer policy (6b); the fast-node
-  roots-index serving CF (§10) and an RLE wire encoding.
+  network. The initial peer fetch is bounded by finalized commit progress, so peer delivery
+  cannot fill the cache with the entire checkpoint range. Deferred follow-ups: tighter
+  integration with live header-sync progress; multi-peer fanout/straggler hedging; the
+  adversarial peer policy (6b); the fast-node roots-index serving CF (§10) and an RLE wire
+  encoding.
 - **Increment 6b — adversarial peer policy.** Wire `tree_aux` verification failures into
   peer-reputation / reject machinery: downscore the offender and re-request from a different
   peer (bounded retries, peer diversity), with the §8 refusal as the backstop. The
@@ -527,6 +538,10 @@ over the wire rather than a silent legacy sync.
   `tree_aux_serves_real_state_roots_over_the_wire` (a real `populated_state` finalized DB serves
   through the production `StateTreeAuxPort` → `TreeAuxService` over the real loopback transport;
   an above-tip range errors so the committer keeps it legacy).
+- **Driver resource bounds:** pure window-math tests cover initial fetch-ahead, handoff
+  clamping, saturation, and waiting until the committed-root watermark opens more cache room;
+  peer-source tests assert the watermark starts empty, advances on committed-root eviction, and
+  never regresses.
 - **Real-data manual runs (`#[ignore]`, env-gated):** `verifies_real_nu5_range_over_synced_forks`
   verifies the real NU5/V2 range against synced archive forks (corrupted root rejected at H+1).
 - **Headline end-to-end (manual, follow-up):** a fresh node fast-syncing
