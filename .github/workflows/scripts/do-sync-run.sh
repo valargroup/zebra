@@ -15,6 +15,11 @@
 #   SPACES_BUCKET, SPACES_REGION, SPACES_ACCESS_KEY, SPACES_SECRET_KEY
 set -euo pipefail
 
+# The DigitalOcean docker-20-04 image ships Docker but not s3cmd/zstd; install them.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq s3cmd zstd
+
 STATE_DIR=/mnt/zebra-state
 OBJECT="s3://${SPACES_BUCKET}/sync-confidence/state/v${STATE_VERSION}/mainnet/${STATE_KEY}.tar.zst"
 

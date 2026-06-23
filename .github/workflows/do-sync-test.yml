@@ -137,7 +137,9 @@ jobs:
           # NOTE: `date -d` is GNU coreutils (present on ubuntu-latest).
           doctl compute droplet list --tag-name sync-confidence-ci --format ID,Created --no-header | \
           while read -r id created; do
-            age=$(( $(date +%s) - $(date -d "$created" +%s) ))
+            [ -z "$id" ] && continue
+            created_epoch=$(date -d "$created" +%s 2>/dev/null) || continue
+            age=$(( $(date +%s) - created_epoch ))
             [ "$age" -gt 3600 ] && doctl compute droplet delete "$id" -f
           done
           true
