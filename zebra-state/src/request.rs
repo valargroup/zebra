@@ -619,6 +619,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
     }
 }
 
+/// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
 fn transaction_hashes_and_auth_data_root(
     block: &Block,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
@@ -636,6 +637,32 @@ fn transaction_hashes_and_auth_data_root(
         .collect();
 
     (transaction_hashes.into(), auth_data_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    #[test]
+    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
+        let _init_guard = zebra_test::init();
+
+        let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("NU5 mainnet block deserializes");
+
+        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
+        let expected_transaction_hashes: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.hash())
+            .collect();
+
+        assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
+        assert_eq!(auth_data_root, block.auth_data_root());
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
