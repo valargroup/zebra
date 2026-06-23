@@ -206,11 +206,29 @@ impl Sequencer {
     /// Offer a received body to the commit pipeline. Runs the redundancy checks
     /// and (when not redundant) buffers it in the reorder buffer, which takes
     /// ownership of the body's existing `bytes` reservation.
+    #[cfg(test)]
     pub(super) fn accept_body(
         &mut self,
         height: block::Height,
         hash: block::Hash,
         block: Arc<block::Block>,
+        bytes: u64,
+        source_peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        self.accept_buffered_body(
+            height,
+            hash,
+            BufferedBlockBody::Decoded(block),
+            bytes,
+            source_peer,
+        )
+    }
+
+    pub(super) fn accept_buffered_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
@@ -224,7 +242,10 @@ impl Sequencer {
             };
         }
 
-        match self.reorder.insert(height, block, bytes, source_peer) {
+        match self
+            .reorder
+            .insert_body(height, hash, body, bytes, source_peer)
+        {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
             ReorderInsertResult::Duplicate => AcceptOutcome::Redundant {
                 release_bytes: bytes,
