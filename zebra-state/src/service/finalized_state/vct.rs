@@ -276,6 +276,11 @@ impl VctState {
         self.source.invalidate(height);
     }
 
+    /// Discard peer-supplied roots that are no longer needed after `height` has committed.
+    pub(super) fn evict_committed_roots_through(&self, height: block::Height) {
+        self.source.evict_committed_through(height);
+    }
+
     /// The checkpoint handoff height: the boundary below which the fast path skips
     /// per-height note-commitment trees. `None` unless final frontiers are loaded.
     pub(super) fn fast_sync_handoff_height(&self) -> Option<block::Height> {
