@@ -793,10 +793,7 @@ impl Orchard {
             value_balance: Zec::from(value_balance).lossy_zec(),
             value_balance_zat: value_balance.zatoshis(),
             flags: shielded_data.map(|data| {
-                OrchardFlags::new(
-                    data.flags.contains(orchard::Flags::ENABLE_OUTPUTS),
-                    data.flags.contains(orchard::Flags::ENABLE_SPENDS),
-                )
+                OrchardFlags::new(data.flags.outputs_enabled(), data.flags.spends_enabled())
             }),
             anchor: shielded_data.map(|data| data.shared_anchor.bytes_in_display_order()),
             proof: shielded_data.map(|data| data.proof.bytes_in_display_order()),
@@ -1130,7 +1127,7 @@ mod tests {
         let value_balance: Amount = 123i64.try_into().expect("test amount is valid");
         let proof = Halo2Proof(vec![1; ::orchard::Proof::expected_proof_size(1)]);
         let ironwood_shielded_data = ironwood::ShieldedData {
-            flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+            flags: ironwood::Flags::ENABLED,
             value_balance,
             shared_anchor: tree::Root::default(),
             proof: proof.clone(),

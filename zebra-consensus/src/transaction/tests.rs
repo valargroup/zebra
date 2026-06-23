@@ -97,7 +97,7 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
             })
             .expect("V5 tx with only Orchard shielded data");
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::empty();
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
 
         // The check will fail if the transaction has no flags
         assert_eq!(
@@ -106,7 +106,7 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
         );
 
         // If we add ENABLE_SPENDS flag it will pass the inputs check but fails with the outputs
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLE_SPENDS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::OUTPUTS_DISABLED;
 
         assert_eq!(
             check::has_inputs_and_outputs(&tx),
@@ -114,7 +114,7 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
         );
 
         // If we add ENABLE_OUTPUTS flag it will pass the outputs check but fails with the inputs
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLE_OUTPUTS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::SPENDS_DISABLED;
 
         assert_eq!(
             check::has_inputs_and_outputs(&tx),
@@ -122,8 +122,7 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
         );
 
         // Finally make it valid by adding both required flags
-        tx.orchard_shielded_data_mut().unwrap().flags =
-            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLED;
 
         assert!(check::has_inputs_and_outputs(&tx).is_ok());
     }
@@ -210,7 +209,7 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
     let (network, height) = nu6_3_test_network_and_height();
 
     let orchard_withdraw = v6_pool_flow_transaction(
-        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        Some(orchard_shielded_data(10, Flags::OUTPUTS_DISABLED)),
         None,
         vec![transparent_output(10)],
     );
@@ -228,14 +227,8 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
         Ok(Amount::<NonNegative>::zero())
     );
 
-    let orchard_no_flow = v6_pool_flow_transaction(
-        Some(orchard_shielded_data(
-            0,
-            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
-        )),
-        None,
-        vec![],
-    );
+    let orchard_no_flow =
+        v6_pool_flow_transaction(Some(orchard_shielded_data(0, Flags::ENABLED)), None, vec![]);
 
     // Zero value balance leaves the Orchard chain pool unchanged, so Orchard
     // spends and outputs in the same transaction remain valid after NU6.3.
@@ -245,7 +238,7 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
     );
 
     let orchard_deposit = v6_pool_flow_transaction(
-        Some(orchard_shielded_data(-10, Flags::ENABLE_OUTPUTS)),
+        Some(orchard_shielded_data(-10, Flags::SPENDS_DISABLED)),
         None,
         vec![],
     );
@@ -259,14 +252,8 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
-    let orchard_cross_address = v6_pool_flow_transaction(
-        Some(orchard_shielded_data(
-            0,
-            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS | Flags::ENABLE_CROSS_ADDRESS,
-        )),
-        None,
-        vec![],
-    );
+    let orchard_cross_address =
+        v6_pool_flow_transaction(Some(orchard_shielded_data(0, Flags::ENABLED)), None, vec![]);
 
     assert_eq!(
         check::orchard_cross_address_disabled(&orchard_cross_address),
@@ -275,12 +262,7 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
 
     let ironwood_cross_address = v6_pool_flow_transaction(
         None,
-        Some(ironwood_shielded_data(
-            0,
-            ironwood::Flags::ENABLE_SPENDS
-                | ironwood::Flags::ENABLE_OUTPUTS
-                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
-        )),
+        Some(ironwood_shielded_data(0, ironwood::Flags::ENABLED)),
         vec![],
     );
 
@@ -295,8 +277,11 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
 fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu6_3_test_network_and_height();
     let tx = v6_pool_flow_transaction(
-        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
-        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
+        Some(orchard_shielded_data(10, Flags::OUTPUTS_DISABLED)),
+        Some(ironwood_shielded_data(
+            -10,
+            ironwood::Flags::SPENDS_DISABLED,
+        )),
         vec![],
     );
 
@@ -329,7 +314,10 @@ fn orchard_to_ironwood_migration_balances() {
 fn ironwood_withdraw_balances() {
     let tx = v6_pool_flow_transaction(
         None,
-        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
+        Some(ironwood_shielded_data(
+            10,
+            ironwood::Flags::OUTPUTS_DISABLED,
+        )),
         vec![transparent_output(10)],
     );
 
@@ -356,8 +344,10 @@ fn ironwood_withdraw_balances() {
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[tokio::test]
 async fn v6_with_padded_orchard_proof_returns_consensus_error() {
-    let mut orchard_shielded_data =
-        orchard_shielded_data(0, Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS);
+    // A transactional Orchard bundle in a V6 transaction must keep cross-address transfers
+    // disabled, so the full verifier reaches the proof-size check rather than rejecting it for
+    // `OrchardHasEnableCrossAddress` first.
+    let mut orchard_shielded_data = orchard_shielded_data(0, Flags::CROSS_ADDRESS_DISABLED);
     orchard_shielded_data.proof.0.push(0);
 
     let transaction = v6_pool_flow_transaction(Some(orchard_shielded_data), None, vec![]);
@@ -369,10 +359,7 @@ async fn v6_with_padded_orchard_proof_returns_consensus_error() {
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[tokio::test]
 async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
-    let mut ironwood_shielded_data = ironwood_shielded_data(
-        0,
-        ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
-    );
+    let mut ironwood_shielded_data = ironwood_shielded_data(0, ironwood::Flags::ENABLED);
     ironwood_shielded_data.proof.0.push(0);
 
     let transaction = v6_pool_flow_transaction(None, Some(ironwood_shielded_data), vec![]);
@@ -421,7 +408,7 @@ fn v5_transaction_with_orchard_actions_has_flags() {
             })
             .expect("V5 tx with only Orchard actions");
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::empty();
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
 
         // The check will fail if the transaction has no flags
         assert_eq!(
@@ -430,20 +417,19 @@ fn v5_transaction_with_orchard_actions_has_flags() {
         );
 
         // If we add ENABLE_SPENDS flag it will pass.
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLE_SPENDS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::OUTPUTS_DISABLED;
         assert!(check::has_enough_orchard_flags(&tx).is_ok());
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::empty();
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
 
         // If we add ENABLE_OUTPUTS flag instead, it will pass.
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLE_OUTPUTS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::SPENDS_DISABLED;
         assert!(check::has_enough_orchard_flags(&tx).is_ok());
 
-        tx.orchard_shielded_data_mut().unwrap().flags = Flags::empty();
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::from_parts(false, false);
 
         // If we add BOTH ENABLE_SPENDS and ENABLE_OUTPUTS flags it will pass.
-        tx.orchard_shielded_data_mut().unwrap().flags =
-            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+        tx.orchard_shielded_data_mut().unwrap().flags = Flags::ENABLED;
         assert!(check::has_enough_orchard_flags(&tx).is_ok());
     }
 }
@@ -1500,7 +1486,7 @@ fn v5_coinbase_transaction_without_enable_spends_flag_passes_validation() {
 
         let shielded_data = insert_fake_orchard_shielded_data(&mut tx);
 
-        assert!(!shielded_data.flags.contains(Flags::ENABLE_SPENDS));
+        assert!(!shielded_data.flags.spends_enabled());
 
         assert!(check::coinbase_tx_no_prevout_joinsplit_spend(&tx).is_ok());
     }
@@ -1515,9 +1501,9 @@ fn v5_coinbase_transaction_with_enable_spends_flag_fails_validation() {
 
         let shielded_data = insert_fake_orchard_shielded_data(&mut tx);
 
-        assert!(!shielded_data.flags.contains(Flags::ENABLE_SPENDS));
+        assert!(!shielded_data.flags.spends_enabled());
 
-        shielded_data.flags = Flags::ENABLE_SPENDS;
+        shielded_data.flags = Flags::OUTPUTS_DISABLED;
 
         assert_eq!(
             check::coinbase_tx_no_prevout_joinsplit_spend(&tx),
@@ -3104,7 +3090,7 @@ async fn v5_with_duplicate_orchard_action() {
             .expect("tx without transparent, Sprout, or Sapling outputs must have Orchard actions");
 
         // Enable spends
-        orchard_shielded_data.flags = Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+        orchard_shielded_data.flags = Flags::ENABLED;
 
         let duplicate_action = orchard_shielded_data.actions.first().clone();
         let duplicate_nullifier = duplicate_action.action.nullifier;
@@ -3214,7 +3200,7 @@ async fn orchard_disabling_soft_fork_rejects_orchard_actions_in_blocks_and_mempo
     // and `has_enough_orchard_flags`, reaching the soft-fork check.
     tx.orchard_shielded_data_mut()
         .expect("tx without transparent, Sprout, or Sapling data must have Orchard actions")
-        .flags = Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+        .flags = Flags::ENABLED;
 
     // Verify at the transaction's own expiry height, where its NU5 consensus
     // branch id is valid on the default Testnet activation schedule.
@@ -4146,7 +4132,7 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
                 .expect("coinbase V5 tx");
 
             let shielded_data = insert_fake_orchard_shielded_data(&mut transaction);
-            shielded_data.flags = Flags::ENABLE_OUTPUTS;
+            shielded_data.flags = Flags::SPENDS_DISABLED;
 
             let action = fill_action_with_note_encryption_test_vector(
                 &shielded_data.actions.first().action,
@@ -4181,8 +4167,7 @@ fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
             .expect("coinbase V5 tx");
 
         let shielded_data = insert_fake_orchard_shielded_data(&mut fixture);
-        shielded_data.flags =
-            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS;
+        shielded_data.flags = ironwood::Flags::SPENDS_DISABLED;
         shielded_data.value_balance =
             Amount::<NegativeAllowed>::try_from(-1).expect("valid test amount");
 
@@ -4231,7 +4216,7 @@ fn shielded_outputs_are_not_decryptable_for_fake_v5_blocks() {
                 .expect("V5 coinbase tx");
 
             let shielded_data = insert_fake_orchard_shielded_data(&mut tx);
-            shielded_data.flags = Flags::ENABLE_OUTPUTS;
+            shielded_data.flags = Flags::SPENDS_DISABLED;
 
             let action = fill_action_with_note_encryption_test_vector(
                 &shielded_data.actions.first().action,

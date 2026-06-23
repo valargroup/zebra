@@ -48,7 +48,7 @@ fn zip317_counts_ironwood_actions() {
         .expect("test action strategy creates a value")
         .current();
     let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+        flags: ironwood::Flags::ENABLED,
         value_balance: Amount::<NegativeAllowed>::zero(),
         shared_anchor: ironwood::tree::Root::default(),
         proof: Halo2Proof(vec![]),

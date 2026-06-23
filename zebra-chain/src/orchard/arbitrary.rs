@@ -115,14 +115,20 @@ impl Arbitrary for SpendAuthVerificationKeyBytes {
     type Strategy = BoxedStrategy<Self>;
 }
 
-impl Arbitrary for Flags {
-    type Parameters = ();
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (any::<u8>()).prop_map(Self::from_bits_truncate).boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
+/// A strategy yielding the [`Flags`] sets that are valid under the pre-NU6.3 bundle format.
+///
+/// `orchard::Flags` is a foreign type, so we can't implement `Arbitrary` for it here. These
+/// are exactly the four flag sets encodable as the canonical flag bytes `0..=3` under
+/// [`orchard::BundleFormat::PreNu6_3`] (cross-address transfers are implicitly enabled in that
+/// format), matching the values the previous `from_bits_truncate(any::<u8>())` strategy produced.
+pub(crate) fn pre_nu6_3_flags_strategy() -> BoxedStrategy<Flags> {
+    prop_oneof![
+        Just(Flags::ENABLED),
+        Just(Flags::SPENDS_DISABLED),
+        Just(Flags::OUTPUTS_DISABLED),
+        Just(Flags::from_parts(false, false)),
+    ]
+    .boxed()
 }
 
 fn pallas_base_strat() -> BoxedStrategy<pallas::Base> {

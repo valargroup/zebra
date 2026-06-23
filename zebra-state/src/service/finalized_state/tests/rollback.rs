@@ -609,7 +609,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
     let nullifier = action.nullifier;
 
     let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: orchard::Flags::ENABLE_SPENDS,
+        flags: orchard::Flags::OUTPUTS_DISABLED,
         value_balance: Amount::zero(),
         shared_anchor: tree::Root::default(),
         proof: Halo2Proof(vec![0; 4992]),

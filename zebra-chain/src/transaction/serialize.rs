@@ -365,7 +365,7 @@ impl ZcashSerialize for Option<orchard::ShieldedData> {
         serialize_optional_orchard_shielded_data_with_flags(
             self,
             &mut writer,
-            orchard::shielded_data::FlagFormat::PreNu6_3,
+            orchard::BundleFormat::PreNu6_3,
         )
     }
 }
@@ -373,7 +373,7 @@ impl ZcashSerialize for Option<orchard::ShieldedData> {
 fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
     orchard_shielded_data: &Option<orchard::ShieldedData>,
     mut writer: W,
-    flag_format: orchard::shielded_data::FlagFormat,
+    flag_format: orchard::BundleFormat,
 ) -> Result<(), io::Error> {
     match orchard_shielded_data {
         None => {
@@ -399,7 +399,7 @@ fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
 fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
     orchard_shielded_data: &orchard::ShieldedData,
     mut writer: W,
-    flag_format: orchard::shielded_data::FlagFormat,
+    flag_format: orchard::BundleFormat,
 ) -> Result<(), io::Error> {
     // Split the AuthorizedAction
     let (actions, sigs): (Vec<orchard::Action>, Vec<Signature<SpendAuth>>) = orchard_shielded_data
@@ -413,9 +413,14 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
     actions.zcash_serialize(&mut writer)?;
 
     // Denoted as `flagsOrchard` in the spec.
-    orchard_shielded_data
-        .flags
-        .zcash_serialize_with_format(&mut writer, flag_format)?;
+    writer.write_u8(
+        orchard_shielded_data
+            .flags
+            .to_byte(flag_format)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-canonical orchard flags")
+            })?,
+    )?;
 
     // Denoted as `valueBalanceOrchard` in the spec.
     orchard_shielded_data
@@ -443,17 +448,13 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
 
 impl ZcashSerialize for orchard::ShieldedData {
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
-        serialize_orchard_shielded_data_with_flags(
-            self,
-            writer,
-            orchard::shielded_data::FlagFormat::PreNu6_3,
-        )
+        serialize_orchard_shielded_data_with_flags(self, writer, orchard::BundleFormat::PreNu6_3)
     }
 }
 
 fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     mut reader: R,
-    flag_format: orchard::shielded_data::FlagFormat,
+    flag_format: orchard::BundleFormat,
 ) -> Result<Option<orchard::ShieldedData>, SerializationError> {
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
     let actions: Vec<orchard::Action> = (&mut reader).zcash_deserialize_into()?;
@@ -475,8 +476,9 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
 
     // Denoted as `flagsOrchard` in the spec.
     // Consensus: type of each flag is 𝔹, i.e. a bit. This is enforced implicitly
-    // by the format-specific flag deserializer.
-    let flags = orchard::Flags::zcash_deserialize_with_format(&mut reader, flag_format)?;
+    // by the format-specific flag byte codec.
+    let flags = orchard::Flags::from_byte(reader.read_u8()?, flag_format)
+        .ok_or(SerializationError::Parse("invalid orchard flags"))?;
 
     // Denoted as `valueBalanceOrchard` in the spec.
     let value_balance: amount::Amount = (&mut reader).zcash_deserialize_into()?;
@@ -526,10 +528,7 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
 // because the counts are read along with the arrays.
 impl ZcashDeserialize for Option<orchard::ShieldedData> {
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        deserialize_orchard_shielded_data_with_flags(
-            reader,
-            orchard::shielded_data::FlagFormat::PreNu6_3,
-        )
+        deserialize_orchard_shielded_data_with_flags(reader, orchard::BundleFormat::PreNu6_3)
     }
 }
 
@@ -812,7 +811,7 @@ impl ZcashSerialize for Transaction {
                 serialize_optional_orchard_shielded_data_with_flags(
                     orchard_shielded_data,
                     &mut writer,
-                    orchard::shielded_data::FlagFormat::Nu6_3,
+                    orchard::BundleFormat::Nu6_3,
                 )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
@@ -822,7 +821,7 @@ impl ZcashSerialize for Transaction {
                 serialize_optional_orchard_shielded_data_with_flags(
                     ironwood_shielded_data,
                     &mut writer,
-                    orchard::shielded_data::FlagFormat::Nu6_3,
+                    orchard::BundleFormat::Nu6_3,
                 )?;
             }
         }
@@ -1160,7 +1159,7 @@ impl ZcashDeserialize for Transaction {
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
-                    orchard::shielded_data::FlagFormat::Nu6_3,
+                    orchard::BundleFormat::Nu6_3,
                 )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
@@ -1169,7 +1168,7 @@ impl ZcashDeserialize for Transaction {
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
                 let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
-                    orchard::shielded_data::FlagFormat::Nu6_3,
+                    orchard::BundleFormat::Nu6_3,
                 )?;
 
                 let tx = Transaction::V6 {

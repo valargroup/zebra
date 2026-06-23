@@ -336,15 +336,9 @@ impl Transaction {
         self.joinsplit_count() > 0
             || self.sapling_spends_per_anchor().count() > 0
             || (self.orchard_actions().count() > 0
-                && self
-                    .orchard_flags()
-                    .unwrap_or_else(orchard::Flags::empty)
-                    .contains(orchard::Flags::ENABLE_SPENDS))
+                && self.orchard_flags().is_some_and(|f| f.spends_enabled()))
             || (self.ironwood_actions().count() > 0
-                && self
-                    .ironwood_flags()
-                    .unwrap_or_else(ironwood::Flags::empty)
-                    .contains(ironwood::Flags::ENABLE_SPENDS))
+                && self.ironwood_flags().is_some_and(|f| f.spends_enabled()))
     }
 
     /// Does this transaction have shielded outputs?
@@ -354,15 +348,9 @@ impl Transaction {
         self.joinsplit_count() > 0
             || self.sapling_outputs().count() > 0
             || (self.orchard_actions().count() > 0
-                && self
-                    .orchard_flags()
-                    .unwrap_or_else(orchard::Flags::empty)
-                    .contains(orchard::Flags::ENABLE_OUTPUTS))
+                && self.orchard_flags().is_some_and(|f| f.outputs_enabled()))
             || (self.ironwood_actions().count() > 0
-                && self
-                    .ironwood_flags()
-                    .unwrap_or_else(ironwood::Flags::empty)
-                    .contains(ironwood::Flags::ENABLE_OUTPUTS))
+                && self.ironwood_flags().is_some_and(|f| f.outputs_enabled()))
     }
 
     /// Does this transaction have transparent or shielded outputs?
@@ -376,8 +364,7 @@ impl Transaction {
             return true;
         }
         self.orchard_flags()
-            .unwrap_or_else(orchard::Flags::empty)
-            .intersects(orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS)
+            .is_some_and(|f| f.spends_enabled() || f.outputs_enabled())
     }
 
     /// Does this transaction have at least one flag when we have at least one
@@ -387,8 +374,7 @@ impl Transaction {
             return true;
         }
         self.ironwood_flags()
-            .unwrap_or_else(ironwood::Flags::empty)
-            .intersects(ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS)
+            .is_some_and(|f| f.spends_enabled() || f.outputs_enabled())
     }
 
     /// Returns the [`CoinbaseSpendRestriction`] for this transaction,
@@ -1149,7 +1135,7 @@ impl Transaction {
 
     /// Access the [`orchard::Flags`] in this transaction, if there is any,
     /// regardless of version.
-    pub fn orchard_flags(&self) -> Option<orchard::shielded_data::Flags> {
+    pub fn orchard_flags(&self) -> Option<orchard::Flags> {
         self.orchard_shielded_data()
             .map(|orchard_shielded_data| orchard_shielded_data.flags)
     }

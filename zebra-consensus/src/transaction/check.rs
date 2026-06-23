@@ -14,7 +14,6 @@ use chrono::{DateTime, Utc};
 use zebra_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
-    orchard::Flags,
     parameters::{Network, NetworkUpgrade},
     primitives::zcash_note_encryption,
     transaction::{LockTime, Transaction},
@@ -160,12 +159,20 @@ pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionErro
 /// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool uses the Ironwood
 /// circuit in V6 transactions, but consensus still requires transactional Orchard bundles to keep
 /// cross-address transfers disabled. Ironwood shielded data is allowed to set this flag.
+///
+/// This only applies to V6 (and later) transactions, whose Orchard bundles use the NU6.3 flag
+/// format where bit 2 is a meaningful `enableCrossAddress` flag. In pre-NU6.3 (V5) transactions
+/// bit 2 is reserved and must be zero; that rule is already enforced by the flag-byte deserializer,
+/// which rejects the byte before a transaction can be constructed. `orchard::Flags` represents the
+/// implicit pre-NU6.3 state as cross-address-enabled, so this check must not be applied to V5
+/// transactions or it would reject every V5 Orchard bundle.
 pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
+    if tx.version() < 6 {
+        return Ok(());
+    }
+
     if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-        if orchard_shielded_data
-            .flags
-            .contains(Flags::ENABLE_CROSS_ADDRESS)
-        {
+        if orchard_shielded_data.flags.cross_address_enabled() {
             return Err(TransactionError::OrchardHasEnableCrossAddress);
         }
     }
@@ -222,13 +229,13 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         }
 
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-            if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+            if orchard_shielded_data.flags.spends_enabled() {
                 return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
             }
         }
 
         if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
-            if ironwood_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+            if ironwood_shielded_data.flags.spends_enabled() {
                 return Err(TransactionError::CoinbaseHasEnableSpendsIronwood);
             }
         }

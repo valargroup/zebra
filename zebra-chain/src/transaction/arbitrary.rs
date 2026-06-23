@@ -748,16 +748,8 @@ impl Arbitrary for orchard::ShieldedData {
     type Strategy = BoxedStrategy<Self>;
 }
 
-fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<orchard::shielded_data::Flags> {
-    use orchard::shielded_data::Flags;
-
-    prop_oneof![
-        Just(Flags::empty()),
-        Just(Flags::ENABLE_SPENDS),
-        Just(Flags::ENABLE_OUTPUTS),
-        Just(Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS),
-    ]
-    .boxed()
+fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<orchard::Flags> {
+    crate::orchard::arbitrary::pre_nu6_3_flags_strategy()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1107,7 +1099,7 @@ pub fn insert_fake_orchard_shielded_data(
 
     // Place the dummy action inside the Orchard shielded data
     let dummy_shielded_data = orchard::ShieldedData {
-        flags: orchard::Flags::empty(),
+        flags: orchard::Flags::from_parts(false, false),
         value_balance: Amount::try_from(0).expect("invalid transaction amount"),
         shared_anchor: orchard::tree::Root::default(),
         proof: Halo2Proof(vec![]),

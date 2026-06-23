@@ -9,7 +9,7 @@ mod note;
 mod sinsemilla;
 
 #[cfg(any(test, feature = "proptest-impl"))]
-mod arbitrary;
+pub(crate) mod arbitrary;
 #[cfg(test)]
 mod tests;
 
@@ -22,4 +22,6 @@ pub use address::Address;
 pub use commitment::{CommitmentRandomness, NoteCommitment, ValueCommitment};
 pub use keys::Diversifier;
 pub use note::{EncryptedNote, Note, Nullifier, WrappedNoteKey};
-pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};
+pub use shielded_data::{AuthorizedAction, ShieldedData};
+
+pub use ::orchard::{BundleFormat, Flags};

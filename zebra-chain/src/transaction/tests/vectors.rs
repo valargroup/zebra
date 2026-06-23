@@ -145,13 +145,14 @@ fn v5_orchard_cross_address_flag_fails_serialization() {
         unreachable!("test transaction is V5 with Orchard shielded data");
     };
 
-    orchard_shielded_data
-        .flags
-        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+    // Disabling cross-address transfers is unrepresentable in the pre-NU6.3 (V5) format, where
+    // bit 2 is reserved and cross-address transfers are implicitly enabled. Serializing such a
+    // flag set under the V5 format must fail rather than emit a non-canonical flag byte.
+    orchard_shielded_data.flags = crate::orchard::Flags::CROSS_ADDRESS_DISABLED;
 
     let error = tx
         .zcash_serialize_to_vec()
-        .expect_err("V5 Orchard flags must reject reserved cross-address bit");
+        .expect_err("V5 Orchard flags must reject the non-canonical cross-address-disabled set");
 
     assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
@@ -1134,7 +1135,7 @@ fn v6_txid_commits_to_ironwood_digest() {
         .current();
 
     let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        flags: Flags::ENABLED,
         value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
         shared_anchor: tree::Root::default(),
         proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
@@ -1193,7 +1194,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
         .current();
 
     let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        flags: Flags::ENABLED,
         value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
         shared_anchor: test_anchor(1),
         proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
@@ -1332,7 +1333,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
     };
 
     let shielded_data = ShieldedData {
-        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        flags: Flags::ENABLED,
         value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
         shared_anchor: tree::Root::default(),
         // An empty proof is accepted at deserialization time.
