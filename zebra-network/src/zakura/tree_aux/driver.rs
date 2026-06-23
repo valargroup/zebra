@@ -1,10 +1,11 @@
 //! Client-side `tree_aux` root fetching.
 //!
 //! [`fetch_roots`] pulls verified per-block commitment roots for a height range from
-//! connected peers and hands each contiguous batch to a sink. The node wires that sink
-//! to a `PeerSource`, so the fast committer reads peer-fetched roots through the same
-//! seam it uses for the fixture. Run *ahead of* body download (header-sync-aligned), so
-//! a range's coverage is known before it is committed.
+//! connected peers and hands each contiguous batch to a sink. The node stages those
+//! batches until the requested range succeeds, then publishes the complete range to
+//! `PeerSource`, so the fast committer reads peer-fetched roots through the same seam
+//! it uses for the fixture. Run *ahead of* body download (header-sync-aligned), so a
+//! range's coverage is known before it is committed.
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},

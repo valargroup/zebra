@@ -83,8 +83,9 @@ Commitment roots are header-adjacent verified metadata, not body data: tiny, ver
 the header chain, servable only by a node holding the validated headers, and needed *buffered
 ahead of* the committer. So `tree_aux` is a **separate Zakura stream** (its own capability
 bit) **templated and timed on `header_sync`, not `block_sync`** — driven ahead of body
-download. Because header sync runs ahead of block sync, a range's coverage is known before it
-is committed, which is what keeps the legacy fallback sound by construction.
+download. The driver stages fetched batches and only publishes them to the committer cache after
+the whole verified-tip-to-handoff range succeeds, so a range's coverage is known before any of
+its roots can trigger the fast path.
 
 The one coupling to bodies: verifying a root via the ZIP-221 MMR leaf needs the block's
 tx-counts (from the body), so roots are **consumed** at commit time with bodies even though
@@ -188,11 +189,11 @@ Implementations:
   scaffolding).
 - `VecRootSource` — an in-process payload (used for the producer→consumer round-trip test).
 - `PeerSource` — a fillable, transport-backed cache (the production default). Its
-  `PeerSourceWriter` is filled by the `tree_aux` driver as verified ranges arrive; the
-  committer reads it per height. The handoff frontier is held immutably from the embedded
-  constant, so only roots come from the network. `invalidate` evicts a rejected root from the
-  cache so the next read misses and a re-fetch from another peer can replace it (the key to
-  not letting one malicious peer wedge a bad root in place — §8, §11).
+  `PeerSourceWriter` is filled by the `tree_aux` driver only after the initial requested range
+  has been fully fetched; the committer reads it per height. The handoff frontier is held
+  immutably from the embedded constant, so only roots come from the network. `invalidate` evicts
+  a rejected root from the cache so the next read misses and a re-fetch from another peer can
+  replace it (the key to not letting one malicious peer wedge a bad root in place — §8, §11).
 
 The **producer** half (`produce_block_roots(db, range)` / `produce_final_frontiers(db,
 height)`) derives the same payload from a database's per-height trees — the serving read path
@@ -201,7 +202,8 @@ consumer agree is `vct_db_produced_payload_round_trips`.
 
 Peer mode creates a per-state `TreeAuxRootsWriter` alongside the committer's `PeerSource`.
 `zebra_state::init` returns that handle to `zebrad`, which passes it to the `tree_aux` driver.
-The same handle also carries targeted refetch subscriptions, so each state instance pairs its
+The driver stages the initial fetch locally and publishes it atomically after full-range success;
+the same handle also carries targeted refetch subscriptions, so each state instance pairs its
 committer, root cache, and driver without process-global state.
 
 ### 5.4 The `tree_aux` Zakura stream
@@ -378,13 +380,13 @@ chain (the one-block lag) is likewise **deferred, not committed on faith**: an u
 root is rejected before it is persisted, rather than one block too late (when it would be
 irreversibly on disk and could wedge the sync). A trusted local fixture is exempt and commits
 its tip root on the in-arrears check. This is the safety contract: **a bad, slow, or
-withholding peer degrades to legacy speed before freeze, or to a bounded wait/refetch loop
-inside the frozen window; it never writes wrong state and does not reset the block queue for
-root availability.** A height that stays stuck on a retryable stall past a threshold escalates
+withholding peer cannot publish an incomplete initial prefix; after freeze, a later bad or
+missing refetch never writes wrong state and does not reset the block queue for root
+availability.** A height that stays stuck on a retryable stall past a threshold escalates
 to an error-level log and the `state.vct.root.stalled.height` gauge, so a genuinely unservable
-root surfaces loudly instead of a silent stall. Because coverage is known ahead of bodies
-(§4.2), the common case is that
-the frozen window is never entered without its roots in hand. Counters:
+root surfaces loudly instead of a silent stall. Because the initial driver only publishes after
+full-range success (§4.2), the common case is that the frozen window is never entered without
+its roots in hand. Counters:
 `state.vct.root.rejected.count` (evicted after failing verification),
 `state.vct.root.unavailable.count` (frozen-frontier hole refused),
 `state.vct.root.await_successor.count` (deferred for a missing successor),

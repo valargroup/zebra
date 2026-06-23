@@ -2,10 +2,9 @@
 //!
 //! Serving side: [`StateTreeAuxPort`] answers inbound `GetRoots` from local state via
 //! [`ReadRequest::BlockRoots`]. Client side: [`run_tree_aux_driver`] fetches the per-block
-//! commitment roots for the verified-tip→checkpoint range from a peer and writes them into the
-//! committer's cache ([`TreeAuxRootsWriter`]) *ahead of* body commit, so the fast path can
-//! fold them in at commit time. The handoff frontier is embedded in the binary, so only
-//! roots travel over the wire.
+//! commitment roots for the verified-tip→checkpoint range from peers, then publishes the
+//! complete range into the committer's cache ([`TreeAuxRootsWriter`]) *ahead of* body commit.
+//! The handoff frontier is embedded in the binary, so only roots travel over the wire.
 //!
 //! Runs when the state committer exposes a `tree_aux` roots writer. On Mainnet this
 //! is the default fast path under checkpoint sync; `consensus.checkpoint_sync = false`
@@ -88,10 +87,11 @@ where
 /// Fetch and refetch verified-tip→checkpoint per-block roots from peers into the committer cache.
 ///
 /// Once an outbound peer is available, fetch the roots the committer still needs — the range from
-/// this node's verified tip up to the checkpoint — and write each batch into `writer` ahead of
-/// body commit. The driver then stays alive for targeted root-refetch requests from the committer:
-/// a frozen-frontier root miss parks the checkpoint block, asks this driver to refill that height
-/// from peers, and retries the same commit without resetting the block queue.
+/// this node's verified tip up to the checkpoint — and publish them to `writer` only after the
+/// whole initial range has been fetched. The driver then stays alive for targeted root-refetch
+/// requests from the committer: a frozen-frontier root miss parks the checkpoint block, asks this
+/// driver to refill that height from peers, and retries the same commit without resetting the block
+/// queue.
 ///
 /// The fetch starts at `verified_tip + 1`, not genesis: heights at or below the verified tip are
 /// already committed, so their roots are never looked up. Fetching from genesis on a node that
@@ -196,18 +196,37 @@ pub(crate) async fn run_tree_aux_driver(
     }
 }
 
-/// Fetch `[from, to]` roots and insert every returned batch into the committer's peer cache.
+/// Fetch `[from, to]` roots and insert the complete range into the committer's peer cache.
 ///
 /// This is the write side of the `tree_aux` source: `fetch_roots` validates the transport
-/// response shape, then the writer makes those roots visible to the finalized committer. The
-/// roots are still untrusted here; the committer verifies them against checkpoint headers.
+/// response shape while staging each batch locally. Only a full-range success makes those roots
+/// visible to the finalized committer. The roots are still untrusted here; the committer verifies
+/// them against checkpoint headers.
 async fn fetch_roots_into_writer(
     supervisor: &ZakuraSupervisorHandle,
     writer: &TreeAuxRootsWriter,
     from: block::Height,
     to: block::Height,
 ) -> Result<(), BoxError> {
-    fetch_roots(supervisor, from, to, |batch| writer.insert_roots(batch)).await
+    let mut staged = Vec::new();
+    // Keep partial batches private: if the fetch errors or this future is cancelled by
+    // `select!`, the staged prefix drops here without reaching `PeerSource`.
+    let result = fetch_roots(supervisor, from, to, |batch| staged.extend(batch)).await;
+    insert_staged_roots_after_success(staged, result, |roots| writer.insert_roots(roots))
+}
+
+/// Publish staged roots only if the fetch for their whole requested range succeeded.
+fn insert_staged_roots_after_success<F>(
+    staged: Vec<BlockCommitmentRoots>,
+    result: Result<(), BoxError>,
+    insert_roots: F,
+) -> Result<(), BoxError>
+where
+    F: FnOnce(Vec<BlockCommitmentRoots>),
+{
+    result?;
+    insert_roots(staged);
+    Ok(())
 }
 
 /// Handle one targeted root-refetch request from the finalized committer.
@@ -498,6 +517,43 @@ mod tests {
 
         // Finalized tip above the best-chain tip: use the finalized tip.
         assert_eq!(root_fetch_start(at(200), at(150), &net), h(201));
+    }
+
+    #[test]
+    fn staged_roots_insert_after_full_fetch_success() -> Result<(), BoxError> {
+        let staged = vec![root_at(42), root_at(43)];
+        let expected = staged.clone();
+        let mut inserted = None;
+
+        insert_staged_roots_after_success(staged, Ok(()), |roots| inserted = Some(roots))?;
+
+        assert_eq!(
+            inserted,
+            Some(expected),
+            "a successful full-range fetch publishes the staged roots exactly once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_roots_are_dropped_after_fetch_error() {
+        let staged_prefix = vec![root_at(42), root_at(43)];
+        let mut inserted = false;
+
+        let result = insert_staged_roots_after_success(
+            staged_prefix,
+            Err("suffix unavailable".into()),
+            |_roots| inserted = true,
+        );
+
+        assert!(
+            result.is_err(),
+            "the original fetch error is returned to the retry loop"
+        );
+        assert!(
+            !inserted,
+            "a failed full-range fetch must not publish its staged prefix"
+        );
     }
 
     #[tokio::test]
