@@ -17,6 +17,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, RwLock},
 };
 
@@ -47,6 +48,93 @@ pub(super) struct FinalFrontiers {
     pub(super) sprout: Arc<sprout::tree::NoteCommitmentTree>,
 }
 
+/// Errors parsing [`FinalFrontiers`] from the embedded/frontier-file byte format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum FinalFrontiersParseError {
+    /// The input ended before the 4-byte height field.
+    MissingHeight {
+        /// The total number of bytes in the input.
+        actual_len: usize,
+    },
+    /// The input ended before a tree blob's 4-byte length prefix.
+    MissingLength {
+        /// The tree whose length prefix was being read.
+        tree: &'static str,
+        /// Byte offset where the length prefix starts.
+        offset: usize,
+        /// Bytes remaining from `offset`.
+        remaining: usize,
+    },
+    /// A tree blob's length prefix points past the end of the input.
+    TruncatedBlob {
+        /// The tree whose blob was being read.
+        tree: &'static str,
+        /// Byte offset where the blob starts.
+        offset: usize,
+        /// Blob length from the prefix.
+        expected_len: usize,
+        /// Bytes remaining from `offset`.
+        remaining: usize,
+    },
+    /// A tree blob's length prefix overflows `usize` arithmetic.
+    LengthOverflow {
+        /// The tree whose blob was being read.
+        tree: &'static str,
+        /// Byte offset where the blob starts.
+        offset: usize,
+        /// Blob length from the prefix.
+        len: usize,
+    },
+    /// The parser consumed all expected fields, but extra bytes remained.
+    TrailingBytes {
+        /// Byte offset where the trailing data starts.
+        offset: usize,
+        /// Number of trailing bytes.
+        trailing_len: usize,
+    },
+}
+
+impl fmt::Display for FinalFrontiersParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FinalFrontiersParseError::MissingHeight { actual_len } => write!(
+                f,
+                "missing final frontier height: expected 4 bytes, got {actual_len}"
+            ),
+            FinalFrontiersParseError::MissingLength {
+                tree,
+                offset,
+                remaining,
+            } => write!(
+                f,
+                "missing {tree} frontier length prefix at byte {offset}: expected 4 bytes, got {remaining}"
+            ),
+            FinalFrontiersParseError::TruncatedBlob {
+                tree,
+                offset,
+                expected_len,
+                remaining,
+            } => write!(
+                f,
+                "truncated {tree} frontier blob at byte {offset}: length prefix says {expected_len} bytes, but only {remaining} remain"
+            ),
+            FinalFrontiersParseError::LengthOverflow { tree, offset, len } => write!(
+                f,
+                "{tree} frontier blob length overflows at byte {offset}: {len} bytes"
+            ),
+            FinalFrontiersParseError::TrailingBytes {
+                offset,
+                trailing_len,
+            } => write!(
+                f,
+                "unexpected trailing final frontier bytes at byte {offset}: {trailing_len} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FinalFrontiersParseError {}
+
 impl FinalFrontiers {
     /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
     /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes. Used to
@@ -68,29 +156,83 @@ impl FinalFrontiers {
     }
 
     /// Parse the embedded byte format written by [`Self::to_bytes`].
-    pub(super) fn from_bytes(bytes: &[u8]) -> Self {
-        let height = block::Height(u32::from_le_bytes(
-            bytes[0..4].try_into().expect("4 bytes for height"),
-        ));
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self, FinalFrontiersParseError> {
+        let height_bytes = bytes
+            .get(0..4)
+            .ok_or(FinalFrontiersParseError::MissingHeight {
+                actual_len: bytes.len(),
+            })?;
+        let height_bytes: [u8; 4] =
+            height_bytes
+                .try_into()
+                .map_err(|_| FinalFrontiersParseError::MissingHeight {
+                    actual_len: bytes.len(),
+                })?;
+        let height = block::Height(u32::from_le_bytes(height_bytes));
 
         // Read three `u32`-length-prefixed blobs starting after the height.
-        let mut cursor = 4;
-        let mut next_blob = |bytes: &[u8]| -> Vec<u8> {
-            let len = u32::from_le_bytes(
-                bytes[cursor..cursor + 4]
+        let mut cursor: usize = 4;
+        let mut next_blob = |tree: &'static str| -> Result<Vec<u8>, FinalFrontiersParseError> {
+            let len_end =
+                cursor
+                    .checked_add(4)
+                    .ok_or(FinalFrontiersParseError::LengthOverflow {
+                        tree,
+                        offset: cursor,
+                        len: 4,
+                    })?;
+            let len_bytes =
+                bytes
+                    .get(cursor..len_end)
+                    .ok_or(FinalFrontiersParseError::MissingLength {
+                        tree,
+                        offset: cursor,
+                        remaining: bytes.len().saturating_sub(cursor),
+                    })?;
+            let len_bytes: [u8; 4] =
+                len_bytes
                     .try_into()
-                    .expect("4 bytes for length"),
-            ) as usize;
-            cursor += 4;
-            let blob = bytes[cursor..cursor + len].to_vec();
-            cursor += len;
-            blob
+                    .map_err(|_| FinalFrontiersParseError::MissingLength {
+                        tree,
+                        offset: cursor,
+                        remaining: bytes.len().saturating_sub(cursor),
+                    })?;
+            // Zebra's supported platforms have at least 32-bit `usize`, so every
+            // u32 length prefix fits in memory indexes.
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            cursor = len_end;
+            let blob_end =
+                cursor
+                    .checked_add(len)
+                    .ok_or(FinalFrontiersParseError::LengthOverflow {
+                        tree,
+                        offset: cursor,
+                        len,
+                    })?;
+            let blob =
+                bytes
+                    .get(cursor..blob_end)
+                    .ok_or(FinalFrontiersParseError::TruncatedBlob {
+                        tree,
+                        offset: cursor,
+                        expected_len: len,
+                        remaining: bytes.len().saturating_sub(cursor),
+                    })?;
+            cursor = blob_end;
+            Ok(blob.to_vec())
         };
-        let sapling = next_blob(bytes);
-        let orchard = next_blob(bytes);
-        let sprout = next_blob(bytes);
+        let sapling = next_blob("sapling")?;
+        let orchard = next_blob("orchard")?;
+        let sprout = next_blob("sprout")?;
 
-        FinalFrontiers {
+        if cursor != bytes.len() {
+            return Err(FinalFrontiersParseError::TrailingBytes {
+                offset: cursor,
+                trailing_len: bytes.len() - cursor,
+            });
+        }
+
+        Ok(FinalFrontiers {
             height,
             sapling: Arc::new(<sapling::tree::NoteCommitmentTree as FromDisk>::from_bytes(
                 sapling,
@@ -101,7 +243,7 @@ impl FinalFrontiers {
             sprout: Arc::new(<sprout::tree::NoteCommitmentTree as FromDisk>::from_bytes(
                 sprout,
             )),
-        }
+        })
     }
 }
 
@@ -469,7 +611,8 @@ mod tests {
             sprout: Arc::new(Default::default()),
         };
 
-        let parsed = FinalFrontiers::from_bytes(&frontiers.to_bytes());
+        let parsed =
+            FinalFrontiers::from_bytes(&frontiers.to_bytes()).expect("frontiers should parse");
 
         assert_eq!(parsed.height, frontiers.height, "height round-trips");
         assert_eq!(
