@@ -96,7 +96,10 @@ const DATABASE_FORMAT_VERSION: u64 = 27;
 /// design §4): a compact per-height `(sapling_root, orchard_root)` map every node writes so a
 /// fast-synced node can serve `tree_aux` roots without per-height trees. New databases populate
 /// it going forward; existing ones open with it empty and serve from per-height trees as before.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 4;
+///
+/// Version 5 repairs incompatible stored history-tree bytes on open before background format
+/// checks read the tip tree.
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 5;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

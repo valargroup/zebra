@@ -517,15 +517,7 @@ impl FinalizedState {
             );
         }
 
-        // A *completed* verified-commitment-trees fast sync is NOT refused here. Fast sync is
-        // the default under checkpoint sync for both Archive and Pruned storage modes, so a
-        // fast-synced database must reopen in any storage mode (the common case after the
-        // handoff marker is written). The per-height trees below the handoff were never
-        // written, so historical tree/subtree RPCs return a typed archive-mode error below the
-        // handoff (§9) — that limitation is enforced at the RPC boundary, not by refusing to
-        // reopen. (Unlike pruning, fast sync deletes nothing: reopening loses no servable data.)
-        //
-        // But an *interrupted* fast sync — frozen frontier, tip still below the handoff — can
+        // An *interrupted* fast sync — frozen frontier, tip still below the handoff — can
         // only be safely resumed by the fast path (which supplies the verified roots). The
         // on-disk frontier is stale, so the committer fails closed on every below-handoff
         // height with no supplied root (§8). Turning the fast path off mid-sync with
