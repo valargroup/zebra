@@ -39,7 +39,10 @@ type OrchardTree = Arc<zebra_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zebra_chain::sprout::tree::NoteCommitmentTree>;
 
 fn enable_vct_test_fixture_source(state: &mut FinalizedState, roots: TestRootMap) {
-    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(roots, None)));
+    state.enable_vct_fast_source(
+        Box::new(commitment_aux::FixtureSource::new(roots, None)),
+        false,
+    );
 }
 
 fn enable_vct_test_fixture_source_with_handoff(
@@ -50,15 +53,18 @@ fn enable_vct_test_fixture_source_with_handoff(
     orchard: OrchardTree,
     sprout: SproutTree,
 ) {
-    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(
-        roots,
-        Some(commitment_aux::FinalFrontiers {
-            height: handoff_height,
-            sapling,
-            orchard,
-            sprout,
-        }),
-    )));
+    state.enable_vct_fast_source(
+        Box::new(commitment_aux::FixtureSource::new(
+            roots,
+            Some(commitment_aux::FinalFrontiers {
+                height: handoff_height,
+                sapling,
+                orchard,
+                sprout,
+            }),
+        )),
+        false,
+    );
 }
 
 #[test]
@@ -619,7 +625,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             writer.insert_roots(peer_roots);
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(source));
+            fast.enable_vct_fast_source(Box::new(source), true);
 
             // Commit up to (but not including) the tip target, each with its successor.
             for i in 0..tip_target {
@@ -751,7 +757,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             writer.insert_roots(peer_roots);
 
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(source));
+            fast.enable_vct_fast_source(Box::new(source), true);
 
             for i in 0..target {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -1449,10 +1455,10 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .into_iter()
                 .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
                 .collect();
-            fast.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(
-                produced_roots,
-                None,
-            )));
+            fast.enable_vct_fast_source(
+                Box::new(commitment_aux::FixtureSource::new(produced_roots, None)),
+                false,
+            );
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = Some((blocks[i + 1].block.clone(), None));
@@ -1543,7 +1549,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             // untrusted source defers a tip commit with no successor (covered by
             // `vct_peer_source_defers_unverifiable_tip_root_until_successor`).
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(peer_source));
+            fast.enable_vct_fast_source(Box::new(peer_source), true);
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = Some((blocks[i + 1].block.clone(), None));

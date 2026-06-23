@@ -254,8 +254,8 @@ impl FinalFrontiers {
 /// trees locally and never consults a source; the fast verified path reads roots
 /// from *some* source and verifies them against the headers. The production source is
 /// [`PeerSource`]; tests may install a trusted local source to isolate committer
-/// behavior. The trait carries no trust by itself: every supplied root is verified
-/// against the checkpoint-committed headers before commit.
+/// behavior. The trait carries no trust policy by itself: the owning VCT state decides
+/// whether supplied roots must be confirmed by a buffered successor before commit.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
     fn fast_root(
@@ -285,20 +285,6 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// for an uncommitted block. The default is a no-op for test-only local sources; the
     /// peer source uses this to keep its live fetch-ahead cache bounded during sync.
     fn evict_committed_through(&self, _height: block::Height) {}
-
-    /// Whether the committer must confirm each supplied root against a *buffered successor*
-    /// before committing it (the one-block-lag verification, design §6).
-    ///
-    /// A block's roots are only committed by the next block's header, so a root committed
-    /// without a successor to confirm it is unverified at commit time and only checked one
-    /// block later — by which point it is irreversibly on disk. For an **untrusted** source
-    /// (peers), a single wrong tip root would then wedge the sync with no recovery, so the
-    /// committer must instead *defer* such a block until its successor is buffered. Returns
-    /// `true` for the peer source; the default `false` is for trusted test-only sources,
-    /// which are not adversarial and may commit a tip root on the in-arrears check.
-    fn requires_verified_successor(&self) -> bool {
-        false
-    }
 }
 
 /// The shared in-memory representation behind the concrete sources: a height→roots
@@ -518,13 +504,6 @@ impl CommitmentRootSource for PeerSource {
             }
             cache.committed_through = Some(height.0);
         }
-    }
-
-    fn requires_verified_successor(&self) -> bool {
-        // Peer-supplied roots are untrusted: never commit one without a buffered successor
-        // to confirm it, so a wrong tip root is rejected before it is persisted rather than
-        // detected one block too late (see the trait method).
-        true
     }
 }
 
@@ -788,24 +767,6 @@ mod tests {
             writer.committed_through(),
             Some(block::Height(42)),
             "committed watermark never regresses"
-        );
-    }
-
-    /// Only the untrusted peer source requires a buffered successor before committing a
-    /// supplied root; the trusted local fixture does not. This is the trust boundary the
-    /// committer's deferral guard keys on, so it must not silently flip for either source.
-    #[test]
-    fn only_the_peer_source_requires_a_verified_successor() {
-        let (peer, _writer) = PeerSource::new(None);
-        assert!(
-            peer.requires_verified_successor(),
-            "the untrusted peer source must confirm each root against a successor"
-        );
-
-        let fixture = FixtureSource::new(HashMap::new(), None);
-        assert!(
-            !fixture.requires_verified_successor(),
-            "the trusted local fixture commits its tip root on the in-arrears check"
         );
     }
 }

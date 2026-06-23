@@ -17,7 +17,11 @@ use std::sync::{
 
 #[cfg(test)]
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
-use zebra_chain::{block, orchard, parameters::Network, sapling, sprout};
+use zebra_chain::{
+    block, orchard,
+    parameters::{Network, NetworkUpgrade},
+    sapling, sprout,
+};
 
 use super::commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource, PeerSourceHandle};
 
@@ -39,6 +43,9 @@ pub(crate) struct VctState {
     /// Where the verified per-block roots and handoff frontiers come from. The
     /// committer reads roots/handoff/frontiers through this seam only.
     source: Box<dyn CommitmentRootSource>,
+    /// Whether roots from this VCT state must be confirmed against a buffered successor
+    /// before they are committed.
+    requires_verified_successor: bool,
     /// Count of blocks that took the fast (skip-recompute) path, for the run summary.
     fast_count: AtomicU64,
     /// Count of fast blocks whose own commitment check was skipped because the
@@ -104,6 +111,7 @@ impl VctState {
                 Some(Arc::new(VctState {
                     fast: true,
                     source: Box::new(source),
+                    requires_verified_successor: true,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
                     peer_source_handle: Some(peer_source_handle),
@@ -119,13 +127,6 @@ impl VctState {
     /// `true` when the fast (skip-recompute) path is active.
     pub(super) fn is_fast(&self) -> bool {
         self.fast
-    }
-
-    /// `true` when this source's roots are untrusted, so the committer must confirm each
-    /// against a buffered successor before committing it (the peer source). See
-    /// [`CommitmentRootSource::requires_verified_successor`](super::commitment_aux::CommitmentRootSource::requires_verified_successor).
-    pub(super) fn requires_verified_successor(&self) -> bool {
-        self.source.requires_verified_successor()
     }
 
     /// The per-state peer-source driver handle, if this committer uses the `tree_aux`
@@ -154,6 +155,28 @@ impl VctState {
             return None;
         }
         self.source.fast_root(height)
+    }
+
+    /// `true` when committing `height` on the fast path needs a buffered successor before
+    /// it can safely persist this block's supplied roots.
+    ///
+    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
+    /// checkpoint handoff is exempt because its embedded final frontiers are verified
+    /// against this block's roots before the real tip treestate is written; trusted
+    /// local fixtures can commit their tip root on the in-arrears check.
+    pub(super) fn fast_root_needs_successor(
+        &self,
+        height: block::Height,
+        network: &Network,
+    ) -> bool {
+        self.fast
+            && self.fast_root(height).is_some()
+            && self.requires_verified_successor
+            && self
+                .source
+                .final_frontiers()
+                .is_none_or(|frontiers| frontiers.height != height)
+            && Some(height) >= NetworkUpgrade::Heartwood.activation_height(network)
     }
 
     /// Discard the supplied root for `height` after it failed verification, so a re-fetch
@@ -216,10 +239,14 @@ impl VctState {
     /// (e.g. a payload produced from a database), so the producer→consumer round-trip
     /// can be exercised without networking.
     #[cfg(test)]
-    pub(super) fn test_with_source(source: Box<dyn CommitmentRootSource>) -> Arc<Self> {
+    pub(super) fn test_with_source(
+        source: Box<dyn CommitmentRootSource>,
+        requires_verified_successor: bool,
+    ) -> Arc<Self> {
         Arc::new(VctState {
             fast: true,
             source,
+            requires_verified_successor,
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
             peer_source_handle: None,
@@ -318,6 +345,40 @@ mod tests {
         assert_eq!(select_source_mode(false, false), Legacy);
         // No embedded frontiers (e.g. Testnet): legacy, never peer, even under checkpoint sync.
         assert_eq!(select_source_mode(true, false), Legacy);
+    }
+
+    #[test]
+    fn successor_policy_is_vct_state_data() {
+        let network = Network::Mainnet;
+        let height = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("mainnet has a Heartwood activation height");
+        let root_map =
+            || std::iter::once((height.0, (Default::default(), Default::default()))).collect();
+
+        let trusted = VctState::test_with_source(
+            Box::new(super::super::commitment_aux::FixtureSource::new(
+                root_map(),
+                None,
+            )),
+            false,
+        );
+        assert!(
+            !trusted.fast_root_needs_successor(height, &network),
+            "trusted fixture roots can commit without a buffered successor"
+        );
+
+        let untrusted = VctState::test_with_source(
+            Box::new(super::super::commitment_aux::FixtureSource::new(
+                root_map(),
+                None,
+            )),
+            true,
+        );
+        assert!(
+            untrusted.fast_root_needs_successor(height, &network),
+            "untrusted roots defer until a buffered successor verifies them"
+        );
     }
 
     #[test]
