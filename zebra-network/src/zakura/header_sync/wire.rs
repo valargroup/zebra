@@ -4,9 +4,9 @@ use super::{config::*, error::*, validation::*, *};
 pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// Version of the native header-sync stream.
 ///
-/// Version 2 intentionally breaks stream-5 compatibility before header sync is
-/// deployed: `Headers` now carries one advisory body-size hint per header.
-pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 2;
+/// Version 4 makes header-carried tree-aux roots optional all-or-nothing
+/// metadata. Headers remain the required propagation payload.
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 4;
 
 /// Peer status advertisement.
 pub const MSG_HS_STATUS: u8 = 1;
@@ -28,7 +28,10 @@ pub const DEFAULT_HS_MAX_INFLIGHT: u16 = 10;
 
 pub(super) const HEADER_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_COUNT_BYTES: usize = 4;
+pub(super) const HEADER_SYNC_HAS_ROOTS_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_BODY_SIZE_BYTES: usize = 4;
+/// Encoded [`BlockCommitmentRoots`]: height + Sapling root + Orchard root.
+pub(super) const HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES: usize = 4 + 32 + 32;
 pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
 pub(super) const REGTEST_HEADER_BYTES: usize = 177;
 pub(super) const HEADER_SYNC_FANOUT: usize = 3;
@@ -48,7 +51,10 @@ const _: () = assert!(MAX_HS_MESSAGE_BYTES < LOCAL_MAX_MESSAGE_BYTES as usize);
 const _: () = assert!(
     HEADER_SYNC_MESSAGE_TYPE_BYTES
         + HEADER_SYNC_COUNT_BYTES
-        + (COMMON_HEADER_BYTES + HEADER_SYNC_BODY_SIZE_BYTES) * (DEFAULT_HS_RANGE as usize)
+        + (COMMON_HEADER_BYTES
+            + HEADER_SYNC_BODY_SIZE_BYTES
+            + HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES)
+            * (DEFAULT_HS_RANGE as usize)
         < MAX_HS_MESSAGE_BYTES
 );
 
@@ -63,15 +69,20 @@ pub enum HeaderSyncMessage {
         start_height: block::Height,
         /// Requested header count.
         count: u32,
+        /// Whether the requester wants all-or-nothing tree-aux roots.
+        want_tree_aux_roots: bool,
     },
     /// A bounded contiguous header run with one advisory body-size hint per header.
     ///
-    /// A `0` size means "unknown"; the hint is not consensus data.
+    /// A `0` size means "unknown"; the hint is not consensus data. Tree-aux roots
+    /// are peer-sourced execution hints and are verified by state before use.
     Headers {
         /// Headers in ascending height order.
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
+        /// Per-height commitment roots, parallel to `headers`.
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     },
     /// Full block tip-flood payload.
     NewBlock(Arc<block::Block>),
@@ -97,21 +108,29 @@ impl HeaderSyncMessage {
             Self::GetHeaders {
                 start_height,
                 count,
+                want_tree_aux_roots,
             } => {
                 validate_get_headers_count(*count)?;
                 write_height(&mut bytes, *start_height)?;
                 bytes.write_u32::<LittleEndian>(*count)?;
+                bytes.write_u8(u8::from(*want_tree_aux_roots))?;
             }
             Self::Headers {
                 headers,
                 body_sizes,
+                tree_aux_roots,
             } => {
                 validate_headers_len(headers.len(), usize_from_u32(MAX_HS_RANGE, "headers cap")?)?;
                 validate_body_sizes_len(headers.len(), body_sizes.len())?;
+                validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
                 bytes.write_u32::<LittleEndian>(u32_from_usize(headers.len(), "headers count")?)?;
+                bytes.write_u8(u8::from(!tree_aux_roots.is_empty()))?;
                 for (header, body_size) in headers.iter().zip(body_sizes) {
                     header.zcash_serialize(&mut bytes)?;
                     bytes.write_u32::<LittleEndian>(*body_size)?;
+                }
+                for roots in tree_aux_roots {
+                    roots.zcash_serialize(&mut bytes)?;
                 }
             }
             Self::NewBlock(block) => {
@@ -145,27 +164,44 @@ impl HeaderSyncMessage {
             MSG_HS_GET_HEADERS => {
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
+                let want_tree_aux_roots = read_bool_marker(&mut reader, "want_tree_aux_roots")?;
                 validate_get_headers_count(count)?;
                 Self::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots,
                 }
             }
             MSG_HS_HEADERS => {
                 let count = usize_from_u32(reader.read_u32::<LittleEndian>()?, "headers count")?;
+                let has_roots = read_bool_marker(&mut reader, "has_roots")?;
                 let Some(max_headers) = context.headers_response_limit()? else {
                     return Err(HeaderSyncWireError::UnsolicitedHeaders);
                 };
+                if has_roots && !context.wants_tree_aux_roots() {
+                    return Err(HeaderSyncWireError::UnrequestedTreeAuxRoots);
+                }
                 validate_headers_len(count, max_headers)?;
                 let mut headers = Vec::with_capacity(count);
                 let mut body_sizes = Vec::with_capacity(count);
+                let mut tree_aux_roots = if has_roots {
+                    Vec::with_capacity(count)
+                } else {
+                    Vec::new()
+                };
                 for _ in 0..count {
                     headers.push(Arc::new(block::Header::zcash_deserialize(&mut reader)?));
                     body_sizes.push(reader.read_u32::<LittleEndian>()?);
                 }
+                if has_roots {
+                    for _ in 0..count {
+                        tree_aux_roots.push(BlockCommitmentRoots::zcash_deserialize(&mut reader)?);
+                    }
+                }
                 Self::Headers {
                     headers,
                     body_sizes,
+                    tree_aux_roots,
                 }
             }
             MSG_HS_NEW_BLOCK => {

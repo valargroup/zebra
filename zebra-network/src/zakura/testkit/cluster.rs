@@ -172,13 +172,15 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
     use zebra_chain::{
-        block,
+        block, orchard,
+        parallel::commitment_aux::BlockCommitmentRoots,
         parameters::{
             testnet::{
                 ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters as TestnetParameters,
             },
             Network,
         },
+        sapling,
         serialization::{ZcashDeserializeInto, ZcashSerialize},
     };
     use zebra_test::vectors::{
@@ -188,10 +190,46 @@ mod tests {
 
     fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
         let body_sizes = vec![0; headers.len()];
+        let start_height = headers
+            .first()
+            .map(|header| test_header_height(header.as_ref()))
+            .unwrap_or(block::Height(1));
+        let tree_aux_roots = roots_from_height(start_height, headers.len());
         HeaderSyncMessage::Headers {
             headers,
             body_sizes,
+            tree_aux_roots,
         }
+    }
+
+    fn root_at(height: block::Height) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height,
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }
+    }
+
+    fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockCommitmentRoots> {
+        (0..count)
+            .map(|offset| {
+                let offset = u32::try_from(offset).expect("test root count fits in u32");
+                root_at(block::Height(start_height.0 + offset))
+            })
+            .collect()
+    }
+
+    fn test_header_height(header: &block::Header) -> block::Height {
+        let hash = block::Hash::from(header);
+        if hash == mainnet_genesis_hash() {
+            return block::Height(0);
+        }
+
+        (1..=5)
+            .find_map(|height| {
+                (hash == mainnet_block(block_bytes(height)).hash()).then_some(block::Height(height))
+            })
+            .unwrap_or(block::Height(1))
     }
 
     #[derive(Debug, Default)]
@@ -779,6 +817,7 @@ mod tests {
                                     HeaderSyncMessage::GetHeaders {
                                         start_height: actual_start,
                                         count: actual_count,
+                want_tree_aux_roots: false,
                                     } if *actual_start == start_height && *actual_count == count
                                 )
                         })
@@ -843,7 +882,9 @@ mod tests {
                             .push((peer, HeaderSyncMessage::NewBlock(block)));
                     }
                 }
-                HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                HeaderSyncAction::QueryHeadersByHeightRange {
+                    peer, start, count, ..
+                } => {
                     let headers = local
                         .store
                         .lock()
@@ -1236,7 +1277,9 @@ mod tests {
                             .expect("misbehavior list mutex is not poisoned")
                             .push(reason);
                     }
-                    HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                    HeaderSyncAction::QueryHeadersByHeightRange {
+                        peer, start, count, ..
+                    } => {
                         let Some(handle) = endpoint.header_sync() else {
                             continue;
                         };
@@ -2974,6 +3017,7 @@ mod tests {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(start),
                         count: 1,
+                        want_tree_aux_roots: false,
                     },
                 )
                 .await;
@@ -3166,6 +3210,7 @@ mod tests {
                 HeaderSyncMessage::GetHeaders {
                     start_height: block::Height(1),
                     count: 4_001,
+                    want_tree_aux_roots: false,
                 },
             )
             .await;

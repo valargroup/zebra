@@ -517,6 +517,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![999_999, 0],
+                tree_aux_roots: Vec::new(),
             })
             .await?,
         Response::Committed(block2_hash),
@@ -703,6 +704,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
             anchor: genesis.hash(),
             headers: vec![block1.header.clone(), block2.header.clone()],
             body_sizes: vec![999_999, 0],
+            tree_aux_roots: Vec::new(),
         }),
     )
     .await

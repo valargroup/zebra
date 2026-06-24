@@ -61,6 +61,7 @@ use crate::{
     Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
     TreeAuxRootsWriter,
 };
+use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
 pub mod block_iter;
 pub mod chain_tip;
@@ -1009,6 +1010,7 @@ impl StateService {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
@@ -1022,6 +1024,7 @@ impl StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
                 rsp_tx,
             })
         {
@@ -1260,9 +1263,12 @@ impl Service<Request> for StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
             } => {
                 let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
+                    span.in_scope(|| {
+                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
+                    })
                 });
 
                 let span = Span::current();
@@ -1564,28 +1570,41 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // Serve from the compact `commitment_roots_by_height` index, which every
-                // node persists for each committed block — including a fast-synced node that
-                // holds no per-height trees (design §4). This is what keeps the root-serving
-                // fleet from collapsing as nodes adopt fast sync. For a database written
-                // before the index existed (a pre-index archive node), the index is empty, so
-                // fall back to deriving the roots from the per-height trees when present. The
-                // range is clamped to the tip; out-of-range or empty requests return no roots.
-                let roots = match state.db.finalized_tip_height() {
-                    Some(tip) if count > 0 && start_height <= tip => {
+                // Serve committed verified roots first, then provisional header-ahead roots for
+                // heights that have headers but no committed body yet. Both sources are read as a
+                // contiguous prefix from the requested start; committed roots win for overlapping
+                // heights because they have already been verified during block commit.
+                let roots = if count == 0 {
+                    Vec::new()
+                } else if let Some((tip, _hash)) = state.db.best_header_tip() {
+                    if start_height > tip {
+                        Vec::new()
+                    } else {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
-                        let range = start_height..=block::Height(last);
-                        let indexed = state.db.commitment_roots_by_height_range(range.clone());
-                        if !indexed.is_empty() || state.db.is_vct_synced() {
-                            // Indexed roots (the common path), or a fast-synced node whose only
-                            // possible source is the index — never the absent per-height trees.
-                            indexed
-                        } else {
-                            // Pre-index archive database: derive from the per-height trees.
-                            finalized_state::produce_block_roots(&state.db, range)
+                        let requested = start_height..=block::Height(last);
+                        let mut roots =
+                            state.db.commitment_roots_by_height_range(requested.clone());
+
+                        if roots.is_empty() && !state.db.is_vct_synced() {
+                            roots =
+                                finalized_state::produce_block_roots(&state.db, requested.clone());
                         }
+
+                        let next_height = roots
+                            .last()
+                            .and_then(|root| root.height.next().ok())
+                            .unwrap_or(start_height);
+                        if next_height <= *requested.end() {
+                            let provisional =
+                                state.db.zakura_header_commitment_roots_by_height_range(
+                                    next_height..=*requested.end(),
+                                );
+                            roots.extend(provisional);
+                        }
+                        roots
                     }
-                    _ => Vec::new(),
+                } else {
+                    Vec::new()
                 };
                 Ok(ReadResponse::BlockRoots(roots))
             }

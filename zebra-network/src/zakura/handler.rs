@@ -176,7 +176,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_2 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_4 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -4114,7 +4114,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_2: u16 = 2;
+const ZAKURA_STREAM_VERSION_4: u16 = 4;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4914,6 +4914,7 @@ mod tests {
         let get_headers_frame = HeaderSyncMessage::GetHeaders {
             start_height: block::Height(1),
             count: 1,
+            want_tree_aux_roots: false,
         }
         .encode_frame()?;
 
@@ -5142,6 +5143,7 @@ mod tests {
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: block::Height(1),
                     count: 1,
+                    want_tree_aux_roots: false,
                 },
             })
             .await?;
@@ -6475,7 +6477,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_2,
+                    version: ZAKURA_STREAM_VERSION_4,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -6495,7 +6497,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_2),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_4),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
