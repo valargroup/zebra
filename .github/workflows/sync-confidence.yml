@@ -90,7 +90,7 @@ jobs:
     needs: build
     # Run on schedule and dispatch (never on merge — merge only refreshes the image).
     # Tolerate a skipped build: schedule / build_image=false reuse the ironwood-main image.
-    if: ${{ github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     permissions:
       contents: read
     uses: ./.github/workflows/do-sync-test.yml
@@ -110,7 +110,7 @@ jobs:
 
   post-nu62:
     needs: build
-    if: ${{ github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     permissions:
       contents: read
     uses: ./.github/workflows/do-sync-test.yml
