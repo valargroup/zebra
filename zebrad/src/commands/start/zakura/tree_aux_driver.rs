@@ -341,22 +341,22 @@ pub(crate) async fn run_tree_aux_driver(
 fn next_fetch_window(
     from: block::Height,
     next_fetch: block::Height,
-    handoff: block::Height,
+    last_checkpoint_height: block::Height,
     committed_through: Option<block::Height>,
     fetch_ahead_roots: u32,
 ) -> Option<(block::Height, block::Height)> {
-    if next_fetch > handoff {
+    if next_fetch > last_checkpoint_height {
         return None;
     }
 
-    let window_end = fetch_window_end(from, handoff, committed_through, fetch_ahead_roots);
+    let window_end = fetch_window_end(from, last_checkpoint_height, committed_through, fetch_ahead_roots);
     (next_fetch <= window_end).then_some((next_fetch, window_end))
 }
 
 /// Highest root the driver may fetch while staying within the fetch-ahead cap.
 fn fetch_window_end(
     from: block::Height,
-    handoff: block::Height,
+    last_checkpoint_height: block::Height,
     committed_through: Option<block::Height>,
     fetch_ahead_roots: u32,
 ) -> block::Height {
@@ -367,7 +367,7 @@ fn fetch_window_end(
     block::Height(
         committed_floor
             .saturating_add(fetch_ahead_roots)
-            .min(handoff.0),
+            .min(last_checkpoint_height.0),
     )
 }
 
