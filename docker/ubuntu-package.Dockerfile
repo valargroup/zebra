@@ -5,9 +5,10 @@ FROM ${UBUNTU_IMAGE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_VERSION=1.91.0
+ARG CARGO_PROFILE=release
 ARG FEATURES="default-release-binaries"
-# Custom rustc cfgs that gate the NU6.3 consensus paths.
-# ARG RUSTFLAGS='--cfg zcash_unstable="nu6.3"'
+ARG RUSTFLAGS=""
+# Extra rustc flags, such as custom cfgs that gate unstable consensus paths.
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -37,9 +38,9 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/workspace/target \
-#     RUSTFLAGS="${RUSTFLAGS}" \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad && \
-    install -D target/release/zebrad /out/zebrad
+    RUSTFLAGS="${RUSTFLAGS}" \
+    cargo build --locked --profile "${CARGO_PROFILE}" --features "${FEATURES}" --package zebrad --bin zebrad && \
+    install -D "target/${CARGO_PROFILE}/zebrad" /out/zebrad
 
 FROM scratch AS artifact
 

@@ -5,12 +5,15 @@ use super::{error::*, wire::*, *};
 /// Keep block-body ranges narrow so a missing response only holds one height at
 /// the body-download floor.
 pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
-/// Initial number of in-flight block requests advertised per peer.
+/// Default advertised hard cap on concurrent in-flight block requests per peer.
 ///
-/// Outbound scheduling starts at this window and adjusts per peer based on
-/// request timeouts, while peer advertisements can still allow growth up to
-/// [`MAX_BS_INFLIGHT_REQUESTS`].
-pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 128;
+/// This is the ceiling the adaptive per-peer window grows *toward*, **not** the
+/// opening window. Scheduling starts at [`DEFAULT_BS_INITIAL_INFLIGHT`] and ramps
+/// up to the peer-advertised value (this default, clamped to
+/// [`MAX_BS_INFLIGHT_REQUESTS`]) only after sustained error-free responses (see
+/// the streak-gated cubic ramp on `DownloadWindow`). In a homogeneous fleet this
+/// is the per-peer concurrency ceiling every peer offers.
+pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 32000;
 /// Initial per-peer outbound request window (slow-start point).
 ///
 /// The adaptive window starts here and grows toward the peer-advertised hard cap
@@ -19,7 +22,12 @@ pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 128;
 /// known.
 pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 /// Maximum peer-advertised in-flight request count accepted by this node.
-pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 16_384;
+///
+/// This is the hard ceiling the default advertisement ([`DEFAULT_BS_MAX_INFLIGHT`]
+/// = 32,000) is clamped to, and also the per-peer outstanding-request safety bound
+/// (`EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER`). It bounds how many concurrent
+/// requests a remote peer can make us hold against it, so it doubles as a DoS bound.
+pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 32_768;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
@@ -33,6 +41,16 @@ pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
 /// never exceed this worst case and the shrink is always non-negative.
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
+/// Default byte cap for speculative reorder look-ahead above the download floor.
+///
+/// The default leaves one advertised response worth of headroom below the global
+/// byte budget. The synchronous floor-pop path is the funding guarantee when
+/// that headroom has been consumed by races or changed configuration.
+pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
+    // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
+    DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
+/// Default block-count cap for speculative reorder look-ahead bookkeeping.
+pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
@@ -41,6 +59,10 @@ pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Default central floor-watchdog cadence.
+pub const DEFAULT_BS_FLOOR_WATCHDOG_TICK: Duration = Duration::from_secs(1);
+/// Default hard floor-peer avoid cooldown after a watchdog cancellation.
+pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
 /// Default block-sync status refresh interval reserved for later advertisement.
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Default tolerated size-hint deviation percentage reserved for later soft scoring.
@@ -133,6 +155,16 @@ pub struct ZakuraBlockSyncConfig {
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for in-flight and buffered block bodies.
     pub max_inflight_block_bytes: u64,
+    /// Maximum speculative body bytes held above the download floor.
+    pub max_reorder_lookahead_bytes: u64,
+    /// Maximum speculative body heights tracked above the download floor.
+    pub max_reorder_lookahead_blocks: u32,
+    /// Cadence for the central floor watchdog that rescues expired floor claims.
+    #[serde(with = "humantime_serde")]
+    pub floor_watchdog_tick: Duration,
+    /// How long to avoid reassigning an expired floor height to the same peer.
+    #[serde(with = "humantime_serde")]
+    pub floor_peer_avoid_cooldown: Duration,
     /// Maximum block bodies submitted to the verifier before completed applies
     /// release more submission slots.
     pub max_submitted_block_applies: usize,
@@ -167,6 +199,10 @@ impl Default for ZakuraBlockSyncConfig {
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+            max_reorder_lookahead_bytes: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+            max_reorder_lookahead_blocks: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
+            floor_watchdog_tick: DEFAULT_BS_FLOOR_WATCHDOG_TICK,
+            floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
@@ -196,6 +232,47 @@ impl ZakuraBlockSyncConfig {
     /// Return the non-zero verifier submission cap.
     pub fn submitted_apply_limit(&self) -> usize {
         self.max_submitted_block_applies.max(1)
+    }
+
+    /// Return the speculative look-ahead byte cap clamped to the global budget.
+    pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
+        self.max_reorder_lookahead_bytes
+            .min(self.max_inflight_block_bytes)
+    }
+
+    /// Return the watchdog tick clamped to a positive duration no larger than the request timeout.
+    pub fn effective_floor_watchdog_tick(&self) -> Duration {
+        self.floor_watchdog_tick
+            .min(self.request_timeout)
+            .max(Duration::from_millis(1))
+    }
+
+    /// Return the floor avoid cooldown clamped to a positive duration.
+    pub fn effective_floor_peer_avoid_cooldown(&self) -> Duration {
+        self.floor_peer_avoid_cooldown.max(Duration::from_millis(1))
+    }
+
+    /// Return the largest byte reservation a single floor request can need.
+    pub fn floor_request_byte_reservation(&self) -> u64 {
+        let fanout = u64::try_from(self.fanout.max(1)).unwrap_or(u64::MAX);
+        let worst_case_blocks = u64::from(self.advertised_max_blocks_per_response())
+            .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES)
+            .saturating_mul(fanout);
+        u64::from(self.advertised_max_response_bytes()).max(worst_case_blocks)
+    }
+
+    /// Validate production-safety bounds after deserialization.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_inflight_block_bytes == 0 {
+            return Err("max_inflight_block_bytes must be greater than zero");
+        }
+        if self.max_reorder_lookahead_blocks == 0 {
+            return Err("max_reorder_lookahead_blocks must be greater than zero");
+        }
+        if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
+            return Err("max_inflight_block_bytes must exceed one floor request");
+        }
+        Ok(())
     }
 
     /// Build the inert local status used before the block-sync reactor is wired.

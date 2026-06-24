@@ -114,11 +114,53 @@ impl ByteBudget {
         self.inner.capacity.notify_waiters();
     }
 
-    /// Shrink a reservation from `from` to `to` bytes, releasing the difference.
-    /// Used when a received body's worst-case reservation is replaced by its
-    /// actual (smaller) size; a no-op when `to >= from`.
-    pub(crate) fn shrink(&mut self, from: u64, to: u64) {
-        self.release(from.saturating_sub(to));
+    /// Add `bytes` to the shared counter without applying the admission gate.
+    ///
+    /// Used when a body was already admitted based on an estimate and its actual
+    /// serialized size is larger than that estimate. The request cannot be
+    /// rejected at this point, so the budget must record the overshoot and let
+    /// later releases drain it.
+    pub(crate) fn charge(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.inner
+            .reserved_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                Some(reserved.saturating_add(bytes))
+            })
+            .ok();
+    }
+
+    /// Settle an estimated reservation to the actual bytes now held.
+    ///
+    /// If `actual` is smaller, this releases slack. If it is larger, this charges
+    /// the overshoot so held bodies are never under-counted.
+    #[cfg(test)]
+    pub(crate) fn settle(&mut self, reserved: u64, actual: u64) {
+        if actual > reserved {
+            self.charge(actual - reserved);
+        } else {
+            self.release(reserved - actual);
+        }
+    }
+
+    /// Audit the shared counter against an externally-derived expected value.
+    ///
+    /// Returns `true` when the budget matches.
+    pub(crate) fn audit(&self, expected: u64, context: &'static str) -> bool {
+        let actual = self.reserved();
+        let ok = actual == expected;
+        if !ok {
+            metrics::counter!("sync.block.budget.audit_drift").increment(1);
+            tracing::warn!(
+                actual,
+                expected,
+                context,
+                "Zakura block-sync byte-budget audit drift"
+            );
+        }
+        ok
     }
 
     /// Subscribe to capacity-freed notifications. A consumer blocked on a full
@@ -297,6 +339,23 @@ mod tests {
         assert_eq!(budget.reserved(), 400);
         budget.release(400);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn byte_budget_settles_estimates_to_actuals() {
+        let mut budget = ByteBudget::new(1_000);
+        assert!(budget.try_reserve(300));
+        budget.settle(300, 200);
+        assert_eq!(budget.reserved(), 200);
+
+        assert!(budget.try_reserve(300));
+        budget.settle(300, 300);
+        assert_eq!(budget.reserved(), 500);
+
+        assert!(budget.try_reserve(300));
+        budget.settle(300, 450);
+        assert_eq!(budget.reserved(), 950);
+        assert_eq!(budget.available(), 50);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub enum BlockSizeEstimate {
     Confirmed(u32),
     /// Untrusted advertised size hint from header sync.
     Advertised(u32),
-    /// No size hint is known; use the EWMA fallback.
+    /// No size hint is known; reserve the per-block worst case.
     Unknown,
 }
 
@@ -28,8 +28,8 @@ pub(super) struct BlockRangeRequest {
     pub(super) start_height: block::Height,
     pub(super) count: u32,
     pub(super) anchor_hash: block::Hash,
-    /// The reserved worst-case byte total for this request (released on
-    /// timeout/disconnect/send-failure). Distinct from the per-height size
+    /// The reserved byte total for this request (released on
+    /// timeout/disconnect/send-failure). Equal to the sum of the per-height size
     /// estimates in `expected_blocks`.
     pub(super) estimated_bytes: u64,
     pub(super) expected_blocks: Vec<ExpectedBlock>,

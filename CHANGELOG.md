@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Tightened Zakura block-sync body budget accounting and floor-liveness behavior:
+  body-size overshoots are accounted symmetrically, stale watchdog claims no
+  longer release bodies already handed to the commit pipeline, above-floor
+  downloads preserve a configured floor rescue reserve, and the central floor
+  watchdog now has configurable tick/cooldown settings.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Reject transactions that add net value to the Orchard pool after NU6.3

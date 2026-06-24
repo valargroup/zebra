@@ -65,6 +65,9 @@ indexer = ["zebra-state/indexer"]
 # Per-block commit-phase timing histograms (zebra.state.write.*), for perf profiling
 commit-metrics = ["zebra-state/commit-metrics"]
 
+# Use jemalloc as the global allocator, with heap profiling enabled.
+jemalloc-profiling = ["dep:tikv-jemallocator"]
+
 # Experimental internal miner support
 internal-miner = [
     "thread-priority",
@@ -215,6 +218,9 @@ nix = { workspace = true, features = ["fs"] }
 
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
+
+# prod feature jemalloc-profiling
+tikv-jemallocator = { workspace = true, features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms"], optional = true }
 
 # prod feature sentry
 sentry = { workspace = true, features = ["backtrace", "contexts", "logs", "rustls", "tracing", "ureq"], optional = true }
