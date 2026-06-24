@@ -323,8 +323,8 @@ pub struct FinalizedState {
     /// value can never cause an incorrect skip.
     vct_prevalidated_next: Option<(block::Height, block::Hash)>,
 
-    /// `true` while a verified-commitment-trees fast sync has frozen the
-    /// note-commitment frontier — i.e. a fast block has committed but the
+    /// `true` while a verified-commitment-trees (vct) fast sync has frozen the
+    /// note-commitment frontier — i.e. a verified commitment tree block has committed but the
     /// checkpoint handoff (which replaces the frontier with the real one) has not.
     ///
     /// While frozen, the running frontier is no longer the real frontier for the
@@ -335,10 +335,10 @@ pub struct FinalizedState {
     /// `false` at the handoff, after which legacy recompute resumes from the real
     /// frontier.
     ///
-    /// Seeded from durable state on open (not just within a session): a fast sync
+    /// Seeded from durable state on open (not just within a session): a vct sync
     /// interrupted by a restart leaves the frozen frontier persisted but the tip
     /// below the handoff, so [`FinalizedState::new`] re-derives this flag from the
-    /// fast-sync marker. Without that, the first post-restart height with no supplied
+    /// vct-sync marker. Without that, the first post-restart height with no supplied
     /// root would legacy-recompute against the stale on-disk frontier and corrupt the
     /// MMR — the exact hazard this flag exists to prevent.
     vct_frontier_frozen: bool,
@@ -525,8 +525,8 @@ impl FinalizedState {
         // stalling silently.
         if new_state.vct_frontier_frozen && new_state.vct.is_none() {
             panic!(
-                "this database has a fast sync in progress (verified commitment trees) that was \
-                 interrupted below the checkpoint handoff height, but the fast path that supplies \
+                "this database was previously synced in verified commitment tree mode that was \
+                 interrupted below the checkpoint handoff height. the fast path that supplies \
                  the verified roots needed to resume it is disabled. Set \
                  `consensus.checkpoint_sync = true` and `consensus.disable_vct_fast_sync = false` to \
                  finish the fast sync, or delete the cache directory and re-sync from genesis"
