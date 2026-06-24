@@ -26,9 +26,18 @@ state objects after a DB format-version bump by re-running the snapshots workflo
    `Sync confidence` run; droplets pull it anonymously).
 
 ## Running
-Once the snapshots exist and the package is public, **Sync confidence** runs on
-merge to `ironwood-main` and via manual dispatch; each window restores its pruned
-tarball and syncs its 5k-block range.
+Once the snapshots exist and the package is public, **Sync confidence**:
+- **on merge to `ironwood-main`** rebuilds and publishes the `ironwood-main` test image
+  to GHCR — no sync test runs, so merges stay cheap;
+- **every 12 hours (schedule)** reuses that `ironwood-main` image (no rebuild) and syncs
+  both windows;
+- **on manual dispatch** builds the image from the dispatched ref and syncs both windows
+  by default; uncheck `build_image` to reuse the `ironwood-main` image instead.
+
+Each window restores its pruned tarball and syncs its 5k-block range. A red means a
+sync/consensus regression or a broken DB-format migration — the consumer runs the image's
+migration when opening the pruned state, and the error distinguishes the two
+(`FormatMismatch`/migration panic vs. a verification failure).
 
 ## Cost note
 Droplets are deleted after each run (`if: always()` + a 1h orphan sweep). If a run
