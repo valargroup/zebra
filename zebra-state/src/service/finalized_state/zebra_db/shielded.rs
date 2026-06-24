@@ -670,15 +670,15 @@ impl DiskWriteBatch {
             ..
         } = finalized;
 
-        // Mark the database as fast-synced (per-height note-commitment trees absent
+        // Mark the database as vct-synced (per-height note-commitment trees absent
         // below the checkpoint handoff height). Written in the same atomic batch as
-        // every fast commit, so a fast-synced database always carries the marker and
+        // every vct commit, so a vct-synced database always carries the marker and
         // the read/validity guards never see absent trees without it.
         if let Some(handoff) = vct_sync_below {
             self.update_vct_sync_marker(zebra_db, handoff);
         }
 
-        // POC (verified-commitment-trees) fast path: the committer skipped the
+        // POC (verified-commitment-trees) vct path: the committer skipped the
         // per-block frontier recompute, so `note_commitment_trees` is the frozen
         // parent frontier. Write only the supplied roots into the anchor set and
         // the (already-extended) history tree; skip the per-height Sapling/Orchard
@@ -861,11 +861,11 @@ impl DiskWriteBatch {
     /// note-commitment trees are absent below `handoff`. Idempotent (written in the
     /// same batch as each fast commit).
     pub fn update_vct_sync_marker(&mut self, zebra_db: &ZebraDb, handoff: Height) {
-        let fast_sync_metadata = zebra_db
+        let vct_sync_metadata = zebra_db
             .db
-            .cf_handle(crate::service::finalized_state::FAST_SYNC_METADATA)
+            .cf_handle(crate::service::finalized_state::VCT_SYNC_METADATA)
             .unwrap();
-        self.zs_insert(&fast_sync_metadata, (), handoff);
+        self.zs_insert(&vct_sync_metadata, (), handoff);
     }
 
     /// Inserts the Sapling note commitment subtree into the batch.

@@ -46,7 +46,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, FAST_SYNC_METADATA, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, VCT_SYNC_METADATA, PRUNING_METADATA,
     },
     HashOrHeight,
 };
@@ -737,8 +737,8 @@ impl ZebraDb {
     /// Returns `None` if the database was synced normally (it has per-height trees
     /// for all heights below the tip).
     pub fn vct_synced_below(&self) -> Option<Height> {
-        let fast_sync_metadata = self.db.cf_handle(FAST_SYNC_METADATA)?;
-        self.db.zs_get(&fast_sync_metadata, &())
+        let vct_sync_metadata = self.db.cf_handle(VCT_SYNC_METADATA)?;
+        self.db.zs_get(&vct_sync_metadata, &())
     }
 
     /// Returns `true` if the database was built by the verified-commitment-trees

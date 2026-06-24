@@ -213,7 +213,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     COMMITMENT_ROOTS_BY_HEIGHT,
     // Storage policy
     PRUNING_METADATA,
-    FAST_SYNC_METADATA,
+    VCT_SYNC_METADATA,
 ];
 
 /// The name of the column family that records pruning progress.
@@ -225,34 +225,34 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
 pub const PRUNING_METADATA: &str = "pruning_metadata";
 
 /// The name of the column family that marks a verified-commitment-trees
-/// fast-synced database.
+/// (vct) synced database.
 ///
-/// A fast-synced database is built by folding verified commitment roots into the
+/// A vct-synced database is built by folding verified commitment roots into the
 /// anchor set and history tree below the last checkpoint, skipping the per-height
 /// note-commitment trees entirely. This column family holds a single entry, keyed
 /// by the unit value `()`, mapping to the checkpoint handoff height: the lowest
 /// height at which a per-height note-commitment tree is present. Per-height trees
 /// are absent for every non-genesis height strictly below it.
 ///
-/// The presence of this entry marks the database as fast-synced: the historical
+/// The presence of this entry marks the database as vct-synced: the historical
 /// per-height trees were never written, so the database cannot answer historical
 /// tree/subtree RPCs below the handoff height (the RPC handlers return a typed
-/// archive-mode error there, §9). Fast sync is the default under checkpoint sync
-/// for both Archive and Pruned storage modes, so a fast-synced database reopens in
+/// archive-mode error there, §9). Vct sync is the default under checkpoint sync
+/// for both Archive and Pruned storage modes, so a vct-synced database reopens in
 /// either; the missing-history limitation is enforced at the RPC boundary, not at
 /// reopen. This is orthogonal to pruning (which drops raw transactions but keeps
 /// the trees); a database can be both.
-pub const FAST_SYNC_METADATA: &str = "fast_sync_metadata";
+pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
 
 /// The name of the column family holding the per-height Sapling/Orchard note-commitment
 /// roots, keyed by [`block::Height`].
 ///
 /// This is the verified-commitment-trees serving index (design §4): a compact
 /// `height -> (sapling_root, orchard_root)` map (64 bytes/height) that **every** node
-/// persists for each committed block, on both the fast and legacy commit paths. Its purpose
-/// is to let a fast-synced node — which folds verified roots in but writes no per-height
+/// persists for each committed block, on both the vct and legacy commit paths. Its purpose
+/// is to let a vct-synced node — which folds verified roots in but writes no per-height
 /// note-commitment trees — still answer the `tree_aux` `BlockRoots` read, so the
-/// root-serving fleet does not collapse as nodes adopt fast sync. The roots are the same
+/// root-serving fleet does not collapse as nodes adopt vct sync. The roots are the same
 /// values a legacy node derives from its per-height trees via `produce_block_roots`; serving
 /// reads this index first and falls back to the trees only for databases written before the
 /// index existed.

@@ -153,7 +153,7 @@ pub(crate) async fn run_tree_aux_driver(
     read_state: ReadStateService,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
-    let handoff = network.checkpoint_list().max_height();
+    let last_checkpoint_height = network.checkpoint_list().max_height();
 
     // The first root the committer still needs: one above the current verified tip. Read once at
     // startup; the fetched range stays a superset of what the committer will commit even if it
@@ -177,10 +177,11 @@ pub(crate) async fn run_tree_aux_driver(
             }
 
             if !initial_fetch_complete {
-                if next_fetch > handoff {
+                // We reached the last checkpoint, roots aren't needed anymore
+                if next_fetch > last_checkpoint_height {
                     tracing::info!(
                         from_height = from.0,
-                        handoff_height = handoff.0,
+                        handoff_height = last_checkpoint_height.0,
                         "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
                     );
                     initial_fetch_complete = true;
@@ -195,7 +196,7 @@ pub(crate) async fn run_tree_aux_driver(
                             continue;
                         };
                         next_fetch = block::Height(next_height);
-                        if next_fetch > handoff {
+                        if next_fetch > last_checkpoint_height {
                             continue;
                         }
                     }
@@ -204,7 +205,7 @@ pub(crate) async fn run_tree_aux_driver(
                 let Some((window_from, window_to)) = next_fetch_window(
                     from,
                     next_fetch,
-                    handoff,
+                    last_checkpoint_height,
                     committed_through,
                     TREE_AUX_FETCH_AHEAD_ROOTS,
                 ) else {
@@ -288,11 +289,11 @@ pub(crate) async fn run_tree_aux_driver(
                             committed_through = ?writer.committed_through(),
                             "tree_aux: fetched bounded peer-root window into the committer cache"
                         );
-                        if window_to >= handoff {
+                        if window_to >= last_checkpoint_height {
                             initial_fetch_complete = true;
                             tracing::info!(
                                 from_height = from.0,
-                                handoff_height = handoff.0,
+                                handoff_height = last_checkpoint_height.0,
                                 "tree_aux: fetched verified-tip→checkpoint roots from peer into the committer cache"
                             );
                         } else {
