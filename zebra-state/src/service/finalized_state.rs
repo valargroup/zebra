@@ -803,11 +803,11 @@ impl FinalizedState {
                 // anchor set and history leaf instead. The frontier stays the (frozen)
                 // parent frontier; nothing below the checkpoint reads it for consensus.
                 // See docs/design/verified-commitment-trees.md.
-                let vct_fast = self.vct.as_ref().and_then(|v| {
+                let vct_mode = self.vct.as_ref().and_then(|v| {
                     if handoff_height.is_some_and(|handoff| height > handoff) {
                         None
                     } else {
-                        v.fast_root(height)
+                        v.vct_roots_at_height(height)
                     }
                 });
 
@@ -816,7 +816,7 @@ impl FinalizedState {
                 // to the fast-sync marker in the commit batch.
                 let mut fast_sync_below = None;
 
-                if let Some((sapling_root, orchard_root)) = vct_fast {
+                if let Some((sapling_root, orchard_root)) = vct_mode {
                     // The handoff frontiers are the only non-successor authority that
                     // can authenticate this block's own supplied roots before they are
                     // persisted.
@@ -1173,7 +1173,7 @@ impl FinalizedState {
     pub(crate) fn vct_fast_will_apply(&self, height: block::Height) -> bool {
         self.vct
             .as_ref()
-            .is_some_and(|v| v.is_fast() && v.fast_root(height).is_some())
+            .is_some_and(|v| v.is_fast() && v.vct_roots_at_height(height).is_some())
     }
 
     /// Clears any cached successor prevalidation.

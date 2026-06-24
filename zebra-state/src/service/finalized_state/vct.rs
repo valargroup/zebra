@@ -176,9 +176,9 @@ impl VctState {
         true
     }
 
-    /// The supplied roots for `height`, when fast mode has a source entry for it
+    /// The supplied roots for `height`, when vct mode has a source entry for it
     /// (the signal that this block takes the fast path).
-    pub(super) fn fast_root(
+    pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
@@ -194,7 +194,7 @@ impl VctState {
             return None;
         }
 
-        self.source.fast_root(height)
+        self.source.vct_root(height)
     }
 
     /// `true` when committing `height` on the fast path needs a buffered successor before
@@ -210,7 +210,7 @@ impl VctState {
         network: &Network,
     ) -> bool {
         self.fast
-            && self.fast_root(height).is_some()
+            && self.vct_roots_at_height(height).is_some()
             && self.requires_verified_successor
             && self
                 .source
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_root_is_bounded_by_handoff_height() {
+    fn vct_root_is_bounded_by_handoff_height() {
         let handoff = block::Height(10);
         let after_handoff = (handoff + 1).expect("test height is valid");
         let roots = std::collections::HashMap::from([
@@ -472,11 +472,11 @@ mod tests {
             false,
         );
         assert!(
-            bounded.fast_root(handoff).is_some(),
+            bounded.vct_roots_at_height(handoff).is_some(),
             "the handoff root remains fast-path eligible"
         );
         assert!(
-            bounded.fast_root(after_handoff).is_none(),
+            bounded.vct_roots_at_height(after_handoff).is_none(),
             "roots above the handoff are ignored"
         );
 
@@ -487,7 +487,7 @@ mod tests {
             false,
         );
         assert!(
-            unbounded.fast_root(after_handoff).is_some(),
+            unbounded.vct_roots_at_height(after_handoff).is_some(),
             "sources without a handoff keep the existing fixture behavior"
         );
     }

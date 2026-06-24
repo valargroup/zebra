@@ -274,7 +274,7 @@ impl FinalFrontiers {
 /// whether supplied roots must be confirmed by a buffered successor before commit.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
-    fn fast_root(
+    fn vct_root(
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)>;
@@ -347,7 +347,7 @@ impl FixtureSource {
 
 #[cfg(test)]
 impl CommitmentRootSource for FixtureSource {
-    fn fast_root(
+    fn vct_root(
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
@@ -494,7 +494,7 @@ impl PeerSourceHandle {
 }
 
 impl CommitmentRootSource for PeerSource {
-    fn fast_root(
+    fn vct_root(
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
@@ -670,11 +670,11 @@ mod tests {
         let source = FixtureSource::new(roots, Some(frontiers));
 
         assert!(
-            source.fast_root(block::Height(10)).is_some(),
+            source.vct_root(block::Height(10)).is_some(),
             "produced root is looked up by height"
         );
         assert!(
-            source.fast_root(block::Height(99)).is_none(),
+            source.vct_root(block::Height(99)).is_none(),
             "absent height has no root"
         );
         assert_eq!(
@@ -698,14 +698,14 @@ mod tests {
         }]);
 
         assert!(
-            source.fast_root(block::Height(42)).is_some(),
+            source.vct_root(block::Height(42)).is_some(),
             "the inserted root is present before eviction"
         );
 
         source.invalidate(block::Height(42));
 
         assert!(
-            source.fast_root(block::Height(42)).is_none(),
+            source.vct_root(block::Height(42)).is_none(),
             "an evicted root is gone, so the next read misses and a re-fetch can replace it"
         );
     }
@@ -728,19 +728,19 @@ mod tests {
         writer.invalidate_roots([block::Height(41), block::Height(43)]);
 
         assert!(
-            source.fast_root(block::Height(40)).is_some(),
+            source.vct_root(block::Height(40)).is_some(),
             "roots outside the invalidation set stay cached"
         );
         assert!(
-            source.fast_root(block::Height(41)).is_none(),
+            source.vct_root(block::Height(41)).is_none(),
             "the first invalidated height is evicted"
         );
         assert!(
-            source.fast_root(block::Height(43)).is_none(),
+            source.vct_root(block::Height(43)).is_none(),
             "the second invalidated height is evicted"
         );
         assert!(
-            source.fast_root(block::Height(44)).is_some(),
+            source.vct_root(block::Height(44)).is_some(),
             "higher roots outside the invalidation set stay cached"
         );
     }
@@ -761,11 +761,11 @@ mod tests {
         }]);
 
         assert!(
-            source_a.fast_root(block::Height(42)).is_some(),
+            source_a.vct_root(block::Height(42)).is_some(),
             "the first peer source sees roots inserted through its own handle"
         );
         assert!(
-            source_b.fast_root(block::Height(42)).is_none(),
+            source_b.vct_root(block::Height(42)).is_none(),
             "a second peer source in the same process has an independent cache"
         );
 
@@ -816,15 +816,15 @@ mod tests {
         );
 
         assert!(
-            source.fast_root(block::Height(40)).is_none(),
+            source.vct_root(block::Height(40)).is_none(),
             "roots below the committed height are evicted"
         );
         assert!(
-            source.fast_root(block::Height(42)).is_none(),
+            source.vct_root(block::Height(42)).is_none(),
             "the committed height's root is evicted"
         );
         assert!(
-            source.fast_root(block::Height(43)).is_some(),
+            source.vct_root(block::Height(43)).is_some(),
             "fetch-ahead roots remain cached"
         );
 
@@ -835,11 +835,11 @@ mod tests {
         }));
 
         assert!(
-            source.fast_root(block::Height(41)).is_none(),
+            source.vct_root(block::Height(41)).is_none(),
             "late inserts at already-committed heights are ignored"
         );
         assert!(
-            source.fast_root(block::Height(43)).is_some(),
+            source.vct_root(block::Height(43)).is_some(),
             "late inserts above the committed height are still cached"
         );
 
