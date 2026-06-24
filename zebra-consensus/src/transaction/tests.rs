@@ -258,6 +258,64 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
+fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
+    let (network, height) = nu6_3_test_network_and_height();
+
+    let coinbase_input = || transparent::Input::Coinbase {
+        height,
+        data: vec![],
+        sequence: u32::MAX,
+    };
+
+    // A V6 coinbase carrying an Orchard bundle is rejected after NU6.3. The bundle has a
+    // zero value balance, so `disabled_add_to_orchard_pool` does NOT catch it — this
+    // structural rule is what rejects it (the two rules are not redundant).
+    let coinbase_with_orchard = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![coinbase_input()],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        ironwood_shielded_data: None,
+    };
+    assert!(coinbase_with_orchard.is_coinbase());
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_orchard, height, &network),
+        Err(TransactionError::CoinbaseHasOrchardShieldedData)
+    );
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&coinbase_with_orchard, height, &network),
+        Ok(())
+    );
+
+    // A V6 coinbase paying shielded output through Ironwood (no Orchard bundle) is allowed.
+    let coinbase_with_ironwood = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![coinbase_input()],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data(0, ironwood::Flags::ENABLE_OUTPUTS)),
+    };
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_ironwood, height, &network),
+        Ok(())
+    );
+
+    // Before NU6.3 the rule is a no-op: the same Orchard-bearing coinbase is allowed below
+    // the NU6.3 activation height.
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_orchard, Height(0), &network),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
 fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
     let orchard_cross_address = v6_pool_flow_transaction(
         Some(orchard_shielded_data(
