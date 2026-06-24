@@ -279,9 +279,9 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)>;
 
-    /// The checkpoint handoff height (below which the fast path skips per-height
+    /// The checkpoint handoff height (below which the vct path skips per-height
     /// trees), if this source supplies a final frontier.
-    fn handoff_height(&self) -> Option<block::Height>;
+    fn vct_last_checkpoint_height(&self) -> Option<block::Height>;
 
     /// The verified final frontiers at the handoff height, if supplied.
     fn final_frontiers(&self) -> Option<&FinalFrontiers>;
@@ -353,7 +353,7 @@ impl CommitmentRootSource for FixtureSource {
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
         self.0.fast_root(height)
     }
-    fn handoff_height(&self) -> Option<block::Height> {
+    fn vct_last_checkpoint_height(&self) -> Option<block::Height> {
         self.0.handoff_height()
     }
     fn final_frontiers(&self) -> Option<&FinalFrontiers> {
@@ -505,7 +505,7 @@ impl CommitmentRootSource for PeerSource {
             .get(&height.0)
             .copied()
     }
-    fn handoff_height(&self) -> Option<block::Height> {
+    fn vct_last_checkpoint_height(&self) -> Option<block::Height> {
         self.frontiers.as_ref().map(|f| f.height)
     }
     fn final_frontiers(&self) -> Option<&FinalFrontiers> {
@@ -678,7 +678,7 @@ mod tests {
             "absent height has no root"
         );
         assert_eq!(
-            source.handoff_height(),
+            source.vct_last_checkpoint_height(),
             Some(block::Height(11)),
             "handoff height comes from the supplied frontiers"
         );

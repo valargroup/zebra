@@ -844,12 +844,11 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
-        // POC: when `Some`, skip per-height tree writes and fold these roots into
-        // the anchor set instead (verified-commitment-trees fast path).
-        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
-        // POC verified-commitment-trees: when `Some(handoff)`, mark the database as
-        // fast-synced (per-height note-commitment trees absent below `handoff`).
-        fast_sync_below: Option<Height>,
+        // When `Some`, skip per-height tree writes and fold these roots into
+        // the anchor set.
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        // When `Some(height)`, mark the database as vct-synced.
+        vct_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -1033,8 +1032,8 @@ impl ZebraDb {
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
-            fast_anchor_roots,
-            fast_sync_below,
+            vct_anchor_roots,
+            vct_sync_below,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1358,8 +1357,8 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         precomputed_raw_txs: Option<Vec<RawBytes>>,
-        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
-        fast_sync_below: Option<Height>,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1380,8 +1379,8 @@ impl DiskWriteBatch {
             zebra_db,
             finalized,
             prev_note_commitment_trees,
-            fast_anchor_roots,
-            fast_sync_below,
+            vct_anchor_roots,
+            vct_sync_below,
         );
 
         // # Consensus

@@ -657,8 +657,8 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        fast_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
-        fast_sync_below: Option<Height>,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
     ) {
         let FinalizedBlock {
             height,
@@ -674,8 +674,8 @@ impl DiskWriteBatch {
         // below the checkpoint handoff height). Written in the same atomic batch as
         // every fast commit, so a fast-synced database always carries the marker and
         // the read/validity guards never see absent trees without it.
-        if let Some(handoff) = fast_sync_below {
-            self.update_fast_sync_marker(zebra_db, handoff);
+        if let Some(handoff) = vct_sync_below {
+            self.update_vct_sync_marker(zebra_db, handoff);
         }
 
         // POC (verified-commitment-trees) fast path: the committer skipped the
@@ -685,7 +685,7 @@ impl DiskWriteBatch {
         // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
         // modern checkpoint, so it is correctly left untouched here.
         // See docs/design/verified-commitment-trees.md.
-        if let Some((sapling_root, orchard_root)) = fast_anchor_roots {
+        if let Some((sapling_root, orchard_root)) = vct_anchor_roots {
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);
             // Persist the per-height roots into the serving index even though no per-height
@@ -860,7 +860,7 @@ impl DiskWriteBatch {
     /// Records the verified-commitment-trees fast-sync marker: per-height
     /// note-commitment trees are absent below `handoff`. Idempotent (written in the
     /// same batch as each fast commit).
-    pub fn update_fast_sync_marker(&mut self, zebra_db: &ZebraDb, handoff: Height) {
+    pub fn update_vct_sync_marker(&mut self, zebra_db: &ZebraDb, handoff: Height) {
         let fast_sync_metadata = zebra_db
             .db
             .cf_handle(crate::service::finalized_state::FAST_SYNC_METADATA)

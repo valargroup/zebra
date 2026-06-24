@@ -188,7 +188,7 @@ impl VctState {
 
         if self
             .source
-            .handoff_height()
+            .vct_last_checkpoint_height()
             .is_some_and(|handoff| height > handoff)
         {
             return None;
@@ -197,14 +197,14 @@ impl VctState {
         self.source.vct_root(height)
     }
 
-    /// `true` when committing `height` on the fast path needs a buffered successor before
+    /// `true` when committing `height` on the vct path needs a buffered successor before
     /// it can safely persist this block's supplied roots.
     ///
     /// Only untrusted peer-supplied roots at or above Heartwood require this. The
     /// checkpoint handoff is exempt because its embedded final frontiers are verified
     /// against this block's roots before the real tip treestate is written; trusted
     /// local fixtures can commit their tip root on the in-arrears check.
-    pub(super) fn fast_root_needs_successor(
+    pub(super) fn vct_root_needs_successor(
         &self,
         height: block::Height,
         network: &Network,
@@ -233,14 +233,14 @@ impl VctState {
 
     /// The checkpoint handoff height: the boundary below which the fast path skips
     /// per-height note-commitment trees. `None` unless final frontiers are loaded.
-    pub(super) fn fast_sync_handoff_height(&self) -> Option<block::Height> {
-        self.source.handoff_height()
+    pub(super) fn vct_sync_last_checkpoint_height(&self) -> Option<block::Height> {
+        self.source.vct_last_checkpoint_height()
     }
 
     /// The verified `(sapling, orchard, sprout)` frontiers to write as the tip
     /// treestate, when `height` is the checkpoint handoff height.
     #[allow(clippy::type_complexity)]
-    pub(super) fn final_frontiers_for_handoff(
+    pub(super) fn final_frontiers_for_last_checkpoint(
         &self,
         height: block::Height,
     ) -> Option<(
@@ -432,7 +432,7 @@ mod tests {
             false,
         );
         assert!(
-            !trusted.fast_root_needs_successor(height, &network),
+            !trusted.vct_root_needs_successor(height, &network),
             "trusted fixture roots can commit without a buffered successor"
         );
 
@@ -444,7 +444,7 @@ mod tests {
             true,
         );
         assert!(
-            untrusted.fast_root_needs_successor(height, &network),
+            untrusted.vct_root_needs_successor(height, &network),
             "untrusted roots defer until a buffered successor verifies them"
         );
     }

@@ -1145,7 +1145,7 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
     {
         let state = new_state_with_blocks(&config, &network);
         let mut batch = DiskWriteBatch::new();
-        batch.update_fast_sync_marker(&state.db, Height(2));
+        batch.update_vct_sync_marker(&state.db, Height(2));
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
@@ -1190,7 +1190,7 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
     {
         let state = new_state_with_blocks(&config, &network);
         let mut batch = DiskWriteBatch::new();
-        batch.update_fast_sync_marker(&state.db, Height(2));
+        batch.update_vct_sync_marker(&state.db, Height(2));
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
@@ -1235,7 +1235,7 @@ fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
     {
         let state = new_state_with_blocks(&config, &network);
         let mut batch = DiskWriteBatch::new();
-        batch.update_fast_sync_marker(&state.db, Height(100));
+        batch.update_vct_sync_marker(&state.db, Height(100));
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
@@ -1270,7 +1270,7 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
     {
         let state = new_state_with_blocks(&config, &network);
         let mut batch = DiskWriteBatch::new();
-        batch.update_fast_sync_marker(&state.db, Height(100));
+        batch.update_vct_sync_marker(&state.db, Height(100));
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
