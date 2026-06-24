@@ -5,17 +5,20 @@ and store cached chain state in DO Spaces. Configure these once (and update the
 state objects after a DB format-version bump by re-running the snapshots workflow).
 
 ## Secrets (Settings -> Secrets and variables -> Actions -> Secrets)
+
 - `DIGITALOCEAN_ACCESS_TOKEN` - a DO API token with read/write scope.
 - `SPACES_ACCESS_KEY` / `SPACES_SECRET_KEY` - a Spaces access keypair.
 - `DO_SSH_PRIVATE_KEY` - private key of a dedicated CI SSH keypair (PEM).
 
 ## Variables (... -> Variables)
+
 - `SPACES_BUCKET` - the Space (bucket) name, created in `nyc3`.
 - `DO_SSH_KEY_FINGERPRINT` - fingerprint of the public key, after registering it
   in DO (`doctl compute ssh-key import ci-key --public-key-file ci-key.pub`, then
   `doctl compute ssh-key list`).
 
 ## Seed the snapshots (one-time, and after a DB format-version bump)
+
 1. On a host with ~750 GB-1 TB of free disk and the Zebra build deps, run
    `.github/workflows/scripts/make-sync-confidence-snapshots.sh` (point `SNAP_URL`
    at a recent full mainnet snapshot, `REPO` at this checkout, and configure
@@ -26,7 +29,9 @@ state objects after a DB format-version bump by re-running the snapshots workflo
    `Sync confidence` run; droplets pull it anonymously).
 
 ## Running
+
 Once the snapshots exist and the package is public, **Sync confidence**:
+
 - **on merge to `ironwood-main`** rebuilds and publishes the `ironwood-main` test image
   to GHCR — no sync test runs, so merges stay cheap;
 - **every 12 hours (schedule)** reuses that `ironwood-main` image (no rebuild) and syncs
@@ -40,5 +45,6 @@ migration when opening the pruned state, and the error distinguishes the two
 (`FormatMismatch`/migration panic vs. a verification failure).
 
 ## Cost note
+
 Droplets are deleted after each run (`if: always()` + a 1h orphan sweep). If a run
 is force-killed, check `doctl compute droplet list --tag-name sync-confidence-ci`.
