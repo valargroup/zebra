@@ -1,34 +1,59 @@
 name: Sync confidence
 
-# Full-validation sync of two fixed mainnet windows bracketing the NU6.2 soft
-# fork, to catch consensus regressions that would break sync. Builds the test
-# image once (GHCR), then runs each window on an ephemeral DigitalOcean droplet
-# that restores pruned cached state from Spaces. Snapshots are produced
-# out-of-band by make-sync-confidence-snapshots.sh. See docs/sync-confidence-do-setup.md.
+# Catches consensus regressions that would break the ability to sync, by fully
+# (semantically) syncing two fixed mainnet windows bracketing the NU6.2 soft fork on
+# ephemeral DigitalOcean droplets that restore pruned cached state from Spaces.
+#
+# Triggers:
+# - push to ironwood-main: (re)build the test image and publish the `ironwood-main` tag
+#   to GHCR. No sync test runs on merge, so merges stay cheap.
+# - schedule (every 12h): reuse the latest `ironwood-main` image (no rebuild) and run
+#   both windows.
+# - workflow_dispatch: by default build the image from the dispatched ref and run both
+#   windows (so you can test a branch); uncheck `build_image` to reuse the `ironwood-main`
+#   image instead.
+#
+# The consumer opens the pruned snapshots in pruned storage mode and runs the image's
+# DB-format migration on open, so a red can mean a sync regression OR a broken format
+# migration. Snapshots are produced out-of-band by make-sync-confidence-snapshots.sh.
+# See docs/sync-confidence-do-setup.md.
 
 on:
   push:
     branches:
       - ironwood-main
+  schedule:
+    - cron: "0 */12 * * *"
   workflow_dispatch:
+    inputs:
+      build_image:
+        description: "Build the image from this ref (checked) or reuse the last ironwood-main image (unchecked)"
+        type: boolean
+        default: true
 
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep push (build), schedule, and dispatch in separate lanes so a merge-time image
+  # build never queues behind a long scheduled sync (or vice-versa).
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
-  # NOTE: the image build here produces the same image used for snapshot generation
-  # (make-sync-confidence-snapshots.sh). Keep the build-args and Dockerfile target in sync.
+  # Build + push the GHCR test image. Runs on merge to ironwood-main (publishes the
+  # `ironwood-main` tag the scheduled runs reuse) and on a build_image=true dispatch
+  # (publishes a sha tag for that ref). Skipped on schedule and build_image=false dispatch.
+  # NOTE: same image used for snapshot generation (make-sync-confidence-snapshots.sh) —
+  # keep build-args and the Dockerfile target in sync.
   build:
     name: Build test image (GHCR)
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_image) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     outputs:
-      # Single-valued by construction (one metadata tag rule); robust if tags are added later.
+      # sha-<commit> tag (first metadata tag) — unique per ref; used by build_image dispatches.
       image_ref: ghcr.io/${{ github.repository }}-tests:${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -44,7 +69,11 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
         with:
           images: ghcr.io/${{ github.repository }}-tests
-          tags: type=sha,prefix=sha-,format=short
+          # sha tag first => steps.meta.outputs.version (the job's image_ref). The branch
+          # tag (e.g. `ironwood-main`) is the stable tag scheduled runs reuse.
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
       - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
         with:
           context: .
@@ -59,6 +88,9 @@ jobs:
 
   pre-nu62:
     needs: build
+    # Run on schedule and dispatch (never on merge — merge only refreshes the image).
+    # Tolerate a skipped build: schedule / build_image=false reuse the ironwood-main image.
+    if: ${{ github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     permissions:
       contents: read
     uses: ./.github/workflows/do-sync-test.yml
@@ -71,11 +103,14 @@ jobs:
       state_key: pre-nu62
       nextest_profile: sync-range-pre-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
-      image_ref: ${{ needs.build.outputs.image_ref }}
+      # Stable ironwood-main image on schedule / build_image=false; the freshly-built sha
+      # image on a build_image dispatch.
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
       droplet_size: g-8vcpu-32gb
 
   post-nu62:
     needs: build
+    if: ${{ github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     permissions:
       contents: read
     uses: ./.github/workflows/do-sync-test.yml
@@ -88,5 +123,5 @@ jobs:
       state_key: post-nu62
       nextest_profile: sync-range-post-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
-      image_ref: ${{ needs.build.outputs.image_ref }}
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
       droplet_size: g-8vcpu-32gb
