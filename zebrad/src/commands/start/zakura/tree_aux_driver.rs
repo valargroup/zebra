@@ -233,56 +233,34 @@ pub(crate) async fn run_tree_aux_driver(
                     continue;
                 };
 
-                let (result, refetch_closed) = if let Some(rx) = &mut refetch_rx {
-                    let mut refetch_closed = false;
-                    let result = tokio::select! {
-                        result = fetch_roots_into_writer(
-                            &supervisor,
-                            &writer,
-                            &mut peer_policy,
-                            window_from,
-                            window_to,
-                        ) => {
-                            Some(result)
-                        }
-                        request = rx.recv() => {
-                            refetch_closed = handle_refetch_request(
-                                request,
-                                &supervisor,
-                                &writer,
-                                &mut peer_policy,
-                            )
-                                .await
-                                .is_err();
-                            None
-                        }
-                    };
-                    (result, refetch_closed)
-                } else {
-                    (
-                        Some(
-                            fetch_roots_into_writer(
-                                &supervisor,
-                                &writer,
-                                &mut peer_policy,
-                                window_from,
-                                window_to,
-                            )
-                            .await,
-                        ),
-                        false,
-                    )
-                };
-                if refetch_closed {
-                    refetch_rx = None;
-                }
-
-                let Some(result) = result else {
-                    continue;
-                };
+                let result = fetch_roots_into_writer(
+                    &supervisor,
+                    &writer,
+                    &mut peer_policy,
+                    window_from,
+                    window_to,
+                )
+                .await;
 
                 match result {
                     Ok(()) => {
+                        if let Some(rx) = &mut refetch_rx {
+                            let processed = process_queued_refetch_requests(
+                                rx,
+                                &supervisor,
+                                &writer,
+                                &mut peer_policy,
+                            )
+                            .await;
+                            if processed > 0 {
+                                tracing::debug!(
+                                    processed,
+                                    from_height = window_from.0,
+                                    to_height = window_to.0,
+                                    "tree_aux: processed queued refetch requests after initial root-window fetch"
+                                );
+                            }
+                        }
                         tracing::debug!(
                             from_height = window_from.0,
                             to_height = window_to.0,
@@ -511,6 +489,50 @@ async fn handle_refetch_request(
             Ok(())
         }
         Err(tokio::sync::broadcast::error::RecvError::Closed) => Err(()),
+    }
+}
+
+async fn process_queued_refetch_requests(
+    rx: &mut tokio::sync::broadcast::Receiver<block::Height>,
+    supervisor: &ZakuraSupervisorHandle,
+    writer: &TreeAuxRootsWriter,
+    peer_policy: &mut TreeAuxPeerPolicy,
+) -> u64 {
+    let mut processed = 0u64;
+    loop {
+        match rx.try_recv() {
+            Ok(height) => {
+                let _ = handle_refetch_request(Ok(height), supervisor, writer, peer_policy).await;
+                processed = processed.saturating_add(1);
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                tracing::warn!(
+                    "tree_aux: missed refetch requests while draining, latest will retry"
+                );
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => return processed,
+        }
+    }
+}
+
+#[cfg(test)]
+fn drain_queued_refetch_requests_for_test(
+    rx: &mut tokio::sync::broadcast::Receiver<block::Height>,
+) -> u64 {
+    let mut drained = 0u64;
+    loop {
+        match rx.try_recv() {
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                drained = drained.saturating_add(1);
+            }
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => return drained,
+        }
     }
 }
 
@@ -1371,6 +1393,18 @@ mod tests {
             h(u32::MAX),
             "fetch-ahead arithmetic saturates before clamping to the handoff"
         );
+    }
+
+    #[test]
+    fn process_queued_refetch_requests_drains_channel() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+
+        tx.send(block::Height(42)).expect("receiver is live");
+        tx.send(block::Height(43)).expect("receiver is live");
+
+        let drained = drain_queued_refetch_requests_for_test(&mut rx);
+        assert_eq!(drained, 2);
+        assert_eq!(drain_queued_refetch_requests_for_test(&mut rx), 0);
     }
 
     #[test]

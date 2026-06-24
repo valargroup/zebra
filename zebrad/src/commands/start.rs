@@ -692,6 +692,7 @@ impl StartCmd {
                         state.clone(),
                         read_only_state_service.clone(),
                         block_verifier_router.clone(),
+                        tree_aux_roots_writer.clone(),
                         trace.clone(),
                         shutdown.clone().cancelled_owned(),
                     )
@@ -2088,6 +2089,7 @@ mod zakura_header_sync_driver_tests {
     use tower::{service_fn, util::BoxService, ServiceExt};
     use zebra_chain::block;
     use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_chain::{orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
     use zebra_network::zakura::{
         commit_state_trace as cs_trace, BlockApplyExecutor, BlockApplyRequest, BlockApplyResult,
@@ -2106,13 +2108,21 @@ mod zakura_header_sync_driver_tests {
         coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
         drive_zakura_header_sync_actions, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZakuraHeaderSyncDriverHandles, ZebradBlockApplyExecutor, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles, ZebradBlockApplyExecutor,
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    fn root_at(height: block::Height) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height,
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }
     }
 
     #[derive(Debug)]
@@ -2203,6 +2213,33 @@ mod zakura_header_sync_driver_tests {
                 &body_size_hints,
             ),
             vec![0, 100],
+        );
+    }
+
+    #[test]
+    fn served_header_tree_aux_roots_require_a_complete_aligned_prefix() {
+        let start = block::Height(10);
+        let header_heights = [
+            block::Height(10),
+            block::Height(11),
+            block::Height(12),
+            block::Height(13),
+        ];
+        let roots = [root_at(block::Height(10)), root_at(block::Height(11))];
+
+        assert_eq!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots),
+            roots.to_vec()
+        );
+
+        let roots_with_gap = [
+            root_at(block::Height(10)),
+            root_at(block::Height(12)),
+            root_at(block::Height(13)),
+        ];
+        assert_eq!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap),
+            vec![root_at(block::Height(10))],
         );
     }
 
@@ -2780,6 +2817,11 @@ mod zakura_header_sync_driver_tests {
             );
         }
         assert!(
+            zebra_network::zakura::DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+                > zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+            "Zakura block sync must be able to submit a full checkpoint gap plus the resolving checkpoint block",
+        );
+        assert!(
             usize::try_from(DEFAULT_HS_RANGE)
                 .expect("DEFAULT_HS_RANGE fits usize on supported targets")
                 >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
@@ -2894,6 +2936,7 @@ mod zakura_header_sync_driver_tests {
             state,
             read_state,
             verifier,
+            None,
             zebra_network::zakura::ZakuraTrace::noop(),
             async move {
                 let _ = shutdown_rx.await;

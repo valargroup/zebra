@@ -126,6 +126,11 @@ impl HeaderSyncDecodeContext {
         }
     }
 
+    pub(super) fn wants_tree_aux_roots(self) -> bool {
+        self.requested
+            .is_some_and(|requested| requested.want_tree_aux_roots)
+    }
+
     pub(super) fn headers_response_limit(self) -> Result<Option<usize>, HeaderSyncWireError> {
         let Some(requested) = self.requested else {
             return Ok(None);
@@ -326,6 +331,39 @@ pub(super) fn validate_body_sizes_len(
     Ok(())
 }
 
+pub(super) fn validate_tree_aux_roots_len(
+    headers: usize,
+    roots: usize,
+) -> Result<(), HeaderSyncWireError> {
+    if roots != 0 && headers != roots {
+        return Err(HeaderSyncWireError::TreeAuxRootCountMismatch { headers, roots });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_tree_aux_root_heights(
+    start_height: block::Height,
+    roots: &[BlockCommitmentRoots],
+) -> Result<(), HeaderSyncWireError> {
+    for (offset, root) in roots.iter().enumerate() {
+        let offset = u32::try_from(offset)
+            .map_err(|_| HeaderSyncWireError::NumericOverflow("tree-aux root height offset"))?;
+        let expected_height = block::Height(
+            start_height
+                .0
+                .checked_add(offset)
+                .ok_or(HeaderSyncWireError::NumericOverflow("tree-aux root height"))?,
+        );
+        if root.height != expected_height {
+            return Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+                expected_height,
+                root_height: root.height,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn clamp_advertised_range(value: u32) -> u32 {
     value.clamp(1, MAX_HS_RANGE)
 }
@@ -344,6 +382,17 @@ pub(super) fn read_height<R: Read>(reader: &mut R) -> Result<block::Height, Head
         return Err(HeaderSyncWireError::HeightOutOfRange(height.0));
     }
     Ok(height)
+}
+
+pub(super) fn read_bool_marker<R: Read>(
+    reader: &mut R,
+    field: &'static str,
+) -> Result<bool, HeaderSyncWireError> {
+    match reader.read_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(HeaderSyncWireError::InvalidBoolMarker { field, value }),
+    }
 }
 
 pub(super) fn reject_trailing(

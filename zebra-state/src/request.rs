@@ -1009,6 +1009,11 @@ pub enum Request {
         ///
         /// A `0` value means unknown. These hints are not consensus data.
         body_sizes: Vec<u32>,
+        /// Optional all-or-nothing tree-aux roots, parallel to `headers` when non-empty.
+        ///
+        /// Empty means the peer did not provide roots. Non-empty roots are
+        /// advisory until verified during block commit.
+        tree_aux_roots: Vec<zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>,
     },
 
     /// Computes the depth in the current best chain of the block identified by the given hash.

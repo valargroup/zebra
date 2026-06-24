@@ -31,15 +31,46 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 /// flowing to trigger the inline check (e.g. once outstanding requests drain).
 const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Maximum downloaded bodies handled in one fair-loop turn.
-///
-/// Body handling can drain/submit a large contiguous prefix, so one body per turn
-/// is enough to keep floor bodies moving without letting body traffic bury
-/// verifier completions and frontier/reset controls.
-const MAX_BODY_BATCH_PER_TURN: usize = 1;
-
 const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
+
+#[derive(Copy, Clone, Debug)]
+enum ReadySource {
+    Control,
+    Body,
+    ApplyCompletion,
+    ApplyExecutor,
+    CheckpointRefresh,
+}
+
+impl ReadySource {
+    const COUNT: usize = 5;
+
+    fn from_index(index: usize) -> Self {
+        match index % Self::COUNT {
+            0 => Self::Control,
+            1 => Self::Body,
+            2 => Self::ApplyCompletion,
+            3 => Self::ApplyExecutor,
+            4 => Self::CheckpointRefresh,
+            _ => unreachable!("ready source index is modulo source count"),
+        }
+    }
+
+    fn next(self) -> Self {
+        Self::from_index(self.index() + 1)
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Control => 0,
+            Self::Body => 1,
+            Self::ApplyCompletion => 2,
+            Self::ApplyExecutor => 3,
+            Self::CheckpointRefresh => 4,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SubmittedBlockApply {
@@ -272,6 +303,7 @@ pub(super) struct SequencerTask {
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     trace: ZakuraTrace,
+    next_ready_source: ReadySource,
 }
 
 impl SequencerTask {
@@ -313,6 +345,7 @@ impl SequencerTask {
             view_tx,
             action_send_timeout,
             trace,
+            next_ready_source: ReadySource::Control,
         }
     }
 
@@ -333,65 +366,36 @@ impl SequencerTask {
                 break;
             }
 
-            let mut progressed = false;
-
-            if control_open {
-                match self.control_input_rx.try_recv() {
-                    Ok(input) => {
-                        progressed = true;
-                        self.process_control_input(input).await;
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        control_open = false;
-                    }
-                }
-            }
-
-            if body_open {
-                for _ in 0..MAX_BODY_BATCH_PER_TURN {
-                    match self.body_input_rx.try_recv() {
-                        Ok(body) => {
-                            progressed = true;
-                            self.process_body_input(body).await;
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            body_open = false;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if self.refresh_due() {
-                progressed = true;
-                self.process_checkpoint_refresh().await;
-            }
-
-            if progressed {
+            if self
+                .process_one_ready(&mut control_open, &mut body_open, &mut apply_executor_open)
+                .await
+            {
                 continue;
             }
 
             tokio::select! {
                 input = self.control_input_rx.recv(), if control_open => {
+                    self.next_ready_source = ReadySource::Body;
                     match input {
                         Some(input) => self.process_control_input(input).await,
                         None => control_open = false,
                     }
                 }
                 body = self.body_input_rx.recv(), if body_open => {
+                    self.next_ready_source = ReadySource::ApplyCompletion;
                     match body {
                         Some(body) => self.process_body_input(body).await,
                         None => body_open = false,
                     }
                 }
                 completed = self.in_flight_applies.next(), if !self.in_flight_applies.is_empty() => {
+                    self.next_ready_source = ReadySource::ApplyExecutor;
                     if let Some(completed) = completed {
                         self.process_apply_completion(completed).await;
                     }
                 }
                 changed = self.apply_executor_rx.changed(), if apply_executor_open && self.should_watch_apply_executor() => {
+                    self.next_ready_source = ReadySource::CheckpointRefresh;
                     if changed.is_ok() {
                         self.install_apply_executor_if_ready().await;
                     } else {
@@ -404,6 +408,7 @@ impl SequencerTask {
                         None => std::future::pending().await,
                     }
                 }, if self.checkpoint_frontier_refresh.next_attempt_at().is_some() => {
+                    self.next_ready_source = ReadySource::Control;
                     self.process_checkpoint_refresh().await;
                 }
                 _ = shed_tick.tick() => {
@@ -419,6 +424,111 @@ impl SequencerTask {
         }
     }
 
+    async fn process_one_ready(
+        &mut self,
+        control_open: &mut bool,
+        body_open: &mut bool,
+        apply_executor_open: &mut bool,
+    ) -> bool {
+        let start = self.next_ready_source.index();
+        for offset in 0..ReadySource::COUNT {
+            let source = ReadySource::from_index(start + offset);
+            if self
+                .process_ready_source(source, control_open, body_open, apply_executor_open)
+                .await
+            {
+                self.next_ready_source = source.next();
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn process_ready_source(
+        &mut self,
+        source: ReadySource,
+        control_open: &mut bool,
+        body_open: &mut bool,
+        apply_executor_open: &mut bool,
+    ) -> bool {
+        match source {
+            ReadySource::Control => {
+                if !*control_open {
+                    return false;
+                }
+                match self.control_input_rx.try_recv() {
+                    Ok(input) => {
+                        self.process_control_input(input).await;
+                        true
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => false,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        *control_open = false;
+                        false
+                    }
+                }
+            }
+            ReadySource::Body => {
+                if !*body_open {
+                    return false;
+                }
+                match self.body_input_rx.try_recv() {
+                    Ok(body) => {
+                        self.process_body_input(body).await;
+                        true
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => false,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        *body_open = false;
+                        false
+                    }
+                }
+            }
+            ReadySource::ApplyCompletion => {
+                let Some(completed) = self.poll_ready_apply_completion().await else {
+                    return false;
+                };
+                self.process_apply_completion(completed).await;
+                true
+            }
+            ReadySource::ApplyExecutor => {
+                if !*apply_executor_open || !self.should_watch_apply_executor() {
+                    return false;
+                }
+                match self.apply_executor_rx.has_changed() {
+                    Ok(true) => {
+                        self.install_apply_executor_if_ready().await;
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(_) => {
+                        *apply_executor_open = false;
+                        false
+                    }
+                }
+            }
+            ReadySource::CheckpointRefresh => {
+                if !self.refresh_due() {
+                    return false;
+                }
+                self.process_checkpoint_refresh().await;
+                true
+            }
+        }
+    }
+
+    async fn poll_ready_apply_completion(&mut self) -> Option<SubmittedBlockApply> {
+        if self.in_flight_applies.is_empty() {
+            return None;
+        }
+
+        futures::future::poll_fn(|cx| match self.in_flight_applies.poll_next_unpin(cx) {
+            std::task::Poll::Ready(completed) => std::task::Poll::Ready(completed),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        })
+        .await
+    }
+
     fn refresh_due(&self) -> bool {
         self.checkpoint_frontier_refresh
             .next_attempt_at()
@@ -427,7 +537,7 @@ impl SequencerTask {
 
     async fn install_apply_executor_if_ready(&mut self) {
         if self.should_replace_apply_executor() {
-            self.apply_executor = self.apply_executor_rx.borrow().clone();
+            self.apply_executor = self.apply_executor_rx.borrow_and_update().clone();
         }
         self.submit_pending_blocks().await;
         self.publish_view();
@@ -836,8 +946,13 @@ impl SequencerTask {
 
     fn can_submit_class(&self, class: BlockApplyClass, limits: BlockApplyLimits) -> bool {
         // The checkpoint verifier can hold a complete range until its checkpoint is
-        // reached. Keep room for the current range and the next complete range.
-        let checkpoint_pipeline_apply_limit = limits.checkpoint_apply_limit.saturating_mul(2);
+        // reached. Keep room for the current range and the next complete range,
+        // except for explicit single-apply ports such as throughput-probe mode.
+        let checkpoint_pipeline_apply_limit = if limits == BlockApplyLimits::single() {
+            1
+        } else {
+            limits.checkpoint_apply_limit.saturating_mul(2)
+        };
         let checkpoint_combined_apply_limit = limits
             .combined_apply_limit
             .max(checkpoint_pipeline_apply_limit);

@@ -44,6 +44,7 @@ use crate::{
                 ZebraDb,
             },
             COMMITMENT_ROOTS_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
+            ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -935,6 +936,10 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         .db
         .cf_handle("zakura_header_body_size_by_height")
         .unwrap();
+    let roots_by_height = db
+        .db
+        .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+        .unwrap();
 
     let Some((tip_height, _tip_hash)) = db
         .db
@@ -950,6 +955,7 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         batch.zs_delete(&hash_by_height, height);
         batch.zs_delete(&header_by_height, height);
         batch.zs_delete(&body_size_by_height, height);
+        batch.zs_delete(&roots_by_height, height);
     }
 }
 

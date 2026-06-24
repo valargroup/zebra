@@ -131,7 +131,12 @@ impl BlockApplyExecutor for TestBlockApplyExecutor {
             if let Some(completion) = completion {
                 return match completion {
                     TestBlockApplyCompletion::Held(completion) => match completion.await {
-                        Ok(output) => output,
+                        Ok(output) => {
+                            if let Some(completed_count) = completed_count.as_ref() {
+                                completed_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            output
+                        }
                         Err(_) => future::pending::<BlockApplyOutput>().await,
                     },
                     TestBlockApplyCompletion::Parked => future::pending::<BlockApplyOutput>().await,
@@ -159,6 +164,29 @@ impl BlockApplyExecutor for TestBlockApplyExecutor {
             }
         }
         .boxed()
+    }
+
+    fn refresh_checkpoint_frontier(
+        &self,
+        _highest_sent: block::Height,
+        _attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        async { None }.boxed()
+    }
+}
+
+#[derive(Debug)]
+struct TestCheckpointBlockApplyExecutor {
+    inner: TestBlockApplyExecutor,
+}
+
+impl BlockApplyExecutor for TestCheckpointBlockApplyExecutor {
+    fn block_apply_class(&self, _block: &block::Block) -> BlockApplyClass {
+        BlockApplyClass::Checkpoint
+    }
+
+    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
+        self.inner.apply(request)
     }
 
     fn refresh_checkpoint_frontier(
@@ -211,22 +239,6 @@ fn test_apply_executor_port() -> BlockApplyExecutorPort {
             combined_apply_limit: 128,
         },
     )
-}
-
-fn test_apply_executor_port_with_limits_and_completion_counter(
-    limits: BlockApplyLimits,
-    completed_count: StdArc<AtomicUsize>,
-    submit_completed_counts: StdArc<Mutex<Vec<(block::Height, usize)>>>,
-) -> BlockApplyExecutorPort {
-    let completions = StdArc::new(Mutex::new(VecDeque::new()));
-    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
-    let executor = TestBlockApplyExecutor {
-        completions,
-        default_result,
-        completed_count: Some(completed_count),
-        submit_completed_counts: Some(submit_completed_counts),
-    };
-    BlockApplyExecutorPort::with_limits(StdArc::new(executor), limits)
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
@@ -2822,6 +2834,29 @@ fn sequencer_records_and_decrements_submitted_applies() {
     assert!(!seq.submitted_contains(block::Height(1)));
 }
 
+#[test]
+fn sequencer_release_applied_through_clears_submitted_records() {
+    let mut seq = test_sequencer(0, 4);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+
+    let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
+    let item2 = seq.prepare_submit(block::Height(2)).expect("applying at 2");
+    let item3 = seq.prepare_submit(block::Height(3)).expect("applying at 3");
+    seq.record_submitted_apply(item1.height, item1.hash);
+    seq.record_submitted_apply(item2.height, item2.hash);
+    seq.record_submitted_apply(item3.height, item3.hash);
+
+    assert_eq!(seq.release_applied_through(block::Height(2)), 200);
+    assert!(!seq.submitted_contains(block::Height(1)));
+    assert!(!seq.submitted_contains(block::Height(2)));
+    assert!(seq.submitted_contains(block::Height(3)));
+}
+
 #[tokio::test]
 async fn sequencer_task_body_input_is_not_starved_by_control_backlog() {
     let frontiers = BlockSyncFrontiers {
@@ -2847,7 +2882,7 @@ async fn sequencer_task_body_input_is_not_starved_by_control_backlog() {
         body_rx,
         control_rx,
         apply_executor_rx,
-        body_input_bytes,
+        body_input_bytes.clone(),
         view_tx,
         Duration::from_secs(1),
         ZakuraTrace::noop(),
@@ -2926,7 +2961,7 @@ async fn sequencer_buffers_bodies_until_executor_installed() {
         body_rx,
         control_rx,
         apply_executor_rx,
-        body_input_bytes,
+        body_input_bytes.clone(),
         view_tx,
         Duration::from_secs(1),
         ZakuraTrace::noop(),
@@ -2968,37 +3003,36 @@ async fn sequencer_buffers_bodies_until_executor_installed() {
 }
 
 #[tokio::test]
-async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
-    const READY_COMPLETIONS: u32 = 10_000;
-
+async fn sequencer_single_apply_limit_serializes_checkpoint_submissions() {
     let frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(0),
         verified_block_tip: block::Height(0),
         verified_block_hash: block::Hash([0; 32]),
     };
-    let blocks = fake_sequential_blocks(READY_COMPLETIONS + 1);
+    let blocks = fake_sequential_blocks(2);
     let bytes = u64::from(block_size(&blocks[0]));
-    let (body_tx, body_rx) = mpsc::channel(blocks.len());
+    let (body_tx, body_rx) = mpsc::channel(4);
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
-    let (actions_tx, mut actions_rx) = mpsc::channel(blocks.len());
-    let queued_block_count = u64::try_from(blocks.len()).expect("test block count fits in u64");
-    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(
-        bytes.saturating_mul(queued_block_count),
-    ));
+    let (actions_tx, mut actions_rx) = mpsc::channel(4);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes.saturating_mul(2)));
     let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
-    let completed_count = StdArc::new(AtomicUsize::new(0));
-    let submit_completed_counts = StdArc::new(Mutex::new(Vec::new()));
-    let limits = BlockApplyLimits {
-        checkpoint_apply_limit: 1,
-        full_apply_limit: blocks.len(),
-        combined_apply_limit: blocks.len(),
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    let first_completion = controller.hold_next();
+    let executor = TestCheckpointBlockApplyExecutor {
+        inner: TestBlockApplyExecutor {
+            completions,
+            default_result,
+            completed_count: None,
+            submit_completed_counts: None,
+        },
     };
     let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(
-        test_apply_executor_port_with_limits_and_completion_counter(
-            limits,
-            completed_count.clone(),
-            submit_completed_counts.clone(),
-        ),
+        BlockApplyExecutorPort::with_limits(StdArc::new(executor), BlockApplyLimits::single()),
     ));
     let task = super::sequencer_task::SequencerTask::new(
         Sequencer::new(block::Height(0), blocks.len()),
@@ -3010,7 +3044,7 @@ async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
         body_rx,
         control_rx,
         apply_executor_rx,
-        body_input_bytes,
+        body_input_bytes.clone(),
         view_tx,
         Duration::from_secs(1),
         ZakuraTrace::noop(),
@@ -3027,11 +3061,178 @@ async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
                 received_at: Instant::now(),
             })
             .await
+            .expect("checkpoint body queues");
+    }
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    let (first_token, first_block) =
+        match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+            .await
+            .expect("first checkpoint body submits")
+        {
+            Some(BlockSyncAction::ApplySubmitted { token, block }) => (token, block),
+            other => panic!("unexpected action for first checkpoint submit: {other:?}"),
+        };
+    assert_eq!(first_block.coinbase_height(), Some(block::Height(1)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions_rx.recv())
+            .await
+            .is_err(),
+        "single-apply checkpoint mode must not submit the next body before the first completes",
+    );
+
+    first_completion
+        .send(BlockApplyOutput {
+            token: first_token,
+            height: block::Height(1),
+            hash: first_block.hash(),
+            result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(1),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: first_block.hash(),
+            }),
+        })
+        .expect("held checkpoint completion receiver is still live");
+
+    match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+        .await
+        .expect("second checkpoint body submits after first completion")
+    {
+        Some(BlockSyncAction::ApplySubmitted {
+            block: submitted_block,
+            ..
+        }) => {
+            assert_eq!(submitted_block.coinbase_height(), Some(block::Height(2)));
+        }
+        other => panic!("unexpected action for second checkpoint submit: {other:?}"),
+    }
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
+    const READY_COMPLETIONS: u32 = 10_000;
+
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(READY_COMPLETIONS + 1);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(blocks.len());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(blocks.len());
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    let mut held_completions = Vec::new();
+    for _ in 0..READY_COMPLETIONS {
+        held_completions.push(controller.hold_next());
+    }
+    let completed_count = StdArc::new(AtomicUsize::new(0));
+    let submit_completed_counts = StdArc::new(Mutex::new(Vec::new()));
+    let limits = BlockApplyLimits {
+        checkpoint_apply_limit: 1,
+        full_apply_limit: blocks.len(),
+        combined_apply_limit: blocks.len(),
+    };
+    let executor = TestBlockApplyExecutor {
+        completions,
+        default_result,
+        completed_count: Some(completed_count.clone()),
+        submit_completed_counts: Some(submit_completed_counts.clone()),
+    };
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(
+        BlockApplyExecutorPort::with_limits(StdArc::new(executor), limits),
+    ));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes.clone(),
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    for block in blocks.iter().take(READY_COMPLETIONS as usize) {
+        body_input_bytes.fetch_add(bytes, Ordering::Relaxed);
+        body_tx
+            .send(super::sequencer_task::SequencedBody {
+                height: block.coinbase_height().expect("test block has height"),
+                hash: block.hash(),
+                body: BufferedBlockBody::Decoded(block.clone()),
+                bytes,
+                peer: peer(1),
+                received_at: Instant::now(),
+            })
+            .await
             .expect("body input queues before task starts");
     }
 
     let task_handle = tokio::spawn(async move { task.run().await });
     let floor_height = block::Height(READY_COMPLETIONS + 1);
+    let mut submitted = Vec::new();
+    while submitted.len() < READY_COMPLETIONS as usize {
+        match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+            .await
+            .expect("held apply is submitted")
+        {
+            Some(BlockSyncAction::ApplySubmitted { token, block }) => {
+                submitted.push((token, block));
+            }
+            other => panic!("unexpected action while filling apply set: {other:?}"),
+        }
+    }
+
+    let floor_block = blocks
+        .last()
+        .expect("floor body exists in the synthesized chain");
+    body_input_bytes.fetch_add(bytes, Ordering::Relaxed);
+    body_tx
+        .send(super::sequencer_task::SequencedBody {
+            height: floor_height,
+            hash: floor_block.hash(),
+            body: BufferedBlockBody::Decoded(floor_block.clone()),
+            bytes,
+            peer: peer(1),
+            received_at: Instant::now(),
+        })
+        .await
+        .expect("floor body queues beside ready apply completions");
+
+    for (completion, (token, block)) in held_completions.into_iter().zip(submitted) {
+        let height = block
+            .coinbase_height()
+            .expect("submitted test block has height");
+        completion
+            .send(BlockApplyOutput {
+                token,
+                height,
+                hash: block.hash(),
+                result: BlockApplyResult::Committed,
+                local_frontier: Some(BlockSyncFrontiers {
+                    finalized_height: height,
+                    verified_block_tip: height,
+                    verified_block_hash: block.hash(),
+                }),
+            })
+            .expect("held apply completion receiver is still live");
+    }
 
     loop {
         match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
@@ -3058,6 +3259,83 @@ async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
         floor_submit_completed_count <= 2,
         "queued floor body must submit before draining the ready completion flood",
     );
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_harvests_apply_completions_under_budget_limited_body_flood() {
+    const BLOCKS: u32 = 128;
+
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(BLOCKS);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(16);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(16);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let budget = ByteBudget::new(bytes.saturating_mul(4));
+    let producer_budget = budget.clone();
+    let producer_body_input_bytes = body_input_bytes.clone();
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(test_apply_executor_port()));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        budget,
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes,
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+    let task_handle = tokio::spawn(async move { task.run().await });
+    let producer_handle = tokio::spawn(async move {
+        let mut budget = producer_budget;
+        for block in blocks {
+            while !budget.try_reserve(bytes) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            producer_body_input_bytes.fetch_add(bytes, Ordering::Relaxed);
+            body_tx
+                .send(super::sequencer_task::SequencedBody {
+                    height: block.coinbase_height().expect("test block has height"),
+                    hash: block.hash(),
+                    body: BufferedBlockBody::Decoded(block),
+                    bytes,
+                    peer: peer(1),
+                    received_at: Instant::now(),
+                })
+                .await
+                .expect("budget-limited body queues");
+        }
+    });
+
+    let mut submitted = 0u32;
+    while submitted < BLOCKS {
+        match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+            .await
+            .expect("budget-limited flood keeps submitting")
+        {
+            Some(BlockSyncAction::ApplySubmitted { .. }) => {
+                submitted = submitted.saturating_add(1);
+            }
+            other => panic!("unexpected action while draining budget-limited flood: {other:?}"),
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), producer_handle)
+        .await
+        .expect("producer finishes once apply completions release budget")
+        .expect("producer task does not panic");
 
     task_handle.abort();
 }
