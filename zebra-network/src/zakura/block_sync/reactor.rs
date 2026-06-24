@@ -21,7 +21,6 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// request; the routine never blocks on it (the only blocking routine send is the
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -134,6 +133,7 @@ pub fn spawn_block_sync_reactor(
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
         sequencer_input_bytes: sequencer_input_bytes.clone(),
+        sequencer_control: sequencer_control_tx.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
@@ -150,7 +150,7 @@ pub fn spawn_block_sync_reactor(
     };
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
-        committed_floor: startup.frontiers.verified_block_tip,
+        request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
@@ -219,10 +219,10 @@ pub(super) struct BlockSyncReactor {
     /// Reactor-side mirror of the Sequencer's verified tip (it no longer lives
     /// in `state`). Updated from the committed view; initialized from startup.
     verified_block_tip: block::Height,
-    /// Reactor-side mirror of the Sequencer's body-download floor. Used ONLY for
-    /// the producer query lower bound, candidate prune, and stale-prefix trim —
-    /// never as a fetch decision.
-    committed_floor: block::Height,
+    /// Reactor-side scheduler/query lower bound. It follows the Sequencer's
+    /// download floor, but it is not verified state and must not be used for
+    /// serving/status advertisement.
+    request_floor: block::Height,
     /// `(verified_tip, best_header_tip, best_header_hash)` for a dispatched
     /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
     /// back yet.
@@ -256,6 +256,8 @@ impl BlockSyncReactor {
                 .status_refresh_interval
                 .max(Duration::from_millis(1)),
         );
+        let mut floor_watchdog_ticks =
+            time::interval(self.startup.config.effective_floor_watchdog_tick());
 
         self.query_needed_blocks().await;
         self.publish_metrics();
@@ -343,7 +345,47 @@ impl BlockSyncReactor {
                     self.trace_sync_state();
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
+                _ = floor_watchdog_ticks.tick() => {
+                    self.run_floor_watchdog(Instant::now());
+                    self.publish_metrics();
+                }
             }
+        }
+    }
+
+    fn run_floor_watchdog(&mut self, now: Instant) {
+        let Some(height) = next_height(self.request_floor) else {
+            return;
+        };
+        let (servable_peers, _) = self.registry.floor_gap_servable(height);
+        let claims = self.registry.outstanding_claims_at(height);
+        for claim in claims {
+            if claim.meta.deadline > now {
+                continue;
+            }
+
+            self.registry
+                .clear_outstanding_height(&claim.peer, claim.height);
+            if servable_peers > 2 {
+                self.registry.avoid_height_until(
+                    &claim.peer,
+                    claim.height,
+                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
+                );
+            }
+            let released = self
+                .state
+                .work
+                .release_reserved_and_return_items([claim.height]);
+            self.state.budget.release(released);
+            metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
+            tracing::debug!(
+                peer = ?claim.peer,
+                height = ?claim.height,
+                estimated_bytes = claim.meta.estimated_bytes,
+                released,
+                "force-cancelled expired Zakura block-sync floor request"
+            );
         }
     }
 
@@ -635,10 +677,10 @@ impl BlockSyncReactor {
     /// floor advances. The producer (`handle_needed_blocks`) only ever *grows*
     /// `needed_heights`; this prunes the heights the floor passed so the candidate
     /// gap clears promptly without waiting for the next `NeededBlocks` snapshot.
-    /// Reads the `committed_floor` mirror (the Sequencer's floor now lives on the
-    /// task); this is a GC/candidate use, never a fetch throttle.
+    /// Reads the `request_floor` mirror (the Sequencer's download floor now lives
+    /// on the task); this is a GC/candidate use, never a fetch throttle.
     fn prune_needed_below_floor(&mut self) {
-        let floor = self.committed_floor;
+        let floor = self.request_floor;
         let before = self.state.needed_heights.len();
         self.state.needed_heights.retain(|height| *height > floor);
         if self.state.needed_heights.len() != before {
@@ -718,7 +760,7 @@ impl BlockSyncReactor {
         self.last_view = view;
         self.state.finalized_height = self.state.finalized_height.max(view.finalized);
         self.verified_block_tip = view.verified_tip;
-        self.committed_floor = view.floor;
+        self.request_floor = view.download_floor;
         self.state.verified_block_hash = view.verified_hash;
         self.state.servable_high = view.verified_tip;
         self.state.servable_hash = view.verified_hash;
@@ -783,7 +825,7 @@ impl BlockSyncReactor {
         // or `reset_above` (reset). So a height above the committed floor that is
         // not in `in_flight` is genuinely missing and re-queuable; one that is
         // in `in_flight` is already claimed and must not be re-issued. The
-        // `committed_floor` mirror is the producer's lower bound only.
+        // `request_floor` mirror is the producer's lower bound only.
         //
         // `!has_outstanding_request` is kept (the registry's per-peer outstanding):
         // the `in_flight ⟺ outstanding` half of the invariant breaks transiently
@@ -798,7 +840,7 @@ impl BlockSyncReactor {
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
-                block.height > self.committed_floor
+                block.height > self.request_floor
                     && !self.state.work.in_flight_contains(block.height)
                     && !self
                         .registry
@@ -1094,7 +1136,7 @@ impl BlockSyncReactor {
         if !self.startup.state_queries_enabled {
             return false;
         }
-        if self.committed_floor >= self.state.best_header_tip {
+        if self.request_floor >= self.state.best_header_tip {
             self.pending_needed_query = None;
             return true;
         }
@@ -1110,7 +1152,7 @@ impl BlockSyncReactor {
             return true;
         }
         let query = (
-            self.committed_floor,
+            self.request_floor,
             self.state.best_header_tip,
             self.state.best_header_hash,
         );
@@ -1118,7 +1160,7 @@ impl BlockSyncReactor {
             return true;
         }
         let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: self.committed_floor,
+            verified_block_tip: self.request_floor,
             best_header_tip: self.state.best_header_tip,
         });
         if dispatched {
@@ -1425,7 +1467,8 @@ impl BlockSyncReactor {
             .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
             .unwrap_or((0, 0));
         self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
-            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.floor);
+            bs_insert_height(row, bs_trace::REQUEST_FLOOR, self.request_floor);
+            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.download_floor);
             bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
             bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
             bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
@@ -1780,21 +1823,23 @@ impl BlockSyncReactor {
         });
     }
 
-    fn floor_gap_diagnostics(&self, _now: Instant) -> Option<FloorGapDiagnostics> {
-        let height = next_height(self.committed_floor)?;
+    fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {
+        let height = next_height(self.request_floor)?;
         if height > self.state.best_header_tip {
             return None;
         }
 
-        // Servable / outstanding peer counts come from the registry (the routines
-        // mirror their outstanding heights there). The per-request deadline ages
-        // now live in the routines and are no longer reactor-visible; this trace
-        // field drops the `oldest/next deadline ms` breakdown (per-peer routines) — the periodic
-        // `BLOCK_SYNC_STATE` row still carries the slot/budget signals.
         let (servable_peers, outstanding_peers) = self.registry.floor_gap_servable(height);
+        let claims = self.registry.outstanding_claims_at(height);
         let available_peers = 0usize;
-        let oldest_outstanding_ms = None;
-        let next_deadline_ms = None;
+        let oldest_outstanding_ms = claims
+            .iter()
+            .map(|claim| elapsed_ms_u64(now.saturating_duration_since(claim.meta.queued_at)))
+            .max();
+        let next_deadline_ms = claims
+            .iter()
+            .map(|claim| elapsed_ms_u64(claim.meta.deadline.saturating_duration_since(now)))
+            .min();
 
         // Sequencer task: the Sequencer's per-height `applying`/`submitted_apply`/`reorder`
         // membership is no longer reactor-visible (it lives on the task). A height
@@ -2159,6 +2204,10 @@ fn bs_insert_str(
     value: &str,
 ) {
     row.insert(key.to_string(), serde_json::Value::from(value.to_string()));
+}
+
+fn elapsed_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {

@@ -46,7 +46,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, RawBytes, VCT_SYNC_METADATA, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, VCT_SYNC_METADATA, PRUNING_METADATA,
     },
     HashOrHeight,
 };

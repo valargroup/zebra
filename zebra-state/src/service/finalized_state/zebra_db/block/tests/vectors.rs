@@ -276,7 +276,7 @@ fn block_size_hints_prefer_confirmed_block_info_over_advertised_hint() {
 }
 
 #[test]
-fn block_size_hints_exclude_advertised_hints() {
+fn block_size_hints_use_advertised_hints_when_unconfirmed() {
     let _init_guard = zebra_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();
 
@@ -300,7 +300,7 @@ fn block_size_hints_exclude_advertised_hints() {
             Height(1),
             1,
         ),
-        vec![(Height(1), None)],
+        vec![(Height(1), Some(999_999))],
     );
 }
 

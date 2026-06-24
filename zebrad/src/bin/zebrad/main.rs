@@ -2,6 +2,10 @@
 
 use zebrad::application::{boot, APPLICATION};
 
+#[cfg(all(feature = "jemalloc-profiling", not(target_env = "msvc")))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Process entry point for `zebrad`
 fn main() {
     // Enable backtraces by default for zebrad, but allow users to override it.
