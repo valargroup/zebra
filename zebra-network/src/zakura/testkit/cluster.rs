@@ -1049,14 +1049,14 @@ mod tests {
                             .collect();
                         let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                     }
-                    BlockSyncAction::SubmitBlock { token, block } => {
+                    BlockSyncAction::ApplySubmitted { token, block } => {
                         let height = block.coinbase_height().expect("submitted block has height");
                         submitted
                             .lock()
                             .expect("submitted list mutex is not poisoned")
                             .push(height);
                         let _ = handle
-                            .send(BlockSyncEvent::BlockApplyFinished {
+                            .send(BlockSyncEvent::TestApplyDone {
                                 token,
                                 height,
                                 hash: block.hash(),

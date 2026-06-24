@@ -21,6 +21,55 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// request; the routine never blocks on it (the only blocking routine send is the
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ImmediateTestBlockApplyExecutor;
+
+#[cfg(test)]
+impl BlockApplyExecutor for ImmediateTestBlockApplyExecutor {
+    fn block_apply_class(&self, _block: &block::Block) -> BlockApplyClass {
+        BlockApplyClass::Full
+    }
+
+    fn apply(
+        &self,
+        request: BlockApplyRequest,
+    ) -> futures::future::BoxFuture<'static, BlockApplyOutput> {
+        use futures::FutureExt;
+
+        async move {
+            let height = request
+                .block
+                .coinbase_height()
+                .expect("submitted test block has height");
+            let hash = request.block.hash();
+            BlockApplyOutput {
+                token: request.token,
+                height,
+                hash,
+                result: BlockApplyResult::Committed,
+                local_frontier: Some(BlockSyncFrontiers {
+                    finalized_height: height,
+                    verified_block_tip: height,
+                    verified_block_hash: hash,
+                }),
+            }
+        }
+        .boxed()
+    }
+
+    fn refresh_checkpoint_frontier(
+        &self,
+        _highest_sent: block::Height,
+        _attempts_remaining: usize,
+    ) -> futures::future::BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        use futures::FutureExt;
+
+        async { None }.boxed()
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -63,13 +112,9 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-    // Size the action channel so the Sequencer can dispatch a full checkpoint
-    // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
-    // spare pool. The byte
-    // budget — not this channel — bounds in-flight body memory, and `SubmitBlock`
-    // only carries an `Arc<Block>` already accounted in `applying`, so the larger
-    // channel costs negligible memory while removing a head-of-line stall that
-    // throttled body intake behind commit submission.
+    // Size the action channel for query and misbehavior bursts. Block body
+    // applies are driven inside the Sequencer task, so this channel is no longer
+    // in the commit pipeline.
     let actions_capacity = startup
         .config
         .submitted_apply_limit()
@@ -95,6 +140,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
+    let (apply_executor_tx, apply_executor_rx) = watch::channel(None);
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
@@ -107,6 +153,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         sequencer_body_input_rx,
         sequencer_control_rx,
+        apply_executor_rx,
         sequencer_input_bytes.clone(),
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
@@ -143,11 +190,18 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
+        apply_executor: apply_executor_tx,
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
         routine_wiring: Some(routine_wiring),
     };
+    #[cfg(test)]
+    {
+        let _ = handle.install_block_apply_executor(BlockApplyExecutorPort::new(
+            std::sync::Arc::new(ImmediateTestBlockApplyExecutor),
+        ));
+    }
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
@@ -409,16 +463,8 @@ impl BlockSyncReactor {
             BlockSyncEvent::NeededBlocks(blocks) => {
                 self.handle_needed_blocks(blocks).await;
             }
-            BlockSyncEvent::BlockApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                self.handle_block_apply_finished(token, height, hash, result, local_frontier)
-                    .await
-            }
+            #[cfg(test)]
+            BlockSyncEvent::TestApplyDone { .. } => {}
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
                 start_height,
@@ -767,7 +813,7 @@ impl BlockSyncReactor {
 
         // The heavy serving/peer/candidate/producer reaction (drop-outstanding,
         // prune, status, query, schedule) ran in the single-task version for a
-        // frontier advance, reset, or apply-finished — never for a pure body
+        // frontier advance, reset, or apply completion — never for a pure body
         // buffer/submit, which only reschedules the forwarding peer (the reactor
         // already did that after forwarding `AcceptBody`). The `reaction_epoch`
         // advances exactly for those inputs.
@@ -1065,47 +1111,6 @@ impl BlockSyncReactor {
                 send_elapsed: Duration::ZERO,
                 total_elapsed: elapsed,
             },
-        );
-    }
-
-    async fn handle_block_apply_finished(
-        &mut self,
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-        result: BlockApplyResult,
-        local_frontier: Option<BlockSyncFrontiers>,
-    ) {
-        // The whole commit-pipeline body (token validate, embedded local-frontier
-        // advance, applying removal, budget release, throughput record, rollback +
-        // misbehavior, drain + submit) runs on the Sequencer task. The reactor
-        // forwards the completion and reacts to the resulting committed view
-        // (serving/status/query/schedule) on the `view` arm.
-        self.trace_apply_finished(height, token, result, self.state.budget.reserved());
-        let capacity = self.sequencer_input.capacity();
-        let max_capacity = self.sequencer_input.max_capacity();
-        let started = Instant::now();
-        let send_result = self
-            .sequencer_control
-            .send(SequencerControlInput::ApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            });
-        self.trace_sequencer_control_send(
-            "apply_finished",
-            if send_result.is_ok() {
-                "queued"
-            } else {
-                "closed"
-            },
-            started.elapsed(),
-            Some(height),
-            Some(token),
-            capacity,
-            max_capacity,
         );
     }
 
@@ -1723,21 +1728,6 @@ impl BlockSyncReactor {
         });
     }
 
-    fn trace_apply_finished(
-        &self,
-        height: block::Height,
-        token: BlockApplyToken,
-        result: BlockApplyResult,
-        budget_reserved_after: u64,
-    ) {
-        self.emit_trace(bs_trace::BLOCK_APPLY_FINISHED, |row| {
-            bs_insert_height(row, bs_trace::HEIGHT, height);
-            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
-            bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(result));
-            bs_insert_u64(row, bs_trace::BUDGET_RESERVED_AFTER, budget_reserved_after);
-        });
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn trace_sequencer_control_send(
         &self,
@@ -1985,18 +1975,23 @@ impl BlockSyncReactor {
                     bs_insert_height(row, bs_trace::RANGE_START, first.height);
                 }
             }
-            BlockSyncEvent::BlockApplyFinished {
+            #[cfg(test)]
+            BlockSyncEvent::TestApplyDone {
                 token,
                 height,
                 hash,
                 result,
                 local_frontier,
             } => {
-                bs_insert_str(row, bs_trace::KIND, "block_apply_finished");
+                bs_insert_str(row, bs_trace::KIND, "test_apply_finished");
                 bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
                 bs_insert_height(row, bs_trace::HEIGHT, *height);
                 bs_insert_hash(row, bs_trace::HASH, *hash);
-                bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(*result));
+                bs_insert_str(
+                    row,
+                    bs_trace::RESULT,
+                    block_apply_result_label_for_test(*result),
+                );
                 if let Some(frontiers) = local_frontier {
                     bs_insert_frontiers(row, frontiers);
                 }
@@ -2044,8 +2039,9 @@ impl BlockSyncReactor {
                 bs_insert_height(row, bs_trace::RANGE_START, *start);
                 bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
             }
-            BlockSyncAction::SubmitBlock { token, block } => {
-                bs_insert_str(row, bs_trace::KIND, "submit_block");
+            #[cfg(test)]
+            BlockSyncAction::ApplySubmitted { token, block } => {
+                bs_insert_str(row, bs_trace::KIND, "apply_submitted");
                 bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
                 bs_insert_hash(row, bs_trace::HASH, block.hash());
                 if let Some(height) = block.coinbase_height() {
@@ -2066,7 +2062,8 @@ pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeI
     NodeId::from_bytes(&bytes).ok()
 }
 
-fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
+#[cfg(test)]
+fn block_apply_result_label_for_test(result: BlockApplyResult) -> &'static str {
     match result {
         BlockApplyResult::Committed => "committed",
         BlockApplyResult::Duplicate => "duplicate",

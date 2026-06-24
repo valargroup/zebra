@@ -149,6 +149,7 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    pub(super) apply_executor: watch::Sender<Option<BlockApplyExecutorPort>>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
@@ -211,6 +212,35 @@ impl BlockSyncHandle {
         event: BlockSyncEvent,
     ) -> Result<(), mpsc::error::SendError<BlockSyncEvent>> {
         self.send_control(event)
+    }
+
+    /// Install the node-wiring block body apply executor.
+    ///
+    /// The slot is one-shot: production wiring installs it after verifier/state
+    /// services exist, and later attempts are ignored so the Sequencer never
+    /// changes commit backends mid-sync.
+    pub fn install_block_apply_executor(
+        &self,
+        executor: BlockApplyExecutorPort,
+    ) -> Result<(), BlockApplyExecutorPort> {
+        let mut executor = Some(executor);
+        if self.apply_executor.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = executor.take();
+            true
+        }) {
+            Ok(())
+        } else {
+            Err(executor.expect("executor remains available when install slot is occupied"))
+        }
+    }
+
+    /// Replace the node-wiring block body apply executor in tests.
+    #[cfg(test)]
+    pub(super) fn replace_block_apply_executor_for_test(&self, executor: BlockApplyExecutorPort) {
+        self.apply_executor.send_replace(Some(executor));
     }
 
     /// Return the currently cached peer slot snapshot.

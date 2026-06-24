@@ -1,5 +1,13 @@
-use std::{collections::HashMap, future};
+use std::{
+    collections::{HashMap, VecDeque},
+    future,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc as StdArc, Mutex,
+    },
+};
 
+use futures::{future::BoxFuture, FutureExt};
 use proptest::{prop_assert, prop_assert_eq};
 
 use super::*;
@@ -16,6 +24,7 @@ use super::{
     request::*,
     sequencer::*,
     state::*,
+    work_queue::WorkQueue,
 };
 use crate::zakura::{
     framed_channel, ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange,
@@ -44,6 +53,180 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
         mainnet_block(&BLOCK_MAINNET_2_BYTES),
         mainnet_block(&BLOCK_MAINNET_3_BYTES),
     ]
+}
+
+#[derive(Clone, Debug)]
+struct TestBlockApplyExecutor {
+    completions: StdArc<Mutex<VecDeque<TestBlockApplyCompletion>>>,
+    default_result: StdArc<Mutex<BlockApplyResult>>,
+    completed_count: Option<StdArc<AtomicUsize>>,
+    submit_completed_counts: Option<StdArc<Mutex<Vec<(block::Height, usize)>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct TestBlockApplyController {
+    completions: StdArc<Mutex<VecDeque<TestBlockApplyCompletion>>>,
+    default_result: StdArc<Mutex<BlockApplyResult>>,
+}
+
+#[derive(Debug)]
+enum TestBlockApplyCompletion {
+    Held(oneshot::Receiver<BlockApplyOutput>),
+    Parked,
+}
+
+impl TestBlockApplyController {
+    fn set_default_result(&self, result: BlockApplyResult) {
+        *self
+            .default_result
+            .lock()
+            .expect("test apply result mutex is not poisoned") = result;
+    }
+
+    fn hold_next(&self) -> oneshot::Sender<BlockApplyOutput> {
+        let (tx, rx) = oneshot::channel();
+        self.completions
+            .lock()
+            .expect("test apply completion mutex is not poisoned")
+            .push_back(TestBlockApplyCompletion::Held(rx));
+        tx
+    }
+
+    fn park_next(&self) {
+        self.completions
+            .lock()
+            .expect("test apply completion mutex is not poisoned")
+            .push_back(TestBlockApplyCompletion::Parked);
+    }
+}
+
+impl BlockApplyExecutor for TestBlockApplyExecutor {
+    fn block_apply_class(&self, _block: &block::Block) -> BlockApplyClass {
+        BlockApplyClass::Full
+    }
+
+    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
+        let completions = self.completions.clone();
+        let default_result = self.default_result.clone();
+        let completed_count = self.completed_count.clone();
+        let submit_completed_counts = self.submit_completed_counts.clone();
+        let height = request
+            .block
+            .coinbase_height()
+            .expect("submitted test block has height");
+        let hash = request.block.hash();
+        if let (Some(submit_completed_counts), Some(completed_count)) =
+            (&submit_completed_counts, &completed_count)
+        {
+            submit_completed_counts
+                .lock()
+                .expect("test submit snapshot mutex is not poisoned")
+                .push((height, completed_count.load(Ordering::Relaxed)));
+        }
+        async move {
+            let completion = completions
+                .lock()
+                .expect("test apply completion mutex is not poisoned")
+                .pop_front();
+            if let Some(completion) = completion {
+                return match completion {
+                    TestBlockApplyCompletion::Held(completion) => match completion.await {
+                        Ok(output) => output,
+                        Err(_) => future::pending::<BlockApplyOutput>().await,
+                    },
+                    TestBlockApplyCompletion::Parked => future::pending::<BlockApplyOutput>().await,
+                };
+            }
+
+            let result = *default_result
+                .lock()
+                .expect("test apply result mutex is not poisoned");
+            if let Some(completed_count) = completed_count {
+                completed_count.fetch_add(1, Ordering::Relaxed);
+            }
+            let local_frontier =
+                matches!(result, BlockApplyResult::Committed).then_some(BlockSyncFrontiers {
+                    finalized_height: height,
+                    verified_block_tip: height,
+                    verified_block_hash: hash,
+                });
+            BlockApplyOutput {
+                token: request.token,
+                height,
+                hash,
+                result,
+                local_frontier,
+            }
+        }
+        .boxed()
+    }
+
+    fn refresh_checkpoint_frontier(
+        &self,
+        _highest_sent: block::Height,
+        _attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        async { None }.boxed()
+    }
+}
+
+fn replace_test_apply_executor(handle: &BlockSyncHandle) -> TestBlockApplyController {
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    let executor = TestBlockApplyExecutor {
+        completions,
+        default_result,
+        completed_count: None,
+        submit_completed_counts: None,
+    };
+    handle.replace_block_apply_executor_for_test(BlockApplyExecutorPort::with_limits(
+        StdArc::new(executor),
+        BlockApplyLimits {
+            checkpoint_apply_limit: 128,
+            full_apply_limit: 128,
+            combined_apply_limit: 128,
+        },
+    ));
+    controller
+}
+
+fn test_apply_executor_port() -> BlockApplyExecutorPort {
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let executor = TestBlockApplyExecutor {
+        completions,
+        default_result,
+        completed_count: None,
+        submit_completed_counts: None,
+    };
+    BlockApplyExecutorPort::with_limits(
+        StdArc::new(executor),
+        BlockApplyLimits {
+            checkpoint_apply_limit: 128,
+            full_apply_limit: 128,
+            combined_apply_limit: 128,
+        },
+    )
+}
+
+fn test_apply_executor_port_with_limits_and_completion_counter(
+    limits: BlockApplyLimits,
+    completed_count: StdArc<AtomicUsize>,
+    submit_completed_counts: StdArc<Mutex<Vec<(block::Height, usize)>>>,
+) -> BlockApplyExecutorPort {
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let executor = TestBlockApplyExecutor {
+        completions,
+        default_result,
+        completed_count: Some(completed_count),
+        submit_completed_counts: Some(submit_completed_counts),
+    };
+    BlockApplyExecutorPort::with_limits(StdArc::new(executor), limits)
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
@@ -373,7 +556,7 @@ async fn drain_parent_first_actions(
         tokio::time::timeout(Duration::from_millis(25), actions.recv()).await
     {
         match action {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 let height = block
                     .coinbase_height()
                     .expect("submitted test block has height");
@@ -2639,6 +2822,349 @@ fn sequencer_records_and_decrements_submitted_applies() {
     assert!(!seq.submitted_contains(block::Height(1)));
 }
 
+#[tokio::test]
+async fn sequencer_task_body_input_is_not_starved_by_control_backlog() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let bytes = u64::from(block_size(&block));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(8);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(test_apply_executor_port()));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), 4),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes,
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    body_tx
+        .send(super::sequencer_task::SequencedBody {
+            height: block::Height(1),
+            hash: block.hash(),
+            body: BufferedBlockBody::Decoded(block.clone()),
+            bytes,
+            peer: peer(1),
+            received_at: Instant::now(),
+        })
+        .await
+        .expect("body input queues");
+
+    for _ in 0..256 {
+        control_tx
+            .send(
+                super::sequencer_task::SequencerControlInput::FrontierAdvance {
+                    frontiers,
+                    release_applied: true,
+                },
+            )
+            .expect("control input queues");
+    }
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    control_tx
+        .send(
+            super::sequencer_task::SequencerControlInput::FundFloorReservation {
+                needed_bytes: 1,
+                reply: reply_tx,
+            },
+        )
+        .expect("control canary queues");
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+
+    match tokio::time::timeout(Duration::from_millis(100), actions_rx.recv())
+        .await
+        .expect("queued body is submitted without draining the control backlog")
+    {
+        Some(BlockSyncAction::ApplySubmitted { block, .. }) => assert_eq!(
+            block.coinbase_height().expect("test block has a height"),
+            block::Height(1)
+        ),
+        other => panic!("expected queued body to submit, got {other:?}"),
+    }
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_buffers_bodies_until_executor_installed() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let bytes = u64::from(block_size(&block));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(8);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let (apply_executor_tx, apply_executor_rx) = watch::channel(None);
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), 4),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes,
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    body_tx
+        .send(super::sequencer_task::SequencedBody {
+            height: block::Height(1),
+            hash: block.hash(),
+            body: BufferedBlockBody::Decoded(block.clone()),
+            bytes,
+            peer: peer(1),
+            received_at: Instant::now(),
+        })
+        .await
+        .expect("body input queues before executor installation");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions_rx.recv())
+            .await
+            .is_err(),
+        "body must buffer while no block-apply executor is installed",
+    );
+
+    apply_executor_tx.send_replace(Some(test_apply_executor_port()));
+    match tokio::time::timeout(Duration::from_millis(100), actions_rx.recv())
+        .await
+        .expect("buffered body submits after executor installation")
+    {
+        Some(BlockSyncAction::ApplySubmitted { block, .. }) => assert_eq!(
+            block.coinbase_height().expect("test block has a height"),
+            block::Height(1)
+        ),
+        other => panic!("expected buffered body to submit, got {other:?}"),
+    }
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
+    const READY_COMPLETIONS: u32 = 10_000;
+
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(READY_COMPLETIONS + 1);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(blocks.len());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(blocks.len());
+    let queued_block_count = u64::try_from(blocks.len()).expect("test block count fits in u64");
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(
+        bytes.saturating_mul(queued_block_count),
+    ));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completed_count = StdArc::new(AtomicUsize::new(0));
+    let submit_completed_counts = StdArc::new(Mutex::new(Vec::new()));
+    let limits = BlockApplyLimits {
+        checkpoint_apply_limit: 1,
+        full_apply_limit: blocks.len(),
+        combined_apply_limit: blocks.len(),
+    };
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(
+        test_apply_executor_port_with_limits_and_completion_counter(
+            limits,
+            completed_count.clone(),
+            submit_completed_counts.clone(),
+        ),
+    ));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes,
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    for block in &blocks {
+        body_tx
+            .send(super::sequencer_task::SequencedBody {
+                height: block.coinbase_height().expect("test block has height"),
+                hash: block.hash(),
+                body: BufferedBlockBody::Decoded(block.clone()),
+                bytes,
+                peer: peer(1),
+                received_at: Instant::now(),
+            })
+            .await
+            .expect("body input queues before task starts");
+    }
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    let floor_height = block::Height(READY_COMPLETIONS + 1);
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+            .await
+            .expect("flooded floor body is submitted")
+        {
+            Some(BlockSyncAction::ApplySubmitted { block, .. })
+                if block.coinbase_height() == Some(floor_height) =>
+            {
+                break;
+            }
+            Some(BlockSyncAction::ApplySubmitted { .. }) => {}
+            other => panic!("unexpected action while waiting for flooded floor submit: {other:?}"),
+        }
+    }
+
+    let floor_submit_completed_count = submit_completed_counts
+        .lock()
+        .expect("test submit snapshot mutex is not poisoned")
+        .iter()
+        .find_map(|(height, completed)| (*height == floor_height).then_some(*completed))
+        .expect("floor body submission snapshot is recorded");
+    assert!(
+        floor_submit_completed_count <= 2,
+        "queued floor body must submit before draining the ready completion flood",
+    );
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_drains_in_flight_applies_on_shutdown() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let bytes = u64::from(block_size(&block));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(8);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    let completion = controller.hold_next();
+    let executor = TestBlockApplyExecutor {
+        completions,
+        default_result,
+        completed_count: None,
+        submit_completed_counts: None,
+    };
+    let (_apply_executor_tx, apply_executor_rx) =
+        watch::channel(Some(BlockApplyExecutorPort::with_limits(
+            StdArc::new(executor),
+            BlockApplyLimits {
+                checkpoint_apply_limit: 1,
+                full_apply_limit: 1,
+                combined_apply_limit: 1,
+            },
+        )));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), 4),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes,
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+    let mut task_handle = tokio::spawn(async move { task.run().await });
+
+    body_tx
+        .send(super::sequencer_task::SequencedBody {
+            height: block::Height(1),
+            hash: block.hash(),
+            body: BufferedBlockBody::Decoded(block.clone()),
+            bytes,
+            peer: peer(1),
+            received_at: Instant::now(),
+        })
+        .await
+        .expect("body input queues");
+
+    let (token, hash) = match tokio::time::timeout(Duration::from_secs(1), actions_rx.recv())
+        .await
+        .expect("body is submitted before shutdown")
+        .expect("action channel is live")
+    {
+        BlockSyncAction::ApplySubmitted { token, block } => (token, block.hash()),
+        action => panic!("unexpected action before shutdown: {action:?}"),
+    };
+
+    drop(body_tx);
+    drop(control_tx);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut task_handle)
+            .await
+            .is_err(),
+        "sequencer must not drop an in-flight apply when inputs close",
+    );
+
+    completion
+        .send(BlockApplyOutput {
+            token,
+            height: block::Height(1),
+            hash,
+            result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: hash,
+            }),
+        })
+        .expect("apply future is still waiting");
+
+    tokio::time::timeout(Duration::from_secs(1), task_handle)
+        .await
+        .expect("sequencer exits after in-flight apply completes")
+        .expect("sequencer task does not panic");
+}
+
 #[test]
 fn sequencer_advance_verified_tip_releases_bytes_and_reports_change() {
     let mut seq = test_sequencer(0, 8);
@@ -2946,6 +3472,111 @@ proptest::proptest! {
             prop_assert_eq!(budget.reserved(), 0);
             prop_assert_eq!(ledger.current_charge(), 0);
         }
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+    #[test]
+    fn sequencer_apply_conservation(ops in proptest::collection::vec(0u8..4, 1..256)) {
+        let blocks = fake_sequential_blocks(64);
+        let mut sequencer = Sequencer::new(block::Height(0), usize::MAX);
+        let mut budget = ByteBudget::new(u64::MAX);
+        let mut next_accept = 0usize;
+        let mut submitted = VecDeque::new();
+        let mut submitted_count = 0usize;
+        let mut terminal_count = 0usize;
+        let mut previous_floor = sequencer.floor();
+
+        for op in ops {
+            let reset = op == 3;
+            match op {
+                0 if next_accept < blocks.len() => {
+                    let block = blocks[next_accept].clone();
+                    let height = block.coinbase_height().expect("test block has height");
+                    let bytes = u64::from(block_size(&block));
+                    prop_assert!(budget.try_reserve(bytes));
+                    match sequencer.accept_body(height, block.hash(), block, bytes, peer(1)) {
+                        AcceptOutcome::Buffered { .. } => {}
+                        AcceptOutcome::Redundant { release_bytes } => budget.release(release_bytes),
+                    }
+                    let _ = sequencer.drain_ready_into_applying();
+                    next_accept = next_accept.saturating_add(1);
+                }
+                1 => {
+                    if let Some(height) = sequencer.submittable_heights().into_iter().next() {
+                        if let Some(item) = sequencer.prepare_submit(height) {
+                            sequencer.record_submitted_apply(item.height, item.hash);
+                            submitted.push_back((item.height, item.token, item.hash));
+                            submitted_count = submitted_count.saturating_add(1);
+                        }
+                    }
+                }
+                2 => {
+                    if let Some((height, token, hash)) = submitted.pop_front() {
+                        if sequencer.applying_token_hash(height) == Some((token, hash)) {
+                            let applying = sequencer
+                                .remove_applying(height)
+                                .expect("submitted apply still has an applying body");
+                            budget.release(applying.bytes);
+                            sequencer.decrement_submitted_apply(height, hash);
+                            let advance = sequencer.advance_verified_tip(height, false);
+                            budget.release(advance.release_bytes);
+                            terminal_count = terminal_count.saturating_add(1);
+                        }
+                    }
+                }
+                3 => {
+                    let released = sequencer.reset_to(sequencer.verified_tip(), false);
+                    budget.release(released);
+                    terminal_count = terminal_count.saturating_add(submitted.len());
+                    submitted.clear();
+                }
+                _ => {}
+            }
+
+            if !reset {
+                prop_assert!(sequencer.floor() >= previous_floor);
+            }
+            previous_floor = sequencer.floor();
+            prop_assert_eq!(
+                budget.reserved(),
+                sequencer
+                    .reorder_buffered_bytes()
+                    .saturating_add(sequencer.applying_buffered_bytes())
+            );
+            prop_assert!(terminal_count <= submitted_count);
+        }
+
+        loop {
+            let Some(height) = sequencer.submittable_heights().into_iter().next() else {
+                break;
+            };
+            let Some(item) = sequencer.prepare_submit(height) else {
+                break;
+            };
+            sequencer.record_submitted_apply(item.height, item.hash);
+            submitted.push_back((item.height, item.token, item.hash));
+            submitted_count = submitted_count.saturating_add(1);
+        }
+        while let Some((height, token, hash)) = submitted.pop_front() {
+            if sequencer.applying_token_hash(height) == Some((token, hash)) {
+                let applying = sequencer
+                    .remove_applying(height)
+                    .expect("submitted apply still has an applying body");
+                budget.release(applying.bytes);
+                sequencer.decrement_submitted_apply(height, hash);
+                let advance = sequencer.advance_verified_tip(height, false);
+                budget.release(advance.release_bytes);
+                terminal_count = terminal_count.saturating_add(1);
+            }
+        }
+        let released = sequencer.reset_to(sequencer.verified_tip(), false);
+        budget.release(released);
+
+        prop_assert_eq!(submitted_count, terminal_count);
+        prop_assert_eq!(budget.reserved(), 0);
     }
 }
 
@@ -3299,12 +3930,14 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         })
         .expect("test fills bounded wire queue");
     let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (apply_executor, _apply_executor_rx) = watch::channel(None);
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
+        apply_executor,
         peers,
         status,
         candidates,
@@ -3614,7 +4247,7 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock {
+            BlockSyncAction::ApplySubmitted {
                 block: submitted, ..
             } => {
                 assert_eq!(submitted.hash(), block_hash);
@@ -3629,7 +4262,7 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
 }
 
 #[tokio::test]
-async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
+async fn reactor_requeries_needed_blocks_after_inline_commit() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let mut config = immediate_body_download_config();
@@ -3649,6 +4282,8 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let apply_controller = replace_test_apply_executor(&handle);
+    let apply_completion = apply_controller.hold_next();
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -3719,7 +4354,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
 
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -3733,7 +4368,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     // GetBlocks may issue. a routine that consumed work pings the reactor to
     // re-query, so a budget-orthogonal `QueryNeededBlocks` may appear in this
     // window (the producer self-gates; it is idempotent and downloads nothing).
-    // Tolerate only that; any GetBlocks/SubmitBlock here would be the regression.
+    // Tolerate only that; any GetBlocks/ApplySubmitted here would be the regression.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
     loop {
         match tokio::time::timeout_at(deadline, actions.recv()).await {
@@ -3745,8 +4380,16 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
         }
     }
 
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+    let view_rx = handle
+        .routine_wiring
+        .as_ref()
+        .expect("test reactor has routine wiring")
+        .view
+        .clone();
+    let reaction_epoch_before_commit = view_rx.borrow().reaction_epoch;
+
+    apply_completion
+        .send(BlockApplyOutput {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -3757,8 +4400,7 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
                 verified_block_hash: blocks[0].hash(),
             }),
         })
-        .await
-        .expect("apply-finished event queues");
+        .expect("apply future is still waiting");
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if handle.local_status().servable_high == block::Height(1) {
@@ -3769,6 +4411,11 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     })
     .await
     .expect("apply completion frontier advances advertised status");
+    assert_eq!(
+        view_rx.borrow().reaction_epoch,
+        reaction_epoch_before_commit.saturating_add(1),
+        "inline commit completion must trigger exactly one reactor reaction epoch",
+    );
 
     let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(start_height, block::Height(2));
@@ -3883,7 +4530,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     // pipeline (and still claimed in `in_flight`).
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break;
             }
@@ -4014,7 +4661,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     let submitted = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             match next_action(&mut actions).await {
-                BlockSyncAction::SubmitBlock { block, .. } => break block.hash(),
+                BlockSyncAction::ApplySubmitted { block, .. } => break block.hash(),
                 // The preserved size-deviation check reports the hint mismatch but
                 // must not drop the body.
                 BlockSyncAction::Misbehavior {
@@ -4036,7 +4683,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
 /// A stalled commit must not pace downloads. The refill low-water mark counts
 /// only the download pipeline (`queued` + `outstanding`), never the commit
 /// pipeline (`reorder` + `applying`), so a block stuck in `applying` (submitted
-/// but never apply-finished) does not stop the reactor from re-querying and
+/// but never apply completion) does not stop the reactor from re-querying and
 /// downloading higher heights — downloads run ahead of commit, bounded only by
 /// the in-flight byte budget.
 ///
@@ -4090,7 +4737,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
 
     // Supply only height 1, download it, and submit it — then leave it stuck in
-    // `applying` by never sending BlockApplyFinished (a stalled commit).
+    // `applying` by never sending TestApplyDone (a stalled commit).
     handle
         .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
         .await
@@ -4109,7 +4756,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
         .expect("block queues");
     let _submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -4119,7 +4766,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
     };
 
     // The commit is now stalled: block 1 sits in `applying` (awaiting an
-    // apply-finished that never comes), holding its byte reservation. The
+    // apply completion that never comes), holding its byte reservation. The
     // download floor advanced to 1 on submit, but `queued` and `outstanding`
     // are both empty. A header-tip bump must still make the reactor re-query
     // and download height 2 — the download pipeline is empty even though the
@@ -4231,6 +4878,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    replace_test_apply_executor(&handle).set_default_result(BlockApplyResult::Duplicate);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -4266,7 +4914,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -4276,7 +4924,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     };
 
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -4405,7 +5053,9 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } if block.hash() == blocks[0].hash() => break,
+            BlockSyncAction::ApplySubmitted { block, .. } if block.hash() == blocks[0].hash() => {
+                break
+            }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before first submit: {action:?}"),
         }
@@ -4429,7 +5079,7 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
     while let Ok(Some(action)) = tokio::time::timeout(Duration::from_secs(1), actions.recv()).await
     {
         match action {
-            BlockSyncAction::SubmitBlock { block, .. } if block.hash() == blocks[1].hash() => {
+            BlockSyncAction::ApplySubmitted { block, .. } if block.hash() == blocks[1].hash() => {
                 submitted_second = true;
                 break;
             }
@@ -4437,7 +5087,7 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
                 peer,
                 reason: BlockSyncMisbehavior::UnsolicitedBlock,
             } if peer == peer_id => panic!("in-flight body was misclassified as unsolicited"),
-            BlockSyncAction::QueryNeededBlocks { .. } | BlockSyncAction::SubmitBlock { .. } => {}
+            BlockSyncAction::QueryNeededBlocks { .. } | BlockSyncAction::ApplySubmitted { .. } => {}
             action => panic!("unexpected action after second block: {action:?}"),
         }
     }
@@ -4634,7 +5284,7 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
 
     let submitted = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
+            if let BlockSyncAction::ApplySubmitted { block, .. } = next_action(&mut actions).await {
                 return block.hash();
             }
         }
@@ -4748,7 +5398,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 submitted.push((
                     block.coinbase_height().expect("test block has height"),
                     token,
@@ -4767,7 +5417,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     );
 
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: submitted[0].1,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -4775,7 +5425,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             local_frontier: None,
         })
         .await
-        .expect("apply-finished event queues");
+        .expect("apply completion event queues");
 
     // routines ping the producer on a low-water timer, so an early query can
     // fire while the contiguous prefix is still draining into `applying` (floor
@@ -4821,6 +5471,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    replace_test_apply_executor(&handle).set_default_result(BlockApplyResult::Rejected);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -4881,7 +5532,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
         .expect("block queues");
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock {
+            BlockSyncAction::ApplySubmitted {
                 token,
                 block: submitted,
             } => {
@@ -4894,7 +5545,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
     };
 
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: submit_token,
             height: block::Height(1),
             hash: block.hash(),
@@ -4902,7 +5553,7 @@ async fn reactor_retries_submitted_body_after_apply_rejection() {
             local_frontier: None,
         })
         .await
-        .expect("apply-finished event queues");
+        .expect("apply completion event queues");
     // the rejection rollback (`reset_above` + floor reset) runs on the
     // Sequencer task while routines independently re-query, so re-supply the needed
     // metadata on every `QueryNeededBlocks` (idempotent — filtered while the height
@@ -5109,22 +5760,22 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
         .await
         .expect("block frame queues");
 
-    // Drive height 1 to commit: drain its SubmitBlock and report it applied. The
+    // Drive height 1 to commit: drain its ApplySubmitted and report it applied. The
     // Sequencer task then releases the byte budget and the capacity notify must
     // wake the budget-blocked routine to issue the next GetBlocks (the     // missed-wake guarantee — a release between the routine's fill-check and its
     // await must not be lost).
     let token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.coinbase_height(), Some(block::Height(1)));
                 break token;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before SubmitBlock: {action:?}"),
+            action => panic!("unexpected action before ApplySubmitted: {action:?}"),
         }
     };
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -5132,7 +5783,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
             local_frontier: None,
         })
         .await
-        .expect("apply-finished event queues");
+        .expect("apply completion event queues");
 
     let (second_start, _count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(
@@ -5723,7 +6374,7 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
     let mut submitted = Vec::new();
     while submitted.len() < 3 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
+            BlockSyncAction::ApplySubmitted { block, .. } => submitted.push(
                 block
                     .coinbase_height()
                     .expect("submitted test block has height"),
@@ -5880,7 +6531,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
                                 .await
                                 .expect("needed metadata queues");
                         }
-                        BlockSyncAction::SubmitBlock { block, .. } => {
+                        BlockSyncAction::ApplySubmitted { block, .. } => {
                             submitted.insert(
                                 block.coinbase_height().expect("submitted block has height"),
                             );
@@ -5970,7 +6621,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
         .expect("block queues");
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 assert_eq!(block.coinbase_height(), Some(block::Height(1)));
                 break;
@@ -6037,7 +6688,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         .expect("block queues");
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break;
             }
@@ -6133,7 +6784,7 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
         .expect("block queues");
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break;
             }
@@ -6309,7 +6960,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                                 .await
                                 .expect("checkpoint metadata queues");
                         }
-                        BlockSyncAction::SubmitBlock { block, .. } => {
+                        BlockSyncAction::ApplySubmitted { block, .. } => {
                             let height =
                                 block.coinbase_height().expect("submitted block has height");
                             assert!(
@@ -6400,7 +7051,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                                 .await
                                 .expect("post-disconnect metadata queues");
                         }
-                        BlockSyncAction::SubmitBlock { block, .. } => {
+                        BlockSyncAction::ApplySubmitted { block, .. } => {
                             let height =
                                 block.coinbase_height().expect("submitted block has height");
                             assert!(
@@ -6578,6 +7229,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let apply_controller = replace_test_apply_executor(&handle);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -6623,7 +7275,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         .expect("contiguous body queues");
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[1].hash());
                 break;
             }
@@ -6631,6 +7283,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
             action => panic!("unexpected action before first submit: {action:?}"),
         }
     }
+    let successor_completion = apply_controller.hold_next();
 
     inbound_tx
         .send(
@@ -6642,7 +7295,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         .expect("successor body queues");
     let successor_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), blocks[2].hash());
                 break token;
             }
@@ -6666,16 +7319,15 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         "forward reset must not re-query or re-submit the preserved successor body",
     );
 
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+    successor_completion
+        .send(BlockApplyOutput {
             token: successor_token,
             height: block::Height(3),
             hash: blocks[2].hash(),
             result: BlockApplyResult::Committed,
             local_frontier: None,
         })
-        .await
-        .expect("successor apply result queues");
+        .expect("successor apply future is still waiting");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), actions.recv())
             .await
@@ -6761,7 +7413,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(block.hash(), blocks[2].hash());
                 break;
             }
@@ -6866,7 +7518,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(
                     block.hash(),
                     blocks[2].hash(),
@@ -6909,6 +7561,9 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let apply_controller = replace_test_apply_executor(&handle);
+    let first_completion = apply_controller.hold_next();
+    let _second_completion = apply_controller.hold_next();
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -6947,7 +7602,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => submitted.push((
+            BlockSyncAction::ApplySubmitted { token, block } => submitted.push((
                 block.coinbase_height().expect("test block has height"),
                 token,
             )),
@@ -6962,6 +7617,19 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
             .collect::<Vec<_>>(),
         vec![block::Height(1), block::Height(2)]
     );
+    first_completion
+        .send(BlockApplyOutput {
+            token: submitted[0].1,
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: blocks[0].hash(),
+            }),
+        })
+        .expect("first apply future is still waiting");
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
@@ -7006,7 +7674,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
             "any same-hash re-request must target exactly the released height"
         );
         // Deliver the same-hash body for the re-request and assert it is dropped
-        // as redundant (no SubmitBlock) — the no-double-apply guarantee.
+        // as redundant (no ApplySubmitted) — the no-double-apply guarantee.
         inbound_tx
             .send(
                 BlockSyncMessage::Block(blocks[1].clone())
@@ -7018,7 +7686,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         let no_resubmit = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
                 match actions.recv().await {
-                    Some(BlockSyncAction::SubmitBlock { block, .. })
+                    Some(BlockSyncAction::ApplySubmitted { block, .. })
                         if block.hash() == blocks[1].hash() =>
                     {
                         panic!("same-hash body with a pending apply must not be re-submitted")
@@ -7151,7 +7819,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         .expect("first body frame queues");
     let stale_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), block_hash);
                 break token;
             }
@@ -7217,7 +7885,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         .expect("second body frame queues");
     let current_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), block_hash);
                 break token;
             }
@@ -7228,7 +7896,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     assert_ne!(stale_token, current_token);
 
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: stale_token,
             height: block::Height(1),
             hash: block_hash,
@@ -7236,15 +7904,15 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             local_frontier: None,
         })
         .await
-        .expect("stale apply-finished event queues");
+        .expect("stale apply completion event queues");
     // The stale completion must not release the current submission: it produces no
-    // new `SubmitBlock` (no re-submission). Routines ping the producer on a
+    // new `ApplySubmitted` (no re-submission). Routines ping the producer on a
     // low-water timer, so a benign `QueryNeededBlocks` is allowed and skipped; the
-    // releasing signal we guard against is a fresh `SubmitBlock`.
+    // releasing signal we guard against is a fresh `ApplySubmitted`.
     while let Ok(Some(action)) =
         tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
     {
-        if let BlockSyncAction::SubmitBlock { .. } = action {
+        if let BlockSyncAction::ApplySubmitted { .. } = action {
             panic!(
                 "stale apply completion released/re-submitted the current submission: {action:?}"
             );
@@ -7252,7 +7920,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     }
 
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: current_token,
             height: block::Height(1),
             hash: block_hash,
@@ -7260,7 +7928,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             local_frontier: None,
         })
         .await
-        .expect("current apply-finished event queues");
+        .expect("current apply completion event queues");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), actions.recv())
             .await
@@ -7479,6 +8147,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             config.clone(),
         );
         let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let apply_controller = replace_test_apply_executor(&handle);
         let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
             &service,
@@ -7522,6 +8191,10 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
 
         let mut submitted_tip = block::Height(0);
         for height in old_before_reset {
+            if height == 1 {
+                apply_controller.park_next();
+                apply_controller.park_next();
+            }
             inbound_tx
                 .send(
                     BlockSyncMessage::Block(old_blocks[height - 1].clone())
@@ -7687,6 +8360,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         );
 
         reactor_task.abort();
+        let _ = reactor_task.await;
     }
 }
 
@@ -7987,7 +8661,7 @@ async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
+            BlockSyncAction::ApplySubmitted { block, .. } => submitted.push(
                 block
                     .coinbase_height()
                     .expect("submitted test block has height"),
@@ -8370,6 +9044,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    replace_test_apply_executor(&handle).set_default_result(BlockApplyResult::Rejected);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (bad_peer, bad_inbound, mut bad_outbound) = connect_peer_with_status(
         &service,
@@ -8415,7 +9090,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     // and submitted to consensus.
     let submit_token = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => {
+            BlockSyncAction::ApplySubmitted { token, block } => {
                 assert_eq!(block.hash(), blocks[0].hash());
                 break token;
             }
@@ -8429,7 +9104,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
     // rather than silently rolling back scheduling state and letting the peer
     // keep feeding invalid bodies for needed heights.
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token: submit_token,
             height: block::Height(1),
             hash: blocks[0].hash(),
@@ -8437,7 +9112,7 @@ async fn reactor_scores_peer_whose_invalid_body_is_rejected_by_consensus() {
             local_frontier: None,
         })
         .await
-        .expect("apply-finished event queues");
+        .expect("apply completion event queues");
 
     // the apply-rejection `Misbehavior` is emitted by the Sequencer task while
     // the routines independently ping `RequeryNeeded`, so one or more
@@ -8617,7 +9292,7 @@ async fn reactor_never_serves_reorder_buffer_bodies() {
 
     let quiet = tokio::time::timeout(Duration::from_millis(50), async {
         while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
+            if matches!(action, BlockSyncAction::ApplySubmitted { .. }) {
                 panic!("height 3 must stay buffered behind the height 2 gap");
             }
         }
@@ -9156,7 +9831,7 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
 
     while !matches!(
         next_action(&mut actions).await,
-        BlockSyncAction::SubmitBlock { .. }
+        BlockSyncAction::ApplySubmitted { .. }
     ) {}
 
     handle
@@ -9267,7 +9942,7 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
     let mut submitted = Vec::new();
     while submitted.len() < blocks.len() {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
+            BlockSyncAction::ApplySubmitted { block, .. } => submitted.push(
                 block
                     .coinbase_height()
                     .expect("submitted test block has height"),
@@ -9329,6 +10004,9 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let apply_controller = replace_test_apply_executor(&handle);
+    let first_completion = apply_controller.hold_next();
+    let _second_completion = apply_controller.hold_next();
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
@@ -9366,7 +10044,7 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => submitted.push((
+            BlockSyncAction::ApplySubmitted { token, block } => submitted.push((
                 token,
                 block
                     .coinbase_height()
@@ -9384,7 +10062,7 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
         tokio::time::timeout(Duration::from_millis(100), async {
             loop {
                 match actions.recv().await {
-                    Some(BlockSyncAction::SubmitBlock { block, .. }) => {
+                    Some(BlockSyncAction::ApplySubmitted { block, .. }) => {
                         return block.coinbase_height();
                     }
                     Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
@@ -9399,20 +10077,19 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     );
 
     let (token, height, hash) = submitted[0];
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+    first_completion
+        .send(BlockApplyOutput {
             token,
             height,
             hash,
             result: BlockApplyResult::Committed,
             local_frontier: None,
         })
-        .await
-        .expect("apply completion queues");
+        .expect("first apply future is still waiting");
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
+            BlockSyncAction::ApplySubmitted { block, .. } => {
                 assert_eq!(
                     block
                         .coinbase_height()
@@ -10250,7 +10927,7 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
 
     let no_submit = tokio::time::timeout(Duration::from_millis(200), async {
         while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
+            if matches!(action, BlockSyncAction::ApplySubmitted { .. }) {
                 return false;
             }
         }
@@ -10495,7 +11172,7 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
 
     let (token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => break (token, block.hash()),
+            BlockSyncAction::ApplySubmitted { token, block } => break (token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }
@@ -10505,7 +11182,7 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
     // delivered the matching verified-tip update. The applying entry is gone,
     // but `body_download_floor` still proves this height was already accepted.
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token,
             height: block::Height(2),
             hash,
@@ -10621,13 +11298,13 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
 
     let (token, hash) = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => break (token, block.hash()),
+            BlockSyncAction::ApplySubmitted { token, block } => break (token, block.hash()),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while waiting for submit: {action:?}"),
         }
     };
     handle
-        .send(BlockSyncEvent::BlockApplyFinished {
+        .send(BlockSyncEvent::TestApplyDone {
             token,
             height: block::Height(2),
             hash,

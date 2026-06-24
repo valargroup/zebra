@@ -121,10 +121,6 @@ impl BlocksyncThroughputProbe {
             .expect("blocksync throughput probe mutex is not poisoned")
     }
 
-    pub(crate) fn verified_tip(&self) -> block::Height {
-        self.lock().verified_block_tip
-    }
-
     #[cfg(test)]
     pub(crate) fn synthetic_frontier(&self) -> BlockSyncFrontiers {
         self.lock().frontiers()
