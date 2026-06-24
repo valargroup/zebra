@@ -736,26 +736,26 @@ impl ZebraDb {
     /// strictly below this height (they were never written by the fast path).
     /// Returns `None` if the database was synced normally (it has per-height trees
     /// for all heights below the tip).
-    pub fn fast_synced_below(&self) -> Option<Height> {
+    pub fn vct_synced_below(&self) -> Option<Height> {
         let fast_sync_metadata = self.db.cf_handle(FAST_SYNC_METADATA)?;
         self.db.zs_get(&fast_sync_metadata, &())
     }
 
     /// Returns `true` if the database was built by the verified-commitment-trees
-    /// fast path, and therefore lacks per-height note-commitment trees below the
+    /// path, and therefore lacks per-height note-commitment trees below the
     /// handoff height. The missing history is surfaced at the RPC boundary (§9);
     /// it does not prevent reopening in any storage mode.
-    pub fn is_fast_synced(&self) -> bool {
-        self.fast_synced_below().is_some()
+    pub fn is_vct_synced(&self) -> bool {
+        self.vct_synced_below().is_some()
     }
 
     /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
     /// whose per-height note-commitment tree is unavailable because this is a
-    /// fast-synced database (the tree below the checkpoint handoff height was
+    /// vct-synced database (the tree below the checkpoint handoff height was
     /// never written). Read-request handlers use this to return an archive-mode
     /// error instead of a misleading "not found".
-    pub fn fast_synced_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        let Some(boundary) = self.fast_synced_below() else {
+    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
+        let Some(boundary) = self.vct_synced_below() else {
             return false;
         };
         hash_or_height

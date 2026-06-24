@@ -141,7 +141,7 @@ impl DiskFormatUpgrade for AddSubtrees {
         // Fast-synced databases deliberately have no per-height note-commitment
         // trees or subtrees below the checkpoint handoff height, so the subtree
         // scans below do not apply to them.
-        if db.is_fast_synced() {
+        if db.is_vct_synced() {
             return Ok(Ok(()));
         }
 
@@ -219,7 +219,7 @@ pub fn subtree_format_calculation_pre_checks(db: &ZebraDb) -> Result<(), String>
 
     // Fast-synced databases deliberately have no per-height note-commitment trees
     // or subtrees below the checkpoint handoff height, so these checks don't apply.
-    if db.is_fast_synced() {
+    if db.is_vct_synced() {
         return Ok(());
     }
 

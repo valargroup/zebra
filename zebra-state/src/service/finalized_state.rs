@@ -477,7 +477,7 @@ impl FinalizedState {
         // `tip < handoff` (exclusive) is exactly the frozen region. Read from the
         // fast-sync marker, not `vct`, so it holds even if VCT is disabled this run.
         let vct_frontier_frozen = db
-            .fast_synced_below()
+            .vct_synced_below()
             .zip(db.finalized_tip_height())
             .is_some_and(|(handoff, tip)| tip < handoff);
 
@@ -1287,7 +1287,7 @@ impl FinalizedState {
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.
     #[cfg(test)]
     pub(crate) fn vct_fast_synced_below(&self) -> Option<block::Height> {
-        self.db.fast_synced_below()
+        self.db.vct_synced_below()
     }
 
     /// Test-only: number of blocks that took the fast (skip-recompute) path so far.

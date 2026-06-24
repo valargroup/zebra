@@ -77,7 +77,7 @@ pub fn quick_check(db: &ZebraDb) -> Result<(), String> {
     // A fast-synced database deliberately has no per-height note-commitment trees
     // below the checkpoint handoff height, including the genesis trees this check
     // reads. The genesis-root-caching invariant does not apply to it.
-    if db.is_fast_synced() {
+    if db.is_vct_synced() {
         return Ok(());
     }
 
@@ -137,7 +137,7 @@ pub fn detailed_check(
     // A fast-synced database deliberately has no per-height note-commitment trees
     // below the checkpoint handoff height, so the per-height tree scans below do
     // not apply to it.
-    if db.is_fast_synced() {
+    if db.is_vct_synced() {
         return Ok(Ok(()));
     }
 

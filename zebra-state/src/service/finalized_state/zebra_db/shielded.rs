@@ -234,7 +234,7 @@ impl ZebraDb {
             // sprout tip tree is only written at the handoff; the committer does not
             // read it before then.
             assert!(
-                self.fast_synced_below()
+                self.vct_synced_below()
                     .is_some_and(|below| self.finalized_tip_height() < Some(below)),
                 "Sprout note commitment tree must exist if there is a finalized tip"
             );
@@ -295,7 +295,7 @@ impl ZebraDb {
             // folds verified roots). Every other caller reaches here only at or
             // above the handoff, where the tree is present.
             assert!(
-                self.fast_synced_below().is_some_and(|below| height < below),
+                self.vct_synced_below().is_some_and(|below| height < below),
                 "Sapling note commitment tree must exist if there is a finalized tip"
             );
             Default::default()
@@ -322,7 +322,7 @@ impl ZebraDb {
         // `None` rather than letting the backward search return a stale tree from
         // an earlier height; the tree at the handoff height and above is present.
         if self
-            .fast_synced_below()
+            .vct_synced_below()
             .is_some_and(|boundary| *height < boundary)
         {
             return None;
@@ -439,7 +439,7 @@ impl ZebraDb {
             // See `sapling_tree_for_tip`: the fast-sync tip frontier below the
             // handoff height is not stored and not read by the committer.
             assert!(
-                self.fast_synced_below().is_some_and(|below| height < below),
+                self.vct_synced_below().is_some_and(|below| height < below),
                 "Orchard note commitment tree must exist if there is a finalized tip"
             );
             Default::default()
@@ -466,7 +466,7 @@ impl ZebraDb {
         // `None` rather than letting the backward search return a stale tree from
         // an earlier height; the tree at the handoff height and above is present.
         if self
-            .fast_synced_below()
+            .vct_synced_below()
             .is_some_and(|boundary| *height < boundary)
         {
             return None;

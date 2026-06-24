@@ -1164,7 +1164,7 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
     );
 
     assert_eq!(
-        reopened.db.fast_synced_below(),
+        reopened.db.vct_synced_below(),
         Some(Height(2)),
         "the fast-sync marker is preserved across the archive-mode reopen"
     );
@@ -1208,7 +1208,7 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
     );
 
     assert_eq!(
-        reopened.db.fast_synced_below(),
+        reopened.db.vct_synced_below(),
         Some(Height(2)),
         "the fast-sync marker is preserved across the pruned-mode reopen"
     );
