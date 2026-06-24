@@ -793,7 +793,7 @@ impl FinalizedState {
                 let network = self.network();
                 let height = checkpoint_verified.height;
 
-                // The checkpoint handoff height (boundary below which the vct
+                // The last checkpoint height (boundary below which the vct
                 // path skips per-height trees), when final frontiers are loaded.
                 let vct_last_checkpoint_height = self.vct.as_ref().and_then(|v| v.vct_sync_last_checkpoint_height());
 
