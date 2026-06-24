@@ -73,7 +73,7 @@ jobs:
       nextest_profile: sync-range-pre-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
       image_ref: ${{ needs.build.outputs.image_ref }}
-      droplet_size: s-8vcpu-16gb
+      droplet_size: g-8vcpu-32gb
 
   post-nu62:
     needs: build
@@ -90,4 +90,4 @@ jobs:
       nextest_profile: sync-range-post-nu62
       test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
       image_ref: ${{ needs.build.outputs.image_ref }}
-      droplet_size: s-8vcpu-16gb
+      droplet_size: g-8vcpu-32gb

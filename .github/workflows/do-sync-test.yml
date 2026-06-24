@@ -25,6 +25,8 @@ jobs:
   run:
     name: ${{ inputs.state_key }}
     runs-on: ubuntu-latest
+    # Backstop so a wedged droplet/SSH fails the job in ~1h instead of stalling for the 6h default.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -117,7 +119,11 @@ jobs:
           } > /tmp/run.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env .github/workflows/scripts/do-sync-run.sh "root@${IP}:/root/"
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh "root@${IP}" \
+          # ServerAliveInterval sends keepalives during the long, low-output sync so an idle
+          # NAT/firewall timeout can't drop the connection (which previously severed the sync
+          # mid-run and left this step hung).
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
             'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/do-sync-run.sh'
 
       - name: Destroy droplet + sweep orphans
