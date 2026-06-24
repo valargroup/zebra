@@ -14,12 +14,15 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use zebra_chain::{
+    orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet::{
             ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters, RegtestParameters,
         },
         Network,
     },
+    sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
@@ -116,10 +119,23 @@ fn mainnet_header(bytes: &[u8]) -> Arc<block::Header> {
 }
 
 fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+    let start_height = headers
+        .first()
+        .map(|header| test_header_height(header.as_ref()))
+        .unwrap_or(block::Height(1));
+    headers_message_from(start_height, headers)
+}
+
+fn headers_message_from(
+    start_height: block::Height,
+    headers: Vec<Arc<block::Header>>,
+) -> HeaderSyncMessage {
     let body_sizes = vec![0; headers.len()];
+    let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
         headers,
         body_sizes,
+        tree_aux_roots,
     }
 }
 
@@ -127,10 +143,49 @@ fn headers_message_with_sizes(
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
 ) -> HeaderSyncMessage {
+    let start_height = headers
+        .first()
+        .map(|header| test_header_height(header.as_ref()))
+        .unwrap_or(block::Height(1));
+    let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
         headers,
         body_sizes,
+        tree_aux_roots,
     }
+}
+
+fn root_at(height: block::Height) -> BlockCommitmentRoots {
+    BlockCommitmentRoots {
+        height,
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+    }
+}
+
+fn test_header_height(header: &block::Header) -> block::Height {
+    let hash = block::Hash::from(header);
+    [
+        (block::Height(0), &BLOCK_MAINNET_GENESIS_BYTES[..]),
+        (block::Height(1), &BLOCK_MAINNET_1_BYTES[..]),
+        (block::Height(2), &BLOCK_MAINNET_2_BYTES[..]),
+        (block::Height(3), &BLOCK_MAINNET_3_BYTES[..]),
+        (block::Height(4), &BLOCK_MAINNET_4_BYTES[..]),
+    ]
+    .into_iter()
+    .find_map(|(height, bytes)| {
+        (hash == block::Hash::from(mainnet_header(bytes).as_ref())).then_some(height)
+    })
+    .unwrap_or(block::Height(1))
+}
+
+fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockCommitmentRoots> {
+    (0..count)
+        .map(|offset| {
+            let offset = u32::try_from(offset).expect("test root count fits in u32");
+            root_at(block::Height(start_height.0 + offset))
+        })
+        .collect()
 }
 
 async fn validate_headers_stateless_after_equihash_acceptance(
@@ -153,7 +208,7 @@ async fn validate_headers_stateless_after_equihash_acceptance(
 
 fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
     HeaderSyncDecodeContext::for_headers_response(
-        ExpectedHeadersResponse::new(block::Height(1), count).unwrap(),
+        ExpectedHeadersResponse::new(block::Height(1), count, false).unwrap(),
         peer_cap,
     )
 }
@@ -446,6 +501,7 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
+                        want_tree_aux_roots: false,
                     },
             } if peer == peer_id => {
                 assert_eq!(start_height, block::Height(1));
@@ -686,6 +742,7 @@ async fn next_outbound_get_headers(
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
+                        want_tree_aux_roots: false,
                     },
             } => return (peer, start_height, count),
             HeaderSyncAction::Misbehavior { peer, reason } => {
@@ -803,6 +860,7 @@ fn codec_round_trips_get_headers() {
     let message = HeaderSyncMessage::GetHeaders {
         start_height: block::Height(42),
         count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
     };
 
     let encoded = message.encode().unwrap();
@@ -853,6 +911,7 @@ fn codec_rejects_unknown_message_types_and_trailing_bytes() {
     let mut encoded = HeaderSyncMessage::GetHeaders {
         start_height: block::Height(1),
         count: 1,
+        want_tree_aux_roots: false,
     }
     .encode()
     .unwrap();
@@ -874,6 +933,27 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
         Err(HeaderSyncWireError::BodySizeCountMismatch {
             headers: 1,
             body_sizes: 2,
+        })
+    ));
+
+    assert!(matches!(
+        HeaderSyncMessage::Headers {
+            headers: headers.clone(),
+            body_sizes: vec![100],
+            tree_aux_roots: Vec::new(),
+        }
+        .encode(),
+        Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
+            headers: 1,
+            roots: 0,
+        })
+    ));
+
+    assert!(matches!(
+        validate_tree_aux_root_heights(block::Height(1), &[root_at(block::Height(2))]),
+        Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+            expected_height: block::Height(1),
+            root_height: block::Height(2),
         })
     ));
 
@@ -945,9 +1025,11 @@ fn headers_codec_does_not_use_legacy_160_header_cap() {
         HeaderSyncMessage::Headers {
             headers,
             body_sizes,
+            tree_aux_roots,
         } => {
             assert_eq!(headers.len(), 161);
             assert_eq!(body_sizes, vec![0; 161]);
+            assert_eq!(tree_aux_roots, roots_from_height(block::Height(1), 161));
         }
         _ => panic!("decoded message must be Headers"),
     }
@@ -958,6 +1040,7 @@ fn get_headers_rejects_invalid_counts() {
     assert!(HeaderSyncMessage::GetHeaders {
         start_height: block::Height(1),
         count: 0,
+        want_tree_aux_roots: false,
     }
     .encode()
     .is_err());
@@ -965,6 +1048,7 @@ fn get_headers_rejects_invalid_counts() {
     assert!(HeaderSyncMessage::GetHeaders {
         start_height: block::Height(1),
         count: MAX_HS_RANGE + 1,
+        want_tree_aux_roots: false,
     }
     .encode()
     .is_err());
@@ -1019,7 +1103,10 @@ fn header_serialized_sizes_are_exact_and_message_cap_has_headroom() {
 
     let default_response_bytes = HEADER_SYNC_MESSAGE_TYPE_BYTES
         + HEADER_SYNC_COUNT_BYTES
-        + (COMMON_HEADER_BYTES + HEADER_SYNC_BODY_SIZE_BYTES) * DEFAULT_HS_RANGE as usize;
+        + (COMMON_HEADER_BYTES
+            + HEADER_SYNC_BODY_SIZE_BYTES
+            + HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES)
+            * DEFAULT_HS_RANGE as usize;
     assert!(default_response_bytes < MAX_HS_MESSAGE_BYTES);
     assert!(MAX_HS_MESSAGE_BYTES < LOCAL_MAX_MESSAGE_BYTES as usize);
 }
@@ -1031,13 +1118,21 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         MAX_HS_RANGE,
         &Network::Mainnet,
         LOCAL_MAX_MESSAGE_BYTES,
+        false,
     );
 
     assert!(count < MAX_HS_RANGE);
     let headers =
         vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
-    let headers =
-        truncate_headers_to_byte_budget(headers, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES);
+    let body_sizes = vec![0u32; headers.len()];
+    let tree_aux_roots = roots_from_height(block::Height(1), headers.len());
+    let (headers, _body_sizes, _tree_aux_roots) = truncate_headers_to_byte_budget(
+        headers,
+        body_sizes,
+        tree_aux_roots,
+        &Network::Mainnet,
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
     let encoded = headers_message(headers).encode().unwrap();
 
     assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
@@ -1094,6 +1189,7 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1155,6 +1251,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
         } = next_non_query_action(&mut fixture.actions).await
         {
@@ -1233,6 +1330,7 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
         } = next_non_query_action(&mut fixture.actions).await
         {
@@ -1265,6 +1363,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
         MAX_HS_RANGE,
         &network,
         LOCAL_MAX_MESSAGE_BYTES,
+        false,
     );
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -1299,6 +1398,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
         } = action
         {
@@ -1331,6 +1431,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1372,6 +1473,7 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1410,6 +1512,7 @@ async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1514,10 +1617,13 @@ async fn headers_over_outstanding_contract_reports_response_too_long_without_flo
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(vec![
-                mainnet_header(&BLOCK_MAINNET_1_BYTES),
-                mainnet_header(&BLOCK_MAINNET_2_BYTES),
-            ]),
+            msg: headers_message_from(
+                start,
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
         })
         .await
         .unwrap();
@@ -1586,10 +1692,10 @@ async fn matching_headers_are_statelessly_validated_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(vec![
-                mainnet_header(&BLOCK_MAINNET_1_BYTES),
-                Arc::new(bad_second),
-            ]),
+            msg: headers_message_from(
+                next_height(two_before_checkpoint).expect("has successor"),
+                vec![mainnet_header(&BLOCK_MAINNET_1_BYTES), Arc::new(bad_second)],
+            ),
         })
         .await
         .unwrap();
@@ -1832,6 +1938,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(1),
                         count: 1,
+                        want_tree_aux_roots: false,
                     },
             } if peer == peer_id => break,
             _ => {}
@@ -1855,6 +1962,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(2),
                         count: 1,
+                        want_tree_aux_roots: false,
                     },
             } if peer == peer_id => break,
             _ => {}
@@ -1969,6 +2077,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
+                        want_tree_aux_roots: false,
                     },
             } if peer == first_peer || peer == second_peer => {
                 assert_eq!(start_height, start);
@@ -2156,6 +2265,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
+                want_tree_aux_roots: false,
             },
         } if peer == peer_id
     ));
@@ -2184,6 +2294,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
+                want_tree_aux_roots: false,
             },
         } if peer == peer_id
     ));
@@ -2990,6 +3101,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
+                want_tree_aux_roots: false,
             },
         })
         .await
@@ -3023,6 +3135,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: start,
                     count: 3,
+                    want_tree_aux_roots: false,
                 },
             })
             .await
@@ -3032,6 +3145,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
                 peer,
                 start: action_start,
                 count,
+                ..
             } => {
                 assert_eq!(peer, requester);
                 assert_eq!(action_start, start);
@@ -3048,6 +3162,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(7),
                 count: 1,
+                want_tree_aux_roots: false,
             },
         })
         .await
@@ -3079,12 +3194,15 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(8),
                 count: 1,
+                want_tree_aux_roots: false,
             },
         })
         .await
         .unwrap();
     match next_query_headers_action(&mut fixture.actions).await {
-        HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+        HeaderSyncAction::QueryHeadersByHeightRange {
+            peer, start, count, ..
+        } => {
             assert_eq!(peer, requester);
             assert_eq!(start, block::Height(8));
             assert_eq!(count, 1);
@@ -3123,6 +3241,7 @@ async fn inbound_get_headers_over_cap_disconnects_without_state_read() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 4,
+                want_tree_aux_roots: false,
             },
         })
         .await
@@ -3174,7 +3293,10 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+            msg: headers_message_from(
+                block::Height(1),
+                vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
+            ),
         })
         .await
         .unwrap();
@@ -3545,7 +3667,10 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
             .handle
             .send(HeaderSyncEvent::WireMessage {
                 peer: served_peer,
-                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+                msg: headers_message_from(
+                    start_height,
+                    vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                ),
             })
             .await
             .unwrap();
@@ -3569,6 +3694,7 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count: _,
+                        want_tree_aux_roots: false,
                     },
                 ..
             } if saw_reanchor_action && start_height == expected_start => {
@@ -3626,7 +3752,10 @@ async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
             .handle
             .send(HeaderSyncEvent::WireMessage {
                 peer: served_peer,
-                msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+                msg: headers_message_from(
+                    start_height,
+                    vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                ),
             })
             .await
             .unwrap();
@@ -3674,6 +3803,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
+                    want_tree_aux_roots: false,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -3867,11 +3997,14 @@ async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(vec![
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-            ]),
+            msg: headers_message_from(
+                block::Height(1),
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
+                ],
+            ),
         })
         .await
         .unwrap();
@@ -3919,7 +4052,10 @@ async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_comm
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)]),
+            msg: headers_message_from(
+                block::Height(1),
+                vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
+            ),
         })
         .await
         .unwrap();

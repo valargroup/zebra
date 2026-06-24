@@ -181,6 +181,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_height_by_hash",
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+    ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",
@@ -257,6 +258,16 @@ pub const FAST_SYNC_METADATA: &str = "fast_sync_metadata";
 /// reads this index first and falls back to the trees only for databases written before the
 /// index existed.
 pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
+
+/// Provisional peer-supplied per-height Sapling/Orchard roots attached to Zakura
+/// header-sync responses.
+///
+/// These roots are advisory metadata for header-ahead blocks. They are persisted
+/// with `zakura_header_*` so VCT fast sync can read them before full block bodies
+/// arrive, but they remain untrusted until block commit verifies them against the
+/// header commitments.
+pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
+    "zakura_header_commitment_roots_by_height";
 
 /// The finalized part of the chain state, stored in the db.
 ///
@@ -466,6 +477,7 @@ impl FinalizedState {
             config.checkpoint_sync,
             config.disable_vct_fast_sync,
             network,
+            db.clone(),
         );
 
         // Re-derive the frozen-frontier flag from durable state: a fast sync

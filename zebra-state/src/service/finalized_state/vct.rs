@@ -24,7 +24,10 @@ use zebra_chain::{
     sapling, sprout,
 };
 
-use super::commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource, PeerSourceHandle};
+use super::{
+    commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource, PeerSourceHandle},
+    ZebraDb,
+};
 
 /// Embedded verified final note-commitment frontiers for Mainnet.
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
@@ -117,6 +120,7 @@ impl VctState {
         checkpoint_sync: bool,
         disable_vct_fast_sync: bool,
         network: &Network,
+        db: ZebraDb,
     ) -> Option<Arc<Self>> {
         // Parse the embedded handoff frontier once (None on networks without one, e.g.
         // Testnet). The decision below only needs its presence; the peer arm reuses the
@@ -137,7 +141,7 @@ impl VctState {
                     handoff_height = parsed.height.0,
                     "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
                 );
-                let (source, peer_source_handle) = PeerSource::new(Some(parsed));
+                let (source, peer_source_handle) = PeerSource::new_with_db(db, Some(parsed));
                 Some(Arc::new(VctState {
                     fast: true,
                     source: Box::new(source),

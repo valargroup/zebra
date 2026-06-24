@@ -384,6 +384,17 @@ impl Sequencer {
         }
     }
 
+    fn clear_submitted_applies_through(&mut self, through: block::Height) {
+        let heights: Vec<_> = self
+            .submitted_applies
+            .range(..=through)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in heights {
+            self.submitted_applies.remove(&height);
+        }
+    }
+
     // ---- apply finished ----
 
     /// The `(token, hash)` of the body currently applying at `height`, for
@@ -445,6 +456,7 @@ impl Sequencer {
                 released = released.saturating_add(applying.bytes);
             }
         }
+        self.clear_submitted_applies_through(tip);
         released
     }
 

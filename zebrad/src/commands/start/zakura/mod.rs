@@ -26,7 +26,7 @@ pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_st
 pub(crate) use header_sync_driver::{
     block_sync_chain_tip_event, body_sizes_for_served_header_range,
     chain_tip_mirror_frontier_change, header_range_commit_failure_kind,
-    notify_block_sync_header_tip,
+    notify_block_sync_header_tip, tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{
     drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,

@@ -54,9 +54,11 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
-/// window is queued, so this defaults to one maximum checkpoint gap.
+/// window, including the resolving checkpoint block, is queued. A node that
+/// starts one height before a checkpoint-gap boundary can therefore need one
+/// maximum checkpoint gap plus the boundary block in flight.
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default central floor-watchdog cadence.

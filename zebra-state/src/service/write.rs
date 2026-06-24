@@ -19,7 +19,10 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::block::{self, Height};
 
-use zebra_chain::parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees};
+use zebra_chain::parallel::{
+    commitment_aux::BlockCommitmentRoots,
+    tree::{BlockNotePrecompute, NoteCommitmentTrees},
+};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
@@ -166,11 +169,18 @@ fn commit_header_range(
     anchor: block::Hash,
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
+    tree_aux_roots: Vec<BlockCommitmentRoots>,
     rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
 ) {
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
     let result = batch
-        .prepare_header_range_batch(&finalized_state.db, anchor, &headers, &body_sizes)
+        .prepare_header_range_batch_with_roots(
+            &finalized_state.db,
+            anchor,
+            &headers,
+            &body_sizes,
+            &tree_aux_roots,
+        )
         .and_then(|hash| {
             finalized_state
                 .db
@@ -223,6 +233,7 @@ pub enum NonFinalizedWriteMessage {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
         rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
     },
     /// The hash of a block that should be invalidated and removed from
@@ -392,9 +403,17 @@ impl WriteBlockWorkerTask {
                     anchor,
                     headers,
                     body_sizes,
+                    tree_aux_roots,
                     rsp_tx,
                 }) => {
-                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    commit_header_range(
+                        finalized_state,
+                        anchor,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                        rsp_tx,
+                    );
                     continue;
                 }
                 Ok(msg) => deferred_non_finalized_messages.push_back(msg),
@@ -671,9 +690,17 @@ impl WriteBlockWorkerTask {
                     anchor,
                     headers,
                     body_sizes,
+                    tree_aux_roots,
                     rsp_tx,
                 } => {
-                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    commit_header_range(
+                        finalized_state,
+                        anchor,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                        rsp_tx,
+                    );
                     continue;
                 }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {

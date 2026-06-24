@@ -466,7 +466,8 @@ mod tests {
     #[test]
     fn deliver_correlated_headers_decodes_against_expectation() {
         let (handle, mut events) = test_handle();
-        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        let expected =
+            ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
 
         let flow = deliver(&handle, Some(expected), peer(), headers_frame(Vec::new()));
 
@@ -488,8 +489,10 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
 
-        let first = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
-        let second = ExpectedHeadersResponse::new(block::Height(2), 2).expect("count is valid");
+        let first =
+            ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
+        let second =
+            ExpectedHeadersResponse::new(block::Height(2), 2, false).expect("count is valid");
         commands_tx
             .send(HeaderSyncPeerCommand::RecordExpectedHeaders(first))
             .expect("pipe is alive");
@@ -584,7 +587,8 @@ mod tests {
         let (handle, _events_rx) = saturated_events_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
-        let expected = ExpectedHeadersResponse::new(block::Height(1), 1).expect("count is valid");
+        let expected =
+            ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
         commands_tx
             .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
             .expect("pipe is alive");
@@ -600,6 +604,11 @@ mod tests {
         let solicited_headers = HeaderSyncMessage::Headers {
             headers: vec![block_one.header.clone()],
             body_sizes: vec![0],
+            tree_aux_roots: vec![BlockCommitmentRoots {
+                height: block::Height(1),
+                sapling_root: zebra_chain::sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: zebra_chain::orchard::tree::NoteCommitmentTree::default().root(),
+            }],
         }
         .encode_frame()
         .expect("headers frame encodes");

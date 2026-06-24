@@ -371,6 +371,7 @@ impl CommitmentRootSource for FixtureSource {
 /// only roots come from peers.
 #[derive(Debug)]
 pub(super) struct PeerSource {
+    db: Option<ZebraDb>,
     cache: Arc<RwLock<PeerRootsCache>>,
     frontiers: Option<FinalFrontiers>,
 }
@@ -380,6 +381,7 @@ pub(super) struct PeerSource {
 /// and source share one cache.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerSourceWriter {
+    db: Option<ZebraDb>,
     cache: Arc<RwLock<PeerRootsCache>>,
 }
 
@@ -403,13 +405,40 @@ struct PeerRootsCache {
 impl PeerSource {
     /// Create an empty peer source and its driver handle. `frontiers` is the embedded
     /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[allow(dead_code)]
     pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceHandle) {
         let cache = Arc::new(RwLock::new(PeerRootsCache::default()));
         let writer = PeerSourceWriter {
             cache: Arc::clone(&cache),
+            db: None,
         };
         (
             PeerSource {
+                db: None,
+                cache: Arc::clone(&cache),
+                frontiers,
+            },
+            PeerSourceHandle {
+                writer,
+                refetch_sender: broadcast::channel(64).0,
+            },
+        )
+    }
+
+    /// Create a source backed by provisional header-ahead roots in `db`.
+    pub(super) fn new_with_db(
+        db: ZebraDb,
+        frontiers: Option<FinalFrontiers>,
+    ) -> (Self, PeerSourceHandle) {
+        let cache = Arc::new(RwLock::new(PeerRootsCache::default()));
+        let writer = PeerSourceWriter {
+            db: Some(db.clone()),
+            cache: Arc::clone(&cache),
+        };
+        (
+            PeerSource {
+                db: Some(db),
                 cache: Arc::clone(&cache),
                 frontiers,
             },
@@ -427,6 +456,13 @@ impl PeerSourceWriter {
     /// Last write wins per uncommitted height; roots at already-committed heights are
     /// ignored so stale refetches cannot grow the cache below the finalized tip.
     pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
+        if let Some(db) = &self.db {
+            if let Err(error) = db.insert_zakura_header_commitment_roots(roots) {
+                tracing::debug!(?error, "failed to persist VCT peer roots");
+            }
+            return;
+        }
+
         let mut cache = self.cache.write().expect("peer source roots lock poisoned");
         for r in roots {
             if cache
@@ -444,6 +480,13 @@ impl PeerSourceWriter {
 
     /// Remove peer-supplied roots at `heights` from the shared cache.
     fn invalidate_roots(&self, heights: impl IntoIterator<Item = block::Height>) {
+        if let Some(db) = &self.db {
+            if let Err(error) = db.delete_zakura_header_commitment_roots(heights) {
+                tracing::debug!(?error, "failed to delete invalid VCT peer roots");
+            }
+            return;
+        }
+
         let mut cache = self.cache.write().expect("peer source roots lock poisoned");
         for height in heights {
             cache.roots.remove(&height.0);
@@ -498,6 +541,14 @@ impl CommitmentRootSource for PeerSource {
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+        if let Some(db) = &self.db {
+            return db
+                .zakura_header_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+                .map(|roots| (roots.sapling_root, roots.orchard_root));
+        }
+
         self.cache
             .read()
             .expect("peer source roots lock poisoned")
@@ -514,6 +565,13 @@ impl CommitmentRootSource for PeerSource {
     fn invalidate(&self, height: block::Height) {
         // Drop the rejected root so the next read misses and the driver can re-fetch a
         // (verifiable) replacement for this height from another peer.
+        if let Some(db) = &self.db {
+            if let Err(error) = db.delete_zakura_header_commitment_roots([height]) {
+                tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
+            }
+            return;
+        }
+
         self.cache
             .write()
             .expect("peer source roots lock poisoned")
