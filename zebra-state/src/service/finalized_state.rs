@@ -793,44 +793,44 @@ impl FinalizedState {
                 let network = self.network();
                 let height = checkpoint_verified.height;
 
-                // The checkpoint handoff height (boundary below which the fast
+                // The checkpoint handoff height (boundary below which the vct
                 // path skips per-height trees), when final frontiers are loaded.
-                let handoff_height = self.vct.as_ref().and_then(|v| v.fast_sync_handoff_height());
+                let vct_last_checkpoint_height = self.vct.as_ref().and_then(|v| v.vct_sync_last_checkpoint_height());
 
-                // In fast mode, if the source has this height's roots at or below the
-                // handoff, skip the per-block note-commitment frontier recompute
+                // In vct mode, if the source has this height's roots at or below the
+                // last checkpoint height, skip the per-block note-commitment frontier recompute
                 // (`update_trees_parallel`) entirely and fold the supplied roots into the
                 // anchor set and history leaf instead. The frontier stays the (frozen)
                 // parent frontier; nothing below the checkpoint reads it for consensus.
                 // See docs/design/verified-commitment-trees.md.
-                let vct_mode = self.vct.as_ref().and_then(|v| {
-                    if handoff_height.is_some_and(|handoff| height > handoff) {
+                let vct_roots = self.vct.as_ref().and_then(|v| {
+                    if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| height > last_checkpoint_height) {
                         None
                     } else {
                         v.vct_roots_at_height(height)
                     }
                 });
 
-                let mut fast_anchor_roots = None;
+                let mut vct_anchor_roots = None;
                 // `Some(C)` for fast blocks of a persistent fast sync; written
                 // to the fast-sync marker in the commit batch.
-                let mut fast_sync_below = None;
+                let mut vct_sync_below = None;
 
-                if let Some((sapling_root, orchard_root)) = vct_mode {
+                if let Some((sapling_root, orchard_root)) = vct_roots {
                     // The handoff frontiers are the only non-successor authority that
                     // can authenticate this block's own supplied roots before they are
                     // persisted.
-                    let handoff_frontiers = self
+                    let last_checkpoint_frontiers = self
                         .vct
                         .as_ref()
-                        .and_then(|v| v.final_frontiers_for_handoff(height));
+                        .and_then(|v| v.final_frontiers_for_last_checkpoint(height));
 
                     // This block's own commitment check is identical to the
-                    // previous fast block's look-ahead. When that look-ahead
+                    // previous vct block's look-ahead. When that look-ahead
                     // already validated this exact header, skip the duplicate.
                     let block_hash = block.hash();
-                    let prevalidated = self.vct_prevalidated_next == Some((height, block_hash));
-                    if prevalidated {
+                    let is_prevalidated = self.vct_prevalidated_next == Some((height, block_hash));
+                    if is_prevalidated {
                         if let Some(v) = &self.vct {
                             v.record_prevalidated();
                         }
@@ -846,7 +846,7 @@ impl FinalizedState {
                             sapling_root,
                             orchard_root,
                             precomputed_auth_data_root,
-                            prevalidated,
+                            is_prevalidated,
                         ),
                     ];
                     if let Some((next_block, next_auth)) = &next_checkpoint {
@@ -882,10 +882,10 @@ impl FinalizedState {
                     } else if self
                         .vct
                         .as_ref()
-                        .is_some_and(|v| v.fast_root_needs_successor(height, &network))
+                        .is_some_and(|v| v.vct_root_needs_successor(height, &network))
                     {
                         // Untrusted root at/above Heartwood, no successor to confirm it,
-                        // not the handoff: defer rather than persist it unverified. Leaves
+                        // not the last checkpoint: defer rather than persist it unverified. Leaves
                         // the database untouched; the block re-commits once the successor
                         // is buffered.
                         metrics::counter!("state.vct.root.await_successor.count").increment(1);
@@ -910,10 +910,10 @@ impl FinalizedState {
                     // When final frontiers are loaded, this is a persistent fast
                     // sync: mark the database fast-synced (per-height trees absent
                     // below the handoff height).
-                    fast_sync_below = handoff_height;
+                    vct_sync_below = vct_last_checkpoint_height;
 
                     if let Some((sapling_frontier, orchard_frontier, sprout_frontier)) =
-                        handoff_frontiers
+                        last_checkpoint_frontiers
                     {
                         // Checkpoint handoff: verify the supplied frontiers against
                         // this block's verified roots (collision resistance makes the
@@ -944,7 +944,7 @@ impl FinalizedState {
                         // above the handoff resume legacy recompute from a correct frontier.
                         self.vct_frontier_frozen = false;
                     } else {
-                        fast_anchor_roots = Some((sapling_root, orchard_root));
+                        vct_anchor_roots = Some((sapling_root, orchard_root));
 
                         // A non-handoff fast block leaves the note-commitment frontier
                         // frozen (it folds roots instead of advancing the trees), so a
@@ -1049,8 +1049,8 @@ impl FinalizedState {
                     FinalizedBlock::from_checkpoint_verified(checkpoint_verified, treestate),
                     Some(prev_note_commitment_trees),
                     self.retention_plan(height, true),
-                    fast_anchor_roots,
-                    fast_sync_below,
+                    vct_anchor_roots,
+                    vct_sync_below,
                 )
             }
             FinalizableBlock::Contextual {
@@ -1195,7 +1195,7 @@ impl FinalizedState {
     pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
         self.vct
             .as_ref()
-            .is_some_and(|v| v.fast_root_needs_successor(height, &self.network()))
+            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
     }
 
     /// The per-state `tree_aux` peer-source driver handle, if peer mode is active.
