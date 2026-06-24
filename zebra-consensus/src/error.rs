@@ -53,6 +53,9 @@ pub enum TransactionError {
     #[error("coinbase transaction MUST NOT have the EnableSpendsIronwood flag set")]
     CoinbaseHasEnableSpendsIronwood,
 
+    #[error("coinbase transaction MUST NOT have an Orchard shielded bundle")]
+    CoinbaseHasOrchardShieldedData,
+
     #[error("coinbase transaction Sapling or Orchard outputs MUST be decryptable with an all-zero outgoing viewing key")]
     CoinbaseOutputsNotDecryptable,
 
@@ -358,6 +361,7 @@ impl TransactionError {
             | CoinbaseHasOutputPreHeartwood
             | CoinbaseHasEnableSpendsOrchard
             | CoinbaseHasEnableSpendsIronwood
+            | CoinbaseHasOrchardShieldedData
             | CoinbaseOutputsNotDecryptable
             | CoinbaseInMempool
             | NonCoinbaseHasCoinbaseInput
