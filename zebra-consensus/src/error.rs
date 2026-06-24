@@ -195,9 +195,6 @@ pub enum TransactionError {
     #[error("Orchard transactions MUST NOT have the EnableCrossAddress flag set")]
     OrchardHasEnableCrossAddress,
 
-    #[error("Ironwood transactions MUST have the EnableCrossAddress flag set")]
-    IronwoodDoesNotHaveEnableCrossAddress,
-
     #[error("could not find transparent input UTXO in the best chain or mempool")]
     TransparentInputNotFound,
 

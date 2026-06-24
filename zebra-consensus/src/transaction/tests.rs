@@ -292,7 +292,10 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
-fn ironwood_cross_address_flag_is_required_after_nu6_3() {
+fn ironwood_cross_address_flag_is_optional_after_nu6_3() {
+    // After NU6.3 the cross-address bit is OPTIONAL for Ironwood shielded data: a bundle
+    // is accepted whether or not it sets ENABLE_CROSS_ADDRESS. (Orchard bundles still MUST
+    // NOT set it — that rule is unrelated and lives in `orchard_cross_address_disabled`.)
     let ironwood_without_cross_address = v6_pool_flow_transaction(
         None,
         Some(ironwood_shielded_data(
@@ -302,22 +305,35 @@ fn ironwood_cross_address_flag_is_required_after_nu6_3() {
         vec![],
     );
 
+    // `has_enough_ironwood_flags` is the only consensus check that inspects Ironwood flags,
+    // and it ignores the cross-address bit, so a bundle without it is accepted.
     assert_eq!(
-        check::ironwood_cross_address_enabled(&ironwood_without_cross_address),
-        Err(TransactionError::IronwoodDoesNotHaveEnableCrossAddress)
+        check::has_enough_ironwood_flags(&ironwood_without_cross_address),
+        Ok(())
+    );
+    // The Orchard cross-address rule must stay a no-op on an Ironwood-only bundle.
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_without_cross_address),
+        Ok(())
     );
 
     let ironwood_with_cross_address = v6_pool_flow_transaction(
         None,
         Some(ironwood_shielded_data(
             0,
-            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+            ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
         )),
         vec![],
     );
 
     assert_eq!(
-        check::ironwood_cross_address_enabled(&ironwood_with_cross_address),
+        check::has_enough_ironwood_flags(&ironwood_with_cross_address),
+        Ok(())
+    );
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_with_cross_address),
         Ok(())
     );
 }
@@ -328,10 +344,7 @@ fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu6_3_test_network_and_height();
     let tx = v6_pool_flow_transaction(
         Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
-        Some(ironwood_shielded_data(
-            -10,
-            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
-        )),
+        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
         vec![],
     );
 
@@ -364,10 +377,7 @@ fn orchard_to_ironwood_migration_balances() {
 fn ironwood_withdraw_balances() {
     let tx = v6_pool_flow_transaction(
         None,
-        Some(ironwood_shielded_data(
-            10,
-            ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
-        )),
+        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
         vec![transparent_output(10)],
     );
 
@@ -409,9 +419,7 @@ async fn v6_with_padded_orchard_proof_returns_consensus_error() {
 async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
     let mut ironwood_shielded_data = ironwood_shielded_data(
         0,
-        ironwood::Flags::ENABLE_SPENDS
-            | ironwood::Flags::ENABLE_OUTPUTS
-            | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
     );
     ironwood_shielded_data.proof.0.push(0);
 
