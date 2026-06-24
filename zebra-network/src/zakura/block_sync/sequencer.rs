@@ -1,7 +1,7 @@
 //! The serial commit pipeline for Zakura block sync.
 //!
 //! The [`Sequencer`] owns the consensus-critical reorder → applying →
-//! `SubmitBlock` → apply-finished machinery and nothing else. It deliberately
+//! `ApplySubmitted` → apply completion machinery and nothing else. It deliberately
 //! never touches download-side state — the byte budget, the work scheduler,
 //! peers, emitted actions, or state queries. Two rules keep that boundary clean:
 //!
@@ -45,7 +45,7 @@ pub(super) enum AcceptOutcome {
 }
 
 /// A body the Sequencer has assigned a token and marked submitted; the reactor
-/// dispatches the matching `SubmitBlock` action.
+/// dispatches the matching `ApplySubmitted` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
     pub(super) height: block::Height,
@@ -64,7 +64,7 @@ pub(super) struct AdvanceOutcome {
     pub(super) changed: bool,
 }
 
-/// The reorder → applying → submit → apply-finished commit pipeline.
+/// The reorder → applying → submit → apply completion commit pipeline.
 #[derive(Clone, Debug)]
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
@@ -387,7 +387,7 @@ impl Sequencer {
     // ---- apply finished ----
 
     /// The `(token, hash)` of the body currently applying at `height`, for
-    /// validating an apply-finished completion against the live submission.
+    /// validating an apply completion completion against the live submission.
     pub(super) fn applying_token_hash(
         &self,
         height: block::Height,

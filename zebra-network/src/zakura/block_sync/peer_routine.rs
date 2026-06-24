@@ -1003,8 +1003,8 @@ impl PeerRoutine {
         let request_elapsed_ms = elapsed_ms_u64(outstanding.queued_at.elapsed());
 
         // The body's transactions are not validated against the header here;
-        // consensus does it on apply (`handle_block_apply_finished` attributes a
-        // rejection back to the delivering peer for misbehavior scoring).
+        // consensus does it on apply, and the Sequencer attributes a rejection
+        // back to the delivering peer for misbehavior scoring.
 
         // Prefer the wire-measured body size; only re-serialize when absent (test
         // event).

@@ -625,11 +625,12 @@ pub struct ShieldedSpend {
     spend_auth_sig: [u8; 64],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
+// Keep a manual getter because `derive_getters` cannot currently copy this
+// upstream type even though it implements `Copy`.
 impl ShieldedSpend {
     /// The value commitment to the input note.
     pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
+        self.cv
     }
 }
 
@@ -657,11 +658,12 @@ pub struct ShieldedOutput {
     proof: [u8; 192],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
+// Keep a manual getter because `derive_getters` cannot currently copy this
+// upstream type even though it implements `Copy`.
 impl ShieldedOutput {
     /// The value commitment to the output note.
     pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
+        self.cv
     }
 }
 
@@ -899,7 +901,7 @@ impl TransactionObject {
                     let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();
 
                     ShieldedSpend {
-                        cv: spend.cv.clone(),
+                        cv: spend.cv,
                         anchor,
                         nullifier,
                         rk,
@@ -919,7 +921,7 @@ impl TransactionObject {
                     let out_ciphertext: [u8; 80] = output.out_ciphertext.into();
 
                     ShieldedOutput {
-                        cv: output.cv.clone(),
+                        cv: output.cv,
                         cm_u,
                         ephemeral_key,
                         enc_ciphertext,

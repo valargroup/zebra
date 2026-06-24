@@ -19,8 +19,7 @@ pub(crate) use block_sync_driver::{
     apply_block_sync_body, block_apply_class, block_sync_missing_body_window,
     block_sync_needed_blocks_from_state, coalesce_ready_needed_block_queries,
     coalesce_stale_needed_block_queries, commit_block_sync_body, query_block_sync_needed_blocks,
-    BlockApplyClass, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-    ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+    ZebradBlockApplyExecutor, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
@@ -35,6 +34,8 @@ pub(crate) use header_sync_driver::{
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 pub(crate) use tree_aux_driver::{run_tree_aux_driver, StateTreeAuxPort};
+#[cfg(test)]
+pub(crate) use zebra_network::zakura::BlockApplyClass;
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 

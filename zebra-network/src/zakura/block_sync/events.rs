@@ -1,3 +1,5 @@
+use futures::future::BoxFuture;
+
 use super::{request::*, state::*, *};
 
 /// Committed header metadata used by block sync to schedule and validate a body.
@@ -40,15 +42,16 @@ pub enum BlockSyncEvent {
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
-    /// Node wiring finished applying a submitted block body.
-    BlockApplyFinished {
-        /// Submission token from the matching [`BlockSyncAction::SubmitBlock`].
+    /// Test-only legacy completion event kept while tests migrate to executor control.
+    #[cfg(test)]
+    TestApplyDone {
+        /// Submission token from the matching test observation.
         token: BlockApplyToken,
         /// Submitted block height.
         height: block::Height,
         /// Submitted block hash.
         hash: block::Hash,
-        /// Apply result from the verifier driver.
+        /// Apply result supplied by the test.
         result: BlockApplyResult,
         /// Locally observed chain frontier after the apply attempt completed.
         local_frontier: Option<BlockSyncFrontiers>,
@@ -97,6 +100,128 @@ pub enum BlockApplyResult {
 /// ignore those stale completions instead of releasing a newer in-flight body.
 pub type BlockApplyToken = u64;
 
+/// Verification path used for a submitted block body.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BlockApplyClass {
+    /// Body will be committed through the checkpoint verifier path.
+    Checkpoint,
+    /// Body will be committed through the full semantic verifier path.
+    Full,
+}
+
+/// A body submission request owned by the block-sync Sequencer.
+#[derive(Clone, Debug)]
+pub struct BlockApplyRequest {
+    /// Submission token assigned by the Sequencer.
+    pub token: BlockApplyToken,
+    /// Parent-first block body to verify and commit.
+    pub block: Arc<block::Block>,
+}
+
+/// Output from a block body apply attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BlockApplyOutput {
+    /// Submission token echoed from [`BlockApplyRequest`].
+    pub token: BlockApplyToken,
+    /// Submitted block height.
+    pub height: block::Height,
+    /// Submitted block hash.
+    pub hash: block::Hash,
+    /// Verifier result.
+    pub result: BlockApplyResult,
+    /// Locally observed chain frontier after the apply attempt completed.
+    pub local_frontier: Option<BlockSyncFrontiers>,
+}
+
+/// Dependency-neutral block body apply executor installed by node wiring.
+pub trait BlockApplyExecutor: Send + Sync + 'static {
+    /// Classify the block body so the Sequencer can preserve verifier apply limits.
+    fn block_apply_class(&self, block: &block::Block) -> BlockApplyClass;
+
+    /// Submit one block body to the verifier/state pipeline.
+    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput>;
+
+    /// Refresh the durable frontier after checkpoint applies that can complete
+    /// before their batched state commit reaches the tip.
+    fn refresh_checkpoint_frontier(
+        &self,
+        highest_sent: block::Height,
+        attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>>;
+}
+
+/// Verifier apply concurrency limits owned by the Sequencer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BlockApplyLimits {
+    /// Number of checkpoint bodies per checkpoint range.
+    pub checkpoint_apply_limit: usize,
+    /// Number of full semantic bodies in flight.
+    pub full_apply_limit: usize,
+    /// Total full semantic bodies in flight.
+    pub combined_apply_limit: usize,
+}
+
+impl BlockApplyLimits {
+    /// Return conservative single-apply limits for tests and preconfigured ports.
+    pub fn single() -> Self {
+        Self {
+            checkpoint_apply_limit: 1,
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+        }
+    }
+}
+
+/// Cloneable block body apply executor port.
+#[derive(Clone)]
+pub struct BlockApplyExecutorPort {
+    inner: Arc<dyn BlockApplyExecutor>,
+    limits: BlockApplyLimits,
+}
+
+impl BlockApplyExecutorPort {
+    /// Wrap an executor implementation in a cloneable port.
+    pub fn new(inner: Arc<dyn BlockApplyExecutor>) -> Self {
+        Self::with_limits(inner, BlockApplyLimits::single())
+    }
+
+    /// Wrap an executor implementation with explicit apply limits.
+    pub fn with_limits(inner: Arc<dyn BlockApplyExecutor>, limits: BlockApplyLimits) -> Self {
+        Self { inner, limits }
+    }
+
+    /// Return the apply concurrency limits.
+    pub fn limits(&self) -> BlockApplyLimits {
+        self.limits
+    }
+
+    /// Classify one block body for apply-limit accounting.
+    pub fn block_apply_class(&self, block: &block::Block) -> BlockApplyClass {
+        self.inner.block_apply_class(block)
+    }
+
+    /// Submit one block body to the verifier/state pipeline.
+    pub fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
+        self.inner.apply(request)
+    }
+
+    /// Refresh the durable frontier after checkpoint applies.
+    pub fn refresh_checkpoint_frontier(
+        &self,
+        highest_sent: block::Height,
+        attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        self.inner
+            .refresh_checkpoint_frontier(highest_sent, attempts_remaining)
+    }
+}
+
+impl std::fmt::Debug for BlockApplyExecutorPort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BlockApplyExecutorPort")
+    }
+}
+
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]
 pub enum BlockSyncAction {
@@ -116,11 +241,12 @@ pub enum BlockSyncAction {
         /// Maximum count.
         count: u32,
     },
-    /// Parent-first body ready for B3's verifier/commit driver.
-    SubmitBlock {
-        /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
+    /// Test-only observation hook for a body submitted to the apply executor.
+    #[cfg(test)]
+    ApplySubmitted {
+        /// Submission token assigned by the Sequencer.
         token: BlockApplyToken,
-        /// Block body that is contiguous above `verified_block_tip`.
+        /// Block body submitted to the test apply executor.
         block: Arc<block::Block>,
     },
     /// Report peer misbehavior to the supervisor.

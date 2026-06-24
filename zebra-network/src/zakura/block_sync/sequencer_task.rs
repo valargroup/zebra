@@ -1,17 +1,17 @@
 //! The Sequencer's own serial task (Sequencer task boundary split).
 //!
 //! Sequencer task moves the consensus-critical commit pipeline (`Sequencer`: reorder →
-//! applying → `SubmitBlock` → apply-finished) off the reactor's single thread
+//! applying → verifier apply completion) off the reactor's single thread
 //! and into this spawned serial task. The reactor keeps issuance, peer matching,
 //! serving, and the producer; peer routines forward block bodies over a bounded
-//! body input channel, while the reactor forwards progress-critical control
-//! events over a non-blocking control channel. The reactor learns committed
+//! body input channel, while the reactor forwards rare external control events
+//! over a non-blocking control channel. The reactor learns committed
 //! progress back over a non-blocking `watch` ([`SequencerView`]).
 //!
 //! The logic in each input handler is the **verbatim** logic that used to run
 //! inline in the matching reactor handler (`handle_block`'s body-acceptance tail,
 //! `apply_state_frontiers_changed`'s Sequencer half, `handle_chain_tip_reset`,
-//! `handle_block_apply_finished`); only its location and the budget/work/actions
+//! and apply-completion handling); only its location and the budget/work/actions
 //! handles it uses move here. See the  "Sequencer task".
 
 use super::{
@@ -23,12 +23,64 @@ use super::{
     work_queue::WorkQueue,
     *,
 };
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 
 /// How often the Sequencer task checks whether the byte budget is starving the
 /// commit-unblocking (lowest pending) height and sheds the speculative top of the
 /// reorder buffer to fund it. Bounds the recovery latency when no bodies are
 /// flowing to trigger the inline check (e.g. once outstanding requests drain).
 const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Maximum downloaded bodies handled in one fair-loop turn.
+///
+/// Body handling can drain/submit a large contiguous prefix, so one body per turn
+/// is enough to keep floor bodies moving without letting body traffic bury
+/// verifier completions and frontier/reset controls.
+const MAX_BODY_BATCH_PER_TURN: usize = 1;
+
+const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
+
+#[derive(Debug)]
+struct SubmittedBlockApply {
+    class: BlockApplyClass,
+    output: BlockApplyOutput,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CheckpointFrontierRefresh {
+    highest_sent: Option<block::Height>,
+    attempts_remaining: usize,
+    next_attempt_at: Option<tokio::time::Instant>,
+}
+
+impl CheckpointFrontierRefresh {
+    fn observe_checkpoint_commit(&mut self, highest_observed_at_apply: block::Height) {
+        self.highest_sent = Some(
+            self.highest_sent
+                .map(|height| height.max(highest_observed_at_apply))
+                .unwrap_or(highest_observed_at_apply),
+        );
+        self.attempts_remaining = CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS;
+        if self.next_attempt_at.is_none() {
+            self.next_attempt_at =
+                Some(tokio::time::Instant::now() + CHECKPOINT_FRONTIER_REFRESH_INTERVAL);
+        }
+    }
+
+    fn next_attempt_at(&self) -> Option<tokio::time::Instant> {
+        (self.attempts_remaining > 0)
+            .then_some(self.next_attempt_at)
+            .flatten()
+    }
+
+    fn finish_attempt(&mut self, highest_sent: block::Height) {
+        self.highest_sent = Some(highest_sent);
+        self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
+        self.next_attempt_at = (self.attempts_remaining > 0)
+            .then_some(tokio::time::Instant::now() + CHECKPOINT_FRONTIER_REFRESH_INTERVAL);
+    }
+}
 
 /// Favor the lowest needed height over the speculative high tail.
 ///
@@ -105,12 +157,12 @@ pub(super) struct SequencedBody {
     pub(super) received_at: Instant,
 }
 
-/// Progress-critical Sequencer events forwarded by the reactor.
+/// Rare external Sequencer events forwarded by the reactor.
 ///
-/// These events must not sit behind downloaded bodies. `ApplyFinished` releases
-/// budget and verifier slots, and frontier/reset events can release or discard
-/// stale body work. They are locally generated and tiny, so they use a separate
-/// unbounded channel and are prioritized by the Sequencer task.
+/// These events must not sit behind downloaded bodies. Frontier/reset events can
+/// release or discard stale body work, and floor-funding requests synchronously
+/// pop speculative tail bodies. They are locally generated and tiny, so they use
+/// a separate unbounded channel.
 #[derive(Debug)]
 pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
@@ -131,14 +183,6 @@ pub(super) enum SequencerControlInput {
         /// `peers.any(outstanding.expected_hash(tip) is Some(h) && h != hash)` —
         /// the peer-outstanding clause of `reset_tip_conflicts_with_local_work`.
         peer_outstanding_conflicts_at_tip: bool,
-    },
-    /// A verifier apply completion.
-    ApplyFinished {
-        token: BlockApplyToken,
-        height: block::Height,
-        hash: block::Hash,
-        result: BlockApplyResult,
-        local_frontier: Option<BlockSyncFrontiers>,
     },
     /// Synchronously pop the speculative high tail until a floor request can
     /// reserve `needed_bytes`, then wake the requester to retry the reservation.
@@ -165,7 +209,7 @@ pub(super) struct SequencerView {
     /// body). The reactor runs its heavy serving/producer/schedule reaction only
     /// when this advances, mirroring the single-task version where a pure body
     /// buffer/submit reran nothing but the forwarding peer's reschedule, while a
-    /// frontier advance, reset, or apply-finished always reran query/schedule.
+    /// frontier advance, reset, or apply completion always reran query/schedule.
     pub(super) reaction_epoch: u64,
     pub(super) reorder_len: u64,
     pub(super) applying_len: u64,
@@ -201,8 +245,9 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
 /// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
-/// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
-/// `Misbehavior` on the same action channel the reactor uses.
+/// committed throughput meter. Releases bytes directly, drives verifier applies
+/// through the installed executor, and emits `Misbehavior` on the same action
+/// channel the reactor uses.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
     budget: ByteBudget,
@@ -217,6 +262,12 @@ pub(super) struct SequencerTask {
     reaction_epoch: u64,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+    apply_executor_rx: watch::Receiver<Option<BlockApplyExecutorPort>>,
+    apply_executor: Option<BlockApplyExecutorPort>,
+    in_flight_applies: FuturesUnordered<BoxFuture<'static, SubmittedBlockApply>>,
+    checkpoint_in_flight: usize,
+    full_in_flight: usize,
+    checkpoint_frontier_refresh: CheckpointFrontierRefresh,
     body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
@@ -234,6 +285,7 @@ impl SequencerTask {
         frontiers: BlockSyncFrontiers,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+        apply_executor_rx: watch::Receiver<Option<BlockApplyExecutorPort>>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
@@ -251,6 +303,12 @@ impl SequencerTask {
             reaction_epoch: 0,
             body_input_rx,
             control_input_rx,
+            apply_executor_rx,
+            apply_executor: None,
+            in_flight_applies: FuturesUnordered::new(),
+            checkpoint_in_flight: 0,
+            full_in_flight: 0,
+            checkpoint_frontier_refresh: CheckpointFrontierRefresh::default(),
             body_input_bytes,
             view_tx,
             action_send_timeout,
@@ -260,50 +318,94 @@ impl SequencerTask {
 
     pub(super) async fn run(mut self) {
         // Periodic shed backstop: catches budget starvation of the floor even when
-        // no bodies/control events are arriving to trigger the inline checks.
+        // no sequencer inputs are arriving to trigger the inline checks.
         let mut shed_tick = tokio::time::interval(FLOOR_STARVATION_SHED_INTERVAL);
         shed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.install_apply_executor_if_ready().await;
         // Track input closure explicitly: the always-ready shed timer means the
         // `select!` never falls through to an `else`, so shut down only once both
         // input channels have closed.
         let mut control_open = true;
         let mut body_open = true;
+        let mut apply_executor_open = true;
         loop {
-            if !control_open && !body_open {
+            if !control_open && !body_open && self.in_flight_applies.is_empty() {
                 break;
             }
-            tokio::select! {
-                biased;
 
+            let mut progressed = false;
+
+            if control_open {
+                match self.control_input_rx.try_recv() {
+                    Ok(input) => {
+                        progressed = true;
+                        self.process_control_input(input).await;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        control_open = false;
+                    }
+                }
+            }
+
+            if body_open {
+                for _ in 0..MAX_BODY_BATCH_PER_TURN {
+                    match self.body_input_rx.try_recv() {
+                        Ok(body) => {
+                            progressed = true;
+                            self.process_body_input(body).await;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            body_open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if self.refresh_due() {
+                progressed = true;
+                self.process_checkpoint_refresh().await;
+            }
+
+            if progressed {
+                continue;
+            }
+
+            tokio::select! {
                 input = self.control_input_rx.recv(), if control_open => {
                     match input {
-                        Some(input) => {
-                            let needs_reaction = self.handle_control_input(input).await;
-                            if needs_reaction {
-                                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
-                            }
-                            self.publish_view();
-                        }
+                        Some(input) => self.process_control_input(input).await,
                         None => control_open = false,
                     }
                 }
-
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
-                        Some(body) => {
-                            self.release_body_input_bytes(body.bytes);
-                            self.handle_accept_body(body).await;
-                            shed_top_for_floor_starvation(
-                                &mut self.budget,
-                                &self.work,
-                                &mut self.sequencer,
-                            );
-                            self.publish_view();
-                        }
+                        Some(body) => self.process_body_input(body).await,
                         None => body_open = false,
                     }
                 }
-
+                completed = self.in_flight_applies.next(), if !self.in_flight_applies.is_empty() => {
+                    if let Some(completed) = completed {
+                        self.process_apply_completion(completed).await;
+                    }
+                }
+                changed = self.apply_executor_rx.changed(), if apply_executor_open && self.should_watch_apply_executor() => {
+                    if changed.is_ok() {
+                        self.install_apply_executor_if_ready().await;
+                    } else {
+                        apply_executor_open = false;
+                    }
+                }
+                _ = async {
+                    match self.checkpoint_frontier_refresh.next_attempt_at() {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.checkpoint_frontier_refresh.next_attempt_at().is_some() => {
+                    self.process_checkpoint_refresh().await;
+                }
                 _ = shed_tick.tick() => {
                     if shed_top_for_floor_starvation(
                         &mut self.budget,
@@ -315,6 +417,84 @@ impl SequencerTask {
                 }
             }
         }
+    }
+
+    fn refresh_due(&self) -> bool {
+        self.checkpoint_frontier_refresh
+            .next_attempt_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    }
+
+    async fn install_apply_executor_if_ready(&mut self) {
+        if self.should_replace_apply_executor() {
+            self.apply_executor = self.apply_executor_rx.borrow().clone();
+        }
+        self.submit_pending_blocks().await;
+        self.publish_view();
+    }
+
+    fn should_watch_apply_executor(&self) -> bool {
+        self.apply_executor.is_none() || cfg!(test)
+    }
+
+    fn should_replace_apply_executor(&self) -> bool {
+        self.apply_executor.is_none() || cfg!(test)
+    }
+
+    async fn process_control_input(&mut self, input: SequencerControlInput) {
+        let needs_reaction = self.handle_control_input(input).await;
+        if needs_reaction {
+            self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+        }
+        self.publish_view();
+    }
+
+    async fn process_body_input(&mut self, body: SequencedBody) {
+        self.release_body_input_bytes(body.bytes);
+        self.handle_accept_body(body).await;
+        shed_top_for_floor_starvation(&mut self.budget, &self.work, &mut self.sequencer);
+        self.publish_view();
+    }
+
+    async fn process_apply_completion(&mut self, completed: SubmittedBlockApply) {
+        self.decrement_in_flight_apply_count(completed.class);
+        self.observe_apply_completion(completed.class, completed.output);
+        let needs_reaction = self
+            .handle_apply_finished(
+                completed.output.token,
+                completed.output.height,
+                completed.output.hash,
+                completed.output.result,
+                completed.output.local_frontier,
+            )
+            .await;
+        if needs_reaction {
+            self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+        }
+        self.publish_view();
+    }
+
+    async fn process_checkpoint_refresh(&mut self) {
+        let Some(executor) = self.apply_executor.clone() else {
+            return;
+        };
+        let Some(highest_sent) = self.checkpoint_frontier_refresh.highest_sent else {
+            return;
+        };
+        let attempts_remaining = self.checkpoint_frontier_refresh.attempts_remaining;
+        let frontiers = executor
+            .refresh_checkpoint_frontier(highest_sent, attempts_remaining)
+            .await;
+        let next_highest_sent = frontiers
+            .map(|frontiers| frontiers.verified_block_tip)
+            .unwrap_or(highest_sent);
+        self.checkpoint_frontier_refresh
+            .finish_attempt(next_highest_sent);
+        if let Some(frontiers) = frontiers {
+            self.handle_frontier_advance(frontiers, true).await;
+            self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+        }
+        self.publish_view();
     }
 
     async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
@@ -346,16 +526,6 @@ impl SequencerTask {
                 )
                 .await;
                 true
-            }
-            SequencerControlInput::ApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                self.handle_apply_finished(token, height, hash, result, local_frontier)
-                    .await
             }
             SequencerControlInput::FundFloorReservation {
                 needed_bytes,
@@ -513,10 +683,10 @@ impl SequencerTask {
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Verbatim from `handle_block_apply_finished` (1443-1540), minus the
-    /// reactor-side serving/query/schedule/status tail (which the view reaction
-    /// runs). The embedded `local_frontier` advance is folded in as a frontier
-    /// advance with `release_applied: false`.
+    /// Apply-completion bookkeeping, minus the reactor-side serving/query/
+    /// schedule/status tail (which the view reaction runs). The embedded
+    /// `local_frontier` advance is folded in as a frontier advance with
+    /// `release_applied: false`.
     async fn handle_apply_finished(
         &mut self,
         token: BlockApplyToken,
@@ -592,10 +762,14 @@ impl SequencerTask {
                 // scored and eventually disconnected. `TimedOut` is a local apply
                 // timeout, not a peer fault, so it is not scored.
                 if matches!(result, BlockApplyResult::Rejected) {
-                    self.send_action(BlockSyncAction::Misbehavior {
-                        peer: applying.source_peer.clone(),
-                        reason: BlockSyncMisbehavior::InvalidBlock,
-                    })
+                    Self::send_action(
+                        self.actions.clone(),
+                        self.action_send_timeout,
+                        BlockSyncAction::Misbehavior {
+                            peer: applying.source_peer.clone(),
+                            reason: BlockSyncMisbehavior::InvalidBlock,
+                        },
+                    )
                     .await;
                 }
             }
@@ -620,25 +794,99 @@ impl SequencerTask {
     }
 
     async fn submit_pending_blocks(&mut self) {
+        let Some(executor) = self.apply_executor.clone() else {
+            return;
+        };
+        let limits = executor.limits();
         for height in self.sequencer.submittable_heights() {
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };
+            let class = executor.block_apply_class(item.block.as_ref());
+            if !self.can_submit_class(class, limits) {
+                self.sequencer.unsubmit(item.height, item.token);
+                continue;
+            }
 
             metrics::counter!("sync.block.submit.sent").increment(1);
-            if !self
-                .send_action(BlockSyncAction::SubmitBlock {
-                    token: item.token,
-                    block: item.block,
-                })
-                .await
-            {
-                self.sequencer.unsubmit(item.height, item.token);
-                return;
-            }
+            self.increment_in_flight_apply_count(class);
             self.sequencer
                 .record_submitted_apply(item.height, item.hash);
             self.trace_body_submitted(item.height, item.token);
+            #[cfg(test)]
+            {
+                let _ = self.actions.try_send(BlockSyncAction::ApplySubmitted {
+                    token: item.token,
+                    block: item.block.clone(),
+                });
+            }
+            let apply = executor.apply(BlockApplyRequest {
+                token: item.token,
+                block: item.block,
+            });
+            self.in_flight_applies.push(
+                async move {
+                    let output = apply.await;
+                    SubmittedBlockApply { class, output }
+                }
+                .boxed(),
+            );
+        }
+    }
+
+    fn can_submit_class(&self, class: BlockApplyClass, limits: BlockApplyLimits) -> bool {
+        // The checkpoint verifier can hold a complete range until its checkpoint is
+        // reached. Keep room for the current range and the next complete range.
+        let checkpoint_pipeline_apply_limit = limits.checkpoint_apply_limit.saturating_mul(2);
+        let checkpoint_combined_apply_limit = limits
+            .combined_apply_limit
+            .max(checkpoint_pipeline_apply_limit);
+        match class {
+            BlockApplyClass::Checkpoint => {
+                self.checkpoint_in_flight
+                    .saturating_add(self.full_in_flight)
+                    < checkpoint_combined_apply_limit
+                    && self.checkpoint_in_flight < checkpoint_pipeline_apply_limit
+            }
+            BlockApplyClass::Full => {
+                self.checkpoint_in_flight
+                    .saturating_add(self.full_in_flight)
+                    < limits.combined_apply_limit
+                    && self.full_in_flight < limits.full_apply_limit
+            }
+        }
+    }
+
+    fn increment_in_flight_apply_count(&mut self, class: BlockApplyClass) {
+        match class {
+            BlockApplyClass::Checkpoint => {
+                self.checkpoint_in_flight = self.checkpoint_in_flight.saturating_add(1);
+            }
+            BlockApplyClass::Full => {
+                self.full_in_flight = self.full_in_flight.saturating_add(1);
+            }
+        }
+    }
+
+    fn decrement_in_flight_apply_count(&mut self, class: BlockApplyClass) {
+        match class {
+            BlockApplyClass::Checkpoint => {
+                self.checkpoint_in_flight = self.checkpoint_in_flight.saturating_sub(1);
+            }
+            BlockApplyClass::Full => {
+                self.full_in_flight = self.full_in_flight.saturating_sub(1);
+            }
+        }
+    }
+
+    fn observe_apply_completion(&mut self, class: BlockApplyClass, output: BlockApplyOutput) {
+        if class == BlockApplyClass::Checkpoint && output.result == BlockApplyResult::Committed {
+            let highest_observed_at_apply = output
+                .local_frontier
+                .map(|frontiers| frontiers.verified_block_tip)
+                .unwrap_or_else(|| output.height.previous().unwrap_or(output.height));
+            self.checkpoint_frontier_refresh
+                .observe_checkpoint_commit(highest_observed_at_apply);
         }
     }
 
@@ -735,12 +983,12 @@ impl SequencerTask {
             .unwrap_or(true)
     }
 
-    async fn send_action(&self, action: BlockSyncAction) -> bool {
-        // `SubmitBlock` is the intended verifier-backpressure point: a slow
-        // verifier blocks the task here, stopping it from draining `input`. The
-        // timeout matches the reactor's `dispatch_action` so a permanently
-        // stalled driver does not wedge the pipeline forever.
-        match time::timeout(self.action_send_timeout, self.actions.send(action)).await {
+    async fn send_action(
+        actions: mpsc::Sender<BlockSyncAction>,
+        action_send_timeout: Duration,
+        action: BlockSyncAction,
+    ) -> bool {
+        match time::timeout(action_send_timeout, actions.send(action)).await {
             Ok(Ok(())) => true,
             Ok(Err(_)) => false,
             Err(_) => {
