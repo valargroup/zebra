@@ -1814,7 +1814,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::SaplingTree(hash_or_height) => {
-                if state.db.fast_synced_tree_unavailable(hash_or_height) {
+                if state.db.vct_historical_tree_unavailable(hash_or_height) {
                     return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
                 }
                 Ok(ReadResponse::SaplingTree(read::sapling_tree(
@@ -1825,7 +1825,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::OrchardTree(hash_or_height) => {
-                if state.db.fast_synced_tree_unavailable(hash_or_height) {
+                if state.db.vct_historical_tree_unavailable(hash_or_height) {
                     return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
                 }
                 Ok(ReadResponse::OrchardTree(read::orchard_tree(
