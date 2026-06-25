@@ -1427,7 +1427,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
         MAX_HS_RANGE,
         &network,
         LOCAL_MAX_MESSAGE_BYTES,
-        false,
+        true,
     );
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -1462,7 +1462,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
         } = action
         {
@@ -1495,7 +1495,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1589,6 +1589,96 @@ async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
+    let network = Parameters::build()
+        .with_network_name("HeadersyncRootWindowTest")
+        .expect("custom network name is valid")
+        .with_genesis_hash(Network::Mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(4),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), Network::Mainnet.genesis_hash()),
+            (block::Height(400), block::Hash([4; 32])),
+            (block::Height(1_200), block::Hash([12; 32])),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let first_checkpoint = block::Height(400);
+    let first_checkpoint_hash = block::Hash([4; 32]);
+    let mut capture =
+        TraceCapture::for_test("forward_ranges_below_checkpoint_handoff_request_tree_aux_roots")
+            .unwrap();
+    let mut startup = startup_for(
+        network,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some((first_checkpoint, first_checkpoint_hash)),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(77);
+
+    connect_peer(&fixture, peer_id).await;
+    advertise_tip(
+        &fixture,
+        peer(77),
+        block::Height(0),
+        block::Height(1_000),
+        DEFAULT_HS_RANGE,
+        10,
+    )
+    .await;
+
+    loop {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    want_tree_aux_roots,
+                },
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(401));
+            assert_eq!(count, 600);
+            assert!(
+                want_tree_aux_roots,
+                "header ranges below the checkpoint handoff should carry roots"
+            );
+            break;
+        }
+    }
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    reader.table(HEADER_SYNC_TABLE.table()).assert_row(
+        hs_trace::HEADER_GET_HEADERS_SENT,
+        &[
+            (hs_trace::RANGE_START, TraceValue::U64(401)),
+            (hs_trace::RANGE_COUNT, TraceValue::U64(600)),
+            (hs_trace::FINALIZED, TraceValue::Bool(false)),
+            (hs_trace::WANT_TREE_AUX_ROOTS, TraceValue::Bool(true)),
+            (hs_trace::RANGE_PRIORITY, TraceValue::Str("forward")),
+            (hs_trace::VERIFIED_BLOCK_TIP, TraceValue::U64(0)),
+            (hs_trace::FINALIZED_HEIGHT, TraceValue::U64(0)),
+            (hs_trace::BEST_HEADER_TIP, TraceValue::U64(400)),
+        ],
+    );
+
+    let _ = capture.finish().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn incoming_headers_match_outstanding_before_commit() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
@@ -1640,7 +1730,7 @@ async fn incoming_headers_match_outstanding_before_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn non_finalized_response_carrying_tree_aux_roots_is_malformed() {
+async fn unrequested_response_carrying_tree_aux_roots_is_malformed() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let first_checkpoint = block::Height(3);
@@ -1669,9 +1759,9 @@ async fn non_finalized_response_carrying_tree_aux_roots_is_malformed() {
         }
     }
 
-    // The range above the checkpoint is non-finalized, so the request did not
-    // ask for roots. A peer that volunteers roots anyway is reported as
-    // MalformedMessage and the range is retried rather than committed.
+    // This network's checkpoint handoff is the first checkpoint, so the range
+    // does not ask for roots. A peer that volunteers roots anyway is reported
+    // as MalformedMessage and the range is retried rather than committed.
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
@@ -1689,7 +1779,7 @@ async fn non_finalized_response_carrying_tree_aux_roots_is_malformed() {
                 break;
             }
             HeaderSyncAction::CommitHeaderRange { .. } => {
-                panic!("a roots-bearing non-finalized response must not commit")
+                panic!("an unrequested roots-bearing response must not commit")
             }
             _ => {}
         }
