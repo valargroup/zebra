@@ -119,7 +119,16 @@ impl Arbitrary for Flags {
     type Parameters = ();
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (any::<u8>()).prop_map(Self::from_bits_truncate).boxed()
+        (any::<bool>(), any::<bool>())
+            .prop_map(|(enable_spends, enable_outputs)| {
+                let mut flags = Self::empty();
+
+                flags.set(Self::ENABLE_SPENDS, enable_spends);
+                flags.set(Self::ENABLE_OUTPUTS, enable_outputs);
+
+                flags
+            })
+            .boxed()
     }
 
     type Strategy = BoxedStrategy<Self>;
