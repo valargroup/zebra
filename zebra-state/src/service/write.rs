@@ -429,6 +429,11 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
+                        // No block waiting to be committed: the committer is starved
+                        // (download/verify is the gate, not the committer). The empty
+                        // fraction poll_empty/(poll_empty+poll_ready) is its idle time.
+                        #[cfg(feature = "commit-metrics")]
+                        metrics::counter!("zebra.committer.poll_empty").increment(1);
                         std::thread::park_timeout(Duration::from_millis(10));
                         continue;
                     }
@@ -558,13 +563,31 @@ impl WriteBlockWorkerTask {
                 metrics::counter!("state.vct.fast_path.miss").increment(1);
             }
 
-            // Try committing the block
-            match finalized_state.commit_finalized(
+            // Committer input backlog: blocks already verified and waiting on the
+            // serial committer. A persistently high depth means the committer is the
+            // binding stage; a depth near zero (with high poll_empty) means it keeps up.
+            #[cfg(feature = "commit-metrics")]
+            {
+                metrics::counter!("zebra.committer.poll_ready").increment(1);
+                metrics::gauge!("zebra.committer.input_queue_depth")
+                    .set((finalized_block_write_receiver.len() + finalized_lookahead.len()) as f64);
+            }
+
+            // Try committing the block. The wall time spent here is the committer's
+            // busy time; summed and divided by elapsed wall it gives the committer
+            // utilization (busy fraction), the decisive gate-vs-starved signal.
+            #[cfg(feature = "commit-metrics")]
+            let _commit_busy_start = std::time::Instant::now();
+            let commit_result = finalized_state.commit_finalized(
                 ordered_block,
                 prev_note_commitment_trees,
                 note_precompute,
                 next_checkpoint,
-            ) {
+            );
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.committer.commit.duration_seconds")
+                .record(_commit_busy_start.elapsed().as_secs_f64());
+            match commit_result {
                 Ok((finalized, note_commitment_trees)) => {
                     // A successful commit clears any VCT root stall: log recovery and reset
                     // the stalled-height gauge if it had been raised.

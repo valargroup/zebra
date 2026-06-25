@@ -47,7 +47,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, VCT_SYNC_METADATA, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA,
         ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     },
     HashOrHeight,
@@ -917,6 +917,13 @@ impl ZebraDb {
         // When `Some(height)`, mark the database as vct-synced.
         vct_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        // Total wall time of the committer's DB stage (reads + batch build + write),
+        // and a sub-timer for the read-bound prep that precedes the write batch.
+        #[cfg(feature = "commit-metrics")]
+        let _write_block_start = std::time::Instant::now();
+        #[cfg(feature = "commit-metrics")]
+        let _prep_reads_start = std::time::Instant::now();
+
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1082,6 +1089,14 @@ impl ZebraDb {
             }))
         };
 
+        // Read-bound prep (spent-UTXO/address lookups + index building) is done; the
+        // rest of the stage is CPU-bound batch building plus the atomic write.
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.prep_reads.duration_seconds")
+            .record(_prep_reads_start.elapsed().as_secs_f64());
+
+        #[cfg(feature = "commit-metrics")]
+        let _batch_prep_start = std::time::Instant::now();
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1111,6 +1126,11 @@ impl ZebraDb {
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
 
+        // CPU-bound batch building (serialization + index updates) is done.
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.batch_prep.duration_seconds")
+            .record(_batch_prep_start.elapsed().as_secs_f64());
+
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db
@@ -1118,6 +1138,10 @@ impl ZebraDb {
             .expect("unexpected rocksdb error while writing block");
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
+
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.write_block_total.duration_seconds")
+            .record(_write_block_start.elapsed().as_secs_f64());
 
         tracing::trace!(?source, "committed block from");
 

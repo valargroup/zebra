@@ -774,6 +774,11 @@ impl FinalizedState {
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        // Sub-phase: all setup before the compute scope (the FinalizableBlock match,
+        // treestate read, VCT fast_root/handoff resolution). `tip_trees_read` is a
+        // component of this; recorded at the legacy-path entry below.
+        #[cfg(feature = "commit-metrics")]
+        let _prep_start = std::time::Instant::now();
         let (
             height,
             hash,
@@ -797,17 +802,27 @@ impl FinalizedState {
                 // so the commitment check below doesn't recompute it here on the
                 // single-threaded committer. `AuthDataRoot` is `Copy`.
                 let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
+                // Sub-phase: read the parent treestate (history + note trees) from
+                // the DB/look-ahead and clone the note trees the committer mutates.
+                #[cfg(feature = "commit-metrics")]
+                let _tip_trees_start = std::time::Instant::now();
                 let mut history_tree = self.db.history_tree();
                 let prev_note_commitment_trees = prev_note_commitment_trees
                     .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
                 let mut note_commitment_trees = prev_note_commitment_trees.clone();
+                #[cfg(feature = "commit-metrics")]
+                metrics::histogram!("zebra.state.commit.tip_trees_read.duration_seconds")
+                    .record(_tip_trees_start.elapsed().as_secs_f64());
                 let network = self.network();
                 let height = checkpoint_verified.height;
 
                 // The last checkpoint height (boundary below which the vct
                 // path skips per-height trees), when final frontiers are loaded.
-                let vct_last_checkpoint_height = self.vct.as_ref().and_then(|v| v.vct_sync_last_checkpoint_height());
+                let vct_last_checkpoint_height = self
+                    .vct
+                    .as_ref()
+                    .and_then(|v| v.vct_sync_last_checkpoint_height());
 
                 // In vct mode, if the source has this height's roots at or below the
                 // last checkpoint height, skip the per-block note-commitment frontier recompute
@@ -816,7 +831,9 @@ impl FinalizedState {
                 // parent frontier; nothing below the checkpoint reads it for consensus.
                 // See docs/design/verified-commitment-trees.md.
                 let vct_roots = self.vct.as_ref().and_then(|v| {
-                    if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| height > last_checkpoint_height) {
+                    if vct_last_checkpoint_height
+                        .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
+                    {
                         None
                     } else {
                         v.vct_roots_at_height(height)
@@ -987,6 +1004,9 @@ impl FinalizedState {
                     // (the legacy path) — either VCT is off, or the fast path's roots were
                     // unavailable for this height and it safely fell back.
                     metrics::counter!("state.vct.legacy.block.count").increment(1);
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.commit.prep.duration_seconds")
+                        .record(_prep_start.elapsed().as_secs_f64());
 
                     // Legacy / capture path: recompute the note-commitment frontier.
                     //
@@ -1035,6 +1055,10 @@ impl FinalizedState {
                     commitment_result.expect("scope has already finished")?;
 
                     // Update the history tree (depends on both operations above).
+                    // Sub-phase: includes computing the Sapling/Orchard roots and the
+                    // history-MMR push — the largest committer cost after note_tree.
+                    #[cfg(feature = "commit-metrics")]
+                    let _history_push_start = std::time::Instant::now();
                     let history_tree_mut = Arc::make_mut(&mut history_tree);
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
@@ -1042,6 +1066,9 @@ impl FinalizedState {
                         .push(&network, block.clone(), &sapling_root, &orchard_root)
                         .map_err(Arc::new)
                         .map_err(ValidateContextError::from)?;
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.commit.history_push.duration_seconds")
+                        .record(_history_push_start.elapsed().as_secs_f64());
 
                     #[cfg(feature = "commit-metrics")]
                     metrics::histogram!("zebra.state.write.checkpoint_compute.duration_seconds")
@@ -1112,7 +1139,14 @@ impl FinalizedState {
 
         #[cfg(feature = "elasticsearch")]
         let finalized_inner_block = finalized.block.clone();
+        // Sub-phase: clone the post-block note trees returned to the committer loop
+        // (full Sapling/Orchard/Sprout frontiers).
+        #[cfg(feature = "commit-metrics")]
+        let _result_clone_start = std::time::Instant::now();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.commit.result_trees_clone.duration_seconds")
+            .record(_result_clone_start.elapsed().as_secs_f64());
 
         // Run `write_block` directly on the committer thread rather than entering the
         // dedicated commit-compute pool via `install()`.
@@ -1126,6 +1160,12 @@ impl FinalizedState {
         // `write_block` here removes the per-block round-trip; its internal rayon uses
         // the global pool instead. Measured net win on the sandblast region (see PR).
         let network = self.network();
+        // Committer-side wall of the (now direct, post-PR) write_block call. With the
+        // pool install removed, this should track write_block_total closely, so the
+        // analyzer's `install_overhead` (write_block_install - write_block_total) reads
+        // ~0 — confirming the double-install #2 is gone on this branch.
+        #[cfg(feature = "commit-metrics")]
+        let _wbi_start = std::time::Instant::now();
         let result = self.db.write_block(
             finalized,
             prev_note_commitment_trees,
@@ -1135,7 +1175,12 @@ impl FinalizedState {
             fast_anchor_roots,
             fast_sync_below,
         );
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.commit.write_block_install.duration_seconds")
+            .record(_wbi_start.elapsed().as_secs_f64());
 
+        #[cfg(feature = "commit-metrics")]
+        let _post_start = std::time::Instant::now();
         if result.is_ok() {
             if let Some(vct) = &self.vct {
                 vct.evict_committed_roots_through(height);
@@ -1173,6 +1218,11 @@ impl FinalizedState {
                 Self::exit_process();
             }
         }
+
+        // Sub-phase: post-write bookkeeping (VCT root eviction, stop-height check).
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.commit.post.duration_seconds")
+            .record(_post_start.elapsed().as_secs_f64());
 
         result.map(|hash| (hash, note_commitment_trees))
     }

@@ -748,7 +748,8 @@ where
         .clone()
         .oneshot(zebra_consensus::Request::Commit(block));
 
-    match class {
+    let started = Instant::now();
+    let result = match class {
         BlockApplyClass::Checkpoint => {
             tokio::pin!(commit);
             tokio::select! {
@@ -780,7 +781,14 @@ where
                 Err(_elapsed) => block_commit_timed_out(Some(height), expected_hash),
             }
         }
-    }
+    };
+    metrics::histogram!(
+        "sync.block.apply.commit_seconds",
+        "class" => block_apply_class_label(class),
+        "result" => block_apply_result_label(result),
+    )
+    .record(started.elapsed().as_secs_f64());
+    result
 }
 
 fn block_commit_result<E>(

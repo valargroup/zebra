@@ -636,6 +636,9 @@ where
         height: block::Height,
         hash: block::Hash,
     ) -> Result<(), VerifyCheckpointError> {
+        // Verifier-CPU signal: difficulty + equihash are the dominant per-block
+        // proof-of-work cost on the single-threaded checkpoint verifier.
+        let _pow_start = std::time::Instant::now();
         if self.network.disable_pow() {
             crate::block::check::difficulty_threshold_is_valid(
                 header,
@@ -647,6 +650,8 @@ where
             crate::block::check::difficulty_is_valid(header, &self.network, &height, &hash)?;
             crate::block::check::equihash_solution_is_valid(header)?;
         }
+        metrics::histogram!("zebra.feed.equihash_pow.duration_seconds")
+            .record(_pow_start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -671,11 +676,15 @@ where
                 .map(DeferredPoolBalanceChange::new),
         );
 
+        // Verifier-CPU signal: Merkle root recomputation over the block's txids.
+        let _merkle_start = std::time::Instant::now();
         crate::block::check::merkle_root_validity(
             &self.network,
             &block.block,
             &block.transaction_hashes,
         )?;
+        metrics::histogram!("zebra.feed.merkle_root.duration_seconds")
+            .record(_merkle_start.elapsed().as_secs_f64());
 
         Ok(block)
     }
@@ -841,20 +850,26 @@ where
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
+            let verify_wait_started = std::time::Instant::now();
             let hash = req_block
                 .rx
                 .await
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
+            metrics::histogram!("checkpoint.verify_wait.duration_seconds")
+                .record(verify_wait_started.elapsed().as_secs_f64());
 
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.
-            match state_service
+            let state_commit_started = std::time::Instant::now();
+            let response = state_service
                 .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
-            {
+                .await?;
+            metrics::histogram!("checkpoint.state_commit.duration_seconds")
+                .record(state_commit_started.elapsed().as_secs_f64());
+            match response {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
                     Ok(hash)
@@ -976,6 +991,7 @@ where
         //   - cache the height of the last continuous chain as a new field in
         //     self, and start at that height during the next check.
 
+        let started = std::time::Instant::now();
         // Return early if verification has finished
         let previous_checkpoint_hash = match self.previous_checkpoint_hash() {
             // Since genesis blocks are hard-coded in zcashd, and not verified
@@ -1082,6 +1098,9 @@ where
         let block_count = rev_valid_blocks.len();
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
         metrics::counter!("checkpoint.verified.block.count").increment(block_count as u64);
+        metrics::histogram!("checkpoint.range.process.duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        metrics::histogram!("checkpoint.range.process.blocks").record(block_count as f64);
 
         // All the blocks we've kept are valid, so let's verify them
         // in height order.

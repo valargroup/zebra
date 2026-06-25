@@ -327,7 +327,12 @@ fn next_fetch_window(
         return None;
     }
 
-    let window_end = fetch_window_end(from, last_checkpoint_height, committed_through, fetch_ahead_roots);
+    let window_end = fetch_window_end(
+        from,
+        last_checkpoint_height,
+        committed_through,
+        fetch_ahead_roots,
+    );
     (next_fetch <= window_end).then_some((next_fetch, window_end))
 }
 

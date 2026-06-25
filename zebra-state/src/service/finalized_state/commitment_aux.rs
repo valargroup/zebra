@@ -274,10 +274,8 @@ impl FinalFrontiers {
 /// whether supplied roots must be confirmed by a buffered successor before commit.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
-    fn vct_root(
-        &self,
-        height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)>;
+    fn vct_root(&self, height: block::Height)
+        -> Option<(sapling::tree::Root, orchard::tree::Root)>;
 
     /// The checkpoint handoff height (below which the vct path skips per-height
     /// trees), if this source supplies a final frontier.

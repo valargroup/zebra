@@ -22,6 +22,10 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Benchmark-only: per-block verifier-CPU phase histograms (proof-of-work, Merkle
+# root). Off in production; enabled by the workspace `commit-metrics` feature.
+commit-metrics = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [
