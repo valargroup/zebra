@@ -1,0 +1,18 @@
+# Rendered by deploy/deployer/deploy.py — do not edit on the node by hand.
+# Placeholders ({{NAME}}) are substituted at deploy time from the node config.
+
+[network]
+network = "{{NETWORK}}"
+listen_addr = "{{LISTEN_ADDR}}"
+
+[state]
+cache_dir = "{{STATE_CACHE_DIR}}"
+
+[rpc]
+{{RPC_BLOCK}}
+
+[tracing]
+# Deterministic log file: the deploy tool reads exactly this path for
+# `logs fetch` / `logs follow`, so writer and reader share one source of truth.
+log_file = "{{LOG_FILE}}"
+use_color = false
