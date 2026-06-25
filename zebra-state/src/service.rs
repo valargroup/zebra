@@ -1566,7 +1566,7 @@ impl Service<ReadRequest> for ReadStateService {
                     } else {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
                         let requested = start_height..=block::Height(last);
-                        
+
                         // Read verified per-block roots from the committed serving index first.
                         // This index is written for every committed block, including VCT fast-sync
                         // commits that do not store per-height note-commitment trees.
