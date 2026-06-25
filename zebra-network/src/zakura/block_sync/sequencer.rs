@@ -275,12 +275,6 @@ impl Sequencer {
     /// Drain the contiguous reorder prefix above the floor into `applying`,
     /// advancing the floor. Returns the newly-covered heights so the reactor
     /// marks them covered in the download scheduler.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
-        self.drain_ready_into_applying_limited(usize::MAX)
-    }
-
     /// Drain at most `limit` contiguous bodies into `applying`.
     ///
     /// The production Sequencer task uses this to keep the body-download floor

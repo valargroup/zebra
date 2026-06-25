@@ -2460,7 +2460,9 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(3), block.clone(), 300, peer(0)),
         ReorderInsertResult::Inserted
     );
-    assert!(reorder.drain_contiguous_prefix(block::Height(0)).is_empty());
+    assert!(reorder
+        .drain_contiguous_prefix_limited(block::Height(0), usize::MAX)
+        .is_empty());
     assert_eq!(reorder.buffered_bytes(), 300);
     assert_eq!(budget.reserved(), 300);
 
@@ -2469,7 +2471,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(1), block.clone(), 100, peer(0)),
         ReorderInsertResult::Inserted
     );
-    let released = reorder.drain_contiguous_prefix(block::Height(0));
+    let released = reorder.drain_contiguous_prefix_limited(block::Height(0), usize::MAX);
     assert_eq!(
         released
             .iter()
@@ -2488,7 +2490,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(2), block.clone(), 200, peer(0)),
         ReorderInsertResult::Inserted
     );
-    let released = reorder.drain_contiguous_prefix(block::Height(1));
+    let released = reorder.drain_contiguous_prefix_limited(block::Height(1), usize::MAX);
     assert_eq!(
         released
             .iter()
@@ -2809,7 +2811,10 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     // Only the contiguous prefix above the floor (height 1) drains.
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.drain_ready_into_applying_limited(usize::MAX),
+        vec![block::Height(1)]
+    );
     assert_eq!(seq.floor(), block::Height(1));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.applying_len(), 1);
@@ -2822,7 +2827,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.drain_ready_into_applying_limited(usize::MAX),
         vec![block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.floor(), block::Height(3));
@@ -2866,7 +2871,7 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+    assert_eq!(seq.drain_ready_into_applying_limited(usize::MAX).len(), 3);
     // The submission window of 2 caps the eligible heights.
     assert_eq!(
         seq.submittable_heights(),
@@ -2906,7 +2911,7 @@ fn sequencer_release_applied_through_clears_submitted_records() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+    assert_eq!(seq.drain_ready_into_applying_limited(usize::MAX).len(), 3);
 
     let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
     let item2 = seq.prepare_submit(block::Height(2)).expect("applying at 2");
@@ -3367,7 +3372,7 @@ async fn checkpoint_refresh_reaped_commit_is_still_counted() {
                 "seeded checkpoint body buffers",
             );
         }
-        seq.drain_ready_into_applying();
+        seq.drain_ready_into_applying_limited(usize::MAX);
         for block in &blocks {
             let height = block.coinbase_height().expect("test block has height");
             let item = seq.prepare_submit(height).expect("applying height submits");
@@ -3827,7 +3832,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
         100,
         peer(0),
     );
-    seq.drain_ready_into_applying();
+    seq.drain_ready_into_applying_limited(usize::MAX);
     seq.accept_body(
         block::Height(2),
         blocks[1].hash(),
@@ -3853,7 +3858,7 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.drain_ready_into_applying_limited(usize::MAX);
     assert_eq!(seq.floor(), block::Height(3));
     // A reject at height 2 drops applying >= 2 (200 bytes) and rolls the floor
     // back below 2, never below the verified tip.
@@ -3891,7 +3896,8 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
                 reorder.insert(block::Height(height), block.clone(), 100, peer(0)),
                 ReorderInsertResult::Inserted
             );
-            for (released, _, bytes, _) in reorder.drain_contiguous_prefix(tip) {
+            for (released, _, bytes, _) in reorder.drain_contiguous_prefix_limited(tip, usize::MAX)
+            {
                 assert_eq!(released, block::Height(tip.0 + 1));
                 tip = released;
                 released_all.push(released);
@@ -4121,7 +4127,7 @@ proptest::proptest! {
                         AcceptOutcome::Buffered { .. } => {}
                         AcceptOutcome::Redundant { release_bytes } => budget.release(release_bytes),
                     }
-                    let _ = sequencer.drain_ready_into_applying();
+                    let _ = sequencer.drain_ready_into_applying_limited(usize::MAX);
                     next_accept = next_accept.saturating_add(1);
                 }
                 1 => {
@@ -4244,7 +4250,9 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
         // releases them.
         let mut floor = block::Height(0);
         let mut applied_bytes = 0;
-        for (_height, _block, bytes, _peer) in reorder.drain_contiguous_prefix(floor) {
+        for (_height, _block, bytes, _peer) in
+            reorder.drain_contiguous_prefix_limited(floor, usize::MAX)
+        {
             applied_bytes += bytes;
             floor = block::Height(floor.0 + 1);
         }

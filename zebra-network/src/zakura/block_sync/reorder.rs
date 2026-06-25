@@ -91,15 +91,6 @@ impl ReorderBuffer {
         ReorderInsertResult::Inserted
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn drain_contiguous_prefix(
-        &mut self,
-        verified_block_tip: block::Height,
-    ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
-        self.drain_contiguous_prefix_limited(verified_block_tip, usize::MAX)
-    }
-
     pub(super) fn drain_contiguous_prefix_limited(
         &mut self,
         verified_block_tip: block::Height,
