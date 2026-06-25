@@ -379,6 +379,9 @@ pub(super) struct SequencerView {
     pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
     pub(super) submitted_applying_bytes: u64,
+    pub(super) lowest_applying_height: Option<block::Height>,
+    pub(super) lowest_submitted_height: Option<block::Height>,
+    pub(super) commit_frontier_stall_seconds: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -399,6 +402,9 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
         submitted_applying_bytes: 0,
+        lowest_applying_height: None,
+        lowest_submitted_height: None,
+        commit_frontier_stall_seconds: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -435,6 +441,7 @@ pub(super) struct SequencerTask {
     trace: ZakuraTrace,
     next_ready_source: ReadySource,
     commit_progress: CommitProgress,
+    commit_frontier_since: Instant,
 }
 
 impl SequencerTask {
@@ -478,6 +485,7 @@ impl SequencerTask {
             trace,
             next_ready_source: ReadySource::Control,
             commit_progress: CommitProgress::new(Instant::now()),
+            commit_frontier_since: Instant::now(),
         }
     }
 
@@ -860,6 +868,7 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         self.budget.release(advance.release_bytes);
         if advance.changed {
+            self.commit_frontier_since = Instant::now();
             let released = self.work.advance_floor(frontiers.verified_block_tip);
             self.budget.release(released);
             self.release_contiguous_blocks().await;
@@ -938,6 +947,7 @@ impl SequencerTask {
             .sequencer
             .reset_to(frontiers.verified_block_tip, remember_released_applies);
         self.budget.release(released);
+        self.commit_frontier_since = Instant::now();
         // Drop every download work item above the reset target (their buffers
         // were cleared by `reset_to`); the reactor's `query_needed_blocks`
         // re-fills.
@@ -1053,7 +1063,13 @@ impl SequencerTask {
     /// Drain the contiguous reorder prefix into applying and submit (verbatim
     /// from `release_contiguous_blocks` + `submit_pending_blocks`).
     async fn release_contiguous_blocks(&mut self) {
-        let _ = self.sequencer.drain_ready_into_applying();
+        let capacity = self.sequencer.applying_capacity();
+        let covered = self.sequencer.drain_ready_into_applying_limited(capacity);
+        if capacity == 0 {
+            metrics::counter!("sync.block.apply_window.full").increment(1);
+        } else if covered.len() == capacity {
+            metrics::counter!("sync.block.apply_window.filled").increment(1);
+        }
         self.submit_pending_blocks().await;
     }
 
@@ -1363,7 +1379,8 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
-        self.committed_throughput.sample(Instant::now());
+        let now = Instant::now();
+        self.committed_throughput.sample(now);
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         let body_input_bytes = self
@@ -1391,6 +1408,11 @@ impl SequencerTask {
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
+            lowest_applying_height: self.sequencer.lowest_applying_height(),
+            lowest_submitted_height: self.sequencer.lowest_submitted_height(),
+            commit_frontier_stall_seconds: now
+                .saturating_duration_since(self.commit_frontier_since)
+                .as_secs(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         });

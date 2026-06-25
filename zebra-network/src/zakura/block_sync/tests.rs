@@ -2830,6 +2830,35 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
 }
 
 #[test]
+fn sequencer_limited_drain_keeps_download_floor_near_apply_window() {
+    let mut seq = test_sequencer(0, 2);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        seq.accept_body(
+            block::Height(index as u32 + 1),
+            block.hash(),
+            block.clone(),
+            100,
+            peer(0),
+        );
+    }
+
+    assert_eq!(
+        seq.drain_ready_into_applying_limited(seq.applying_capacity()),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert_eq!(seq.floor(), block::Height(2));
+    assert_eq!(seq.applying_len(), 2);
+    assert_eq!(seq.reorder_len(), 1);
+    assert!(seq.reorder_contains(block::Height(3)));
+
+    assert!(seq
+        .drain_ready_into_applying_limited(seq.applying_capacity())
+        .is_empty());
+    assert_eq!(seq.floor(), block::Height(2));
+}
+
+#[test]
 fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     let mut seq = test_sequencer(0, 2);
     let blocks = mainnet_blocks_1_to_3();
