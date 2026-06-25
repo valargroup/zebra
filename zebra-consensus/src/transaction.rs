@@ -395,11 +395,16 @@ where
         let mempool = self.mempool.clone();
 
         let tx = req.transaction();
-        let tx_id = req.tx_id();
-        let span = tracing::debug_span!("tx", ?tx_id);
+        // Use the mined transaction ID (already known for block requests) for
+        // tracing until the proof-size check runs. Computing the unmined ID
+        // for historical block transactions can route through
+        // `to_librustzcash`, which expects canonical Orchard proof sizes. The
+        // unmined ID is computed immediately after that check.
+        let tx_mined_id = req.tx_mined_id();
+        let span = tracing::debug_span!("tx", ?tx_mined_id);
 
         async move {
-            tracing::trace!(?tx_id, ?req, "got tx verify request");
+            tracing::trace!(?tx_mined_id, "got tx verify request");
 
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
@@ -435,13 +440,9 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
+
+            let tx_id = req.tx_id();
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -649,7 +650,7 @@ where
         }
             .inspect(move |result| {
                 // Hide the transaction data to avoid filling the logs
-                tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
+                tracing::trace!(?tx_mined_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })
             .instrument(span)
             .boxed()
