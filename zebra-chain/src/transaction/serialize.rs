@@ -365,6 +365,8 @@ fn deserialize_v5_sapling_shielded_data<R: io::Read>(
 }
 
 impl ZcashSerialize for Option<orchard::ShieldedData> {
+    /// Serializes Orchard shielded data using the pre-Ironwood Orchard flag
+    /// rules, where the cross-address bit is reserved.
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         serialize_optional_orchard_shielded_data_with_flags(
             self,
@@ -448,6 +450,8 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
 }
 
 impl ZcashSerialize for orchard::ShieldedData {
+    /// Serializes Orchard shielded data using the pre-Ironwood Orchard flag
+    /// rules, where the cross-address bit is reserved.
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
         serialize_orchard_shielded_data_with_flags(self, writer, !ALLOW_CROSS_ADDRESS_BIT)
     }
@@ -567,6 +571,8 @@ fn deserialize_orchard_flags<R: io::Read>(
 // we can't split ShieldedData out of Option<ShieldedData> deserialization,
 // because the counts are read along with the arrays.
 impl ZcashDeserialize for Option<orchard::ShieldedData> {
+    /// Deserializes Orchard shielded data using the pre-Ironwood Orchard flag
+    /// rules, where the cross-address bit is reserved.
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
         deserialize_orchard_shielded_data_with_flags(reader, !ALLOW_CROSS_ADDRESS_BIT)
     }
@@ -792,7 +798,11 @@ impl ZcashSerialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                orchard_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_orchard_shielded_data_with_flags(
+                    orchard_shielded_data,
+                    &mut writer,
+                    !ALLOW_CROSS_ADDRESS_BIT,
+                )?;
             }
 
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
@@ -1120,7 +1130,10 @@ impl ZcashDeserialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                let orchard_shielded_data = (&mut limited_reader).zcash_deserialize_into()?;
+                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
+                    &mut limited_reader,
+                    !ALLOW_CROSS_ADDRESS_BIT,
+                )?;
 
                 let tx = Transaction::V5 {
                     network_upgrade,
