@@ -130,6 +130,43 @@ fn headers_message_from(
     start_height: block::Height,
     headers: Vec<Arc<block::Header>>,
 ) -> HeaderSyncMessage {
+    // Non-finalized ranges never request tree-aux roots, so the common test
+    // builder omits them. The reactor rejects roots on a non-finalized range as
+    // `MalformedMessage`; finalized-range tests opt in via `finalized_*`.
+    let _ = start_height;
+    let body_sizes = vec![0; headers.len()];
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+        tree_aux_roots: Vec::new(),
+    }
+}
+
+fn headers_message_with_sizes(
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+) -> HeaderSyncMessage {
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+        tree_aux_roots: Vec::new(),
+    }
+}
+
+/// Finalized-range `Headers` carrying one tree-aux root per header, as a peer
+/// answering a `want_tree_aux_roots` request would send.
+fn finalized_headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+    let start_height = headers
+        .first()
+        .map(|header| test_header_height(header.as_ref()))
+        .unwrap_or(block::Height(1));
+    finalized_headers_message_from(start_height, headers)
+}
+
+fn finalized_headers_message_from(
+    start_height: block::Height,
+    headers: Vec<Arc<block::Header>>,
+) -> HeaderSyncMessage {
     let body_sizes = vec![0; headers.len()];
     let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
@@ -139,7 +176,7 @@ fn headers_message_from(
     }
 }
 
-fn headers_message_with_sizes(
+fn finalized_headers_message_with_sizes(
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
 ) -> HeaderSyncMessage {
@@ -209,6 +246,14 @@ async fn validate_headers_stateless_after_equihash_acceptance(
 fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
     HeaderSyncDecodeContext::for_headers_response(
         ExpectedHeadersResponse::new(block::Height(1), count, false).unwrap(),
+        peer_cap,
+    )
+}
+
+/// Decode context for a finalized-range response that requested tree-aux roots.
+fn finalized_headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
+    HeaderSyncDecodeContext::for_headers_response(
+        ExpectedHeadersResponse::new(block::Height(1), count, true).unwrap(),
         peer_cap,
     )
 }
@@ -872,10 +917,10 @@ fn codec_round_trips_get_headers() {
 #[test]
 fn codec_round_trips_headers_with_bounded_vector() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
-    let message = headers_message_with_sizes(headers, vec![123_456]);
+    let message = finalized_headers_message_with_sizes(headers, vec![123_456]);
 
     let encoded = message.encode().unwrap();
-    let decoded = HeaderSyncMessage::decode(&encoded, headers_context(1, 1)).unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)).unwrap();
 
     assert_eq!(decoded, message);
 }
@@ -883,12 +928,26 @@ fn codec_round_trips_headers_with_bounded_vector() {
 #[test]
 fn codec_round_trips_headers_with_unknown_body_size_sentinel() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
-    let message = headers_message_with_sizes(headers, vec![0]);
+    let message = finalized_headers_message_with_sizes(headers, vec![0]);
 
     let encoded = message.encode().unwrap();
-    let decoded = HeaderSyncMessage::decode(&encoded, headers_context(1, 1)).unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)).unwrap();
 
     assert_eq!(decoded, message);
+}
+
+#[test]
+fn decode_rejects_tree_aux_roots_when_not_requested() {
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    let message = finalized_headers_message_with_sizes(headers, vec![0]);
+    let encoded = message.encode().unwrap();
+
+    // A response carrying tree-aux roots against a request that did not ask for
+    // them (a non-finalized range) is rejected at decode before allocation.
+    assert!(matches!(
+        HeaderSyncMessage::decode(&encoded, headers_context(1, 1)),
+        Err(HeaderSyncWireError::UnrequestedTreeAuxRoots)
+    ));
 }
 
 #[test]
@@ -936,16 +995,18 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
         })
     ));
 
+    // Empty roots is the valid all-or-nothing "none" case; a non-empty count
+    // that disagrees with the header count is the rejection.
     assert!(matches!(
         HeaderSyncMessage::Headers {
             headers: headers.clone(),
             body_sizes: vec![100],
-            tree_aux_roots: Vec::new(),
+            tree_aux_roots: vec![root_at(block::Height(1)), root_at(block::Height(2))],
         }
         .encode(),
         Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
             headers: 1,
-            roots: 0,
+            roots: 2,
         })
     ));
 
@@ -992,6 +1053,7 @@ fn frame_decode_rejects_oversized_payload_length_before_allocating() {
 fn decode_rejects_header_counts_over_contract_caps() {
     let mut encoded = vec![MSG_HS_HEADERS];
     encoded.write_u32::<LittleEndian>(MAX_HS_RANGE + 1).unwrap();
+    encoded.write_u8(0).unwrap();
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, headers_context(MAX_HS_RANGE, MAX_HS_RANGE)),
         Err(HeaderSyncWireError::HeaderCountLimit { .. })
@@ -999,6 +1061,7 @@ fn decode_rejects_header_counts_over_contract_caps() {
 
     let mut encoded = vec![MSG_HS_HEADERS];
     encoded.write_u32::<LittleEndian>(2).unwrap();
+    encoded.write_u8(0).unwrap();
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, headers_context(1, MAX_HS_RANGE)),
         Err(HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 })
@@ -1006,6 +1069,7 @@ fn decode_rejects_header_counts_over_contract_caps() {
 
     let mut encoded = vec![MSG_HS_HEADERS];
     encoded.write_u32::<LittleEndian>(2).unwrap();
+    encoded.write_u8(0).unwrap();
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, headers_context(MAX_HS_RANGE, 1)),
         Err(HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 })
@@ -1016,10 +1080,10 @@ fn decode_rejects_header_counts_over_contract_caps() {
 fn headers_codec_does_not_use_legacy_160_header_cap() {
     let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
     let headers = vec![header; 161];
-    let message = headers_message(headers);
+    let message = finalized_headers_message(headers);
 
     let encoded = message.encode().unwrap();
-    let decoded = HeaderSyncMessage::decode(&encoded, headers_context(161, 161)).unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(161, 161)).unwrap();
 
     match decoded {
         HeaderSyncMessage::Headers {
@@ -1512,7 +1576,7 @@ async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1572,6 +1636,63 @@ async fn incoming_headers_match_outstanding_before_commit() {
             assert!(!finalized);
         }
         action => panic!("unexpected action: {action:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_finalized_response_carrying_tree_aux_roots_is_malformed() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let first_checkpoint = block::Height(3);
+    let start = block::Height(4);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((first_checkpoint, checkpoint_hash)),
+    ));
+    let peer_id = peer(8);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), block::Height(0), start, 1, 1).await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders {
+                    want_tree_aux_roots: false,
+                    ..
+                },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    // The range above the checkpoint is non-finalized, so the request did not
+    // ask for roots. A peer that volunteers roots anyway is reported as
+    // MalformedMessage and the range is retried rather than committed.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: finalized_headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("a roots-bearing non-finalized response must not commit")
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3803,7 +3924,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -3818,7 +3939,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
+            msg: finalized_headers_message(headers.to_vec()),
         })
         .await
         .unwrap();
@@ -4378,6 +4499,7 @@ async fn pow_validation_does_not_monopolize_the_runtime_thread() {
 fn hostile_vectors_are_rejected_for_allocation_and_unsolicited_headers() {
     let mut encoded = vec![MSG_HS_HEADERS];
     encoded.write_u32::<LittleEndian>(u32::MAX).unwrap();
+    encoded.write_u8(0).unwrap();
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, headers_context(MAX_HS_RANGE, MAX_HS_RANGE)),
         Err(HeaderSyncWireError::HeaderCountLimit { .. })
@@ -4385,6 +4507,7 @@ fn hostile_vectors_are_rejected_for_allocation_and_unsolicited_headers() {
 
     let mut encoded = vec![MSG_HS_HEADERS];
     encoded.write_u32::<LittleEndian>(1).unwrap();
+    encoded.write_u8(0).unwrap();
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()),
         Err(HeaderSyncWireError::UnsolicitedHeaders)
