@@ -780,6 +780,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
+                let started = Instant::now();
                 match read_state
                     .clone()
                     .oneshot(zebra_state::ReadRequest::BestHeaderTip)
