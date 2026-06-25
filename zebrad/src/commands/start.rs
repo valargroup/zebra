@@ -2942,11 +2942,13 @@ mod zakura_header_sync_driver_tests {
                     >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
             );
         }
-        assert!(
-            zebra_network::zakura::DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
-                > zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
-            "Zakura block sync must be able to submit a full checkpoint gap plus the resolving checkpoint block",
-        );
+        const {
+            assert!(
+                zebra_network::zakura::DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+                    > zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+                "Zakura block sync must be able to submit a full checkpoint gap plus the resolving checkpoint block",
+            );
+        }
         assert!(
             usize::try_from(DEFAULT_HS_RANGE)
                 .expect("DEFAULT_HS_RANGE fits usize on supported targets")
@@ -3396,7 +3398,6 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn unmatched_checkpoint_commit_success_does_not_refresh_block_sync_frontiers() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-        let block_hash = block.hash();
         let (tip_tx, tip_rx) =
             tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
         let _tip_tx = tip_tx;
