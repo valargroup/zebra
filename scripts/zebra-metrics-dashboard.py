@@ -84,6 +84,8 @@ PANELS = [
     ("Verify",     "verify_queued",  "Checkpoint queued slots",     "",      "gauge"),
     ("Verify",     "verify_mem_q",   "Semantic queued blocks",      "",      "gauge"),
     ("Verify",     "verify_util",    "Verify queue utilization",    "%",     "gauge"),
+    ("Verify",     "verify_height",  "Verified height (checkpoint)","",      "gauge"),
+    ("Verify",     "verified_per_s", "Verified blocks / s",         "/s",    "rate"),
     ("Download",   "dl_p50_ms",      "Block download p50",          "ms",    "gauge"),
     ("Download",   "dl_p90_ms",      "Block download p90",          "ms",    "gauge"),
     ("Download",   "dl_util",        "Download slot utilization",   "%",     "gauge"),
@@ -165,13 +167,34 @@ def classify(samples, ckpt_limit=None, dl_limit=None):
     if verify_u is not None: scores["verify"] = round(verify_u, 3)
     if dl_u     is not None: scores["download"] = round(dl_u, 3)
 
-    if bps is None:
-        return {"verdict": "idle", "label": "No progress", "confidence": "low",
-                "scores": scores, "detail": "no throughput reading", "bps": bps}
-    if bps < STALL_BPS:
-        return {"verdict": "stalled", "label": "STALLED / STARVED",
-                "confidence": "high", "scores": scores, "bps": round(bps, 2),
-                "detail": f"no commit progress ({bps:.2f} blk/s)"}
+    # No (or near-zero) finalized throughput. The finalized-height gauge is only emitted
+    # once the committer commits a block, so a node that downloads/verifies but never
+    # finalizes reports bps=None — that is a STALL, not idle. Distinguish a genuinely
+    # quiet node from one that is clearly working, and attribute the stall to the stage
+    # that is saturated (downloads piling up = head-of-line; verifier backlog; else commit).
+    active = any(med(k) is not None for k in
+                 ("in_flight", "outstanding", "verify_queued", "verify_mem_q"))
+    vps = med("verified_per_s")
+    if bps is None or bps < STALL_BPS:
+        if not active and bps is None:
+            return {"verdict": "idle", "label": "No data", "confidence": "low",
+                    "scores": scores, "detail": "node not reporting activity", "bps": bps}
+        prog = f"{bps:.2f}" if bps is not None else "0"
+        vnote = (f"; checkpoint verification still advancing (+{vps:.0f} blk/s) — finalization is the wall"
+                 if (vps and vps > 0) else "")
+        if dl_u is not None and dl_u >= DL_FRAC_HI:
+            return {"verdict": "stalled", "label": "STALLED — download head-of-line",
+                    "confidence": "high", "scores": scores, "bps": bps,
+                    "detail": (f"finalized output stalled ({prog} blk/s) while downloads pile up "
+                               f"({dl_inflight:.0f} in flight vs limit {dl_limit:g}){vnote}")}
+        if verify_u is not None and verify_u >= VERIFY_FRAC_HI:
+            return {"verdict": "stalled", "label": "STALLED — verify backlog",
+                    "confidence": "high", "scores": scores, "bps": bps,
+                    "detail": (f"finalized output stalled ({prog} blk/s) with verifier backlog "
+                               f"{verify_back:.0f} ({verify_u*100:.0f}% of limit {ckpt_limit:g}){vnote}")}
+        return {"verdict": "stalled", "label": "STALLED — not finalizing",
+                "confidence": "medium", "scores": scores, "bps": bps,
+                "detail": f"finalized output stalled ({prog} blk/s); no stage clearly saturated{vnote}"}
 
     # downstream-first decision tree
     if commit_u is not None and cutil >= COMMIT_UTIL_HI:
@@ -313,6 +336,7 @@ class Collector:
         d["queue_depth"]    = bare(m, "zebra_committer_input_queue_depth")
         d["verify_queued"]  = bare(m, "checkpoint_queued_slots")
         d["verify_mem_q"]   = bare(m, "state_memory_queued_block_count")
+        d["verify_height"]  = bare(m, "checkpoint_verified_height")
         d["in_flight"]      = bare(m, "sync_downloads_in_flight")
         d["outstanding"]    = bare(m, "sync_block_outstanding")
         d["missing_bodies"] = bare(m, "sync_header_missing_bodies")
@@ -334,6 +358,7 @@ class Collector:
             "h":   bare(m, "state_finalized_block_height"),
             "vf":  bare(m, "state_vct_fast_block_count"),
             "vl":  bare(m, "state_vct_legacy_block_count"),
+            "vh":  bare(m, "checkpoint_verified_height"),
             "nin": total(m, "zcash_net_in_bytes_total"),
             "nout":total(m, "zcash_net_out_bytes_total"),
             "cm_s":bare(m, "zebra_committer_commit_duration_seconds_sum"),
@@ -359,6 +384,7 @@ class Collector:
             dt = now - self.prev_t
             p = self.prev
             d["blocks_per_s"]  = rate(p["h"],  cur["h"],  dt)
+            d["verified_per_s"]= rate(p["vh"], cur["vh"], dt)
             d["vct_fast_s"]    = rate(p["vf"], cur["vf"], dt)
             d["vct_legacy_s"]  = rate(p["vl"], cur["vl"], dt)
             ni = rate(p["nin"], cur["nin"], dt);  d["net_in_mbps"]  = ni/1e6 if ni is not None else None
