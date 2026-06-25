@@ -82,12 +82,13 @@ impl HeaderSyncCore {
         if count == 0 {
             return;
         }
+        let want_tree_aux_roots = self.wants_tree_aux_roots(start, end, startup);
         self.schedule.ensure_forward(RangeRequest {
             start_height: start,
             count,
             anchor_hash: self.best_header_hash,
             finalized,
-            want_tree_aux_roots: true,
+            want_tree_aux_roots,
             priority: RangePriority::Forward,
         });
     }
@@ -120,6 +121,17 @@ impl HeaderSyncCore {
             want_tree_aux_roots: true,
             priority: RangePriority::Backward,
         });
+    }
+
+    fn wants_tree_aux_roots(
+        &self,
+        start: block::Height,
+        end: block::Height,
+        startup: &HeaderSyncStartup,
+    ) -> bool {
+        let last_checkpoint_height = startup.network.checkpoint_list().max_height();
+
+        start <= last_checkpoint_height && end > self.verified_block_tip
     }
 }
 
