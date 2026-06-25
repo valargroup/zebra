@@ -532,6 +532,47 @@ pub(crate) fn produce_block_roots(
     roots
 }
 
+/// Serve the per-block roots for `range`, stitching the two sources at the upgrade height `U`.
+///
+/// The `commitment_roots_by_height` serving index only covers heights at and above `U` (the lowest
+/// height this binary committed). Heights below `U` predate the index, so they are derived from the
+/// per-height trees instead, and the two runs are concatenated. This is what lets a node that
+/// upgraded mid-chain serve a request that straddles `U` as one gap-free batch, rather than the
+/// short index-only prefix that would stall the client's minimum-progress check.
+///
+/// Both sources stop at the first absent height, so the result is always a contiguous run from
+/// `range.start()`; a tree gap below `U` is served as the prefix collected so far without reaching
+/// into the index. A database that never recorded `U` — a pre-index archive node — derives the
+/// whole range from the trees, the original archive fallback.
+pub(crate) fn serve_block_roots(
+    db: &ZebraDb,
+    range: std::ops::RangeInclusive<block::Height>,
+) -> Vec<BlockCommitmentRoots> {
+    let Some(upgrade) = db.vct_upgrade_height() else {
+        return produce_block_roots(db, range);
+    };
+
+    let (start, end) = (*range.start(), *range.end());
+
+    // Wholly at/above `U`: the index covers it. (`U == 0` for a node that fast-synced from
+    // genesis takes this path for every request, never touching the absent per-height trees.)
+    if start >= upgrade {
+        return db.commitment_roots_by_height_range(range);
+    }
+
+    // Below `U`: derive the per-height-tree run up to `U - 1` (`start < upgrade` so `upgrade >= 1`).
+    let trees_end = block::Height(end.0.min(upgrade.0 - 1));
+    let mut roots = produce_block_roots(db, start..=trees_end);
+
+    // Continue into the index only if the tree run is contiguous up to `U - 1`; a short run means a
+    // gap below `U`, so serve it alone and let the client retry the remainder.
+    if roots.last().map(|root| root.height) == Some(trees_end) && end >= upgrade {
+        roots.extend(db.commitment_roots_by_height_range(upgrade..=end));
+    }
+
+    roots
+}
+
 /// Produce the final frontiers at `height` from `db`'s per-height trees.
 ///
 /// Sprout is frozen far below any modern checkpoint, so the tip Sprout tree is the frontier at

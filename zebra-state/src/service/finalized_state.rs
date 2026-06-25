@@ -129,7 +129,7 @@ use vct::VctState;
 
 /// The verified-commitment-trees `tree_aux` serving read path (design §9): the per-block
 /// commitment roots for a height range, derived from the per-height trees.
-pub(crate) use commitment_aux::produce_block_roots;
+pub(crate) use commitment_aux::serve_block_roots;
 
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
@@ -211,6 +211,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
+    VCT_UPGRADE_METADATA,
 ];
 
 /// The name of the column family that records pruning progress.
@@ -240,6 +241,21 @@ pub const PRUNING_METADATA: &str = "pruning_metadata";
 /// reopen. This is orthogonal to pruning (which drops raw transactions but keeps
 /// the trees); a database can be both.
 pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
+
+/// The name of the column family that records the verified-commitment-trees upgrade height.
+///
+/// This holds a single entry, keyed by the unit value `()`, mapping to `U`: the lowest height
+/// this (vct-aware) binary committed, which is also the lowest height present in the
+/// [`COMMITMENT_ROOTS_BY_HEIGHT`] serving index. It is written once — on the first committed
+/// block — and never moved, so it is a stable boundary as the chain grows.
+///
+/// `U` is what lets the two root sources be stitched without a gap: heights below `U` predate
+/// this binary, so they carry per-height trees but no index entry and are served from the trees;
+/// heights at or above `U` carry an index entry and are served from it. Combined with the
+/// checkpoint handoff `H` in [`VCT_SYNC_METADATA`], it also bounds the band `[U, H)` in which a
+/// vct-synced node holds no per-height tree, so historical tree/subtree RPCs are unavailable
+/// there but available below `U` (pre-upgrade trees) and at/above `H` (semantic-sync trees).
+pub const VCT_UPGRADE_METADATA: &str = "vct_upgrade_metadata";
 
 /// The name of the column family holding the per-height Sapling/Orchard note-commitment
 /// roots, keyed by [`block::Height`].
@@ -321,7 +337,7 @@ pub struct FinalizedState {
     /// when legacy recompute is selected. Shared across clones.
     vct: Option<Arc<VctState>>,
 
-    /// POC verify-before-commit dedup. Holds the `(height, hash)` of the next
+    /// Verify-before-commit dedup. Holds the `(height, hash)` of the next
     /// block whose commitment was already validated by the previous fast
     /// commit's look-ahead (`C(next, candidate)`). When the next block to commit
     /// matches, its own commitment check is the identical computation, so it is

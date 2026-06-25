@@ -47,7 +47,7 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA,
+        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
         ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     },
     HashOrHeight,
@@ -795,14 +795,15 @@ impl ZebraDb {
 
     // Verified-commitment-trees fast-sync methods
 
-    /// Returns the checkpoint handoff height of a verified-commitment-trees
-    /// fast-synced database: the lowest height at which a per-height
-    /// note-commitment tree is present.
+    /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced
+    /// database: the upper (exclusive) bound of the band `[U, H)` in which per-height
+    /// note-commitment trees are absent. `U` is [`vct_upgrade_height`](Self::vct_upgrade_height).
     ///
-    /// Per-height note-commitment trees are absent for every non-genesis height
-    /// strictly below this height (they were never written by the fast path).
-    /// Returns `None` if the database was synced normally (it has per-height trees
-    /// for all heights below the tip).
+    /// The fast path skips per-height trees only below the handoff; at and above `H`, semantic sync
+    /// writes them again. (Trees below the upgrade height `U` are also present — written before this
+    /// binary ran.) Returns `None` if the database was synced normally (per-height trees for every
+    /// height below the tip). Use [`vct_tree_absent`](Self::vct_tree_absent) to test a single
+    /// height rather than comparing against this bound directly.
     pub fn vct_synced_below(&self) -> Option<Height> {
         let vct_sync_metadata = self.db.cf_handle(VCT_SYNC_METADATA)?;
         self.db.zs_get(&vct_sync_metadata, &())
@@ -816,18 +817,46 @@ impl ZebraDb {
         self.vct_synced_below().is_some()
     }
 
-    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
-    /// whose per-height note-commitment tree is unavailable because this is a
-    /// vct-synced database (the tree below the checkpoint handoff height was
-    /// never written). Read-request handlers use this to return an archive-mode
-    /// error instead of a misleading "not found".
-    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        let Some(boundary) = self.vct_synced_below() else {
+    /// Returns the verified-commitment-trees upgrade height `U`: the lowest height this binary
+    /// committed, equal to the lowest height in the `commitment_roots_by_height` serving index.
+    ///
+    /// Written once on the first committed block and never moved (see
+    /// [`VCT_UPGRADE_METADATA`](crate::service::finalized_state::VCT_UPGRADE_METADATA)). Heights
+    /// below `U` predate this binary, so they hold per-height trees but no index entry; heights at
+    /// or above `U` hold an index entry. Returns `None` for a database written before this marker
+    /// existed (a pre-index archive database), where every height is served from the trees.
+    pub fn vct_upgrade_height(&self) -> Option<Height> {
+        let vct_upgrade_metadata = self.db.cf_handle(VCT_UPGRADE_METADATA)?;
+        self.db.zs_get(&vct_upgrade_metadata, &())
+    }
+
+    /// Returns `true` if the per-height note-commitment tree at `height` was never written because
+    /// this is a vct-synced database, i.e. `height` falls in the absent band `[U, H)`.
+    ///
+    /// `U` is the upgrade height ([`vct_upgrade_height`](Self::vct_upgrade_height)) and `H` is the
+    /// checkpoint handoff ([`vct_synced_below`](Self::vct_synced_below)). The fast path skips
+    /// per-height trees only at and after the upgrade and only below the checkpoint: heights below
+    /// `U` keep their pre-upgrade trees, and heights at or above `H` get trees again from semantic
+    /// sync. Returns `false` for a normally-synced database (`H` is `None`). When `H` is set, `U`
+    /// is too (both are written by the commit path), but `U` defaults to genesis if ever absent,
+    /// which preserves the original "absent below `H`" behaviour.
+    pub fn vct_tree_absent(&self, height: Height) -> bool {
+        let Some(handoff) = self.vct_synced_below() else {
             return false;
         };
+        let upgrade = self.vct_upgrade_height().unwrap_or(Height(0));
+        upgrade <= height && height < handoff
+    }
+
+    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
+    /// whose per-height note-commitment tree is unavailable because this is a
+    /// vct-synced database (the tree within the `[U, H)` absent band was never
+    /// written). Read-request handlers use this to return an archive-mode error
+    /// instead of a misleading "not found".
+    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
         hash_or_height
             .height_or_else(|hash| self.height(hash))
-            .is_some_and(|height| height < boundary)
+            .is_some_and(|height| self.vct_tree_absent(height))
     }
 
     /// Returns the half-open range of block heights `[from, until)` whose raw
