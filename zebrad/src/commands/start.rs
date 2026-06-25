@@ -94,9 +94,8 @@ use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use zakura::{
     drive_block_sync_actions, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
-    query_block_sync_frontiers, run_tree_aux_driver, zakura_header_sync_driver_startup,
-    BlocksyncThroughputProbe, BlocksyncThroughputSummary, StateTreeAuxPort,
-    ZakuraHeaderSyncDriverHandles,
+    query_block_sync_frontiers, zakura_header_sync_driver_startup, BlocksyncThroughputProbe,
+    BlocksyncThroughputSummary, ZakuraHeaderSyncDriverHandles,
 };
 
 use crate::{
@@ -632,19 +631,6 @@ impl StartCmd {
             PeerServices::NODE_NETWORK
         };
 
-        // Verified-commitment-trees `tree_aux` serving port: under the Zakura sync path,
-        // register the roots service so this node both advertises the capability and
-        // answers `GetRoots` from local state (a node serves the roots it can derive; a
-        // fast-synced node holds none and reports the range unavailable).
-        let tree_aux_port: Option<std::sync::Arc<dyn zebra_network::zakura::TreeAuxStatePort>> =
-            if config.network.v2_p2p {
-                Some(std::sync::Arc::new(StateTreeAuxPort::new(
-                    read_only_state_service.clone(),
-                )))
-            } else {
-                None
-            };
-
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zebra_network::init_with_zakura_header_sync(
                 config.network.clone(),
@@ -653,7 +639,6 @@ impl StartCmd {
                 user_agent(),
                 advertised_services,
                 zakura_header_sync_driver_startup,
-                tree_aux_port,
             )
             .await;
 
@@ -693,24 +678,6 @@ impl StartCmd {
                     .in_current_span(),
                 );
                 endpoint.push_header_sync_task(driver_task).await;
-
-                // Verified-commitment-trees `tree_aux` peer-source driver: when the
-                // committer is built in peer mode (the default where embedded final
-                // frontiers exist), fetch the checkpoint roots from a peer into the
-                // committer's cache, ahead of body commit.
-                if let Some(writer) = zebra_state::tree_aux_roots_writer() {
-                    let tree_aux_task = tokio::spawn(
-                        run_tree_aux_driver(
-                            endpoint.supervisor(),
-                            writer,
-                            config.network.network.clone(),
-                            read_only_state_service.clone(),
-                            shutdown.clone().cancelled_owned(),
-                        )
-                        .in_current_span(),
-                    );
-                    endpoint.push_header_sync_task(tree_aux_task).await;
-                }
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),
@@ -2700,7 +2667,6 @@ mod zakura_header_sync_driver_tests {
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
             }),
-            None,
         )
         .await
         .expect("Zakura endpoint starts")

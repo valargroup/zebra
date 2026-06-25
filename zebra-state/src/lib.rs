@@ -89,30 +89,6 @@ pub use service::{
     ReadStateService,
 };
 
-/// Write handle for the verified-commitment-trees `tree_aux` peer source: the node's
-/// `tree_aux` driver fills the committer's per-block-root cache through this as verified
-/// root ranges arrive from peers. Available only when the committer was built in peer
-/// mode (the `VCT_PEER` experiment toggle); [`tree_aux_roots_writer`] returns `None`
-/// otherwise.
-#[derive(Clone, Debug)]
-pub struct TreeAuxRootsWriter(service::finalized_state::PeerSourceWriter);
-
-impl TreeAuxRootsWriter {
-    /// Insert a batch of verified per-block roots into the committer's cache.
-    pub fn insert_roots(
-        &self,
-        roots: impl IntoIterator<Item = zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    ) {
-        self.0.insert_roots(roots);
-    }
-}
-
-/// The live [`TreeAuxRootsWriter`] when the committer is running in `tree_aux` peer mode,
-/// or `None` in the default (legacy) configuration.
-pub fn tree_aux_roots_writer() -> Option<TreeAuxRootsWriter> {
-    service::finalized_state::peer_roots_writer().map(TreeAuxRootsWriter)
-}
-
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{
