@@ -1566,9 +1566,15 @@ impl Service<ReadRequest> for ReadStateService {
                     } else {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
                         let requested = start_height..=block::Height(last);
+                        
+                        // Read verified per-block roots from the committed serving index first.
+                        // This index is written for every committed block, including VCT fast-sync
+                        // commits that do not store per-height note-commitment trees.
                         let mut roots =
                             state.db.commitment_roots_by_height_range(requested.clone());
 
+                        // Older non-VCT databases may not have the compact serving index. If so,
+                        // derive the same roots from stored per-height note-commitment trees.
                         if roots.is_empty() && !state.db.is_vct_synced() {
                             roots =
                                 finalized_state::produce_block_roots(&state.db, requested.clone());
@@ -1579,6 +1585,11 @@ impl Service<ReadRequest> for ReadStateService {
                             .and_then(|root| root.height.next().ok())
                             .unwrap_or(start_height);
                         if next_height <= *requested.end() {
+                            // Extend the committed prefix with provisional Zakura header-ahead roots.
+                            // These are peer-supplied advisory roots for heights whose headers are known
+                            // but whose block bodies have not been committed yet. Once a block is
+                            // committed, its verified roots move to the committed index and the
+                            // provisional row for that height is deleted.
                             let provisional =
                                 state.db.zakura_header_commitment_roots_by_height_range(
                                     next_height..=*requested.end(),
