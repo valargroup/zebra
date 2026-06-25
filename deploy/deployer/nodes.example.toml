@@ -1,0 +1,25 @@
+# Example node fleet config for deploy/deployer/deploy.py.
+#
+# Copy to nodes.toml and edit. Per-node values override [defaults].
+# Run: python3 deploy.py deploy --config nodes.toml
+
+[defaults]
+service_name    = "zebrad"                  # systemd unit name on the node
+bin_path        = "/usr/local/bin/zebrad"
+config_path     = "/etc/zebrad/zebrad.toml"
+log_file        = "/var/log/zebrad/zebrad.log"   # deterministic log path
+state_cache_dir = "/var/lib/zebrad"
+network         = "Mainnet"
+listen_addr     = "[::]:8233"
+rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
+# port          = 22                        # optional non-default ssh port
+
+[[nodes]]
+name       = "node-a"
+ssh_string = "root@167.99.162.47"
+commit     = "evan/perf-note-commit-tree"   # branch, tag, or full/short SHA
+
+[[nodes]]
+name       = "node-b"
+ssh_string = "root@167.172.201.36"
+commit     = "evan/perf-note-commit-tree"
