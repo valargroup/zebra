@@ -796,6 +796,7 @@ impl HeaderSyncReactor {
             &self.startup.config,
             &self.startup.network,
             self.startup.max_frame_bytes,
+            want_tree_aux_roots,
         );
         if count == 0 || count > allowed_count {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::GetHeadersTooLong)

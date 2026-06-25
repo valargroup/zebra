@@ -12,6 +12,7 @@
 
 use std::{iter, path::Path, sync::Arc};
 
+use super::super::RetentionPlan;
 use zebra_chain::{
     block::{
         self,
@@ -22,11 +23,14 @@ use zebra_chain::{
         Block, Height,
     },
     block_info::BlockInfo,
+    orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet,
         Network::{self, *},
         NetworkUpgrade,
     },
+    sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transparent::new_ordered_outputs_with_height,
     work::difficulty::ParameterDifficulty,
@@ -535,6 +539,48 @@ fn committed_body_releases_only_its_height_and_keeps_the_frontier() {
             (Height(1), block1.hash(), block1.header.clone()),
             (Height(2), block2.hash(), block2.header.clone()),
         ],
+    );
+}
+
+#[test]
+fn write_block_deletes_matching_provisional_zakura_roots() {
+    let _init_guard = zebra_test::init();
+    let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+    let mut state = ZebraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    );
+    let roots = [root_at(Height(1)), root_at(Height(2))];
+
+    write_full_block(&mut state, genesis);
+    state
+        .insert_zakura_header_commitment_roots(roots.clone())
+        .expect("provisional roots write");
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(2)),
+        roots.to_vec()
+    );
+
+    write_full_block(&mut state, block1);
+
+    assert!(state
+        .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1))
+        .is_empty());
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2)),
+        vec![root_at(Height(2))]
     );
 }
 
@@ -1237,6 +1283,32 @@ fn alternate_header(
     header.previous_block_hash = previous_block_hash;
     header.nonce.0[0] ^= nonce_tag;
     Arc::new(header)
+}
+
+fn root_at(height: Height) -> BlockCommitmentRoots {
+    BlockCommitmentRoots {
+        height,
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+    }
+}
+
+fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
+    let checkpoint_verified = CheckpointVerifiedBlock::from(block);
+    let finalized =
+        FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
+
+    state
+        .write_block(
+            finalized,
+            None,
+            &Mainnet,
+            "test",
+            RetentionPlan::Store,
+            None,
+            None,
+        )
+        .expect("block commit succeeds");
 }
 
 fn commit_header_range(

@@ -403,13 +403,22 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         } else {
                             Vec::new()
                         };
-                        let header_heights: Vec<_> =
+                        let mut header_heights: Vec<_> =
                             headers.iter().map(|(height, _, _)| *height).collect();
-                        let tree_aux_roots = tree_aux_roots_for_served_header_range(
+                        let mut tree_aux_roots = tree_aux_roots_for_served_header_range(
                             start,
                             header_heights.iter().copied(),
                             &block_roots,
                         );
+                        let served_header_count = served_header_count_for_tree_aux_roots(
+                            header_heights.len(),
+                            want_tree_aux_roots,
+                            tree_aux_roots.len(),
+                        );
+                        header_heights.truncate(served_header_count);
+                        if tree_aux_roots.len() != served_header_count {
+                            tree_aux_roots.clear();
+                        }
                         let body_sizes = body_sizes_for_served_header_range(
                             start,
                             header_heights.iter().copied(),
@@ -417,6 +426,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         );
                         let headers = headers
                             .into_iter()
+                            .take(header_heights.len())
                             .map(|(_height, _hash, header)| header)
                             .collect();
                         trace_header_reactor_event(
@@ -856,6 +866,18 @@ pub(crate) fn tree_aux_roots_for_served_header_range(
     }
 
     roots
+}
+
+pub(crate) fn served_header_count_for_tree_aux_roots(
+    header_count: usize,
+    want_tree_aux_roots: bool,
+    tree_aux_roots_len: usize,
+) -> usize {
+    if want_tree_aux_roots && tree_aux_roots_len > 0 {
+        header_count.min(tree_aux_roots_len)
+    } else {
+        header_count
+    }
 }
 
 async fn log_missing_block_bodies<ReadState>(

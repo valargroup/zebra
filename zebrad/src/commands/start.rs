@@ -2072,9 +2072,10 @@ mod zakura_header_sync_driver_tests {
         coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
         drive_zakura_header_sync_actions, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
-        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles, ZebradBlockApplyExecutor,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        served_header_count_for_tree_aux_roots, tree_aux_roots_for_served_header_range,
+        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
+        ZakuraHeaderSyncDriverHandles, ZebradBlockApplyExecutor, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -2204,6 +2205,25 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap),
             vec![root_at(block::Height(10))],
+        );
+    }
+
+    #[test]
+    fn served_header_count_keeps_tree_aux_roots_aligned() {
+        assert_eq!(
+            served_header_count_for_tree_aux_roots(4, true, 2),
+            2,
+            "requested non-empty root prefixes shorten the served header range"
+        );
+        assert_eq!(
+            served_header_count_for_tree_aux_roots(4, true, 0),
+            4,
+            "missing roots are served as rootless headers"
+        );
+        assert_eq!(
+            served_header_count_for_tree_aux_roots(4, false, 2),
+            4,
+            "unrequested roots do not shorten the served header range"
         );
     }
 
