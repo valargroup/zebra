@@ -1576,7 +1576,7 @@ impl Service<ReadRequest> for ReadStateService {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
                         let range = start_height..=block::Height(last);
                         let indexed = state.db.commitment_roots_by_height_range(range.clone());
-                        if !indexed.is_empty() || state.db.is_fast_synced() {
+                        if !indexed.is_empty() || state.db.is_vct_synced() {
                             // Indexed roots (the common path), or a fast-synced node whose only
                             // possible source is the index — never the absent per-height trees.
                             indexed
