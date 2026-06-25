@@ -601,14 +601,14 @@ mod tests {
                 .zcash_deserialize_into()
                 .expect("block 1 vector parses"),
         );
+        // The expectation above did not request tree-aux roots (a non-finalized
+        // range), so a roots-bearing response would be rejected at decode as
+        // `UnrequestedTreeAuxRoots`. This test exercises queue-saturation
+        // expectation restoral, not roots, so the response carries none.
         let solicited_headers = HeaderSyncMessage::Headers {
             headers: vec![block_one.header.clone()],
             body_sizes: vec![0],
-            tree_aux_roots: vec![BlockCommitmentRoots {
-                height: block::Height(1),
-                sapling_root: zebra_chain::sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: zebra_chain::orchard::tree::NoteCommitmentTree::default().root(),
-            }],
+            tree_aux_roots: Vec::new(),
         }
         .encode_frame()
         .expect("headers frame encodes");
