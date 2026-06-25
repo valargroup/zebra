@@ -89,50 +89,12 @@ pub use service::{
     ReadStateService,
 };
 
-/// Write handle for the verified-commitment-trees `tree_aux` peer source: the node's
-/// `tree_aux` driver fills the committer's per-block-root cache through this as verified
-/// root ranges arrive from peers. Available only when the committer was built in peer
-/// mode, which is the default on networks with embedded final frontiers.
-#[derive(Clone, Debug)]
-pub struct TreeAuxRootsWriter(service::finalized_state::PeerSourceHandle);
-
-impl TreeAuxRootsWriter {
-    /// Insert a batch of verified per-block roots into the committer's cache.
-    pub fn insert_roots(
-        &self,
-        roots: impl IntoIterator<Item = zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>,
-    ) {
-        self.0.insert_roots(roots);
-    }
-
-    /// Remove peer-supplied roots from the committer cache.
-    ///
-    /// Used by the `tree_aux` driver when one peer-supplied root fails verification:
-    /// all still-cached roots from that same supplier are dropped so the committer does
-    /// not grind through the poisoned window one height at a time.
-    pub fn invalidate_roots(&self, heights: impl IntoIterator<Item = zebra_chain::block::Height>) {
-        self.0.invalidate_roots(heights);
-    }
-
-    /// The highest finalized height whose peer roots have been evicted from the cache.
-    pub fn committed_through(&self) -> Option<zebra_chain::block::Height> {
-        self.0.committed_through()
-    }
-
-    /// Subscribe to targeted `tree_aux` root refetch requests from the state committer.
-    pub fn subscribe_refetch(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<zebra_chain::block::Height> {
-        self.0.subscribe_refetch()
-    }
-}
-
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::{
     arbitrary::{populated_state, CHAIN_TIP_UPDATE_WAIT_LIMIT},
     finalized_state::{RawBytes, KV, MAX_ON_DISK_HEIGHT},
-    init_test, init_test_services, init_test_services_with_tree_aux_writer,
+    init_test, init_test_services,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]

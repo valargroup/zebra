@@ -111,7 +111,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         ),
         None => (zebra_state::Config::ephemeral(), false),
     };
-    let (state_service, read_state, _latest_tip, _tip_change, tree_aux_writer) = zebra_state::init(
+    let (state_service, read_state, _latest_tip, _tip_change) = zebra_state::init(
         state_config,
         &network,
         max_checkpoint_height,
@@ -171,15 +171,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // Feed cached tree roots into the VCT fast path (production gets these from
     // header-carried roots over the wire; here from `fetch --with-roots`).
     if args.with_roots {
-        match &tree_aux_writer {
-            Some(writer) => {
-                let roots = load_roots(&args.cache_dir, &blocks)?;
-                let count = roots.len();
-                writer.insert_roots(roots);
-                tracing::info!(count, "fed tree-aux roots into the VCT fast path");
-            }
-            None => bail!("--with-roots set but the state exposed no tree_aux writer"),
-        }
+        // The old `tree_aux` peer-source writer that fed roots straight into the
+        // committer cache has been removed. Roots now reach the committer only via the
+        // header-sync `CommitHeaderRange` path, persisted to the
+        // `zakura_header_commitment_roots_by_height` column family. Re-port `--with-roots`
+        // onto that path to benchmark the VCT fast path again.
+        let _ = load_roots; // keep the loader wired for the re-port
+        bail!(
+            "--with-roots is not supported after the tree_aux stream removal; roots now \
+             arrive via header sync (CommitHeaderRange) — re-port the bench onto that path"
+        );
     }
 
     let state = Buffer::new(state_service, 64);
@@ -553,7 +554,7 @@ mod tests {
         let checkpoint_hash = chain[10].hash();
 
         let state_config = zebra_state::Config::ephemeral();
-        let (state_service, read_state, _tip, _change, _aux) =
+        let (state_service, read_state, _tip, _change) =
             zebra_state::init(state_config, &network, block::Height(10), 401).await;
         let state = Buffer::new(state_service, 16);
 

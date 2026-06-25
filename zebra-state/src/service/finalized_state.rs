@@ -134,10 +134,6 @@ pub(crate) use commitment_aux::produce_block_roots;
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
 
-/// The verified-commitment-trees `tree_aux` peer-source write handle, root-refetch
-/// signal, and their per-state accessors.
-pub(crate) use commitment_aux::PeerSourceHandle;
-
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 
@@ -807,7 +803,10 @@ impl FinalizedState {
 
                 // The last checkpoint height (boundary below which the vct
                 // path skips per-height trees), when final frontiers are loaded.
-                let vct_last_checkpoint_height = self.vct.as_ref().and_then(|v| v.vct_sync_last_checkpoint_height());
+                let vct_last_checkpoint_height = self
+                    .vct
+                    .as_ref()
+                    .and_then(|v| v.vct_sync_last_checkpoint_height());
 
                 // In vct mode, if the source has this height's roots at or below the
                 // last checkpoint height, skip the per-block note-commitment frontier recompute
@@ -816,7 +815,9 @@ impl FinalizedState {
                 // parent frontier; nothing below the checkpoint reads it for consensus.
                 // See docs/design/verified-commitment-trees.md.
                 let vct_roots = self.vct.as_ref().and_then(|v| {
-                    if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| height > last_checkpoint_height) {
+                    if vct_last_checkpoint_height
+                        .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
+                    {
                         None
                     } else {
                         v.vct_roots_at_height(height)
@@ -1208,28 +1209,6 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
-    /// The per-state `tree_aux` peer-source driver handle, if peer mode is active.
-    pub(crate) fn tree_aux_roots_handle(&self) -> Option<PeerSourceHandle> {
-        self.vct.as_ref().and_then(|v| v.peer_source_handle())
-    }
-
-    /// Request a targeted peer-root refetch for `height`.
-    pub(crate) fn request_vct_peer_root_refetch(&self, height: block::Height) {
-        if self
-            .vct
-            .as_ref()
-            .is_some_and(|v| v.request_peer_root_refetch(height))
-        {
-            return;
-        }
-
-        metrics::counter!("state.vct.root.refetch.no_sender.count").increment(1);
-        tracing::debug!(
-            ?height,
-            "VCT: requested peer root refetch before the peer-source signal was installed"
-        );
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.

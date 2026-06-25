@@ -25,7 +25,7 @@ use zebra_chain::{
 };
 
 use super::{
-    commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource, PeerSourceHandle},
+    commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
     ZebraDb,
 };
 
@@ -76,8 +76,6 @@ pub(crate) struct VctState {
     /// previous block's look-ahead already validated it (the dedup). Lets tests
     /// assert the dedup actually engages, so it can't be silently regressed.
     prevalidated_count: AtomicU64,
-    /// Per-state `tree_aux` driver handle, present only for the peer source.
-    peer_source_handle: Option<PeerSourceHandle>,
 }
 
 /// Which commitment-root source the committer uses, resolved from the (already read)
@@ -141,14 +139,13 @@ impl VctState {
                     handoff_height = parsed.height.0,
                     "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
                 );
-                let (source, peer_source_handle) = PeerSource::new_with_db(db, Some(parsed));
+                let source = PeerSource::new_with_db(db, Some(parsed));
                 Some(Arc::new(VctState {
                     fast: true,
                     source: Box::new(source),
                     requires_verified_successor: true,
                     fast_count: AtomicU64::new(0),
                     prevalidated_count: AtomicU64::new(0),
-                    peer_source_handle: Some(peer_source_handle),
                 }))
             }
 
@@ -162,22 +159,6 @@ impl VctState {
     /// `true` when the fast (skip-recompute) path is active.
     pub(super) fn is_fast(&self) -> bool {
         self.fast
-    }
-
-    /// The per-state peer-source driver handle, if this committer uses the `tree_aux`
-    /// peer source.
-    pub(super) fn peer_source_handle(&self) -> Option<PeerSourceHandle> {
-        self.peer_source_handle.clone()
-    }
-
-    /// Request a targeted peer-root refetch for `height`.
-    pub(super) fn request_peer_root_refetch(&self, height: block::Height) -> bool {
-        let Some(handle) = &self.peer_source_handle else {
-            return false;
-        };
-
-        handle.request_refetch(height);
-        true
     }
 
     /// The supplied roots for `height`, when vct mode has a source entry for it
@@ -293,7 +274,6 @@ impl VctState {
             requires_verified_successor,
             fast_count: AtomicU64::new(0),
             prevalidated_count: AtomicU64::new(0),
-            peer_source_handle: None,
         })
     }
 }

@@ -11,7 +11,6 @@ pub(crate) mod block_sync_driver;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
-pub(crate) mod tree_aux_driver;
 
 pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
@@ -33,7 +32,6 @@ pub(crate) use header_sync_driver::{
     zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
-pub(crate) use tree_aux_driver::{run_tree_aux_driver, StateTreeAuxPort};
 #[cfg(test)]
 pub(crate) use zebra_network::zakura::BlockApplyClass;
 

@@ -118,7 +118,6 @@ where
         user_agent,
         advertised_services,
         None,
-        None,
     )
     .await;
 
@@ -133,7 +132,6 @@ pub async fn init_with_zakura_header_sync<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
     header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
-    tree_aux_port: Option<std::sync::Arc<dyn crate::zakura::TreeAuxStatePort>>,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
     Arc<std::sync::Mutex<AddressBook>>,
@@ -166,7 +164,6 @@ where
             )) as Arc<dyn crate::zakura::Service>
         },
         header_sync_driver_startup,
-        tree_aux_port,
     )
     .await
     .expect("Zakura endpoint should start when P2P v2 is enabled");
