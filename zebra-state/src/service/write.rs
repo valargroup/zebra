@@ -548,6 +548,16 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
+            // Whether this commit consumed header-carried (peer-supplied) tree-aux
+            // roots to skip the note-commitment frontier rebuild. This is the payoff
+            // signal for header-carried roots: a low hit rate means the roots are not
+            // arriving ahead of body commit, so the committer pays the full tree cost.
+            if finalized_state.vct_fast_will_apply(ordered_block.0.height) {
+                metrics::counter!("state.vct.fast_path.hit").increment(1);
+            } else {
+                metrics::counter!("state.vct.fast_path.miss").increment(1);
+            }
+
             // Try committing the block
             match finalized_state.commit_finalized(
                 ordered_block,
