@@ -983,6 +983,10 @@ fn block_sync_config_defaults_and_round_trips() {
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
     );
+    assert_eq!(
+        default.submitted_apply_limit(),
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+    );
     assert_eq!(default.request_timeout, DEFAULT_BS_REQUEST_TIMEOUT);
     assert_eq!(default.fanout, DEFAULT_BS_FANOUT);
 
@@ -999,6 +1003,11 @@ fn block_sync_config_defaults_and_round_trips() {
     )
     .expect("nested Zakura block-sync config deserializes");
     assert_eq!(config.zakura.block_sync.max_submitted_block_applies, 9);
+    assert_eq!(
+        config.zakura.block_sync.submitted_apply_limit(),
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        "stale configs below one complete checkpoint range are clamped"
+    );
 }
 
 #[test]
@@ -4195,6 +4204,53 @@ fn budget_audit_catches_injected_drift() {
     );
     budget.release(400);
     assert!(budget.audit(0, "test released audit"));
+}
+
+#[test]
+fn budget_audit_reproduces_peer_to_sequencer_handoff_gap() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let estimate = 2_048u64;
+    let actual = 1_693u64;
+    let work = WorkQueue::new(block::Height(0));
+    let mut budget = ByteBudget::new(estimate);
+
+    assert_eq!(
+        work.extend([(height, hash, BlockSizeEstimate::Confirmed(estimate as u32))]),
+        1
+    );
+    assert_eq!(work.take_in_range(height, height, 1).len(), 1);
+    assert_eq!(work.mark_reserved([height]), estimate);
+    assert!(budget.try_reserve(estimate));
+    assert_eq!(work.reserved_bytes(), estimate);
+    assert!(budget.audit(estimate, "block-sync sequencer view"));
+
+    let delta = work
+        .settle_active_reserved_height(height, actual)
+        .expect("height still owns an active request reservation");
+    if delta >= 0 {
+        budget.charge(u64::try_from(delta).expect("positive test delta fits in u64"));
+    } else {
+        budget.release(u64::try_from(-delta).expect("negative test delta fits in u64"));
+    }
+
+    // This is the peer-routine handoff window after settling the work ledger and
+    // before `forward_body_to_sequencer` increments the queued input counter.
+    let body_input_bytes = 0u64;
+    let expected = work.reserved_bytes().saturating_add(body_input_bytes);
+    assert_eq!(expected, 0);
+    assert_eq!(budget.reserved(), actual);
+    assert!(
+        !budget.audit(expected, "block-sync sequencer view"),
+        "the sequencer view is low by exactly the settled body size"
+    );
+
+    let body_input_bytes = body_input_bytes.saturating_add(actual);
+    let expected = work.reserved_bytes().saturating_add(body_input_bytes);
+    assert!(
+        budget.audit(expected, "block-sync sequencer view"),
+        "once the body is counted as queued sequencer input, the audit is clean"
+    );
 }
 
 proptest::proptest! {
@@ -10814,10 +10870,14 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
 
 #[tokio::test]
 async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
-    let blocks = fake_sequential_blocks(4);
+    let submitted_apply_limit = 128usize;
+    let blocks = fake_sequential_blocks(
+        u32::try_from(submitted_apply_limit + 1).expect("test block count fits u32"),
+    );
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = u64::MAX;
-    config.max_submitted_block_applies = 2;
+    config.max_blocks_per_response =
+        u32::try_from(submitted_apply_limit).expect("submitted apply limit fits u32");
     config.request_timeout = Duration::from_secs(300);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
@@ -10827,25 +10887,42 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         },
-        (block::Height(4), blocks[3].hash()),
+        (
+            block::Height(u32::try_from(blocks.len()).expect("test block count fits u32")),
+            blocks.last().expect("test has blocks").hash(),
+        ),
         tip_rx,
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let apply_controller = replace_test_apply_executor(&handle);
-    let first_completion = apply_controller.hold_next();
-    let _second_completion = apply_controller.hold_next();
+    let mut completions = VecDeque::new();
+    for _ in 0..submitted_apply_limit {
+        completions.push_back(apply_controller.hold_next());
+    }
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
-    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    wait_for_query_needed_blocks(
+        &mut actions,
+        block::Height(0),
+        block::Height(u32::try_from(blocks.len()).expect("test block count fits u32")),
+    )
+    .await;
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
         &mut actions,
         67,
-        block::Height(4),
-        blocks[3].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
+        BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(
+                u32::try_from(blocks.len()).expect("test block count fits u32"),
+            ),
+            tip_hash: blocks.last().expect("test has blocks").hash(),
+            max_blocks_per_response: u32::try_from(blocks.len())
+                .expect("test block count fits u32"),
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        },
     )
     .await;
 
@@ -10856,9 +10933,12 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
         .await
         .expect("needed metadata queues");
     let (_start, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
-    assert_eq!(count, 4);
+    assert_eq!(
+        count,
+        u32::try_from(submitted_apply_limit).expect("submitted apply limit fits u32")
+    );
 
-    for block in &blocks {
+    for block in blocks.iter().take(submitted_apply_limit) {
         inbound_tx
             .send(
                 BlockSyncMessage::Block(block.clone())
@@ -10870,7 +10950,7 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     }
 
     let mut submitted = Vec::new();
-    while submitted.len() < 2 {
+    while submitted.len() < submitted_apply_limit {
         match next_action(&mut actions).await {
             BlockSyncAction::ApplySubmitted { token, block } => submitted.push((
                 token,
@@ -10884,7 +10964,31 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
         }
     }
     assert_eq!(submitted[0].1, block::Height(1));
-    assert_eq!(submitted[1].1, block::Height(2));
+    assert_eq!(
+        submitted.last().expect("submitted bodies").1,
+        block::Height(
+            u32::try_from(submitted_apply_limit).expect("submitted apply limit fits u32")
+        )
+    );
+
+    let (start, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(
+        (start, count),
+        (
+            block::Height(
+                u32::try_from(submitted_apply_limit + 1).expect("submitted apply limit fits u32")
+            ),
+            1
+        )
+    );
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[submitted_apply_limit].clone())
+                .encode_frame()
+                .expect("block frame encodes"),
+        )
+        .await
+        .expect("block frame queues");
 
     assert!(
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -10905,7 +11009,9 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     );
 
     let (token, height, hash) = submitted[0];
-    first_completion
+    completions
+        .pop_front()
+        .expect("held first completion")
         .send(BlockApplyOutput {
             token,
             height,
@@ -10922,7 +11028,10 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
                     block
                         .coinbase_height()
                         .expect("submitted test block has height"),
-                    block::Height(3)
+                    block::Height(
+                        u32::try_from(submitted_apply_limit + 1)
+                            .expect("submitted apply limit fits u32")
+                    )
                 );
                 break;
             }

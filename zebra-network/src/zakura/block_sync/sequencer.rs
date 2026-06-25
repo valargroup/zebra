@@ -126,6 +126,14 @@ impl Sequencer {
         self.applying.len()
     }
 
+    pub(super) fn lowest_applying_height(&self) -> Option<block::Height> {
+        self.applying.keys().next().copied()
+    }
+
+    pub(super) fn lowest_submitted_height(&self) -> Option<block::Height> {
+        self.submitted_applies.keys().next().copied()
+    }
+
     pub(super) fn applying_buffered_bytes(&self) -> u64 {
         self.applying
             .values()

@@ -258,10 +258,14 @@ pub mod block_sync_trace {
     pub const BLOCK_BODY_DECODE_PERMIT: &str = "block_body_decode_permit";
     /// Sequencer task accepted a received body from its input channel.
     pub const BLOCK_BODY_ACCEPTED: &str = "block_body_accepted";
+    /// Body moved from the reorder buffer into the contiguous applying set.
+    pub const BLOCK_BODY_APPLYING: &str = "block_body_applying";
     /// Reactor attempted or completed a control send to the Sequencer task.
     pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
     /// Body submitted to the verifier for commit.
     pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
+    /// Ready body could not submit because an apply-class limit was saturated.
+    pub const BLOCK_BODY_SUBMIT_THROTTLED: &str = "block_body_submit_throttled";
     /// Peer reported a requested range as unavailable.
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.

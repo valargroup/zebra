@@ -379,6 +379,9 @@ pub(super) struct SequencerView {
     pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
     pub(super) submitted_applying_bytes: u64,
+    pub(super) lowest_applying_height: Option<block::Height>,
+    pub(super) lowest_submitted_height: Option<block::Height>,
+    pub(super) commit_frontier_stall_seconds: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -399,6 +402,9 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
         submitted_applying_bytes: 0,
+        lowest_applying_height: None,
+        lowest_submitted_height: None,
+        commit_frontier_stall_seconds: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -435,6 +441,7 @@ pub(super) struct SequencerTask {
     trace: ZakuraTrace,
     next_ready_source: ReadySource,
     commit_progress: CommitProgress,
+    commit_frontier_since: Instant,
 }
 
 impl SequencerTask {
@@ -478,6 +485,7 @@ impl SequencerTask {
             trace,
             next_ready_source: ReadySource::Control,
             commit_progress: CommitProgress::new(Instant::now()),
+            commit_frontier_since: Instant::now(),
         }
     }
 
@@ -860,6 +868,7 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         self.budget.release(advance.release_bytes);
         if advance.changed {
+            self.commit_frontier_since = Instant::now();
             let released = self.work.advance_floor(frontiers.verified_block_tip);
             self.budget.release(released);
             self.release_contiguous_blocks().await;
@@ -938,6 +947,7 @@ impl SequencerTask {
             .sequencer
             .reset_to(frontiers.verified_block_tip, remember_released_applies);
         self.budget.release(released);
+        self.commit_frontier_since = Instant::now();
         // Drop every download work item above the reset target (their buffers
         // were cleared by `reset_to`); the reactor's `query_needed_blocks`
         // re-fills.
@@ -1053,7 +1063,9 @@ impl SequencerTask {
     /// Drain the contiguous reorder prefix into applying and submit (verbatim
     /// from `release_contiguous_blocks` + `submit_pending_blocks`).
     async fn release_contiguous_blocks(&mut self) {
-        let _ = self.sequencer.drain_ready_into_applying();
+        for height in self.sequencer.drain_ready_into_applying() {
+            self.trace_body_applying(height);
+        }
         self.submit_pending_blocks().await;
     }
 
@@ -1074,6 +1086,7 @@ impl SequencerTask {
                 // visible in metrics and the commit-progress rollup.
                 metrics::counter!("sync.block.submit.throttled").increment(1);
                 self.commit_progress.record_throttle();
+                self.trace_submit_throttled(item.height, item.token, class, limits);
                 break;
             }
 
@@ -1081,7 +1094,7 @@ impl SequencerTask {
             self.increment_in_flight_apply_count(class);
             self.sequencer
                 .record_submitted_apply(item.height, item.hash);
-            self.trace_body_submitted(item.height, item.token);
+            self.trace_body_submitted(item.height, item.token, class);
             #[cfg(test)]
             {
                 let _ = self.actions.try_send(BlockSyncAction::ApplySubmitted {
@@ -1170,7 +1183,33 @@ impl SequencerTask {
         }
     }
 
-    fn trace_body_submitted(&self, height: block::Height, token: BlockApplyToken) {
+    fn trace_body_applying(&self, height: block::Height) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(bs_trace::BLOCK_BODY_APPLYING.to_string()),
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, self.sequencer.floor());
+            bs_insert_u64(
+                row,
+                bs_trace::APPLYING,
+                self.sequencer.applying_len() as u64,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::SUBMITTED_APPLIES,
+                self.sequencer.submitted_applying_count() as u64,
+            );
+        });
+    }
+
+    fn trace_body_submitted(
+        &self,
+        height: block::Height,
+        token: BlockApplyToken,
+        class: BlockApplyClass,
+    ) {
         self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
             row.insert(
                 bs_trace::EVENT.to_string(),
@@ -1178,6 +1217,64 @@ impl SequencerTask {
             );
             bs_insert_height(row, bs_trace::HEIGHT, height);
             bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+            row.insert(
+                bs_trace::APPLY_CLASS.to_string(),
+                serde_json::Value::String(block_apply_class_label(class).to_string()),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::CHECKPOINT_IN_FLIGHT,
+                self.checkpoint_in_flight as u64,
+            );
+            bs_insert_u64(row, bs_trace::FULL_IN_FLIGHT, self.full_in_flight as u64);
+        });
+    }
+
+    fn trace_submit_throttled(
+        &self,
+        height: block::Height,
+        token: BlockApplyToken,
+        class: BlockApplyClass,
+        limits: BlockApplyLimits,
+    ) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(bs_trace::BLOCK_BODY_SUBMIT_THROTTLED.to_string()),
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+            row.insert(
+                bs_trace::APPLY_CLASS.to_string(),
+                serde_json::Value::String(block_apply_class_label(class).to_string()),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::CHECKPOINT_IN_FLIGHT,
+                self.checkpoint_in_flight as u64,
+            );
+            bs_insert_u64(row, bs_trace::FULL_IN_FLIGHT, self.full_in_flight as u64);
+            bs_insert_u64(
+                row,
+                "checkpoint_apply_limit",
+                limits.checkpoint_apply_limit as u64,
+            );
+            bs_insert_u64(row, "full_apply_limit", limits.full_apply_limit as u64);
+            bs_insert_u64(
+                row,
+                "combined_apply_limit",
+                limits.combined_apply_limit as u64,
+            );
+            bs_insert_u64(
+                row,
+                "submitted_applying_count",
+                self.sequencer.submitted_applying_count() as u64,
+            );
+            bs_insert_u64(
+                row,
+                "unsubmitted_applying_count",
+                self.sequencer.unsubmitted_applying_count() as u64,
+            );
         });
     }
 
@@ -1363,7 +1460,8 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
-        self.committed_throughput.sample(Instant::now());
+        let now = Instant::now();
+        self.committed_throughput.sample(now);
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         let body_input_bytes = self
@@ -1391,6 +1489,11 @@ impl SequencerTask {
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
+            lowest_applying_height: self.sequencer.lowest_applying_height(),
+            lowest_submitted_height: self.sequencer.lowest_submitted_height(),
+            commit_frontier_stall_seconds: now
+                .saturating_duration_since(self.commit_frontier_since)
+                .as_secs(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         });

@@ -233,7 +233,8 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the non-zero verifier submission cap.
     pub fn submitted_apply_limit(&self) -> usize {
-        self.max_submitted_block_applies.max(1)
+        self.max_submitted_block_applies
+            .max(DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES)
     }
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
