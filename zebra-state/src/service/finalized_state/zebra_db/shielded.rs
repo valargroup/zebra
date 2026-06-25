@@ -234,8 +234,8 @@ impl ZebraDb {
             // sprout tip tree is only written at the handoff; the committer does not
             // read it before then.
             assert!(
-                self.vct_synced_below()
-                    .is_some_and(|below| self.finalized_tip_height() < Some(below)),
+                self.finalized_tip_height()
+                    .is_some_and(|tip| self.vct_tree_absent(tip)),
                 "Sprout note commitment tree must exist if there is a finalized tip"
             );
             Arc::<sprout::tree::NoteCommitmentTree>::default()
@@ -290,12 +290,12 @@ impl ZebraDb {
         };
 
         self.sapling_tree_by_height(&height).unwrap_or_else(|| {
-            // While a fast sync is in progress the tip is below the handoff height
-            // and its frontier is not stored; the committer does not read it (it
-            // folds verified roots). Every other caller reaches here only at or
-            // above the handoff, where the tree is present.
+            // While a fast sync is in progress the tip is in the absent band and its
+            // frontier is not stored; the committer does not read it (it folds
+            // verified roots). Every other caller reaches here only below the upgrade
+            // height or at/above the handoff, where the tree is present.
             assert!(
-                self.vct_synced_below().is_some_and(|below| height < below),
+                self.vct_tree_absent(height),
                 "Sapling note commitment tree must exist if there is a finalized tip"
             );
             Default::default()
@@ -317,14 +317,11 @@ impl ZebraDb {
             return None;
         }
 
-        // On a verified-commitment-trees fast-synced database, the per-height
-        // trees below the checkpoint handoff height were never written. Return
-        // `None` rather than letting the backward search return a stale tree from
-        // an earlier height; the tree at the handoff height and above is present.
-        if self
-            .vct_synced_below()
-            .is_some_and(|boundary| *height < boundary)
-        {
+        // On a verified-commitment-trees fast-synced database, the per-height trees within the
+        // `[U, H)` absent band were never written. Return `None` rather than letting the backward
+        // search return a stale tree from an earlier height; trees below the upgrade height `U`
+        // (pre-upgrade) and at/above the handoff `H` (semantic sync) are present.
+        if self.vct_tree_absent(*height) {
             return None;
         }
 
@@ -436,10 +433,10 @@ impl ZebraDb {
         };
 
         self.orchard_tree_by_height(&height).unwrap_or_else(|| {
-            // See `sapling_tree_for_tip`: the fast-sync tip frontier below the
-            // handoff height is not stored and not read by the committer.
+            // See `sapling_tree_for_tip`: the fast-sync tip frontier in the absent
+            // band is not stored and not read by the committer.
             assert!(
-                self.vct_synced_below().is_some_and(|below| height < below),
+                self.vct_tree_absent(height),
                 "Orchard note commitment tree must exist if there is a finalized tip"
             );
             Default::default()
@@ -461,14 +458,11 @@ impl ZebraDb {
             return None;
         }
 
-        // On a verified-commitment-trees fast-synced database, the per-height
-        // trees below the checkpoint handoff height were never written. Return
-        // `None` rather than letting the backward search return a stale tree from
-        // an earlier height; the tree at the handoff height and above is present.
-        if self
-            .vct_synced_below()
-            .is_some_and(|boundary| *height < boundary)
-        {
+        // On a verified-commitment-trees fast-synced database, the per-height trees within the
+        // `[U, H)` absent band were never written. Return `None` rather than letting the backward
+        // search return a stale tree from an earlier height; trees below the upgrade height `U`
+        // (pre-upgrade) and at/above the handoff `H` (semantic sync) are present.
+        if self.vct_tree_absent(*height) {
             return None;
         }
 
@@ -670,6 +664,16 @@ impl DiskWriteBatch {
             ..
         } = finalized;
 
+        // Record the upgrade height `U` once, on the first block this binary commits: the lowest
+        // height in the serving index, and the boundary below which roots are served from the
+        // pre-upgrade per-height trees instead. Written on both commit paths so it is set even for
+        // a node that upgrades above the last checkpoint (legacy path only). Set-once: the marker
+        // is never moved, so the boundary stays stable as the chain grows. Commits are sequential,
+        // so the absent check sees the previous block's committed marker, not a half-written batch.
+        if zebra_db.vct_upgrade_height().is_none() {
+            self.update_vct_upgrade_marker(zebra_db, *height);
+        }
+
         // Mark the database as vct-synced (per-height note-commitment trees absent
         // below the checkpoint handoff height). Written in the same atomic batch as
         // every vct commit, so a vct-synced database always carries the marker and
@@ -866,6 +870,18 @@ impl DiskWriteBatch {
             .cf_handle(crate::service::finalized_state::VCT_SYNC_METADATA)
             .unwrap();
         self.zs_insert(&vct_sync_metadata, (), handoff);
+    }
+
+    /// Records the verified-commitment-trees upgrade height `U` = `height`, the lowest height this
+    /// binary commits and the lowest height in the serving index. Set once and never moved, so the
+    /// caller must only invoke this when [`vct_upgrade_height`](ZebraDb::vct_upgrade_height) is
+    /// still absent.
+    pub fn update_vct_upgrade_marker(&mut self, zebra_db: &ZebraDb, height: Height) {
+        let vct_upgrade_metadata = zebra_db
+            .db
+            .cf_handle(crate::service::finalized_state::VCT_UPGRADE_METADATA)
+            .unwrap();
+        self.zs_insert(&vct_upgrade_metadata, (), height);
     }
 
     /// Inserts the Sapling note commitment subtree into the batch.

@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extended value-pool disk serialization with an Ironwood slot after the deferred pool, and
   consolidated the current verified-commitment-trees state database format changes under
   version `27.3.0`.
+- Added the `vct_upgrade_metadata` column family, recording the upgrade height `U` (the lowest
+  height this binary committed). `tree_aux` root serving now stitches the per-height trees below
+  `U` with the serving index at and above `U`, so a node that upgraded mid-chain serves a range
+  crossing `U` as one gap-free batch instead of a short prefix that stalled the fetch client.
+  Historical note-commitment tree RPCs are unavailable only within the band `[U, H)` (where `H`
+  is the checkpoint handoff), and available below `U` and at or above `H`.
 
 ## [8.0.0] - 2026-06-02
 

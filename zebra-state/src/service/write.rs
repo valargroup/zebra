@@ -19,7 +19,10 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::block::{self, Height};
 
-use zebra_chain::parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees};
+use zebra_chain::parallel::{
+    commitment_aux::BlockCommitmentRoots,
+    tree::{BlockNotePrecompute, NoteCommitmentTrees},
+};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
@@ -166,11 +169,18 @@ fn commit_header_range(
     anchor: block::Hash,
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
+    tree_aux_roots: Vec<BlockCommitmentRoots>,
     rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
 ) {
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
     let result = batch
-        .prepare_header_range_batch(&finalized_state.db, anchor, &headers, &body_sizes)
+        .prepare_header_range_batch_with_roots(
+            &finalized_state.db,
+            anchor,
+            &headers,
+            &body_sizes,
+            &tree_aux_roots,
+        )
         .and_then(|hash| {
             finalized_state
                 .db
@@ -223,6 +233,7 @@ pub enum NonFinalizedWriteMessage {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
         rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
     },
     /// The hash of a block that should be invalidated and removed from
@@ -392,9 +403,17 @@ impl WriteBlockWorkerTask {
                     anchor,
                     headers,
                     body_sizes,
+                    tree_aux_roots,
                     rsp_tx,
                 }) => {
-                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    commit_header_range(
+                        finalized_state,
+                        anchor,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                        rsp_tx,
+                    );
                     continue;
                 }
                 Ok(msg) => deferred_non_finalized_messages.push_back(msg),
@@ -529,6 +548,9 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
+            let next_block_took_vct_path =
+                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+
             // Try committing the block
             match finalized_state.commit_finalized(
                 ordered_block,
@@ -537,6 +559,14 @@ impl WriteBlockWorkerTask {
                 next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Whether this successful commit consumed header-carried
+                    // tree-aux roots to skip the note-commitment frontier rebuild.
+                    if next_block_took_vct_path {
+                        metrics::counter!("state.vct.fast_path.hit").increment(1);
+                    } else {
+                        metrics::counter!("state.vct.fast_path.miss").increment(1);
+                    }
+
                     // A successful commit clears any VCT root stall: log recovery and reset
                     // the stalled-height gauge if it had been raised.
                     if vct_root_stall.is_some() {
@@ -558,15 +588,12 @@ impl WriteBlockWorkerTask {
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
                     // verifiable for lack of a buffered successor) park-and-retry the same
-                    // block in place rather than resetting the queue. Only an absent root
-                    // needs a peer refetch; an await-successor stall just waits for the next
-                    // block to be downloaded into the look-ahead, so it polls faster.
+                    // block in place rather than resetting the queue. An absent root waits
+                    // for header sync to deliver it; an await-successor stall just waits for
+                    // the next block to be downloaded into the look-ahead, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         metrics::counter!("state.vct.root.retry.count").increment(1);
                         let needs_refetch = error.vct_supplied_root_unavailable_height();
-                        if let Some(refetch_height) = needs_refetch {
-                            finalized_state.request_vct_peer_root_refetch(refetch_height);
-                        }
 
                         // Escalate a stall that persists on the same height past the warn
                         // threshold: a transient wait resolves in a few polls and stays
@@ -671,9 +698,17 @@ impl WriteBlockWorkerTask {
                     anchor,
                     headers,
                     body_sizes,
+                    tree_aux_roots,
                     rsp_tx,
                 } => {
-                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    commit_header_range(
+                        finalized_state,
+                        anchor,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                        rsp_tx,
+                    );
                     continue;
                 }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {

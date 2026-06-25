@@ -304,7 +304,7 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // Set the maximum checkpoint height to block 1, so the checkpoint phase ends once block 1 is
     // committed to the finalized state.
     let max_checkpoint_height = blocks[1].coinbase_height().unwrap();
-    let (mut state_service, _read, _tip, _tip_change, _) =
+    let (mut state_service, _read, _tip, _tip_change) =
         StateService::new(Config::ephemeral(), &network, max_checkpoint_height, 0).await;
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
@@ -393,7 +393,7 @@ async fn handoff_trigger_microbench() -> Result<()> {
 
     // Use `Height::MAX` so the height condition is never met: the helper runs its full guard but
     // never transitions, which is exactly the non-transitioning path we want to measure.
-    let (mut state_service, _read, _tip, _tip_change, _) =
+    let (mut state_service, _read, _tip, _tip_change) =
         StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
 
     for block in &blocks[0..=1] {
@@ -449,7 +449,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
 {
     let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
-    let (mut state_service, read_state, _, _, _) =
+    let (mut state_service, read_state, _, _) =
         StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
     let genesis =
         zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
@@ -517,6 +517,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![999_999, 0],
+                tree_aux_roots: Vec::new(),
             })
             .await?,
         Response::Committed(block2_hash),
@@ -667,7 +668,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
 ) -> std::result::Result<(), BoxError> {
     let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
-    let (mut state_service, read_state, _, _, _) =
+    let (mut state_service, read_state, _, _) =
         StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
     let genesis =
         zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
@@ -703,6 +704,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
             anchor: genesis.hash(),
             headers: vec![block1.header.clone(), block2.header.clone()],
             body_sizes: vec![999_999, 0],
+            tree_aux_roots: Vec::new(),
         }),
     )
     .await
@@ -732,7 +734,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
 async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<()> {
     let _init_guard = zebra_test::init();
     let network = Network::Mainnet;
-    let (state_service, _read_state, _, _, _) =
+    let (state_service, _read_state, _, _) =
         StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
     let block1 = Arc::new(
         network
@@ -914,7 +916,7 @@ proptest! {
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         let _init_guard = zebra_test::init();
-        let (mut state_service, _, _, _, _) = Runtime::new().unwrap().block_on(async {
+        let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
         });
@@ -1008,7 +1010,7 @@ proptest! {
     ) {
         let _init_guard = zebra_test::init();
 
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, _) = Runtime::new().unwrap().block_on(async {
+        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
         });

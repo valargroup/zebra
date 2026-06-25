@@ -22,7 +22,7 @@ use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
     orchard,
-    parallel::tree::NoteCommitmentTrees,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize as _},
@@ -43,10 +43,12 @@ use crate::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
+            shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, VCT_SYNC_METADATA, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     },
     HashOrHeight,
 };
@@ -512,6 +514,71 @@ impl ZebraDb {
         self.db.zs_get(&header_by_height, &height)
     }
 
+    /// Returns provisional Zakura header-ahead roots for the contiguous prefix of `range`.
+    pub fn zakura_header_commitment_roots_by_height_range(
+        &self,
+        range: std::ops::RangeInclusive<Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut roots = Vec::new();
+        for height in (range.start().0..=range.end().0).map(Height) {
+            let Some(value) = self
+                .db
+                .zs_get::<_, _, CommitmentRootsByHeight>(&cf, &height)
+            else {
+                break;
+            };
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: value.sapling,
+                orchard_root: value.orchard,
+            });
+        }
+        roots
+    }
+
+    /// Persist provisional header-ahead roots supplied by Zakura header sync.
+    pub fn insert_zakura_header_commitment_roots(
+        &self,
+        roots: impl IntoIterator<Item = BlockCommitmentRoots>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        for roots in roots {
+            batch.zs_insert(
+                &cf,
+                roots.height,
+                CommitmentRootsByHeight {
+                    sapling: roots.sapling_root,
+                    orchard: roots.orchard_root,
+                },
+            );
+        }
+        self.write_batch(batch)
+    }
+
+    /// Delete provisional header-ahead roots by height.
+    pub fn delete_zakura_header_commitment_roots(
+        &self,
+        heights: impl IntoIterator<Item = Height>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        for height in heights {
+            batch.zs_delete(&cf, height);
+        }
+        self.write_batch(batch)
+    }
+
     // The header readers below resolve from the consensus header column families
     // (`hash_by_height` / `height_by_hash` / `block_header_by_height`) *ungated*
     // by body availability, then fall back to the provisional Zakura frontier.
@@ -728,14 +795,15 @@ impl ZebraDb {
 
     // Verified-commitment-trees fast-sync methods
 
-    /// Returns the checkpoint handoff height of a verified-commitment-trees
-    /// fast-synced database: the lowest height at which a per-height
-    /// note-commitment tree is present.
+    /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced
+    /// database: the upper (exclusive) bound of the band `[U, H)` in which per-height
+    /// note-commitment trees are absent. `U` is [`vct_upgrade_height`](Self::vct_upgrade_height).
     ///
-    /// Per-height note-commitment trees are absent for every non-genesis height
-    /// strictly below this height (they were never written by the fast path).
-    /// Returns `None` if the database was synced normally (it has per-height trees
-    /// for all heights below the tip).
+    /// The fast path skips per-height trees only below the handoff; at and above `H`, semantic sync
+    /// writes them again. (Trees below the upgrade height `U` are also present — written before this
+    /// binary ran.) Returns `None` if the database was synced normally (per-height trees for every
+    /// height below the tip). Use [`vct_tree_absent`](Self::vct_tree_absent) to test a single
+    /// height rather than comparing against this bound directly.
     pub fn vct_synced_below(&self) -> Option<Height> {
         let vct_sync_metadata = self.db.cf_handle(VCT_SYNC_METADATA)?;
         self.db.zs_get(&vct_sync_metadata, &())
@@ -749,18 +817,46 @@ impl ZebraDb {
         self.vct_synced_below().is_some()
     }
 
-    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
-    /// whose per-height note-commitment tree is unavailable because this is a
-    /// vct-synced database (the tree below the checkpoint handoff height was
-    /// never written). Read-request handlers use this to return an archive-mode
-    /// error instead of a misleading "not found".
-    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
-        let Some(boundary) = self.vct_synced_below() else {
+    /// Returns the verified-commitment-trees upgrade height `U`: the lowest height this binary
+    /// committed, equal to the lowest height in the `commitment_roots_by_height` serving index.
+    ///
+    /// Written once on the first committed block and never moved (see
+    /// [`VCT_UPGRADE_METADATA`](crate::service::finalized_state::VCT_UPGRADE_METADATA)). Heights
+    /// below `U` predate this binary, so they hold per-height trees but no index entry; heights at
+    /// or above `U` hold an index entry. Returns `None` for a database written before this marker
+    /// existed (a pre-index archive database), where every height is served from the trees.
+    pub fn vct_upgrade_height(&self) -> Option<Height> {
+        let vct_upgrade_metadata = self.db.cf_handle(VCT_UPGRADE_METADATA)?;
+        self.db.zs_get(&vct_upgrade_metadata, &())
+    }
+
+    /// Returns `true` if the per-height note-commitment tree at `height` was never written because
+    /// this is a vct-synced database, i.e. `height` falls in the absent band `[U, H)`.
+    ///
+    /// `U` is the upgrade height ([`vct_upgrade_height`](Self::vct_upgrade_height)) and `H` is the
+    /// checkpoint handoff ([`vct_synced_below`](Self::vct_synced_below)). The fast path skips
+    /// per-height trees only at and after the upgrade and only below the checkpoint: heights below
+    /// `U` keep their pre-upgrade trees, and heights at or above `H` get trees again from semantic
+    /// sync. Returns `false` for a normally-synced database (`H` is `None`). When `H` is set, `U`
+    /// is too (both are written by the commit path), but `U` defaults to genesis if ever absent,
+    /// which preserves the original "absent below `H`" behaviour.
+    pub fn vct_tree_absent(&self, height: Height) -> bool {
+        let Some(handoff) = self.vct_synced_below() else {
             return false;
         };
+        let upgrade = self.vct_upgrade_height().unwrap_or(Height(0));
+        upgrade <= height && height < handoff
+    }
+
+    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
+    /// whose per-height note-commitment tree is unavailable because this is a
+    /// vct-synced database (the tree within the `[U, H)` absent band was never
+    /// written). Read-request handlers use this to return an archive-mode error
+    /// instead of a misleading "not found".
+    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
         hash_or_height
             .height_or_else(|hash| self.height(hash))
-            .is_some_and(|height| height < boundary)
+            .is_some_and(|height| self.vct_tree_absent(height))
     }
 
     /// Returns the half-open range of block heights `[from, until)` whose raw
@@ -1367,6 +1463,11 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
+        let zakura_header_commitment_roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1744,6 +1845,19 @@ impl DiskWriteBatch {
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
+        self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &[])
+    }
+
+    /// Prepare a database batch containing a contextually validated header range
+    /// and optional all-or-nothing provisional tree-aux roots.
+    pub fn prepare_header_range_batch_with_roots(
+        &mut self,
+        zebra_db: &ZebraDb,
+        anchor: block::Hash,
+        headers: &[Arc<block::Header>],
+        body_sizes: &[u32],
+        tree_aux_roots: &[BlockCommitmentRoots],
+    ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
         }
@@ -1752,6 +1866,13 @@ impl DiskWriteBatch {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
                 headers: headers.len(),
                 body_sizes: body_sizes.len(),
+            });
+        }
+
+        if !tree_aux_roots.is_empty() && headers.len() != tree_aux_roots.len() {
+            return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
+                headers: headers.len(),
+                roots: tree_aux_roots.len(),
             });
         }
 
@@ -1767,6 +1888,10 @@ impl DiskWriteBatch {
         let body_size_by_height = zebra_db
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+        let roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
             .unwrap();
 
         let anchor_height = zebra_db
@@ -1802,6 +1927,14 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if roots.height != height {
+                    return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                        expected_height: height,
+                        root_height: roots.height,
+                    });
+                }
+            }
 
             if let Some(expected) = checkpoints.hash(height) {
                 if expected != hash {
@@ -1912,10 +2045,12 @@ impl DiskWriteBatch {
                 self.zs_delete(&hash_by_height, height);
                 self.zs_delete(&header_by_height, height);
                 self.zs_delete(&body_size_by_height, height);
+                self.zs_delete(&roots_by_height, height);
             }
         }
 
-        for (height, hash, header, body_size) in validated_headers {
+        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
+        {
             self.zs_insert(&header_by_height, height, header);
             self.zs_insert(&hash_by_height, height, hash);
             self.zs_insert(&height_by_hash, hash, height);
@@ -1923,6 +2058,17 @@ impl DiskWriteBatch {
                 self.zs_insert(&body_size_by_height, height, body_size);
             } else {
                 self.zs_delete(&body_size_by_height, height);
+            }
+
+            if let Some(roots) = tree_aux_roots.get(index) {
+                self.zs_insert(
+                    &roots_by_height,
+                    height,
+                    CommitmentRootsByHeight {
+                        sapling: roots.sapling_root,
+                        orchard: roots.orchard_root,
+                    },
+                );
             }
         }
 

@@ -94,9 +94,8 @@ use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use zakura::{
     drive_block_sync_actions, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
-    query_block_sync_frontiers, run_tree_aux_driver, zakura_header_sync_driver_startup,
-    BlocksyncThroughputProbe, BlocksyncThroughputSummary, StateTreeAuxPort,
-    ZakuraHeaderSyncDriverHandles,
+    query_block_sync_frontiers, zakura_header_sync_driver_startup, BlocksyncThroughputProbe,
+    BlocksyncThroughputSummary, ZakuraHeaderSyncDriverHandles,
 };
 
 use crate::{
@@ -549,20 +548,15 @@ impl StartCmd {
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
         state_config.disable_vct_fast_sync = config.consensus.disable_vct_fast_sync;
 
-        let (
-            state_service,
-            read_only_state_service,
-            latest_chain_tip,
-            chain_tip_change,
-            tree_aux_roots_writer,
-        ) = zebra_state::init(
-            state_config,
-            &config.network.network,
-            max_checkpoint_height,
-            config.sync.checkpoint_verify_concurrency_limit
-                * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-        )
-        .await;
+        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+            zebra_state::init(
+                state_config,
+                &config.network.network,
+                max_checkpoint_height,
+                config.sync.checkpoint_verify_concurrency_limit
+                    * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+            )
+            .await;
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -637,19 +631,6 @@ impl StartCmd {
             PeerServices::NODE_NETWORK
         };
 
-        // Verified-commitment-trees `tree_aux` serving port: under the Zakura sync path,
-        // register the roots service so this node both advertises the capability and
-        // answers `GetRoots` from local state (a node serves the roots it can derive; a
-        // fast-synced node holds none and reports the range unavailable).
-        let tree_aux_port: Option<std::sync::Arc<dyn zebra_network::zakura::TreeAuxStatePort>> =
-            if config.network.v2_p2p {
-                Some(std::sync::Arc::new(StateTreeAuxPort::new(
-                    read_only_state_service.clone(),
-                )))
-            } else {
-                None
-            };
-
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zebra_network::init_with_zakura_header_sync(
                 config.network.clone(),
@@ -658,7 +639,6 @@ impl StartCmd {
                 user_agent(),
                 advertised_services,
                 zakura_header_sync_driver_startup,
-                tree_aux_port,
             )
             .await;
 
@@ -698,24 +678,6 @@ impl StartCmd {
                     .in_current_span(),
                 );
                 endpoint.push_header_sync_task(driver_task).await;
-
-                // Verified-commitment-trees `tree_aux` peer-source driver: when the
-                // committer is built in peer mode (the default where embedded final
-                // frontiers exist), fetch the checkpoint roots from a peer into the
-                // committer's cache, ahead of body commit.
-                if let Some(writer) = tree_aux_roots_writer {
-                    let tree_aux_task = tokio::spawn(
-                        run_tree_aux_driver(
-                            endpoint.supervisor(),
-                            writer,
-                            config.network.network.clone(),
-                            read_only_state_service.clone(),
-                            shutdown.clone().cancelled_owned(),
-                        )
-                        .in_current_span(),
-                    );
-                    endpoint.push_header_sync_task(tree_aux_task).await;
-                }
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),
@@ -2091,6 +2053,7 @@ mod zakura_header_sync_driver_tests {
     use tower::{service_fn, util::BoxService, ServiceExt};
     use zebra_chain::block;
     use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_chain::{orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
     use zebra_network::zakura::{
         commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
@@ -2109,13 +2072,22 @@ mod zakura_header_sync_driver_tests {
         coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
         drive_zakura_header_sync_actions, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
+        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    fn root_at(height: block::Height) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height,
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }
     }
 
     #[derive(Debug)]
@@ -2197,6 +2169,46 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             body_sizes_for_served_header_range(start, header_heights, &[]),
             vec![0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn served_header_tree_aux_roots_require_complete_coverage() {
+        let start = block::Height(10);
+        let header_heights = [
+            block::Height(10),
+            block::Height(11),
+            block::Height(12),
+            block::Height(13),
+        ];
+        let roots = [root_at(block::Height(10)), root_at(block::Height(11))];
+
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots).is_err(),
+            "partial root coverage is reported before serving rootless headers"
+        );
+
+        let roots_with_gap = [
+            root_at(block::Height(10)),
+            root_at(block::Height(12)),
+            root_at(block::Height(13)),
+        ];
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap).is_err(),
+            "root gaps are reported before serving rootless headers"
+        );
+
+        let complete_roots = [
+            root_at(block::Height(10)),
+            root_at(block::Height(11)),
+            root_at(block::Height(12)),
+            root_at(block::Height(13)),
+        ];
+        assert_eq!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &complete_roots)
+                .expect("complete roots match the served header range"),
+            complete_roots.to_vec(),
+            "complete root coverage is attached to the served header range"
         );
     }
 
@@ -2597,7 +2609,6 @@ mod zakura_header_sync_driver_tests {
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
             }),
-            None,
         )
         .await
         .expect("Zakura endpoint starts")

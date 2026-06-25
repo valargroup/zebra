@@ -60,10 +60,9 @@ use crate::{
         ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
         CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
-        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, MAX_TA_MESSAGE_BYTES, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
-        ZAKURA_STREAM_TREE_AUX,
+        MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -176,7 +175,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_2 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_4 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -1263,15 +1262,8 @@ pub(crate) fn service_registry(
     block_sync_config: ZakuraBlockSyncConfig,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<dyn Service>,
-    tree_aux_port: Option<Arc<dyn super::TreeAuxStatePort>>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone(), discovery_service];
-    // The verified-commitment-trees `tree_aux` roots service, when enabled. Registering
-    // it both advertises the capability (so this node can fetch) and serves roots from
-    // local state (design §9).
-    if let Some(tree_aux_port) = tree_aux_port {
-        services.push(Arc::new(super::TreeAuxService::new(tree_aux_port)) as Arc<dyn Service>);
-    }
     if let Some(header_sync) = &header_sync {
         services.push(Arc::new(HeaderSyncService::new(header_sync.clone())) as Arc<dyn Service>);
     } else {
@@ -2442,18 +2434,14 @@ pub async fn spawn_zakura_endpoint(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
-    spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None, None).await
+    spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None).await
 }
 
 /// Start a Zakura endpoint with an externally driven header-sync reactor.
-///
-/// `tree_aux_port`, when `Some`, registers the verified-commitment-trees `tree_aux`
-/// roots service (advertising the capability and serving roots from local state).
 pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
-    tree_aux_port: Option<Arc<dyn super::TreeAuxStatePort>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p {
         return Ok(None);
@@ -2572,7 +2560,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.block_sync.clone(),
         legacy_service,
         discovery_service,
-        tree_aux_port,
     )?;
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
@@ -3380,10 +3367,6 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
-/// Maximum response frames a generic (non-legacy) request/response stream may return.
-/// `tree_aux` answers with a single frame; a small bound guards against a runaway peer.
-const MAX_GENERIC_RESPONSE_FRAMES: usize = 4;
-
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
@@ -3393,16 +3376,12 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    // The legacy request stream validates responses with a legacy-message-specific
-    // budget. Generic request/response streams (e.g. `tree_aux`) read response frames
-    // bounded only by the stream's frame cap and a small response-frame count.
-    let mut legacy_state = if stream_kind == ZAKURA_STREAM_TREE_AUX {
-        None
-    } else {
-        Some(LegacyResponseReadState::new(
-            LegacyResponseBudget::from_request(message_type, &payload, limits)?,
-        ))
-    };
+    // The legacy request stream validates responses with a legacy-message-specific budget.
+    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
+        message_type,
+        &payload,
+        limits,
+    )?);
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -3439,7 +3418,6 @@ async fn write_outbound_request_frame_inner(
     let _ = send.finish();
 
     let mut frames = Vec::new();
-    let mut generic_frame_count = 0usize;
     loop {
         match read_frame(
             &mut recv,
@@ -3453,22 +3431,11 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                if let Some(state) = legacy_state.as_mut() {
-                    state.validate_frame(request_id, &frame)?;
-                } else {
-                    generic_frame_count += 1;
-                    if generic_frame_count > MAX_GENERIC_RESPONSE_FRAMES {
-                        return Err(OutboundRequestError::Fatal(
-                            "generic request/response exceeded the response frame limit".into(),
-                        ));
-                    }
-                }
+                legacy_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                if let Some(state) = legacy_state.take() {
-                    state.finish()?;
-                }
+                legacy_state.finish()?;
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
@@ -4065,12 +4032,6 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
             limits.max_frame_bytes.min(header_sync_cap)
         }
         ZAKURA_STREAM_BLOCK_SYNC => limits.max_frame_bytes.min(MAX_BS_FRAME_BYTES),
-        ZAKURA_STREAM_TREE_AUX => {
-            let tree_aux_cap =
-                u32::try_from(MAX_TA_MESSAGE_BYTES.saturating_add(FRAME_HEADER_BYTES))
-                    .expect("tree-aux frame cap fits in u32");
-            limits.max_frame_bytes.min(tree_aux_cap)
-        }
         _ => limits.max_frame_bytes.min(LOCAL_MAX_CONTROL_FRAME_BYTES),
     }
     .max(1)
@@ -4114,7 +4075,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_2: u16 = 2;
+const ZAKURA_STREAM_VERSION_4: u16 = 4;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4885,7 +4846,6 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             recorder.clone(),
             test_discovery_service(&supervisor),
-            None,
         )?;
         let peer = test_peer(6);
 
@@ -4914,6 +4874,7 @@ mod tests {
         let get_headers_frame = HeaderSyncMessage::GetHeaders {
             start_height: block::Height(1),
             count: 1,
+            want_tree_aux_roots: false,
         }
         .encode_frame()?;
 
@@ -5107,7 +5068,6 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             test_discovery_service(&supervisor),
-            None,
         )?;
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
@@ -5142,6 +5102,7 @@ mod tests {
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: block::Height(1),
                     count: 1,
+                    want_tree_aux_roots: false,
                 },
             })
             .await?;
@@ -5188,7 +5149,6 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
-            None,
         )?;
         let peer_node_id = SecretKey::from_bytes(&[13u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -5292,7 +5252,6 @@ mod tests {
             ZakuraBlockSyncConfig::default(),
             Arc::new(RecordingService::default()),
             discovery_service,
-            None,
         )?;
         let peer_node_id = SecretKey::from_bytes(&[14u8; 32]).public();
         let peer = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -6475,7 +6434,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_2,
+                    version: ZAKURA_STREAM_VERSION_4,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -6495,7 +6454,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_2),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_4),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(

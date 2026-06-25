@@ -172,13 +172,15 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
     use zebra_chain::{
-        block,
+        block, orchard,
+        parallel::commitment_aux::BlockCommitmentRoots,
         parameters::{
             testnet::{
                 ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters as TestnetParameters,
             },
             Network,
         },
+        sapling,
         serialization::{ZcashDeserializeInto, ZcashSerialize},
     };
     use zebra_test::vectors::{
@@ -188,10 +190,58 @@ mod tests {
 
     fn headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
         let body_sizes = vec![0; headers.len()];
+        let start_height = headers
+            .first()
+            .map(|header| test_header_height(header.as_ref()))
+            .unwrap_or(block::Height(1));
+        let tree_aux_roots = roots_from_height(start_height, headers.len());
         HeaderSyncMessage::Headers {
             headers,
             body_sizes,
+            tree_aux_roots,
         }
+    }
+
+    /// A `Headers` response with no tree-aux roots, as a peer answers a request
+    /// that did not set `want_tree_aux_roots` (a non-finalized range). The
+    /// reactor rejects roots on a non-finalized range as `MalformedMessage`.
+    fn headers_message_without_roots(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+        let body_sizes = vec![0; headers.len()];
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+            tree_aux_roots: Vec::new(),
+        }
+    }
+
+    fn root_at(height: block::Height) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height,
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        }
+    }
+
+    fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockCommitmentRoots> {
+        (0..count)
+            .map(|offset| {
+                let offset = u32::try_from(offset).expect("test root count fits in u32");
+                root_at(block::Height(start_height.0 + offset))
+            })
+            .collect()
+    }
+
+    fn test_header_height(header: &block::Header) -> block::Height {
+        let hash = block::Hash::from(header);
+        if hash == mainnet_genesis_hash() {
+            return block::Height(0);
+        }
+
+        (1..=5)
+            .find_map(|height| {
+                (hash == mainnet_block(block_bytes(height)).hash()).then_some(block::Height(height))
+            })
+            .unwrap_or(block::Height(1))
     }
 
     #[derive(Debug, Default)]
@@ -779,6 +829,7 @@ mod tests {
                                     HeaderSyncMessage::GetHeaders {
                                         start_height: actual_start,
                                         count: actual_count,
+                                        ..
                                     } if *actual_start == start_height && *actual_count == count
                                 )
                         })
@@ -843,7 +894,12 @@ mod tests {
                             .push((peer, HeaderSyncMessage::NewBlock(block)));
                     }
                 }
-                HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                HeaderSyncAction::QueryHeadersByHeightRange {
+                    peer,
+                    start,
+                    count,
+                    want_tree_aux_roots,
+                } => {
                     let headers = local
                         .store
                         .lock()
@@ -851,11 +907,20 @@ mod tests {
                         .headers_by_range(start, count);
                     let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     if let Some(target) = peer_to_index.get(&peer) {
+                        // Mirror production serving: only a finalized-range
+                        // requester (`want_tree_aux_roots`) receives roots; a
+                        // non-finalized requester must get a roots-free response
+                        // or the reactor rejects it as `MalformedMessage`.
+                        let msg = if want_tree_aux_roots {
+                            headers_message(headers)
+                        } else {
+                            headers_message_without_roots(headers)
+                        };
                         let _ = nodes[*target]
                             .handle
                             .send(HeaderSyncEvent::WireMessage {
                                 peer: local.peer_id.clone(),
-                                msg: headers_message(headers),
+                                msg,
                             })
                             .await;
                         let _ = local
@@ -1236,7 +1301,9 @@ mod tests {
                             .expect("misbehavior list mutex is not poisoned")
                             .push(reason);
                     }
-                    HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+                    HeaderSyncAction::QueryHeadersByHeightRange {
+                        peer, start, count, ..
+                    } => {
                         let Some(handle) = endpoint.header_sync() else {
                             continue;
                         };
@@ -2731,8 +2798,13 @@ mod tests {
         cluster.start_drivers();
         cluster.connect_all().await;
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
+        // `with_checkpoint_anchor(3)` pre-sets `finalized_height = 3`, so waiting
+        // on the finalized height is a no-op that returns before the backward
+        // checkpoint range (1..=3) has actually been backfilled. Wait instead for
+        // the backfilled headers to land in the store, so the `(1, 3)` commit
+        // trace below is asserted only after the backward range has committed.
         await_until(
-            "checkpoint backfill finalized",
+            "checkpoint backfill committed",
             Duration::from_secs(5),
             || {
                 cluster
@@ -2743,8 +2815,8 @@ mod tests {
                     .store
                     .lock()
                     .expect("test store mutex is not poisoned")
-                    .finalized_height
-                    >= block::Height(3)
+                    .headers
+                    .contains_key(&block::Height(1))
             },
         )
         .await?;
@@ -2954,7 +3026,9 @@ mod tests {
             .inject(
                 victim,
                 out_of_range,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+                headers_message_without_roots(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES)
+                    .header
+                    .clone()]),
             )
             .await;
         cluster
@@ -2974,6 +3048,7 @@ mod tests {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(start),
                         count: 1,
+                        want_tree_aux_roots: false,
                     },
                 )
                 .await;
@@ -2996,7 +3071,7 @@ mod tests {
             .inject(
                 victim,
                 response_too_long,
-                headers_message(vec![
+                headers_message_without_roots(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                 ]),
@@ -3034,7 +3109,7 @@ mod tests {
             .inject(
                 bad_continuity_victim,
                 bad_continuity,
-                headers_message(vec![
+                headers_message_without_roots(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
                 ]),
@@ -3066,7 +3141,7 @@ mod tests {
             .inject(
                 bad_pow_victim,
                 bad_pow,
-                headers_message(vec![Arc::new(bad_pow_header)]),
+                headers_message_without_roots(vec![Arc::new(bad_pow_header)]),
             )
             .await;
         cluster
@@ -3099,7 +3174,7 @@ mod tests {
             .inject(
                 bad_daa_victim,
                 bad_daa,
-                headers_message(vec![
+                headers_message_without_roots(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
@@ -3166,6 +3241,7 @@ mod tests {
                 HeaderSyncMessage::GetHeaders {
                     start_height: block::Height(1),
                     count: 4_001,
+                    want_tree_aux_roots: false,
                 },
             )
             .await;

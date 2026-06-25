@@ -82,11 +82,13 @@ impl HeaderSyncCore {
         if count == 0 {
             return;
         }
+        let want_tree_aux_roots = self.wants_tree_aux_roots(start, end, startup);
         self.schedule.ensure_forward(RangeRequest {
             start_height: start,
             count,
             anchor_hash: self.best_header_hash,
             finalized,
+            want_tree_aux_roots,
             priority: RangePriority::Forward,
         });
     }
@@ -116,8 +118,20 @@ impl HeaderSyncCore {
             count,
             anchor_hash: previous_hash,
             finalized: true,
+            want_tree_aux_roots: true,
             priority: RangePriority::Backward,
         });
+    }
+
+    fn wants_tree_aux_roots(
+        &self,
+        start: block::Height,
+        end: block::Height,
+        startup: &HeaderSyncStartup,
+    ) -> bool {
+        let last_checkpoint_height = startup.network.checkpoint_list().max_height();
+
+        start <= last_checkpoint_height && end > self.verified_block_tip
     }
 }
 
@@ -335,6 +349,7 @@ pub(super) struct RangeRequest {
     pub(super) count: u32,
     pub(super) anchor_hash: block::Hash,
     pub(super) finalized: bool,
+    pub(super) want_tree_aux_roots: bool,
     pub(super) priority: RangePriority,
 }
 
@@ -354,4 +369,13 @@ impl RangeRequest {
 pub(super) enum RangePriority {
     Forward,
     Backward,
+}
+
+impl RangePriority {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RangePriority::Forward => "forward",
+            RangePriority::Backward => "backward",
+        }
+    }
 }

@@ -11,7 +11,6 @@ pub(crate) mod block_sync_driver;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
-pub(crate) mod tree_aux_driver;
 
 pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
@@ -27,14 +26,13 @@ pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_st
 pub(crate) use header_sync_driver::{
     block_sync_chain_tip_event, body_sizes_for_served_header_range,
     chain_tip_mirror_frontier_change, header_range_commit_failure_kind,
-    notify_block_sync_header_tip,
+    notify_block_sync_header_tip, tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{
     drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
     zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
-pub(crate) use tree_aux_driver::{run_tree_aux_driver, StateTreeAuxPort};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 

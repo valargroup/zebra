@@ -129,14 +129,10 @@ use vct::VctState;
 
 /// The verified-commitment-trees `tree_aux` serving read path (design §9): the per-block
 /// commitment roots for a height range, derived from the per-height trees.
-pub(crate) use commitment_aux::produce_block_roots;
+pub(crate) use commitment_aux::serve_block_roots;
 
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
-
-/// The verified-commitment-trees `tree_aux` peer-source write handle, root-refetch
-/// signal, and their per-state accessors.
-pub(crate) use commitment_aux::PeerSourceHandle;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -181,6 +177,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_height_by_hash",
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+    ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",
@@ -214,6 +211,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
+    VCT_UPGRADE_METADATA,
 ];
 
 /// The name of the column family that records pruning progress.
@@ -244,6 +242,21 @@ pub const PRUNING_METADATA: &str = "pruning_metadata";
 /// the trees); a database can be both.
 pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
 
+/// The name of the column family that records the verified-commitment-trees upgrade height.
+///
+/// This holds a single entry, keyed by the unit value `()`, mapping to `U`: the lowest height
+/// this (vct-aware) binary committed, which is also the lowest height present in the
+/// [`COMMITMENT_ROOTS_BY_HEIGHT`] serving index. It is written once — on the first committed
+/// block — and never moved, so it is a stable boundary as the chain grows.
+///
+/// `U` is what lets the two root sources be stitched without a gap: heights below `U` predate
+/// this binary, so they carry per-height trees but no index entry and are served from the trees;
+/// heights at or above `U` carry an index entry and are served from it. Combined with the
+/// checkpoint handoff `H` in [`VCT_SYNC_METADATA`], it also bounds the band `[U, H)` in which a
+/// vct-synced node holds no per-height tree, so historical tree/subtree RPCs are unavailable
+/// there but available below `U` (pre-upgrade trees) and at/above `H` (semantic-sync trees).
+pub const VCT_UPGRADE_METADATA: &str = "vct_upgrade_metadata";
+
 /// The name of the column family holding the per-height Sapling/Orchard note-commitment
 /// roots, keyed by [`block::Height`].
 ///
@@ -257,6 +270,16 @@ pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
 /// reads this index first and falls back to the trees only for databases written before the
 /// index existed.
 pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
+
+/// Provisional peer-supplied per-height Sapling/Orchard roots attached to Zakura
+/// header-sync responses.
+///
+/// These roots are advisory metadata for header-ahead blocks. They are persisted
+/// with `zakura_header_*` so VCT fast sync can read them before full block bodies
+/// arrive, but they remain untrusted until block commit verifies them against the
+/// header commitments.
+pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
+    "zakura_header_commitment_roots_by_height";
 
 /// The finalized part of the chain state, stored in the db.
 ///
@@ -314,7 +337,7 @@ pub struct FinalizedState {
     /// when legacy recompute is selected. Shared across clones.
     vct: Option<Arc<VctState>>,
 
-    /// POC verify-before-commit dedup. Holds the `(height, hash)` of the next
+    /// Verify-before-commit dedup. Holds the `(height, hash)` of the next
     /// block whose commitment was already validated by the previous fast
     /// commit's look-ahead (`C(next, candidate)`). When the next block to commit
     /// matches, its own commitment check is the identical computation, so it is
@@ -466,6 +489,7 @@ impl FinalizedState {
             config.checkpoint_sync,
             config.disable_vct_fast_sync,
             network,
+            db.clone(),
         );
 
         // Re-derive the frozen-frontier flag from durable state: a fast sync
@@ -795,7 +819,10 @@ impl FinalizedState {
 
                 // The last checkpoint height (boundary below which the vct
                 // path skips per-height trees), when final frontiers are loaded.
-                let vct_last_checkpoint_height = self.vct.as_ref().and_then(|v| v.vct_sync_last_checkpoint_height());
+                let vct_last_checkpoint_height = self
+                    .vct
+                    .as_ref()
+                    .and_then(|v| v.vct_sync_last_checkpoint_height());
 
                 // In vct mode, if the source has this height's roots at or below the
                 // last checkpoint height, skip the per-block note-commitment frontier recompute
@@ -804,7 +831,9 @@ impl FinalizedState {
                 // parent frontier; nothing below the checkpoint reads it for consensus.
                 // See docs/design/verified-commitment-trees.md.
                 let vct_roots = self.vct.as_ref().and_then(|v| {
-                    if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| height > last_checkpoint_height) {
+                    if vct_last_checkpoint_height
+                        .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
+                    {
                         None
                     } else {
                         v.vct_roots_at_height(height)
@@ -1196,28 +1225,6 @@ impl FinalizedState {
         self.vct
             .as_ref()
             .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
-    /// The per-state `tree_aux` peer-source driver handle, if peer mode is active.
-    pub(crate) fn tree_aux_roots_handle(&self) -> Option<PeerSourceHandle> {
-        self.vct.as_ref().and_then(|v| v.peer_source_handle())
-    }
-
-    /// Request a targeted peer-root refetch for `height`.
-    pub(crate) fn request_vct_peer_root_refetch(&self, height: block::Height) {
-        if self
-            .vct
-            .as_ref()
-            .is_some_and(|v| v.request_peer_root_refetch(height))
-        {
-            return;
-        }
-
-        metrics::counter!("state.vct.root.refetch.no_sender.count").increment(1);
-        tracing::debug!(
-            ?height,
-            "VCT: requested peer root refetch before the peer-source signal was installed"
-        );
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.

@@ -59,8 +59,8 @@ use crate::{
     },
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
     Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    TreeAuxRootsWriter,
 };
+use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
 pub mod block_iter;
 pub mod chain_tip;
@@ -328,13 +328,7 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> (
-        Self,
-        ReadStateService,
-        LatestChainTip,
-        ChainTipChange,
-        Option<TreeAuxRootsWriter>,
-    ) {
+    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -357,9 +351,6 @@ impl StateService {
             .await
             .expect("failed to join blocking task")
         };
-        let tree_aux_roots_writer = finalized_state
-            .tree_aux_roots_handle()
-            .map(TreeAuxRootsWriter);
 
         // # Correctness
         //
@@ -503,13 +494,7 @@ impl StateService {
             }
         });
 
-        (
-            state,
-            read_service,
-            latest_chain_tip,
-            chain_tip_change,
-            tree_aux_roots_writer,
-        )
+        (state, read_service, latest_chain_tip, chain_tip_change)
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -1009,6 +994,7 @@ impl StateService {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
@@ -1022,6 +1008,7 @@ impl StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
                 rsp_tx,
             })
         {
@@ -1260,9 +1247,12 @@ impl Service<Request> for StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
             } => {
                 let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
+                    span.in_scope(|| {
+                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
+                    })
                 });
 
                 let span = Span::current();
@@ -1564,28 +1554,53 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // Serve from the compact `commitment_roots_by_height` index, which every
-                // node persists for each committed block — including a fast-synced node that
-                // holds no per-height trees (design §4). This is what keeps the root-serving
-                // fleet from collapsing as nodes adopt fast sync. For a database written
-                // before the index existed (a pre-index archive node), the index is empty, so
-                // fall back to deriving the roots from the per-height trees when present. The
-                // range is clamped to the tip; out-of-range or empty requests return no roots.
-                let roots = match state.db.finalized_tip_height() {
-                    Some(tip) if count > 0 && start_height <= tip => {
+                // Serve stitched committed verified roots first, then provisional
+                // header-ahead roots for heights that have headers but no committed
+                // body yet. Committed roots win for overlapping heights because
+                // they have already been verified during block commit.
+                let roots = if count == 0 {
+                    Vec::new()
+                } else if let Some((tip, _hash)) = state.db.best_header_tip() {
+                    if start_height > tip {
+                        Vec::new()
+                    } else {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
-                        let range = start_height..=block::Height(last);
-                        let indexed = state.db.commitment_roots_by_height_range(range.clone());
-                        if !indexed.is_empty() || state.db.is_vct_synced() {
-                            // Indexed roots (the common path), or a fast-synced node whose only
-                            // possible source is the index — never the absent per-height trees.
-                            indexed
+                        let requested = start_height..=block::Height(last);
+                        let committed_end = state
+                            .db
+                            .finalized_tip_height()
+                            .map(|finalized_tip| finalized_tip.min(*requested.end()))
+                            .filter(|committed_end| start_height <= *committed_end);
+
+                        let mut roots = if let Some(committed_end) = committed_end {
+                            finalized_state::serve_block_roots(
+                                &state.db,
+                                start_height..=committed_end,
+                            )
                         } else {
-                            // Pre-index archive database: derive from the per-height trees.
-                            finalized_state::produce_block_roots(&state.db, range)
+                            Vec::new()
+                        };
+
+                        let next_height = roots
+                            .last()
+                            .and_then(|root| root.height.next().ok())
+                            .unwrap_or(start_height);
+                        if next_height <= *requested.end() {
+                            // Extend the committed prefix with provisional Zakura header-ahead roots.
+                            // These are peer-supplied advisory roots for heights whose headers are known
+                            // but whose block bodies have not been committed yet. Once a block is
+                            // committed, its verified roots move to the committed index and the
+                            // provisional row for that height is deleted.
+                            let provisional =
+                                state.db.zakura_header_commitment_roots_by_height_range(
+                                    next_height..=*requested.end(),
+                                );
+                            roots.extend(provisional);
                         }
+                        roots
                     }
-                    _ => Vec::new(),
+                } else {
+                    Vec::new()
                 };
                 Ok(ReadResponse::BlockRoots(roots))
             }
@@ -2087,28 +2102,21 @@ pub async fn init(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
-    Option<TreeAuxRootsWriter>,
 ) {
-    let (
-        state_service,
-        read_only_state_service,
-        latest_chain_tip,
-        chain_tip_change,
-        tree_aux_roots_writer,
-    ) = StateService::new(
-        config,
-        network,
-        max_checkpoint_height,
-        checkpoint_verify_concurrency_limit,
-    )
-    .await;
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        StateService::new(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+        )
+        .await;
 
     (
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
-        tree_aux_roots_writer,
     )
 }
 
@@ -2169,7 +2177,7 @@ pub fn spawn_init_read_only(
 pub async fn init_test(
     network: &Network,
 ) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
-    let (state_service, _, _, _, _) = init_test_services_inner(network).await;
+    let (state_service, _, _, _) = init_test_services_inner(network).await;
 
     state_service
 }
@@ -2187,31 +2195,6 @@ pub async fn init_test_services(
     LatestChainTip,
     ChainTipChange,
 ) {
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _) =
-        init_test_services_inner(network).await;
-
-    (
-        state_service,
-        read_state_service,
-        latest_chain_tip,
-        chain_tip_change,
-    )
-}
-
-/// Initializes a state service with an ephemeral [`Config`] and returns its optional
-/// `tree_aux` roots writer for integration tests that need to exercise the peer source.
-///
-/// This is the same setup as [`init_test_services`], with the test-only writer included.
-#[cfg(any(test, feature = "proptest-impl"))]
-pub async fn init_test_services_with_tree_aux_writer(
-    network: &Network,
-) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-    Option<TreeAuxRootsWriter>,
-) {
     init_test_services_inner(network).await
 }
 
@@ -2223,11 +2206,10 @@ async fn init_test_services_inner(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
-    Option<TreeAuxRootsWriter>,
 ) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, tree_aux_writer) =
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
@@ -2237,6 +2219,5 @@ async fn init_test_services_inner(
         read_state_service,
         latest_chain_tip,
         chain_tip_change,
-        tree_aux_writer,
     )
 }

@@ -44,6 +44,7 @@ use crate::{
                 ZebraDb,
             },
             COMMITMENT_ROOTS_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
+            ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -935,6 +936,10 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         .db
         .cf_handle("zakura_header_body_size_by_height")
         .unwrap();
+    let roots_by_height = db
+        .db
+        .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+        .unwrap();
 
     let Some((tip_height, _tip_hash)) = db
         .db
@@ -950,6 +955,7 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         batch.zs_delete(&hash_by_height, height);
         batch.zs_delete(&header_by_height, height);
         batch.zs_delete(&body_size_by_height, height);
+        batch.zs_delete(&roots_by_height, height);
     }
 }
 
@@ -1277,6 +1283,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(1), Height(2)],
             "rollback truncates the serving index above the target"
+        );
+    }
+
+    /// `vct_tree_absent` marks exactly the half-open band `[U, H)`: heights below the upgrade
+    /// height `U` keep their pre-upgrade trees, and heights at or above the handoff `H` get trees
+    /// again from semantic sync. With no handoff marker the database is a normal archive and no
+    /// height is ever absent.
+    #[test]
+    fn vct_tree_absent_marks_only_the_upgrade_to_handoff_band() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // No markers: a normally-synced archive database, never absent.
+        assert!(!db.vct_tree_absent(Height(0)));
+        assert!(!db.vct_tree_absent(Height(100)));
+
+        // Upgrade U = 4, handoff H = 10: per-height trees absent exactly in [4, 10).
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        batch.update_vct_sync_marker(&db, Height(10));
+        db.write_batch(batch).expect("seeding vct markers succeeds");
+
+        assert!(
+            !db.vct_tree_absent(Height(3)),
+            "below U: the pre-upgrade tree is present"
+        );
+        assert!(db.vct_tree_absent(Height(4)), "at U: the tree is absent");
+        assert!(db.vct_tree_absent(Height(9)), "below H: the tree is absent");
+        assert!(
+            !db.vct_tree_absent(Height(10)),
+            "at H: the handoff tree is present"
+        );
+        assert!(
+            !db.vct_tree_absent(Height(11)),
+            "above H: the semantic-sync tree is present"
+        );
+    }
+
+    /// When the upgrade height is at or above the handoff — a node upgraded after the last
+    /// checkpoint, where semantic sync keeps writing trees — the band `[U, H)` is empty, so every
+    /// height is servable regardless of the upgrade height.
+    #[test]
+    fn vct_tree_absent_empty_band_when_upgraded_above_handoff() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(15));
+        batch.update_vct_sync_marker(&db, Height(10));
+        db.write_batch(batch).expect("seeding vct markers succeeds");
+
+        for height in [0, 9, 10, 12, 15, 20] {
+            assert!(
+                !db.vct_tree_absent(Height(height)),
+                "U >= H leaves an empty band, so height {height} is servable"
+            );
+        }
+    }
+
+    /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight
+    /// from the serving index, without touching the per-height trees.
+    #[test]
+    fn serve_block_roots_serves_at_or_above_upgrade_from_index() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // Index covers [4, 6]; the upgrade height is U = 4.
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        for height in 4u32..=6 {
+            batch.insert_commitment_roots_by_height(
+                &db,
+                Height(height),
+                &sapling_root(height.into()),
+                &orchard_root(height.into()),
+            );
+        }
+        db.write_batch(batch)
+            .expect("seeding the serving index succeeds");
+
+        let served = crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6));
+        assert_eq!(
+            served
+                .into_iter()
+                .map(|root| root.height)
+                .collect::<Vec<_>>(),
+            vec![Height(4), Height(5), Height(6)],
+            "a request at or above U is served from the index"
         );
     }
 

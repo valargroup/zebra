@@ -20,7 +20,8 @@ use crate::{
 };
 
 use super::super::{
-    commitment_aux, vct::validate_final_frontiers_bytes, CheckpointVerifiedBlock, FinalizedState,
+    commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1145,8 +1146,11 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                     .expect("verified fast commit succeeds");
             }
 
-            // The database is marked fast-synced at the handoff height.
+            // The database is marked fast-synced at the handoff height, and the upgrade height is
+            // genesis: a node that fast-syncs from genesis records `U = 0`, so its whole `[0, H)`
+            // range is the absent band and every request is served from the index.
             prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast-sync marker is set to the handoff height");
+            prop_assert_eq!(fast.db.vct_upgrade_height(), Some(Height(0)), "genesis fast sync records the upgrade height at genesis");
 
             // Consensus state (anchor sets + history root) matches the legacy recompute.
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
@@ -1174,9 +1178,14 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // legacy/archive node derives from its per-height trees.
             let below_handoff = Height((seed + 1) as u32)..=Height(last as u32 - 1);
             let served = fast.db.commitment_roots_by_height_range(below_handoff.clone());
-            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff);
+            let expected = commitment_aux::produce_block_roots(&legacy.db, below_handoff.clone());
             prop_assert!(!served.is_empty(), "a fast-synced node serves below-handoff roots from the index");
-            prop_assert_eq!(served, expected, "index-served roots match the legacy per-height-tree roots");
+            prop_assert_eq!(served, expected.clone(), "index-served roots match the legacy per-height-tree roots");
+
+            // The same range goes through `serve_block_roots`: with `U = 0` the request starts at
+            // or above the upgrade height, so it is served entirely from the index — no per-height
+            // trees (which the fast-synced node lacks below the handoff) are consulted.
+            prop_assert_eq!(serve_block_roots(&fast.db, below_handoff), expected, "serve_block_roots serves the fast-synced range from the index");
 
             // The `z_gettreestate` RPC gate predicate matches the read guard: a
             // below-handoff height is unavailable (typed archive-mode error), while the
@@ -1740,6 +1749,41 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
 
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from DB-produced roots match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from DB-produced roots match legacy");
+
+            // Serving stitch across the upgrade height `U`. Simulate a node that upgraded
+            // mid-chain: it keeps the full per-height trees (written before the upgrade) but only
+            // has the serving index from `U` upward. `serve_block_roots` must still return the
+            // whole requested range as one contiguous run — trees fill `[start, U)`, the index
+            // fills `[U, end]` — matching the all-trees reference, with no short batch at the
+            // boundary that would stall the client's minimum-progress check.
+            let serve_range = Height((seed + 1) as u32)..=last_height;
+            let all_trees_reference =
+                commitment_aux::produce_block_roots(&legacy.db, serve_range.clone());
+            let upgrade = Height(((seed + 1 + last) / 2) as u32);
+            prop_assert!(
+                serve_range.start() < &upgrade && upgrade <= last_height,
+                "the chosen upgrade height splits the served range"
+            );
+            let mut batch = DiskWriteBatch::new();
+            batch.delete_range_commitment_roots_by_height(&legacy.db, &Height(0), &upgrade);
+            batch.update_vct_upgrade_marker(&legacy.db, upgrade);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("simulating a mid-chain upgrade succeeds");
+            prop_assert!(
+                legacy
+                    .db
+                    .commitment_roots_by_height_range(Height(0)..=Height(upgrade.0 - 1))
+                    .is_empty(),
+                "the serving index is dropped below the upgrade height"
+            );
+            let stitched = serve_block_roots(&legacy.db, serve_range);
+            prop_assert_eq!(
+                stitched,
+                all_trees_reference,
+                "serve_block_roots stitches the trees below U with the index at/above U into one gap-free run"
+            );
     });
 
     Ok(())

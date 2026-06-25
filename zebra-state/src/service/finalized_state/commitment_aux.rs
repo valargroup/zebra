@@ -20,7 +20,6 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::broadcast;
 use zebra_chain::{block, orchard, sapling, sprout};
 
 use super::{FromDisk, IntoDisk, ZebraDb};
@@ -274,10 +273,8 @@ impl FinalFrontiers {
 /// whether supplied roots must be confirmed by a buffered successor before commit.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
-    fn vct_root(
-        &self,
-        height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)>;
+    fn vct_root(&self, height: block::Height)
+        -> Option<(sapling::tree::Root, orchard::tree::Root)>;
 
     /// The checkpoint handoff height (below which the vct path skips per-height
     /// trees), if this source supplies a final frontier.
@@ -361,36 +358,17 @@ impl CommitmentRootSource for FixtureSource {
     }
 }
 
-/// A fillable [`CommitmentRootSource`] backed by a shared, height-keyed roots cache.
+/// A [`CommitmentRootSource`] backed by provisional header-ahead roots in `db`.
 ///
-/// The `tree_aux` driver (increment 6a) writes verified roots into the cache *ahead of*
-/// the committer via [`PeerSourceWriter`], after staging the initial range to completion
-/// or when serving targeted refetches. The committer reads them per height through the
-/// [`CommitmentRootSource`] seam. The handoff frontier is embedded in the binary
-/// (design §5.2), so it is held immutably here and never fetched over the network —
-/// only roots come from peers.
+/// Header sync persists peer-supplied roots into `db` ahead of body commit; the committer
+/// reads them per height through the [`CommitmentRootSource`] seam. The handoff frontier is
+/// embedded in the binary (design §5.2), held immutably here and never fetched over the
+/// network. The in-memory `cache` is test-only scaffolding for the non-`db` source.
 #[derive(Debug)]
 pub(super) struct PeerSource {
+    db: Option<ZebraDb>,
     cache: Arc<RwLock<PeerRootsCache>>,
     frontiers: Option<FinalFrontiers>,
-}
-
-/// Write handle for a [`PeerSource`]: the driver fills the shared cache after verified root
-/// ranges are complete, or for targeted single-height refetches. Cloneable so the driver
-/// and source share one cache.
-#[derive(Clone, Debug)]
-pub(crate) struct PeerSourceWriter {
-    cache: Arc<RwLock<PeerRootsCache>>,
-}
-
-/// Per-state driver handle for a [`PeerSource`].
-///
-/// The `tree_aux` driver writes verified roots through [`Self::insert_roots`] and subscribes
-/// to targeted refetch requests from the committer through [`Self::subscribe_refetch`].
-#[derive(Clone, Debug)]
-pub(crate) struct PeerSourceHandle {
-    writer: PeerSourceWriter,
-    refetch_sender: broadcast::Sender<block::Height>,
 }
 
 /// Shared peer-source cache state.
@@ -401,32 +379,51 @@ struct PeerRootsCache {
 }
 
 impl PeerSource {
-    /// Create an empty peer source and its driver handle. `frontiers` is the embedded
-    /// handoff frontier (`None` for the bare benchmark, with no checkpoint handoff).
-    pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceHandle) {
+    /// Create an empty in-memory peer source and a writer sharing its cache. `frontiers`
+    /// is the embedded handoff frontier (`None` for the bare benchmark, with no checkpoint
+    /// handoff). The writer lets a test fill roots before and after the source is moved
+    /// into the committer.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[allow(dead_code)]
+    pub(super) fn new(frontiers: Option<FinalFrontiers>) -> (Self, PeerSourceWriter) {
         let cache = Arc::new(RwLock::new(PeerRootsCache::default()));
         let writer = PeerSourceWriter {
             cache: Arc::clone(&cache),
         };
         (
             PeerSource {
-                cache: Arc::clone(&cache),
+                db: None,
+                cache,
                 frontiers,
             },
-            PeerSourceHandle {
-                writer,
-                refetch_sender: broadcast::channel(64).0,
-            },
+            writer,
         )
+    }
+
+    /// Create a source backed by provisional header-ahead roots in `db`.
+    pub(super) fn new_with_db(db: ZebraDb, frontiers: Option<FinalFrontiers>) -> Self {
+        PeerSource {
+            db: Some(db),
+            cache: Arc::new(RwLock::new(PeerRootsCache::default())),
+            frontiers,
+        }
     }
 }
 
+/// Test-only writer sharing a [`PeerSource`]'s in-memory cache, so a proptest can fill
+/// roots before and after the source is moved into the committer.
+#[cfg(any(test, feature = "proptest-impl"))]
+#[derive(Clone, Debug)]
+pub(super) struct PeerSourceWriter {
+    cache: Arc<RwLock<PeerRootsCache>>,
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
 impl PeerSourceWriter {
-    /// Insert verified roots fetched for a range into the shared cache.
-    ///
-    /// Last write wins per uncommitted height; roots at already-committed heights are
-    /// ignored so stale refetches cannot grow the cache below the finalized tip.
-    pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
+    /// Insert roots into the shared in-memory cache. Last write wins per uncommitted
+    /// height; roots at already-committed heights are ignored.
+    #[allow(dead_code)]
+    pub(super) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
         let mut cache = self.cache.write().expect("peer source roots lock poisoned");
         for r in roots {
             if cache
@@ -441,56 +438,6 @@ impl PeerSourceWriter {
                 .insert(r.height.0, (r.sapling_root, r.orchard_root));
         }
     }
-
-    /// Remove peer-supplied roots at `heights` from the shared cache.
-    fn invalidate_roots(&self, heights: impl IntoIterator<Item = block::Height>) {
-        let mut cache = self.cache.write().expect("peer source roots lock poisoned");
-        for height in heights {
-            cache.roots.remove(&height.0);
-        }
-    }
-
-    /// The highest finalized height whose peer roots have been evicted from the cache.
-    fn committed_through(&self) -> Option<block::Height> {
-        self.cache
-            .read()
-            .expect("peer source roots lock poisoned")
-            .committed_through
-            .map(block::Height)
-    }
-}
-
-impl PeerSourceHandle {
-    /// Insert verified roots fetched for a range into the shared cache.
-    pub(crate) fn insert_roots(&self, roots: impl IntoIterator<Item = BlockCommitmentRoots>) {
-        self.writer.insert_roots(roots);
-    }
-
-    /// Remove peer-supplied roots at `heights` from the shared cache.
-    pub(crate) fn invalidate_roots(&self, heights: impl IntoIterator<Item = block::Height>) {
-        self.writer.invalidate_roots(heights);
-    }
-
-    /// The highest finalized height whose peer roots have been evicted from the cache.
-    pub(crate) fn committed_through(&self) -> Option<block::Height> {
-        self.writer.committed_through()
-    }
-
-    /// Subscribe to targeted peer-root refetch requests.
-    pub(crate) fn subscribe_refetch(&self) -> broadcast::Receiver<block::Height> {
-        self.refetch_sender.subscribe()
-    }
-
-    /// Request a targeted peer-root refetch for `height`.
-    pub(crate) fn request_refetch(&self, height: block::Height) {
-        if self.refetch_sender.send(height).is_err() {
-            metrics::counter!("state.vct.root.refetch.no_receiver.count").increment(1);
-            tracing::debug!(
-                ?height,
-                "VCT: requested peer root refetch but no tree_aux driver is subscribed"
-            );
-        }
-    }
 }
 
 impl CommitmentRootSource for PeerSource {
@@ -498,6 +445,14 @@ impl CommitmentRootSource for PeerSource {
         &self,
         height: block::Height,
     ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+        if let Some(db) = &self.db {
+            return db
+                .zakura_header_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+                .map(|roots| (roots.sapling_root, roots.orchard_root));
+        }
+
         self.cache
             .read()
             .expect("peer source roots lock poisoned")
@@ -512,8 +467,15 @@ impl CommitmentRootSource for PeerSource {
         self.frontiers.as_ref()
     }
     fn invalidate(&self, height: block::Height) {
-        // Drop the rejected root so the next read misses and the driver can re-fetch a
-        // (verifiable) replacement for this height from another peer.
+        // Drop the rejected root so the next read misses; header sync can then deliver a
+        // verifiable replacement for this height from another peer.
+        if let Some(db) = &self.db {
+            if let Err(error) = db.delete_zakura_header_commitment_roots([height]) {
+                tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
+            }
+            return;
+        }
+
         self.cache
             .write()
             .expect("peer source roots lock poisoned")
@@ -567,6 +529,47 @@ pub(crate) fn produce_block_roots(
             orchard_root: orchard.root(),
         });
     }
+    roots
+}
+
+/// Serve the per-block roots for `range`, stitching the two sources at the upgrade height `U`.
+///
+/// The `commitment_roots_by_height` serving index only covers heights at and above `U` (the lowest
+/// height this binary committed). Heights below `U` predate the index, so they are derived from the
+/// per-height trees instead, and the two runs are concatenated. This is what lets a node that
+/// upgraded mid-chain serve a request that straddles `U` as one gap-free batch, rather than the
+/// short index-only prefix that would stall the client's minimum-progress check.
+///
+/// Both sources stop at the first absent height, so the result is always a contiguous run from
+/// `range.start()`; a tree gap below `U` is served as the prefix collected so far without reaching
+/// into the index. A database that never recorded `U` — a pre-index archive node — derives the
+/// whole range from the trees, the original archive fallback.
+pub(crate) fn serve_block_roots(
+    db: &ZebraDb,
+    range: std::ops::RangeInclusive<block::Height>,
+) -> Vec<BlockCommitmentRoots> {
+    let Some(upgrade) = db.vct_upgrade_height() else {
+        return produce_block_roots(db, range);
+    };
+
+    let (start, end) = (*range.start(), *range.end());
+
+    // Wholly at/above `U`: the index covers it. (`U == 0` for a node that fast-synced from
+    // genesis takes this path for every request, never touching the absent per-height trees.)
+    if start >= upgrade {
+        return db.commitment_roots_by_height_range(range);
+    }
+
+    // Below `U`: derive the per-height-tree run up to `U - 1` (`start < upgrade` so `upgrade >= 1`).
+    let trees_end = block::Height(end.0.min(upgrade.0 - 1));
+    let mut roots = produce_block_roots(db, start..=trees_end);
+
+    // Continue into the index only if the tree run is contiguous up to `U - 1`; a short run means a
+    // gap below `U`, so serve it alone and let the client retry the remainder.
+    if roots.last().map(|root| root.height) == Some(trees_end) && end >= upgrade {
+        roots.extend(db.commitment_roots_by_height_range(upgrade..=end));
+    }
+
     roots
 }
 
@@ -707,148 +710,6 @@ mod tests {
         assert!(
             source.vct_root(block::Height(42)).is_none(),
             "an evicted root is gone, so the next read misses and a re-fetch can replace it"
-        );
-    }
-
-    /// Bulk invalidation drops every still-cached root named by the driver after it
-    /// identifies a bad supplier, so a poisoned fetch window is retried from another peer
-    /// instead of failing one height at a time.
-    #[test]
-    fn peer_source_bulk_invalidate_evicts_multiple_roots() {
-        let (source, writer) = PeerSource::new(None);
-        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
-        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
-
-        writer.insert_roots((40..=44).map(|height| BlockCommitmentRoots {
-            height: block::Height(height),
-            sapling_root: empty_sapling_root,
-            orchard_root: empty_orchard_root,
-        }));
-
-        writer.invalidate_roots([block::Height(41), block::Height(43)]);
-
-        assert!(
-            source.vct_root(block::Height(40)).is_some(),
-            "roots outside the invalidation set stay cached"
-        );
-        assert!(
-            source.vct_root(block::Height(41)).is_none(),
-            "the first invalidated height is evicted"
-        );
-        assert!(
-            source.vct_root(block::Height(43)).is_none(),
-            "the second invalidated height is evicted"
-        );
-        assert!(
-            source.vct_root(block::Height(44)).is_some(),
-            "higher roots outside the invalidation set stay cached"
-        );
-    }
-
-    /// Each peer source owns its cache and refetch signal. This is the property the
-    /// per-state handle replaces the old process-global `OnceLock` publishing with.
-    #[test]
-    fn peer_source_handles_are_isolated_per_state() {
-        let (source_a, handle_a) = PeerSource::new(None);
-        let (source_b, handle_b) = PeerSource::new(None);
-        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
-        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
-
-        handle_a.insert_roots([BlockCommitmentRoots {
-            height: block::Height(42),
-            sapling_root: empty_sapling_root,
-            orchard_root: empty_orchard_root,
-        }]);
-
-        assert!(
-            source_a.vct_root(block::Height(42)).is_some(),
-            "the first peer source sees roots inserted through its own handle"
-        );
-        assert!(
-            source_b.vct_root(block::Height(42)).is_none(),
-            "a second peer source in the same process has an independent cache"
-        );
-
-        let mut refetch_a = handle_a.subscribe_refetch();
-        let mut refetch_b = handle_b.subscribe_refetch();
-        handle_a.request_refetch(block::Height(42));
-
-        assert_eq!(
-            refetch_a.try_recv(),
-            Ok(block::Height(42)),
-            "the first handle receives its own refetch request"
-        );
-        assert!(
-            matches!(
-                refetch_b.try_recv(),
-                Err(broadcast::error::TryRecvError::Empty)
-            ),
-            "the second handle does not receive another state's refetch request"
-        );
-    }
-
-    /// After a block commits, the peer source drops all roots through that height while
-    /// retaining fetch-ahead roots the committer still needs.
-    #[test]
-    fn peer_source_evicts_committed_roots_only() {
-        let (source, writer) = PeerSource::new(None);
-        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
-        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
-
-        assert_eq!(
-            writer.committed_through(),
-            None,
-            "a fresh peer source has no committed watermark"
-        );
-
-        writer.insert_roots((40..=44).map(|height| BlockCommitmentRoots {
-            height: block::Height(height),
-            sapling_root: empty_sapling_root,
-            orchard_root: empty_orchard_root,
-        }));
-
-        source.evict_committed_through(block::Height(42));
-
-        assert_eq!(
-            writer.committed_through(),
-            Some(block::Height(42)),
-            "the writer exposes the cache eviction watermark to the fetch driver"
-        );
-
-        assert!(
-            source.vct_root(block::Height(40)).is_none(),
-            "roots below the committed height are evicted"
-        );
-        assert!(
-            source.vct_root(block::Height(42)).is_none(),
-            "the committed height's root is evicted"
-        );
-        assert!(
-            source.vct_root(block::Height(43)).is_some(),
-            "fetch-ahead roots remain cached"
-        );
-
-        writer.insert_roots((41..=43).map(|height| BlockCommitmentRoots {
-            height: block::Height(height),
-            sapling_root: empty_sapling_root,
-            orchard_root: empty_orchard_root,
-        }));
-
-        assert!(
-            source.vct_root(block::Height(41)).is_none(),
-            "late inserts at already-committed heights are ignored"
-        );
-        assert!(
-            source.vct_root(block::Height(43)).is_some(),
-            "late inserts above the committed height are still cached"
-        );
-
-        source.evict_committed_through(block::Height(41));
-
-        assert_eq!(
-            writer.committed_through(),
-            Some(block::Height(42)),
-            "committed watermark never regresses"
         );
     }
 }
