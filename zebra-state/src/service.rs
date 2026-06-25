@@ -1554,10 +1554,10 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // Serve committed verified roots first, then provisional header-ahead roots for
-                // heights that have headers but no committed body yet. Both sources are read as a
-                // contiguous prefix from the requested start; committed roots win for overlapping
-                // heights because they have already been verified during block commit.
+                // Serve stitched committed verified roots first, then provisional
+                // header-ahead roots for heights that have headers but no committed
+                // body yet. Committed roots win for overlapping heights because
+                // they have already been verified during block commit.
                 let roots = if count == 0 {
                     Vec::new()
                 } else if let Some((tip, _hash)) = state.db.best_header_tip() {
@@ -1566,19 +1566,20 @@ impl Service<ReadRequest> for ReadStateService {
                     } else {
                         let last = start_height.0.saturating_add(count - 1).min(tip.0);
                         let requested = start_height..=block::Height(last);
+                        let committed_end = state
+                            .db
+                            .finalized_tip_height()
+                            .map(|finalized_tip| finalized_tip.min(*requested.end()))
+                            .filter(|committed_end| start_height <= *committed_end);
 
-                        // Read verified per-block roots from the committed serving index first.
-                        // This index is written for every committed block, including VCT fast-sync
-                        // commits that do not store per-height note-commitment trees.
-                        let mut roots =
-                            state.db.commitment_roots_by_height_range(requested.clone());
-
-                        // Older non-VCT databases may not have the compact serving index. If so,
-                        // derive the same roots from stored per-height note-commitment trees.
-                        if roots.is_empty() && !state.db.is_vct_synced() {
-                            roots =
-                                finalized_state::produce_block_roots(&state.db, requested.clone());
-                        }
+                        let mut roots = if let Some(committed_end) = committed_end {
+                            finalized_state::serve_block_roots(
+                                &state.db,
+                                start_height..=committed_end,
+                            )
+                        } else {
+                            Vec::new()
+                        };
 
                         let next_height = roots
                             .last()
