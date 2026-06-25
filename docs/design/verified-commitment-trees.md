@@ -45,7 +45,7 @@ peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header
       zakura_header_commitment_roots_by_height for header-ahead heights (all-or-nothing; §9)
 ```
 
-**Lifecycle of one fast sync.** 
+**Lifecycle of one fast sync.**
 
 (1) Node starts under `consensus.checkpoint_sync = true` on
 Mainnet → the committer is built in peer mode.
@@ -66,7 +66,7 @@ the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (�
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
 | **Fail closed** | In the frozen window, refuse the commit (retryable) rather than recompute or guess (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `zakura_header_commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
-| **All-or-nothing** | A `Headers` message carries roots for *every* header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
+| **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
 | **Kill switch** | `consensus.disable_vct_fast_sync = true`: keep checkpoint sync but force the legacy committer (§4.4). |
 
 For where each piece lives in the tree, see the file map (§15).
@@ -476,8 +476,8 @@ provenance/cooldown/demotion/hedging policy. Bad roots are handled in two layers
   invalid marker byte — is reported through header sync's existing misbehavior path
   (`report_misbehavior(.., MalformedMessage)`), and the range is retried. None of those roots
   reach state.
-- **At verify-before-commit**, a well-formed but *wrong* root fails authentication against the
-  header commitment (§6). The committer evicts it (`PeerSource::invalidate` **deletes** it from
+- **At verify-before-commit**, a well-formed but _wrong_ root fails authentication against the
+  header commitment (§6). The committer evicts it (`PeerSource::invalidate` __deletes__ it from
   `zakura_header_commitment_roots_by_height`) and refuses the commit with the retryable
   `VctSuppliedRootUnavailable` error (§8). Header sync then re-requests that finalized range and
   delivers a replacement root from whichever peer answers; the block commits in place once a
