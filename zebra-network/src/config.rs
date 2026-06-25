@@ -336,8 +336,11 @@ impl Config {
         let dns_peers =
             Config::resolve_peers(&self.initial_peer_hostnames().iter().cloned().collect()).await;
 
-        if self.network.is_regtest() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest.
+        if self.network.is_regtest() || self.network.disable_pow() {
+            // Only return local peer addresses and skip loading the peer cache on Regtest and other
+            // PoW-disabled networks. These are single-node/local test networks (e.g. a mainnet
+            // shadow-fork): they have no remote peers to sync from, which is what makes treating
+            // them as always-close-to-tip (for the mempool and `generate`) correct.
             dns_peers
                 .into_iter()
                 .filter(PeerSocketAddr::is_localhost)
