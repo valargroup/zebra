@@ -27,9 +27,9 @@ use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use super::*;
 use crate::sapling;
 
+const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-const ORCHARD_V6_FLAG_BITS: u8 = 0b0000_0111;
+const ORCHARD_CROSS_ADDRESS_FLAG_BIT: u8 = 0b0000_0100;
 
 impl ZcashDeserialize for jubjub::Fq {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
@@ -366,7 +366,11 @@ fn deserialize_v5_sapling_shielded_data<R: io::Read>(
 
 impl ZcashSerialize for Option<orchard::ShieldedData> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        serialize_optional_orchard_shielded_data_with_flags(self, &mut writer, false)
+        serialize_optional_orchard_shielded_data_with_flags(
+            self,
+            &mut writer,
+            !ALLOW_CROSS_ADDRESS_BIT,
+        )
     }
 }
 
@@ -445,7 +449,7 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
 
 impl ZcashSerialize for orchard::ShieldedData {
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
-        serialize_orchard_shielded_data_with_flags(self, writer, false)
+        serialize_orchard_shielded_data_with_flags(self, writer, !ALLOW_CROSS_ADDRESS_BIT)
     }
 }
 
@@ -455,14 +459,7 @@ fn serialize_orchard_flags<W: io::Write>(
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     let valid_bits = if allow_cross_address_bit {
-        #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-        {
-            ORCHARD_V6_FLAG_BITS
-        }
-        #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
-        {
-            ORCHARD_SPEND_OUTPUT_FLAG_BITS
-        }
+        ORCHARD_SPEND_OUTPUT_FLAG_BITS | ORCHARD_CROSS_ADDRESS_FLAG_BIT
     } else {
         ORCHARD_SPEND_OUTPUT_FLAG_BITS
     };
@@ -556,17 +553,10 @@ fn deserialize_orchard_flags<R: io::Read>(
 ) -> Result<orchard::Flags, SerializationError> {
     let bits = reader.read_u8()?;
     if allow_cross_address_bit {
-        #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-        {
-            if bits & !ORCHARD_V6_FLAG_BITS == 0 {
-                Some(orchard::Flags::from_bits_retain(bits))
-            } else {
-                None
-            }
-        }
-        #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
-        {
-            orchard::Flags::from_bits(bits)
+        if bits & !(ORCHARD_SPEND_OUTPUT_FLAG_BITS | ORCHARD_CROSS_ADDRESS_FLAG_BIT) == 0 {
+            Some(orchard::Flags::from_bits_retain(bits))
+        } else {
+            None
         }
     } else {
         orchard::Flags::from_bits(bits)
@@ -578,7 +568,7 @@ fn deserialize_orchard_flags<R: io::Read>(
 // because the counts are read along with the arrays.
 impl ZcashDeserialize for Option<orchard::ShieldedData> {
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        deserialize_orchard_shielded_data_with_flags(reader, false)
+        deserialize_orchard_shielded_data_with_flags(reader, !ALLOW_CROSS_ADDRESS_BIT)
     }
 }
 
@@ -852,7 +842,7 @@ impl ZcashSerialize for Transaction {
                 serialize_optional_orchard_shielded_data_with_flags(
                     orchard_shielded_data,
                     &mut writer,
-                    true,
+                    ALLOW_CROSS_ADDRESS_BIT,
                 )?;
             }
         }
@@ -1189,8 +1179,10 @@ impl ZcashDeserialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                let orchard_shielded_data =
-                    deserialize_orchard_shielded_data_with_flags(&mut limited_reader, true)?;
+                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
+                    &mut limited_reader,
+                    ALLOW_CROSS_ADDRESS_BIT,
+                )?;
 
                 Ok(Transaction::V6 {
                     network_upgrade,
