@@ -52,6 +52,10 @@ pub(super) struct SubmitItem {
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
     pub(super) block: Arc<block::Block>,
+    /// The body's reserved byte size, carried to the apply completion so commit
+    /// throughput can be attributed even if the `applying` entry is reaped (by a
+    /// coalesced checkpoint frontier refresh) before the completion is drained.
+    pub(super) bytes: u64,
 }
 
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
@@ -322,6 +326,7 @@ impl Sequencer {
             hash: applying.hash,
             token,
             block,
+            bytes: applying.bytes,
         })
     }
 

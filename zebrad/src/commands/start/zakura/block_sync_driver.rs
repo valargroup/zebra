@@ -23,8 +23,8 @@ use crate::components::sync;
 use super::{
     block_apply_result_label, block_verify_error_is_duplicate, emit_commit_state, insert_cs_bool,
     insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
-    insert_cs_u64, query_block_sync_frontiers, BlocksyncThroughputProbe,
-    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+    insert_cs_u64, query_block_sync_frontiers, verified_block_tip_from_state,
+    BlocksyncThroughputProbe, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
@@ -112,7 +112,7 @@ where
 
     fn refresh_checkpoint_frontier(
         &self,
-        highest_sent: block::Height,
+        baseline_verified_tip: block::Height,
         attempts_remaining: usize,
     ) -> BoxFuture<'static, Option<zebra_network::zakura::BlockSyncFrontiers>> {
         let executor = self.clone();
@@ -122,7 +122,7 @@ where
                 executor.latest_chain_tip,
                 executor.endpoint,
                 executor.trace,
-                highest_sent,
+                baseline_verified_tip,
                 attempts_remaining,
             )
             .await
@@ -635,6 +635,20 @@ where
             insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
         },
     );
+
+    if throughput_probe.is_none()
+        && class == BlockApplyClass::Checkpoint
+        && result == BlockApplyResult::Committed
+    {
+        return BlockApplyOutput {
+            token,
+            height,
+            hash: expected_hash,
+            result,
+            local_frontier: None,
+        };
+    }
+
     emit_commit_state(
         &trace,
         cs_trace::FRONTIER_QUERY_START,
@@ -645,6 +659,7 @@ where
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
         },
     );
+    let frontier_started = Instant::now();
     let local_frontier = match throughput_probe.as_ref() {
         Some(_) => probe_frontier,
         None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
@@ -668,6 +683,7 @@ where
             insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
             insert_cs_height(row, cs_trace::HEIGHT, height);
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
+            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(frontier_started));
             insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
             if let Some(frontiers) = &local_frontier {
                 insert_cs_frontiers(row, frontiers);
@@ -832,7 +848,7 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     endpoint: Option<ZakuraEndpoint>,
     trace: ZakuraTrace,
-    highest_sent: block::Height,
+    baseline_verified_tip: block::Height,
     attempts_remaining: usize,
 ) -> Option<zebra_network::zakura::BlockSyncFrontiers>
 where
@@ -850,14 +866,44 @@ where
         cs_trace::CHECKPOINT_REFRESH_ATTEMPT,
         "block_sync_driver",
         |row| {
-            insert_cs_u64(row, "attempts_remaining", attempts_remaining as u64);
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, highest_sent);
+            insert_cs_u64(
+                row,
+                "attempts_remaining",
+                u64::try_from(attempts_remaining).unwrap_or(u64::MAX),
+            );
+            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
         },
     );
+    emit_commit_state(
+        &trace,
+        cs_trace::FRONTIER_QUERY_START,
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh");
+            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
+        },
+    );
+    let frontier_started = Instant::now();
     let frontiers =
-        query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await?;
+        query_checkpoint_refresh_frontiers(read_state.clone(), latest_chain_tip.clone(), &trace)
+            .await;
+    emit_commit_state(
+        &trace,
+        cs_trace::FRONTIER_QUERY_FINISH,
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh");
+            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
+            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(frontier_started));
+            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, frontiers.is_some());
+            if let Some(frontiers) = &frontiers {
+                insert_cs_frontiers(row, frontiers);
+            }
+        },
+    );
+    let frontiers = frontiers?;
 
-    if frontiers.verified_block_tip <= highest_sent {
+    if frontiers.verified_block_tip <= baseline_verified_tip {
         return None;
     }
 
@@ -871,6 +917,178 @@ where
         },
     );
     Some(frontiers)
+}
+
+async fn query_checkpoint_refresh_frontiers<ReadState>(
+    read_state: ReadState,
+    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
+    trace: &ZakuraTrace,
+) -> Option<zebra_network::zakura::BlockSyncFrontiers>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let latest_tip = latest_chain_tip.best_tip_height_and_hash();
+    emit_checkpoint_refresh_read_start(trace, "checkpoint_refresh_finalized_tip");
+    let finalized_started = Instant::now();
+    let finalized_tip = match tokio::time::timeout(
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::FinalizedTip),
+    )
+    .await
+    {
+        Ok(Ok(zebra_state::ReadResponse::FinalizedTip(tip))) => {
+            emit_checkpoint_refresh_read_finish(
+                trace,
+                "checkpoint_refresh_finalized_tip",
+                finalized_started,
+                true,
+            );
+            tip
+        }
+        Ok(Ok(response)) => {
+            warn!(?response, "unexpected FinalizedTip response");
+            emit_checkpoint_refresh_read_finish(
+                trace,
+                "checkpoint_refresh_finalized_tip",
+                finalized_started,
+                false,
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(
+                ?error,
+                "failed to refresh Zakura block-sync finalized frontier"
+            );
+            emit_checkpoint_refresh_read_finish(
+                trace,
+                "checkpoint_refresh_finalized_tip",
+                finalized_started,
+                false,
+            );
+            None
+        }
+        Err(_elapsed) => {
+            warn!("timed out refreshing Zakura block-sync finalized frontier");
+            emit_commit_state(
+                trace,
+                cs_trace::STATE_READ_TIMEOUT,
+                "block_sync_driver",
+                |row| {
+                    insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh_finalized_tip");
+                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(finalized_started));
+                },
+            );
+            None
+        }
+    };
+
+    emit_checkpoint_refresh_read_start(trace, "checkpoint_refresh_tip");
+    let tip_started = Instant::now();
+    match tokio::time::timeout(
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zebra_state::ReadRequest::Tip),
+    )
+    .await
+    {
+        Ok(Ok(zebra_state::ReadResponse::Tip(tip))) => {
+            emit_checkpoint_refresh_read_finish(trace, "checkpoint_refresh_tip", tip_started, true);
+            let state_tip = (finalized_tip.is_some() || tip.is_some()).then(|| {
+                verified_block_tip_from_state(
+                    finalized_tip,
+                    tip,
+                    latest_tip.unwrap_or((block::Height(0), block::Hash([0; 32]))),
+                )
+            });
+            let (height, hash) = match (state_tip, latest_tip) {
+                (Some(state_tip), latest_tip) => {
+                    verified_block_tip_from_state(Some(state_tip), latest_tip, state_tip)
+                }
+                (None, Some(latest_tip)) => latest_tip,
+                (None, None) => return None,
+            };
+            let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
+            Some(zebra_network::zakura::BlockSyncFrontiers {
+                finalized_height,
+                verified_block_tip: height,
+                verified_block_hash: hash,
+            })
+        }
+        Ok(Ok(response)) => {
+            warn!(?response, "unexpected Tip response");
+            emit_checkpoint_refresh_read_finish(
+                trace,
+                "checkpoint_refresh_tip",
+                tip_started,
+                false,
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(?error, "failed to refresh Zakura block-sync body frontier");
+            emit_checkpoint_refresh_read_finish(
+                trace,
+                "checkpoint_refresh_tip",
+                tip_started,
+                false,
+            );
+            None
+        }
+        Err(_elapsed) => {
+            warn!("timed out refreshing Zakura block-sync body frontier");
+            emit_commit_state(
+                trace,
+                cs_trace::STATE_READ_TIMEOUT,
+                "block_sync_driver",
+                |row| {
+                    insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh_tip");
+                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(tip_started));
+                },
+            );
+            None
+        }
+    }
+}
+
+fn emit_checkpoint_refresh_read_start(trace: &ZakuraTrace, action: &'static str) {
+    emit_commit_state(
+        trace,
+        cs_trace::STATE_READ_START,
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, action);
+        },
+    );
+}
+
+fn emit_checkpoint_refresh_read_finish(
+    trace: &ZakuraTrace,
+    action: &'static str,
+    started: Instant,
+    success: bool,
+) {
+    emit_commit_state(
+        trace,
+        if success {
+            cs_trace::STATE_READ_SUCCESS
+        } else {
+            cs_trace::STATE_READ_ERROR
+        },
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, action);
+            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+        },
+    );
 }
 
 fn publish_body_frontier(
