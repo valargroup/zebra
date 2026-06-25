@@ -181,13 +181,14 @@ pub fn inbound_get_headers_count_limit(
     config: &ZakuraHeaderSyncConfig,
     network: &Network,
     max_frame_bytes: u32,
+    want_tree_aux_roots: bool,
 ) -> u32 {
     clamp_header_sync_request_count(
         u32::MAX,
         config.advertised_max_headers_per_response(),
         network,
         max_frame_bytes,
-        false,
+        want_tree_aux_roots,
     )
 }
 

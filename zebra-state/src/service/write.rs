@@ -548,15 +548,8 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
-            // Whether this commit consumed header-carried (peer-supplied) tree-aux
-            // roots to skip the note-commitment frontier rebuild. This is the payoff
-            // signal for header-carried roots: a low hit rate means the roots are not
-            // arriving ahead of body commit, so the committer pays the full tree cost.
-            if finalized_state.vct_fast_will_apply(ordered_block.0.height) {
-                metrics::counter!("state.vct.fast_path.hit").increment(1);
-            } else {
-                metrics::counter!("state.vct.fast_path.miss").increment(1);
-            }
+            let next_block_took_vct_path =
+                finalized_state.vct_fast_will_apply(ordered_block.0.height);
 
             // Try committing the block
             match finalized_state.commit_finalized(
@@ -566,6 +559,14 @@ impl WriteBlockWorkerTask {
                 next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Whether this successful commit consumed header-carried
+                    // tree-aux roots to skip the note-commitment frontier rebuild.
+                    if next_block_took_vct_path {
+                        metrics::counter!("state.vct.fast_path.hit").increment(1);
+                    } else {
+                        metrics::counter!("state.vct.fast_path.miss").increment(1);
+                    }
+
                     // A successful commit clears any VCT root stall: log recovery and reset
                     // the stalled-height gauge if it had been raised.
                     if vct_root_stall.is_some() {

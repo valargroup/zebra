@@ -1186,6 +1186,28 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
     );
 
     assert!(count < MAX_HS_RANGE);
+    let count_with_roots = clamp_header_sync_request_count(
+        MAX_HS_RANGE,
+        MAX_HS_RANGE,
+        &Network::Mainnet,
+        LOCAL_MAX_MESSAGE_BYTES,
+        true,
+    );
+    assert!(count_with_roots < count);
+
+    let config = ZakuraHeaderSyncConfig {
+        max_headers_per_response: MAX_HS_RANGE,
+        ..ZakuraHeaderSyncConfig::default()
+    };
+    assert_eq!(
+        inbound_get_headers_count_limit(&config, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES, false),
+        count
+    );
+    assert_eq!(
+        inbound_get_headers_count_limit(&config, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES, true),
+        count_with_roots
+    );
+
     let headers =
         vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
     let body_sizes = vec![0u32; headers.len()];

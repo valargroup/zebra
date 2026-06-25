@@ -841,11 +841,11 @@ pub(crate) fn tree_aux_roots_for_served_header_range(
         };
 
         let Some(root) = block_roots.get(offset) else {
-            break;
+            return Vec::new();
         };
 
         if root.height != height {
-            break;
+            return Vec::new();
         }
 
         roots.push(root.clone());

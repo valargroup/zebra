@@ -1434,6 +1434,11 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
+        let zakura_header_commitment_roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.

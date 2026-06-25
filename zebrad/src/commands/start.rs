@@ -2173,7 +2173,7 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn served_header_tree_aux_roots_require_a_complete_aligned_prefix() {
+    fn served_header_tree_aux_roots_require_complete_coverage() {
         let start = block::Height(10);
         let header_heights = [
             block::Height(10),
@@ -2185,7 +2185,8 @@ mod zakura_header_sync_driver_tests {
 
         assert_eq!(
             tree_aux_roots_for_served_header_range(start, header_heights, &roots),
-            roots.to_vec()
+            Vec::new(),
+            "partial root coverage is served as rootless headers"
         );
 
         let roots_with_gap = [
@@ -2195,7 +2196,20 @@ mod zakura_header_sync_driver_tests {
         ];
         assert_eq!(
             tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap),
-            vec![root_at(block::Height(10))],
+            Vec::new(),
+            "root gaps are served as rootless headers"
+        );
+
+        let complete_roots = [
+            root_at(block::Height(10)),
+            root_at(block::Height(11)),
+            root_at(block::Height(12)),
+            root_at(block::Height(13)),
+        ];
+        assert_eq!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &complete_roots),
+            complete_roots.to_vec(),
+            "complete root coverage is attached to the served header range"
         );
     }
 
