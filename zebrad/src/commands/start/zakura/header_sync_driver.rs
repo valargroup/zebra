@@ -405,11 +405,26 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         };
                         let header_heights: Vec<_> =
                             headers.iter().map(|(height, _, _)| *height).collect();
-                        let tree_aux_roots = tree_aux_roots_for_served_header_range(
-                            start,
-                            header_heights.iter().copied(),
-                            &block_roots,
-                        );
+                        let tree_aux_roots = if want_tree_aux_roots {
+                            tree_aux_roots_for_served_header_range(
+                                start,
+                                header_heights.iter().copied(),
+                                &block_roots,
+                            )
+                            .unwrap_or_else(|error| {
+                                debug!(
+                                    ?peer,
+                                    ?start,
+                                    requested_count = count,
+                                    ?error,
+                                    "serving header range without tree aux roots"
+                                );
+
+                                Vec::new()
+                            })
+                        } else {
+                            Vec::new()
+                        };
                         let body_sizes = body_sizes_for_served_header_range(
                             start,
                             header_heights.iter().copied(),
@@ -828,34 +843,59 @@ pub(crate) fn body_sizes_for_served_header_range(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreeAuxRootsForServedHeaderRangeError {
+    HeaderBeforeStart {
+        start: block::Height,
+        height: block::Height,
+    },
+    OffsetOutOfRange {
+        start: block::Height,
+        height: block::Height,
+    },
+    MissingRoot {
+        height: block::Height,
+        offset: usize,
+    },
+    RootHeightMismatch {
+        expected_height: block::Height,
+        actual_height: block::Height,
+        offset: usize,
+    },
+}
+
 pub(crate) fn tree_aux_roots_for_served_header_range(
     start: block::Height,
     header_heights: impl IntoIterator<Item = block::Height>,
     block_roots: &[BlockCommitmentRoots],
-) -> Vec<BlockCommitmentRoots> {
+) -> Result<Vec<BlockCommitmentRoots>, TreeAuxRootsForServedHeaderRangeError> {
     let mut roots = Vec::new();
 
     for height in header_heights {
         if height < start {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::HeaderBeforeStart { start, height });
         }
 
         let Some(offset) = usize::try_from(height - start).ok() else {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::OffsetOutOfRange { start, height });
         };
 
         let Some(root) = block_roots.get(offset) else {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::MissingRoot { height, offset });
         };
 
         if root.height != height {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::RootHeightMismatch {
+                expected_height: height,
+                actual_height: root.height,
+                offset,
+            });
         }
 
         roots.push(root.clone());
     }
 
-    roots
+    Ok(roots)
 }
 
 async fn log_missing_block_bodies<ReadState>(

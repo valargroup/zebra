@@ -1586,6 +1586,11 @@ impl Service<ReadRequest> for ReadStateService {
                             .and_then(|root| root.height.next().ok())
                             .unwrap_or(start_height);
                         if next_height <= *requested.end() {
+                            // Extend the committed prefix with provisional Zakura header-ahead roots.
+                            // These are peer-supplied advisory roots for heights whose headers are known
+                            // but whose block bodies have not been committed yet. Once a block is
+                            // committed, its verified roots move to the committed index and the
+                            // provisional row for that height is deleted.
                             let provisional =
                                 state.db.zakura_header_commitment_roots_by_height_range(
                                     next_height..=*requested.end(),

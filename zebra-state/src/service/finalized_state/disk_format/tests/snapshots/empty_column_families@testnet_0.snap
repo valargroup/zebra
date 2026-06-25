@@ -4,7 +4,6 @@ expression: empty_column_families
 ---
 [
   "balance_by_transparent_addr: no entries",
-  "fast_sync_metadata: no entries",
   "history_tree: no entries",
   "orchard_note_commitment_subtree: no entries",
   "orchard_nullifiers: no entries",
@@ -16,8 +15,10 @@ expression: empty_column_families
   "tx_loc_by_transparent_addr_loc: no entries",
   "utxo_by_out_loc: no entries",
   "utxo_loc_by_transparent_addr_loc: no entries",
+  "vct_sync_metadata: no entries",
   "zakura_header_body_size_by_height: no entries",
   "zakura_header_by_height: no entries",
+  "zakura_header_commitment_roots_by_height: no entries",
   "zakura_header_hash_by_height: no entries",
   "zakura_header_height_by_hash: no entries",
 ]
