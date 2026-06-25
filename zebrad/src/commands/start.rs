@@ -2191,10 +2191,9 @@ mod zakura_header_sync_driver_tests {
         ];
         let roots = [root_at(block::Height(10)), root_at(block::Height(11))];
 
-        assert_eq!(
-            tree_aux_roots_for_served_header_range(start, header_heights, &roots),
-            Vec::new(),
-            "partial root coverage is served as rootless headers"
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots).is_err(),
+            "partial root coverage is reported before serving rootless headers"
         );
 
         let roots_with_gap = [
@@ -2202,10 +2201,9 @@ mod zakura_header_sync_driver_tests {
             root_at(block::Height(12)),
             root_at(block::Height(13)),
         ];
-        assert_eq!(
-            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap),
-            Vec::new(),
-            "root gaps are served as rootless headers"
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap).is_err(),
+            "root gaps are reported before serving rootless headers"
         );
 
         let complete_roots = [
@@ -2215,7 +2213,8 @@ mod zakura_header_sync_driver_tests {
             root_at(block::Height(13)),
         ];
         assert_eq!(
-            tree_aux_roots_for_served_header_range(start, header_heights, &complete_roots),
+            tree_aux_roots_for_served_header_range(start, header_heights, &complete_roots)
+                .expect("complete roots match the served header range"),
             complete_roots.to_vec(),
             "complete root coverage is attached to the served header range"
         );

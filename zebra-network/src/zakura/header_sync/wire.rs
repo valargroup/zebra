@@ -70,6 +70,9 @@ pub enum HeaderSyncMessage {
         /// Requested header count.
         count: u32,
         /// Whether the requester wants all-or-nothing tree-aux roots.
+        /// A sender who is syncing in vct mode will always request these.
+        /// A sender who is syncing in non-checkpoint mode does not need these but still requests them.
+        /// A sender who is syncing above the last checkpoint height does not request these.
         want_tree_aux_roots: bool,
     },
     /// A bounded contiguous header run with one advisory body-size hint per header.
