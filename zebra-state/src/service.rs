@@ -1554,10 +1554,12 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // Serve stitched committed verified roots first, then provisional
-                // header-ahead roots for heights that have headers but no committed
-                // body yet. Committed roots win for overlapping heights because
-                // they have already been verified during block commit.
+                // Serve stitched committed verified roots first, then provisional header-ahead
+                // roots for heights that have headers but no committed body yet. Committed roots
+                // come from the compact `commitment_roots_by_height` index, with
+                // `serve_block_roots` filling pre-upgrade gaps from per-height trees when needed.
+                // They win for overlapping heights because they have already been verified during
+                // block commit.
                 let roots = if count == 0 {
                     Vec::new()
                 } else if let Some((tip, _hash)) = state.db.best_header_tip() {
