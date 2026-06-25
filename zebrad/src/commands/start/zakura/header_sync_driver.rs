@@ -501,6 +501,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 finalized: _finalized,
             } => {
                 let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
+                let tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -510,6 +511,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_peer(row, cs_trace::PEER, &peer);
                         insert_cs_height(row, cs_trace::RANGE_START, start_height);
                         insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                        insert_cs_u64(
+                            row,
+                            cs_trace::TREE_AUX_ROOTS_LEN,
+                            u64::from(tree_aux_roots_len),
+                        );
                         insert_cs_hash(row, cs_trace::HASH, anchor);
                     },
                 );
@@ -534,6 +540,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 insert_cs_peer(row, cs_trace::PEER, &peer);
                                 insert_cs_height(row, cs_trace::RANGE_START, start_height);
                                 insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                                insert_cs_u64(
+                                    row,
+                                    cs_trace::TREE_AUX_ROOTS_LEN,
+                                    u64::from(tree_aux_roots_len),
+                                );
                                 insert_cs_str(row, cs_trace::RESULT, "committed");
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },

@@ -62,6 +62,14 @@ pub(super) fn insert_u64(row: &mut serde_json::Map<String, Value>, key: &'static
     row.insert(key.to_string(), Value::Number(Number::from(value)));
 }
 
+pub(super) fn insert_bool(
+    row: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    value: bool,
+) {
+    row.insert(key.to_string(), Value::Bool(value));
+}
+
 pub(super) fn insert_optional_str(
     row: &mut serde_json::Map<String, Value>,
     key: &'static str,

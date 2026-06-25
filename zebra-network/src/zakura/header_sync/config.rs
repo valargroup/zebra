@@ -140,9 +140,11 @@ pub fn header_sync_count_by_byte_budget(
         .unwrap_or(usize::MAX)
         .saturating_sub(FRAME_HEADER_BYTES);
     let payload_cap = MAX_HS_MESSAGE_BYTES.min(frame_payload_cap);
-    let root_bytes = want_tree_aux_roots
-        .then_some(HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES)
-        .unwrap_or(0);
+    let root_bytes = if want_tree_aux_roots {
+        HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES
+    } else {
+        0
+    };
     let header_bytes = header_sync_header_bytes_for_network(network)
         .saturating_add(HEADER_SYNC_BODY_SIZE_BYTES)
         .saturating_add(root_bytes);

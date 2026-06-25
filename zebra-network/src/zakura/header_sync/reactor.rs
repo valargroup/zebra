@@ -627,12 +627,20 @@ impl HeaderSyncReactor {
         requested_count: u32,
         returned_count: u32,
     ) {
-        self.trace_headers_served(&peer, start_height, requested_count, returned_count);
+        self.trace_headers_served(
+            &peer,
+            start_height,
+            requested_count,
+            returned_count,
+            false,
+            0,
+        );
         if let Some(peer_state) = self.state.peers.get_mut(&peer) {
             peer_state.finish_serving_headers();
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_header_range_response_ready(
         &mut self,
         peer: ZakuraPeerId,
@@ -659,6 +667,7 @@ impl HeaderSyncReactor {
             Vec::new()
         };
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
+        let served_tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
         let send_result = peer_state.session.try_send_headers_with_sizes_and_roots(
             headers,
             body_sizes,
@@ -667,9 +676,14 @@ impl HeaderSyncReactor {
         peer_state.finish_serving_headers();
 
         match send_result {
-            Ok(()) => {
-                self.trace_headers_served(&peer, start_height, requested_count, returned_count)
-            }
+            Ok(()) => self.trace_headers_served(
+                &peer,
+                start_height,
+                requested_count,
+                returned_count,
+                want_tree_aux_roots,
+                served_tree_aux_roots_len,
+            ),
             Err(error) => {
                 tracing::debug!(
                     ?peer,
@@ -975,6 +989,8 @@ impl HeaderSyncReactor {
                 outstanding.expected_max_count,
                 peer_max_headers_per_response,
                 in_flight_count,
+                outstanding.range.finalized,
+                u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX),
             );
             if let Some(peer_state) = self.state.peers.get_mut(&peer) {
                 peer_state.outstanding.push(OutstandingRange {
@@ -995,6 +1011,8 @@ impl HeaderSyncReactor {
             outstanding.expected_max_count,
             peer_max_headers_per_response,
             in_flight_count,
+            outstanding.range.finalized,
+            u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX),
         );
         if header_count > outstanding.expected_max_count || header_count > outstanding.range.count {
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::ResponseTooLong)
@@ -1702,6 +1720,7 @@ impl HeaderSyncReactor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn trace_headers_received(
         &self,
         peer: &ZakuraPeerId,
@@ -1710,6 +1729,8 @@ impl HeaderSyncReactor {
         expected_max_count: u32,
         advertised_cap: u32,
         in_flight_count: usize,
+        want_tree_aux_roots: bool,
+        tree_aux_roots_len: u32,
     ) {
         self.emit_trace(hs_trace::HEADER_HEADERS_RECEIVED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
@@ -1718,6 +1739,12 @@ impl HeaderSyncReactor {
             insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(expected_max_count));
             insert_u64(row, hs_trace::IN_FLIGHT_COUNT, in_flight_count as u64);
+            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
+            insert_u64(
+                row,
+                hs_trace::TREE_AUX_ROOTS_LEN,
+                u64::from(tree_aux_roots_len),
+            );
         });
     }
 
@@ -1727,12 +1754,20 @@ impl HeaderSyncReactor {
         start_height: block::Height,
         requested_count: u32,
         returned_count: u32,
+        want_tree_aux_roots: bool,
+        tree_aux_roots_len: u32,
     ) {
         self.emit_trace(hs_trace::HEADER_HEADERS_SERVED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(returned_count));
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(requested_count));
+            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
+            insert_u64(
+                row,
+                hs_trace::TREE_AUX_ROOTS_LEN,
+                u64::from(tree_aux_roots_len),
+            );
         });
     }
 
