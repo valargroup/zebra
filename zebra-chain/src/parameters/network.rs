@@ -101,7 +101,14 @@ impl NetworkKind {
         match self {
             Self::Mainnet => "main".to_string(),
             Self::Testnet => "test".to_string(),
+            // Mainnet-masquerade (`--cfg zcash_regtest_mainnet_keys`, OFF by default): report
+            // Regtest as "main" so a mainnet-mode wallet (e.g. a normal-mode Keystone via vizor
+            // running as networkName=main) accepts this chain's self-reported network. This pairs
+            // with the librustzcash fork's cfg of the same name. Unchanged when the cfg is absent.
+            #[cfg(not(zcash_regtest_mainnet_keys))]
             Self::Regtest => "test".to_string(),
+            #[cfg(zcash_regtest_mainnet_keys)]
+            Self::Regtest => "main".to_string(),
         }
     }
 

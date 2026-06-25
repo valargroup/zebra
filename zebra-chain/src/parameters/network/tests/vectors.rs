@@ -792,3 +792,15 @@ fn orchard_canonical_proof_size_rule_activation() {
     );
     assert!(nu6_3_only_network.orchard_canonical_proof_size_rule_active(nu6_3_height));
 }
+
+/// Mainnet-masquerade (`--cfg zcash_regtest_mainnet_keys`): the node reports its BIP70 network
+/// name as "main" for Regtest, so a mainnet-mode wallet (vizor as networkName=main) accepts the
+/// chain. Mainnet/Testnet are unchanged. Only compiled/run with the opt-in cfg set.
+#[cfg(zcash_regtest_mainnet_keys)]
+#[test]
+fn regtest_masquerades_chain_name_as_main() {
+    use crate::parameters::NetworkKind;
+    assert_eq!(NetworkKind::Regtest.bip70_network_name(), "main");
+    assert_eq!(NetworkKind::Mainnet.bip70_network_name(), "main");
+    assert_eq!(NetworkKind::Testnet.bip70_network_name(), "test");
+}

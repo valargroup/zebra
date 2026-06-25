@@ -180,15 +180,15 @@ config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
 
 [patch.crates-io]
-equihash = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_address = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_encoding = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_history = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_keys = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_primitives = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_proofs = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_protocol = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
-zcash_transparent = { git = "https://github.com/valargroup/librustzcash.git", rev = "2b709578ace577c0de956fea11ff801baf5f79b0" }
+equihash = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_address = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_encoding = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_history = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_keys = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_primitives = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_proofs = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_protocol = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
+zcash_transparent = { git = "https://github.com/valargroup/librustzcash.git", rev = "6752c3fc3e239d0a52aa190e7f0fcee601801771" }
 
 [workspace.metadata.release]
 
@@ -355,6 +355,10 @@ debug = false
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu6.3", "nu7"))', # Used in Zebra and librustzcash
+    # Opt-in (TEST-ONLY) mainnet-masquerade for the Ironwood regtest network: makes the node report
+    # chain_name "main" (and its librustzcash deps derive/encode as mainnet). OFF by default; set via
+    # RUSTFLAGS, never a cargo feature. Must match the librustzcash fork's cfg of the same name.
+    'cfg(zcash_regtest_mainnet_keys)',
 ] }
 
 # High-risk code
