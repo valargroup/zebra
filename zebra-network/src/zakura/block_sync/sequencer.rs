@@ -126,14 +126,6 @@ impl Sequencer {
         self.applying.len()
     }
 
-    pub(super) fn lowest_applying_height(&self) -> Option<block::Height> {
-        self.applying.keys().next().copied()
-    }
-
-    pub(super) fn lowest_submitted_height(&self) -> Option<block::Height> {
-        self.submitted_applies.keys().next().copied()
-    }
-
     pub(super) fn applying_buffered_bytes(&self) -> u64 {
         self.applying
             .values()
@@ -275,16 +267,10 @@ impl Sequencer {
     /// Drain the contiguous reorder prefix above the floor into `applying`,
     /// advancing the floor. Returns the newly-covered heights so the reactor
     /// marks them covered in the download scheduler.
-    /// Drain at most `limit` contiguous bodies into `applying`.
-    ///
-    /// The production Sequencer task uses this to keep the body-download floor
-    /// close to the verifier/commit frontier. Without this cap, a contiguous
-    /// download burst can move thousands of bodies into `applying`, making the
-    /// floor watchdog rescue a height far above the checkpoint commit blocker.
-    pub(super) fn drain_ready_into_applying_limited(&mut self, limit: usize) -> Vec<block::Height> {
+    pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
         let released = self
             .reorder
-            .drain_contiguous_prefix_limited(self.body_download_floor, limit);
+            .drain_contiguous_prefix(self.body_download_floor);
         let mut covered = Vec::with_capacity(released.len());
         for (height, block, bytes, source_peer) in released {
             let hash = block.hash();
@@ -303,13 +289,6 @@ impl Sequencer {
             );
         }
         covered
-    }
-
-    /// Number of additional bodies that may move from `reorder` into `applying`
-    /// without outrunning the configured apply submission window.
-    pub(super) fn applying_capacity(&self) -> usize {
-        self.submitted_apply_limit
-            .saturating_sub(self.applying.len())
     }
 
     // ---- submission ----
@@ -334,6 +313,10 @@ impl Sequencer {
     /// item. `None` if the height is no longer applying (the token counter is
     /// not consumed in that case).
     pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
+        debug_assert!(
+            !self.has_unsubmitted_applying_below(height),
+            "must submit applying blocks in contiguous height order"
+        );
         let block = self
             .applying
             .get(&height)
@@ -349,6 +332,12 @@ impl Sequencer {
             block,
             bytes: applying.bytes,
         })
+    }
+
+    fn has_unsubmitted_applying_below(&self, height: block::Height) -> bool {
+        self.applying
+            .range(..height)
+            .any(|(_, applying)| !applying.submitted)
     }
 
     /// Roll back a submit whose dispatch failed (only if the token still matches,

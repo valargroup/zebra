@@ -91,25 +91,18 @@ impl ReorderBuffer {
         ReorderInsertResult::Inserted
     }
 
-    pub(super) fn drain_contiguous_prefix_limited(
+    pub(super) fn drain_contiguous_prefix(
         &mut self,
         verified_block_tip: block::Height,
-        limit: usize,
     ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
         let mut released = Vec::new();
-        if limit == 0 {
-            return released;
-        }
 
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
             None => return released,
         };
 
-        while released.len() < limit {
-            let Some(buffered) = self.blocks.remove(&next) else {
-                break;
-            };
+        while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
             released.push((
                 next,

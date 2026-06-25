@@ -1870,30 +1870,6 @@ impl BlockSyncReactor {
         metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
-        metrics::gauge!("sync.block.download_floor.height")
-            .set(self.last_view.download_floor.0 as f64);
-        metrics::gauge!("sync.block.commit_gap.height").set(
-            self.last_view
-                .download_floor
-                .0
-                .saturating_sub(self.last_view.verified_tip.0) as f64,
-        );
-        metrics::gauge!("sync.block.lowest_applying.height").set(
-            self.last_view
-                .lowest_applying_height
-                .map(|height| f64::from(height.0))
-                .unwrap_or(0.0),
-        );
-        metrics::gauge!("sync.block.lowest_submitted.height").set(
-            self.last_view
-                .lowest_submitted_height
-                .map(|height| f64::from(height.0))
-                .unwrap_or(0.0),
-        );
-        metrics::gauge!("sync.block.unsubmitted_applying")
-            .set(self.last_view.unsubmitted_applying_count as f64);
-        metrics::gauge!("sync.block.commit_frontier_stall.seconds")
-            .set(self.last_view.commit_frontier_stall_seconds as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
         metrics::gauge!("sync.block.budget.reserved_bytes")
             .set(self.state.budget.reserved() as f64);

@@ -199,6 +199,37 @@ impl BlockApplyExecutor for TestCheckpointBlockApplyExecutor {
 }
 
 #[derive(Debug)]
+struct TestHeightClassBlockApplyExecutor {
+    inner: TestBlockApplyExecutor,
+    checkpoint_heights: Vec<block::Height>,
+}
+
+impl BlockApplyExecutor for TestHeightClassBlockApplyExecutor {
+    fn block_apply_class(&self, block: &block::Block) -> BlockApplyClass {
+        let height = block
+            .coinbase_height()
+            .expect("submitted test block has height");
+        if self.checkpoint_heights.contains(&height) {
+            BlockApplyClass::Checkpoint
+        } else {
+            BlockApplyClass::Full
+        }
+    }
+
+    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
+        self.inner.apply(request)
+    }
+
+    fn refresh_checkpoint_frontier(
+        &self,
+        _baseline_verified_tip: block::Height,
+        _attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        async { None }.boxed()
+    }
+}
+
+#[derive(Debug)]
 struct TestCheckpointRefreshExecutor {
     inner: TestBlockApplyExecutor,
     refresh_calls: StdArc<Mutex<Vec<(block::Height, usize)>>>,
@@ -2460,9 +2491,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(3), block.clone(), 300, peer(0)),
         ReorderInsertResult::Inserted
     );
-    assert!(reorder
-        .drain_contiguous_prefix_limited(block::Height(0), usize::MAX)
-        .is_empty());
+    assert!(reorder.drain_contiguous_prefix(block::Height(0)).is_empty());
     assert_eq!(reorder.buffered_bytes(), 300);
     assert_eq!(budget.reserved(), 300);
 
@@ -2471,7 +2500,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(1), block.clone(), 100, peer(0)),
         ReorderInsertResult::Inserted
     );
-    let released = reorder.drain_contiguous_prefix_limited(block::Height(0), usize::MAX);
+    let released = reorder.drain_contiguous_prefix(block::Height(0));
     assert_eq!(
         released
             .iter()
@@ -2490,7 +2519,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         reorder.insert(block::Height(2), block.clone(), 200, peer(0)),
         ReorderInsertResult::Inserted
     );
-    let released = reorder.drain_contiguous_prefix_limited(block::Height(1), usize::MAX);
+    let released = reorder.drain_contiguous_prefix(block::Height(1));
     assert_eq!(
         released
             .iter()
@@ -2811,10 +2840,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     // Only the contiguous prefix above the floor (height 1) drains.
-    assert_eq!(
-        seq.drain_ready_into_applying_limited(usize::MAX),
-        vec![block::Height(1)]
-    );
+    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
     assert_eq!(seq.floor(), block::Height(1));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.applying_len(), 1);
@@ -2827,7 +2853,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     assert_eq!(
-        seq.drain_ready_into_applying_limited(usize::MAX),
+        seq.drain_ready_into_applying(),
         vec![block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.floor(), block::Height(3));
@@ -2835,7 +2861,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
 }
 
 #[test]
-fn sequencer_limited_drain_keeps_download_floor_near_apply_window() {
+fn sequencer_drains_full_contiguous_prefix_beyond_submission_limit() {
     let mut seq = test_sequencer(0, 2);
     let blocks = mainnet_blocks_1_to_3();
     for (index, block) in blocks.iter().enumerate() {
@@ -2849,18 +2875,16 @@ fn sequencer_limited_drain_keeps_download_floor_near_apply_window() {
     }
 
     assert_eq!(
-        seq.drain_ready_into_applying_limited(seq.applying_capacity()),
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+    assert_eq!(seq.floor(), block::Height(3));
+    assert_eq!(seq.applying_len(), 3);
+    assert_eq!(seq.reorder_len(), 0);
+    assert_eq!(
+        seq.submittable_heights(),
         vec![block::Height(1), block::Height(2)]
     );
-    assert_eq!(seq.floor(), block::Height(2));
-    assert_eq!(seq.applying_len(), 2);
-    assert_eq!(seq.reorder_len(), 1);
-    assert!(seq.reorder_contains(block::Height(3)));
-
-    assert!(seq
-        .drain_ready_into_applying_limited(seq.applying_capacity())
-        .is_empty());
-    assert_eq!(seq.floor(), block::Height(2));
 }
 
 #[test]
@@ -2871,7 +2895,7 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying_limited(usize::MAX).len(), 3);
+    assert_eq!(seq.drain_ready_into_applying().len(), 3);
     // The submission window of 2 caps the eligible heights.
     assert_eq!(
         seq.submittable_heights(),
@@ -2886,6 +2910,24 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     // Rolling back a failed dispatch frees the slot and re-offers the height.
     seq.unsubmit(block::Height(2), item2.token);
     assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
+}
+
+#[test]
+fn sequencer_continues_after_lower_submitted_height_is_removed() {
+    let mut seq = test_sequencer(0, 1);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+
+    let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
+    seq.record_submitted_apply(item1.height, item1.hash);
+    assert!(seq.submittable_heights().is_empty());
+
+    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -2911,7 +2953,7 @@ fn sequencer_release_applied_through_clears_submitted_records() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying_limited(usize::MAX).len(), 3);
+    assert_eq!(seq.drain_ready_into_applying().len(), 3);
 
     let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
     let item2 = seq.prepare_submit(block::Height(2)).expect("applying at 2");
@@ -3176,6 +3218,167 @@ async fn sequencer_single_apply_limit_serializes_checkpoint_submissions() {
     task_handle.abort();
 }
 
+#[tokio::test]
+async fn sequencer_task_does_not_skip_lower_unsubmitted_checkpoint_when_full_can_submit() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(2);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(4);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes.saturating_mul(2)));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let executor = TestHeightClassBlockApplyExecutor {
+        inner: TestBlockApplyExecutor {
+            completions,
+            default_result,
+            completed_count: None,
+            submit_completed_counts: None,
+        },
+        checkpoint_heights: vec![block::Height(1)],
+    };
+    let (_apply_executor_tx, apply_executor_rx) =
+        watch::channel(Some(BlockApplyExecutorPort::with_limits(
+            StdArc::new(executor),
+            BlockApplyLimits {
+                checkpoint_apply_limit: 0,
+                full_apply_limit: 1,
+                combined_apply_limit: 1,
+            },
+        )));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes.clone(),
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    for block in &blocks {
+        body_tx
+            .send(super::sequencer_task::SequencedBody {
+                height: block.coinbase_height().expect("test block has height"),
+                hash: block.hash(),
+                body: BufferedBlockBody::Decoded(block.clone()),
+                bytes,
+                peer: peer(1),
+                received_at: Instant::now(),
+            })
+            .await
+            .expect("mixed-class body queues");
+    }
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), actions_rx.recv())
+            .await
+            .is_err(),
+        "height 2 must not submit while height 1 is unsubmitted and checkpoint-throttled",
+    );
+
+    task_handle.abort();
+}
+
+#[tokio::test]
+async fn sequencer_task_allows_later_submit_after_lower_height_is_submitted() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(2);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(4);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes.saturating_mul(2)));
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    controller.park_next();
+    let executor = TestHeightClassBlockApplyExecutor {
+        inner: TestBlockApplyExecutor {
+            completions,
+            default_result,
+            completed_count: None,
+            submit_completed_counts: None,
+        },
+        checkpoint_heights: vec![block::Height(1)],
+    };
+    let (_apply_executor_tx, apply_executor_rx) =
+        watch::channel(Some(BlockApplyExecutorPort::with_limits(
+            StdArc::new(executor),
+            BlockApplyLimits {
+                checkpoint_apply_limit: 1,
+                full_apply_limit: 1,
+                combined_apply_limit: 2,
+            },
+        )));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes.clone(),
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    for block in &blocks {
+        body_tx
+            .send(super::sequencer_task::SequencedBody {
+                height: block.coinbase_height().expect("test block has height"),
+                hash: block.hash(),
+                body: BufferedBlockBody::Decoded(block.clone()),
+                bytes,
+                peer: peer(1),
+                received_at: Instant::now(),
+            })
+            .await
+            .expect("mixed-class body queues");
+    }
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    for expected_height in [block::Height(1), block::Height(2)] {
+        match tokio::time::timeout(Duration::from_secs(5), actions_rx.recv())
+            .await
+            .expect("expected body submits")
+        {
+            Some(BlockSyncAction::ApplySubmitted { block, .. }) => assert_eq!(
+                block.coinbase_height().expect("test block has a height"),
+                expected_height
+            ),
+            other => panic!("expected ApplySubmitted for {expected_height:?}, got {other:?}"),
+        }
+    }
+
+    task_handle.abort();
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn sequencer_coalesces_checkpoint_frontier_refreshes() {
     let frontiers = BlockSyncFrontiers {
@@ -3372,7 +3575,7 @@ async fn checkpoint_refresh_reaped_commit_is_still_counted() {
                 "seeded checkpoint body buffers",
             );
         }
-        seq.drain_ready_into_applying_limited(usize::MAX);
+        seq.drain_ready_into_applying();
         for block in &blocks {
             let height = block.coinbase_height().expect("test block has height");
             let item = seq.prepare_submit(height).expect("applying height submits");
@@ -3832,7 +4035,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
         100,
         peer(0),
     );
-    seq.drain_ready_into_applying_limited(usize::MAX);
+    seq.drain_ready_into_applying();
     seq.accept_body(
         block::Height(2),
         blocks[1].hash(),
@@ -3858,7 +4061,7 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying_limited(usize::MAX);
+    seq.drain_ready_into_applying();
     assert_eq!(seq.floor(), block::Height(3));
     // A reject at height 2 drops applying >= 2 (200 bytes) and rolls the floor
     // back below 2, never below the verified tip.
@@ -3896,8 +4099,7 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
                 reorder.insert(block::Height(height), block.clone(), 100, peer(0)),
                 ReorderInsertResult::Inserted
             );
-            for (released, _, bytes, _) in reorder.drain_contiguous_prefix_limited(tip, usize::MAX)
-            {
+            for (released, _, bytes, _) in reorder.drain_contiguous_prefix(tip) {
                 assert_eq!(released, block::Height(tip.0 + 1));
                 tip = released;
                 released_all.push(released);
@@ -4127,7 +4329,7 @@ proptest::proptest! {
                         AcceptOutcome::Buffered { .. } => {}
                         AcceptOutcome::Redundant { release_bytes } => budget.release(release_bytes),
                     }
-                    let _ = sequencer.drain_ready_into_applying_limited(usize::MAX);
+                    let _ = sequencer.drain_ready_into_applying();
                     next_accept = next_accept.saturating_add(1);
                 }
                 1 => {
@@ -4250,9 +4452,7 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
         // releases them.
         let mut floor = block::Height(0);
         let mut applied_bytes = 0;
-        for (_height, _block, bytes, _peer) in
-            reorder.drain_contiguous_prefix_limited(floor, usize::MAX)
-        {
+        for (_height, _block, bytes, _peer) in reorder.drain_contiguous_prefix(floor) {
             applied_bytes += bytes;
             floor = block::Height(floor.0 + 1);
         }
