@@ -303,6 +303,16 @@ pub mod header_sync_trace {
     pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
     /// Whether header-carried tree-aux roots were requested for this range.
     pub const WANT_TREE_AUX_ROOTS: &str = "want_tree_aux_roots";
+    /// Whether the range is expected to terminate at a checkpoint.
+    pub const FINALIZED: &str = "finalized";
+    /// Header scheduler priority label (`forward` or `backward`).
+    pub const RANGE_PRIORITY: &str = "range_priority";
+    /// Highest verified full-block/body height observed by the header scheduler.
+    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
+    /// Durable finalized height observed by the header scheduler.
+    pub const FINALIZED_HEIGHT: &str = "finalized_height";
+    /// Durable best header tip observed by the header scheduler.
+    pub const BEST_HEADER_TIP: &str = "best_header_tip";
     /// Number of header-carried tree-aux roots present on this send/receive.
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Destination peer count field.
