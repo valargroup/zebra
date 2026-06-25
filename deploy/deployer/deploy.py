@@ -48,6 +48,15 @@ DEFAULTS = {
     "listen_addr": "[::]:8233",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "port": None,           # ssh port; None -> ssh default
+    # Match zebrad's own defaults so existing fleets render unchanged.
+    "storage_mode": "archive",
+    "v2_p2p": True,
+    "legacy_p2p": True,
+    "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
+    "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zebrad default
+    # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
+    # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
+    "zakura": None,
 }
 
 
@@ -68,6 +77,12 @@ class Node:
     network: str
     listen_addr: str
     rpc_listen_addr: str
+    storage_mode: str
+    v2_p2p: bool
+    legacy_p2p: bool
+    metrics_endpoint: str
+    tracing_filter: str
+    zakura: object  # dict | None: fleet-wide [network.zakura] settings
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -135,6 +150,12 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             network=merged["network"],
             listen_addr=merged["listen_addr"],
             rpc_listen_addr=merged["rpc_listen_addr"],
+            storage_mode=merged["storage_mode"],
+            v2_p2p=merged["v2_p2p"],
+            legacy_p2p=merged["legacy_p2p"],
+            metrics_endpoint=merged["metrics_endpoint"],
+            tracing_filter=merged["tracing_filter"],
+            zakura=merged.get("zakura"),
             port=merged["port"],
         ))
 
@@ -272,16 +293,51 @@ def render_template(name: str, subst: dict[str, str]) -> str:
     return text
 
 
+def render_zakura_block(zakura: object) -> str:
+    """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
+
+    Recognises `dev_network` (str), `listen_addr` (str), and `bootstrap_peers`
+    (list of `node_id@addr` strings). Unknown keys are passed through verbatim so
+    the deployer does not need to learn every Zakura field.
+    """
+    if not zakura:
+        return ""
+    lines = ["[network.zakura]"]
+    for key, value in zakura.items():
+        if isinstance(value, bool):
+            lines.append(f"{key} = {'true' if value else 'false'}")
+        elif isinstance(value, (int, float)):
+            lines.append(f"{key} = {value}")
+        elif isinstance(value, list):
+            if value:
+                items = "".join(f'    "{v}",\n' for v in value)
+                lines.append(f"{key} = [\n{items}]")
+            else:
+                lines.append(f"{key} = []")
+        else:
+            lines.append(f'{key} = "{value}"')
+    # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
+    return "\n" + "\n".join(lines) + "\n"
+
+
 def render_node_config(node: Node) -> str:
     rpc_block = ""
     if node.rpc_listen_addr:
         rpc_block = f'listen_addr = "{node.rpc_listen_addr}"'
     else:
         rpc_block = "# listen_addr disabled"
+    metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
+    filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zebrad default)"
     return render_template("zebrad.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
         "STATE_CACHE_DIR": node.state_cache_dir,
+        "STORAGE_MODE": node.storage_mode,
+        "V2_P2P": "true" if node.v2_p2p else "false",
+        "LEGACY_P2P": "true" if node.legacy_p2p else "false",
+        "ZAKURA_BLOCK": render_zakura_block(node.zakura),
+        "METRICS_BLOCK": metrics_block,
+        "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
     })
@@ -479,13 +535,19 @@ def cmd_status(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
 
     def work(node: Node) -> tuple[str, str]:
+        # `zebrad --version` prints clean semver (e.g. "zebrad 5.0.0-rc.3") with no
+        # commit, so also read the running build's git commit from the startup
+        # diagnostic line in the node's log (`git commit: <sha>`). The configured
+        # ref is appended so requested-vs-running is visible at a glance.
         probe = (
             f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null; "
-            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1; "
+            f"grep -aoE 'git commit: [0-9a-f]+' {shlex.quote(node.log_file)} 2>/dev/null | tail -1"
         )
         proc = ssh_capture_script(node, probe)
-        out = proc.stdout.strip().replace("\n", " | ") or proc.stderr.strip() or "unreachable"
-        return (node.name, out)
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        out = " | ".join(lines) if lines else (proc.stderr.strip() or "unreachable")
+        return (node.name, f"{out} | cfg {node.commit}")
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(nodes))) as pool:
