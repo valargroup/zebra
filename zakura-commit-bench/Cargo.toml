@@ -1,0 +1,50 @@
+[package]
+name = "zakura-commit-bench"
+version = "0.1.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A standalone benchmark for the block-commit stack *below* Zakura block-sync:
+# real checkpoint verifier + real finalized state, driven over real mainnet
+# blocks at production apply concurrency. See README.md.
+
+[features]
+default = []
+# Per-block commit-phase timing histograms (zebra.state.write.*).
+commit-metrics = ["zebra-state/commit-metrics"]
+# Make jemalloc the global allocator with heap profiling, mirroring zebrad's
+# `jemalloc-profiling` feature (use with MALLOC_CONF=prof:true ...).
+jemalloc-profiling = ["dep:tikv-jemallocator"]
+
+[dependencies]
+zebra-chain = { path = "../zebra-chain" }
+# `proptest-impl` exposes the real `CheckpointVerifier` constructor; the verifier
+# and state code it drives is the normal production path.
+zebra-consensus = { path = "../zebra-consensus", features = ["proptest-impl"] }
+zebra-network = { path = "../zebra-network" }
+zebra-state = { path = "../zebra-state" }
+zebra-jsonl-trace = { path = "../zebra-jsonl-trace" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+futures = { workspace = true }
+tower = { workspace = true, features = ["buffer", "util"] }
+clap = { workspace = true, features = ["derive"] }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+metrics = { workspace = true }
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tempfile = { workspace = true }
+
+tikv-jemallocator = { workspace = true, features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms"], optional = true }
+
+[dev-dependencies]
+zebra-test = { path = "../zebra-test" }

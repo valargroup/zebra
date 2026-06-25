@@ -30,36 +30,141 @@ fn main() {
 fn try_main() -> Result<(), BoxError> {
     let mut args = env::args().skip(1);
 
-    match (args.next().as_deref(), args.next().as_deref()) {
-        (Some("package"), Some("ubuntu")) => {
-            let profiling = match args.next().as_deref() {
-                None => false,
-                Some("--profiling") => {
-                    if args.next().is_some() {
+    match args.next().as_deref() {
+        Some("package") => match args.next().as_deref() {
+            Some("ubuntu") => {
+                let profiling = match args.next().as_deref() {
+                    None => false,
+                    Some("--profiling") => {
+                        if args.next().is_some() {
+                            return Err(Box::new(UsageError(
+                                "unexpected extra arguments after `--profiling`",
+                            )));
+                        }
+
+                        true
+                    }
+                    Some(_) => {
                         return Err(Box::new(UsageError(
-                            "unexpected extra arguments after `--profiling`",
+                            "expected `cargo xtask package ubuntu [--profiling]`",
                         )));
                     }
+                };
 
-                    true
-                }
-                Some(_) => {
-                    return Err(Box::new(UsageError(
-                        "expected `cargo xtask package ubuntu [--profiling]`",
-                    )));
-                }
-            };
-
-            package_ubuntu(profiling)
-        }
-        (Some("-h" | "--help"), None) | (None, None) => {
+                package_ubuntu(profiling)
+            }
+            _ => Err(Box::new(UsageError(
+                "expected `cargo xtask package ubuntu [--profiling]`",
+            ))),
+        },
+        Some("zakura-commit-bench") => commit_bench(args.collect()),
+        Some("-h" | "--help") | None => {
             print_help();
             Ok(())
         }
         _ => Err(Box::new(UsageError(
-            "expected `cargo xtask package ubuntu [--profiling]`",
+            "expected `cargo xtask <package|zakura-commit-bench> ...`",
         ))),
     }
+}
+
+/// `cargo xtask zakura-commit-bench [--profile] [--jemalloc] -- <bench args>`
+///
+/// Builds and runs the `zakura-commit-bench` binary, forwarding bench args after
+/// `--`. `--profile` builds with the `profiling` Cargo profile + frame pointers
+/// and runs under `samply` (if installed) for a CPU flamegraph; `--jemalloc`
+/// enables jemalloc heap profiling (sets `MALLOC_CONF`).
+fn commit_bench(args: Vec<String>) -> Result<(), BoxError> {
+    let repo_root = repo_root()?;
+
+    let mut profile = false;
+    let mut jemalloc = false;
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--profile" => profile = true,
+            "--jemalloc" => jemalloc = true,
+            "--" => {
+                passthrough.extend(iter.by_ref());
+                break;
+            }
+            _ => passthrough.push(arg),
+        }
+    }
+
+    let jemalloc_malloc_conf =
+        "prof:true,prof_active:true,lg_prof_sample:19,prof_prefix:/tmp/zakura-bench-jeprof/bench,prof_final:true";
+    if jemalloc {
+        let _ = fs::create_dir_all("/tmp/zakura-bench-jeprof");
+    }
+
+    if !profile {
+        // Plain release run.
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(&repo_root)
+            .env("CXXFLAGS", "-include cstdint")
+            .arg("run")
+            .arg("--release")
+            .arg("-p")
+            .arg("zakura-commit-bench");
+        if jemalloc {
+            command.arg("--features").arg("jemalloc-profiling");
+            command.env("MALLOC_CONF", jemalloc_malloc_conf);
+        }
+        command.arg("--");
+        command.args(&passthrough);
+        return run_command(&mut command);
+    }
+
+    // Profiling build: profiling Cargo profile + frame pointers, then run under
+    // samply if present (captures Rust + rocksdb C++ frames).
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(&repo_root)
+        .env("CXXFLAGS", "-include cstdint")
+        .env("RUSTFLAGS", PROFILING_RUSTFLAGS)
+        .arg("build")
+        .arg("--profile")
+        .arg(PROFILING_PROFILE)
+        .arg("-p")
+        .arg("zakura-commit-bench");
+    if jemalloc {
+        build.arg("--features").arg("jemalloc-profiling");
+    }
+    run_command(&mut build)?;
+
+    let binary = repo_root
+        .join("target")
+        .join(PROFILING_PROFILE)
+        .join("zakura-commit-bench");
+
+    let samply_available = Command::new("samply")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    let mut run = if samply_available {
+        let mut command = Command::new("samply");
+        command.arg("record").arg(&binary);
+        command
+    } else {
+        println!(
+            "note: `samply` not found on PATH; running directly. To CPU-profile, run:\n      samply record {} {}",
+            binary.display(),
+            passthrough.join(" "),
+        );
+        Command::new(&binary)
+    };
+    run.current_dir(&repo_root);
+    if jemalloc {
+        run.env("MALLOC_CONF", jemalloc_malloc_conf);
+        println!("note: jemalloc heap profiles will be written under /tmp/zakura-bench-jeprof/");
+    }
+    run.args(&passthrough);
+    run_command(&mut run)
 }
 
 fn package_ubuntu(profiling: bool) -> Result<(), BoxError> {
@@ -277,7 +382,25 @@ fn print_help() {
 }
 
 fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
-    writeln!(output, "Usage: cargo xtask package ubuntu [--profiling]")?;
+    writeln!(output, "Usage:")?;
+    writeln!(output, "  cargo xtask package ubuntu [--profiling]")?;
+    writeln!(
+        output,
+        "  cargo xtask zakura-commit-bench [--profile] [--jemalloc] -- <fetch|run> [args]"
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "`zakura-commit-bench` benchmarks the block-commit stack below Zakura block-sync"
+    )?;
+    writeln!(
+        output,
+        "(real checkpoint verifier + real state). `--profile` runs under samply; `--jemalloc`"
+    )?;
+    writeln!(
+        output,
+        "enables jemalloc heap profiling. See zakura-commit-bench/README.md."
+    )?;
     writeln!(output)?;
     writeln!(
         output,

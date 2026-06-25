@@ -8948,6 +8948,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
+name = "zakura-commit-bench"
+version = "0.1.0"
+dependencies = [
+ "clap 4.6.1",
+ "color-eyre",
+ "futures",
+ "hex",
+ "metrics",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tikv-jemallocator",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+ "zebra-chain",
+ "zebra-consensus",
+ "zebra-jsonl-trace",
+ "zebra-network",
+ "zebra-state",
+ "zebra-test",
+]
+
+[[package]]
 name = "zcash_address"
 version = "0.12.0"
 source = "git+https://github.com/valargroup/librustzcash.git?rev=69befdcab3ce8ba6e6b6fbc0a23c787f9ec95ed6#69befdcab3ce8ba6e6b6fbc0a23c787f9ec95ed6"
