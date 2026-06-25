@@ -61,7 +61,7 @@ impl BlockApplyExecutor for ImmediateTestBlockApplyExecutor {
 
     fn refresh_checkpoint_frontier(
         &self,
-        _highest_sent: block::Height,
+        _baseline_verified_tip: block::Height,
         _attempts_remaining: usize,
     ) -> futures::future::BoxFuture<'static, Option<BlockSyncFrontiers>> {
         use futures::FutureExt;

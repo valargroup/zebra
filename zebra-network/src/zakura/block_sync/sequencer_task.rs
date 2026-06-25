@@ -34,6 +34,15 @@ const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
 
+/// Emit a `block_commit_progress` rollup at most once per this many committed
+/// bodies. Bounds row volume during fast checkpoint sync (≈ committed_blocks /
+/// 256 rows per second) instead of one row per commit.
+const COMMIT_PROGRESS_BLOCK_INTERVAL: u64 = 256;
+/// ...and at least this often while commits are making progress, so a slow
+/// full-verify near the tip still emits a partial rollup row rather than waiting
+/// for 256 commits.
+const COMMIT_PROGRESS_TIME_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Copy, Clone, Debug)]
 enum ReadySource {
     Control,
@@ -76,21 +85,130 @@ impl ReadySource {
 struct SubmittedBlockApply {
     class: BlockApplyClass,
     output: BlockApplyOutput,
+    /// When the body was handed to the verifier driver, used to measure the
+    /// submit → finish apply round-trip latency on completion.
+    submitted_at: Instant,
+    /// The body's reserved byte size, captured at submit so a `Committed`
+    /// completion can be attributed to commit throughput even when the
+    /// `applying` entry was already reaped (by a coalesced checkpoint frontier
+    /// refresh) before this completion is drained.
+    bytes: u64,
+}
+
+/// Rolling commit-throughput accumulator, drained into a `block_commit_progress`
+/// trace row on a bounded cadence (see [`COMMIT_PROGRESS_BLOCK_INTERVAL`] /
+/// [`COMMIT_PROGRESS_TIME_INTERVAL`]). It answers "how long to commit N blocks
+/// while syncing" without one row per commit, and exposes whether the apply
+/// pipeline (not download) is the limiter via `submit_throttled`.
+#[derive(Debug)]
+struct CommitProgress {
+    window_start: Instant,
+    blocks: u64,
+    bytes: u64,
+    apply_latency_sum_us: u128,
+    apply_latency_max_us: u64,
+    submit_throttled: u64,
+}
+
+/// A drained [`CommitProgress`] interval, ready to emit.
+struct CommitProgressSnapshot {
+    interval_ms: u64,
+    blocks: u64,
+    bytes: u64,
+    apply_latency_avg_us: u64,
+    apply_latency_max_us: u64,
+    submit_throttled: u64,
+}
+
+impl CommitProgress {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            blocks: 0,
+            bytes: 0,
+            apply_latency_sum_us: 0,
+            apply_latency_max_us: 0,
+            submit_throttled: 0,
+        }
+    }
+
+    fn record_commit(&mut self, bytes: u64, latency: Duration) {
+        self.blocks = self.blocks.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+        self.apply_latency_sum_us = self
+            .apply_latency_sum_us
+            .saturating_add(u128::from(latency_us));
+        self.apply_latency_max_us = self.apply_latency_max_us.max(latency_us);
+    }
+
+    fn record_throttle(&mut self) {
+        self.submit_throttled = self.submit_throttled.saturating_add(1);
+    }
+
+    fn should_emit(&self, now: Instant) -> bool {
+        self.blocks >= COMMIT_PROGRESS_BLOCK_INTERVAL
+            || (self.blocks > 0
+                && now.saturating_duration_since(self.window_start)
+                    >= COMMIT_PROGRESS_TIME_INTERVAL)
+    }
+
+    fn take(&mut self, now: Instant) -> CommitProgressSnapshot {
+        let interval_ms =
+            u64::try_from(now.saturating_duration_since(self.window_start).as_millis())
+                .unwrap_or(u64::MAX);
+        let apply_latency_avg_us = if self.blocks > 0 {
+            u64::try_from(self.apply_latency_sum_us / u128::from(self.blocks)).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        let snapshot = CommitProgressSnapshot {
+            interval_ms,
+            blocks: self.blocks,
+            bytes: self.bytes,
+            apply_latency_avg_us,
+            apply_latency_max_us: self.apply_latency_max_us,
+            submit_throttled: self.submit_throttled,
+        };
+        self.window_start = now;
+        self.blocks = 0;
+        self.bytes = 0;
+        self.apply_latency_sum_us = 0;
+        self.apply_latency_max_us = 0;
+        self.submit_throttled = 0;
+        snapshot
+    }
+}
+
+fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
+    match class {
+        BlockApplyClass::Checkpoint => "checkpoint",
+        BlockApplyClass::Full => "full",
+    }
+}
+
+fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
+    match result {
+        BlockApplyResult::Committed => "committed",
+        BlockApplyResult::Duplicate => "duplicate",
+        BlockApplyResult::Rejected => "rejected",
+        BlockApplyResult::TimedOut => "timed_out",
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct CheckpointFrontierRefresh {
-    highest_sent: Option<block::Height>,
+    baseline_verified_tip: Option<block::Height>,
     attempts_remaining: usize,
     next_attempt_at: Option<tokio::time::Instant>,
 }
 
 impl CheckpointFrontierRefresh {
-    fn observe_checkpoint_commit(&mut self, highest_observed_at_apply: block::Height) {
-        self.highest_sent = Some(
-            self.highest_sent
-                .map(|height| height.max(highest_observed_at_apply))
-                .unwrap_or(highest_observed_at_apply),
+    fn observe_checkpoint_commit(&mut self, baseline_verified_tip: block::Height) {
+        self.baseline_verified_tip = Some(
+            self.baseline_verified_tip
+                .map(|height| height.max(baseline_verified_tip))
+                .unwrap_or(baseline_verified_tip),
         );
         self.attempts_remaining = CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS;
         if self.next_attempt_at.is_none() {
@@ -105,11 +223,23 @@ impl CheckpointFrontierRefresh {
             .flatten()
     }
 
-    fn finish_attempt(&mut self, highest_sent: block::Height) {
-        self.highest_sent = Some(highest_sent);
+    fn finish_attempt(&mut self, published_tip: Option<block::Height>) {
+        if let Some(published_tip) = published_tip {
+            self.baseline_verified_tip = Some(published_tip);
+        }
         self.attempts_remaining = self.attempts_remaining.saturating_sub(1);
         self.next_attempt_at = (self.attempts_remaining > 0)
             .then_some(tokio::time::Instant::now() + CHECKPOINT_FRONTIER_REFRESH_INTERVAL);
+    }
+
+    fn observe_verified_tip(&mut self, verified_tip: block::Height) {
+        if self.baseline_verified_tip.is_some() {
+            self.baseline_verified_tip = Some(
+                self.baseline_verified_tip
+                    .map(|height| height.max(verified_tip))
+                    .unwrap_or(verified_tip),
+            );
+        }
     }
 }
 
@@ -304,6 +434,7 @@ pub(super) struct SequencerTask {
     action_send_timeout: Duration,
     trace: ZakuraTrace,
     next_ready_source: ReadySource,
+    commit_progress: CommitProgress,
 }
 
 impl SequencerTask {
@@ -346,6 +477,7 @@ impl SequencerTask {
             action_send_timeout,
             trace,
             next_ready_source: ReadySource::Control,
+            commit_progress: CommitProgress::new(Instant::now()),
         }
     }
 
@@ -419,6 +551,9 @@ impl SequencerTask {
                     ) {
                         self.publish_view();
                     }
+                    // Backstop: flush a partial commit-progress rollup when commits
+                    // are crawling (the per-completion check below fires too rarely).
+                    self.maybe_emit_commit_progress();
                 }
             }
         }
@@ -567,20 +702,40 @@ impl SequencerTask {
     }
 
     async fn process_apply_completion(&mut self, completed: SubmittedBlockApply) {
+        let apply_latency = completed.submitted_at.elapsed();
+        let class = completed.class;
+        let token = completed.output.token;
+        let height = completed.output.height;
+        let result = completed.output.result;
+        let bytes = completed.bytes;
         self.decrement_in_flight_apply_count(completed.class);
         self.observe_apply_completion(completed.class, completed.output);
         let needs_reaction = self
             .handle_apply_finished(
-                completed.output.token,
-                completed.output.height,
+                token,
+                height,
                 completed.output.hash,
-                completed.output.result,
+                result,
                 completed.output.local_frontier,
             )
             .await;
+        self.trace_apply_finished(height, token, class, result, apply_latency);
+        // Attribute commit throughput from the apply RESULT, not from the
+        // presence of a live `applying` entry. A coalesced checkpoint frontier
+        // refresh advances the verified tip from durable state and reaps the
+        // committed `applying` entries (`release_applied_through`); if that runs
+        // before a still-pending completion is drained here, the entry is gone
+        // and the old entry-keyed attribution silently dropped the commit. Each
+        // completion is drained exactly once and state de-duplicates commits at a
+        // height, so a `Committed` result counts each real commit exactly once.
+        if matches!(result, BlockApplyResult::Committed) {
+            self.committed_throughput.record(bytes);
+            self.commit_progress.record_commit(bytes, apply_latency);
+        }
         if needs_reaction {
             self.reaction_epoch = self.reaction_epoch.saturating_add(1);
         }
+        self.maybe_emit_commit_progress();
         self.publish_view();
     }
 
@@ -588,18 +743,16 @@ impl SequencerTask {
         let Some(executor) = self.apply_executor.clone() else {
             return;
         };
-        let Some(highest_sent) = self.checkpoint_frontier_refresh.highest_sent else {
+        let Some(baseline_verified_tip) = self.checkpoint_frontier_refresh.baseline_verified_tip
+        else {
             return;
         };
         let attempts_remaining = self.checkpoint_frontier_refresh.attempts_remaining;
         let frontiers = executor
-            .refresh_checkpoint_frontier(highest_sent, attempts_remaining)
+            .refresh_checkpoint_frontier(baseline_verified_tip, attempts_remaining)
             .await;
-        let next_highest_sent = frontiers
-            .map(|frontiers| frontiers.verified_block_tip)
-            .unwrap_or(highest_sent);
         self.checkpoint_frontier_refresh
-            .finish_attempt(next_highest_sent);
+            .finish_attempt(frontiers.map(|frontiers| frontiers.verified_block_tip));
         if let Some(frontiers) = frontiers {
             self.handle_frontier_advance(frontiers, true).await;
             self.reaction_epoch = self.reaction_epoch.saturating_add(1);
@@ -711,6 +864,8 @@ impl SequencerTask {
             self.budget.release(released);
             self.release_contiguous_blocks().await;
         }
+        self.checkpoint_frontier_refresh
+            .observe_verified_tip(self.sequencer.verified_tip());
     }
 
     /// The Sequencer/work/budget body of `handle_chain_tip_reset` (verbatim from
@@ -788,6 +943,8 @@ impl SequencerTask {
         // re-fills.
         let released = self.work.reset_above(self.sequencer.floor());
         self.budget.release(released);
+        self.checkpoint_frontier_refresh
+            .observe_verified_tip(self.sequencer.verified_tip());
         // A destructive reset: bump the epoch so the reactor drops *all*
         // outstanding requests (not just those through the tip).
         self.reset_epoch = self.reset_epoch.saturating_add(1);
@@ -807,7 +964,9 @@ impl SequencerTask {
     ) -> bool {
         // A stale completion (no live applying entry, or token/hash mismatch)
         // only decrements the submitted-apply record and returns; the single-task
-        // version ran no query/schedule tail here, so it needs no reaction.
+        // version ran no query/schedule tail here, so it needs no reaction. Commit
+        // throughput is attributed by the caller from the apply RESULT, so a
+        // refresh-reaped-but-committed body is still counted there.
         let Some((applying_token, applying_hash)) = self.sequencer.applying_token_hash(height)
         else {
             self.sequencer.decrement_submitted_apply(height, hash);
@@ -845,11 +1004,6 @@ impl SequencerTask {
             .expect("applying entry exists because it was just checked");
 
         self.budget.release(applying.bytes);
-        // A `Committed` result is a body that newly extended the chain; count it
-        // toward commit throughput (the apply rate the download path is racing).
-        if matches!(result, BlockApplyResult::Committed) {
-            self.committed_throughput.record(applying.bytes);
-        }
         self.sequencer.decrement_submitted_apply(height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
@@ -915,6 +1069,11 @@ impl SequencerTask {
             let class = executor.block_apply_class(item.block.as_ref());
             if !self.can_submit_class(class, limits) {
                 self.sequencer.unsubmit(item.height, item.token);
+                // The body is ready but a downstream apply limit is saturated:
+                // record it so a backed-up commit pipeline (vs. slow download) is
+                // visible in metrics and the commit-progress rollup.
+                metrics::counter!("sync.block.submit.throttled").increment(1);
+                self.commit_progress.record_throttle();
                 continue;
             }
 
@@ -930,14 +1089,21 @@ impl SequencerTask {
                     block: item.block.clone(),
                 });
             }
+            let bytes = item.bytes;
             let apply = executor.apply(BlockApplyRequest {
                 token: item.token,
                 block: item.block,
             });
+            let submitted_at = Instant::now();
             self.in_flight_applies.push(
                 async move {
                     let output = apply.await;
-                    SubmittedBlockApply { class, output }
+                    SubmittedBlockApply {
+                        class,
+                        output,
+                        submitted_at,
+                        bytes,
+                    }
                 }
                 .boxed(),
             );
@@ -995,13 +1161,12 @@ impl SequencerTask {
     }
 
     fn observe_apply_completion(&mut self, class: BlockApplyClass, output: BlockApplyOutput) {
-        if class == BlockApplyClass::Checkpoint && output.result == BlockApplyResult::Committed {
-            let highest_observed_at_apply = output
-                .local_frontier
-                .map(|frontiers| frontiers.verified_block_tip)
-                .unwrap_or_else(|| output.height.previous().unwrap_or(output.height));
+        if class == BlockApplyClass::Checkpoint
+            && output.result == BlockApplyResult::Committed
+            && output.local_frontier.is_none()
+        {
             self.checkpoint_frontier_refresh
-                .observe_checkpoint_commit(highest_observed_at_apply);
+                .observe_checkpoint_commit(self.sequencer.verified_tip());
         }
     }
 
@@ -1032,6 +1197,90 @@ impl SequencerTask {
                 bs_trace::RESULT.to_string(),
                 serde_json::Value::String(outcome.to_string()),
             );
+        });
+    }
+
+    /// Per-block apply completion row carrying the submit → finish round-trip
+    /// latency (verifier verify + commit + the driver's post-commit frontier
+    /// re-read), i.e. the commit cost as the sequencer experiences it.
+    fn trace_apply_finished(
+        &self,
+        height: block::Height,
+        token: BlockApplyToken,
+        class: BlockApplyClass,
+        result: BlockApplyResult,
+        latency: Duration,
+    ) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(bs_trace::BLOCK_APPLY_FINISHED.to_string()),
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+            row.insert(
+                bs_trace::APPLY_CLASS.to_string(),
+                serde_json::Value::String(block_apply_class_label(class).to_string()),
+            );
+            row.insert(
+                bs_trace::RESULT.to_string(),
+                serde_json::Value::String(block_apply_result_label(result).to_string()),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::APPLY_LATENCY_US,
+                u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+            );
+        });
+    }
+
+    /// Flush a `block_commit_progress` rollup if the bounded block/time cadence
+    /// has been reached; cheap (one `Instant::now` + comparison) otherwise.
+    fn maybe_emit_commit_progress(&mut self) {
+        let now = Instant::now();
+        if !self.commit_progress.should_emit(now) {
+            return;
+        }
+        let snapshot = self.commit_progress.take(now);
+        self.emit_commit_progress(&snapshot);
+    }
+
+    fn emit_commit_progress(&self, snapshot: &CommitProgressSnapshot) {
+        let blocks_per_sec = if snapshot.interval_ms > 0 {
+            snapshot
+                .blocks
+                .saturating_mul(1000)
+                .saturating_div(snapshot.interval_ms)
+        } else {
+            0
+        };
+        let verified_tip = self.sequencer.verified_tip();
+        // `as u64`: in-flight apply counts are small bounded usize gauges.
+        let checkpoint_in_flight = self.checkpoint_in_flight as u64;
+        let full_in_flight = self.full_in_flight as u64;
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(bs_trace::BLOCK_COMMIT_PROGRESS.to_string()),
+            );
+            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, verified_tip);
+            bs_insert_u64(row, bs_trace::COMMITTED_BLOCKS, snapshot.blocks);
+            bs_insert_u64(row, bs_trace::COMMITTED_BYTES, snapshot.bytes);
+            bs_insert_u64(row, bs_trace::INTERVAL_MS, snapshot.interval_ms);
+            bs_insert_u64(row, bs_trace::COMMITTED_BLOCKS_PER_SEC, blocks_per_sec);
+            bs_insert_u64(
+                row,
+                bs_trace::APPLY_LATENCY_AVG_US,
+                snapshot.apply_latency_avg_us,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::APPLY_LATENCY_MAX_US,
+                snapshot.apply_latency_max_us,
+            );
+            bs_insert_u64(row, bs_trace::CHECKPOINT_IN_FLIGHT, checkpoint_in_flight);
+            bs_insert_u64(row, bs_trace::FULL_IN_FLIGHT, full_in_flight);
+            bs_insert_u64(row, bs_trace::SUBMIT_THROTTLED, snapshot.submit_throttled);
         });
     }
 
@@ -1145,5 +1394,57 @@ impl SequencerTask {
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         });
+    }
+}
+
+#[cfg(test)]
+impl SequencerTask {
+    /// Direct access to the owned `Sequencer` so a white-box test can seed
+    /// `applying`/submitted state without driving the full run loop.
+    pub(super) fn sequencer_mut(&mut self) -> &mut Sequencer {
+        &mut self.sequencer
+    }
+
+    /// Direct access to the byte budget so a test can pre-reserve the bytes its
+    /// seeded `applying` entries hold (keeping the `publish_view` audit clean).
+    pub(super) fn budget_mut(&mut self) -> &mut ByteBudget {
+        &mut self.budget
+    }
+
+    /// Committed blocks accumulated in the current (not-yet-emitted)
+    /// `block_commit_progress` window.
+    pub(super) fn commit_progress_blocks(&self) -> u64 {
+        self.commit_progress.blocks
+    }
+
+    /// Committed bytes accumulated in the current (not-yet-emitted)
+    /// `block_commit_progress` window.
+    pub(super) fn commit_progress_bytes(&self) -> u64 {
+        self.commit_progress.bytes
+    }
+
+    /// Drive one apply completion exactly as the run loop's
+    /// `in_flight_applies` arm would, with a caller-supplied output and byte
+    /// size (no real verifier future).
+    pub(super) async fn drive_apply_completion(
+        &mut self,
+        class: BlockApplyClass,
+        output: BlockApplyOutput,
+        bytes: u64,
+    ) {
+        self.process_apply_completion(SubmittedBlockApply {
+            class,
+            output,
+            submitted_at: Instant::now(),
+            bytes,
+        })
+        .await;
+    }
+
+    /// Simulate the coalesced checkpoint refresh advancing the verified tip from
+    /// durable state — the step that reaps committed `applying` entries (via
+    /// `release_applied_through`) before their completions are drained.
+    pub(super) async fn drive_checkpoint_refresh_advance(&mut self, frontiers: BlockSyncFrontiers) {
+        self.handle_frontier_advance(frontiers, true).await;
     }
 }

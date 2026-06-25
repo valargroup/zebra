@@ -130,6 +130,10 @@ pub struct BlockApplyOutput {
     /// Verifier result.
     pub result: BlockApplyResult,
     /// Locally observed chain frontier after the apply attempt completed.
+    ///
+    /// Successful checkpoint applies may intentionally return `None`: their
+    /// durable frontier publication is coalesced by
+    /// [`BlockApplyExecutor::refresh_checkpoint_frontier`].
     pub local_frontier: Option<BlockSyncFrontiers>,
 }
 
@@ -145,7 +149,7 @@ pub trait BlockApplyExecutor: Send + Sync + 'static {
     /// before their batched state commit reaches the tip.
     fn refresh_checkpoint_frontier(
         &self,
-        highest_sent: block::Height,
+        baseline_verified_tip: block::Height,
         attempts_remaining: usize,
     ) -> BoxFuture<'static, Option<BlockSyncFrontiers>>;
 }
@@ -208,11 +212,11 @@ impl BlockApplyExecutorPort {
     /// Refresh the durable frontier after checkpoint applies.
     pub fn refresh_checkpoint_frontier(
         &self,
-        highest_sent: block::Height,
+        baseline_verified_tip: block::Height,
         attempts_remaining: usize,
     ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
         self.inner
-            .refresh_checkpoint_frontier(highest_sent, attempts_remaining)
+            .refresh_checkpoint_frontier(baseline_verified_tip, attempts_remaining)
     }
 }
 

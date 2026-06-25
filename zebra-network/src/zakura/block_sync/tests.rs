@@ -168,7 +168,7 @@ impl BlockApplyExecutor for TestBlockApplyExecutor {
 
     fn refresh_checkpoint_frontier(
         &self,
-        _highest_sent: block::Height,
+        _baseline_verified_tip: block::Height,
         _attempts_remaining: usize,
     ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
         async { None }.boxed()
@@ -191,10 +191,45 @@ impl BlockApplyExecutor for TestCheckpointBlockApplyExecutor {
 
     fn refresh_checkpoint_frontier(
         &self,
-        _highest_sent: block::Height,
+        _baseline_verified_tip: block::Height,
         _attempts_remaining: usize,
     ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
         async { None }.boxed()
+    }
+}
+
+#[derive(Debug)]
+struct TestCheckpointRefreshExecutor {
+    inner: TestBlockApplyExecutor,
+    refresh_calls: StdArc<Mutex<Vec<(block::Height, usize)>>>,
+    refresh_frontiers: StdArc<Mutex<VecDeque<Option<BlockSyncFrontiers>>>>,
+}
+
+impl BlockApplyExecutor for TestCheckpointRefreshExecutor {
+    fn block_apply_class(&self, _block: &block::Block) -> BlockApplyClass {
+        BlockApplyClass::Checkpoint
+    }
+
+    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
+        self.inner.apply(request)
+    }
+
+    fn refresh_checkpoint_frontier(
+        &self,
+        baseline_verified_tip: block::Height,
+        attempts_remaining: usize,
+    ) -> BoxFuture<'static, Option<BlockSyncFrontiers>> {
+        self.refresh_calls
+            .lock()
+            .expect("test refresh call mutex is not poisoned")
+            .push((baseline_verified_tip, attempts_remaining));
+        let frontiers = self
+            .refresh_frontiers
+            .lock()
+            .expect("test refresh frontier mutex is not poisoned")
+            .pop_front()
+            .unwrap_or(None);
+        async move { frontiers }.boxed()
     }
 }
 
@@ -3087,11 +3122,7 @@ async fn sequencer_single_apply_limit_serializes_checkpoint_submissions() {
             height: block::Height(1),
             hash: first_block.hash(),
             result: BlockApplyResult::Committed,
-            local_frontier: Some(BlockSyncFrontiers {
-                finalized_height: block::Height(1),
-                verified_block_tip: block::Height(1),
-                verified_block_hash: first_block.hash(),
-            }),
+            local_frontier: None,
         })
         .expect("held checkpoint completion receiver is still live");
 
@@ -3109,6 +3140,288 @@ async fn sequencer_single_apply_limit_serializes_checkpoint_submissions() {
     }
 
     task_handle.abort();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sequencer_coalesces_checkpoint_frontier_refreshes() {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let blocks = fake_sequential_blocks(2);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(4);
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(bytes.saturating_mul(2)));
+    let (view_tx, mut view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    let completions = StdArc::new(Mutex::new(VecDeque::new()));
+    let default_result = StdArc::new(Mutex::new(BlockApplyResult::Committed));
+    let controller = TestBlockApplyController {
+        completions: completions.clone(),
+        default_result: default_result.clone(),
+    };
+    let first_completion = controller.hold_next();
+    let second_completion = controller.hold_next();
+    let refresh_calls = StdArc::new(Mutex::new(Vec::new()));
+    let refresh_frontiers = StdArc::new(Mutex::new(VecDeque::from([Some(BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(2),
+        verified_block_hash: blocks[1].hash(),
+    })])));
+    let executor = TestCheckpointRefreshExecutor {
+        inner: TestBlockApplyExecutor {
+            completions,
+            default_result,
+            completed_count: None,
+            submit_completed_counts: None,
+        },
+        refresh_calls: refresh_calls.clone(),
+        refresh_frontiers,
+    };
+    let limits = BlockApplyLimits {
+        checkpoint_apply_limit: 2,
+        full_apply_limit: 2,
+        combined_apply_limit: 2,
+    };
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(Some(
+        BlockApplyExecutorPort::with_limits(StdArc::new(executor), limits),
+    ));
+    let task = super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), blocks.len()),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        body_input_bytes.clone(),
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    );
+
+    for block in &blocks {
+        body_tx
+            .send(super::sequencer_task::SequencedBody {
+                height: block.coinbase_height().expect("test block has height"),
+                hash: block.hash(),
+                body: BufferedBlockBody::Decoded(block.clone()),
+                bytes,
+                peer: peer(1),
+                received_at: Instant::now(),
+            })
+            .await
+            .expect("checkpoint body queues");
+    }
+
+    let task_handle = tokio::spawn(async move { task.run().await });
+    let mut submitted = Vec::new();
+    while submitted.len() < 2 {
+        match next_action(&mut actions_rx).await {
+            BlockSyncAction::ApplySubmitted { token, block } => {
+                submitted.push((token, block));
+            }
+            action => panic!("unexpected action before checkpoint submissions: {action:?}"),
+        }
+    }
+
+    for (completion, (token, block)) in [first_completion, second_completion]
+        .into_iter()
+        .zip(submitted)
+    {
+        let height = block
+            .coinbase_height()
+            .expect("submitted test block has height");
+        completion
+            .send(BlockApplyOutput {
+                token,
+                height,
+                hash: block.hash(),
+                result: BlockApplyResult::Committed,
+                local_frontier: None,
+            })
+            .expect("held checkpoint completion receiver is still live");
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            view_rx.changed().await.expect("view sender remains live");
+            if view_rx.borrow().submitted_applying_count == 0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("checkpoint completions release submitted apply slots");
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            view_rx.changed().await.expect("view sender remains live");
+            if view_rx.borrow().verified_tip == block::Height(2) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("coalesced checkpoint refresh advances the verified tip");
+
+    assert_eq!(
+        refresh_calls
+            .lock()
+            .expect("test refresh call mutex is not poisoned")
+            .as_slice(),
+        &[(block::Height(0), 24)],
+        "multiple checkpoint completions before the deadline share one refresh baseline",
+    );
+
+    task_handle.abort();
+}
+
+/// Build a bare `SequencerTask` (verified tip 0, no installed executor) for
+/// white-box accounting tests that drive the completion/refresh handlers
+/// directly instead of running the full loop.
+fn build_checkpoint_accounting_task() -> super::sequencer_task::SequencerTask {
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let (_body_tx, body_rx) = mpsc::channel(4);
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, _actions_rx) = mpsc::channel(4);
+    let (_apply_executor_tx, apply_executor_rx) = watch::channel(None);
+    let (view_tx, _view_rx) = watch::channel(super::sequencer_task::initial_view(frontiers));
+    super::sequencer_task::SequencerTask::new(
+        Sequencer::new(block::Height(0), 3),
+        ByteBudget::new(u64::MAX),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        apply_executor_rx,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        view_tx,
+        Duration::from_secs(1),
+        ZakuraTrace::noop(),
+    )
+}
+
+/// A coalesced checkpoint frontier refresh advances the verified tip from
+/// durable state and reaps the committed `applying` entries before their
+/// own apply completions are drained. Those completions then find no live
+/// `applying` entry — but they are still real commits and must still be
+/// attributed to commit-throughput, otherwise `block_commit_progress`
+/// undercounts every block reaped by a refresh.
+#[tokio::test]
+async fn checkpoint_refresh_reaped_commit_is_still_counted() {
+    let blocks = fake_sequential_blocks(3);
+    let bytes = u64::from(block_size(&blocks[0]));
+    let mut task = build_checkpoint_accounting_task();
+    task.budget_mut().try_reserve(bytes.saturating_mul(3));
+
+    // Seed `applying` with three submitted checkpoint bodies (heights 1..=3).
+    let mut submitted = Vec::new();
+    {
+        let seq = task.sequencer_mut();
+        for block in &blocks {
+            let height = block.coinbase_height().expect("test block has height");
+            let outcome = seq.accept_body(height, block.hash(), block.clone(), bytes, peer(1));
+            assert!(
+                matches!(outcome, AcceptOutcome::Buffered { .. }),
+                "seeded checkpoint body buffers",
+            );
+        }
+        seq.drain_ready_into_applying();
+        for block in &blocks {
+            let height = block.coinbase_height().expect("test block has height");
+            let item = seq.prepare_submit(height).expect("applying height submits");
+            seq.record_submitted_apply(item.height, item.hash);
+            submitted.push((item.height, item.token, item.hash));
+        }
+    }
+
+    // Height 1 completes normally (its `applying` entry is still live).
+    let (height1, token1, hash1) = submitted[0];
+    task.drive_apply_completion(
+        BlockApplyClass::Checkpoint,
+        BlockApplyOutput {
+            token: token1,
+            height: height1,
+            hash: hash1,
+            result: BlockApplyResult::Committed,
+            local_frontier: None,
+        },
+        bytes,
+    )
+    .await;
+    assert_eq!(
+        task.commit_progress_blocks(),
+        1,
+        "a checkpoint commit with a live applying entry is counted",
+    );
+
+    // The coalesced refresh observes durable tip 3 and reaps the applying
+    // entries for heights 2 and 3 before their completions are drained.
+    task.drive_checkpoint_refresh_advance(BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(3),
+        verified_block_hash: blocks[2].hash(),
+    })
+    .await;
+
+    // Heights 2 and 3 now complete with no live applying entry (reaped above).
+    for &(height, token, hash) in &submitted[1..] {
+        task.drive_apply_completion(
+            BlockApplyClass::Checkpoint,
+            BlockApplyOutput {
+                token,
+                height,
+                hash,
+                result: BlockApplyResult::Committed,
+                local_frontier: None,
+            },
+            bytes,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        task.commit_progress_blocks(),
+        3,
+        "refresh-reaped checkpoint commits are still attributed to throughput",
+    );
+    assert_eq!(
+        task.commit_progress_bytes(),
+        bytes.saturating_mul(3),
+        "every committed body's bytes are counted exactly once",
+    );
+
+    // A genuinely non-committed stale completion (no live entry, not Committed)
+    // must not be counted: attribution keys on the apply RESULT, not staleness.
+    task.drive_apply_completion(
+        BlockApplyClass::Checkpoint,
+        BlockApplyOutput {
+            token: 0,
+            height: block::Height(3),
+            hash: block::Hash([9; 32]),
+            result: BlockApplyResult::Duplicate,
+            local_frontier: None,
+        },
+        bytes,
+    )
+    .await;
+    assert_eq!(
+        task.commit_progress_blocks(),
+        3,
+        "a non-committed stale completion is not counted",
+    );
 }
 
 #[tokio::test]
