@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Added the optional `[network.zakura] dev_network` config tag for private
+  Zakura (v2) dev networks. Nodes that set the same tag form an isolated v2
+  overlay on top of an unchanged chain: their Zakura handshakes and discovery
+  records carry a cohort-derived id, so public nodes and other cohorts ignore
+  them. This lets a team test breaking Zakura changes without interfering with
+  each other or the public network, while still validating real consensus. See
+  the [private Zakura dev networks](book/src/dev/private-zakura-network.md) guide.
+
 ### Performance
 
 - Parallelize per-block serialization in the finalized block writer. On heavy
