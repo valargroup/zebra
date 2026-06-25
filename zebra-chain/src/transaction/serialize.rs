@@ -29,7 +29,6 @@ use crate::sapling;
 
 const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
-const ORCHARD_CROSS_ADDRESS_FLAG_BIT: u8 = 0b0000_0100;
 
 impl ZcashDeserialize for jubjub::Fq {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
@@ -463,7 +462,7 @@ fn serialize_orchard_flags<W: io::Write>(
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     let valid_bits = if allow_cross_address_bit {
-        ORCHARD_SPEND_OUTPUT_FLAG_BITS | ORCHARD_CROSS_ADDRESS_FLAG_BIT
+        ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits()
     } else {
         ORCHARD_SPEND_OUTPUT_FLAG_BITS
     };
@@ -557,7 +556,9 @@ fn deserialize_orchard_flags<R: io::Read>(
 ) -> Result<orchard::Flags, SerializationError> {
     let bits = reader.read_u8()?;
     if allow_cross_address_bit {
-        if bits & !(ORCHARD_SPEND_OUTPUT_FLAG_BITS | ORCHARD_CROSS_ADDRESS_FLAG_BIT) == 0 {
+        if bits & !(ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits())
+            == 0
+        {
             Some(orchard::Flags::from_bits_retain(bits))
         } else {
             None
