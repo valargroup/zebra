@@ -1008,11 +1008,15 @@ pub(crate) fn tree_aux_roots_for_served_header_range(
         };
 
         let Some(root) = block_roots.get(offset) else {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::MissingRoot { height, offset });
         };
 
         if root.height != height {
-            return Vec::new();
+            return Err(TreeAuxRootsForServedHeaderRangeError::RootHeightMismatch {
+                expected_height: height,
+                actual_height: root.height,
+                offset,
+            });
         }
 
         roots.push(root.clone());
