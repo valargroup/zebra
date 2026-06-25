@@ -221,7 +221,7 @@ pub enum CommitHeaderRangeError {
         body_sizes: usize,
     },
 
-    /// The request supplied a non-empty root list with a different number of roots than headers.
+    /// The request supplied a different number of roots than headers.
     #[error("header range tree-aux root count {roots} does not match header count {headers}")]
     TreeAuxRootCountMismatch {
         /// Header count.

@@ -2065,13 +2065,14 @@ mod zakura_header_sync_driver_tests {
     use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
     use super::zakura::{
-        apply_block_sync_body, block_apply_class, block_sync_chain_tip_event,
-        block_sync_missing_body_window, block_sync_needed_blocks_from_state,
-        block_verify_error_is_duplicate, body_sizes_for_served_header_range,
-        chain_tip_mirror_frontier_change, coalesce_ready_needed_block_queries,
-        coalesce_stale_needed_block_queries, commit_block_sync_body, drive_block_sync_actions,
-        drive_zakura_header_sync_actions, header_range_commit_failure_kind,
-        notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
+        apply_block_sync_body, block_apply_class, block_roots_cover_range,
+        block_sync_chain_tip_event, block_sync_missing_body_window,
+        block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
+        body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
+        coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
+        commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
+        header_range_commit_failure_kind, notify_block_sync_header_tip, query_block_sync_frontiers,
+        query_block_sync_needed_blocks, root_covered_query_best_header_tip,
         tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
         BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles, ZebradBlockApplyExecutor,
         ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
@@ -2217,6 +2218,54 @@ mod zakura_header_sync_driver_tests {
                 .expect("complete roots match the served header range"),
             complete_roots.to_vec(),
             "complete root coverage is attached to the served header range"
+        );
+    }
+
+    #[test]
+    fn startup_root_backfill_gate_requires_complete_root_coverage() {
+        let start = block::Height(10);
+        let complete_roots = [
+            root_at(block::Height(10)),
+            root_at(block::Height(11)),
+            root_at(block::Height(12)),
+        ];
+        assert!(block_roots_cover_range(start, 3, &complete_roots));
+        assert!(!block_roots_cover_range(start, 3, &complete_roots[..2]));
+
+        let roots_with_gap = [
+            root_at(block::Height(10)),
+            root_at(block::Height(12)),
+            root_at(block::Height(13)),
+        ];
+        assert!(!block_roots_cover_range(start, 3, &roots_with_gap));
+    }
+
+    #[tokio::test]
+    async fn query_best_header_tip_is_capped_when_roots_are_missing() {
+        let verified_tip = (block::Height(0), block::Hash([0; 32]));
+        let durable_header_tip = (block::Height(2), block::Hash([2; 32]));
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::Tip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::Tip(Some(verified_tip)),
+                ),
+                zebra_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 2);
+                    Ok(zebra_state::ReadResponse::BlockRoots(Vec::new()))
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+
+        assert_eq!(
+            root_covered_query_best_header_tip(read_state, durable_header_tip)
+                .await
+                .expect("capped query succeeds"),
+            verified_tip
         );
     }
 
