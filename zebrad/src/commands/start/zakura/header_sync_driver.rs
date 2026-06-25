@@ -1008,15 +1008,11 @@ pub(crate) fn tree_aux_roots_for_served_header_range(
         };
 
         let Some(root) = block_roots.get(offset) else {
-            return Err(TreeAuxRootsForServedHeaderRangeError::MissingRoot { height, offset });
+            break;
         };
 
         if root.height != height {
-            return Err(TreeAuxRootsForServedHeaderRangeError::RootHeightMismatch {
-                expected_height: height,
-                actual_height: root.height,
-                offset,
-            });
+            break;
         }
 
         roots.push(root.clone());
