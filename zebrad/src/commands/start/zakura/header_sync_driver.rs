@@ -49,6 +49,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     };
 
     let verified_block_tip = match read_state
+        .clone()
         .oneshot(zebra_state::ReadRequest::Tip)
         .await
         .map_err(|error| eyre!("{error}"))?
@@ -61,14 +62,115 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
+    let best_header_tip = root_covered_best_header_tip_or_verified(
+        read_state,
+        best_header_tip.unwrap_or(empty_state_tip),
+        verified_block_tip,
+    )
+    .await?;
+
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
             verified_block_hash: verified_block_tip.1,
         },
-        best_header_tip: Some(best_header_tip.unwrap_or(empty_state_tip)),
+        best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
+    })
+}
+
+async fn root_covered_best_header_tip_or_verified<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+    verified_block_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    if best_header_tip.0 <= verified_block_tip.0 {
+        return Ok(best_header_tip);
+    }
+
+    let Ok(start_height) = verified_block_tip.0.next() else {
+        return Ok(verified_block_tip);
+    };
+    let best_header_height = best_header_tip.0;
+    let verified_block_height = verified_block_tip.0;
+    let count = best_header_height
+        .0
+        .checked_sub(verified_block_height.0)
+        .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
+    let roots = match read_state
+        .oneshot(zebra_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::BlockRoots(roots) => roots,
+        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
+    };
+
+    if block_roots_cover_range(start_height, count, &roots) {
+        Ok(best_header_tip)
+    } else {
+        Ok(verified_block_tip)
+    }
+}
+
+pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let verified_block_tip = match read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::Tip)
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::Tip(Some(tip)) => tip,
+        zebra_state::ReadResponse::Tip(None) => return Ok(best_header_tip),
+        response => Err(eyre!("unexpected Tip response: {response:?}"))?,
+    };
+
+    root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
+}
+
+pub(crate) fn block_roots_cover_range(
+    start_height: block::Height,
+    count: u32,
+    roots: &[BlockCommitmentRoots],
+) -> bool {
+    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    roots.iter().enumerate().all(|(offset, roots)| {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        start_height
+            .0
+            .checked_add(offset)
+            .is_some_and(|height| roots.height == block::Height(height))
     })
 }
 
@@ -678,12 +780,37 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
+                let started = Instant::now();
                 match read_state
                     .clone()
                     .oneshot(zebra_state::ReadRequest::BestHeaderTip)
                     .await
                 {
-                    Ok(zebra_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
+                    Ok(zebra_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
+                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
+                            read_state.clone(),
+                            best_header_tip,
+                        )
+                        .await
+                        {
+                            Ok(tip) => tip,
+                            Err(error) => {
+                                trace_state_read_error(
+                                    &trace,
+                                    "query_best_header_tip_roots",
+                                    None,
+                                    best_header_tip.0,
+                                    1,
+                                    &format!("{error}"),
+                                    started,
+                                );
+                                warn!(
+                                    ?error,
+                                    "failed to apply Zakura root coverage to best header tip"
+                                );
+                                continue;
+                            }
+                        };
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -825,6 +952,10 @@ pub(crate) fn body_sizes_for_served_header_range(
     header_heights
         .into_iter()
         .map(|height| {
+            if height < start {
+                return 0;
+            }
+
             let Some(offset) = usize::try_from(height - start).ok() else {
                 return 0;
             };
@@ -986,6 +1117,9 @@ pub(crate) fn header_range_commit_failure_kind(
         }
         zebra_state::CommitHeaderRangeError::EmptyRange
         | zebra_state::CommitHeaderRangeError::RangeTooLong { .. }
+        | zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
+        | zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
+        | zebra_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
         | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zebra_state::CommitHeaderRangeError::HeightOverflow
         | zebra_state::CommitHeaderRangeError::ImmutableConflict { .. }

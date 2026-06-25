@@ -203,10 +203,17 @@ pub fn truncate_headers_to_byte_budget(
     network: &Network,
     max_frame_bytes: u32,
 ) -> (Vec<Arc<block::Header>>, Vec<u32>, Vec<BlockCommitmentRoots>) {
+    if headers.len() != tree_aux_roots.len() {
+        headers.clear();
+        body_sizes.clear();
+        tree_aux_roots.clear();
+        return (headers, body_sizes, tree_aux_roots);
+    }
+
     let max_count = usize::try_from(header_sync_count_by_byte_budget(
         network,
         max_frame_bytes,
-        !tree_aux_roots.is_empty(),
+        true,
     ))
     .expect("header-sync byte-budget count fits in usize");
     headers.truncate(max_count);

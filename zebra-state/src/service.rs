@@ -1487,6 +1487,126 @@ where
     headers
 }
 
+fn block_roots_by_height_range<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    start: block::Height,
+    count: u32,
+) -> Vec<BlockCommitmentRoots>
+where
+    C: AsRef<Chain>,
+{
+    let mut roots = Vec::with_capacity(
+        usize::try_from(count.min(MAX_HEADER_SYNC_HEIGHT_RANGE))
+            .expect("capped root count fits in usize"),
+    );
+
+    for offset in 0..count.min(MAX_HEADER_SYNC_HEIGHT_RANGE) {
+        let Some(height) = start + i64::from(offset) else {
+            break;
+        };
+
+        let root = if db
+            .finalized_tip_height()
+            .is_some_and(|finalized_tip| height <= finalized_tip)
+        {
+            finalized_state::serve_block_roots(db, height..=height)
+                .into_iter()
+                .next()
+        } else if let Some(chain) = chain
+            .as_ref()
+            .map(|chain| chain.as_ref())
+            .filter(|chain| chain.contains_block_height(height))
+        {
+            match (
+                chain.sapling_tree(height.into()),
+                chain.orchard_tree(height.into()),
+            ) {
+                (Some(sapling), Some(orchard)) => Some(BlockCommitmentRoots {
+                    height,
+                    sapling_root: sapling.root(),
+                    orchard_root: orchard.root(),
+                }),
+                _ => None,
+            }
+        } else {
+            db.zakura_header_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+        };
+
+        let Some(root) = root else {
+            break;
+        };
+
+        if root.height != height {
+            break;
+        }
+
+        roots.push(root);
+    }
+
+    roots
+}
+
+fn block_roots_cover_range(
+    start_height: block::Height,
+    count: u32,
+    roots: &[BlockCommitmentRoots],
+) -> bool {
+    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    roots.iter().enumerate().all(|(offset, roots)| {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        start_height
+            .0
+            .checked_add(offset)
+            .is_some_and(|height| roots.height == block::Height(height))
+    })
+}
+
+fn root_covered_best_header_tip<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    best_disk_header_tip: Option<(block::Height, block::Hash)>,
+    verified_block_tip: Option<(block::Height, block::Hash)>,
+) -> Option<(block::Height, block::Hash)>
+where
+    C: AsRef<Chain>,
+{
+    let best_header_tip = match (best_disk_header_tip, verified_block_tip) {
+        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => Some(block_tip),
+        (Some(header_tip), _) => Some(header_tip),
+        (None, block_tip) => block_tip,
+    }?;
+
+    let Some(verified_block_tip) = verified_block_tip else {
+        return Some(best_header_tip);
+    };
+
+    if best_header_tip.0 <= verified_block_tip.0 {
+        return Some(best_header_tip);
+    }
+
+    let Ok(start_height) = verified_block_tip.0.next() else {
+        return Some(verified_block_tip);
+    };
+    let best_header_height = best_header_tip.0;
+    let verified_block_height = verified_block_tip.0;
+    let count = best_header_height.0.checked_sub(verified_block_height.0)?;
+    let roots = block_roots_by_height_range(chain, db, start_height, count);
+
+    if block_roots_cover_range(start_height, count, &roots) {
+        Some(best_header_tip)
+    } else {
+        Some(verified_block_tip)
+    }
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -1554,53 +1674,15 @@ impl Service<ReadRequest> for ReadStateService {
                 start_height,
                 count,
             } => {
-                // Serve stitched committed verified roots first, then provisional
-                // header-ahead roots for heights that have headers but no committed
-                // body yet. Committed roots win for overlapping heights because
-                // they have already been verified during block commit.
                 let roots = if count == 0 {
                     Vec::new()
-                } else if let Some((tip, _hash)) = state.db.best_header_tip() {
-                    if start_height > tip {
-                        Vec::new()
-                    } else {
-                        let last = start_height.0.saturating_add(count - 1).min(tip.0);
-                        let requested = start_height..=block::Height(last);
-                        let committed_end = state
-                            .db
-                            .finalized_tip_height()
-                            .map(|finalized_tip| finalized_tip.min(*requested.end()))
-                            .filter(|committed_end| start_height <= *committed_end);
-
-                        let mut roots = if let Some(committed_end) = committed_end {
-                            finalized_state::serve_block_roots(
-                                &state.db,
-                                start_height..=committed_end,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-
-                        let next_height = roots
-                            .last()
-                            .and_then(|root| root.height.next().ok())
-                            .unwrap_or(start_height);
-                        if next_height <= *requested.end() {
-                            // Extend the committed prefix with provisional Zakura header-ahead roots.
-                            // These are peer-supplied advisory roots for heights whose headers are known
-                            // but whose block bodies have not been committed yet. Once a block is
-                            // committed, its verified roots move to the committed index and the
-                            // provisional row for that height is deleted.
-                            let provisional =
-                                state.db.zakura_header_commitment_roots_by_height_range(
-                                    next_height..=*requested.end(),
-                                );
-                            roots.extend(provisional);
-                        }
-                        roots
-                    }
                 } else {
-                    Vec::new()
+                    block_roots_by_height_range(
+                        state.latest_best_chain(),
+                        &state.db,
+                        start_height,
+                        count,
+                    )
                 };
                 Ok(ReadResponse::BlockRoots(roots))
             }
@@ -1778,17 +1860,15 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BestHeaderTip => {
                 let best_disk_header_tip = state.db.best_header_tip();
-                let verified_block_tip = read::tip(state.latest_best_chain(), &state.db);
+                let best_chain = state.latest_best_chain();
+                let verified_block_tip = read::tip(best_chain.clone(), &state.db);
 
-                Ok(ReadResponse::BestHeaderTip(
-                    match (best_disk_header_tip, verified_block_tip) {
-                        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => {
-                            Some(block_tip)
-                        }
-                        (Some(header_tip), _) => Some(header_tip),
-                        (None, block_tip) => block_tip,
-                    },
-                ))
+                Ok(ReadResponse::BestHeaderTip(root_covered_best_header_tip(
+                    best_chain,
+                    &state.db,
+                    best_disk_header_tip,
+                    verified_block_tip,
+                )))
             }
 
             ReadRequest::MissingBlockBodies { from, limit } => {

@@ -467,7 +467,7 @@ mod tests {
     fn deliver_correlated_headers_decodes_against_expectation() {
         let (handle, mut events) = test_handle();
         let expected =
-            ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
+            ExpectedHeadersResponse::new(block::Height(1), 1, true).expect("count is valid");
 
         let flow = deliver(&handle, Some(expected), peer(), headers_frame(Vec::new()));
 
@@ -579,7 +579,7 @@ mod tests {
     /// timeout and desynchronizing the peer-local FIFO from the outstanding range.
     #[test]
     fn saturated_events_queue_restores_solicited_expectation() {
-        use zebra_chain::serialization::ZcashDeserializeInto;
+        use zebra_chain::{orchard, sapling, serialization::ZcashDeserializeInto};
         use zebra_test::vectors::BLOCK_MAINNET_1_BYTES;
 
         // Keep `_events_rx` alive so the saturated queue rejects with `Full`
@@ -588,7 +588,7 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         let expected =
-            ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
+            ExpectedHeadersResponse::new(block::Height(1), 1, true).expect("count is valid");
         commands_tx
             .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
             .expect("pipe is alive");
@@ -601,14 +601,14 @@ mod tests {
                 .zcash_deserialize_into()
                 .expect("block 1 vector parses"),
         );
-        // The expectation above did not request tree-aux roots (a non-finalized
-        // range), so a roots-bearing response would be rejected at decode as
-        // `UnrequestedTreeAuxRoots`. This test exercises queue-saturation
-        // expectation restoral, not roots, so the response carries none.
         let solicited_headers = HeaderSyncMessage::Headers {
             headers: vec![block_one.header.clone()],
             body_sizes: vec![0],
-            tree_aux_roots: Vec::new(),
+            tree_aux_roots: vec![BlockCommitmentRoots {
+                height: block::Height(1),
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            }],
         }
         .encode_frame()
         .expect("headers frame encodes");
@@ -624,10 +624,27 @@ mod tests {
         // Drain the recorded expectation into `HsLocal`, mirroring `run_peer`'s
         // pre-frame command drain so the `Headers` frame is correlated.
         pipe.local_mut().drain_ready_commands();
+        assert_eq!(
+            pipe.local_mut().pop_expected_headers_response(),
+            Some(expected),
+            "the solicited response expectation should be available after draining commands"
+        );
+        pipe.local_mut().restore_expected_headers(expected);
+        HeaderSyncMessage::decode_frame(
+            solicited_headers.clone(),
+            HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
+        )
+        .expect("test Headers frame decodes against its expectation");
 
         // The decoded response cannot be delivered (events queue is full); the
         // pipe logs and continues, exactly as production does.
-        assert!(matches!(pipe.run_one(solicited_headers), Flow::Done));
+        let flow = pipe.run_one(solicited_headers);
+        match flow {
+            Flow::Done => {}
+            Flow::Continue(()) => panic!("unexpected successful forward"),
+            Flow::Reject(SinkReject::Protocol(_)) => panic!("unexpected protocol reject"),
+            Flow::Reject(SinkReject::Local(_)) => panic!("unexpected local reject"),
+        }
 
         // The popped expectation must be restored so the still-outstanding range
         // stays correlated. Without the fix the expectation is gone (returns None).

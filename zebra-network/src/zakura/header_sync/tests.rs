@@ -130,9 +130,35 @@ fn headers_message_from(
     start_height: block::Height,
     headers: Vec<Arc<block::Header>>,
 ) -> HeaderSyncMessage {
-    // Non-finalized ranges never request tree-aux roots, so the common test
-    // builder omits them. The reactor rejects roots on a non-finalized range as
-    // `MalformedMessage`; finalized-range tests opt in via `finalized_*`.
+    let body_sizes = vec![0; headers.len()];
+    let tree_aux_roots = roots_from_height(start_height, headers.len());
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+        tree_aux_roots,
+    }
+}
+
+fn headers_message_with_sizes(
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+) -> HeaderSyncMessage {
+    let start_height = headers
+        .first()
+        .map(|header| test_header_height(header.as_ref()))
+        .unwrap_or(block::Height(1));
+    let tree_aux_roots = roots_from_height(start_height, headers.len());
+    HeaderSyncMessage::Headers {
+        headers,
+        body_sizes,
+        tree_aux_roots,
+    }
+}
+
+fn rootless_headers_message_from(
+    start_height: block::Height,
+    headers: Vec<Arc<block::Header>>,
+) -> HeaderSyncMessage {
     let _ = start_height;
     let body_sizes = vec![0; headers.len()];
     HeaderSyncMessage::Headers {
@@ -142,19 +168,6 @@ fn headers_message_from(
     }
 }
 
-fn headers_message_with_sizes(
-    headers: Vec<Arc<block::Header>>,
-    body_sizes: Vec<u32>,
-) -> HeaderSyncMessage {
-    HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots: Vec::new(),
-    }
-}
-
-/// Finalized-range `Headers` carrying one tree-aux root per header, as a peer
-/// answering a `want_tree_aux_roots` request would send.
 fn finalized_headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
     let start_height = headers
         .first()
@@ -250,7 +263,6 @@ fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
     )
 }
 
-/// Decode context for a finalized-range response that requested tree-aux roots.
 fn finalized_headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
     HeaderSyncDecodeContext::for_headers_response(
         ExpectedHeadersResponse::new(block::Height(1), count, true).unwrap(),
@@ -546,7 +558,7 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
             } if peer == peer_id => {
                 assert_eq!(start_height, block::Height(1));
@@ -787,7 +799,7 @@ async fn next_outbound_get_headers(
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
             } => return (peer, start_height, count),
             HeaderSyncAction::Misbehavior { peer, reason } => {
@@ -995,18 +1007,16 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
         })
     ));
 
-    // Empty roots is the valid all-or-nothing "none" case; a non-empty count
-    // that disagrees with the header count is the rejection.
     assert!(matches!(
         HeaderSyncMessage::Headers {
             headers: headers.clone(),
             body_sizes: vec![100],
-            tree_aux_roots: vec![root_at(block::Height(1)), root_at(block::Height(2))],
+            tree_aux_roots: Vec::new(),
         }
         .encode(),
         Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
             headers: 1,
-            roots: 2,
+            roots: 0,
         })
     ));
 
@@ -1020,7 +1030,9 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
 
     let mut truncated_mid_size = message.encode().unwrap();
     truncated_mid_size.pop();
-    assert!(HeaderSyncMessage::decode(&truncated_mid_size, headers_context(1, 1)).is_err());
+    assert!(
+        HeaderSyncMessage::decode(&truncated_mid_size, finalized_headers_context(1, 1)).is_err()
+    );
 
     let mut truncated_mid_header = vec![MSG_HS_HEADERS];
     truncated_mid_header.write_u32::<LittleEndian>(1).unwrap();
@@ -1030,8 +1042,24 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
     let mut with_trailing = message.encode().unwrap();
     with_trailing.push(0);
     assert!(matches!(
-        HeaderSyncMessage::decode(&with_trailing, headers_context(1, 1)),
+        HeaderSyncMessage::decode(&with_trailing, finalized_headers_context(1, 1)),
         Err(HeaderSyncWireError::TrailingBytes)
+    ));
+}
+
+#[test]
+fn decode_rejects_non_empty_headers_without_tree_aux_roots() {
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    let mut encoded = headers_message(headers).encode().unwrap();
+    encoded[HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES] = 0;
+    encoded.truncate(encoded.len() - HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES);
+
+    assert!(matches!(
+        HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)),
+        Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
+            headers: 1,
+            roots: 0,
+        })
     ));
 }
 
@@ -1275,7 +1303,7 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1337,7 +1365,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
         } = next_non_query_action(&mut fixture.actions).await
         {
@@ -1416,7 +1444,7 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
         } = next_non_query_action(&mut fixture.actions).await
         {
@@ -1559,7 +1587,7 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -1752,7 +1780,7 @@ async fn incoming_headers_match_outstanding_before_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unrequested_response_carrying_tree_aux_roots_is_malformed() {
+async fn rootless_non_empty_response_is_malformed() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let first_checkpoint = block::Height(3);
@@ -1771,7 +1799,7 @@ async fn unrequested_response_carrying_tree_aux_roots_is_malformed() {
             next_non_query_action(&mut fixture.actions).await,
             HeaderSyncAction::SendMessage {
                 msg: HeaderSyncMessage::GetHeaders {
-                    want_tree_aux_roots: false,
+                    want_tree_aux_roots: true,
                     ..
                 },
                 ..
@@ -1781,14 +1809,11 @@ async fn unrequested_response_carrying_tree_aux_roots_is_malformed() {
         }
     }
 
-    // This network's checkpoint handoff is the first checkpoint, so the range
-    // does not ask for roots. A peer that volunteers roots anyway is reported
-    // as MalformedMessage and the range is retried rather than committed.
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: finalized_headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+            msg: rootless_headers_message_from(start, vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
         })
         .await
         .unwrap();
@@ -1801,7 +1826,7 @@ async fn unrequested_response_carrying_tree_aux_roots_is_malformed() {
                 break;
             }
             HeaderSyncAction::CommitHeaderRange { .. } => {
-                panic!("an unrequested roots-bearing response must not commit")
+                panic!("a rootless non-empty response must not commit")
             }
             _ => {}
         }
@@ -2171,7 +2196,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(1),
                         count: 1,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
             } if peer == peer_id => break,
             _ => {}
@@ -2195,7 +2220,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
                     HeaderSyncMessage::GetHeaders {
                         start_height: block::Height(2),
                         count: 1,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
             } if peer == peer_id => break,
             _ => {}
@@ -2310,7 +2335,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
             } if peer == first_peer || peer == second_peer => {
                 assert_eq!(start_height, start);
@@ -2498,7 +2523,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
-                want_tree_aux_roots: false,
+                want_tree_aux_roots: true,
             },
         } if peer == peer_id
     ));
@@ -2527,7 +2552,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
             msg: HeaderSyncMessage::GetHeaders {
                 start_height: block::Height(1),
                 count: 1,
-                want_tree_aux_roots: false,
+                want_tree_aux_roots: true,
             },
         } if peer == peer_id
     ));
@@ -3927,7 +3952,7 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count: _,
-                        want_tree_aux_roots: false,
+                        want_tree_aux_roots: true,
                     },
                 ..
             } if saw_reanchor_action && start_height == expected_start => {

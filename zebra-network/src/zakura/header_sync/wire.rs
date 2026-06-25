@@ -4,8 +4,7 @@ use super::{config::*, error::*, validation::*, *};
 pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// Version of the native header-sync stream.
 ///
-/// Version 4 makes header-carried tree-aux roots optional all-or-nothing
-/// metadata. Headers remain the required propagation payload.
+/// Version 4 carries one tree-aux root for each non-empty range header.
 pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 4;
 
 /// Peer status advertisement.
@@ -200,6 +199,10 @@ impl HeaderSyncMessage {
                     for _ in 0..count {
                         tree_aux_roots.push(BlockCommitmentRoots::zcash_deserialize(&mut reader)?);
                     }
+                }
+                validate_tree_aux_roots_len(count, tree_aux_roots.len())?;
+                if let Some(requested) = context.requested {
+                    validate_tree_aux_root_heights(requested.start_height, &tree_aux_roots)?;
                 }
                 Self::Headers {
                     headers,
