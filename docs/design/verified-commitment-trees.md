@@ -477,7 +477,7 @@ provenance/cooldown/demotion/hedging policy. Bad roots are handled in two layers
   (`report_misbehavior(.., MalformedMessage)`), and the range is retried. None of those roots
   reach state.
 - **At verify-before-commit**, a well-formed but _wrong_ root fails authentication against the
-  header commitment (§6). The committer evicts it (`PeerSource::invalidate` __deletes__ it from
+  header commitment (§6). The committer evicts it (`PeerSource::invalidate` **deletes** it from
   `zakura_header_commitment_roots_by_height`) and refuses the commit with the retryable
   `VctSuppliedRootUnavailable` error (§8). Header sync then re-requests that finalized range and
   delivers a replacement root from whichever peer answers; the block commits in place once a
