@@ -15,9 +15,7 @@ use crate::{
     block::MAX_BLOCK_BYTES,
     orchard::{tree, Action, Nullifier, ValueCommitment},
     primitives::Halo2Proof,
-    serialization::{
-        AtLeastOne, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
-    },
+    serialization::{AtLeastOne, SerializationError, TrustedPreallocate, ZcashSerialize},
 };
 
 /// Returns the canonical size in bytes of an Orchard proof for `num_actions` actions.
@@ -345,20 +343,5 @@ impl serde::Serialize for Flags {
 impl<'de> serde::Deserialize<'de> for Flags {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         bitflags_serde_legacy::deserialize("Flags", deserializer)
-    }
-}
-
-impl ZcashSerialize for Flags {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.zcash_serialize_with_format(&mut writer, FlagFormat::PreNu6_3)
-    }
-}
-
-impl ZcashDeserialize for Flags {
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        // Consensus rule: "In a version 5 transaction,
-        // the reserved bits 2..7 of the flagsOrchard field MUST be zero."
-        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-        Flags::zcash_deserialize_with_format(reader, FlagFormat::PreNu6_3)
     }
 }
