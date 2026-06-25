@@ -27,13 +27,6 @@ use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use super::*;
 use crate::sapling;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum OrchardFlagFormat {
-    PreNu6_3,
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-    Nu6_3,
-}
-
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 const ORCHARD_V6_FLAG_BITS: u8 = 0b0000_0111;
@@ -373,18 +366,14 @@ fn deserialize_v5_sapling_shielded_data<R: io::Read>(
 
 impl ZcashSerialize for Option<orchard::ShieldedData> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        serialize_optional_orchard_shielded_data_with_flags(
-            self,
-            &mut writer,
-            OrchardFlagFormat::PreNu6_3,
-        )
+        serialize_optional_orchard_shielded_data_with_flags(self, &mut writer, false)
     }
 }
 
 fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
     orchard_shielded_data: &Option<orchard::ShieldedData>,
     mut writer: W,
-    flag_format: OrchardFlagFormat,
+    allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     match orchard_shielded_data {
         None => {
@@ -400,7 +389,7 @@ fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
             serialize_orchard_shielded_data_with_flags(
                 orchard_shielded_data,
                 &mut writer,
-                flag_format,
+                allow_cross_address_bit,
             )?;
         }
     }
@@ -410,7 +399,7 @@ fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
 fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
     orchard_shielded_data: &orchard::ShieldedData,
     mut writer: W,
-    flag_format: OrchardFlagFormat,
+    allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
     // Split the AuthorizedAction
     let (actions, sigs): (Vec<orchard::Action>, Vec<Signature<SpendAuth>>) = orchard_shielded_data
@@ -424,7 +413,11 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
     actions.zcash_serialize(&mut writer)?;
 
     // Denoted as `flagsOrchard` in the spec.
-    serialize_orchard_flags_with_format(orchard_shielded_data.flags, &mut writer, flag_format)?;
+    serialize_orchard_flags(
+        orchard_shielded_data.flags,
+        &mut writer,
+        allow_cross_address_bit,
+    )?;
 
     // Denoted as `valueBalanceOrchard` in the spec.
     orchard_shielded_data
@@ -452,19 +445,26 @@ fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
 
 impl ZcashSerialize for orchard::ShieldedData {
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
-        serialize_orchard_shielded_data_with_flags(self, writer, OrchardFlagFormat::PreNu6_3)
+        serialize_orchard_shielded_data_with_flags(self, writer, false)
     }
 }
 
-fn serialize_orchard_flags_with_format<W: io::Write>(
+fn serialize_orchard_flags<W: io::Write>(
     flags: orchard::Flags,
     mut writer: W,
-    flag_format: OrchardFlagFormat,
+    allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
-    let valid_bits = match flag_format {
-        OrchardFlagFormat::PreNu6_3 => ORCHARD_SPEND_OUTPUT_FLAG_BITS,
+    let valid_bits = if allow_cross_address_bit {
         #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-        OrchardFlagFormat::Nu6_3 => ORCHARD_V6_FLAG_BITS,
+        {
+            ORCHARD_V6_FLAG_BITS
+        }
+        #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+        {
+            ORCHARD_SPEND_OUTPUT_FLAG_BITS
+        }
+    } else {
+        ORCHARD_SPEND_OUTPUT_FLAG_BITS
     };
 
     if flags.bits() & !valid_bits != 0 {
@@ -481,7 +481,7 @@ fn serialize_orchard_flags_with_format<W: io::Write>(
 
 fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     mut reader: R,
-    flag_format: OrchardFlagFormat,
+    allow_cross_address_bit: bool,
 ) -> Result<Option<orchard::ShieldedData>, SerializationError> {
     // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
     let actions: Vec<orchard::Action> = (&mut reader).zcash_deserialize_into()?;
@@ -504,7 +504,7 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     // Denoted as `flagsOrchard` in the spec.
     // Consensus: type of each flag is 𝔹, i.e. a bit. This is enforced
     // implicitly by the format-specific flag deserializer.
-    let flags = deserialize_orchard_flags_with_format(&mut reader, flag_format)?;
+    let flags = deserialize_orchard_flags(&mut reader, allow_cross_address_bit)?;
 
     // Denoted as `valueBalanceOrchard` in the spec.
     let value_balance: amount::Amount = (&mut reader).zcash_deserialize_into()?;
@@ -550,21 +550,26 @@ fn deserialize_orchard_shielded_data_with_flags<R: io::Read>(
     }))
 }
 
-fn deserialize_orchard_flags_with_format<R: io::Read>(
+fn deserialize_orchard_flags<R: io::Read>(
     mut reader: R,
-    flag_format: OrchardFlagFormat,
+    allow_cross_address_bit: bool,
 ) -> Result<orchard::Flags, SerializationError> {
     let bits = reader.read_u8()?;
-    match flag_format {
-        OrchardFlagFormat::PreNu6_3 => orchard::Flags::from_bits(bits),
+    if allow_cross_address_bit {
         #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-        OrchardFlagFormat::Nu6_3 => {
+        {
             if bits & !ORCHARD_V6_FLAG_BITS == 0 {
                 Some(orchard::Flags::from_bits_retain(bits))
             } else {
                 None
             }
         }
+        #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+        {
+            orchard::Flags::from_bits(bits)
+        }
+    } else {
+        orchard::Flags::from_bits(bits)
     }
     .ok_or(SerializationError::Parse("invalid reserved orchard flags"))
 }
@@ -573,7 +578,7 @@ fn deserialize_orchard_flags_with_format<R: io::Read>(
 // because the counts are read along with the arrays.
 impl ZcashDeserialize for Option<orchard::ShieldedData> {
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
-        deserialize_orchard_shielded_data_with_flags(reader, OrchardFlagFormat::PreNu6_3)
+        deserialize_orchard_shielded_data_with_flags(reader, false)
     }
 }
 
@@ -847,7 +852,7 @@ impl ZcashSerialize for Transaction {
                 serialize_optional_orchard_shielded_data_with_flags(
                     orchard_shielded_data,
                     &mut writer,
-                    OrchardFlagFormat::Nu6_3,
+                    true,
                 )?;
             }
         }
@@ -1184,10 +1189,8 @@ impl ZcashDeserialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
-                    &mut limited_reader,
-                    OrchardFlagFormat::Nu6_3,
-                )?;
+                let orchard_shielded_data =
+                    deserialize_orchard_shielded_data_with_flags(&mut limited_reader, true)?;
 
                 Ok(Transaction::V6 {
                     network_upgrade,
