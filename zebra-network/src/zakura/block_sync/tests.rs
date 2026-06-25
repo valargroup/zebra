@@ -3951,13 +3951,13 @@ fn block_budget_ledger_settles_and_releases_current_charge() {
 fn budget_audit_catches_injected_drift() {
     let mut budget = ByteBudget::new(1_000);
     assert!(budget.try_reserve(400));
-    assert!(budget.audit(400, "test matching audit"));
+    assert!(budget.audit_snapshot(400, budget.reserved(), "test matching audit"));
     assert!(
-        !budget.audit(300, "test injected drift"),
+        !budget.audit_snapshot(300, budget.reserved(), "test injected drift"),
         "audit reports mismatched derived accounting"
     );
     budget.release(400);
-    assert!(budget.audit(0, "test released audit"));
+    assert!(budget.audit_snapshot(0, budget.reserved(), "test released audit"));
 }
 
 proptest::proptest! {

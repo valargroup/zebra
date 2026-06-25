@@ -299,6 +299,7 @@ impl WorkQueue {
     /// Returns `None` when a central watchdog or local timeout already released
     /// and returned the height. Late bodies from that superseded claim must not
     /// resurrect a second charge.
+    #[cfg(test)]
     pub(super) fn settle_active_reserved_height(
         &self,
         height: block::Height,
@@ -309,6 +310,25 @@ impl WorkQueue {
         item.budget
             .is_reserved()
             .then(|| item.budget.settle(actual))
+    }
+
+    /// Settle an active request and count the body as queued for the Sequencer.
+    ///
+    /// The counter update happens while holding the work queue lock, so audit
+    /// snapshots see either `Reserved(estimate)` or queued body bytes, not both.
+    pub(super) fn settle_active_reserved_height_and_count(
+        &self,
+        height: block::Height,
+        actual: u64,
+        sequencer_input_bytes: &std::sync::atomic::AtomicU64,
+    ) -> Option<i128> {
+        let mut inner = self.lock();
+        let item = inner.in_flight.get_mut(&height)?;
+        item.budget.is_reserved().then(|| {
+            let delta = item.budget.settle(actual);
+            sequencer_input_bytes.fetch_add(actual, std::sync::atomic::Ordering::Relaxed);
+            delta
+        })
     }
 
     /// Mark a height as directly held after the caller admitted `actual` bytes.

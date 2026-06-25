@@ -1364,6 +1364,7 @@ impl SequencerTask {
 
     fn publish_view(&mut self) {
         self.committed_throughput.sample(Instant::now());
+        let budget_before = self.budget.reserved();
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         let body_input_bytes = self
@@ -1375,8 +1376,13 @@ impl SequencerTask {
             .saturating_add(reorder_buffered_bytes)
             .saturating_add(applying_buffered_bytes)
             .saturating_add(body_input_bytes);
-        self.budget
-            .audit(expected_budget, "block-sync sequencer view");
+        let budget_after = self.budget.reserved();
+        let concurrent_budget_change = expected_budget >= budget_before.min(budget_after)
+            && expected_budget <= budget_before.max(budget_after);
+        if !concurrent_budget_change {
+            self.budget
+                .audit_snapshot(expected_budget, budget_after, "block-sync sequencer view");
+        }
         let _ = self.view_tx.send_replace(SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,

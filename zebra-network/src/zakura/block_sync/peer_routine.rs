@@ -81,6 +81,10 @@ fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
     );
 }
 
+fn add_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Outcome classification for finishing an outstanding request (ported verbatim
 /// from the reactor's `OutstandingRangeDisposition`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1035,13 +1039,11 @@ impl PeerRoutine {
         // size. When the body is no larger than its estimate this frees the
         // slack; when it is larger (a stale/under-advertised hint) this charges
         // the overshoot so held bodies are never under-counted.
-        // `mark_received` then stops `reserved_bytes()` counting this height; the
-        // only bytes still held are the `serialized_bytes` carried into the reorder
-        // buffer.
-        let Some(delta) = self
-            .work
-            .settle_active_reserved_height(height, serialized_bytes)
-        else {
+        let Some(delta) = self.work.settle_active_reserved_height_and_count(
+            height,
+            serialized_bytes,
+            &self.sequencer_input_bytes,
+        ) else {
             tracing::debug!(
                 peer = ?self.peer,
                 ?height,
@@ -1125,13 +1127,9 @@ impl PeerRoutine {
         };
 
         let ok = if let Some(permit) = body_permit {
-            self.sequencer_input_bytes
-                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
             permit.send(body);
             true
         } else {
-            self.sequencer_input_bytes
-                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
             let send_result = self.sequencer_input.send(body).await;
             if send_result.is_err() {
                 release_counter_bytes(&self.sequencer_input_bytes, serialized_bytes);
@@ -1238,6 +1236,11 @@ impl PeerRoutine {
             );
             return true;
         }
+
+        // From here on, the shared budget includes this body's actual bytes.
+        // Publish it to the sequencer-input counter before marking the work item
+        // held, so audit snapshots never see charged bytes in neither bucket.
+        add_counter_bytes(&self.sequencer_input_bytes, serialized_bytes);
 
         // Claim this height into `in_flight` so it leaves `pending`; if it is
         // already `in_flight` the take is a no-op and the Sequencer drops the

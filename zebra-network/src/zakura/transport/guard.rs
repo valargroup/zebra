@@ -145,11 +145,11 @@ impl ByteBudget {
         }
     }
 
-    /// Audit the shared counter against an externally-derived expected value.
+    /// Audit a caller-captured snapshot of the shared counter.
     ///
-    /// Returns `true` when the budget matches.
-    pub(crate) fn audit(&self, expected: u64, context: &'static str) -> bool {
-        let actual = self.reserved();
+    /// Use this when the caller needs to compare several independently-owned
+    /// counters and already captured the budget at the same point in its snapshot.
+    pub(crate) fn audit_snapshot(&self, expected: u64, actual: u64, context: &'static str) -> bool {
         let ok = actual == expected;
         if !ok {
             metrics::counter!("sync.block.budget.audit_drift").increment(1);
