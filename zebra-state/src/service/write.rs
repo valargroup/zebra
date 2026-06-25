@@ -587,15 +587,12 @@ impl WriteBlockWorkerTask {
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
                     // verifiable for lack of a buffered successor) park-and-retry the same
-                    // block in place rather than resetting the queue. Only an absent root
-                    // needs a peer refetch; an await-successor stall just waits for the next
-                    // block to be downloaded into the look-ahead, so it polls faster.
+                    // block in place rather than resetting the queue. An absent root waits
+                    // for header sync to deliver it; an await-successor stall just waits for
+                    // the next block to be downloaded into the look-ahead, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         metrics::counter!("state.vct.root.retry.count").increment(1);
                         let needs_refetch = error.vct_supplied_root_unavailable_height();
-                        if let Some(refetch_height) = needs_refetch {
-                            finalized_state.request_vct_peer_root_refetch(refetch_height);
-                        }
 
                         // Escalate a stall that persists on the same height past the warn
                         // threshold: a transient wait resolves in a few polls and stays

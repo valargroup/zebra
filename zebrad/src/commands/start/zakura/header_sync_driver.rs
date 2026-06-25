@@ -78,14 +78,12 @@ pub(crate) struct ZakuraHeaderSyncDriverHandles {
     pub(crate) header_sync: zebra_network::zakura::HeaderSyncHandle,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<HeaderSyncAction>,
     handles: ZakuraHeaderSyncDriverHandles,
     state: State,
     read_state: ReadState,
     block_verifier: BlockVerifier,
-    _tree_aux_roots_writer: Option<zebra_state::TreeAuxRootsWriter>,
     trace: ZakuraTrace,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
