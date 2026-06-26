@@ -714,6 +714,12 @@ where
         &mut self,
         block: CheckpointVerifiedBlock,
     ) -> Result<RequestBlock, VerifyCheckpointError> {
+        // PROBE 4: verifier intake — a block entering the checkpoint queue. Compare its
+        // rate against checkpoint.commit.release.count (blocks leaving for the writer) and
+        // checkpoint.queued_slots (depth): equal rates with a deep queue ⇒ the writer feed
+        // is range-fill/queue bound; intake ≪ release-capacity ⇒ submission-starved.
+        #[cfg(feature = "commit-metrics")]
+        metrics::counter!("checkpoint.commit.intake.count").increment(1);
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -811,7 +817,14 @@ where
         req_block: RequestBlock,
     ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
     {
+        // VERIFY phase: complete any contiguous checkpoint range and release its
+        // blocks' verify results. The CPU cost of checkpoint verification lives here.
+        #[cfg(feature = "commit-metrics")]
+        let _verify_start = std::time::Instant::now();
         self.process_checkpoint_range();
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.consensus.checkpoint.verify_range.duration_seconds")
+            .record(_verify_start.elapsed().as_secs_f64());
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
 
@@ -848,13 +861,47 @@ where
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
-            // We use a `ServiceExt::oneshot`, so that every state service
-            // `poll_ready` has a corresponding `call`. See #1593.
-            match state_service
-                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
-            {
+            // COMMIT phase: the single-writer state commit for this verified block.
+            // Timing this await isolates the writer cost from the verify above; with
+            // commit-DB ~1.4ms (zebra.state.write.*), the remainder is poll_ready/queue
+            // wait behind the serial writer.
+            #[cfg(feature = "commit-metrics")]
+            let _commit_start = std::time::Instant::now();
+            // PROBE 5: split the state-service commit into admission (poll_ready — behind
+            // the state `Buffer`, the NEXT door after the verifier buffer) vs the call (the
+            // actual commit). If widening VERIFIER_BUFFER_BOUND just moves the wait here,
+            // state_admit_wait balloons. `inflight` = commits queued at the writer. We do
+            // ready()+call() explicitly so every poll_ready has its call (see #1593).
+            let mut state_service = state_service;
+            #[cfg(feature = "commit-metrics")]
+            metrics::gauge!("zebra.state.commit.inflight").increment(1.0);
+            #[cfg(feature = "commit-metrics")]
+            let _state_admit = std::time::Instant::now();
+            let committed = match state_service.ready().await {
+                Ok(ready) => {
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.commit.state_admit_wait.duration_seconds")
+                        .record(_state_admit.elapsed().as_secs_f64());
+                    #[cfg(feature = "commit-metrics")]
+                    let _state_call = std::time::Instant::now();
+                    let committed = ready
+                        .call(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                        .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                        .await;
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.commit.state_call.duration_seconds")
+                        .record(_state_call.elapsed().as_secs_f64());
+                    committed
+                }
+                Err(error) => Err(VerifyCheckpointError::CommitCheckpointVerified(error)),
+            };
+            #[cfg(feature = "commit-metrics")]
+            metrics::gauge!("zebra.state.commit.inflight").decrement(1.0);
+            let committed = committed?;
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.consensus.checkpoint.state_commit.duration_seconds")
+                .record(_commit_start.elapsed().as_secs_f64());
+            match committed {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
                     Ok(hash)
@@ -1082,6 +1129,12 @@ where
         let block_count = rev_valid_blocks.len();
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
         metrics::counter!("checkpoint.verified.block.count").increment(block_count as u64);
+        // PROBE 4: verifier release — a whole verified range leaving for its commit tasks
+        // (the writer feed). This counter's rate is the delivery rate the writer sees; if
+        // it tracks throughput while queued_slots stays deep, the feed is range-fill bound
+        // (blocks wait for their range to complete), not anything the writer controls.
+        #[cfg(feature = "commit-metrics")]
+        metrics::counter!("checkpoint.commit.release.count").increment(block_count as u64);
 
         // All the blocks we've kept are valid, so let's verify them
         // in height order.

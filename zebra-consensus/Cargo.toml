@@ -22,6 +22,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Per-phase commit-pipeline instrumentation: splits checkpoint verify vs state commit.
+commit-metrics = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [
