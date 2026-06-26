@@ -487,21 +487,57 @@ async fn drive_mock_block_sync_actions(
         .expect("block-sync action receiver is enabled");
 
     tokio::spawn(async move {
-        while let Some(action) = actions.recv().await {
-            let Some(handle) = endpoint.block_sync() else {
-                continue;
-            };
-            match action {
-                BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip,
-                    best_header_tip,
+        // Drain the applyQ in-line with the action stream (the apply seam replaced
+        // the old `ApplySubmitted`→`TestApplyDone` round-trip): each drained body is
+        // applied synthetically, its commit recorded, and its durable frontier
+        // reported so the verified tip advances.
+        let mut apply_rx = endpoint
+            .block_sync()
+            .and_then(|handle| handle.take_apply_queue());
+        loop {
+            tokio::select! {
+                maybe_item = async {
+                    match apply_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
                 } => {
-                    if let Some(gate) = needed_blocks_gate.as_mut() {
-                        while !*gate.borrow_and_update() {
-                            if gate.changed().await.is_err() {
-                                return;
-                            }
+                    let Some(item) = maybe_item else {
+                        apply_rx = None;
+                        continue;
+                    };
+                    let Some(apply) = apply.as_ref() else {
+                        continue;
+                    };
+                    let outcome = apply.apply(item.block.as_ref());
+                    if outcome.result == BlockApplyResult::Committed {
+                        if let Some(size) = corpus.size_at(item.height) {
+                            stats.record_commit(item.height, size);
                         }
+                    }
+                    if let Some(handle) = endpoint.block_sync() {
+                        handle.report_durable_frontier(outcome.frontiers);
+                    }
+                    continue;
+                }
+                maybe_action = actions.recv() => {
+                    let Some(action) = maybe_action else {
+                        break;
+                    };
+                    let Some(handle) = endpoint.block_sync() else {
+                        continue;
+                    };
+                    match action {
+                        BlockSyncAction::QueryNeededBlocks {
+                            verified_block_tip,
+                            best_header_tip,
+                        } => {
+                            if let Some(gate) = needed_blocks_gate.as_mut() {
+                                while !*gate.borrow_and_update() {
+                                    if gate.changed().await.is_err() {
+                                        return;
+                                    }
+                                }
                     }
                     let start = verified_block_tip.next().unwrap_or(verified_block_tip);
                     let end = best_header_tip.min(corpus.target_height());
@@ -527,30 +563,9 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::ApplySubmitted { token, block } => {
-                    let Some(apply) = &apply else {
-                        continue;
-                    };
-                    let height = block
-                        .coinbase_height()
-                        .expect("synthetic submitted block has height");
-                    let outcome = apply.apply(&block);
-                    if outcome.result == BlockApplyResult::Committed {
-                        if let Some(size) = corpus.size_at(height) {
-                            stats.record_commit(height, size);
-                        }
+                        BlockSyncAction::Misbehavior { .. } => {}
                     }
-                    let _ = handle
-                        .send(BlockSyncEvent::TestApplyDone {
-                            token,
-                            height,
-                            hash: block.hash(),
-                            result: outcome.result,
-                            local_frontier: Some(outcome.frontiers),
-                        })
-                        .await;
                 }
-                BlockSyncAction::Misbehavior { .. } => {}
             }
         }
     })

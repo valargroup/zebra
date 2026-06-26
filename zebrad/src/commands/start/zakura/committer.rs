@@ -2,9 +2,9 @@
 //!
 //! The block-sync Sequencer (in `zebra-network`) drains its contiguous reorder
 //! prefix into [`ApplyItem`]s and pushes them onto the `applyQ`
-//! (`mpsc::Receiver<ApplyItem>`). The [`Committer`] lives here, in node wiring,
-//! because it names the consensus verifier (`zebra_consensus::Request::Commit`),
-//! which `zebra-network` must not depend on.
+//! (`mpsc::UnboundedReceiver<ApplyItem>`). The [`Committer`] lives here, in node
+//! wiring, because it names the consensus verifier
+//! (`zebra_consensus::Request::Commit`), which `zebra-network` must not depend on.
 //!
 //! It is a pump: for each item it fires `Request::Commit` **without awaiting**,
 //! pushing the commit future into a [`FuturesUnordered`], and drains completions
@@ -15,9 +15,10 @@
 //!
 //! The Committer never touches the byte budget — the Sequencer releases bytes on
 //! the durable-tip watch. On a commit failure (consensus-invalid body or local
-//! apply timeout) it raises exactly one [`CommitterReset`] back to the Sequencer
-//! (via [`BlockSyncHandle::report_commit_rejected`]); sibling failures from the
-//! same superseded generation are coalesced by the epoch guard.
+//! apply timeout) it raises a [`CommitterReset`] back to the Sequencer (via
+//! [`BlockSyncHandle::report_commit_rejected`]); within one contiguous range only
+//! the lowest failing height is raised (higher siblings are coalesced), and the
+//! Sequencer's per-height apply-epoch guard discards any remaining stale resets.
 
 use std::{future::Future, sync::Arc, time::Instant};
 
@@ -55,17 +56,15 @@ impl CommitRejectSink for BlockSyncHandle {
     }
 }
 
-/// Metadata carried alongside a fired commit so its completion can be attributed.
+/// Metadata carried alongside a fired commit so its completion can be attributed
+/// to the right height/peer/generation when it resolves.
 #[derive(Clone, Debug)]
 struct CommitMeta {
     height: block::Height,
-    hash: block::Hash,
     source_peer: zebra_network::zakura::ZakuraPeerId,
     /// Generation the item was stamped with; echoed in a [`CommitterReset`] and
     /// used for stale-generation coalescing.
     epoch: u64,
-    class: BlockApplyClass,
-    submitted_at: Instant,
 }
 
 /// A resolved commit: its metadata plus the verifier result.
@@ -76,8 +75,10 @@ struct CommitOutcome {
 
 /// The block-sync commit pump. Generic over the consensus verifier service.
 pub(crate) struct Committer<BlockVerifier> {
-    /// The applyQ: contiguous, hash-verified items from the Sequencer.
-    apply_rx: mpsc::Receiver<ApplyItem>,
+    /// The applyQ: contiguous, hash-verified items from the Sequencer. Unbounded so
+    /// the serial Sequencer task never blocks on a push; the byte budget bounds
+    /// total in-flight memory.
+    apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
     /// The consensus verifier (`Request::Commit`).
     block_verifier: BlockVerifier,
     /// Sink used to report a commit rejection back to the Sequencer.
@@ -89,10 +90,16 @@ pub(crate) struct Committer<BlockVerifier> {
     /// Highest committed height (contiguity assertion + trace).
     committed_marker: block::Height,
     /// Highest generation a reset has already been raised for. Items at or below
-    /// this are stale (superseded by a reset) and discarded; a sibling failure at
-    /// the same generation is coalesced rather than re-raised. Epochs are 1-based,
-    /// so the initial `0` discards nothing.
+    /// this are stale (superseded by a reset) and discarded. Epochs are 1-based, so
+    /// the initial `0` discards nothing.
     last_reset_epoch: u64,
+    /// Lowest height a reset has already been raised for *within* `last_reset_epoch`.
+    /// Within one generation, only a strictly-lower failure extends the rollback (a
+    /// higher one would be a no-op at the Sequencer's per-height guard); a fresh
+    /// generation resets this to `Height::MAX`. This makes lowest-reset-wins hold
+    /// even when several blocks of one contiguous range fail (e.g. an invalid full
+    /// block and its children).
+    last_reset_height: block::Height,
     /// Monotonic per-commit id used for trace correlation (replaces the deleted
     /// verifier apply token).
     commit_seq: BlockApplyToken,
@@ -109,7 +116,7 @@ where
     BlockVerifier::Future: Send + 'static,
 {
     pub(crate) fn new(
-        apply_rx: mpsc::Receiver<ApplyItem>,
+        apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
         block_verifier: BlockVerifier,
         reset_sink: Arc<dyn CommitRejectSink>,
         max_checkpoint_height: block::Height,
@@ -124,6 +131,7 @@ where
             in_flight: FuturesUnordered::new(),
             committed_marker: block::Height::MIN,
             last_reset_epoch: 0,
+            last_reset_height: block::Height::MAX,
             commit_seq: 0,
             trace,
             throughput_probe,
@@ -186,11 +194,8 @@ where
         let commit_seq = self.next_commit_seq();
         let meta = CommitMeta {
             height,
-            hash,
             source_peer,
             epoch,
-            class,
-            submitted_at: Instant::now(),
         };
 
         let verifier = self.block_verifier.clone();
@@ -223,14 +228,39 @@ where
         }
     }
 
-    /// Raise exactly one [`CommitterReset`] for a failed commit, coalescing sibling
-    /// failures from the same (already-reset) generation.
+    /// Raise a [`CommitterReset`] for a failed commit, coalescing failures that a
+    /// reset already covers.
+    ///
+    /// Two failures the Sequencer's per-height guard would no-op are dropped here so
+    /// we do not flood it: a failure from a superseded generation (`epoch <
+    /// last_reset_epoch`), and a same-generation failure that is not strictly lower
+    /// than one already raised (`height >= last_reset_height`). A strictly-lower
+    /// same-generation failure *is* raised, so several invalid blocks in one
+    /// contiguous range each roll the floor back lowest-wins.
     fn on_commit_error(&mut self, meta: CommitMeta, result: BlockApplyResult) {
-        if meta.epoch <= self.last_reset_epoch {
-            // A reset for this generation was already raised; coalesce.
+        // A failure from a superseded generation is already covered by the reset
+        // that bumped the generation; the Sequencer's per-height guard would
+        // no-op it anyway.
+        if meta.epoch < self.last_reset_epoch {
             return;
         }
-        self.last_reset_epoch = meta.epoch;
+        // Entering a fresh generation: re-key the within-generation lowest
+        // tracker to `Height::MAX` (the field's documented invariant) *before*
+        // the height test below. Doing this explicitly — rather than relying on
+        // the `==`-epoch guard clause to be skipped — keeps lowest-reset-wins
+        // correct even if these guards are later reordered: the first failure of
+        // a new generation always raises, and only a strictly-lower one extends
+        // the rollback.
+        if meta.epoch > self.last_reset_epoch {
+            self.last_reset_epoch = meta.epoch;
+            self.last_reset_height = block::Height::MAX;
+        }
+        // Within one generation, only a strictly-lower failure extends the
+        // rollback; a higher one is a no-op at the Sequencer's per-height guard.
+        if meta.height >= self.last_reset_height {
+            return;
+        }
+        self.last_reset_height = meta.height;
         let rejection = if matches!(result, BlockApplyResult::Rejected) {
             CommitRejection::Invalid
         } else {
@@ -470,7 +500,7 @@ mod tests {
     }
 
     fn committer<V>(
-        rx: mpsc::Receiver<ApplyItem>,
+        rx: mpsc::UnboundedReceiver<ApplyItem>,
         verifier: V,
         sink: Arc<RecordingSink>,
         max_checkpoint_height: block::Height,
@@ -509,7 +539,7 @@ mod tests {
     async fn commits_a_contiguous_range() {
         let log: CommitLog = Default::default();
         let sink = Arc::new(RecordingSink::default());
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let committer = committer(
             rx,
             ok_verifier(log.clone()),
@@ -523,7 +553,7 @@ mod tests {
             &BLOCK_MAINNET_2_BYTES[..],
             &BLOCK_MAINNET_3_BYTES[..],
         ] {
-            tx.send(apply_item(block_from(bytes), 1)).await.unwrap();
+            tx.send(apply_item(block_from(bytes), 1)).unwrap();
         }
         drop(tx);
 
@@ -544,7 +574,7 @@ mod tests {
         let log: CommitLog = Default::default();
         let sink = Arc::new(RecordingSink::default());
         let barrier = Arc::new(Barrier::new(3));
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let committer = committer(
             rx,
             batching_verifier(barrier, log.clone()),
@@ -558,7 +588,7 @@ mod tests {
             &BLOCK_MAINNET_2_BYTES[..],
             &BLOCK_MAINNET_3_BYTES[..],
         ] {
-            tx.send(apply_item(block_from(bytes), 1)).await.unwrap();
+            tx.send(apply_item(block_from(bytes), 1)).unwrap();
         }
         drop(tx);
 
@@ -575,13 +605,12 @@ mod tests {
     #[tokio::test]
     async fn rejection_raises_one_attributed_reset() {
         let sink = Arc::new(RecordingSink::default());
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         // max_checkpoint_height 0 ⇒ height-1 body takes the full (rejectable) path.
         let committer = committer(rx, reject_verifier(), sink.clone(), block::Height(0));
         let handle = tokio::spawn(committer.run(never()));
 
         tx.send(apply_item(block_from(&BLOCK_MAINNET_1_BYTES), 7))
-            .await
             .unwrap();
         drop(tx);
 
@@ -595,13 +624,61 @@ mod tests {
         assert_eq!(resets[0].source_peer, peer());
     }
 
+    /// A4 (coalescing contract): within one generation a higher failure raised
+    /// first never suppresses a strictly-lower one (lowest-reset-wins), a higher
+    /// failure after a lower one is coalesced, and a fresh generation re-keys the
+    /// tracker so its first failure always raises regardless of the previous
+    /// generation's lowest height.
+    #[test]
+    fn coalesces_resets_lowest_wins_within_a_generation() {
+        let log: CommitLog = Default::default();
+        let sink = Arc::new(RecordingSink::default());
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut committer = committer(rx, ok_verifier(log), sink.clone(), block::Height(0));
+
+        let fail = |committer: &mut Committer<_>, height: u32, epoch: u64| {
+            committer.on_commit_error(
+                CommitMeta {
+                    height: block::Height(height),
+                    source_peer: peer(),
+                    epoch,
+                },
+                BlockApplyResult::Rejected,
+            );
+        };
+
+        // Higher height fails first, then a strictly-lower one in the same gen.
+        fail(&mut committer, 20, 1);
+        fail(&mut committer, 10, 1);
+        // A higher one after the low is coalesced (no-op at the Sequencer guard).
+        fail(&mut committer, 15, 1);
+        // A fresh generation re-keys: its first failure raises even though its
+        // height (30) is above the previous generation's lowest reset (10).
+        fail(&mut committer, 30, 2);
+
+        let raised: Vec<_> = sink
+            .resets()
+            .iter()
+            .map(|reset| (reset.height, reset.epoch))
+            .collect();
+        assert_eq!(
+            raised,
+            vec![
+                (block::Height(20), 1),
+                (block::Height(10), 1),
+                (block::Height(30), 2),
+            ],
+            "higher-first then lower both raise; mid-height coalesced; fresh gen re-keys"
+        );
+    }
+
     /// A5: items from a superseded generation (epoch ≤ last reset) are discarded,
     /// never fired; a fresh generation is fired.
     #[test]
     fn discards_items_from_a_superseded_generation() {
         let log: CommitLog = Default::default();
         let sink = Arc::new(RecordingSink::default());
-        let (_tx, rx) = mpsc::channel(16);
+        let (_tx, rx) = mpsc::unbounded_channel();
         let mut committer = committer(rx, ok_verifier(log), sink, block::Height(100));
         committer.last_reset_epoch = 5;
 
@@ -618,7 +695,7 @@ mod tests {
     async fn commits_across_the_checkpoint_boundary() {
         let log: CommitLog = Default::default();
         let sink = Arc::new(RecordingSink::default());
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         // Boundary at height 2: blocks 1,2 are checkpoint; 3,4 are full.
         let committer = committer(rx, ok_verifier(log.clone()), sink.clone(), block::Height(2));
         let handle = tokio::spawn(committer.run(never()));
@@ -629,7 +706,7 @@ mod tests {
             &BLOCK_MAINNET_3_BYTES[..],
             &BLOCK_MAINNET_4_BYTES[..],
         ] {
-            tx.send(apply_item(block_from(bytes), 1)).await.unwrap();
+            tx.send(apply_item(block_from(bytes), 1)).unwrap();
         }
         drop(tx);
 
@@ -657,7 +734,7 @@ mod tests {
         // all three are fired before it signals shutdown.
         let entry = Arc::new(Barrier::new(4));
         let (release_tx, release_rx) = watch::channel(false);
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::unbounded_channel();
         let committer = committer(
             rx,
             gated_verifier(entry.clone(), release_rx, log.clone()),
@@ -674,7 +751,7 @@ mod tests {
             &BLOCK_MAINNET_2_BYTES[..],
             &BLOCK_MAINNET_3_BYTES[..],
         ] {
-            tx.send(apply_item(block_from(bytes), 1)).await.unwrap();
+            tx.send(apply_item(block_from(bytes), 1)).unwrap();
         }
         // All three commits are now in flight (entered the verifier).
         entry.wait().await;

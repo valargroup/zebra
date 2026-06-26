@@ -159,10 +159,8 @@ pub mod block_sync_trace {
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
     /// Header tip minus verified body tip.
     pub const BODY_LAG: &str = "body_lag";
-    /// Count of blocks submitted-but-not-yet-committed (held against budget).
+    /// Count of blocks drained onto the applyQ and held against budget until durable.
     pub const APPLYING: &str = "applying";
-    /// Count of applying blocks already submitted to the verifier driver.
-    pub const SUBMITTED_APPLIES: &str = "submitted_applies";
     /// Count of out-of-order bodies buffered awaiting a contiguous prefix.
     pub const REORDER: &str = "reorder";
     /// Count of outstanding (in-flight) range requests across peers.
@@ -209,26 +207,6 @@ pub mod block_sync_trace {
     pub const REFILL_LOW_WATER: &str = "refill_low_water";
     /// Highest end height across the scheduler's covered intervals.
     pub const COVERED_MAX_END: &str = "covered_max_end";
-    /// Apply class for a submitted/finished body (`checkpoint` or `full`).
-    pub const APPLY_CLASS: &str = "apply_class";
-    /// Per-block verifier apply round-trip latency in microseconds (submit → finish).
-    pub const APPLY_LATENCY_US: &str = "apply_latency_us";
-    /// Bodies committed to the chain during a commit-progress rollup interval.
-    pub const COMMITTED_BLOCKS: &str = "committed_blocks";
-    /// Body bytes committed to the chain during a commit-progress rollup interval.
-    pub const COMMITTED_BYTES: &str = "committed_bytes";
-    /// Wall-clock milliseconds covered by a commit-progress rollup interval.
-    pub const INTERVAL_MS: &str = "interval_ms";
-    /// Mean per-block apply round-trip latency over a commit-progress interval (us).
-    pub const APPLY_LATENCY_AVG_US: &str = "apply_latency_avg_us";
-    /// Worst per-block apply round-trip latency over a commit-progress interval (us).
-    pub const APPLY_LATENCY_MAX_US: &str = "apply_latency_max_us";
-    /// Checkpoint-class applies currently in flight to the verifier driver.
-    pub const CHECKPOINT_IN_FLIGHT: &str = "checkpoint_in_flight";
-    /// Full-class applies currently in flight to the verifier driver.
-    pub const FULL_IN_FLIGHT: &str = "full_in_flight";
-    /// Submit attempts deferred during an interval because an apply limit was hit.
-    pub const SUBMIT_THROTTLED: &str = "submit_throttled";
 
     /// Peer status received (servable body range advertised by the peer).
     pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
@@ -262,10 +240,6 @@ pub mod block_sync_trace {
     pub const BLOCK_BODY_APPLYING: &str = "block_body_applying";
     /// Reactor attempted or completed a control send to the Sequencer task.
     pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
-    /// Body submitted to the verifier for commit.
-    pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
-    /// Ready body could not submit because an apply-class limit was saturated.
-    pub const BLOCK_BODY_SUBMIT_THROTTLED: &str = "block_body_submit_throttled";
     /// Peer reported a requested range as unavailable.
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.
@@ -280,10 +254,6 @@ pub mod block_sync_trace {
     pub const BLOCK_CHAIN_TIP_RESET: &str = "block_chain_tip_reset";
     /// Periodic reactor state snapshot (the key stall-diagnosis row).
     pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
-    /// A submitted body's verifier apply finished (carries submit→finish latency).
-    pub const BLOCK_APPLY_FINISHED: &str = "block_apply_finished";
-    /// Periodic commit-throughput rollup from the sequencer task.
-    pub const BLOCK_COMMIT_PROGRESS: &str = "block_commit_progress";
 }
 
 /// Shared discovery trace event names and field keys.

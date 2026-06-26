@@ -149,7 +149,12 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
-    pub(super) apply_executor: watch::Sender<Option<BlockApplyExecutorPort>>,
+    /// The receiving end of the `applyQ`, handed once to the node-side `Committer`
+    /// via [`take_apply_queue`](Self::take_apply_queue). The cloneable handle
+    /// cannot hold a `Receiver` directly, so it is a take-once slot. `None` for the
+    /// inert/handle-less test constructors that never spawn a Sequencer.
+    pub(super) apply_queue_rx:
+        Arc<StdMutex<Option<mpsc::UnboundedReceiver<super::apply_item::ApplyItem>>>>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
@@ -214,33 +219,37 @@ impl BlockSyncHandle {
         self.send_control(event)
     }
 
-    /// Install the node-wiring block body apply executor.
+    /// Take the receiving end of the `applyQ` to hand to the node-side `Committer`.
     ///
-    /// The slot is one-shot: production wiring installs it after verifier/state
-    /// services exist, and later attempts are ignored so the Sequencer never
-    /// changes commit backends mid-sync.
-    pub fn install_block_apply_executor(
+    /// The slot is one-shot: production wiring takes it once, right after the
+    /// reactor is spawned, to construct the `Committer`. A second take (or the
+    /// inert/handle-less constructors) returns `None`.
+    pub fn take_apply_queue(
         &self,
-        executor: BlockApplyExecutorPort,
-    ) -> Result<(), BlockApplyExecutorPort> {
-        let mut executor = Some(executor);
-        if self.apply_executor.send_if_modified(|slot| {
-            if slot.is_some() {
-                return false;
-            }
-            *slot = executor.take();
-            true
-        }) {
-            Ok(())
-        } else {
-            Err(executor.expect("executor remains available when install slot is occupied"))
-        }
+    ) -> Option<mpsc::UnboundedReceiver<super::apply_item::ApplyItem>> {
+        self.apply_queue_rx
+            .lock()
+            .expect("apply queue slot mutex is never poisoned")
+            .take()
     }
 
-    /// Replace the node-wiring block body apply executor in tests.
-    #[cfg(test)]
-    pub(super) fn replace_block_apply_executor_for_test(&self, executor: BlockApplyExecutorPort) {
-        self.apply_executor.send_replace(Some(executor));
+    /// Inject a durable frontier advance into the Sequencer.
+    ///
+    /// Called by the node-side durable chain-tip watcher on each `set_finalized_tip`
+    /// change; it produces exactly the [`SequencerControlInput::FrontierAdvance`]
+    /// the deleted 200 ms checkpoint-frontier poll used to, releasing the held
+    /// ledger bytes ≤ the durable tip and advancing the floor. Idempotent with the
+    /// endpoint-frontier mirror path via the Sequencer's stale guard. A no-op for
+    /// the inert/handle-less constructors that never spawn a Sequencer.
+    pub fn report_durable_frontier(&self, frontiers: BlockSyncFrontiers) {
+        if let Some(wiring) = self.routine_wiring.as_ref() {
+            let _ = wiring.sequencer_control.send(
+                super::sequencer_task::SequencerControlInput::FrontierAdvance {
+                    frontiers,
+                    release_applied: true,
+                },
+            );
+        }
     }
 
     /// Report a Committer-side commit rejection (consensus-invalid body or apply
@@ -819,6 +828,13 @@ impl ThroughputMeter {
     pub(super) fn record(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.blocks = self.blocks.saturating_add(1);
+    }
+
+    /// Record `blocks` committed bodies totalling `bytes`, for attributing a
+    /// durable frontier advance that makes several held heights durable at once.
+    pub(super) fn record_n(&mut self, blocks: u64, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.blocks = self.blocks.saturating_add(blocks);
     }
 
     /// Recompute the cached per-second rates from the bytes/blocks accumulated

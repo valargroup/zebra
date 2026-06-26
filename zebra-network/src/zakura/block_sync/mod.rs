@@ -57,9 +57,8 @@ pub use config::{
 };
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyClass, BlockApplyExecutor, BlockApplyExecutorPort, BlockApplyLimits,
-    BlockApplyOutput, BlockApplyRequest, BlockApplyResult, BlockApplyToken, BlockSyncAction,
-    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyClass, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;

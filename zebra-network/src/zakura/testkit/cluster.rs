@@ -150,9 +150,9 @@ mod tests {
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
         zakura::{
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
-            spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
-            BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
-            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+            spawn_header_sync_reactor, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
+            BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
+            DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
             HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
@@ -1072,59 +1072,76 @@ mod tests {
             .collect();
 
         tokio::spawn(async move {
-            while let Some(action) = actions.recv().await {
-                let Some(handle) = endpoint.block_sync() else {
-                    continue;
-                };
-                match action {
-                    BlockSyncAction::QueryNeededBlocks {
-                        verified_block_tip,
-                        best_header_tip,
-                    } => {
-                        let metas = by_height
-                            .range(
-                                verified_block_tip.next().unwrap_or(verified_block_tip)
-                                    ..=best_header_tip,
-                            )
-                            .map(|(height, block)| BlockSyncBlockMeta {
-                                height: *height,
-                                hash: block.hash(),
-                                size: BlockSizeEstimate::Advertised(block_size(block)),
-                            })
-                            .collect();
-                        let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
+            // Drain the applyQ in-line with the action stream (the apply seam
+            // replaced the old `ApplySubmitted`→`TestApplyDone` round-trip): each
+            // drained body is "committed" synthetically, recorded, and its durable
+            // frontier reported so the verified tip advances.
+            let mut apply_rx = endpoint
+                .block_sync()
+                .and_then(|handle| handle.take_apply_queue());
+            loop {
+                tokio::select! {
+                    maybe_action = actions.recv() => {
+                        let Some(action) = maybe_action else {
+                            break;
+                        };
+                        let Some(handle) = endpoint.block_sync() else {
+                            continue;
+                        };
+                        match action {
+                            BlockSyncAction::QueryNeededBlocks {
+                                verified_block_tip,
+                                best_header_tip,
+                            } => {
+                                let metas = by_height
+                                    .range(
+                                        verified_block_tip.next().unwrap_or(verified_block_tip)
+                                            ..=best_header_tip,
+                                    )
+                                    .map(|(height, block)| BlockSyncBlockMeta {
+                                        height: *height,
+                                        hash: block.hash(),
+                                        size: BlockSizeEstimate::Advertised(block_size(block)),
+                                    })
+                                    .collect();
+                                let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
+                            }
+                            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                                let _ = handle
+                                    .send(BlockSyncEvent::BlockRangeResponseFinished {
+                                        peer,
+                                        start_height: start,
+                                        requested_count: count,
+                                        returned_count: 0,
+                                    })
+                                    .await;
+                            }
+                            BlockSyncAction::Misbehavior { .. } => {}
+                        }
                     }
-                    BlockSyncAction::ApplySubmitted { token, block } => {
-                        let height = block.coinbase_height().expect("submitted block has height");
+                    maybe_item = async {
+                        match apply_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let Some(item) = maybe_item else {
+                            apply_rx = None;
+                            continue;
+                        };
+                        let height = item.height;
                         submitted
                             .lock()
                             .expect("submitted list mutex is not poisoned")
                             .push(height);
-                        let _ = handle
-                            .send(BlockSyncEvent::TestApplyDone {
-                                token,
-                                height,
-                                hash: block.hash(),
-                                result: BlockApplyResult::Committed,
-                                local_frontier: Some(BlockSyncFrontiers {
-                                    finalized_height: height,
-                                    verified_block_tip: height,
-                                    verified_block_hash: block.hash(),
-                                }),
-                            })
-                            .await;
+                        if let Some(handle) = endpoint.block_sync() {
+                            handle.report_durable_frontier(BlockSyncFrontiers {
+                                finalized_height: height,
+                                verified_block_tip: height,
+                                verified_block_hash: item.hash,
+                            });
+                        }
                     }
-                    BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                        let _ = handle
-                            .send(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
-                    BlockSyncAction::Misbehavior { .. } => {}
                 }
             }
         })
@@ -1692,7 +1709,7 @@ mod tests {
         .await?;
 
         await_until(
-            "native block-sync submitted trace rows",
+            "native block-sync applying trace rows",
             Duration::from_secs(5),
             || {
                 capture.reader().is_ok_and(|reader| {
@@ -1700,7 +1717,7 @@ mod tests {
                     expected.iter().all(|height| {
                         rows.iter().any(|row| {
                             row.get(bs_trace::EVENT).and_then(serde_json::Value::as_str)
-                                == Some(bs_trace::BLOCK_BODY_SUBMITTED)
+                                == Some(bs_trace::BLOCK_BODY_APPLYING)
                                 && row
                                     .get(bs_trace::HEIGHT)
                                     .and_then(serde_json::Value::as_u64)

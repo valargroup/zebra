@@ -2,152 +2,40 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use futures::{future::BoxFuture, FutureExt};
 use tokio::{pin, select, sync::mpsc};
 use tower::{Service, ServiceExt};
 use tracing::{debug, warn};
 
-use zebra_chain::{block, chain_tip::ChainTip};
+use zebra_chain::block;
 use zebra_network::zakura::{
-    commit_state_trace as cs_trace, BlockApplyClass, BlockApplyExecutor, BlockApplyExecutorPort,
-    BlockApplyLimits, BlockApplyOutput, BlockApplyRequest, BlockApplyResult, BlockApplyToken,
+    commit_state_trace as cs_trace, BlockApplyClass, BlockApplyResult, BlockApplyToken,
     BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle,
-    BlockSyncMisbehavior, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockSyncMisbehavior, ZakuraTrace,
 };
 
-use crate::components::sync;
-
 use super::{
-    block_apply_result_label, block_verify_error_is_duplicate, emit_commit_state, insert_cs_bool,
-    insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
-    insert_cs_u64, query_block_sync_frontiers, verified_block_tip_from_state,
-    BlocksyncThroughputProbe, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+    block_verify_error_is_duplicate, emit_commit_state, insert_cs_hash, insert_cs_height,
+    insert_cs_peer, insert_cs_str, insert_cs_u64, query_block_sync_frontiers,
+    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
 
-#[derive(Clone)]
-pub(crate) struct ZebradBlockApplyExecutor<ReadState, BlockVerifier, LatestChainTip> {
-    latest_chain_tip: LatestChainTip,
-    endpoint: Option<ZakuraEndpoint>,
-    read_state: ReadState,
-    block_verifier: BlockVerifier,
-    max_checkpoint_height: block::Height,
-    trace: ZakuraTrace,
-    throughput_probe: Option<BlocksyncThroughputProbe>,
-}
-
-impl<ReadState, BlockVerifier, LatestChainTip>
-    ZebradBlockApplyExecutor<ReadState, BlockVerifier, LatestChainTip>
-{
-    pub(crate) fn new(
-        latest_chain_tip: LatestChainTip,
-        endpoint: Option<ZakuraEndpoint>,
-        read_state: ReadState,
-        block_verifier: BlockVerifier,
-        max_checkpoint_height: block::Height,
-        trace: ZakuraTrace,
-        throughput_probe: Option<BlocksyncThroughputProbe>,
-    ) -> Self {
-        Self {
-            latest_chain_tip,
-            endpoint,
-            read_state,
-            block_verifier,
-            max_checkpoint_height,
-            trace,
-            throughput_probe,
-        }
-    }
-
-    pub(crate) fn block_apply_class(&self, block: &block::Block) -> BlockApplyClass {
-        block_apply_class(block, self.max_checkpoint_height)
-    }
-}
-
-impl<ReadState, BlockVerifier, LatestChainTip> BlockApplyExecutor
-    for ZebradBlockApplyExecutor<ReadState, BlockVerifier, LatestChainTip>
-where
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    ReadState::Future: Send + 'static,
-    BlockVerifier:
-        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + Sync + 'static,
-    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
-    BlockVerifier::Future: Send + 'static,
-    LatestChainTip: ChainTip + Clone + Send + Sync + 'static,
-{
-    fn block_apply_class(&self, block: &block::Block) -> BlockApplyClass {
-        self.block_apply_class(block)
-    }
-
-    fn apply(&self, request: BlockApplyRequest) -> BoxFuture<'static, BlockApplyOutput> {
-        let executor = self.clone();
-        async move {
-            let class = executor.block_apply_class(request.block.as_ref());
-            apply_block_sync_body_to_output(
-                executor.block_verifier,
-                executor.latest_chain_tip,
-                executor.endpoint,
-                executor.read_state,
-                request.token,
-                request.block,
-                class,
-                executor.trace,
-                executor.throughput_probe,
-            )
-            .await
-        }
-        .boxed()
-    }
-
-    fn refresh_checkpoint_frontier(
-        &self,
-        baseline_verified_tip: block::Height,
-        attempts_remaining: usize,
-    ) -> BoxFuture<'static, Option<zebra_network::zakura::BlockSyncFrontiers>> {
-        let executor = self.clone();
-        async move {
-            refresh_block_sync_frontiers_for_checkpoint_window(
-                executor.read_state,
-                executor.latest_chain_tip,
-                executor.endpoint,
-                executor.trace,
-                baseline_verified_tip,
-                attempts_remaining,
-            )
-            .await
-        }
-        .boxed()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
+/// Drive the node-side reads the block-sync reactor asks for: needed-blocks
+/// queries and inbound `GetBlocks` serving. The commit *tail* no longer runs here
+/// — bodies are committed by the [`Committer`](super::committer::Committer)
+/// draining the applyQ; this loop is purely the state-read seam.
+pub(crate) async fn drive_block_sync_actions<ReadState>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     // Retained so the disconnect capability stays wired into the driver, even
     // though peer scoring no longer drives disconnects (misbehavior is record-only).
     _supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
-    endpoint: Option<ZakuraEndpoint>,
     block_sync: BlockSyncHandle,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     read_state: ReadState,
-    block_verifier: BlockVerifier,
-    max_checkpoint_height: block::Height,
-    checkpoint_apply_limit: usize,
-    full_apply_limit: usize,
-    combined_apply_limit: usize,
     trace: ZakuraTrace,
-    throughput_probe: Option<BlocksyncThroughputProbe>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -159,46 +47,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         + Sync
         + 'static,
     ReadState::Future: Send + 'static,
-    BlockVerifier:
-        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + Sync + 'static,
-    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
-    BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
-    const {
-        assert!(
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT <= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
-        );
-    }
-    let checkpoint_apply_limit = checkpoint_apply_limit.clamp(
-        sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-        zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
-    );
-    let full_apply_limit = full_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
-    let combined_apply_limit = combined_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
     let mut deferred_actions = VecDeque::new();
-    let apply_executor = ZebradBlockApplyExecutor::new(
-        latest_chain_tip.clone(),
-        endpoint.clone(),
-        read_state.clone(),
-        block_verifier.clone(),
-        max_checkpoint_height,
-        trace.clone(),
-        throughput_probe.clone(),
-    );
-    let apply_limits = if throughput_probe.is_some() {
-        BlockApplyLimits::single()
-    } else {
-        BlockApplyLimits {
-            checkpoint_apply_limit,
-            full_apply_limit,
-            combined_apply_limit,
-        }
-    };
-    let _ = block_sync.install_block_apply_executor(BlockApplyExecutorPort::with_limits(
-        Arc::new(apply_executor),
-        apply_limits,
-    ));
 
     loop {
         let action = if let Some(action) =
@@ -514,193 +365,6 @@ pub(crate) fn block_apply_class(
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
-    block_verifier: BlockVerifier,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    endpoint: Option<ZakuraEndpoint>,
-    read_state: ReadState,
-    _block_sync: BlockSyncHandle,
-    token: BlockApplyToken,
-    block: Arc<block::Block>,
-    class: BlockApplyClass,
-    trace: ZakuraTrace,
-    throughput_probe: Option<BlocksyncThroughputProbe>,
-) -> BlockApplyOutput
-where
-    BlockVerifier:
-        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
-    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
-    BlockVerifier::Future: Send + 'static,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    apply_block_sync_body_to_output(
-        block_verifier,
-        latest_chain_tip,
-        endpoint,
-        read_state,
-        token,
-        block,
-        class,
-        trace.clone(),
-        throughput_probe,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn apply_block_sync_body_to_output<BlockVerifier, ReadState>(
-    block_verifier: BlockVerifier,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    endpoint: Option<ZakuraEndpoint>,
-    read_state: ReadState,
-    token: BlockApplyToken,
-    block: Arc<block::Block>,
-    class: BlockApplyClass,
-    trace: ZakuraTrace,
-    throughput_probe: Option<BlocksyncThroughputProbe>,
-) -> BlockApplyOutput
-where
-    BlockVerifier:
-        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
-    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
-    BlockVerifier::Future: Send + 'static,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    let expected_hash = block.hash();
-    let Some(height) = block.coinbase_height() else {
-        warn!(
-            ?expected_hash,
-            "Zakura block sync cannot apply body without coinbase height"
-        );
-        return BlockApplyOutput {
-            token,
-            height: block::Height(0),
-            hash: expected_hash,
-            result: BlockApplyResult::Rejected,
-            local_frontier: None,
-        };
-    };
-
-    emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
-        insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-        insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-        insert_cs_height(row, cs_trace::HEIGHT, height);
-        insert_cs_hash(row, cs_trace::HASH, expected_hash);
-    });
-    let started = Instant::now();
-    // Throughput-probe mode (debug only): skip consensus verify+commit and
-    // advance an in-memory synthetic frontier instead, discarding the body. In
-    // normal mode the frontier comes from re-reading committed state below.
-    let (result, probe_frontier) = match throughput_probe.as_ref() {
-        Some(probe) => probe.apply_block(block.as_ref()),
-        None => (
-            commit_block_sync_body_with_stall_trace(
-                block_verifier.clone(),
-                block,
-                class,
-                &trace,
-                token,
-                height,
-                expected_hash,
-            )
-            .await,
-            None,
-        ),
-    };
-    emit_commit_state(
-        &trace,
-        cs_trace::COMMIT_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-
-    if throughput_probe.is_none()
-        && class == BlockApplyClass::Checkpoint
-        && result == BlockApplyResult::Committed
-    {
-        return BlockApplyOutput {
-            token,
-            height,
-            hash: expected_hash,
-            result,
-            local_frontier: None,
-        };
-    }
-
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_START,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-        },
-    );
-    let frontier_started = Instant::now();
-    let local_frontier = match throughput_probe.as_ref() {
-        Some(_) => probe_frontier,
-        None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
-    };
-    if let Some(frontiers) = local_frontier {
-        let change =
-            if result == BlockApplyResult::Committed || result == BlockApplyResult::Duplicate {
-                FrontierChange::VerifiedGrow
-            } else {
-                FrontierChange::Snapshot
-            };
-        if class == BlockApplyClass::Full || change != FrontierChange::VerifiedGrow {
-            publish_body_frontier(endpoint.as_ref(), frontiers, change);
-        }
-    }
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(frontier_started));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
-            if let Some(frontiers) = &local_frontier {
-                insert_cs_frontiers(row, frontiers);
-            }
-        },
-    );
-
-    BlockApplyOutput {
-        token,
-        height,
-        hash: expected_hash,
-        result,
-        local_frontier,
-    }
-}
-
-#[cfg(test)]
 pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: Arc<block::Block>,
@@ -843,15 +507,39 @@ fn block_commit_timed_out(
     BlockApplyResult::TimedOut
 }
 
-async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
+/// How many times the durable-frontier watcher retries a failed frontier read
+/// before deferring to the next chain-tip change. The watcher is edge-triggered,
+/// so silently dropping a read could strand held budget until the next — possibly
+/// never — tip change; a bounded retry heals a transient failure on the final
+/// advance without an unbounded loop.
+const DURABLE_FRONTIER_READ_MAX_ATTEMPTS: u32 = 5;
+/// Delay between durable-frontier read retries after a transient `None`.
+const DURABLE_FRONTIER_READ_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Inject a durable frontier advance into the block-sync Sequencer on every
+/// `set_finalized_tip` change.
+///
+/// Replaces the deleted 200 ms checkpoint-frontier poll: on each durable chain-tip
+/// change it reads the finalized + verified frontier and reports it to the
+/// Sequencer (via [`BlockSyncHandle::report_durable_frontier`]), which advances the
+/// verified tip and releases the held byte reservations ≤ the durable tip. The byte
+/// budget therefore recycles continuously (per durable advance) instead of once per
+/// poll tick, which is the bottleneck the scoped apply-side change removes.
+///
+/// Idempotent with the endpoint-frontier mirror path
+/// (`mirror_zakura_full_block_commits`) via the Sequencer's stale guard; the
+/// dedicated watcher guarantees the checkpoint frontier advance is driven directly
+/// off durability rather than the mirror/endpoint hop the poll worked around. A
+/// transient frontier-read failure is retried (see
+/// [`DURABLE_FRONTIER_READ_MAX_ATTEMPTS`]) so the edge-triggered release cannot be
+/// silently dropped on the final advance.
+pub(crate) async fn drive_block_sync_durable_frontier<ReadState>(
+    mut chain_tip_change: zebra_state::ChainTipChange,
+    latest_chain_tip: zebra_state::LatestChainTip,
     read_state: ReadState,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    endpoint: Option<ZakuraEndpoint>,
-    trace: ZakuraTrace,
-    baseline_verified_tip: block::Height,
-    attempts_remaining: usize,
-) -> Option<zebra_network::zakura::BlockSyncFrontiers>
-where
+    block_sync: BlockSyncHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) where
     ReadState: Service<
             zebra_state::ReadRequest,
             Response = zebra_state::ReadResponse,
@@ -861,255 +549,51 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_ATTEMPT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(
-                row,
-                "attempts_remaining",
-                u64::try_from(attempts_remaining).unwrap_or(u64::MAX),
-            );
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
-        },
-    );
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_START,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh");
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
-        },
-    );
-    let frontier_started = Instant::now();
-    let frontiers =
-        query_checkpoint_refresh_frontiers(read_state.clone(), latest_chain_tip.clone(), &trace)
-            .await;
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh");
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, baseline_verified_tip);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(frontier_started));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, frontiers.is_some());
-            if let Some(frontiers) = &frontiers {
-                insert_cs_frontiers(row, frontiers);
+    pin!(shutdown);
+    loop {
+        select! {
+            _ = &mut shutdown => return,
+            change = chain_tip_change.wait_for_tip_change() => {
+                let Ok(_action) = change else {
+                    return;
+                };
             }
-        },
-    );
-    let frontiers = frontiers?;
-
-    if frontiers.verified_block_tip <= baseline_verified_tip {
-        return None;
-    }
-
-    publish_body_frontier(endpoint.as_ref(), frontiers, FrontierChange::VerifiedGrow);
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_frontiers(row, &frontiers);
-        },
-    );
-    Some(frontiers)
-}
-
-async fn query_checkpoint_refresh_frontiers<ReadState>(
-    read_state: ReadState,
-    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
-    trace: &ZakuraTrace,
-) -> Option<zebra_network::zakura::BlockSyncFrontiers>
-where
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    let latest_tip = latest_chain_tip.best_tip_height_and_hash();
-    emit_checkpoint_refresh_read_start(trace, "checkpoint_refresh_finalized_tip");
-    let finalized_started = Instant::now();
-    let finalized_tip = match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state
-            .clone()
-            .oneshot(zebra_state::ReadRequest::FinalizedTip),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::FinalizedTip(tip))) => {
-            emit_checkpoint_refresh_read_finish(
-                trace,
-                "checkpoint_refresh_finalized_tip",
-                finalized_started,
-                true,
-            );
-            tip
         }
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected FinalizedTip response");
-            emit_checkpoint_refresh_read_finish(
-                trace,
-                "checkpoint_refresh_finalized_tip",
-                finalized_started,
-                false,
-            );
-            None
-        }
-        Ok(Err(error)) => {
-            warn!(
-                ?error,
-                "failed to refresh Zakura block-sync finalized frontier"
-            );
-            emit_checkpoint_refresh_read_finish(
-                trace,
-                "checkpoint_refresh_finalized_tip",
-                finalized_started,
-                false,
-            );
-            None
-        }
-        Err(_elapsed) => {
-            warn!("timed out refreshing Zakura block-sync finalized frontier");
-            emit_commit_state(
-                trace,
-                cs_trace::STATE_READ_TIMEOUT,
-                "block_sync_driver",
-                |row| {
-                    insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh_finalized_tip");
-                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(finalized_started));
-                },
-            );
-            None
-        }
-    };
-
-    emit_checkpoint_refresh_read_start(trace, "checkpoint_refresh_tip");
-    let tip_started = Instant::now();
-    match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state.oneshot(zebra_state::ReadRequest::Tip),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::Tip(tip))) => {
-            emit_checkpoint_refresh_read_finish(trace, "checkpoint_refresh_tip", tip_started, true);
-            let state_tip = (finalized_tip.is_some() || tip.is_some()).then(|| {
-                verified_block_tip_from_state(
-                    finalized_tip,
-                    tip,
-                    latest_tip.unwrap_or((block::Height(0), block::Hash([0; 32]))),
-                )
-            });
-            let (height, hash) = match (state_tip, latest_tip) {
-                (Some(state_tip), latest_tip) => {
-                    verified_block_tip_from_state(Some(state_tip), latest_tip, state_tip)
+        // Read the durable frontier and report it so the Sequencer releases the
+        // held byte budget ≤ the durable tip. This watcher is edge-triggered on
+        // tip changes, so a dropped report — a transient state-read failure
+        // returning `None` — would strand the held bytes until the *next* tip
+        // change, which may never arrive once sync reaches the header tip. Retry
+        // a bounded number of times so a transient failure on the final advance
+        // does not leave bytes reserved with no re-trigger. (The endpoint-frontier
+        // mirror is a second, independent release path, but it is edge-triggered
+        // on the same event and can also fail, so this watcher heals itself rather
+        // than relying on it.)
+        let mut attempt: u32 = 0;
+        loop {
+            match query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await {
+                Some(frontiers) => {
+                    block_sync.report_durable_frontier(frontiers);
+                    break;
                 }
-                (None, Some(latest_tip)) => latest_tip,
-                (None, None) => return None,
-            };
-            let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
-            Some(zebra_network::zakura::BlockSyncFrontiers {
-                finalized_height,
-                verified_block_tip: height,
-                verified_block_hash: hash,
-            })
-        }
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected Tip response");
-            emit_checkpoint_refresh_read_finish(
-                trace,
-                "checkpoint_refresh_tip",
-                tip_started,
-                false,
-            );
-            None
-        }
-        Ok(Err(error)) => {
-            warn!(?error, "failed to refresh Zakura block-sync body frontier");
-            emit_checkpoint_refresh_read_finish(
-                trace,
-                "checkpoint_refresh_tip",
-                tip_started,
-                false,
-            );
-            None
-        }
-        Err(_elapsed) => {
-            warn!("timed out refreshing Zakura block-sync body frontier");
-            emit_commit_state(
-                trace,
-                cs_trace::STATE_READ_TIMEOUT,
-                "block_sync_driver",
-                |row| {
-                    insert_cs_str(row, cs_trace::ACTION, "checkpoint_refresh_tip");
-                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(tip_started));
-                },
-            );
-            None
+                None => {
+                    attempt += 1;
+                    if attempt >= DURABLE_FRONTIER_READ_MAX_ATTEMPTS {
+                        warn!(
+                            attempt,
+                            "Zakura durable-frontier read kept failing; deferring \
+                             budget release to the next chain-tip change"
+                        );
+                        break;
+                    }
+                    select! {
+                        _ = &mut shutdown => return,
+                        _ = tokio::time::sleep(DURABLE_FRONTIER_READ_RETRY_DELAY) => {}
+                    }
+                }
+            }
         }
     }
-}
-
-fn emit_checkpoint_refresh_read_start(trace: &ZakuraTrace, action: &'static str) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_START,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-        },
-    );
-}
-
-fn emit_checkpoint_refresh_read_finish(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    started: Instant,
-    success: bool,
-) {
-    emit_commit_state(
-        trace,
-        if success {
-            cs_trace::STATE_READ_SUCCESS
-        } else {
-            cs_trace::STATE_READ_ERROR
-        },
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-}
-
-fn publish_body_frontier(
-    endpoint: Option<&ZakuraEndpoint>,
-    frontiers: zebra_network::zakura::BlockSyncFrontiers,
-    change: FrontierChange,
-) {
-    let Some(endpoint) = endpoint else {
-        return;
-    };
-    let Some(mut update) = endpoint.current_sync_frontier() else {
-        return;
-    };
-    if frontiers.finalized_height == frontiers.verified_block_tip {
-        update.frontier.finalized =
-            Frontier::new(frontiers.finalized_height, frontiers.verified_block_hash);
-    }
-    update.frontier.verified_body =
-        Frontier::new(frontiers.verified_block_tip, frontiers.verified_block_hash);
-    update.change = change;
-    endpoint.publish_sync_frontier_from(update, "block_sync_driver");
 }
 
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(

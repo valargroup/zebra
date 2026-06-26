@@ -1,34 +1,55 @@
 //! The serial commit pipeline for Zakura block sync.
 //!
-//! The [`Sequencer`] owns the consensus-critical reorder → applying →
-//! `ApplySubmitted` → apply completion machinery and nothing else. It deliberately
-//! never touches download-side state — the byte budget, the work scheduler,
-//! peers, emitted actions, or state queries. Two rules keep that boundary clean:
+//! The [`Sequencer`] owns the consensus-critical reorder → applying machinery and
+//! nothing else. "Applying" now means *drained onto the applyQ and held until
+//! durable*: the contiguous reorder prefix is drained out as [`DrainedBlock`]s (the
+//! block `Arc` leaves for the applyQ + the node-side `Committer`), and the
+//! Sequencer keeps only a bytes-and-metadata ledger entry per drained height for
+//! release/reset accounting. The block bytes stay reserved against the byte budget
+//! from drain until the durable frontier crosses the height.
+//!
+//! The Sequencer deliberately never touches download-side state — the byte budget,
+//! the work scheduler, peers, emitted actions, or state queries. Two rules keep
+//! that boundary clean:
 //!
 //! - every method that frees reserved bytes *returns* the freed count, so the
-//!   reactor releases it against the budget (the budget stays in the reactor for
-//!   the budget is shared), and
+//!   reactor/Sequencer task releases it against the shared budget, and
 //! - every download-side consequence (mark a height covered, clear covered,
-//!   re-query, attribute misbehavior) is expressed as a value the reactor acts
-//!   on, not performed here.
-//!
-//! The logic is preserved verbatim from the reactor; only its boundary changes.
-//! That boundary is what lets a later stage move the Sequencer onto its own task.
+//!   re-query, attribute misbehavior) is expressed as a value the task acts on,
+//!   not performed here.
 
-use super::{events::BlockApplyToken, reorder::*, state::*, *};
+use super::{reorder::*, state::*, *};
 
-/// A received body draining contiguously toward the verified tip, awaiting (or
-/// undergoing) verifier submission.
+/// One drained, hash-verified block leaving the reorder buffer for the applyQ.
+///
+/// The block `Arc` is carried out so the Sequencer task can build the
+/// `ApplyItem`; the Sequencer retains only an [`ApplyingEntry`] for accounting.
 #[derive(Clone, Debug)]
-pub(super) struct ApplyingBlock {
-    pub(super) token: BlockApplyToken,
+pub(super) struct DrainedBlock {
+    pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) block: Arc<block::Block>,
     pub(super) bytes: u64,
-    pub(super) submitted: bool,
-    /// The peer that delivered this body, used to attribute an apply rejection
-    /// for misbehavior scoring.
     pub(super) source_peer: ZakuraPeerId,
+    /// Apply generation stamped on this block. Echoed onto the `ApplyItem` and
+    /// recorded in the held ledger so a stale [`super::CommitterReset`] (older
+    /// epoch) for a re-pushed height is ignored.
+    pub(super) epoch: u64,
+}
+
+/// The bytes-and-metadata ledger entry the Sequencer keeps for a height that has
+/// been drained onto the applyQ and is held until the durable frontier crosses it.
+///
+/// The block `Arc` is *not* stored here — it lives on the applyQ / in the
+/// `Committer` / in the state write queue. Only the accounting metadata the reset
+/// and frontier-advance paths need survives.
+#[derive(Copy, Clone, Debug)]
+struct ApplyingEntry {
+    bytes: u64,
+    hash: block::Hash,
+    prev_hash: block::Hash,
+    /// Apply generation this height was drained at (see [`DrainedBlock::epoch`]).
+    epoch: u64,
 }
 
 /// Outcome of offering a received body to the commit pipeline.
@@ -44,20 +65,6 @@ pub(super) enum AcceptOutcome {
     Redundant { release_bytes: u64 },
 }
 
-/// A body the Sequencer has assigned a token and marked submitted; the reactor
-/// dispatches the matching `ApplySubmitted` action.
-#[derive(Clone, Debug)]
-pub(super) struct SubmitItem {
-    pub(super) height: block::Height,
-    pub(super) hash: block::Hash,
-    pub(super) token: BlockApplyToken,
-    pub(super) block: Arc<block::Block>,
-    /// The body's reserved byte size, carried to the apply completion so commit
-    /// throughput can be attributed even if the `applying` entry is reaped (by a
-    /// coalesced checkpoint frontier refresh) before the completion is drained.
-    pub(super) bytes: u64,
-}
-
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AdvanceOutcome {
@@ -66,30 +73,29 @@ pub(super) struct AdvanceOutcome {
     /// Whether the verified tip actually moved. The reactor drops download state
     /// (scheduler/outstanding) and re-drains only when it did.
     pub(super) changed: bool,
+    /// Held heights this advance released (durable commits), for throughput.
+    pub(super) committed_blocks: u64,
+    /// Their byte total, for throughput.
+    pub(super) committed_bytes: u64,
 }
 
-/// The reorder → applying → submit → apply completion commit pipeline.
+/// The reorder → applying (drain-to-applyQ, hold-until-durable) commit pipeline.
 #[derive(Clone, Debug)]
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
-    applying: BTreeMap<block::Height, ApplyingBlock>,
-    submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
-    next_apply_token: BlockApplyToken,
+    /// Heights drained onto the applyQ and held until durable (the byte ledger).
+    applying: BTreeMap<block::Height, ApplyingEntry>,
     body_download_floor: block::Height,
     verified_block_tip: block::Height,
-    submitted_apply_limit: usize,
 }
 
 impl Sequencer {
-    pub(super) fn new(verified_block_tip: block::Height, submitted_apply_limit: usize) -> Self {
+    pub(super) fn new(verified_block_tip: block::Height) -> Self {
         Self {
             reorder: ReorderBuffer::new(),
             applying: BTreeMap::new(),
-            submitted_applies: BTreeMap::new(),
-            next_apply_token: 1,
             body_download_floor: verified_block_tip,
             verified_block_tip,
-            submitted_apply_limit,
         }
     }
 
@@ -113,11 +119,6 @@ impl Sequencer {
         self.applying.contains_key(&height)
     }
 
-    #[cfg(test)]
-    pub(super) fn submitted_contains(&self, height: block::Height) -> bool {
-        self.submitted_applies.contains_key(&height)
-    }
-
     pub(super) fn reorder_len(&self) -> usize {
         self.reorder.len()
     }
@@ -130,14 +131,10 @@ impl Sequencer {
         self.applying.keys().next().copied()
     }
 
-    pub(super) fn lowest_submitted_height(&self) -> Option<block::Height> {
-        self.submitted_applies.keys().next().copied()
-    }
-
     pub(super) fn applying_buffered_bytes(&self) -> u64 {
         self.applying
             .values()
-            .map(|applying| applying.bytes)
+            .map(|entry| entry.bytes)
             .fold(0u64, u64::saturating_add)
     }
 
@@ -150,52 +147,19 @@ impl Sequencer {
         self.reorder.max_height()
     }
 
-    pub(super) fn unsubmitted_applying_count(&self) -> usize {
-        self.applying
-            .values()
-            .filter(|applying| !applying.submitted)
-            .count()
-    }
-
-    pub(super) fn submitted_applying_bytes(&self) -> u64 {
-        self.applying
-            .values()
-            .filter_map(|applying| applying.submitted.then_some(applying.bytes))
-            .fold(0u64, u64::saturating_add)
-    }
-
-    /// Number of `applying` bodies already submitted to the verifier.
-    pub(super) fn submitted_applying_count(&self) -> usize {
-        self.applying
-            .values()
-            .filter(|applying| applying.submitted)
-            .count()
-    }
-
-    pub(super) fn has_submitted_apply(&self, height: block::Height, hash: block::Hash) -> bool {
-        self.submitted_applies
-            .get(&height)
-            .is_some_and(|entries| entries.iter().any(|(entry_hash, _)| *entry_hash == hash))
-    }
-
-    /// Whether any reorder/applying/submitted body sits at or above `height`,
-    /// used by the reactor to decide whether a reset is anchored by active
-    /// successor work.
+    /// Whether any reorder/applying body sits at or above `height`, used by the
+    /// reactor to decide whether a reset is anchored by active successor work.
     pub(super) fn has_buffered_at_or_above(&self, height: block::Height) -> bool {
-        self.reorder.contains_at_or_above(height)
-            || self.applying.range(height..).next().is_some()
-            || self.submitted_applies.range(height..).next().is_some()
+        self.reorder.contains_at_or_above(height) || self.applying.range(height..).next().is_some()
     }
 
     /// `previous_block_hash` of a held `applying` body, for deciding whether a
-    /// reset orphans an already-submitted successor.
+    /// reset orphans an already-drained successor.
     pub(super) fn applying_previous_block_hash(
         &self,
         height: block::Height,
     ) -> Option<block::Hash> {
-        self.applying
-            .get(&height)
-            .map(|applying| applying.block.header.previous_block_hash)
+        self.applying.get(&height).map(|entry| entry.prev_hash)
     }
 
     pub(super) fn reorder_hash(&self, height: block::Height) -> Option<block::Hash> {
@@ -203,19 +167,15 @@ impl Sequencer {
     }
 
     pub(super) fn applying_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.applying.get(&height).map(|applying| applying.hash)
+        self.applying.get(&height).map(|entry| entry.hash)
     }
 
-    /// True when `height` has submitted applies and *none* of them is `hash`
-    /// (a reset to `hash` would conflict with our submitted work).
-    pub(super) fn submitted_has_only_other_hashes(
-        &self,
-        height: block::Height,
-        hash: block::Hash,
-    ) -> bool {
-        self.submitted_applies
-            .get(&height)
-            .is_some_and(|entries| entries.iter().all(|(entry_hash, _)| *entry_hash != hash))
+    /// The apply generation a held height was drained at, or `None` if the height
+    /// is not held. The Sequencer task compares this against an incoming
+    /// [`super::CommitterReset`]'s epoch so a stale reset (from a superseded
+    /// generation, or for a height already committed/rolled back) is a no-op.
+    pub(super) fn applying_epoch(&self, height: block::Height) -> Option<u64> {
+        self.applying.get(&height).map(|entry| entry.epoch)
     }
 
     // ---- body acceptance ----
@@ -252,7 +212,6 @@ impl Sequencer {
         if height <= self.body_download_floor
             || self.reorder.contains(height)
             || self.applying.contains_key(&height)
-            || self.has_submitted_apply(height, hash)
         {
             return AcceptOutcome::Redundant {
                 release_bytes: bytes,
@@ -270,172 +229,45 @@ impl Sequencer {
         }
     }
 
-    // ---- drain reorder → applying ----
+    // ---- drain reorder → applying (onto the applyQ) ----
 
-    /// Drain the contiguous reorder prefix above the floor into `applying`,
-    /// advancing the floor. Returns the newly-covered heights so the reactor
-    /// marks them covered in the download scheduler.
-    pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
+    /// Drain the contiguous reorder prefix above the floor, advancing the floor and
+    /// recording a held ledger entry (stamped with `epoch`) for each height.
+    /// Returns the drained blocks — the caller carries each `Arc` out onto the
+    /// applyQ — so the Sequencer no longer stores block bodies.
+    pub(super) fn drain_ready_into_applying(&mut self, epoch: u64) -> Vec<DrainedBlock> {
         let released = self
             .reorder
             .drain_contiguous_prefix(self.body_download_floor);
-        let mut covered = Vec::with_capacity(released.len());
+        let mut drained = Vec::with_capacity(released.len());
         for (height, block, bytes, source_peer) in released {
             let hash = block.hash();
+            let prev_hash = block.header.previous_block_hash;
             self.body_download_floor = height;
-            covered.push(height);
             self.applying.insert(
                 height,
-                ApplyingBlock {
-                    token: 0,
-                    hash,
-                    block,
+                ApplyingEntry {
                     bytes,
-                    submitted: false,
-                    source_peer,
+                    hash,
+                    prev_hash,
+                    epoch,
                 },
             );
+            drained.push(DrainedBlock {
+                height,
+                hash,
+                block,
+                bytes,
+                source_peer,
+                epoch,
+            });
         }
-        covered
+        drained
     }
 
-    // ---- submission ----
+    // ---- reject / reset rollback ----
 
-    /// The unsubmitted `applying` heights eligible for verifier submission,
-    /// bounded by the remaining submission window.
-    pub(super) fn submittable_heights(&self) -> Vec<block::Height> {
-        let available = self
-            .submitted_apply_limit
-            .saturating_sub(self.submitted_applying_count());
-        if available == 0 {
-            return Vec::new();
-        }
-        self.applying
-            .iter()
-            .filter_map(|(height, applying)| (!applying.submitted).then_some(*height))
-            .take(available)
-            .collect()
-    }
-
-    /// Assign a token to `height`, mark it submitted, and return the dispatch
-    /// item. `None` if the height is no longer applying (the token counter is
-    /// not consumed in that case).
-    pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
-        debug_assert!(
-            !self.has_unsubmitted_applying_below(height),
-            "must submit applying blocks in contiguous height order"
-        );
-        let block = self
-            .applying
-            .get(&height)
-            .map(|applying| applying.block.clone())?;
-        let token = self.next_apply_token();
-        let applying = self.applying.get_mut(&height)?;
-        applying.token = token;
-        applying.submitted = true;
-        Some(SubmitItem {
-            height,
-            hash: applying.hash,
-            token,
-            block,
-            bytes: applying.bytes,
-        })
-    }
-
-    fn has_unsubmitted_applying_below(&self, height: block::Height) -> bool {
-        self.applying
-            .range(..height)
-            .any(|(_, applying)| !applying.submitted)
-    }
-
-    /// Roll back a submit whose dispatch failed (only if the token still matches,
-    /// so a stale rollback cannot clobber a newer submission).
-    pub(super) fn unsubmit(&mut self, height: block::Height, token: BlockApplyToken) {
-        if let Some(applying) = self.applying.get_mut(&height) {
-            if applying.token == token {
-                applying.token = 0;
-                applying.submitted = false;
-            }
-        }
-    }
-
-    fn next_apply_token(&mut self) -> BlockApplyToken {
-        let token = self.next_apply_token;
-        self.next_apply_token = self.next_apply_token.checked_add(1).unwrap_or(1);
-        token
-    }
-
-    pub(super) fn record_submitted_apply(&mut self, height: block::Height, hash: block::Hash) {
-        let entries = self.submitted_applies.entry(height).or_default();
-        if let Some((_, count)) = entries
-            .iter_mut()
-            .find(|(entry_hash, _)| *entry_hash == hash)
-        {
-            *count = count.saturating_add(1);
-        } else {
-            entries.push((hash, 1));
-        }
-    }
-
-    pub(super) fn decrement_submitted_apply(&mut self, height: block::Height, hash: block::Hash) {
-        let Some(entries) = self.submitted_applies.get_mut(&height) else {
-            return;
-        };
-        if let Some(index) = entries
-            .iter()
-            .position(|(entry_hash, _)| *entry_hash == hash)
-        {
-            let (_, count) = &mut entries[index];
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                entries.remove(index);
-            }
-        }
-        if entries.is_empty() {
-            self.submitted_applies.remove(&height);
-        }
-    }
-
-    fn clear_submitted_applies_from(&mut self, from: block::Height) {
-        let heights: Vec<_> = self
-            .submitted_applies
-            .range(from..)
-            .map(|(height, _)| *height)
-            .collect();
-        for height in heights {
-            self.submitted_applies.remove(&height);
-        }
-    }
-
-    fn clear_submitted_applies_through(&mut self, through: block::Height) {
-        let heights: Vec<_> = self
-            .submitted_applies
-            .range(..=through)
-            .map(|(height, _)| *height)
-            .collect();
-        for height in heights {
-            self.submitted_applies.remove(&height);
-        }
-    }
-
-    // ---- apply finished ----
-
-    /// The `(token, hash)` of the body currently applying at `height`, for
-    /// validating an apply completion completion against the live submission.
-    pub(super) fn applying_token_hash(
-        &self,
-        height: block::Height,
-    ) -> Option<(BlockApplyToken, block::Hash)> {
-        self.applying
-            .get(&height)
-            .map(|applying| (applying.token, applying.hash))
-    }
-
-    pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
-        self.applying.remove(&height)
-    }
-
-    /// After a rejected/timed-out apply at `height`, roll the download floor back
+    /// After a rejected/timed-out commit at `height`, roll the download floor back
     /// below it — never below the verified tip — so the height is re-requestable.
     pub(super) fn reset_floor_below(&mut self, height: block::Height) {
         self.body_download_floor = previous_height(height)
@@ -448,8 +280,8 @@ impl Sequencer {
         self.reorder.drop_from(from)
     }
 
-    /// Remove `applying` bodies at or above `from` and clear their submitted
-    /// applies; returns the freed bytes.
+    /// Remove held `applying` ledger entries at or above `from`; returns the freed
+    /// bytes (the budget reservations to release on a reject rollback).
     pub(super) fn release_applying_blocks_from(&mut self, from: block::Height) -> u64 {
         let heights: Vec<_> = self
             .applying
@@ -458,15 +290,15 @@ impl Sequencer {
             .collect();
         let mut released = 0u64;
         for height in heights {
-            if let Some(applying) = self.applying.remove(&height) {
-                released = released.saturating_add(applying.bytes);
+            if let Some(entry) = self.applying.remove(&height) {
+                released = released.saturating_add(entry.bytes);
             }
         }
-        self.clear_submitted_applies_from(from);
         released
     }
 
-    /// Remove committed `applying` bodies at or below `tip`; returns freed bytes.
+    /// Remove durable `applying` ledger entries at or below `tip`; returns freed
+    /// bytes (the budget release on a durable frontier advance).
     pub(super) fn release_applied_through(&mut self, tip: block::Height) -> u64 {
         let applied: Vec<_> = self
             .applying
@@ -475,11 +307,10 @@ impl Sequencer {
             .collect();
         let mut released = 0u64;
         for height in applied {
-            if let Some(applying) = self.applying.remove(&height) {
-                released = released.saturating_add(applying.bytes);
+            if let Some(entry) = self.applying.remove(&height) {
+                released = released.saturating_add(entry.bytes);
             }
         }
-        self.clear_submitted_applies_through(tip);
         released
     }
 
@@ -487,8 +318,9 @@ impl Sequencer {
 
     /// Advance the verified tip to `new_tip` (frontier growth/commit). Bumps the
     /// floor unconditionally, drops superseded reorder bodies (and, when
-    /// `release_applied`, committed applying bodies), and moves the verified tip.
-    /// Returns the freed bytes and whether the tip moved.
+    /// `release_applied`, the now-durable held ledger entries), and moves the
+    /// verified tip. Returns the freed bytes, whether the tip moved, and the held
+    /// heights/bytes the advance made durable (for commit throughput).
     pub(super) fn advance_verified_tip(
         &mut self,
         new_tip: block::Height,
@@ -499,37 +331,43 @@ impl Sequencer {
             return AdvanceOutcome {
                 release_bytes: 0,
                 changed: false,
+                committed_blocks: 0,
+                committed_bytes: 0,
             };
         }
         let mut released = self.reorder.drop_through(new_tip);
-        if release_applied {
-            released = released.saturating_add(self.release_applied_through(new_tip));
-        }
+        let (committed_blocks, committed_bytes) = if release_applied {
+            // All held entries sit above the verified tip, so those at or below the
+            // new tip are exactly the heights this advance makes durable.
+            let committed_blocks = self.applying.range(..=new_tip).count() as u64;
+            let committed_bytes = self.release_applied_through(new_tip);
+            released = released.saturating_add(committed_bytes);
+            (committed_blocks, committed_bytes)
+        } else {
+            (0, 0)
+        };
         self.verified_block_tip = new_tip;
         AdvanceOutcome {
             release_bytes: released,
             changed: true,
+            committed_blocks,
+            committed_bytes,
         }
     }
 
-    /// Destructively reset the commit pipeline to `new_tip` (reorg/rollback):
-    /// clear the reorder buffer and all applying bodies (optionally preserving
-    /// submitted-apply records), and pin the floor and verified tip to `new_tip`.
-    /// Returns the freed bytes.
-    pub(super) fn reset_to(&mut self, new_tip: block::Height, keep_submitted_applies: bool) -> u64 {
+    /// Destructively reset the commit pipeline to `new_tip` (reorg/rollback): clear
+    /// the reorder buffer and all held ledger entries, and pin the floor and
+    /// verified tip to `new_tip`. Returns the freed bytes.
+    pub(super) fn reset_to(&mut self, new_tip: block::Height) -> u64 {
         self.verified_block_tip = new_tip;
         self.body_download_floor = new_tip;
         let mut released = self.reorder.clear();
-        released =
-            released.saturating_add(self.release_all_applying_for_reset(keep_submitted_applies));
-        released
-    }
-
-    fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
-        let released = self.applying.values().map(|applying| applying.bytes).sum();
-        if !keep_submitted_applies {
-            self.submitted_applies.clear();
-        }
+        released = released.saturating_add(
+            self.applying
+                .values()
+                .map(|entry| entry.bytes)
+                .fold(0u64, u64::saturating_add),
+        );
         self.applying.clear();
         released
     }

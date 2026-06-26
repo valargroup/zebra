@@ -13,14 +13,13 @@ pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
 
-pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
 pub(crate) use block_sync_driver::{
-    apply_block_sync_body, block_apply_class, block_sync_missing_body_window,
-    block_sync_needed_blocks_from_state, coalesce_ready_needed_block_queries,
-    coalesce_stale_needed_block_queries, commit_block_sync_body, query_block_sync_needed_blocks,
-    ZebradBlockApplyExecutor, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+    block_apply_class, block_sync_missing_body_window, block_sync_needed_blocks_from_state,
+    coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
+    commit_block_sync_body, query_block_sync_needed_blocks, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
+pub(crate) use block_sync_driver::{drive_block_sync_actions, drive_block_sync_durable_frontier};
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
 pub(crate) use header_sync_driver::{
@@ -76,10 +75,6 @@ pub(crate) fn insert_cs_peer(row: &mut Map<String, Value>, key: &'static str, pe
 
 pub(crate) fn insert_cs_u64(row: &mut Map<String, Value>, key: &'static str, value: u64) {
     row.insert(key.to_string(), Value::Number(Number::from(value)));
-}
-
-pub(crate) fn insert_cs_bool(row: &mut Map<String, Value>, key: &'static str, value: bool) {
-    row.insert(key.to_string(), Value::Bool(value));
 }
 
 pub(crate) fn insert_cs_str(row: &mut Map<String, Value>, key: &'static str, value: &str) {
