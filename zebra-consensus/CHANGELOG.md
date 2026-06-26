@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Ironwood transaction errors:
+  - `TransactionError::CoinbaseHasEnableSpendsIronwood`
+  - `TransactionError::DuplicateIronwoodNullifier`
+  - `TransactionError::NotEnoughIronwoodFlags`
+  - `TransactionError::OrchardHasEnableCrossAddress`
+  - `TransactionError::IronwoodProofSize`
+- Ironwood/Orchard structural check helpers:
+  - `transaction::check::has_enough_ironwood_flags`
+  - `transaction::check::orchard_cross_address_disabled`
+
 ### Changed
 
 - V6 Orchard and Ironwood proof verification now routes through the Ironwood
