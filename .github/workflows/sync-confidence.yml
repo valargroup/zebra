@@ -4,7 +4,7 @@ name: Sync confidence
 # (semantically) syncing two fixed mainnet windows bracketing the NU6.2 soft fork on
 # ephemeral DigitalOcean droplets that restore pruned cached state from Spaces.
 #
-# Triggers:
+# Triggers (push + schedule are currently disabled — see the note on `on:` below):
 # - push to ironwood-main: (re)build the test image and publish the `ironwood-main` tag
 #   to GHCR. No sync test runs on merge, so merges stay cheap.
 # - schedule (every 12h): reuse the latest `ironwood-main` image (no rebuild) and run
@@ -19,11 +19,12 @@ name: Sync confidence
 # See docs/sync-confidence-do-setup.md.
 
 on:
-  push:
-    branches:
-      - ironwood-main
-  schedule:
-    - cron: "0 */12 * * *"
+  # NOTE: the `push` (image build) and `schedule` (12h sync) triggers are intentionally
+  # disabled until ironwood-main ships DB format 28.3.0 and matching pruned snapshots.
+  # The sync-confidence snapshots are format 28.3.0, so an image built from ironwood-main
+  # before then would FormatMismatch when opening them and red the timer. Re-enable by
+  # restoring the `push` and `schedule` blocks (see docs/sync-confidence-do-setup.md).
+  # `workflow_dispatch` stays available so the job can still be run manually.
   workflow_dispatch:
     inputs:
       build_image:

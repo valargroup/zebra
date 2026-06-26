@@ -30,6 +30,12 @@ state objects after a DB format-version bump by re-running the snapshots workflo
 
 ## Running
 
+> **Currently disabled.** The `push` and `schedule` triggers below are commented out in
+> `sync-confidence.yml` until `ironwood-main` ships DB format 28.3.0 and matching pruned
+> snapshots (the snapshots are 28.3.0, so an `ironwood-main` image built before then would
+> `FormatMismatch` on open). Only manual dispatch is active. Re-enable by restoring the
+> `push` and `schedule` blocks in `sync-confidence.yml`.
+
 Once the snapshots exist and the package is public, **Sync confidence**:
 
 - **on merge to `ironwood-main`** rebuilds and publishes the `ironwood-main` test image
