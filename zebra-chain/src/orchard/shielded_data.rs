@@ -3,8 +3,10 @@
 use std::{
     cmp::{Eq, PartialEq},
     fmt::{self, Debug},
+    io,
 };
 
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use halo2::pasta::pallas;
 use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
@@ -13,7 +15,9 @@ use crate::{
     block::MAX_BLOCK_BYTES,
     orchard::{tree, Action, Nullifier, ValueCommitment},
     primitives::Halo2Proof,
-    serialization::{AtLeastOne, TrustedPreallocate, ZcashSerialize},
+    serialization::{
+        AtLeastOne, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
+    },
 };
 
 /// Returns the canonical size in bytes of an Orchard proof for `num_actions` actions.
@@ -237,16 +241,16 @@ impl TrustedPreallocate for Signature<SpendAuth> {
 bitflags! {
     /// Per-Transaction flags for Orchard.
     ///
-    /// The spend, output, and cross address flags are passed to the `Halo2Proof` verifier, which
-    /// verifies the relevant note spending and creation consensus rules.
+    /// The spend, output, and cross-address flags are passed to the `Halo2Proof` verifier,
+    /// which verifies the relevant note spending and creation consensus rules.
     ///
     /// # Consensus
     ///
     /// > [NU5 onward] In a version 5 transaction, the reserved bits 2..7 of the flagsOrchard
     /// > field MUST be zero.
     ///
-    /// In V6 Orchard-style bundle formats, bit 2 is `enableCrossAddress`, and bits 3..7 are
-    /// reserved.
+    /// [NU6.3 onward] In V6 Orchard-style bundle formats, bit 2 is `enableCrossAddress`, and bits
+    /// 3..7 are reserved.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
     ///
@@ -260,7 +264,7 @@ bitflags! {
         const ENABLE_SPENDS = 0b00000001;
         /// Enable creating new non-zero valued Orchard notes.
         const ENABLE_OUTPUTS = 0b00000010;
-        /// Enable cross address transfers in NU6.3 style Orchard bundle formats.
+        /// Enable cross-address transfers in V6 Orchard-style bundle formats.
         const ENABLE_CROSS_ADDRESS = 0b00000100;
     }
 }
@@ -284,5 +288,23 @@ impl serde::Serialize for Flags {
 impl<'de> serde::Deserialize<'de> for Flags {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         bitflags_serde_legacy::deserialize("Flags", deserializer)
+    }
+}
+
+impl ZcashSerialize for Flags {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_u8(self.bits())?;
+
+        Ok(())
+    }
+}
+
+impl ZcashDeserialize for Flags {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        // Consensus rule: "In a version 5 transaction,
+        // the reserved bits 2..7 of the flagsOrchard field MUST be zero."
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        Flags::from_bits(reader.read_u8()?)
+            .ok_or(SerializationError::Parse("invalid reserved orchard flags"))
     }
 }
