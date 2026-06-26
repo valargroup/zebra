@@ -303,11 +303,12 @@ impl Deref for DeprecatedPostNu6_2Verifier {
 pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
     Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD));
 
-/// Returns the global Halo2 verifier for V5 Orchard bundles in blocks at `network_upgrade`.
+/// Returns the global Halo2 verifier for the Orchard Action circuit active at
+/// `network_upgrade`.
 ///
 /// The Orchard Action circuit — and therefore its verifying key — changes with the block era, and
 /// a proof produced under one circuit does not verify under another era's key. The era is a
-/// function of the block's network upgrade, not the transaction version, so each V5 Orchard bundle
+/// function of the block's network upgrade, not the transaction version, so each Orchard bundle
 /// is checked against the key for the upgrade of the block it appears in:
 ///
 ///   * upgrades before NU6.2 are routed to [`VERIFIER_PRE_NU6_2`] (the historical insecure key;
@@ -317,14 +318,12 @@ pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
 ///     cross-address restriction is enforced for every Orchard Action from NU6.3 onward regardless
 ///     of transaction version, "so that it cannot be bypassed by using a version 5 transaction"
 ///     (ZIP 229); that restriction lives in the NU6.3 circuit, which the NU6.2 fixed key cannot
-///     verify. So a V5 Orchard bundle at NU6.3 uses the same key as V6 Orchard and Ironwood.
-///
-/// V6 Orchard and Ironwood bundles use [`v6_verifier`], which returns that same NU6.3-onward key.
+///     verify. So an Orchard bundle at NU6.3 uses the same key as V6 Orchard and Ironwood.
 ///
 /// The mapping is an explicit, exhaustive `match` on every [`NetworkUpgrade`] variant: there is
 /// no version-comparison fallthrough and no default-to-insecure arm, so adding a future upgrade
 /// is a compile error here until it is bound to a key on purpose.
-pub fn v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
+pub fn verifier_for_orchard_circuit(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     use NetworkUpgrade::*;
 
     match network_upgrade {
@@ -353,14 +352,6 @@ pub fn v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierServ
         #[cfg(zcash_unstable = "zfuture")]
         ZFuture => &VERIFIER_NU6_3_ONWARD,
     }
-}
-
-/// Returns the global Halo2 verifier for V6 Orchard and Ironwood bundles.
-///
-/// V6 Orchard and Ironwood bundles only exist from NU6.3 onward, so they always use the NU6.3
-/// circuit — the same [`VERIFIER_NU6_3_ONWARD`] key that V5 Orchard bundles at NU6.3 route to.
-pub fn v6_verifier() -> &'static VerifierService {
-    &VERIFIER_NU6_3_ONWARD
 }
 
 /// Halo2 proof verifier implementation

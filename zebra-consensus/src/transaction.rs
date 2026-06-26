@@ -1247,9 +1247,9 @@ where
     /// the fixed key, and NU6.3-onward bundles against the NU6.3 key — the Orchard cross-address
     /// restriction applies from NU6.3 onward regardless of transaction version (ZIP 229), so a V5
     /// bundle at NU6.3 uses the NU6.3 circuit, not the fixed one. A proof from one era does not
-    /// verify under another era's key. [`primitives::halo2::v5_verifier_for`] maps the upgrade to
-    /// the verifier holding the matching key; the verifiers keep separate batches, so eras are
-    /// never mixed.
+    /// verify under another era's key. [`primitives::halo2::verifier_for_orchard_circuit`] maps
+    /// the upgrade to the verifier holding the matching key; the verifiers keep separate batches,
+    /// so eras are never mixed.
     fn verify_v5_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
@@ -1275,7 +1275,7 @@ where
             // NU6.3-onward bundles only under the NU6.3 key (which enforces the Orchard
             // cross-address restriction even in v5 transactions).
             async_checks.push(
-                primitives::halo2::v5_verifier_for(network_upgrade)
+                primitives::halo2::verifier_for_orchard_circuit(network_upgrade)
                     .clone()
                     .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
             );
@@ -1297,7 +1297,7 @@ where
 
         if let Some(bundle) = bundle {
             async_checks.push(
-                primitives::halo2::v6_verifier()
+                primitives::halo2::VERIFIER_NU6_3_ONWARD
                     .clone()
                     .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
             );
