@@ -71,31 +71,29 @@ def quantile(m, name, q):
     return None
 
 # group, key, label, unit, kind
+# The note-commitment commit pipeline (the single-writer bottleneck) plus Zakura
+# supply. Legacy TCP sync / verifier / committer-task metrics are not emitted on
+# the Zakura v2 path, so they are not shown.
 PANELS = [
-    ("Throughput", "blocks_per_s",   "Blocks / sec",               "blk/s", "rate"),
-    ("Throughput", "height",         "Finalized height",           "",      "gauge"),
-    ("Commit",     "committer_util", "Committer utilization",       "%",     "gauge"),
-    ("Commit",     "committer_ms",   "Committer ms / block",        "ms",    "gauge"),
-    ("Commit",     "queue_depth",    "Committer queue depth",       "",      "gauge"),
-    ("Commit",     "p_note_tree",    "  note_tree",                 "ms",    "gauge"),
-    ("Commit",     "p_write_block",  "  write_block",               "ms",    "gauge"),
-    ("Commit",     "p_batch_commit", "  rocksdb batch_commit",      "ms",    "gauge"),
-    ("Commit",     "p_install_ovh",  "  install overhead",          "ms",    "gauge"),
-    ("Verify",     "verify_queued",  "Checkpoint queued slots",     "",      "gauge"),
-    ("Verify",     "verify_mem_q",   "Semantic queued blocks",      "",      "gauge"),
-    ("Verify",     "verify_util",    "Verify queue utilization",    "%",     "gauge"),
-    ("Download",   "dl_p50_ms",      "Block download p50",          "ms",    "gauge"),
-    ("Download",   "dl_p90_ms",      "Block download p90",          "ms",    "gauge"),
-    ("Download",   "dl_util",        "Download slot utilization",   "%",     "gauge"),
-    ("Download",   "in_flight",      "Downloads in flight (legacy)","",      "gauge"),
-    ("Download",   "outstanding",    "Blocks outstanding (Zakura)", "",      "gauge"),
-    ("Download",   "missing_bodies", "Header bodies missing",       "",      "gauge"),
+    ("Throughput", "blocks_per_s",   "Blocks / sec (20s avg)",      "blk/s", "rate"),
+    ("Throughput", "height",         "Finalized height",            "",      "gauge"),
+    ("Commit",     "commit_ms",      "Commit busy / block",         "ms",    "gauge"),
+    ("Commit",     "commit_util",    "Commit utilization",          "%",     "gauge"),
+    ("Commit CPU", "p_checkpoint",   "checkpoint_compute",          "ms",    "gauge"),
+    ("Commit CPU", "p_commit_check", "  commitment_check",          "ms",    "gauge"),
+    ("Commit CPU", "p_note_tree",    "  note_tree (update_trees)",  "ms",    "gauge"),
+    ("Commit CPU", "p_history_push", "  history_push",              "ms",    "gauge"),
+    ("Commit DB",  "p_spent_reads",  "spent_utxo_reads",            "ms",    "gauge"),
+    ("Commit DB",  "p_addr_reads",   "address_reads",               "ms",    "gauge"),
+    ("Commit DB",  "p_batch_prep",   "batch_prep",                  "ms",    "gauge"),
+    ("Commit DB",  "p_rocksdb",      "rocksdb_write",               "ms",    "gauge"),
+    ("Commit DB",  "commit_mb",      "Committed MB / block",        "MB",    "gauge"),
+    ("Commit DB",  "write_mbps",     "Write throughput",            "MB/s",  "rate"),
     ("VCT path",   "vct_fast_s",     "VCT fast commits / s",        "/s",    "rate"),
     ("VCT path",   "vct_legacy_s",   "VCT legacy commits / s",      "/s",    "rate"),
-    ("Network",    "net_in_mbps",    "Network in",                  "MB/s",  "rate"),
-    ("Network",    "net_out_mbps",   "Network out",                 "MB/s",  "rate"),
-    ("Network",    "peers",          "Legacy peers",                "",      "gauge"),
-    ("Network",    "zakura_peers",   "Zakura peers (active)",       "",      "gauge"),
+    ("Zakura",     "zk_peers",       "Cohort peers (active)",       "",      "gauge"),
+    ("Zakura",     "zk_qdepth",      "Zakura queue depth",          "",      "gauge"),
+    ("Zakura",     "zk_block_sync",  "block_sync streams",          "",      "gauge"),
 ]
 PANEL_KEYS = [k for _, k, *_ in PANELS]
 
@@ -103,15 +101,23 @@ def panels_meta():
     return [{"group": g, "key": k, "label": l, "unit": u} for g, k, l, u, _ in PANELS]
 
 # ── bottleneck classifier ─────────────────────────────────────────────────────
-# A sync run is limited by exactly one pipeline stage: download -> verify -> commit.
-# The limiter is the stage running at full utilization while work backs up at its
-# input and starves everything downstream. We read three utilization signals,
-# checked downstream-first so a queue that is full only because the stage *after*
-# it is slow is attributed to that downstream stage, not to itself.
-STALL_BPS      = 1.0    # below this, the node is making no commit progress
-COMMIT_UTIL_HI = 80.0   # committer busy >= this fraction of wall time -> commit-bound
-VERIFY_FRAC_HI = 0.50   # verify input queue >= this fraction of the verify limit
-DL_FRAC_HI     = 0.80   # download slots >= this fraction of the concurrency limit
+# The single-writer commit pipeline gates throughput. If the writer is busy most
+# of the wall (high commit utilization) the run is COMMIT-BOUND on its heaviest
+# phase; if the writer is mostly idle the Zakura cohort isn't supplying blocks
+# fast enough (SUPPLY-BOUND).
+STALL_BPS      = 1.0    # below this, no commit progress
+COMMIT_UTIL_HI = 70.0   # writer busy >= this % of wall -> commit-bound
+COMMIT_UTIL_LO = 45.0   # writer busy <= this % of wall -> supply-bound
+
+# (key, label) for the sequential per-block commit phases (cc ∥ ut + hp are
+# inside checkpoint_compute; reads + batch build + write are sequential after it).
+COMMIT_PHASES = [
+    ("p_checkpoint",  "checkpoint_compute (note_tree+history)"),
+    ("p_spent_reads", "spent_utxo_reads"),
+    ("p_addr_reads",  "address_reads"),
+    ("p_batch_prep",  "batch_prep"),
+    ("p_rocksdb",     "rocksdb_write"),
+]
 
 def _median(xs):
     xs = sorted(v for v in xs if v is not None)
@@ -134,8 +140,8 @@ def steady_window(samples):
 
 def classify(samples, ckpt_limit=None, dl_limit=None):
     """Return {verdict, label, confidence, scores, detail, bps} over the steady
-    window. scores are per-stage utilizations in [0,1]; the verdict names the
-    limiting stage. Robust to missing metrics (legacy vs Zakura paths)."""
+    window: COMMIT-BOUND (writer saturated, names the heaviest phase) vs
+    SUPPLY-BOUND (writer idle, the cohort isn't feeding blocks) vs BALANCED."""
     win = steady_window(samples)
     if not win:
         return {"verdict": "idle", "label": "No data", "confidence": "low",
@@ -144,69 +150,42 @@ def classify(samples, ckpt_limit=None, dl_limit=None):
     def med(k):
         return _median([s.get(k) for s in win])
 
-    bps  = med("blocks_per_s")
-    cutil = med("committer_util")                 # % busy
-    vq   = med("verify_queued")                   # checkpoint verifier backlog
-    vmq  = med("verify_mem_q")                    # semantic verifier backlog
-    infl = med("in_flight")                       # legacy download slots
-    outs = med("outstanding")                     # Zakura outstanding blocks
-
-    # per-stage utilization in [0,1]
+    bps   = med("blocks_per_s")
+    cutil = med("commit_util")                     # writer % busy of wall
     commit_u = (cutil / 100.0) if cutil is not None else None
-    verify_back = max([x for x in (vq, vmq) if x is not None], default=None)
-    verify_u = (min(1.0, verify_back / ckpt_limit)
-                if (verify_back is not None and ckpt_limit) else None)
-    dl_inflight = infl if infl is not None else outs
-    dl_u = (min(1.0, dl_inflight / dl_limit)
-            if (dl_inflight is not None and dl_limit) else None)
+    phases = {k: med(k) for k, _ in COMMIT_PHASES}
+    phases = {k: v for k, v in phases.items() if v}
+    scores = {"commit": round(commit_u, 3)} if commit_u is not None else {}
 
-    scores = {}
-    if commit_u is not None: scores["commit"] = round(commit_u, 3)
-    if verify_u is not None: scores["verify"] = round(verify_u, 3)
-    if dl_u     is not None: scores["download"] = round(dl_u, 3)
+    if bps is None or bps < STALL_BPS:
+        return {"verdict": "stalled", "label": "STALLED / STARVED", "confidence": "high",
+                "scores": scores, "bps": (round(bps, 2) if bps is not None else None),
+                "detail": f"no commit progress ({(bps or 0):.2f} blk/s)"}
 
-    if bps is None:
-        return {"verdict": "idle", "label": "No progress", "confidence": "low",
-                "scores": scores, "detail": "no throughput reading", "bps": bps}
-    if bps < STALL_BPS:
-        return {"verdict": "stalled", "label": "STALLED / STARVED",
-                "confidence": "high", "scores": scores, "bps": round(bps, 2),
-                "detail": f"no commit progress ({bps:.2f} blk/s)"}
+    top = max(phases, key=phases.get) if phases else None
+    topname = dict(COMMIT_PHASES).get(top, top)
 
-    # downstream-first decision tree
     if commit_u is not None and cutil >= COMMIT_UTIL_HI:
-        phases = {k: med(k) for k in ("p_note_tree", "p_write_block",
-                  "p_batch_commit", "p_install_ovh")}
-        phases = {k: v for k, v in phases.items() if v}
-        top = max(phases, key=phases.get) if phases else None
         detail = f"writer saturated ({cutil:.0f}% util, {bps:.0f} blk/s)"
         if top:
-            detail += f"; dominant phase: {top} ({phases[top]:.1f} ms)"
-        return {"verdict": "commit_starved", "label": "COMMIT-STARVED",
+            detail += f"; dominant phase: {topname} ({phases[top]:.1f} ms/blk)"
+        return {"verdict": "commit_bound", "label": "COMMIT-BOUND",
                 "confidence": _conf(scores, "commit"), "scores": scores,
                 "detail": detail, "bps": round(bps, 2)}
 
-    if verify_u is not None and verify_u >= VERIFY_FRAC_HI:
-        return {"verdict": "verify_bound", "label": "VERIFY-BOUND",
-                "confidence": _conf(scores, "verify"), "scores": scores,
-                "detail": (f"verifier backlog {verify_back:.0f} "
-                           f"({verify_u*100:.0f}% of limit {ckpt_limit}), "
-                           f"committer {cutil:.0f}% util" if cutil is not None
-                           else f"verifier backlog {verify_back:.0f}"),
-                "bps": round(bps, 2)}
+    if commit_u is not None and cutil <= COMMIT_UTIL_LO:
+        qd = med("zk_qdepth")
+        qtxt = f" (queue_depth~{qd:.0f})" if qd is not None else ""
+        return {"verdict": "supply_bound", "label": "SUPPLY-BOUND (Zakura)",
+                "confidence": "medium", "scores": scores, "bps": round(bps, 2),
+                "detail": (f"writer only {cutil:.0f}% busy at {bps:.0f} blk/s — the cohort "
+                           f"isn't delivering blocks fast enough{qtxt}")}
 
-    if dl_u is not None and dl_u >= DL_FRAC_HI:
-        return {"verdict": "download_bound", "label": "DOWNLOAD-BOUND",
-                "confidence": _conf(scores, "download"), "scores": scores,
-                "detail": (f"download slots {dl_inflight:.0f}/{dl_limit} "
-                           f"({dl_u*100:.0f}%) saturated, downstream queues idle"),
-                "bps": round(bps, 2)}
-
-    lean = max(scores, key=scores.get) if scores else "?"
-    return {"verdict": "mixed", "label": "MIXED / UNSATURATED",
-            "confidence": "low", "scores": scores, "bps": round(bps, 2),
-            "detail": (f"no stage saturated at {bps:.0f} blk/s "
-                       f"(leaning {lean}); likely coordination / head-of-line")}
+    detail = f"writer {cutil:.0f}% busy at {bps:.0f} blk/s" if cutil is not None else f"{bps:.0f} blk/s"
+    if top:
+        detail += f"; heaviest phase {topname} ({phases[top]:.1f} ms/blk)"
+    return {"verdict": "balanced", "label": "BALANCED", "confidence": "low",
+            "scores": scores, "bps": round(bps, 2), "detail": detail}
 
 def _conf(scores, winner):
     """high if the winning stage clearly leads the runner-up, else medium."""
@@ -218,23 +197,18 @@ def _conf(scores, winner):
     return "high" if scores[winner] - max(others) >= 0.25 else "medium"
 
 # verdict level -> live-banner CSS class
-LEVEL = {"commit_starved": "warn", "verify_bound": "warn", "download_bound": "info",
-         "mixed": "info", "stalled": "bad", "idle": "idle"}
+LEVEL = {"commit_bound": "warn", "supply_bound": "info", "balanced": "info",
+         "stalled": "bad", "idle": "idle"}
 
 def render_markdown(v, label=None):
     title = f" — {label}" if label else ""
     lines = [f"## Bottleneck verdict{title}", "",
              f"**{v['label']}** (confidence {v['confidence']})", "",
-             v.get("detail", ""), "",
-             "| stage | utilization |", "|-------|------------:|"]
-    names = {"commit": "commit (writer)", "verify": "verify (checkpoint)",
-             "download": "download (peers)"}
-    win = {"commit_starved": "commit", "verify_bound": "verify",
-           "download_bound": "download"}.get(v["verdict"])
-    for k in ("download", "verify", "commit"):
-        if k in v.get("scores", {}):
-            mark = " ⟵ limiter" if k == win else ""
-            lines.append(f"| {names[k]} | {v['scores'][k]*100:.0f}%{mark} |")
+             v.get("detail", ""), ""]
+    if "commit" in v.get("scores", {}):
+        mark = " ⟵ limiter" if v["verdict"] == "commit_bound" else ""
+        lines += ["| stage | utilization |", "|-------|------------:|",
+                  f"| commit (single writer) | {v['scores']['commit']*100:.0f}%{mark} |"]
     if v.get("bps") is not None:
         lines += ["", f"Throughput: **{v['bps']:.1f} blk/s** (steady-state median)."]
     return "\n".join(lines) + "\n"
@@ -274,11 +248,17 @@ def autodetect_target():
     return None
 
 class Collector:
-    def __init__(self, target, interval, window, record_dir=None, meta=None):
+    def __init__(self, target, interval, window, record_dir=None, meta=None,
+                 smooth_secs=20.0):
         self.target = target
         self.interval = interval
         self.series = {k: deque(maxlen=window) for k in PANEL_KEYS}
         self.ts = deque(maxlen=window)
+        # Trailing (time, height) samples for SMOOTHED throughput. Checkpoint
+        # sync commits in batches, so a single-interval Δheight aliases into
+        # spike/zero; averaging over smooth_secs gives the honest block rate.
+        self.smooth_secs = smooth_secs
+        self.h_window = deque()
         self.prev = None
         self.prev_t = None
         self.lock = threading.Lock()
@@ -309,46 +289,50 @@ class Collector:
             m = parse(r.read().decode('utf-8', 'replace'))
         now = time.time()
         d = {}
-        d["height"]         = bare(m, "state_finalized_block_height")
-        d["queue_depth"]    = bare(m, "zebra_committer_input_queue_depth")
-        d["verify_queued"]  = bare(m, "checkpoint_queued_slots")
-        d["verify_mem_q"]   = bare(m, "state_memory_queued_block_count")
-        d["in_flight"]      = bare(m, "sync_downloads_in_flight")
-        d["outstanding"]    = bare(m, "sync_block_outstanding")
-        d["missing_bodies"] = bare(m, "sync_header_missing_bodies")
-        d["peers"]          = bare(m, "zcash_net_peers")
-        d["zakura_peers"]   = bare(m, "zakura_p2p_conn_active")
-        dl50 = quantile(m, "sync_block_download_duration_seconds", "0.5")
-        dl90 = quantile(m, "sync_block_download_duration_seconds", "0.9")
-        d["dl_p50_ms"] = dl50 * 1000 if dl50 is not None else None
-        d["dl_p90_ms"] = dl90 * 1000 if dl90 is not None else None
-        if self.ckpt_limit and d["verify_queued"] is not None:
-            vb = max(d["verify_queued"], d["verify_mem_q"] or 0)
-            d["verify_util"] = min(100.0, 100.0 * vb / self.ckpt_limit)
-        if self.dl_limit:
-            di = d["in_flight"] if d["in_flight"] is not None else d["outstanding"]
-            if di is not None:
-                d["dl_util"] = min(100.0, 100.0 * di / self.dl_limit)
+        d["height"]        = bare(m, "state_finalized_block_height")
+        d["zk_peers"]      = bare(m, "zakura_p2p_conn_active")
+        d["zk_qdepth"]     = bare(m, "zakura_p2p_queue_depth")
+        d["zk_block_sync"] = next((v for lbl, v in m.get("zakura_p2p_stream_accepted", [])
+                                   if "block_sync" in lbl), None)
 
         cur = {
-            "h":   bare(m, "state_finalized_block_height"),
-            "vf":  bare(m, "state_vct_fast_block_count"),
-            "vl":  bare(m, "state_vct_legacy_block_count"),
-            "nin": total(m, "zcash_net_in_bytes_total"),
-            "nout":total(m, "zcash_net_out_bytes_total"),
-            "cm_s":bare(m, "zebra_committer_commit_duration_seconds_sum"),
-            "cm_c":bare(m, "zebra_committer_commit_duration_seconds_count"),
-            "nt_s":bare(m, "zebra_state_write_update_trees_duration_seconds_sum"),
-            "nt_c":bare(m, "zebra_state_write_update_trees_duration_seconds_count"),
-            "wb_s":bare(m, "zebra_state_write_write_block_total_duration_seconds_sum"),
-            "wb_c":bare(m, "zebra_state_write_write_block_total_duration_seconds_count"),
-            "bc_s":bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_sum"),
-            "bc_c":bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_count"),
-            "wi_s":bare(m, "zebra_state_commit_write_block_install_duration_seconds_sum"),
-            "wi_c":bare(m, "zebra_state_commit_write_block_install_duration_seconds_count"),
+            "h":    bare(m, "state_finalized_block_height"),
+            "vf":   bare(m, "state_vct_fast_block_count"),
+            "vl":   bare(m, "state_vct_legacy_block_count"),
+            "ckc_s":bare(m, "zebra_state_write_checkpoint_compute_duration_seconds_sum"),
+            "ckc_c":bare(m, "zebra_state_write_checkpoint_compute_duration_seconds_count"),
+            "cc_s": bare(m, "zebra_state_write_commitment_check_duration_seconds_sum"),
+            "cc_c": bare(m, "zebra_state_write_commitment_check_duration_seconds_count"),
+            "ut_s": bare(m, "zebra_state_write_update_trees_duration_seconds_sum"),
+            "ut_c": bare(m, "zebra_state_write_update_trees_duration_seconds_count"),
+            "hp_s": bare(m, "zebra_state_commit_history_push_duration_seconds_sum"),
+            "hp_c": bare(m, "zebra_state_commit_history_push_duration_seconds_count"),
+            "sur_s":bare(m, "zebra_state_write_spent_utxo_reads_duration_seconds_sum"),
+            "sur_c":bare(m, "zebra_state_write_spent_utxo_reads_duration_seconds_count"),
+            "ar_s": bare(m, "zebra_state_write_address_reads_duration_seconds_sum"),
+            "ar_c": bare(m, "zebra_state_write_address_reads_duration_seconds_count"),
+            "bp_s": bare(m, "zebra_state_write_batch_prep_duration_seconds_sum"),
+            "bp_c": bare(m, "zebra_state_write_batch_prep_duration_seconds_count"),
+            "bc_s": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_sum"),
+            "bc_c": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_count"),
+            "bb_s": bare(m, "zebra_state_write_batch_bytes_sum"),
+            "bb_c": bare(m, "zebra_state_write_batch_bytes_count"),
         }
+        # Maintain the trailing height window for smoothed throughput.
+        if cur["h"] is not None:
+            self.h_window.append((now, cur["h"]))
+            cutoff = now - self.smooth_secs
+            while len(self.h_window) > 2 and self.h_window[0][0] < cutoff:
+                self.h_window.popleft()
         def rate(a, b, dt):
             return (b - a) / dt if (a is not None and b is not None and dt > 0) else None
+        def smoothed_bps():
+            # blk/s over the trailing window spread (>=2 samples), else single-tick.
+            if len(self.h_window) >= 2:
+                t0, h0 = self.h_window[0]; t1, h1 = self.h_window[-1]
+                if t1 > t0 and h0 is not None and h1 is not None:
+                    return (h1 - h0) / (t1 - t0)
+            return None
         def avg(s0, s1, c0, c1, scale=1000.0):
             if None in (s0, s1, c0, c1) or (c1 - c0) <= 0:
                 return None
@@ -356,21 +340,33 @@ class Collector:
         if self.prev is not None:
             dt = now - self.prev_t
             p = self.prev
-            d["blocks_per_s"]  = rate(p["h"],  cur["h"],  dt)
-            d["vct_fast_s"]    = rate(p["vf"], cur["vf"], dt)
-            d["vct_legacy_s"]  = rate(p["vl"], cur["vl"], dt)
-            ni = rate(p["nin"], cur["nin"], dt);  d["net_in_mbps"]  = ni/1e6 if ni is not None else None
-            no = rate(p["nout"],cur["nout"],dt);  d["net_out_mbps"] = no/1e6 if no is not None else None
-            d["committer_ms"]   = avg(p["cm_s"], cur["cm_s"], p["cm_c"], cur["cm_c"])
-            d["p_note_tree"]    = avg(p["nt_s"], cur["nt_s"], p["nt_c"], cur["nt_c"])
-            d["p_write_block"]  = avg(p["wb_s"], cur["wb_s"], p["wb_c"], cur["wb_c"])
-            d["p_batch_commit"] = avg(p["bc_s"], cur["bc_s"], p["bc_c"], cur["bc_c"])
-            wi = avg(p["wi_s"], cur["wi_s"], p["wi_c"], cur["wi_c"])
-            d["p_install_ovh"] = (wi - d["p_write_block"]) if (wi is not None and d.get("p_write_block") is not None) else None
-            if d["committer_ms"] is not None and d.get("blocks_per_s") is not None:
-                d["committer_util"] = min(100.0, max(0.0, d["committer_ms"] * d["blocks_per_s"] / 10.0))
+            d["blocks_per_s"]   = smoothed_bps()
+            if d["blocks_per_s"] is None:
+                d["blocks_per_s"] = rate(p["h"], cur["h"], dt)
+            d["vct_fast_s"]     = rate(p["vf"], cur["vf"], dt)
+            d["vct_legacy_s"]   = rate(p["vl"], cur["vl"], dt)
+            d["p_checkpoint"]   = avg(p["ckc_s"], cur["ckc_s"], p["ckc_c"], cur["ckc_c"])
+            d["p_commit_check"] = avg(p["cc_s"],  cur["cc_s"],  p["cc_c"],  cur["cc_c"])
+            d["p_note_tree"]    = avg(p["ut_s"],  cur["ut_s"],  p["ut_c"],  cur["ut_c"])
+            d["p_history_push"] = avg(p["hp_s"],  cur["hp_s"],  p["hp_c"],  cur["hp_c"])
+            d["p_spent_reads"]  = avg(p["sur_s"], cur["sur_s"], p["sur_c"], cur["sur_c"])
+            d["p_addr_reads"]   = avg(p["ar_s"],  cur["ar_s"],  p["ar_c"],  cur["ar_c"])
+            d["p_batch_prep"]   = avg(p["bp_s"],  cur["bp_s"],  p["bp_c"],  cur["bp_c"])
+            d["p_rocksdb"]      = avg(p["bc_s"],  cur["bc_s"],  p["bc_c"],  cur["bc_c"])
+            bpb = avg(p["bb_s"], cur["bb_s"], p["bb_c"], cur["bb_c"], scale=1.0)  # bytes/block
+            d["commit_mb"]      = (bpb/1e6) if bpb is not None else None
+            wb = rate(p["bb_s"], cur["bb_s"], dt)                                 # bytes/s
+            d["write_mbps"]     = (wb/1e6) if wb is not None else None
+            # commit wall/block = the sequential phases (commitment_check ∥ note_tree
+            # + history_push are inside checkpoint_compute, so don't double-count them).
+            parts = [d.get(k) for k in ("p_checkpoint", "p_spent_reads",
+                     "p_addr_reads", "p_batch_prep", "p_rocksdb")]
+            d["commit_ms"] = (sum(x for x in parts if x is not None)
+                              if any(x is not None for x in parts) else None)
+            if d["commit_ms"] is not None and d.get("blocks_per_s") is not None:
+                d["commit_util"] = min(100.0, max(0.0, d["commit_ms"] * d["blocks_per_s"] / 10.0))
             else:
-                d["committer_util"] = None
+                d["commit_util"] = None
         self.prev, self.prev_t = cur, now
         with self.lock:
             self.ts.append(int(now * 1000))
@@ -686,6 +682,9 @@ def main():
     ap.add_argument('--host', default='0.0.0.0', help='dashboard bind host (default 0.0.0.0 = reachable by IP)')
     ap.add_argument('--interval', type=float, default=2.0)
     ap.add_argument('--window', type=int, default=4000)
+    ap.add_argument('--smooth', type=float, default=20.0,
+                    help='throughput smoothing window in seconds (default 20; '
+                         'averages over batched checkpoint commits)')
     ap.add_argument('--record', default=None, metavar='DIR', help='persist samples to DIR/samples.jsonl')
     ap.add_argument('--no-serve', action='store_true', help='record only, no web server (CI sidecar)')
     ap.add_argument('--archive', default=None, metavar='DIR', help='serve recorded runs under DIR (+live)')
@@ -711,7 +710,8 @@ def main():
     if (a.record or a.no_serve) and not target:
         raise SystemExit("no running zebrad metrics endpoint found; pass --target host:port")
     if target:
-        COLLECTOR = Collector(target, a.interval, a.window, record_dir=a.record, meta=meta)
+        COLLECTOR = Collector(target, a.interval, a.window, record_dir=a.record, meta=meta,
+                              smooth_secs=a.smooth)
         threading.Thread(target=COLLECTOR.loop, daemon=True).start()
         print(f"scraping http://{target}/metrics every {a.interval}s"
               + (f"; recording to {a.record}" if a.record else ""))
