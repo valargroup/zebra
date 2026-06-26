@@ -971,7 +971,7 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_v5_orchard_bundle(orchard_bundle, &sighash, nu)))
+        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu)))
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -1041,7 +1041,7 @@ where
             cached_ffi_transaction.clone(),
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_v6_orchard_bundle(orchard_bundle, &sighash));
+        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu));
 
         // The Ironwood bundle only exists under NU6.3; nu7-V6 has no Ironwood, matching
         // librustzcash where the `ironwood_bundle()` accessor is gated nu6.3-only.
@@ -1237,10 +1237,10 @@ where
         async_checks
     }
 
-    /// Verifies a V5 transaction's Orchard shielded data.
+    /// Verifies a transaction's Orchard shielded data.
     ///
     /// `network_upgrade` is the network upgrade active at the verified transaction's block
-    /// height. It selects the V5 Orchard verifier by circuit era: the Orchard Action circuit (and
+    /// height. It selects the Orchard verifier by circuit era: the Orchard Action circuit (and
     /// its verifying key) changed at NU6.2 to fix the variable-base scalar-multiplication bug
     /// (GHSA-jfw5-j458-pfv6), and again at NU6.3 to add the `disableCrossAddress` constraint. So
     /// pre-NU6.2 V5 bundles verify against the historical key, NU6.2-until-NU6.3 bundles against
@@ -1250,7 +1250,7 @@ where
     /// verify under another era's key. [`primitives::halo2::verifier_for_orchard_circuit`] maps
     /// the upgrade to the verifier holding the matching key; the verifiers keep separate batches,
     /// so eras are never mixed.
-    fn verify_v5_orchard_bundle(
+    fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
         network_upgrade: NetworkUpgrade,
@@ -1270,7 +1270,7 @@ where
             // Actions in one transaction. So we queue it for verification
             // only once instead of queuing it up for every Action description.
             //
-            // Route the V5 bundle to the verifier for its circuit era: pre-NU6.2 bundles verify
+            // Route the bundle to the verifier for its circuit era: pre-NU6.2 bundles verify
             // only under the insecure key, NU6.2-until-NU6.3 bundles only under the fixed key, and
             // NU6.3-onward bundles only under the NU6.3 key (which enforces the Orchard
             // cross-address restriction even in v5 transactions).
@@ -1284,38 +1284,16 @@ where
         async_checks
     }
 
-    /// Verifies a V6 transaction's Orchard shielded data.
-    ///
-    /// V6 Orchard uses the NU6.3 flag format and proves with the Ironwood circuit, even though it
-    /// is still the Orchard value pool.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-    fn verify_v6_orchard_bundle(
-        bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
-        sighash: &SigHash,
-    ) -> AsyncChecks {
-        let mut async_checks = AsyncChecks::new();
-
-        if let Some(bundle) = bundle {
-            async_checks.push(
-                primitives::halo2::VERIFIER_NU6_3_ONWARD
-                    .clone()
-                    .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
-            );
-        }
-
-        async_checks
-    }
-
     /// Verifies a transaction's Ironwood shielded data.
     ///
     /// Ironwood uses the same V6 action proof system as Orchard, but its note commitment and
     /// nullifier state are tracked separately.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn verify_ironwood_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
     ) -> AsyncChecks {
-        Self::verify_v6_orchard_bundle(bundle, sighash)
+        Self::verify_orchard_bundle(bundle, sighash, NetworkUpgrade::Nu6_3)
     }
 }
 
