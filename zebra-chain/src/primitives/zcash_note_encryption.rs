@@ -63,7 +63,7 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
     if let Some(bundle) = tx.ironwood_bundle() {
         for act in bundle.actions() {
             let Some((coinbase_note, _, _)) = zcash_note_encryption::try_output_recovery_with_ovk(
-                &orchard::note_encryption::OrchardDomain::for_action(act),
+                &orchard::note_encryption::IronwoodDomain::for_action(act),
                 &null_orchard_ovk,
                 act,
                 act.cv_net(),
@@ -131,7 +131,7 @@ mod tests {
             .expect("NU5 is active on mainnet")
     }
 
-    fn orchard_shielded_data(protocol: orchard::BundleProtocol) -> ShieldedData {
+    fn orchard_shielded_data(protocol: orchard::bundle::BundlePoolRestrictions) -> ShieldedData {
         let value = Zatoshis::const_from_u64(10_000);
         let mut builder = orchard::builder::Builder::new(
             protocol,
@@ -199,7 +199,8 @@ mod tests {
 
     fn orchard_coinbase_transaction() -> (Transaction, Height) {
         let height = mainnet_nu5_height();
-        let orchard_shielded_data = orchard_shielded_data(orchard::BundleProtocol::OrchardPreNu6_3);
+        let orchard_shielded_data =
+            orchard_shielded_data(orchard::bundle::BundlePoolRestrictions::OrchardNu6_2Only);
 
         (
             Transaction::V5 {
@@ -278,7 +279,7 @@ mod tests {
     fn ironwood_coinbase_output_decrypts_with_v3_note() {
         let height = Height(11);
         let ironwood_shielded_data =
-            orchard_shielded_data(orchard::BundleProtocol::IronwoodPostNu6_3);
+            orchard_shielded_data(orchard::bundle::BundlePoolRestrictions::IronwoodNu6_3Onward);
         let activation_heights = ConfiguredActivationHeights {
             before_overwinter: Some(1),
             overwinter: Some(2),
