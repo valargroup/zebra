@@ -190,6 +190,58 @@ impl WorkQueue {
         taken
     }
 
+    /// Move up to `max_count` contiguous-ascending `pending` heights within
+    /// `low..=high` from `pending` to `in_flight`, also stopping before the
+    /// sum of stored size estimates would exceed `max_estimated_bytes`.
+    ///
+    /// The estimate cap is scheduler input hygiene only. Callers must still
+    /// reserve their existing worst-case bytes before sending the request. To
+    /// guarantee progress, the first eligible item is always taken when
+    /// `max_count > 0`, even if its estimate alone exceeds the cap.
+    pub(super) fn take_in_range_budgeted(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+    ) -> Vec<(block::Height, WorkItem)> {
+        if max_count == 0 || low > high {
+            return Vec::new();
+        }
+        let mut inner = self.lock();
+        let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
+        let mut estimated_bytes = 0u64;
+        let mut next_expected: Option<block::Height> = None;
+        for (height, item) in inner.pending.range(low..=high) {
+            if let Some(expected) = next_expected {
+                if *height != expected {
+                    break;
+                }
+            }
+
+            let next_estimated_bytes = estimated_bytes.saturating_add(item.estimated_bytes);
+            if !taken.is_empty() && next_estimated_bytes > max_estimated_bytes {
+                break;
+            }
+
+            taken.push((*height, *item));
+            estimated_bytes = next_estimated_bytes;
+            if taken.len() >= max_count {
+                break;
+            }
+            // Stop the run at the end of the height space rather than overflowing.
+            match height.0.checked_add(1) {
+                Some(raw) => next_expected = Some(block::Height(raw)),
+                None => break,
+            }
+        }
+        for (height, item) in &taken {
+            inner.pending.remove(height);
+            inner.in_flight.insert(*height, *item);
+        }
+        taken
+    }
+
     /// Move each given height `in_flight → pending`, preserving its stored
     /// [`WorkItem`]. Heights not currently `in_flight` are skipped (idempotent).
     /// Wakes waiters if anything moved.

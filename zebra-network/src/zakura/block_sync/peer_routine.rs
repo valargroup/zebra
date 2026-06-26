@@ -547,7 +547,7 @@ impl PeerRoutine {
             }
             // One contiguous chunk up to the peer's per-request count cap; the
             // outer loop fills the rest of the peer's slots.
-            let max_count = usize::try_from(
+            let local_peer_count_cap = usize::try_from(
                 self.max_blocks_per_response
                     .min(self.config.advertised_max_blocks_per_response())
                     .max(1),
@@ -555,39 +555,35 @@ impl PeerRoutine {
             .unwrap_or(usize::MAX);
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
-            // Compute this chunk's byte ceiling BEFORE taking any work, from the
-            // global byte budget and this peer's per-response cap. The reservation
-            // is worst-case per block (it only ever shrinks toward the actual size
-            // on receipt, so a valid body is never dropped for a full budget). If
-            // the ceiling cannot fund even one worst-case block, break and wait on
-            // the budget-capacity / work-added notifications instead of taking a
-            // chunk only to return it. Taking-then-returning would call
-            // `work.return_items` → `notify_waiters`, which re-wakes THIS routine's
-            // own enabled `work_added` notification (registered before the fill) and
-            // busy-loops the want-work arm (missed-wake's mirror image — a
-            // self-wake spin). Gating before the take keeps the routine parked on
-            // `capacity` until budget frees up.
-            let max_bytes = self
-                .budget
-                .available()
-                .min(u64::from(self.max_response_bytes.max(1)));
-            // Cap the chunk taken to what the byte ceiling can fund at worst case;
-            // break (without taking) when not even one block fits, so no take/return
-            // self-wake cycle can occur.
-            let byte_capped_count = max_bytes
+            // Compute this chunk's byte ceiling BEFORE taking any work. The
+            // count cap is still bounded by what the global budget can reserve at
+            // worst case, so advertised sizes never weaken the existing
+            // pre-send reservation. The estimate cap only decides how many of the
+            // already-affordable heights to pack into this one request.
+            let available_bytes = self.budget.available();
+            let max_count = available_bytes
                 .checked_div(worst)
-                .map(|count| usize::try_from(count).unwrap_or(usize::MAX).min(max_count))
-                .unwrap_or(max_count);
-            if byte_capped_count == 0 {
+                .map(|count| {
+                    usize::try_from(count)
+                        .unwrap_or(usize::MAX)
+                        .min(local_peer_count_cap)
+                })
+                .unwrap_or(local_peer_count_cap);
+            if max_count == 0 {
                 break;
             }
+            let max_estimated_bytes =
+                available_bytes.min(u64::from(self.max_response_bytes.max(1)));
 
             // Take work in this peer's servable range. `servable_high` is NOT
             // clamped to the floor: a peer fetches as far ahead of the committed
             // floor as its servable range and the byte budget allow.
-            let mut items = self
-                .work
-                .take_in_range(servable_low, servable_high, byte_capped_count);
+            let mut items = self.work.take_in_range_budgeted(
+                servable_low,
+                servable_high,
+                max_count,
+                max_estimated_bytes,
+            );
             if items.is_empty() {
                 break;
             }
@@ -619,8 +615,8 @@ impl PeerRoutine {
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
 
-            // `take_in_range` already honoured the byte-capped count, so every
-            // taken item fits under `max_bytes`; nothing is returned here.
+            // `take_in_range_budgeted` already honoured the byte-capped count;
+            // every taken item has worst-case reservation capacity.
             let kept_count = items.len();
 
             let reserved_bytes = worst.saturating_mul(kept_count as u64);
