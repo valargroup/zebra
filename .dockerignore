@@ -23,6 +23,8 @@
 !deploy/watchdog/**
 !tower-*
 !xtask
+!zakura-commit-bench
+!zakura-commit-bench/**
 !deploy
 !deploy/watchdog
 !deploy/watchdog/**
