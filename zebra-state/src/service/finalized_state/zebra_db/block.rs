@@ -985,6 +985,8 @@ impl ZebraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZebraDb = self;
+        #[cfg(feature = "commit-metrics")]
+        let _t_spent_reads = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
             Option<Vec<RawBytes>>,
@@ -1035,6 +1037,9 @@ impl ZebraDb {
                 }
             },
         );
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.spent_utxo_reads.duration_seconds")
+            .record(_t_spent_reads.elapsed().as_secs_f64());
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -1101,6 +1106,8 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
+        #[cfg(feature = "commit-metrics")]
+        let _t_addr_reads = std::time::Instant::now();
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
                 self.address_balance_location(addr)
@@ -1110,7 +1117,12 @@ impl ZebraDb {
                 Some(self.address_balance_location(addr)?.into_new_change())
             }))
         };
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.address_reads.duration_seconds")
+            .record(_t_addr_reads.elapsed().as_secs_f64());
 
+        #[cfg(feature = "commit-metrics")]
+        let _t_batch_prep = std::time::Instant::now();
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1131,6 +1143,9 @@ impl ZebraDb {
             vct_anchor_roots,
             vct_sync_below,
         )?;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.batch_prep.duration_seconds")
+            .record(_t_batch_prep.elapsed().as_secs_f64());
 
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
@@ -1140,6 +1155,9 @@ impl ZebraDb {
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
 
+        // Committed batch size (≈ on-disk bytes / block) for write-throughput (MB/s).
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.batch_bytes").record(batch.size_in_bytes() as f64);
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db

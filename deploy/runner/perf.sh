@@ -21,6 +21,7 @@
 # Helpers:
 #   perf.sh build-local      # rebuild the instrumented bench binary (BENCH_BIN)
 #   perf.sh verify-isolation [met]        # confirm the bench node sees only the cohort
+#   perf.sh logs [label]     # follow the bench node log (drift spam filtered; RAW=1 for all)
 set -euo pipefail
 
 RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -177,7 +178,25 @@ cmd_verify_isolation() {
   echo "Expectation: a small, stable peer count (the 2 serving nodes) and no growing rejects."
 }
 
-usage() { sed -n '3,28p' "${BASH_SOURCE[0]}"; }
+cmd_logs() {
+  local label="${1:-r1}"
+  # Mirror feed_run.sh's log path resolution: BENCH_LOG_DIR, else BENCH_WORK_DIR.
+  local dir="${BENCH_LOG_DIR:-${BENCH_WORK_DIR:-/root/wal-bench}}"
+  local log="$dir/feedrun-${label}.log"
+  [ -f "$log" ] || die "no log at $log (run 'perf.sh run $label' first)"
+  # The Zakura block-sync guard floods this file with 'byte-budget audit drift'
+  # WARNs at hundreds of lines/sec, drowning real progress. Filter them by
+  # default; RAW=1 shows everything. Initial backlog is filtered from a wide
+  # window so useful context survives the spam.
+  if [ -n "${RAW:-}" ]; then
+    note "tailing $log (RAW — all lines; Ctrl-C to stop)"
+    exec tail -n "${LINES:-40}" -f "$log"
+  fi
+  note "tailing $log (drift spam filtered; RAW=1 for all; Ctrl-C to stop)"
+  tail -n "${LINES:-800}" -f "$log" | grep --line-buffered -v "byte-budget audit drift"
+}
+
+usage() { sed -n '3,29p' "${BASH_SOURCE[0]}"; }
 
 case "${1:-}" in
   seed-serving)     shift; cmd_seed_serving "$@" ;;
@@ -189,6 +208,7 @@ case "${1:-}" in
   dashboard)        shift; cmd_dashboard "$@" ;;
   build-local)      shift; cmd_build_local "$@" ;;
   verify-isolation) shift; cmd_verify_isolation "$@" ;;
+  logs)             shift; cmd_logs "$@" ;;
   ""|-h|--help|help) usage ;;
   *) echo "unknown subcommand: $1" >&2; usage; exit 1 ;;
 esac

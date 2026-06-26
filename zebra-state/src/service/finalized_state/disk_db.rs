@@ -550,6 +550,16 @@ impl DiskWriteBatch {
             batch: rocksdb::WriteBatch::default(),
         }
     }
+
+    /// Returns the size of this batch's serialized write data, in bytes.
+    ///
+    /// Approximates the on-disk bytes committed for a block, for write-throughput
+    /// (MB/s) and per-block-size observability. Only built under `commit-metrics`,
+    /// where its sole caller lives, so a default build doesn't flag it dead.
+    #[cfg(feature = "commit-metrics")]
+    pub(crate) fn size_in_bytes(&self) -> usize {
+        self.batch.size_in_bytes()
+    }
 }
 
 impl DiskDb {
