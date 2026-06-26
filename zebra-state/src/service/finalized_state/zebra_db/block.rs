@@ -21,6 +21,7 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
+    history_tree::HistoryTree,
     orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
@@ -44,7 +45,7 @@ use crate::{
         disk_format::{
             block::TransactionLocation,
             shielded::CommitmentRootsByHeight,
-            transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
@@ -933,8 +934,15 @@ impl ZebraDb {
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
-    pub(in super::super) fn write_block(
+    /// Prepare a single block's writes into the given `batch`, WITHOUT writing it
+    /// to RocksDB. Shared by the single-block [`Self::write_block`] and the batched
+    /// [`Self::write_block_batch`] (which folds N blocks into one batch + one write,
+    /// collapsing the per-block commit roundtrip). `source` is accepted for signature
+    /// parity with `write_block`; the "committed" trace is emitted by the writer.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn prepare_block_into(
         &mut self,
+        batch: &mut DiskWriteBatch,
         finalized: FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         network: &Network,
@@ -945,7 +953,14 @@ impl ZebraDb {
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         // When `Some(height)`, mark the database as vct-synced.
         vct_sync_below: Option<Height>,
+        // Read-your-writes overlay for batched commits. `Some` only when this
+        // block shares a `DiskWriteBatch` with earlier blocks that aren't written
+        // yet: the value-pool / spent-UTXO / address-balance reads below consult
+        // it instead of the stale db, and the block's post-state is folded back
+        // in for the next block. `None` for single-block commits (db is current).
+        mut overlay: Option<&mut BatchCommitOverlay>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        let _ = source;
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -985,6 +1000,9 @@ impl ZebraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZebraDb = self;
+        // Outputs created by earlier blocks in this batch (batched commit only);
+        // a spend of one of them resolves here instead of the stale db.
+        let batch_new_outputs = overlay.as_deref().map(|o| &o.new_outputs);
         #[cfg(feature = "commit-metrics")]
         let _t_spent_reads = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
@@ -1003,6 +1021,7 @@ impl ZebraDb {
                                 outpoint,
                                 &tx_hash_indexes,
                                 &finalized.new_outputs,
+                                batch_new_outputs,
                             )
                         })
                         .collect()
@@ -1016,6 +1035,7 @@ impl ZebraDb {
                                 outpoint,
                                 &tx_hash_indexes,
                                 &finalized.new_outputs,
+                                batch_new_outputs,
                             )
                         })
                         .collect()
@@ -1106,13 +1126,21 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
+        // Running absolute balances from earlier blocks in this batch (Insert
+        // mode only); they override the stale db read for a touched address.
+        let overlay_balances = overlay.as_deref().map(|o| &o.address_balances);
         #[cfg(feature = "commit-metrics")]
         let _t_addr_reads = std::time::Instant::now();
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
+                overlay_balances
+                    .and_then(|balances| balances.get(addr).copied())
+                    .or_else(|| self.address_balance_location(addr))
             }))
         } else {
+            // Merge mode (format upgrades in progress) writes per-block deltas
+            // that RocksDB composes, so it needs no overlay; the overlay is not
+            // populated in this mode (see `prepare_transparent_transaction_batch`).
             AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
                 Some(self.address_balance_location(addr)?.into_new_change())
             }))
@@ -1121,12 +1149,23 @@ impl ZebraDb {
         metrics::histogram!("zebra.state.write.address_reads.duration_seconds")
             .record(_t_addr_reads.elapsed().as_secs_f64());
 
+        // In batch mode, read the running value pool from the overlay (the db
+        // pool is stale until the batch is written); otherwise read the db.
+        let value_pool = overlay
+            .as_deref()
+            .and_then(|o| o.value_pool)
+            .unwrap_or_else(|| self.finalized_value_pool());
+
+        // Capture the spent outpoints before the maps are moved into the batch,
+        // so the overlay can drop them once this block has spent them.
+        let spent_outpoints: Vec<transparent::OutPoint> =
+            spent_utxos_by_outpoint.keys().copied().collect();
+
         #[cfg(feature = "commit-metrics")]
         let _t_batch_prep = std::time::Instant::now();
-        let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
-        batch.prepare_block_batch(
+        let post_state = batch.prepare_block_batch(
             self,
             network,
             &finalized,
@@ -1136,7 +1175,7 @@ impl ZebraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
-            self.finalized_value_pool(),
+            value_pool,
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
@@ -1147,14 +1186,56 @@ impl ZebraDb {
         metrics::histogram!("zebra.state.write.batch_prep.duration_seconds")
             .record(_t_batch_prep.elapsed().as_secs_f64());
 
+        // Fold this block's post-state into the overlay so the next block in the
+        // batch reads its (not-yet-written) value pool, new outputs, and address
+        // balances. No-op for single-block commits (`overlay` is `None`).
+        if let Some(overlay) = overlay.as_deref_mut() {
+            let block_new_outputs =
+                finalized.new_outputs.iter().map(|(outpoint, ordered_utxo)| {
+                    let out_loc = lookup_out_loc(finalized.height, outpoint, &tx_hash_indexes);
+                    (*outpoint, (out_loc, ordered_utxo.clone()))
+                });
+            overlay.apply_block(block_new_outputs, spent_outpoints, &post_state);
+        }
+
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
         // goes in the same atomic batch as the tip advance, so pruning and the
         // tip advance are always consistent, and it reuses the single-writer
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
-        retention.prepare_prune(&mut batch, self, &finalized);
+        retention.prepare_prune(batch, self, &finalized);
 
+        Ok(finalized.hash)
+    }
+
+    /// Single-block commit: prepare one block into a fresh batch and write it.
+    /// Behaviour-identical to the pre-batch path — this is the K=1 case of the
+    /// batched commit, kept so existing single-block callers are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn write_block(
+        &mut self,
+        finalized: FinalizedBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        network: &Network,
+        source: &str,
+        retention: RetentionPlan,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
+    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        let mut batch = DiskWriteBatch::new();
+        let hash = self.prepare_block_into(
+            &mut batch,
+            finalized,
+            prev_note_commitment_trees,
+            network,
+            source,
+            retention,
+            vct_anchor_roots,
+            vct_sync_below,
+            // Single-block commit: db is current, so no read-your-writes overlay.
+            None,
+        )?;
         // Committed batch size (≈ on-disk bytes / block) for write-throughput (MB/s).
         #[cfg(feature = "commit-metrics")]
         metrics::histogram!("zebra.state.write.batch_bytes").record(batch.size_in_bytes() as f64);
@@ -1168,7 +1249,7 @@ impl ZebraDb {
 
         tracing::trace!(?source, "committed block from");
 
-        Ok(finalized.hash)
+        Ok(hash)
     }
 
     /// Writes the given batch to the database.
@@ -1221,17 +1302,35 @@ fn read_spent_utxo(
     outpoint: transparent::OutPoint,
     tx_hash_indexes: &HashMap<transaction::Hash, usize>,
     new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    // Outputs created by earlier blocks in the same (not-yet-written) batch.
+    // `Some` only on the batched-commit path; their writes aren't visible to db
+    // reads yet, so an intra-batch spend resolves here. See [`BatchCommitOverlay`].
+    batch_new_outputs: Option<
+        &HashMap<transparent::OutPoint, (OutputLocation, transparent::OrderedUtxo)>,
+    >,
 ) -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
-    let db_out_loc = db.output_location(&outpoint);
-    let out_loc = db_out_loc.unwrap_or_else(|| lookup_out_loc(height, &outpoint, tx_hash_indexes));
-    let utxo = db_out_loc
-        .and_then(|loc| db.utxo_by_location(loc))
-        .map(|ordered_utxo| ordered_utxo.utxo)
-        .or_else(|| {
-            new_outputs
-                .get(&outpoint)
-                .map(|ordered_utxo| ordered_utxo.utxo.clone())
-        })
+    // The db is authoritative for any output already committed to it.
+    if let Some(loc) = db.output_location(&outpoint) {
+        let utxo = db
+            .utxo_by_location(loc)
+            .map(|ordered_utxo| ordered_utxo.utxo)
+            .expect("already checked UTXO was in state");
+        return (outpoint, loc, utxo);
+    }
+
+    // Not in the db: it may have been created by an earlier block in this same
+    // batch (whose writes aren't flushed yet). That block's transaction is not in
+    // this block's `tx_hash_indexes`, so the overlay carries the canonical
+    // out-loc; check it before falling back to a same-block lookup.
+    if let Some((loc, ordered_utxo)) = batch_new_outputs.and_then(|outputs| outputs.get(&outpoint)) {
+        return (outpoint, *loc, ordered_utxo.utxo.clone());
+    }
+
+    // Otherwise the output is created by this very block.
+    let out_loc = lookup_out_loc(height, &outpoint, tx_hash_indexes);
+    let utxo = new_outputs
+        .get(&outpoint)
+        .map(|ordered_utxo| ordered_utxo.utxo.clone())
         .expect("already checked UTXO was in state or block");
 
     (outpoint, out_loc, utxo)
@@ -1466,6 +1565,97 @@ fn inferred_header_range_roots(
         .collect()
 }
 
+/// The post-block state a single block's batch-prepare produces, threaded into
+/// the next block of the same batched commit so it reads earlier blocks' (not
+/// yet written) writes. See [`BatchCommitOverlay`].
+pub struct BlockBatchPostState {
+    /// The chain value pool after this block.
+    pub value_pool: ValueBalance<NonNegative>,
+    /// The post-block absolute address balances (Insert mode only); `None` for
+    /// genesis or Merge mode, which need no read-your-writes overlay.
+    pub address_balances: Option<HashMap<transparent::Address, AddressBalanceLocation>>,
+}
+
+/// Read-your-writes overlay threaded across the blocks of one batched commit
+/// ([`FinalizedState::commit_finalized_batch`]).
+///
+/// All blocks in a batch share a single [`DiskWriteBatch`] that is written once
+/// at the end, so earlier blocks' writes are NOT visible to RocksDB reads while
+/// a later block in the same batch is being prepared. The three read-modify-write
+/// paths must therefore see those pending writes through this overlay instead of
+/// the stale db:
+///
+/// - the chain **value pool** (every block reads the current pool and adds its
+///   delta),
+/// - the transparent **UTXO set** (a block may spend an output an earlier block
+///   in the same batch created), and
+/// - per-address **balances** (Insert mode reads the current absolute balance).
+///
+/// At `K=1` (single-block commit) no overlay is used, so that path is unchanged.
+#[derive(Default)]
+pub struct BatchCommitOverlay {
+    /// Outputs created by earlier blocks in this batch and not yet spent within
+    /// it, keyed by outpoint, with the canonical [`OutputLocation`] of the
+    /// creating transaction. Lets a later block resolve a spend of one of them.
+    new_outputs: HashMap<transparent::OutPoint, (OutputLocation, transparent::OrderedUtxo)>,
+    /// Running absolute address balances for addresses touched so far in the
+    /// batch, overriding the stale db value (Insert mode only).
+    address_balances: HashMap<transparent::Address, AddressBalanceLocation>,
+    /// Running chain value pool after the most recently applied block, or `None`
+    /// before the first block (read the db pool then).
+    value_pool: Option<ValueBalance<NonNegative>>,
+    /// Running ZIP-221 history tree (MMR) after the most recently applied block.
+    /// The MMR appends one block per height and asserts contiguity, so a later
+    /// batch block must extend the prior block's tree, not the stale db tree.
+    /// `None` before the first block (read the db tree then).
+    history_tree: Option<Arc<HistoryTree>>,
+}
+
+impl BatchCommitOverlay {
+    /// The running history tree threaded from the previous batch block, if any.
+    /// Computed in `commit_finalized_direct`, which lives in the parent module,
+    /// so this is exposed as a method over the private field.
+    pub fn history_tree(&self) -> Option<Arc<HistoryTree>> {
+        self.history_tree.clone()
+    }
+
+    /// Record this block's new history tree so the next batch block extends it.
+    pub fn set_history_tree(&mut self, history_tree: Arc<HistoryTree>) {
+        self.history_tree = Some(history_tree);
+    }
+
+    /// Fold one block's post-state into the overlay so the next block sees it.
+    ///
+    /// `new_outputs` are this block's created outputs (with their out-locs);
+    /// `spent` are the outpoints it spent (removed from the overlay so a stale
+    /// entry can't be re-spent). `post` carries the new value pool and, when
+    /// present, the post-block absolute address balances.
+    fn apply_block(
+        &mut self,
+        new_outputs: impl IntoIterator<
+            Item = (
+                transparent::OutPoint,
+                (OutputLocation, transparent::OrderedUtxo),
+            ),
+        >,
+        spent: impl IntoIterator<Item = transparent::OutPoint>,
+        post: &BlockBatchPostState,
+    ) {
+        for outpoint in spent {
+            self.new_outputs.remove(&outpoint);
+        }
+        self.new_outputs.extend(new_outputs);
+
+        if let Some(balances) = &post.address_balances {
+            for (address, balance) in balances {
+                self.address_balances.insert(address.clone(), *balance);
+            }
+        }
+
+        self.value_pool = Some(post.value_pool);
+    }
+}
+
 impl DiskWriteBatch {
     // Write block methods
 
@@ -1499,7 +1689,7 @@ impl DiskWriteBatch {
         precomputed_raw_txs: Option<Vec<RawBytes>>,
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         vct_sync_below: Option<Height>,
-    ) -> Result<(), CommitCheckpointVerifiedError> {
+    ) -> Result<BlockBatchPostState, CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zebra_db,
@@ -1538,7 +1728,7 @@ impl DiskWriteBatch {
         // So we ignore the genesis UTXO, transparent address index, and value pool updates
         // for the genesis block. This also ignores genesis shielded value pool updates, but there
         // aren't any of those on mainnet or testnet.
-        if !finalized.height.is_min() {
+        let post_block_balances = if !finalized.height.is_min() {
             // Commit transaction indexes
             self.prepare_transparent_transaction_batch(
                 zebra_db,
@@ -1550,11 +1740,13 @@ impl DiskWriteBatch {
                 #[cfg(feature = "indexer")]
                 &out_loc_by_outpoint,
                 address_balances,
-            );
-        }
+            )
+        } else {
+            None
+        };
 
         // Commit UTXOs and value pools
-        self.prepare_chain_value_pools_batch(
+        let new_value_pool = self.prepare_chain_value_pools_batch(
             zebra_db,
             finalized,
             spent_utxos_by_outpoint,
@@ -1564,7 +1756,10 @@ impl DiskWriteBatch {
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
 
-        Ok(())
+        Ok(BlockBatchPostState {
+            value_pool: new_value_pool,
+            address_balances: post_block_balances,
+        })
     }
 
     /// Adds deletes for pruned raw transaction data to this batch, for the

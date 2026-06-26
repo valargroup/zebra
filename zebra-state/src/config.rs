@@ -165,6 +165,14 @@ pub struct Config {
     /// Set to `None` by default: Zebra continues syncing indefinitely.
     pub debug_stop_at_height: Option<u32>,
 
+    /// Maximum number of contiguous checkpoint-verified blocks committed in one
+    /// batched `DiskWriteBatch` (one RocksDB write for the whole run), amortizing the
+    /// per-block commit roundtrip. `1` (the default) keeps the per-block path,
+    /// byte-identical to before. `>1` enables batched body commit.
+    ///
+    /// EXPERIMENT (not for merge without the equivalence + partial-failure tests).
+    pub batch_commit_max: usize,
+
     /// While Zebra is running, check state validity this often.
     ///
     /// Set to `None` by default: Zebra only checks state format validity on startup and shutdown.
@@ -433,6 +441,7 @@ impl Default for Config {
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
+            batch_commit_max: 1,
             debug_validity_check_interval: None,
             debug_skip_non_finalized_state_backup_task: false,
             #[cfg(feature = "elasticsearch")]

@@ -30,7 +30,7 @@ use zebra_chain::{
     sapling,
 };
 use zebra_db::{
-    block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
+    block::{BatchCommitOverlay, RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
     chain::BLOCK_INFO,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
@@ -731,6 +731,8 @@ impl FinalizedState {
             note_precompute,
             next_checkpoint,
             "commit checkpoint-verified request",
+            None,
+            None,
         );
 
         if result.is_ok() {
@@ -785,6 +787,15 @@ impl FinalizedState {
         // this height's roots, or outside the checkpoint commit path.
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
         source: &str,
+        // When `Some`, prepare this block's writes into the caller's shared batch and
+        // skip the immediate write + post-write side-effects (the batched-commit path).
+        // The caller (`commit_finalized_batch`) owns the single `write_batch` and runs
+        // the deferred per-block side-effects after it. `None` = today's single-block write.
+        into_batch: Option<&mut DiskWriteBatch>,
+        // The read-your-writes overlay shared across the batch, threaded alongside
+        // `into_batch` (both `Some` together). Lets this block read earlier batch
+        // blocks' not-yet-written value pool / UTXOs / address balances / history tree.
+        mut overlay: Option<&mut BatchCommitOverlay>,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (
             height,
@@ -809,11 +820,26 @@ impl FinalizedState {
                 // so the commitment check below doesn't recompute it here on the
                 // single-threaded committer. `AuthDataRoot` is `Copy`.
                 let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
-                let mut history_tree = self.db.history_tree();
+                // PROBE 2: per-block tree setup on the serial writer — the history-tree
+                // DB read (unconditional every block) + note-commitment-tree clones.
+                // Prime suspect for the ~15ms gap between write_block (~1.4ms) and the
+                // writer's ~16ms effective service time.
+                #[cfg(feature = "commit-metrics")]
+                let _tree_read_start = std::time::Instant::now();
+                // In batch mode, extend the previous batch block's history tree
+                // (threaded via the overlay); the db tree is stale until the batch
+                // is written, and the ZIP-221 MMR append asserts height contiguity.
+                let mut history_tree = overlay
+                    .as_deref()
+                    .and_then(|o| o.history_tree())
+                    .unwrap_or_else(|| self.db.history_tree());
                 let prev_note_commitment_trees = prev_note_commitment_trees
                     .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
                 let mut note_commitment_trees = prev_note_commitment_trees.clone();
+                #[cfg(feature = "commit-metrics")]
+                metrics::histogram!("zebra.state.commit.tree_read.duration_seconds")
+                    .record(_tree_read_start.elapsed().as_secs_f64());
                 let network = self.network();
                 let height = checkpoint_verified.height;
 
@@ -908,21 +934,36 @@ impl FinalizedState {
                             (height + 1).expect("checkpoint block heights are valid"),
                             next_block.hash(),
                         ));
-                    } else if self
-                        .vct
-                        .as_ref()
-                        .is_some_and(|v| v.vct_root_needs_successor(height, &network))
+                    } else if into_batch.is_none()
+                        && self
+                            .vct
+                            .as_ref()
+                            .is_some_and(|v| v.vct_root_needs_successor(height, &network))
                     {
-                        // Untrusted root at/above Heartwood, no successor to confirm it,
-                        // not the last checkpoint: defer rather than persist it unverified. Leaves
-                        // the database untouched; the block re-commits once the successor
-                        // is buffered.
+                        // Per-block commit: an untrusted root at/above Heartwood with no
+                        // successor to confirm it, not the last checkpoint: defer rather than
+                        // persist it unverified. Leaves the database untouched; the block
+                        // re-commits once the successor is buffered.
                         metrics::counter!("state.vct.root.await_successor.count").increment(1);
                         return Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
                             height,
                         }
                         .into());
                     } else {
+                        // Batched commit (or no confirmation needed): commit now. A batch's
+                        // last block has no in-run successor, so when its untrusted root needs
+                        // one the roots are folded in here and the NEXT batch's head block
+                        // re-checks them one block later (≤1-block arrears). This is sound
+                        // below the checkpoint, where transactions are checkpoint-trusted, so a
+                        // transient bad anchor admits no invalid transaction; a bad root is
+                        // caught at the successor and surfaces through the normal reset path.
+                        if self
+                            .vct
+                            .as_ref()
+                            .is_some_and(|v| v.vct_root_needs_successor(height, &network))
+                        {
+                            metrics::counter!("state.vct.root.arrears_commit.count").increment(1);
+                        }
                         self.vct_prevalidated_next = None;
                     }
 
@@ -1072,6 +1113,12 @@ impl FinalizedState {
                         .record(_ckpt_compute.elapsed().as_secs_f64());
                 }
 
+                // Thread this block's new history tree to the next batch block.
+                // No-op for single-block commits (`overlay` is `None`).
+                if let Some(overlay) = overlay.as_deref_mut() {
+                    overlay.set_history_tree(history_tree.clone());
+                }
+
                 let treestate = Treestate {
                     note_commitment_trees,
                     history_tree,
@@ -1110,28 +1157,32 @@ impl FinalizedState {
         let committed_tip_hash = self.db.finalized_tip_hash();
         let committed_tip_height = self.db.finalized_tip_height();
 
-        // Assert that callers (including unit tests) get the chain order correct
-        if self.db.is_empty() {
-            assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
-                "the first block added to an empty state must be a genesis block, source: {source}",
-            );
-            assert_eq!(
-                block::Height(0),
-                height,
-                "cannot commit genesis: invalid height, source: {source}",
-            );
-        } else {
-            assert_eq!(
-                committed_tip_height.expect("state must have a genesis block committed") + 1,
-                Some(height),
-                "committed block height must be 1 more than the finalized tip height, source: {source}",
-            );
+        // Assert that callers (including unit tests) get the chain order correct.
+        // Skipped in batch mode: the db tip is stale until the batch is written, and the
+        // batch caller guarantees a contiguous, height-ordered run.
+        if into_batch.is_none() {
+            if self.db.is_empty() {
+                assert_eq!(
+                    committed_tip_hash, finalized.block.header.previous_block_hash,
+                    "the first block added to an empty state must be a genesis block, source: {source}",
+                );
+                assert_eq!(
+                    block::Height(0),
+                    height,
+                    "cannot commit genesis: invalid height, source: {source}",
+                );
+            } else {
+                assert_eq!(
+                    committed_tip_height.expect("state must have a genesis block committed") + 1,
+                    Some(height),
+                    "committed block height must be 1 more than the finalized tip height, source: {source}",
+                );
 
-            assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
-                "committed block must be a child of the finalized tip, source: {source}",
-            );
+                assert_eq!(
+                    committed_tip_hash, finalized.block.header.previous_block_hash,
+                    "committed block must be a child of the finalized tip, source: {source}",
+                );
+            }
         }
 
         #[cfg(feature = "elasticsearch")]
@@ -1150,17 +1201,36 @@ impl FinalizedState {
         // `write_block` here removes the per-block round-trip; its internal rayon uses
         // the global pool instead. Measured net win on the sandblast region (see PR).
         let network = self.network();
-        let result = self.db.write_block(
-            finalized,
-            prev_note_commitment_trees,
-            &network,
-            source,
-            retention,
-            fast_anchor_roots,
-            fast_sync_below,
-        );
+        // Batch mode prepares into the caller's shared batch (one write for the whole
+        // run); single mode writes immediately. Either way the per-block verification
+        // above has already run, so this only changes WHEN bytes hit disk.
+        let is_batch_mode = into_batch.is_some();
+        let result = match into_batch {
+            Some(batch) => self.db.prepare_block_into(
+                batch,
+                finalized,
+                prev_note_commitment_trees,
+                &network,
+                source,
+                retention,
+                fast_anchor_roots,
+                fast_sync_below,
+                overlay,
+            ),
+            None => self.db.write_block(
+                finalized,
+                prev_note_commitment_trees,
+                &network,
+                source,
+                retention,
+                fast_anchor_roots,
+                fast_sync_below,
+            ),
+        };
 
-        if result.is_ok() {
+        // Post-write side-effects run only for the immediate-write path. In batch mode
+        // the caller runs them (per committed block) after its single `write_batch`.
+        if !is_batch_mode && result.is_ok() {
             if let Some(vct) = &self.vct {
                 vct.evict_committed_roots_through(height);
             }
@@ -1199,6 +1269,104 @@ impl FinalizedState {
         }
 
         result.map(|hash| (hash, note_commitment_trees))
+    }
+
+    /// Batched checkpoint commit — the `commit_header_range` shape, for bodies.
+    ///
+    /// Folds a contiguous, height-ordered `run` of checkpoint-verified blocks into the
+    /// history MMR in memory, runs each block's per-block verification (commitment +
+    /// VCT root authentication, using the in-run successor for the one-block lag), and
+    /// prepares all of them into ONE [`DiskWriteBatch`] committed with a single
+    /// `write_batch`. This deletes the per-block commit roundtrip (~44 ms measured).
+    ///
+    /// Returns the per-block `(hash, trees)` in order on full success, or
+    /// `Err((index, error))` if block `index` fails verification — the valid prefix
+    /// `[0..index)` is committed and `index` is rejected (the write worker resets from
+    /// there). A batch only ever contains already-verified blocks.
+    ///
+    /// NOTE: archive-backlog-clear and the elasticsearch hook (only relevant in archive
+    /// mode / with the `elasticsearch` feature) are not yet wired into the batch path.
+    #[allow(clippy::type_complexity)]
+    pub fn commit_finalized_batch(
+        &mut self,
+        run: Vec<CheckpointVerifiedBlock>,
+        mut prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        source: &str,
+    ) -> Result<Vec<(block::Hash, NoteCommitmentTrees)>, (usize, CommitCheckpointVerifiedError)>
+    {
+        let mut batch = DiskWriteBatch::new();
+        // Read-your-writes overlay shared across the run: each block folds its
+        // (not-yet-written) value pool / new outputs / address balances in, so
+        // the next block reads them instead of the stale db.
+        let mut overlay = BatchCommitOverlay::default();
+        let mut results: Vec<(block::Hash, NoteCommitmentTrees)> = Vec::with_capacity(run.len());
+
+        for i in 0..run.len() {
+            // One-block-lag witness: the next block IN THE RUN. The last block has no
+            // in-run successor and commits in arrears (confirmed by the next batch's head).
+            let next_checkpoint = run
+                .get(i + 1)
+                .map(|next| (next.block.clone(), next.auth_data_root));
+            let finalizable = FinalizableBlock::Checkpoint {
+                checkpoint_verified: run[i].clone(),
+            };
+            match self.commit_finalized_direct(
+                finalizable,
+                prev_note_commitment_trees.take(),
+                None,
+                next_checkpoint,
+                source,
+                Some(&mut batch),
+                Some(&mut overlay),
+            ) {
+                Ok((hash, trees)) => {
+                    prev_note_commitment_trees = Some(trees.clone());
+                    results.push((hash, trees));
+                }
+                Err(error) => {
+                    // Atomic batch: drop it UNWRITTEN on any failure, so the whole run
+                    // stays uncommitted (prepare-into-batch mutated only the batch, never
+                    // self or the DB). The caller falls back to the per-block path, which
+                    // re-commits the verified prefix `[0..i)` and runs the normal reset for
+                    // block `i`. A committed batch therefore only ever holds verified blocks.
+                    return Err((i, error));
+                }
+            }
+        }
+
+        // One write for the whole verified run.
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.commit.batch_size").record(run.len() as f64);
+        let batch_start = std::time::Instant::now();
+        self.db
+            .write_batch(batch)
+            .expect("unexpected rocksdb error while writing block batch");
+        metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
+            .record(batch_start.elapsed().as_secs_f64());
+
+        self.post_commit_batch(&run);
+        Ok(results)
+    }
+
+    /// Deferred per-block side-effects after a batched write — the bits
+    /// `commit_finalized_direct` skips in batch mode: evict committed VCT roots and
+    /// honor the debug stop height.
+    fn post_commit_batch(&mut self, committed: &[CheckpointVerifiedBlock]) {
+        for cv in committed {
+            let height = cv.height;
+            if let Some(vct) = &self.vct {
+                vct.evict_committed_roots_through(height);
+            }
+            if self.is_at_stop_height(height) {
+                tracing::info!(
+                    ?height,
+                    "stopping at configured height (batched commit), flushing database to disk"
+                );
+                self.vct_log_equivalence_digest();
+                self.db.shutdown(true);
+                Self::exit_process();
+            }
+        }
     }
 
     /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will

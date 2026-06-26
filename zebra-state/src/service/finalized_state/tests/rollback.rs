@@ -85,6 +85,8 @@ fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlo
                 None,
                 None,
                 "rollback test",
+                None,
+                None,
             )
             .expect("committing a generated block to a fresh state succeeds");
     }
@@ -252,6 +254,87 @@ fn count_reversible_features(blocks: &[SemanticallyVerifiedBlock]) -> (usize, us
     }
 
     (transparent_spends, shielded_nullifiers)
+}
+
+/// DERISK the batched body commit (`commit_finalized_batch`): committing the same chain
+/// block-by-block (`commit_finalized_direct`, the K=1 path) and as a single batch must
+/// produce byte-identical finalized state — same tip, value pool, and all four
+/// commitment-tree roots + the history root. A failure means the batch path drifts from
+/// the per-block path (e.g. an intra-batch read-your-writes hazard).
+#[test]
+fn batched_commit_matches_per_block_commit() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    proptest!(
+        ProptestConfig::with_cases(proptest_cases()),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().no_shrink())| {
+            let blocks: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            prop_assume!(blocks.len() > 2);
+
+            // State A: commit every block on its own (the per-block path, K=1).
+            let dir_a = TempDir::new().expect("temp dir");
+            let mut state_a = FinalizedState::new(
+                &config_at(dir_a.path()),
+                &network,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            );
+            let mut prev = None;
+            for block in &blocks {
+                let cv = CheckpointVerifiedBlock::from(block.block.clone());
+                let (_hash, trees) = state_a
+                    .commit_finalized_direct(cv.into(), prev.take(), None, None, "per-block", None, None)
+                    .expect("per-block commit of a generated block succeeds");
+                prev = Some(trees);
+            }
+
+            // State B: commit the whole chain as one DiskWriteBatch.
+            let dir_b = TempDir::new().expect("temp dir");
+            let mut state_b = FinalizedState::new(
+                &config_at(dir_b.path()),
+                &network,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            );
+            let run: Vec<CheckpointVerifiedBlock> = blocks
+                .iter()
+                .map(|block| CheckpointVerifiedBlock::from(block.block.clone()))
+                .collect();
+            let batch_result = state_b.commit_finalized_batch(run, None, "batched");
+            prop_assert!(
+                batch_result.is_ok(),
+                "batched commit failed: {:?}",
+                batch_result.err().map(|(i, e)| (i, format!("{e:?}")))
+            );
+
+            // The two finalized states must agree on every aggregate fold.
+            let (a, b) = (&state_a.db, &state_b.db);
+            prop_assert_eq!(a.tip(), b.tip(), "tip");
+            prop_assert_eq!(
+                a.finalized_value_pool(),
+                b.finalized_value_pool(),
+                "value pool"
+            );
+            prop_assert_eq!(
+                a.sprout_tree_for_tip().root(),
+                b.sprout_tree_for_tip().root(),
+                "sprout root"
+            );
+            prop_assert_eq!(
+                a.sapling_tree_for_tip().root(),
+                b.sapling_tree_for_tip().root(),
+                "sapling root"
+            );
+            prop_assert_eq!(
+                a.orchard_tree_for_tip().root(),
+                b.orchard_tree_for_tip().root(),
+                "orchard root"
+            );
+            prop_assert_eq!(a.history_tree().hash(), b.history_tree().hash(), "history root");
+        }
+    );
+
+    Ok(())
 }
 
 #[test]

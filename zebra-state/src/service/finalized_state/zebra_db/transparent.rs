@@ -430,7 +430,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
-    ) {
+    ) -> Option<HashMap<transparent::Address, AddressBalanceLocation>> {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
 
@@ -478,7 +478,19 @@ impl DiskWriteBatch {
             );
         }
 
+        // Capture the post-block absolute balances (Insert mode only) so a
+        // batched commit can thread them into the next block's overlay. The
+        // changes have already been folded in by the calls above, so this map
+        // is the new db state. Merge mode (format upgrades) writes deltas that
+        // RocksDB composes, so it needs no overlay and returns `None`.
+        let post_block_balances = match &address_balances {
+            AddressBalanceLocationUpdates::Insert(balances) => Some(balances.clone()),
+            AddressBalanceLocationUpdates::Merge(_) => None,
+        };
+
         self.prepare_transparent_balances_batch(db, address_balances);
+
+        post_block_balances
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,

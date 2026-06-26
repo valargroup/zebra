@@ -34,7 +34,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    CheckpointVerifiedBlock, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -389,6 +389,11 @@ impl WriteBlockWorkerTask {
         let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
         let mut retry_finalized_block: Option<QueuedCheckpointVerified> = None;
 
+        // EXPERIMENT: batched body commit. When >1, drain a contiguous run and commit it
+        // in one DiskWriteBatch (one RocksDB write), amortizing the per-block commit
+        // roundtrip. 1 = the per-block path, byte-identical to before.
+        let batch_commit_max = finalized_state.db.config().batch_commit_max.max(1);
+
         // Tracks how long the committer has been stuck retrying a single VCT root stall, so a
         // genuine stall (no peer can serve a frozen-frontier height) escalates to a loud,
         // observable signal while a transient wait stays quiet. `(height, first-seen)`.
@@ -397,6 +402,12 @@ impl WriteBlockWorkerTask {
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
+        // PROBE 3: writer-starvation clock. Reset right after each commit, read right
+        // before the next, so its histogram is the idle gap between commits (the
+        // "bus-wait"). With ~1.8ms commit work, a large idle gap = the writer is
+        // starved, not saturated; `writer_park` counts the 10ms empty-channel polls.
+        #[cfg(feature = "commit-metrics")]
+        let mut _writer_idle_start = std::time::Instant::now();
         loop {
             match non_finalized_block_write_receiver.try_recv() {
                 Ok(NonFinalizedWriteMessage::CommitHeaderRange {
@@ -421,7 +432,7 @@ impl WriteBlockWorkerTask {
                 Err(TryRecvError::Disconnected) => {}
             }
 
-            let ordered_block = match retry_finalized_block
+            let mut ordered_block = match retry_finalized_block
                 .take()
                 .or_else(|| finalized_lookahead.pop_front())
             {
@@ -429,6 +440,11 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
+                        // PROBE 3: writer starved — no block ready, polling the empty
+                        // finalized channel at a 10ms granularity (a coarse wakeup that
+                        // can itself add up to 10ms latency per gap).
+                        #[cfg(feature = "commit-metrics")]
+                        metrics::counter!("zebra.state.write.writer_park").increment(1);
                         std::thread::park_timeout(Duration::from_millis(10));
                         continue;
                     }
@@ -476,6 +492,95 @@ impl WriteBlockWorkerTask {
                 continue;
             }
 
+            // ===== BATCH FAST-PATH (experiment: batch_commit_max > 1) =====
+            // Commit a contiguous run of checkpoint-verified blocks in ONE DiskWriteBatch
+            // (one RocksDB write) to amortize the per-block commit roundtrip. The batch is
+            // atomic: on any failure NOTHING is committed, so we re-queue the successors and
+            // fall through to the per-block path for the first block (which owns the
+            // reset/retry logic). `ordered_block` is at `next_valid_height` here.
+            if batch_commit_max > 1 {
+                let mut run: Vec<QueuedCheckpointVerified> = Vec::with_capacity(batch_commit_max);
+                let mut next_height =
+                    (ordered_block.0.height + 1).expect("committed heights are valid");
+                run.push(ordered_block);
+                while run.len() < batch_commit_max {
+                    let candidate = finalized_lookahead
+                        .pop_front()
+                        .or_else(|| finalized_block_write_receiver.try_recv().ok());
+                    match candidate {
+                        Some(next) if next.0.height == next_height => {
+                            next_height =
+                                (next_height + 1).expect("committed heights are valid");
+                            run.push(next);
+                        }
+                        // Non-contiguous: put it back and stop the run there.
+                        Some(other) => {
+                            finalized_lookahead.push_front(other);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+
+                let blocks: Vec<CheckpointVerifiedBlock> =
+                    run.iter().map(|(cv, _rsp)| cv.clone()).collect();
+
+                #[cfg(feature = "commit-metrics")]
+                metrics::histogram!("zebra.state.write.writer_idle.duration_seconds")
+                    .record(_writer_idle_start.elapsed().as_secs_f64());
+                #[cfg(feature = "commit-metrics")]
+                let _batch_start = std::time::Instant::now();
+
+                // Clone the prev trees so the per-block fall-back still has them if the
+                // batch fails (the batch threads/consumes them on success).
+                match finalized_state.commit_finalized_batch(
+                    blocks,
+                    prev_finalized_note_commitment_trees.clone(),
+                    "commit checkpoint-verified batch",
+                ) {
+                    Ok(results) => {
+                        let last = results.len().saturating_sub(1);
+                        for (i, (cv, rsp_tx)) in run.into_iter().enumerate() {
+                            let (hash, trees) = &results[i];
+                            let _ = rsp_tx.send(Ok(*hash));
+                            metrics::counter!("state.checkpoint.finalized.block.count")
+                                .increment(1);
+                            metrics::gauge!("state.checkpoint.finalized.block.height")
+                                .set(cv.height.0 as f64);
+                            metrics::gauge!("zcash.chain.verified.block.height")
+                                .set(cv.height.0 as f64);
+                            metrics::counter!("zcash.chain.verified.block.total").increment(1);
+                            if i == last {
+                                prev_finalized_note_commitment_trees = Some(trees.clone());
+                                chain_tip_sender.set_finalized_tip(ChainTipBlock::from(cv));
+                            }
+                        }
+                        #[cfg(feature = "commit-metrics")]
+                        metrics::histogram!(
+                            "zebra.state.commit.commit_finalized_total.duration_seconds"
+                        )
+                        .record(_batch_start.elapsed().as_secs_f64());
+                        #[cfg(feature = "commit-metrics")]
+                        {
+                            _writer_idle_start = std::time::Instant::now();
+                        }
+                        continue;
+                    }
+                    Err((_idx, error)) => {
+                        // Atomic batch failed — nothing committed. Re-queue the successors
+                        // (height order) and fall back to the per-block path for the first.
+                        tracing::debug!(?error, "batched commit failed; falling back to per-block");
+                        let mut run = run;
+                        let first = run.remove(0);
+                        for later in run.into_iter().rev() {
+                            finalized_lookahead.push_front(later);
+                        }
+                        ordered_block = first;
+                    }
+                }
+            }
+            // ===== end batch fast-path; the per-block path follows =====
+
             // Peek the next block and start its precompute, so the heavy hashing
             // overlaps this block's commit. Its start sizes are the current tree
             // sizes plus this block's note counts (the sizes after this block).
@@ -486,9 +591,12 @@ impl WriteBlockWorkerTask {
             }
 
             // A non-handoff VCT fast block's supplied roots are authenticated by
-            // its successor's header. If the successor is not buffered yet, keep
-            // this block local and wait instead of surfacing a checkpoint commit
-            // error through the invalid-block reset path.
+            // its successor's header. In the per-block path, if the successor is not
+            // buffered yet, keep this block local and wait instead of surfacing a
+            // checkpoint commit error through the invalid-block reset path. (The batch
+            // fast-path above instead commits such a block in arrears, since its run's
+            // last block is confirmed by the next batch's head — see
+            // `commit_finalized_direct`.)
             if finalized_lookahead.is_empty()
                 && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
             {
@@ -551,13 +659,34 @@ impl WriteBlockWorkerTask {
             let next_block_took_vct_path =
                 finalized_state.vct_fast_will_apply(ordered_block.0.height);
 
-            // Try committing the block
-            match finalized_state.commit_finalized(
+            // PROBE 3: idle gap since the previous commit finished — the starvation
+            // wait. If this dominates over the ~1.8ms commit work, the writer is
+            // bus-waiting (throughput is cadence-bound), not commit-bound.
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.state.write.writer_idle.duration_seconds")
+                .record(_writer_idle_start.elapsed().as_secs_f64());
+
+            // Try committing the block.
+            // PROBE 2: total per-block service time of the single writer (the ~16ms
+            // implied by Little's law). Compare against the ~1.4ms instrumented
+            // write_block phases to localize the un-instrumented serial cost.
+            #[cfg(feature = "commit-metrics")]
+            let _commit_finalized_start = std::time::Instant::now();
+            let commit_finalized_result = finalized_state.commit_finalized(
                 ordered_block,
                 prev_note_commitment_trees,
                 note_precompute,
                 next_checkpoint,
-            ) {
+            );
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.state.commit.commit_finalized_total.duration_seconds")
+                .record(_commit_finalized_start.elapsed().as_secs_f64());
+            // Writer is now free again; the next iteration's idle is measured from here.
+            #[cfg(feature = "commit-metrics")]
+            {
+                _writer_idle_start = std::time::Instant::now();
+            }
+            match commit_finalized_result {
                 Ok((finalized, note_commitment_trees)) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
@@ -825,7 +954,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request", None, None)
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
