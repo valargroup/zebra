@@ -13,10 +13,11 @@ use proptest::{prop_assert, prop_assert_eq};
 use super::*;
 use super::{
     config::{
-        BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
+        BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
         DEFAULT_BS_FLOOR_WATCHDOG_TICK, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
         DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_NEAR_FLOOR_FANOUT, DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT,
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
     },
     reactor::node_id_from_block_peer_id,
@@ -686,6 +687,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
                 height: block::Height(height),
                 hash: block::Hash([byte; 32]),
                 estimated_bytes: 1,
+                claim_id: WorkClaimId(u64::from(height)),
             }],
         },
         queued_at: Instant::now(),
@@ -988,7 +990,23 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
     );
     assert_eq!(default.request_timeout, DEFAULT_BS_REQUEST_TIMEOUT);
-    assert_eq!(default.fanout, DEFAULT_BS_FANOUT);
+    assert_eq!(default.near_floor_fanout, DEFAULT_BS_NEAR_FLOOR_FANOUT);
+    assert_eq!(
+        default.near_floor_fanout_height_count,
+        DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT
+    );
+
+    assert_eq!(
+        default.desired_fanout(block::Height(1), block::Height(0)),
+        DEFAULT_BS_NEAR_FLOOR_FANOUT
+    );
+    assert_eq!(
+        default.desired_fanout(
+            block::Height(DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT.saturating_add(1)),
+            block::Height(0)
+        ),
+        1
+    );
 
     let encoded = toml::to_string(&default).expect("block-sync config serializes");
     let decoded: ZakuraBlockSyncConfig =
@@ -1450,6 +1468,105 @@ fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
 }
 
 #[test]
+fn work_queue_near_floor_fanout_allows_two_claims_then_caps() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let excluded = std::collections::BTreeSet::new();
+    let fanout_two = |_| 2usize;
+
+    let first = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_two,
+        &excluded,
+    );
+    assert_eq!(first.len(), 1);
+
+    let second = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_two,
+        &excluded,
+    );
+    assert_eq!(second.len(), 1);
+
+    let third = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_two,
+        &excluded,
+    );
+    assert!(third.is_empty(), "fanout cap must block a third claim");
+}
+
+#[test]
+fn work_queue_fanout_excludes_same_peer_and_far_heights() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(100)),
+            needed(30, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+    let fanout_for_near_floor = |height: block::Height| {
+        if height.0 <= DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT {
+            2usize
+        } else {
+            1usize
+        }
+    };
+    let excluded = std::collections::BTreeSet::new();
+
+    let first = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_for_near_floor,
+        &excluded,
+    );
+    assert_eq!(first.len(), 1);
+
+    let excluded = [block::Height(1)].into_iter().collect();
+    let same_peer_retry = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_for_near_floor,
+        &excluded,
+    );
+    assert!(
+        same_peer_retry.is_empty(),
+        "same peer must not claim the same height twice"
+    );
+
+    let far_first = queue.take_in_range_budgeted_with_fanout(
+        block::Height(30),
+        block::Height(30),
+        1,
+        100,
+        &fanout_for_near_floor,
+        &std::collections::BTreeSet::new(),
+    );
+    assert_eq!(far_first.len(), 1);
+    let far_second = queue.take_in_range_budgeted_with_fanout(
+        block::Height(30),
+        block::Height(30),
+        1,
+        100,
+        &fanout_for_near_floor,
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(far_second.is_empty(), "far-ahead heights stay fanout 1");
+}
+
+#[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 40_000_000,
@@ -1636,6 +1753,62 @@ fn watchdog_after_held_settle_releases_once() {
 }
 
 #[test]
+fn duplicate_claims_settle_and_release_independently() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let mut budget = ByteBudget::new(1_000);
+    let excluded = std::collections::BTreeSet::new();
+    let fanout_two = |_| 2usize;
+
+    let first = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_two,
+        &excluded,
+    );
+    assert_eq!(first.len(), 1);
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+
+    let second = queue.take_in_range_budgeted_with_fanout(
+        block::Height(1),
+        block::Height(1),
+        1,
+        100,
+        &fanout_two,
+        &excluded,
+    );
+    assert_eq!(second.len(), 1);
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(budget.reserved(), 200);
+
+    let first_delta = queue
+        .settle_active_reserved_height(block::Height(1), 80)
+        .expect("first active claim settles");
+    assert_eq!(first_delta, -20);
+    budget.release(20);
+    assert_eq!(budget.reserved(), 180);
+
+    let duplicate_delta = queue
+        .settle_active_reserved_height(block::Height(1), 90)
+        .expect("second active claim settles");
+    assert_eq!(duplicate_delta, -10);
+    budget.release(10);
+    assert_eq!(budget.reserved(), 170);
+
+    // The first body is held by reorder/applying, and the duplicate body is
+    // released as redundant by the sequencer.
+    budget.release(90);
+    assert_eq!(budget.reserved(), 80);
+
+    budget.release(80);
+    assert_eq!(queue.advance_floor(block::Height(1)), 0);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
 fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
@@ -1667,7 +1840,7 @@ fn mark_held_direct_does_not_orphan_a_charge() {
     assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
 
     assert!(budget.try_reserve(80));
-    let old_charge = queue.mark_held_direct(block::Height(1), 80);
+    let (old_charge, _claim_id) = queue.mark_held_direct(block::Height(1), 80);
     budget.release(old_charge);
     assert_eq!(old_charge, 100);
     assert_eq!(budget.reserved(), 80);
@@ -2012,7 +2185,8 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
 /// peer while the rest sit idle with free slots.
 #[tokio::test]
 async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
-    let config = immediate_body_download_config();
+    let mut config = immediate_body_download_config();
+    config.near_floor_fanout = 1;
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2242,7 +2416,7 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
 #[tokio::test]
 async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
+    config.near_floor_fanout = 1;
     // A request timeout long enough that the opening pass fans both heights out
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
@@ -3014,6 +3188,7 @@ async fn sequencer_task_body_input_is_not_starved_by_control_backlog() {
             hash: block.hash(),
             body: BufferedBlockBody::Decoded(block.clone()),
             bytes,
+            claim_id: WorkClaimId(0),
             peer: peer(1),
             received_at: Instant::now(),
         })
@@ -3094,6 +3269,7 @@ async fn sequencer_buffers_bodies_until_executor_installed() {
             hash: block.hash(),
             body: BufferedBlockBody::Decoded(block.clone()),
             bytes,
+            claim_id: WorkClaimId(0),
             peer: peer(1),
             received_at: Instant::now(),
         })
@@ -3177,6 +3353,7 @@ async fn sequencer_single_apply_limit_serializes_checkpoint_submissions() {
                 hash: block.hash(),
                 body: BufferedBlockBody::Decoded(block.clone()),
                 bytes,
+                claim_id: WorkClaimId(0),
                 peer: peer(1),
                 received_at: Instant::now(),
             })
@@ -3284,6 +3461,7 @@ async fn sequencer_task_does_not_skip_lower_unsubmitted_checkpoint_when_full_can
                 hash: block.hash(),
                 body: BufferedBlockBody::Decoded(block.clone()),
                 bytes,
+                claim_id: WorkClaimId(0),
                 peer: peer(1),
                 received_at: Instant::now(),
             })
@@ -3364,6 +3542,7 @@ async fn sequencer_task_allows_later_submit_after_lower_height_is_submitted() {
                 hash: block.hash(),
                 body: BufferedBlockBody::Decoded(block.clone()),
                 bytes,
+                claim_id: WorkClaimId(0),
                 peer: peer(1),
                 received_at: Instant::now(),
             })
@@ -3457,6 +3636,7 @@ async fn sequencer_coalesces_checkpoint_frontier_refreshes() {
                 hash: block.hash(),
                 body: BufferedBlockBody::Decoded(block.clone()),
                 bytes,
+                claim_id: WorkClaimId(0),
                 peer: peer(1),
                 received_at: Instant::now(),
             })
@@ -3736,6 +3916,7 @@ async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
                 hash: block.hash(),
                 body: BufferedBlockBody::Decoded(block.clone()),
                 bytes,
+                claim_id: WorkClaimId(0),
                 peer: peer(1),
                 received_at: Instant::now(),
             })
@@ -3768,6 +3949,7 @@ async fn sequencer_floor_body_not_starved_by_apply_completion_flood() {
             hash: floor_block.hash(),
             body: BufferedBlockBody::Decoded(floor_block.clone()),
             bytes,
+            claim_id: WorkClaimId(0),
             peer: peer(1),
             received_at: Instant::now(),
         })
@@ -3871,6 +4053,7 @@ async fn sequencer_harvests_apply_completions_under_budget_limited_body_flood() 
                     hash: block.hash(),
                     body: BufferedBlockBody::Decoded(block),
                     bytes,
+                    claim_id: WorkClaimId(0),
                     peer: peer(1),
                     received_at: Instant::now(),
                 })
@@ -3958,6 +4141,7 @@ async fn sequencer_drains_in_flight_applies_on_shutdown() {
             hash: block.hash(),
             body: BufferedBlockBody::Decoded(block.clone()),
             bytes,
+            claim_id: WorkClaimId(0),
             peer: peer(1),
             received_at: Instant::now(),
         })
@@ -4147,16 +4331,19 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
                 height: block::Height(1),
                 hash: block::Hash([1; 32]),
                 estimated_bytes: 1_000,
+                claim_id: WorkClaimId(1),
             },
             ExpectedBlock {
                 height: block::Height(2),
                 hash: block::Hash([2; 32]),
                 estimated_bytes: 1_000,
+                claim_id: WorkClaimId(2),
             },
             ExpectedBlock {
                 height: block::Height(3),
                 hash: block::Hash([3; 32]),
                 estimated_bytes: 1_000,
+                claim_id: WorkClaimId(3),
             },
         ],
     };
@@ -4581,6 +4768,7 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
             height: block::Height(1),
             hash: block::Hash([1; 32]),
             estimated_bytes: hint,
+            claim_id: WorkClaimId(1),
         }],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
@@ -7733,7 +7921,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         .collect();
 
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
+    config.near_floor_fanout = 1;
     config.max_inflight_block_bytes = u64::MAX;
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
@@ -10219,7 +10407,7 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
     // heights from the needed set so the gap gets scheduled.
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 3;
+    config.near_floor_fanout = 3;
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
     let startup = BlockSyncStartup::new(
@@ -11208,7 +11396,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 2;
+    config.near_floor_fanout = 2;
     // A long request timeout ensures the timeout-driven retry self-heal cannot mask
     // the wedge within the test window.
     config.request_timeout = Duration::from_secs(300);

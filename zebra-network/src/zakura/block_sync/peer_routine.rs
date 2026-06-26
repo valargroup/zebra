@@ -24,7 +24,7 @@
 //! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
 //! task's own `FramedRecv` rather than a `PeerInput` channel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -44,7 +44,7 @@ use super::{
         next_height, DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter,
         TimeoutBackoffOutcome,
     },
-    work_queue::{WorkItem, WorkQueue},
+    work_queue::{ClaimedWorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
@@ -566,6 +566,9 @@ impl PeerRoutine {
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
             let view = *self.view.borrow();
+            let config = self.config.clone();
+            let desired_fanout = move |height| config.desired_fanout(height, view.download_floor);
+            let peer_outstanding_heights = self.outstanding_height_set();
             let floor_high = floor_rescue_high(view.download_floor);
             let mut request_priority = RequestPriority::Floor;
             let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
@@ -573,7 +576,12 @@ impl PeerRoutine {
             let mut items = if servable_low <= floor_high
                 && self
                     .work
-                    .first_pending_in_range(servable_low, servable_high.min(floor_high))
+                    .first_claimable_in_range(
+                        servable_low,
+                        servable_high.min(floor_high),
+                        &desired_fanout,
+                        &peer_outstanding_heights,
+                    )
                     .is_some()
             {
                 let floor_available = self.budget.available().min(response_byte_cap);
@@ -603,11 +611,13 @@ impl PeerRoutine {
                         Some(_) => servable_high,
                         None => servable_high.min(floor_high),
                     };
-                    self.work.take_in_range_budgeted(
+                    self.work.take_in_range_budgeted_with_fanout(
                         servable_low,
                         floor_take_high,
                         max_count,
                         floor_available,
+                        &desired_fanout,
+                        &peer_outstanding_heights,
                     )
                 }
             } else {
@@ -615,10 +625,12 @@ impl PeerRoutine {
             };
 
             if items.is_empty() {
-                let Some(start_height) = self
-                    .work
-                    .first_pending_in_range(servable_low, servable_high)
-                else {
+                let Some(start_height) = self.work.first_claimable_in_range(
+                    servable_low,
+                    servable_high,
+                    &desired_fanout,
+                    &peer_outstanding_heights,
+                ) else {
                     break;
                 };
                 let Some(decision) = admission_decision(
@@ -646,11 +658,13 @@ impl PeerRoutine {
                 if decision.priority == RequestPriority::AboveFloor {
                     metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
                     request_priority = RequestPriority::AboveFloor;
-                    items = self.work.take_in_range_budgeted(
+                    items = self.work.take_in_range_budgeted_with_fanout(
                         servable_low,
                         servable_high,
                         max_count,
                         decision.max_request_bytes,
+                        &desired_fanout,
+                        &peer_outstanding_heights,
                     );
                 }
             }
@@ -704,21 +718,21 @@ impl PeerRoutine {
             }
             let marked = self
                 .work
-                .mark_reserved(items.iter().map(|(height, _)| *height));
+                .mark_reserved_claims(items.iter().map(|(height, item)| (*height, item.claim_id)));
             if marked != reserved_bytes {
                 self.budget.release(reserved_bytes);
-                let _ = self
-                    .work
-                    .release_and_return_items(items.iter().map(|(height, _)| *height));
+                let _ = self.work.release_and_return_claims(
+                    items.iter().map(|(height, item)| (*height, item.claim_id)),
+                );
                 break;
             }
 
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
                 Err(_) => {
-                    let released = self
-                        .work
-                        .release_and_return_items(items.iter().map(|(height, _)| *height));
+                    let released = self.work.release_and_return_claims(
+                        items.iter().map(|(height, item)| (*height, item.claim_id)),
+                    );
                     self.budget.release(released);
                     break;
                 }
@@ -737,6 +751,7 @@ impl PeerRoutine {
                         height: *height,
                         hash: item.hash,
                         estimated_bytes: item.estimated_bytes,
+                        claim_id: item.claim_id,
                     })
                     .collect(),
             };
@@ -754,9 +769,9 @@ impl PeerRoutine {
                     "failed to queue Zakura block-sync GetBlocks"
                 );
                 // Nothing was received, so return every taken height to the queue.
-                let released = self
-                    .work
-                    .release_and_return_items(items.iter().map(|(height, _)| *height));
+                let released = self.work.release_and_return_claims(
+                    items.iter().map(|(height, item)| (*height, item.claim_id)),
+                );
                 self.budget.release(released);
                 if matches!(error, OrderedSendError::Full) {
                     break;
@@ -771,6 +786,14 @@ impl PeerRoutine {
             let request_start_height = request.start_height;
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
+            let near_floor_fanout_heights = items
+                .iter()
+                .filter(|(height, _)| desired_fanout(*height) > 1)
+                .count();
+            if near_floor_fanout_heights > 0 {
+                metrics::counter!("sync.block.near_floor_fanout.requested.height.count")
+                    .increment(u64::try_from(near_floor_fanout_heights).unwrap_or(u64::MAX));
+            }
             self.window.outstanding.push(OutstandingBlockRange {
                 request,
                 queued_at,
@@ -842,9 +865,27 @@ impl PeerRoutine {
     /// (budget race / send failure). Quiet (no notify): the returning routine must
     /// not re-wake its own want-work arm into a take/return spin, and any other
     /// peer waiting on budget capacity is woken by the matching `budget.release`.
-    fn return_taken_items(&self, items: &[(block::Height, WorkItem)]) {
-        self.work
-            .return_items_quiet(items.iter().map(|(height, _)| *height));
+    fn return_taken_items(&mut self, items: &[(block::Height, ClaimedWorkItem)]) {
+        let released = self
+            .work
+            .release_and_return_claims(items.iter().map(|(height, item)| (*height, item.claim_id)));
+        if released > 0 {
+            self.budget.release(released);
+        }
+    }
+
+    fn outstanding_height_set(&self) -> BTreeSet<block::Height> {
+        self.window
+            .outstanding
+            .iter()
+            .flat_map(|outstanding| {
+                outstanding
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .map(|expected| expected.height)
+            })
+            .collect()
     }
 
     /// Record heights this routine just returned on a failure so it will not
@@ -914,7 +955,7 @@ impl PeerRoutine {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.outstanding.remove(index);
                 released = released
-                    .saturating_add(self.work.release_heights(unreceived_heights(&outstanding)));
+                    .saturating_add(self.work.release_claims(unreceived_claims(&outstanding)));
                 removed = true;
             } else {
                 index += 1;
@@ -998,6 +1039,10 @@ impl PeerRoutine {
             return;
         }
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
+        let Some(claim_id) = outstanding.request.claim_id_for_height(height) else {
+            self.finish_outstanding_at(index, Disposition::RetryOriginal);
+            return;
+        };
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
         let request_elapsed_ms = elapsed_ms_u64(outstanding.queued_at.elapsed());
@@ -1038,9 +1083,9 @@ impl PeerRoutine {
         // `mark_received` then stops `reserved_bytes()` counting this height; the
         // only bytes still held are the `serialized_bytes` carried into the reorder
         // buffer.
-        let Some(delta) = self
-            .work
-            .settle_active_reserved_height(height, serialized_bytes)
+        let Some(delta) =
+            self.work
+                .settle_active_reserved_claim(height, claim_id, serialized_bytes)
         else {
             tracing::debug!(
                 peer = ?self.peer,
@@ -1081,7 +1126,7 @@ impl PeerRoutine {
         let body = raw_block_payload
             .map(BufferedBlockBody::RawFramePayload)
             .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
+        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, claim_id, body_permit)
             .await;
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
@@ -1111,6 +1156,7 @@ impl PeerRoutine {
         hash: block::Hash,
         body: BufferedBlockBody,
         serialized_bytes: u64,
+        claim_id: super::request::WorkClaimId,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
         let received_at = Instant::now();
@@ -1120,6 +1166,7 @@ impl PeerRoutine {
             hash,
             body,
             bytes: serialized_bytes,
+            claim_id,
             peer: self.peer.clone(),
             received_at,
         };
@@ -1243,13 +1290,13 @@ impl PeerRoutine {
         // already `in_flight` the take is a no-op and the Sequencer drops the
         // later duplicate.
         let _ = self.work.take_in_range(height, height, 1);
-        let old_charge = self.work.mark_held_direct(height, serialized_bytes);
+        let (old_charge, claim_id) = self.work.mark_held_direct(height, serialized_bytes);
         self.budget.release(old_charge);
 
         let body = raw_block_payload
             .map(BufferedBlockBody::RawFramePayload)
             .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
+        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, claim_id, body_permit)
             .await;
         true
     }
@@ -1392,9 +1439,10 @@ impl PeerRoutine {
         if outstanding.request.start_height > tip {
             return current;
         }
-        let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
+        let released_claims: Vec<_> =
+            outstanding_unreceived_claims_through(outstanding, tip).collect();
         let _ = outstanding.mark_received_through(tip);
-        let released_bytes = self.work.release_heights(released_heights);
+        let released_bytes = self.work.release_claims(released_claims);
         self.budget.release(released_bytes);
         if outstanding.is_complete() {
             Disposition::Satisfied
@@ -1414,7 +1462,7 @@ impl PeerRoutine {
     }
 
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
-        let released = self.work.release_heights(unreceived_heights(&outstanding));
+        let released = self.work.release_claims(unreceived_claims(&outstanding));
         self.budget.release(released);
         match disposition {
             Disposition::Satisfied => {
@@ -1440,7 +1488,7 @@ impl PeerRoutine {
 
     fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
         self.work
-            .release_and_return_items(unreceived_heights(outstanding))
+            .release_and_return_claims(unreceived_claims(outstanding))
     }
 
     fn apply_budget_delta(&mut self, delta: i128) {
@@ -1471,6 +1519,7 @@ impl PeerRoutine {
                         super::peer_registry::OutstandingMeta {
                             hash: expected.hash,
                             estimated_bytes: expected.estimated_bytes,
+                            claim_id: expected.claim_id,
                             queued_at: outstanding.queued_at,
                             deadline: outstanding.deadline,
                         },
@@ -1702,10 +1751,21 @@ fn unreceived_heights(
         .map(|expected| expected.height)
 }
 
-fn outstanding_unreceived_through(
+fn unreceived_claims(
+    outstanding: &OutstandingBlockRange,
+) -> impl Iterator<Item = (block::Height, super::request::WorkClaimId)> + '_ {
+    outstanding
+        .request
+        .expected_blocks
+        .iter()
+        .filter(move |expected| !outstanding.has_received(expected.height))
+        .map(|expected| (expected.height, expected.claim_id))
+}
+
+fn outstanding_unreceived_claims_through(
     outstanding: &OutstandingBlockRange,
     tip: block::Height,
-) -> impl Iterator<Item = block::Height> + '_ {
+) -> impl Iterator<Item = (block::Height, super::request::WorkClaimId)> + '_ {
     outstanding
         .request
         .expected_blocks
@@ -1713,7 +1773,7 @@ fn outstanding_unreceived_through(
         .filter(move |expected| {
             expected.height <= tip && !outstanding.has_received(expected.height)
         })
-        .map(|expected| expected.height)
+        .map(|expected| (expected.height, expected.claim_id))
 }
 
 impl Drop for PeerRoutine {
@@ -1732,13 +1792,13 @@ impl Drop for PeerRoutine {
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
         for outstanding in self.window.outstanding.drain(..) {
-            let released = self.work.release_and_return_items(
+            let released = self.work.release_and_return_claims(
                 outstanding
                     .request
                     .expected_blocks
                     .iter()
                     .filter(|expected| !outstanding.has_received(expected.height))
-                    .map(|expected| expected.height),
+                    .map(|expected| (expected.height, expected.claim_id)),
             );
             self.budget.release(released);
         }

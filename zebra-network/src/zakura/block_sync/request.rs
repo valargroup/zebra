@@ -9,6 +9,10 @@
 
 use super::{state::*, *};
 
+/// Unique owner for one in-flight claim on a block height.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(super) struct WorkClaimId(pub(super) u64);
+
 /// Source of a block-body byte-size estimate hint.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BlockSizeEstimate {
@@ -41,6 +45,7 @@ pub(super) struct ExpectedBlock {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) estimated_bytes: u64,
+    pub(super) claim_id: WorkClaimId,
 }
 
 impl BlockRangeRequest {
@@ -70,5 +75,11 @@ impl BlockRangeRequest {
         self.expected_blocks
             .iter()
             .find_map(|expected| (expected.height == height).then_some(expected.estimated_bytes))
+    }
+
+    pub(super) fn claim_id_for_height(&self, height: block::Height) -> Option<WorkClaimId> {
+        self.expected_blocks
+            .iter()
+            .find_map(|expected| (expected.height == height).then_some(expected.claim_id))
     }
 }

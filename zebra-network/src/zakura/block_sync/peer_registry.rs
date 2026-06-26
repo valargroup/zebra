@@ -102,6 +102,7 @@ pub(super) struct SlotDiagnostics {
 pub(super) struct OutstandingMeta {
     pub(super) hash: block::Hash,
     pub(super) estimated_bytes: u64,
+    pub(super) claim_id: super::request::WorkClaimId,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
 }
@@ -285,6 +286,25 @@ impl PeerRegistry {
                 .get(&height)
                 .is_some_and(|meta| meta.hash == hash)
         })
+    }
+
+    /// Number of connected peers with an outstanding request for `height`
+    /// expecting `hash`.
+    pub(super) fn outstanding_claim_count(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> usize {
+        let peers = self.lock();
+        peers
+            .values()
+            .filter(|entry| {
+                entry
+                    .outstanding
+                    .get(&height)
+                    .is_some_and(|meta| meta.hash == hash)
+            })
+            .count()
     }
 
     /// Whether any connected peer has an outstanding request covering `height`

@@ -18,6 +18,7 @@ use super::{
     events::*,
     reactor::{bs_insert_height, bs_insert_u64},
     reorder::BufferedBlockBody,
+    request::WorkClaimId,
     sequencer::*,
     state::*,
     work_queue::WorkQueue,
@@ -31,7 +32,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 /// flowing to trigger the inline check (e.g. once outstanding requests drain).
 const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 
-const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
 
 /// Emit a `block_commit_progress` rollup at most once per this many committed
@@ -280,7 +281,7 @@ pub(super) fn shed_top_until_available(
         if freed == 0 {
             break;
         }
-        let released = work.release_and_return_items([top]);
+        let released = work.release_held_and_return_items([top]);
         debug_assert!(
             released == 0 || released == freed,
             "shed reorder release must match the per-height budget ledger when present"
@@ -314,6 +315,7 @@ pub(super) struct SequencedBody {
     pub(super) hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
+    pub(super) claim_id: WorkClaimId,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
 }
@@ -836,7 +838,14 @@ impl SequencerTask {
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
             AcceptOutcome::Redundant { release_bytes } => {
-                self.budget.release(release_bytes);
+                metrics::counter!("sync.block.redundant.body.count").increment(1);
+                metrics::counter!("sync.block.redundant.body.bytes").increment(release_bytes);
+                let released = self.work.release_held_claim(body.height, body.claim_id);
+                self.budget.release(if released == 0 {
+                    release_bytes
+                } else {
+                    released
+                });
                 "redundant"
             }
         };
@@ -1467,6 +1476,10 @@ impl SequencerTask {
         let body_input_bytes = self
             .body_input_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+        let floor_claim_count = next_height(self.sequencer.floor())
+            .map(|height| self.work.claim_count(height))
+            .unwrap_or(0);
+        metrics::gauge!("sync.block.floor.claim.count").set(floor_claim_count as f64);
         let expected_budget = self
             .work
             .reserved_bytes()

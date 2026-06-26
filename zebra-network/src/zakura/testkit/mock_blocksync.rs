@@ -370,7 +370,7 @@ impl HarnessConfig {
                 .max(1),
             request_timeout: Duration::from_secs(60),
             status_refresh_interval: Duration::from_millis(200),
-            fanout: self.fanout,
+            near_floor_fanout: self.fanout,
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: self.seeds.saturating_add(1),
                 max_outbound_peers: self.seeds.saturating_add(1),

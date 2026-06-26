@@ -94,7 +94,12 @@ where
         let executor = self.clone();
         async move {
             let class = executor.block_apply_class(request.block.as_ref());
-            apply_block_sync_body_to_output(
+            // PROBE 4: in-flight apply() concurrency. Near the checkpoint cap (~400) ⇒
+            // concurrency-bound (raise the cap or cut per-apply latency); well below ⇒
+            // the apply pipeline is being fed too slowly (submission/floor-advance bound).
+            #[cfg(feature = "commit-metrics")]
+            metrics::gauge!("zebra.zakura.apply.inflight").increment(1.0);
+            let out = apply_block_sync_body_to_output(
                 executor.block_verifier,
                 executor.latest_chain_tip,
                 executor.endpoint,
@@ -105,7 +110,10 @@ where
                 executor.trace,
                 executor.throughput_probe,
             )
-            .await
+            .await;
+            #[cfg(feature = "commit-metrics")]
+            metrics::gauge!("zebra.zakura.apply.inflight").decrement(1.0);
+            out
         }
         .boxed()
     }
@@ -636,6 +644,17 @@ where
         },
     );
 
+    // Per-apply verify+commit latency (the verifier roundtrip through the
+    // single-writer state). With idle CPU this is the serial-drain cost that
+    // gates apply throughput; compare against zebra-state's commit-DB histograms
+    // to split verify+handoff from the ~1.4ms RocksDB commit.
+    #[cfg(feature = "commit-metrics")]
+    metrics::histogram!(
+        "zebra.zakura.apply.verify_commit.duration_seconds",
+        "class" => block_apply_class_label(class),
+    )
+    .record(started.elapsed().as_secs_f64());
+
     if throughput_probe.is_none()
         && class == BlockApplyClass::Checkpoint
         && result == BlockApplyResult::Committed
@@ -664,6 +683,15 @@ where
         Some(_) => probe_frontier,
         None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
     };
+    // Post-commit state re-read latency (the durable-frontier query). Paid only by
+    // non-checkpoint-committed applies; isolates how much per-apply wall is the
+    // read_state roundtrip versus the verify+commit above.
+    #[cfg(feature = "commit-metrics")]
+    metrics::histogram!(
+        "zebra.zakura.apply.frontier_query.duration_seconds",
+        "class" => block_apply_class_label(class),
+    )
+    .record(frontier_started.elapsed().as_secs_f64());
     if let Some(frontiers) = local_frontier {
         let change =
             if result == BlockApplyResult::Committed || result == BlockApplyResult::Duplicate {
@@ -744,11 +772,31 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    let commit = block_verifier
-        .clone()
-        .oneshot(zebra_consensus::Request::Commit(block));
+    // PROBE 4b: split the apply roundtrip around the verifier to localize the ~34s/apply
+    // that probe 4 showed is spent OUTSIDE the verifier (its queue residency is ~0.5s).
+    //  - admit_wait  = poll_ready: waiting to be ACCEPTED (Buffer/backpressure before the
+    //    verifier's intake). If this dominates, the throttle is UPSTREAM of commit and
+    //    batching body commits won't help.
+    //  - call_to_commit = accepted -> committed (= ~0.5s verifier residency + the
+    //    release->commit roundtrip). If, minus residency, THIS dominates, the per-block
+    //    commit roundtrip is the cost -> batching N body commits into one DiskWriteBatch
+    //    (the commit_header_range lever) is the fix.
+    let mut verifier = block_verifier.clone();
+    #[cfg(feature = "commit-metrics")]
+    let _admit_start = std::time::Instant::now();
+    let commit = match verifier.ready().await {
+        Ok(ready) => {
+            #[cfg(feature = "commit-metrics")]
+            metrics::histogram!("zebra.zakura.apply.admit_wait.duration_seconds")
+                .record(_admit_start.elapsed().as_secs_f64());
+            ready.call(zebra_consensus::Request::Commit(block))
+        }
+        Err(error) => return block_commit_result(Some(height), expected_hash, Err(error)),
+    };
+    #[cfg(feature = "commit-metrics")]
+    let _call_start = std::time::Instant::now();
 
-    match class {
+    let result = match class {
         BlockApplyClass::Checkpoint => {
             tokio::pin!(commit);
             tokio::select! {
@@ -780,7 +828,11 @@ where
                 Err(_elapsed) => block_commit_timed_out(Some(height), expected_hash),
             }
         }
-    }
+    };
+    #[cfg(feature = "commit-metrics")]
+    metrics::histogram!("zebra.zakura.apply.call_to_commit.duration_seconds")
+        .record(_call_start.elapsed().as_secs_f64());
+    result
 }
 
 fn block_commit_result<E>(

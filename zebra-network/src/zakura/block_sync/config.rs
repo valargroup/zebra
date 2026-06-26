@@ -69,8 +69,13 @@ pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TI
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Default tolerated size-hint deviation percentage reserved for later soft scoring.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
-/// Default block-sync peer fanout for the same requested range.
-pub const DEFAULT_BS_FANOUT: usize = 1;
+/// Default block-sync peer fanout for heights closest to the download floor.
+///
+/// `1` disables near-floor fanout (single owner per height, the pre-feature
+/// behavior); raise to `2`+ to re-enable redundant floor downloads.
+pub const DEFAULT_BS_NEAR_FLOOR_FANOUT: usize = 1;
+/// Default number of heights above the download floor eligible for near-floor fanout.
+pub const DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT: u32 = 5;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
 ///
 /// A range response is sent as one `Block` frame per body, and each body frame
@@ -178,8 +183,10 @@ pub struct ZakuraBlockSyncConfig {
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
     pub size_deviation_tolerance: u32,
-    /// Number of peers later range scheduling may fan out to for the same body gap.
-    pub fanout: usize,
+    /// Number of peers near-floor range scheduling may fan out to for the same body gap.
+    pub near_floor_fanout: usize,
+    /// Number of heights above the download floor eligible for near-floor fanout.
+    pub near_floor_fanout_height_count: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
 }
@@ -209,7 +216,8 @@ impl Default for ZakuraBlockSyncConfig {
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
-            fanout: DEFAULT_BS_FANOUT,
+            near_floor_fanout: DEFAULT_BS_NEAR_FLOOR_FANOUT,
+            near_floor_fanout_height_count: DEFAULT_BS_NEAR_FLOOR_FANOUT_HEIGHT_COUNT,
             peer_limits: ServicePeerLimits::default(),
         }
     }
@@ -257,11 +265,25 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the largest byte reservation a single floor request can need.
     pub fn floor_request_byte_reservation(&self) -> u64 {
-        let fanout = u64::try_from(self.fanout.max(1)).unwrap_or(u64::MAX);
+        let fanout = u64::try_from(self.near_floor_fanout.max(1)).unwrap_or(u64::MAX);
         let worst_case_blocks = u64::from(self.advertised_max_blocks_per_response())
             .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES)
             .saturating_mul(fanout);
         u64::from(self.advertised_max_response_bytes()).max(worst_case_blocks)
+    }
+
+    /// Return the configured request fanout for `height`, anchored at the current
+    /// body download floor.
+    pub fn desired_fanout(&self, height: block::Height, download_floor: block::Height) -> usize {
+        let Some(distance) = height.0.checked_sub(download_floor.0) else {
+            return 1;
+        };
+
+        if distance > 0 && distance <= self.near_floor_fanout_height_count {
+            self.near_floor_fanout.max(1)
+        } else {
+            1
+        }
     }
 
     /// Validate production-safety bounds after deserialization.

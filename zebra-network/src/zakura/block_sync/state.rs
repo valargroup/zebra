@@ -694,6 +694,10 @@ impl BlockBudgetLedger {
         matches!(self, Self::Reserved(_))
     }
 
+    pub(super) fn is_held(self) -> bool {
+        matches!(self, Self::Held(_))
+    }
+
     /// Move a reserved height to held bytes and return the signed budget delta.
     ///
     /// Positive means charge more bytes; negative means release bytes.

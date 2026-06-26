@@ -400,7 +400,9 @@ impl BlockSyncReactor {
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
                 _ = floor_watchdog_ticks.tick() => {
-                    self.run_floor_watchdog(Instant::now());
+                    let now = Instant::now();
+                    self.run_floor_watchdog(now);
+                    self.publish_floor_gap_metrics(now);
                     self.publish_metrics();
                 }
             }
@@ -430,7 +432,7 @@ impl BlockSyncReactor {
             let released = self
                 .state
                 .work
-                .release_reserved_and_return_items([claim.height]);
+                .release_reserved_and_return_claims([(claim.height, claim.meta.claim_id)]);
             self.state.budget.release(released);
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
             tracing::debug!(
@@ -883,14 +885,19 @@ impl BlockSyncReactor {
         // timeout). The hash is checked so a reanchor (different hash) still
         // re-queues. The registry's outstanding is routine-owned, so this clause is
         // now backed by per-peer state independent of `work.in_flight`.
+        let download_floor = self.sequencer_view.borrow().download_floor;
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
+                let desired_fanout = self
+                    .startup
+                    .config
+                    .desired_fanout(block.height, download_floor);
                 block.height > self.request_floor
-                    && !self.state.work.in_flight_contains(block.height)
-                    && !self
+                    && self
                         .registry
-                        .has_outstanding_request(block.height, block.hash)
+                        .outstanding_claim_count(block.height, block.hash)
+                        < desired_fanout
             })
             .collect();
 
@@ -1864,6 +1871,30 @@ impl BlockSyncReactor {
         })
     }
 
+    /// Emit floor-gap attribution metrics once per floor-watchdog tick.
+    ///
+    /// The labeled `state` counter is the key signal: ticking it every tick turns
+    /// the rate of each label into the fraction of stall time spent in that
+    /// reason, so a scraper can split zero-progress (download-floor flat) time
+    /// across slow download (`outstanding`), peer/slot/budget starvation
+    /// (`queued`/`needed_unscheduled`), buffered-but-unrequested
+    /// (`in_flight_without_outstanding`), or header-lag (`absent`). `none` means
+    /// the floor is caught up to header sync (no gap to attribute).
+    fn publish_floor_gap_metrics(&self, now: Instant) {
+        let Some(diag) = self.floor_gap_diagnostics(now) else {
+            metrics::counter!("sync.block.floor_gap.state_ticks", "state" => "none").increment(1);
+            return;
+        };
+        metrics::counter!("sync.block.floor_gap.state_ticks", "state" => diag.state).increment(1);
+        // Metrics-only lossy casts (gauges); scheduling uses the integer values.
+        metrics::gauge!("sync.block.floor_gap.servable_peers").set(diag.servable_peers as f64);
+        metrics::gauge!("sync.block.floor_gap.outstanding_peers").set(diag.outstanding_peers as f64);
+        metrics::gauge!("sync.block.floor_gap.oldest_outstanding_ms")
+            .set(diag.oldest_outstanding_ms.unwrap_or(0) as f64);
+        metrics::gauge!("sync.block.floor_gap.next_deadline_ms")
+            .set(diag.next_deadline_ms.unwrap_or(0) as f64);
+    }
+
     fn publish_metrics(&self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
@@ -1899,6 +1930,14 @@ impl BlockSyncReactor {
             .set(self.state.budget.reserved() as f64);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.last_view.reorder_buffered_bytes as f64);
+        // Apply-queue depth discriminators. `applying` is the contiguous-from-floor
+        // queue submitted to the committer (capped at MAX_CHECKPOINT_HEIGHT_GAP =
+        // 400): pinned near 400 ⇒ bodies are downloaded and queued but the commit
+        // handoff is not draining (glue/commit-bound, NOT block-sync). `reorder` is
+        // the out-of-order staging above an unfilled floor gap: high `reorder` with
+        // low `applying` ⇒ genuine head-of-line download stall (the floor body is
+        // missing while successors pile up). Both low ⇒ supply starvation.
+        metrics::gauge!("sync.block.reorder").set(self.last_view.reorder_len as f64);
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
