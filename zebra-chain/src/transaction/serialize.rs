@@ -825,7 +825,7 @@ impl ZcashSerialize for Transaction {
                 }
 
                 // Transaction V6 spec:
-                // TODO: add ZIP link when the Ironwood transaction format is specified.
+                // https://zips.z.cash/zip-0229
 
                 // Denoted as `nVersionGroupId` in the spec.
                 writer.write_u32::<LittleEndian>(TX_V6_VERSION_GROUP_ID)?;
