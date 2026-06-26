@@ -26,11 +26,13 @@ zebra-chain = { path = "../zebra-chain" }
 # `proptest-impl` exposes the real `CheckpointVerifier` constructor; the verifier
 # and state code it drives is the normal production path.
 zebra-consensus = { path = "../zebra-consensus", features = ["proptest-impl"] }
-zebra-network = { path = "../zebra-network" }
+zebra-network = { path = "../zebra-network", features = ["zakura-testkit"] }
 zebra-state = { path = "../zebra-state" }
 zebra-jsonl-trace = { path = "../zebra-jsonl-trace" }
+zebrad = { path = "../zebrad", default-features = false }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 tower = { workspace = true, features = ["buffer", "util"] }
 clap = { workspace = true, features = ["derive"] }

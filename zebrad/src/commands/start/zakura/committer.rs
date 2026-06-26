@@ -45,7 +45,7 @@ use super::{
 /// Sink the Committer raises a [`CommitterReset`] through on a commit failure.
 ///
 /// Production wiring uses [`BlockSyncHandle`]; tests inject a recording double.
-pub(crate) trait CommitRejectSink: Send + Sync + 'static {
+pub trait CommitRejectSink: Send + Sync + 'static {
     /// Report a commit rejection back to the Sequencer.
     fn report_commit_rejected(&self, reset: CommitterReset);
 }
@@ -74,7 +74,7 @@ struct CommitOutcome {
 }
 
 /// The block-sync commit pump. Generic over the consensus verifier service.
-pub(crate) struct Committer<BlockVerifier> {
+pub struct Committer<BlockVerifier> {
     /// The applyQ: contiguous, hash-verified items from the Sequencer. Unbounded so
     /// the serial Sequencer task never blocks on a push; the byte budget bounds
     /// total in-flight memory.
@@ -115,6 +115,24 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
+    /// Construct a Committer for callers that do not use the debug throughput probe.
+    pub fn new_without_probe(
+        apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
+        block_verifier: BlockVerifier,
+        reset_sink: Arc<dyn CommitRejectSink>,
+        max_checkpoint_height: block::Height,
+        trace: ZakuraTrace,
+    ) -> Self {
+        Self::new(
+            apply_rx,
+            block_verifier,
+            reset_sink,
+            max_checkpoint_height,
+            trace,
+            None,
+        )
+    }
+
     pub(crate) fn new(
         apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
         block_verifier: BlockVerifier,
@@ -141,7 +159,7 @@ where
     /// Drain the applyQ, firing commits concurrently, until the queue closes (and
     /// in-flight commits drain) or `shutdown` fires (then drain in-flight and exit).
     /// Returns the highest committed height observed.
-    pub(crate) async fn run(mut self, shutdown: impl Future<Output = ()> + Send) -> block::Height {
+    pub async fn run(mut self, shutdown: impl Future<Output = ()> + Send) -> block::Height {
         pin!(shutdown);
         let mut apply_open = true;
         let mut shutting_down = false;

@@ -16,6 +16,7 @@ mod metrics_rec;
 mod run;
 mod snapshot;
 mod stats;
+mod validate_cache;
 
 #[cfg(feature = "jemalloc-profiling")]
 #[global_allocator]
@@ -37,6 +38,8 @@ enum Command {
     Fetch(fetch::FetchArgs),
     /// Replay cached blocks through the real verifier+state and report throughput.
     Run(run::RunArgs),
+    /// Validate a contiguous cached block range before replaying it.
+    ValidateCache(validate_cache::ValidateArgs),
 }
 
 #[tokio::main]
@@ -56,5 +59,6 @@ async fn main() -> Result<()> {
         Command::Snapshot(args) => snapshot::run(args).await,
         Command::Fetch(args) => fetch::run(args).await,
         Command::Run(args) => run::run(args).await,
+        Command::ValidateCache(args) => validate_cache::run(args),
     }
 }

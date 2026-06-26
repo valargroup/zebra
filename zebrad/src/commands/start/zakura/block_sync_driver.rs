@@ -1,3 +1,5 @@
+//! Node-side state-read driver for Zakura block sync.
+
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -28,7 +30,7 @@ pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
 /// queries and inbound `GetBlocks` serving. The commit *tail* no longer runs here
 /// — bodies are committed by the [`Committer`](super::committer::Committer)
 /// draining the applyQ; this loop is purely the state-read seam.
-pub(crate) async fn drive_block_sync_actions<ReadState>(
+pub async fn drive_block_sync_actions<ReadState>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     // Retained so the disconnect capability stays wired into the driver, even
     // though peer scoring no longer drives disconnects (misbehavior is record-only).
@@ -533,7 +535,7 @@ const DURABLE_FRONTIER_READ_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// transient frontier-read failure is retried (see
 /// [`DURABLE_FRONTIER_READ_MAX_ATTEMPTS`]) so the edge-triggered release cannot be
 /// silently dropped on the final advance.
-pub(crate) async fn drive_block_sync_durable_frontier<ReadState>(
+pub async fn drive_block_sync_durable_frontier<ReadState>(
     mut chain_tip_change: zebra_state::ChainTipChange,
     latest_chain_tip: zebra_state::LatestChainTip,
     read_state: ReadState,

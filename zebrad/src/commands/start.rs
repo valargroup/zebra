@@ -73,7 +73,7 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-mod zakura;
+pub mod zakura;
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
 

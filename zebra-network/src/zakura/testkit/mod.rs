@@ -1,5 +1,6 @@
 //! Test tooling for the default-off Zakura Iroh/QUIC stack.
 
+mod block_sync_peer;
 mod clock;
 mod cluster;
 mod endpoint;
@@ -15,6 +16,7 @@ mod trace_capture;
 mod trace_reader;
 mod wait;
 
+pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
 pub use endpoint::LocalEndpointFactory;

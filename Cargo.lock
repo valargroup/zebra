@@ -8962,6 +8962,7 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
@@ -8971,6 +8972,7 @@ dependencies = [
  "zebra-network",
  "zebra-state",
  "zebra-test",
+ "zebrad",
 ]
 
 [[package]]

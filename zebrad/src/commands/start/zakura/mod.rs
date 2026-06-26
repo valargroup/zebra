@@ -1,3 +1,5 @@
+//! Node-side Zakura sync wiring used by `zebrad` startup and benchmarks.
+
 use std::time::Duration;
 
 use serde_json::{Map, Number, Value};
@@ -7,8 +9,8 @@ use zebra_network::zakura::{
     ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
-pub(crate) mod block_sync_driver;
-pub(crate) mod committer;
+pub mod block_sync_driver;
+pub mod committer;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
@@ -19,7 +21,7 @@ pub(crate) use block_sync_driver::{
     coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
     commit_block_sync_body, query_block_sync_needed_blocks, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
-pub(crate) use block_sync_driver::{drive_block_sync_actions, drive_block_sync_durable_frontier};
+pub use block_sync_driver::{drive_block_sync_actions, drive_block_sync_durable_frontier};
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 #[cfg(test)]
 pub(crate) use header_sync_driver::{
