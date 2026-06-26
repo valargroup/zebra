@@ -3,10 +3,8 @@
 use std::{
     cmp::{Eq, PartialEq},
     fmt::{self, Debug},
-    io,
 };
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use halo2::pasta::pallas;
 use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 
@@ -15,7 +13,7 @@ use crate::{
     block::MAX_BLOCK_BYTES,
     orchard::{tree, Action, Nullifier, ValueCommitment},
     primitives::Halo2Proof,
-    serialization::{AtLeastOne, SerializationError, TrustedPreallocate, ZcashSerialize},
+    serialization::{AtLeastOne, TrustedPreallocate, ZcashSerialize},
 };
 
 /// Returns the canonical size in bytes of an Orchard proof for `num_actions` actions.
@@ -264,63 +262,6 @@ bitflags! {
         const ENABLE_OUTPUTS = 0b00000010;
         /// Enable cross address transfers in NU6.3 style Orchard bundle formats.
         const ENABLE_CROSS_ADDRESS = 0b00000100;
-    }
-}
-
-/// The transaction format used to encode Orchard-style flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FlagFormat {
-    /// V5 Orchard format, where bit 2 is reserved.
-    PreNu6_3,
-    /// V6 Orchard-style format, where bit 2 is `enableCrossAddress`.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
-    Nu6_3,
-}
-
-impl Flags {
-    /// Serializes Orchard-style flags using the selected transaction format.
-    pub(crate) fn zcash_serialize_with_format<W: io::Write>(
-        &self,
-        mut writer: W,
-        format: FlagFormat,
-    ) -> Result<(), io::Error> {
-        match format {
-            FlagFormat::PreNu6_3 => {
-                if self.contains(Self::ENABLE_CROSS_ADDRESS) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid reserved orchard flags",
-                    ));
-                }
-            }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
-            FlagFormat::Nu6_3 => {}
-        }
-
-        writer.write_u8(self.bits())?;
-
-        Ok(())
-    }
-
-    /// Deserializes Orchard-style flags using the selected transaction format.
-    pub(crate) fn zcash_deserialize_with_format<R: io::Read>(
-        mut reader: R,
-        format: FlagFormat,
-    ) -> Result<Self, SerializationError> {
-        let bits = reader.read_u8()?;
-        let flags = match format {
-            FlagFormat::PreNu6_3 => {
-                if bits & Self::ENABLE_CROSS_ADDRESS.bits() == 0 {
-                    Self::from_bits(bits)
-                } else {
-                    None
-                }
-            }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
-            FlagFormat::Nu6_3 => Self::from_bits(bits),
-        };
-
-        flags.ok_or(SerializationError::Parse("invalid reserved orchard flags"))
     }
 }
 
