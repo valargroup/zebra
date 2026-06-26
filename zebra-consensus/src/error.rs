@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use zcash_protocol::value::BalanceError;
 use zebra_chain::{
-    amount, block, ironwood, orchard,
+    amount, block, orchard,
     parameters::subsidy::SubsidyError,
     sapling, sprout,
     transparent::{self, MIN_TRANSPARENT_COINBASE_MATURITY},
@@ -50,8 +50,11 @@ pub enum TransactionError {
     #[error("coinbase transaction MUST NOT have the EnableSpendsOrchard flag set")]
     CoinbaseHasEnableSpendsOrchard,
 
-    #[error("coinbase transaction MUST NOT have the EnableSpendsIronwood flag set")]
-    CoinbaseHasEnableSpendsIronwood,
+    #[error("coinbase transaction MUST NOT have an Orchard shielded bundle")]
+    CoinbaseHasOrchardShieldedData,
+
+    #[error("Orchard shielded data MUST NOT have the EnableCrossAddress flag set")]
+    OrchardHasEnableCrossAddress,
 
     #[error("coinbase transaction Sapling or Orchard outputs MUST be decryptable with an all-zero outgoing viewing key")]
     CoinbaseOutputsNotDecryptable,
@@ -183,17 +186,8 @@ pub enum TransactionError {
     #[error("orchard double-spend: duplicate nullifier: {_0:?}")]
     DuplicateOrchardNullifier(orchard::Nullifier),
 
-    #[error("ironwood double-spend: duplicate nullifier: {_0:?}")]
-    DuplicateIronwoodNullifier(ironwood::Nullifier),
-
     #[error("must have at least one active orchard flag")]
     NotEnoughFlags,
-
-    #[error("must have at least one active ironwood flag")]
-    NotEnoughIronwoodFlags,
-
-    #[error("Orchard transactions MUST NOT have the EnableCrossAddress flag set")]
-    OrchardHasEnableCrossAddress,
 
     #[error("could not find transparent input UTXO in the best chain or mempool")]
     TransparentInputNotFound,
@@ -259,9 +253,6 @@ pub enum TransactionError {
 
     #[error("Orchard proof has a non-canonical size")]
     OrchardProofSize,
-
-    #[error("Ironwood proof has a non-canonical size")]
-    IronwoodProofSize,
 
     #[error("unexpected error")]
     Other(String),
@@ -357,7 +348,8 @@ impl TransactionError {
             | CoinbaseHasSpend
             | CoinbaseHasOutputPreHeartwood
             | CoinbaseHasEnableSpendsOrchard
-            | CoinbaseHasEnableSpendsIronwood
+            | CoinbaseHasOrchardShieldedData
+            | OrchardHasEnableCrossAddress
             | CoinbaseOutputsNotDecryptable
             | CoinbaseInMempool
             | NonCoinbaseHasCoinbaseInput
@@ -379,8 +371,6 @@ impl TransactionError {
             | DisabledAddToSproutPool
             | DisabledAddToOrchardPool
             | NotEnoughFlags
-            | NotEnoughIronwoodFlags
-            | OrchardHasEnableCrossAddress
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)

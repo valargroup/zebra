@@ -653,13 +653,6 @@ async fn padded_v6_orchard_proof_returns_consensus_error_before_block_hashes() {
         .await;
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-#[tokio::test]
-async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() {
-    assert_padded_v6_proof_errors_before_block_hashes(false, TransactionError::IronwoodProofSize)
-        .await;
-}
-
 /// Asserts that proposing a block whose V6 coinbase has an over-padded shielded
 /// proof (Orchard if `use_orchard`, otherwise Ironwood) fails with the `expected`
 /// consensus error before the block hashes are checked.

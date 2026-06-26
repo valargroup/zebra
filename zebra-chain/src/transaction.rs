@@ -33,8 +33,7 @@ pub use serialize::{
 };
 pub use sighash::{HashType, SigHash, SigHasher};
 pub use unmined::{
-    zip317, UnminedTx, UnminedTxError, UnminedTxId, VerifiedUnminedTx,
-    MEMPOOL_TRANSACTION_COST_THRESHOLD,
+    zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
 };
 use zcash_protocol::consensus;
 
@@ -379,17 +378,6 @@ impl Transaction {
         self.orchard_flags()
             .unwrap_or_else(orchard::Flags::empty)
             .intersects(orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS)
-    }
-
-    /// Does this transaction have at least one flag when we have at least one
-    /// Ironwood action?
-    pub fn has_enough_ironwood_flags(&self) -> bool {
-        if self.version() < 6 || self.ironwood_actions().count() == 0 {
-            return true;
-        }
-        self.ironwood_flags()
-            .unwrap_or_else(ironwood::Flags::empty)
-            .intersects(ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS)
     }
 
     /// Returns the [`CoinbaseSpendRestriction`] for this transaction,

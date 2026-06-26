@@ -404,7 +404,6 @@ where
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
-            check::has_enough_ironwood_flags(&tx)?;
             check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
@@ -446,6 +445,7 @@ where
 
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
+                check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
             } else if !tx.is_valid_non_coinbase() {
                 return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
             }
@@ -1259,13 +1259,12 @@ where
     /// Verifies a V5 transaction's Orchard shielded data.
     ///
     /// `network_upgrade` is the network upgrade active at the verified transaction's block
-    /// height. It selects the V5 Orchard verifier: the Orchard Action circuit (and its verifying
+    /// height. It selects the Orchard verifier: the Orchard Action circuit (and its verifying
     /// key) changed at NU6.2 to fix the variable-base scalar-multiplication bug
-    /// (GHSA-jfw5-j458-pfv6), so pre-NU6.2 V5 bundles must be verified against the historical
-    /// key and NU6.2+ V5 bundles against the fixed key. A proof from one era does not verify
-    /// under the other era's key. [`primitives::halo2::v5_verifier_for`] maps the upgrade to the
-    /// verifier holding the matching key; the verifiers keep separate batches, so eras are never
-    /// mixed.
+    /// (GHSA-jfw5-j458-pfv6), so pre-NU6.2 bundles must be verified against the historical
+    /// key and NU6.2+ bundles against the fixed key. A proof from one era does not verify under
+    /// the other era's key. [`primitives::halo2::verifier_for`] maps the upgrade to the verifier
+    /// holding the matching key; the two verifiers keep separate batches, so eras are never mixed.
     fn verify_v5_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
@@ -1289,7 +1288,7 @@ where
             // Route the V5 bundle to the verifier for its circuit era: pre-NU6.2 bundles only
             // verify under the insecure key, NU6.2+ V5 bundles only under the fixed key.
             async_checks.push(
-                primitives::halo2::v5_verifier_for(network_upgrade)
+                primitives::halo2::verifier_for(network_upgrade)
                     .clone()
                     .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
             );
@@ -1311,7 +1310,7 @@ where
 
         if let Some(bundle) = bundle {
             async_checks.push(
-                primitives::halo2::v6_verifier()
+                primitives::halo2::verifier_for(NetworkUpgrade::Nu6_3)
                     .clone()
                     .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
             );
