@@ -18,10 +18,9 @@ use std::{
 
 use zebra_chain::{
     amount::NonNegative,
-    block::{self, Height},
+    block::Height,
     block_info::BlockInfo,
     history_tree::HistoryTree,
-    parameters::NetworkUpgrade,
     serialization::{CompactSizeMessage, ZcashSerialize as _},
     transparent,
     value_balance::ValueBalance,
@@ -56,6 +55,14 @@ pub type LegacyHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, Height, HistoryT
 /// A generic raw key type for reading history trees from the database, regardless of the database version.
 /// This type should not be used in new code.
 pub type RawHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, RawBytes, HistoryTreeParts>;
+
+/// A type for reading the tip history tree value as raw bytes.
+///
+/// The tip tree is stored under the empty key `()`. Reading the value as [`RawBytes`] never fails,
+/// unlike reading it as [`HistoryTreeParts`], so this is used by format-compatibility code to
+/// inspect an entry that may have been written with an older, smaller `Entry` buffer.
+/// This type should not be used in new code.
+pub type RawHistoryTreeValueCf<'cf> = TypedColumnFamily<'cf, (), RawBytes>;
 
 /// The name of the tip-only chain value pools column family.
 ///
@@ -102,6 +109,13 @@ impl ZebraDb {
             .expect("column family was created when database was created")
     }
 
+    /// Returns a handle to the `history_tree` column family that reads the tip tree value as raw
+    /// bytes. This should only be used by format-compatibility code.
+    pub(crate) fn raw_history_tree_value_cf(&self) -> RawHistoryTreeValueCf<'_> {
+        RawHistoryTreeValueCf::new(&self.db, HISTORY_TREE)
+            .expect("column family was created when database was created")
+    }
+
     /// Returns a typed handle to the chain value pools column family.
     pub(crate) fn chain_value_pools_cf(&self) -> ChainValuePoolsCf<'_> {
         ChainValuePoolsCf::new(&self.db, CHAIN_VALUE_POOLS)
@@ -121,19 +135,6 @@ impl ZebraDb {
     /// If history trees have not been activated yet (pre-Heartwood), or the state is empty,
     /// returns an empty history tree.
     pub fn history_tree(&self) -> Arc<HistoryTree> {
-        if self.needs_history_tree_rebuild_before_read() {
-            return self
-                .cached_rebuild_history_tree_to_tip(|| Ok::<(), std::convert::Infallible>(()))
-                .expect("history tree rebuild cannot be cancelled")
-                .map(|(_tip, history_tree)| history_tree)
-                .unwrap_or_default();
-        }
-
-        self.history_tree_from_disk()
-    }
-
-    /// Returns the persisted ZIP-221 history tree of the finalized tip without rebuilding it.
-    pub(crate) fn history_tree_from_disk(&self) -> Arc<HistoryTree> {
         let history_tree_cf = self.history_tree_cf();
 
         // # Backwards Compatibility
@@ -169,224 +170,6 @@ impl ZebraDb {
             )
         });
         Arc::new(HistoryTree::from(history_tree))
-    }
-
-    fn needs_history_tree_rebuild_before_read(&self) -> bool {
-        if self.finalized_tip_height().is_none() {
-            return false;
-        }
-
-        self.format_version_on_disk()
-            .expect("database format version should be readable")
-            .is_some_and(|version| version.major < 28)
-    }
-
-    /// Rebuilds or catches up the ZIP-221 history tree to the current finalized tip,
-    /// using the in-memory upgrade cache when possible.
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn cached_rebuild_history_tree_to_tip<E>(
-        &self,
-        mut check_cancelled: impl FnMut() -> Result<(), E>,
-    ) -> Result<Option<((Height, block::Hash), Arc<HistoryTree>)>, E> {
-        check_cancelled()?;
-
-        let Some(tip @ (tip_height, _tip_hash)) = self.tip() else {
-            return Ok(None);
-        };
-
-        let network = self.db.network();
-        let network_upgrade = NetworkUpgrade::current(&network, tip_height);
-
-        if network_upgrade < NetworkUpgrade::Heartwood {
-            let history_tree = Arc::new(HistoryTree::default());
-            self.cache_rebuilt_history_tree(tip, history_tree.clone());
-            return Ok(Some((tip, history_tree)));
-        }
-
-        let start_height = network_upgrade
-            .activation_height(&network)
-            .expect("current network upgrade must have an activation height");
-
-        let cached = self
-            .history_tree_rebuild_cache
-            .lock()
-            .expect("history tree rebuild cache lock is not poisoned")
-            .clone();
-
-        let history_tree = if let Some(cached) = cached.filter(|cached| {
-            self.cached_history_tree_can_extend(cached.tip, start_height, tip_height)
-        }) {
-            let cached_height = cached.tip.0;
-            let mut history_tree = (*cached.history_tree).clone();
-
-            for height in ((cached_height.0 + 1)..=tip_height.0).map(Height) {
-                check_cancelled()?;
-
-                let (block, sapling_root, orchard_root, ironwood_root) =
-                    self.history_tree_inputs_at_height(height);
-                history_tree
-                    .push(
-                        &network,
-                        block,
-                        &sapling_root,
-                        &orchard_root,
-                        &ironwood_root,
-                    )
-                    .expect(
-                        "stored blocks and note commitment tree roots should rebuild the history tree",
-                    );
-            }
-
-            check_cancelled()?;
-            history_tree
-        } else {
-            self.rebuild_history_tree_to_height(tip_height, &mut check_cancelled)?
-        };
-
-        let history_tree = Arc::new(history_tree);
-        self.cache_rebuilt_history_tree(tip, history_tree.clone());
-
-        Ok(Some((tip, history_tree)))
-    }
-
-    fn cached_history_tree_can_extend(
-        &self,
-        cached_tip: (Height, block::Hash),
-        start_height: Height,
-        target_height: Height,
-    ) -> bool {
-        let (cached_height, cached_hash) = cached_tip;
-
-        cached_height >= start_height
-            && cached_height <= target_height
-            && self.hash(cached_height) == Some(cached_hash)
-    }
-
-    /// Caches a rebuilt history tree without overwriting a newer valid cache entry.
-    pub(crate) fn cache_rebuilt_history_tree(
-        &self,
-        tip: (Height, block::Hash),
-        history_tree: Arc<HistoryTree>,
-    ) {
-        let mut cache = self
-            .history_tree_rebuild_cache
-            .lock()
-            .expect("history tree rebuild cache lock is not poisoned");
-
-        let should_replace = cache.as_ref().is_none_or(|cached| {
-            self.hash(cached.tip.0) != Some(cached.tip.1) || tip.0 >= cached.tip.0
-        });
-
-        if should_replace {
-            *cache = Some(super::CachedHistoryTree { tip, history_tree });
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn history_tree_rebuild_cache_tip(&self) -> Option<(Height, block::Hash)> {
-        self.history_tree_rebuild_cache
-            .lock()
-            .expect("history tree rebuild cache lock is not poisoned")
-            .as_ref()
-            .map(|cached| cached.tip)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_history_tree_rebuild_cache(
-        &self,
-        tip: (Height, block::Hash),
-        history_tree: Arc<HistoryTree>,
-    ) {
-        *self
-            .history_tree_rebuild_cache
-            .lock()
-            .expect("history tree rebuild cache lock is not poisoned") =
-            Some(super::CachedHistoryTree { tip, history_tree });
-    }
-
-    /// Rebuilds the ZIP-221 history tree up to `target_height` from finalized blocks and roots.
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn rebuild_history_tree_to_height<E>(
-        &self,
-        target_height: Height,
-        mut check_cancelled: impl FnMut() -> Result<(), E>,
-    ) -> Result<HistoryTree, E> {
-        check_cancelled()?;
-
-        let network = self.db.network();
-        let network_upgrade = NetworkUpgrade::current(&network, target_height);
-
-        if network_upgrade < NetworkUpgrade::Heartwood {
-            return Ok(HistoryTree::default());
-        }
-
-        let start_height = network_upgrade
-            .activation_height(&network)
-            .expect("current network upgrade must have an activation height");
-        let (block, sapling_root, orchard_root, ironwood_root) =
-            self.history_tree_inputs_at_height(start_height);
-        let mut history_tree = HistoryTree::from_block(
-            &network,
-            block,
-            &sapling_root,
-            &orchard_root,
-            &ironwood_root,
-        )
-        .expect("stored blocks and note commitment tree roots should rebuild the history tree");
-
-        for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
-            check_cancelled()?;
-
-            let (block, sapling_root, orchard_root, ironwood_root) =
-                self.history_tree_inputs_at_height(height);
-            history_tree
-                .push(
-                    &network,
-                    block,
-                    &sapling_root,
-                    &orchard_root,
-                    &ironwood_root,
-                )
-                .expect(
-                    "stored blocks and note commitment tree roots should rebuild the history tree",
-                );
-        }
-
-        check_cancelled()?;
-
-        Ok(history_tree)
-    }
-
-    fn history_tree_inputs_at_height(
-        &self,
-        height: Height,
-    ) -> (
-        Arc<zebra_chain::block::Block>,
-        zebra_chain::sapling::tree::Root,
-        zebra_chain::orchard::tree::Root,
-        zebra_chain::ironwood::tree::Root,
-    ) {
-        let block = self
-            .block(height.into())
-            .expect("finalized block should exist when rebuilding the history tree");
-        let sapling_root = self
-            .sapling_tree_by_height(&height)
-            .expect("Sapling tree should exist when rebuilding the history tree")
-            .root();
-        let orchard_root = self
-            .orchard_tree_by_height(&height)
-            .expect("Orchard tree should exist when rebuilding the history tree")
-            .root();
-        let ironwood_root = match self.ironwood_tree_by_height_range(..=height).last() {
-            Some((_height, tree)) => tree.root(),
-            // Older database formats can rebuild history trees before the Ironwood tree
-            // backfill runs. The backfill creates the empty Ironwood tree, so use that
-            // same root here.
-            None => Default::default(),
-        };
-
-        (block, sapling_root, orchard_root, ironwood_root)
     }
 
     /// Returns all the history tip trees.
@@ -430,7 +213,7 @@ impl ZebraDb {
 impl DiskWriteBatch {
     // History tree methods
 
-    /// Updates the history tree for the tip, if it is not empty.
+    /// Updates the history tree for the tip.
     ///
     /// The batch must be written to the database by the caller.
     pub fn update_history_tree(&mut self, db: &ZebraDb, tree: &HistoryTree) {
@@ -439,6 +222,9 @@ impl DiskWriteBatch {
         if let Some(tree) = tree.as_ref() {
             // The batch is modified by this method and written by the caller.
             let _ = history_tree_cf.zs_insert(&(), &HistoryTreeParts::from(tree));
+        } else {
+            // The batch is modified by this method and written by the caller.
+            let _ = history_tree_cf.zs_delete(&());
         }
     }
 

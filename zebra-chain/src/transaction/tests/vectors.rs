@@ -1040,13 +1040,36 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
-                    // This test iterates real historical mainnet/testnet blocks, which
-                    // contain no V6 transactions, so this arm only exists for match
-                    // exhaustiveness and never executes. A V6 tx's Sapling binding
-                    // signature would reuse the V5 path checked above; Ironwood's own
-                    // binding signature is a consensus-layer concern, not exercised here.
                     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-                    Transaction::V6 { .. } => {}
+                    Transaction::V6 {
+                        sapling_shielded_data,
+                        ..
+                    } => {
+                        if let Some(sapling_shielded_data) = sapling_shielded_data {
+                            // V6 txs have the outputs spent by their transparent inputs hashed into
+                            // their SIGHASH, so we need to exclude txs with transparent inputs.
+                            //
+                            // References:
+                            //
+                            // <https://zips.z.cash/zip-0244#s-2c-amounts-sig-digest>
+                            // <https://zips.z.cash/zip-0244#s-2d-scriptpubkeys-sig-digest>
+                            if tx.has_transparent_inputs() {
+                                continue;
+                            }
+
+                            let sighash = tx
+                                .sighash(nu, HashType::ALL, Arc::new(Vec::new()), None)
+                                .expect("network upgrade is valid for tx");
+
+                            let bvk = redjubjub::VerificationKey::try_from(
+                                sapling_shielded_data.binding_verification_key(),
+                            )
+                            .expect("a valid redjubjub::VerificationKey");
+
+                            bvk.verify(sighash.as_ref(), &sapling_shielded_data.binding_sig)
+                                .expect("verification passes");
+                        }
+                    }
                 }
             }
         }
@@ -1234,6 +1257,43 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
         tx_a.auth_digest(),
         tx_b.auth_digest(),
         "V6 auth digest must commit to the Ironwood anchor"
+    );
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_padded_orchard_proof_is_rejected_on_deserialize() {
+    let _init_guard = zebra_test::init();
+
+    let orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_tx = |orchard_shielded_data| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ironwood_shielded_data: None,
+    };
+
+    // Control: the same tx with a canonical proof must round-trip, so any
+    // rejection below is attributable to the padding, not the test vector.
+    let canonical_bytes = make_tx(orchard_shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("serialize");
+    Transaction::zcash_deserialize(&canonical_bytes[..])
+        .expect("v6 tx with a canonical Orchard proof round-trips");
+
+    let mut padded = orchard_shielded_data;
+    padded.proof.0.push(0);
+    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
+    Transaction::zcash_deserialize(&padded_bytes[..]).expect_err(
+        "v6 transaction with a padded Orchard proof must be rejected on deserialization",
     );
 }
 

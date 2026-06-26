@@ -380,6 +380,17 @@ impl Transaction {
             .intersects(orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS)
     }
 
+    /// Does this transaction have at least one flag when we have at least one
+    /// Ironwood action?
+    pub fn has_enough_ironwood_flags(&self) -> bool {
+        if self.version() < 6 || self.ironwood_actions().count() == 0 {
+            return true;
+        }
+        self.ironwood_flags()
+            .unwrap_or_else(ironwood::Flags::empty)
+            .intersects(ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS)
+    }
+
     /// Returns the [`CoinbaseSpendRestriction`] for this transaction,
     /// assuming it is mined at `spend_height`.
     pub fn coinbase_spend_restriction(

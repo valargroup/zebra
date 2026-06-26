@@ -147,14 +147,23 @@ pub fn has_enough_orchard_flags(tx: &Transaction) -> Result<(), TransactionError
     Ok(())
 }
 
+/// Check that Ironwood actions have at least one active flag.
+pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.has_enough_ironwood_flags() {
+        return Err(TransactionError::NotEnoughIronwoodFlags);
+    }
+    Ok(())
+}
+
 /// Checks that Orchard shielded data does not enable cross-address transfers.
 ///
-/// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool
-/// uses the Ironwood circuit in V6 transactions, but consensus still requires
-/// transactional Orchard bundles to keep cross-address transfers disabled.
-/// Ironwood shielded data is allowed to set this flag.
+/// PRE NU6.3, the flags do not contain this bit, as its unknown to the circuit.
+/// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool uses the Ironwood
+/// circuit in V6 transactions, but consensus still requires transactional Orchard bundles to keep
+/// cross-address transfers disabled. Ironwood shielded data is allowed to set this flag.
 pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
     if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+        // bit will not be set pre NU6.3, and must equal 0 in NU 6.3 onwards.
         if orchard_shielded_data
             .flags
             .contains(Flags::ENABLE_CROSS_ADDRESS)
@@ -176,6 +185,12 @@ pub fn shielded_proof_size_is_canonical(
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
             if !orchard_shielded_data.proof_size_is_canonical() {
                 return Err(TransactionError::OrchardProofSize);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if !ironwood_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::IronwoodProofSize);
             }
         }
     }
@@ -211,6 +226,12 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
             if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
                 return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if ironwood_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+                return Err(TransactionError::CoinbaseHasEnableSpendsIronwood);
             }
         }
     }
@@ -306,10 +327,15 @@ pub fn disabled_add_to_orchard_pool(
 
 /// Check that a coinbase transaction has no Orchard shielded bundle after NU6.3.
 ///
-/// From NU6.3 onward, shielded coinbase outputs use the Ironwood pool instead
-/// of the Orchard pool. This structural rule is distinct from
-/// [`disabled_add_to_orchard_pool`], which only rejects net additions to the
-/// Orchard pool.
+/// From NU6.3 (Ironwood) onward, the Orchard chain pool is closed to new value: shielded
+/// coinbase output flows through the Ironwood pool instead. A coinbase Orchard bundle could
+/// only carry outputs (coinbase transactions cannot enable Orchard spends), so it would
+/// inject net new value into the Orchard pool and is forbidden structurally, regardless of
+/// its `valueBalanceOrchard`. This is distinct from [`disabled_add_to_orchard_pool`], which
+/// only rejects a negative net value balance; an outputs-only coinbase bundle with
+/// `valueBalanceOrchard >= 0` would otherwise pass that rule.
+///
+/// Pre-NU6.3 coinbase transactions with Orchard outputs remain valid.
 pub fn coinbase_has_no_orchard_shielded_data(
     tx: &Transaction,
     height: Height,
@@ -353,11 +379,13 @@ pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError
     let sprout_nullifiers = transaction.sprout_nullifiers().map(Cow::Borrowed);
     let sapling_nullifiers = transaction.sapling_nullifiers().map(Cow::Borrowed);
     let orchard_nullifiers = transaction.orchard_nullifiers().map(Cow::Borrowed);
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Borrowed);
 
     check_for_duplicates(transparent_outpoints, DuplicateTransparentSpend)?;
     check_for_duplicates(sprout_nullifiers, DuplicateSproutNullifier)?;
     check_for_duplicates(sapling_nullifiers, DuplicateSaplingNullifier)?;
     check_for_duplicates(orchard_nullifiers, DuplicateOrchardNullifier)?;
+    check_for_duplicates(ironwood_nullifiers, DuplicateIronwoodNullifier)?;
 
     Ok(())
 }

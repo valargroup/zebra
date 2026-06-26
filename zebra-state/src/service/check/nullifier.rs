@@ -119,6 +119,9 @@ where
     )
 }
 
+// Ironwood reuses `orchard::Nullifier` (`ironwood::Nullifier` is a re-export), so it
+// can't have its own `impl DuplicateNullifierError` without conflicting with the Orchard
+// impl (E0119). Its pool is distinguished at the call site via the `*_with` helpers below.
 fn duplicate_ironwood_nullifier_error(
     nullifier: &ironwood::Nullifier,
     in_finalized_state: bool,
