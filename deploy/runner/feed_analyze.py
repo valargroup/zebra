@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Steady-state bottleneck attribution for feed_run.sh CSVs.
+"""Steady-state commit-pipeline attribution for feed_run.sh CSVs.
 
-Per-block timings from the monotonic histogram sum/count columns
-(1000*dsum/dcount = ms/block), committer utilization, download/verify latency,
-the obtain-tips cadence, and a burst-vs-gap decomposition of committer-idle time
-(the step-1 question: is the idle bandwidth-limited or obtain-tips scheduling?).
+Reports the note-commitment commit pipeline that gates the single-writer:
+the CPU compute phases (checkpoint_compute = commitment_check ∥ update_trees,
+then history_push) and the DB phases (spent-UTXO reads, address reads, batch
+build, rocksdb write). Per-block times come from the histogram sum/count deltas
+(1000*Δsum/Δcount = ms/block). Throughput is the height rate; supply health is
+the Zakura overlay (peers / queue depth / block-sync streams).
 
 Usage: feed_analyze.py CSV [h_lo h_hi]
   No window -> steady-state middle 60% of rows (skips warm-up + final flush).
@@ -28,14 +30,13 @@ def window_indices(rows, h_lo, h_hi):
     return lo, hi
 
 def per_block(a, b, key):
+    """ms per block from a monotonic histogram's sum/count columns."""
     ds = fnum(b, key+"_sum") - fnum(a, key+"_sum")
     dc = fnum(b, key+"_cnt") - fnum(a, key+"_cnt")
     return (1000.0*ds/dc) if dc > 0 else 0.0
 
-def avg_event(a, b, key):  # seconds per event (download/verify latency)
-    ds = fnum(b, key+"_sum") - fnum(a, key+"_sum")
-    dc = fnum(b, key+"_cnt") - fnum(a, key+"_cnt")
-    return (ds/dc) if dc > 0 else 0.0, dc
+def avg(rows, key):
+    return sum(fnum(r, key) for r in rows)/len(rows) if rows else 0.0
 
 def main():
     if len(sys.argv) < 2:
@@ -54,91 +55,70 @@ def main():
     blk_s = dh/dt if dt > 0 else 0
     ms_per_block = 1000.0/blk_s if blk_s > 0 else 0
 
-    commit_busy = per_block(a, b, "commit")
-    util = commit_busy/ms_per_block if ms_per_block > 0 else 0
+    # commit CPU phases (commitment_check ∥ update_trees run in parallel inside
+    # checkpoint_compute; history_push joins them — so ckc is the compute wall time).
+    cc  = per_block(a,b,"cc")    # commitment_check
+    ut  = per_block(a,b,"ut")    # update_trees (note-commitment trees)
+    hp  = per_block(a,b,"hp")    # history MMR push
+    ckc = per_block(a,b,"ckc")   # checkpoint_compute (compute wall: cc∥ut + hp)
+    # commit DB phases (sequential on the writer's critical path).
+    sur = per_block(a,b,"sur")   # spent-UTXO reads (∥ raw-tx serialize)
+    ar  = per_block(a,b,"ar")    # address-balance reads
+    bp  = per_block(a,b,"bp")    # batch build (prepare_block_batch)
+    bc  = per_block(a,b,"bc")    # rocksdb batch write
+    btx = per_block(a,b,"btx")   # mean tx / block (block_tx_count histogram)
 
-    verifier  = per_block(a,b,"eq") + per_block(a,b,"mk")
-    cpu_tree  = per_block(a,b,"ut")
-    cpu_check = per_block(a,b,"cc")
-    cpu_bprep = per_block(a,b,"bp")
-    db_reads  = per_block(a,b,"pr")
-    db_write  = per_block(a,b,"dc")
-    wblock    = per_block(a,b,"wbt")
+    commit_wall = ckc + sur + ar + bp + bc          # writer per-block busy time
+    util = commit_wall/ms_per_block if ms_per_block > 0 else 0
+    db_total  = sur + ar + bp + bc
+    cpu_total = ckc
 
-    dl = fnum(b,"downloaded") - fnum(a,"downloaded")
-    dl_s = dl/dt if dt > 0 else 0
-    in_flight = sum(fnum(r,"in_flight") for r in win)/len(win)
-    dld_lat, dld_n = avg_event(a,b,"dld")     # s per block download
-    vfy_lat, vfy_n = avg_event(a,b,"vfy")     # s per verify completion
-    obt_rounds = fnum(b,"obt_cnt") - fnum(a,"obt_cnt")
-    ext_rounds = fnum(b,"ext_cnt") - fnum(a,"ext_cnt")
-    net_in = (fnum(b,"net_in_bytes")-fnum(a,"net_in_bytes"))/dt/1e6 if dt>0 else 0
-    peers = sum(fnum(r,"peers") for r in win)/len(win)
-    qd = sum(fnum(r,"qdepth") for r in win)/len(win)
+    # committed batch size -> write throughput (separates block size from disk speed).
+    bb_ds = fnum(b,"bb_sum") - fnum(a,"bb_sum"); bb_dc = fnum(b,"bb_cnt") - fnum(a,"bb_cnt")
+    mb_per_block = (bb_ds/bb_dc/1e6) if bb_dc > 0 else 0.0
+    write_mbps   = (bb_ds/dt/1e6)    if dt > 0 else 0.0
+    ms_per_mb    = (bc/mb_per_block)  if mb_per_block > 0 else 0.0
 
-    # burst-vs-gap: 5s samples with near-zero blk_s are obtain-tips/stall gaps.
+    vf = fnum(b,"vct_fast")   - fnum(a,"vct_fast")
+    vl = fnum(b,"vct_legacy") - fnum(a,"vct_legacy")
+    peers = avg(win,"zk_peers"); qd = avg(win,"zk_qdepth"); bss = avg(win,"zk_bs_streams")
+    cores = avg(win,"cpu_cores")
+
     bps = [fnum(r,"blk_s") for r in win]
-    gaps = [x for x in bps if x < 5]
-    active = [x for x in bps if x >= 5]
-    gap_frac = len(gaps)/len(bps) if bps else 0
-    burst = sum(active)/len(active) if active else 0
+    gap_frac = (sum(1 for x in bps if x < 5)/len(bps)) if bps else 0
+    burst = (sum(x for x in bps if x >= 5)/max(1,sum(1 for x in bps if x >= 5)))
 
     print(f"window: height {fnum(a,'height'):.0f} -> {fnum(b,'height'):.0f}  "
           f"({dh:.0f} blocks, {dt:.0f}s, {len(win)} samples)")
-    print(f"throughput: {blk_s:.1f} blk/s  ({ms_per_block:.2f} ms/block wall)\n")
+    print(f"throughput: {blk_s:.1f} blk/s  ({ms_per_block:.2f} ms/block wall)   "
+          f"VCT fast/legacy: {vf:.0f}/{vl:.0f}   block size ~{btx:.0f} tx\n")
 
-    # commit sub-phases that make up committer-busy beyond note_tree + write_block
-    ckc = per_block(a,b,"ckc")   # checkpoint_compute = compute scope + history_push
-    ttr = per_block(a,b,"ttr")   # parent treestate read + clone (subset of prep)
-    hpu = per_block(a,b,"hpu")   # history-MMR push (+ root computation), subset of ckc
-    rtc = per_block(a,b,"rtc")   # result note-trees clone
-    prp = per_block(a,b,"prp")   # all setup before the compute scope (umbrella; incl. ttr)
-    wbi = per_block(a,b,"wbi")   # write_block install wrapper (incl. write_block_total)
-    pst = per_block(a,b,"pst")   # post-write bookkeeping
-    # Non-overlapping accounting: prep + checkpoint_compute + write_block_install + post.
-    # (ttr is inside prep; hpu inside ckc; write_block_total inside wbi.)
-    install_overhead = wbi - wblock
-    scope_overhead = ckc - cpu_tree - cpu_check - hpu
-    accounted = prp + ckc + wbi + pst
-    other = commit_busy - accounted
-    print(f"COMMITTER  busy={commit_busy:.2f} ms/blk  util={util*100:.0f}%  "
-          f"queue_depth~{qd:.0f}")
-    print(f"  prep={prp:.2f} (tip_trees_read={ttr:.2f})  "
-          f"checkpoint_compute={ckc:.2f} (note_tree={cpu_tree:.2f} history_push={hpu:.2f} scope_overhead={scope_overhead:.2f})")
-    print(f"  write_block_install={wbi:.2f} (write_block={wblock:.2f} install_overhead={install_overhead:.2f})  "
-          f"post={pst:.2f}  result_trees_clone={rtc:.2f}")
-    print(f"  accounted={accounted:.2f}  unattributed={other:.2f} ms/blk")
-    print(f"  >> total per-block rayon install overhead ~= scope_overhead + install_overhead "
-          f"= {scope_overhead+install_overhead:.2f} ms (the double-install cost)\n")
+    print(f"COMMIT pipeline  busy={commit_wall:.2f} ms/blk  util={util*100:.0f}% of wall  cpu~{cores:.1f} cores")
+    print(f"  CPU {cpu_total:.2f}   checkpoint_compute={ckc:.2f}  "
+          f"(commitment_check={cc:.2f} ∥ note_tree={ut:.2f}, history_push={hp:.2f})")
+    print(f"  DB  {db_total:.2f}   spent_utxo_reads={sur:.2f}  address_reads={ar:.2f}  "
+          f"batch_prep={bp:.2f}  rocksdb_write={bc:.2f}")
+    print(f"  write  {mb_per_block:.3f} MB/block  {write_mbps:.1f} MB/s  "
+          f"(rocksdb_write = {ms_per_mb:.1f} ms/MB)")
 
-    print("per-block cost by category (ms/block):")
-    print(f"  NETWORK    in={net_in:.1f} MB/s  peers~{peers:.0f}")
-    print(f"  DOWNLOAD   {dl_s:.1f} blk/s delivered  per-block latency={dld_lat*1000:.0f} ms  in_flight~{in_flight:.0f}")
-    print(f"  VERIFIER   cpu {verifier:.2f} ms/blk (eq+mk)   verify-call latency={vfy_lat:.1f} s (batch/queue, n={vfy_n:.0f})")
-    print(f"  COMMIT_CPU {cpu_tree+cpu_check+cpu_bprep:.2f}   "
-          f"(note_tree={cpu_tree:.2f} commit_check={cpu_check:.2f} batch_prep={cpu_bprep:.2f})")
-    print(f"  COMMIT_DB  {db_reads+db_write:.2f}   "
-          f"(prep_reads={db_reads:.2f} rocksdb_write={db_write:.2f})")
-
-    print(f"\nCADENCE    obtain rounds={obt_rounds:.0f}  extend rounds={ext_rounds:.0f}  "
-          f"(~500 hashes/round)")
+    print(f"\nZAKURA supply: peers~{peers:.0f}  queue_depth~{qd:.0f}  block_sync_streams~{bss:.0f}")
     print(f"           burst rate={burst:.0f} blk/s during active samples; "
-          f"gap (blk_s<5) fraction={gap_frac*100:.0f}% of wall")
+          f"idle (blk_s<5) fraction={gap_frac*100:.0f}% of wall")
 
     # verdict
-    if util >= 0.85:
-        stages = {"VERIFIER":verifier,"COMMIT_CPU_note_tree":cpu_tree,
-                  "COMMIT_CPU_batch_prep":cpu_bprep,"COMMIT_DB_reads":db_reads,
-                  "COMMIT_DB_write":db_write}
-        top = max(stages, key=stages.get)
-        v = f"COMMIT-BOUND, dominant phase: {top} ({stages[top]:.2f} ms/blk)"
-    elif gap_frac > 0.30 and dld_lat < 1.0:
-        v = (f"SCHEDULING-BOUND: committer starved ({util*100:.0f}% util), but per-block "
-             f"download is fast ({dld_lat*1000:.0f} ms) and {gap_frac*100:.0f}% of wall is "
-             f"obtain-tips gaps. The cadence (tip discovery / batch handoff), not bandwidth, gates it.")
+    phases = {"checkpoint_compute(note_tree+history)":ckc, "spent_utxo_reads":sur,
+              "address_reads":ar, "batch_prep":bp, "rocksdb_write":bc}
+    top, topv = max(phases.items(), key=lambda kv: kv[1])
+    if util >= 0.70:
+        v = (f"COMMIT-BOUND ({util*100:.0f}% writer util) — dominant phase: {top} "
+             f"({topv:.2f} ms/blk). CPU {cpu_total:.2f} vs DB {db_total:.2f} ms/blk.")
+    elif gap_frac > 0.30:
+        v = (f"SUPPLY-BOUND — the writer is only {util*100:.0f}% busy and {gap_frac*100:.0f}% "
+             f"of wall has ~no progress: the Zakura cohort isn't delivering blocks fast "
+             f"enough to keep the committer fed (queue_depth~{qd:.0f}).")
     else:
-        v = (f"BANDWIDTH/LATENCY-BOUND: committer starved ({util*100:.0f}% util), download "
-             f"delivers {dl_s:.0f} blk/s at {dld_lat*1000:.0f} ms/block, in_flight~{in_flight:.0f}.")
+        v = (f"BALANCED — writer {util*100:.0f}% busy, no large idle gaps; "
+             f"heaviest commit phase is {top} ({topv:.2f} ms/blk).")
     print(f"\nVERDICT: {v}")
 
 if __name__ == "__main__":

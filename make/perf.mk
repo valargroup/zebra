@@ -11,6 +11,7 @@
 	perf-build-local \
 	perf-run \
 	perf-analyze \
+	perf-logs \
 	perf-dashboard \
 	perf-verify-isolation \
 	perf-seed-serving \
@@ -22,9 +23,9 @@ PERF_SH ?= $(CURDIR)/deploy/runner/perf.sh
 
 # perf-run / perf-analyze parameters (override on the command line).
 PERF_LABEL ?= r1
-PERF_STOP  ?= 1822000
-PERF_LO    ?= 1806000
-PERF_HI    ?= 1820000
+PERF_STOP  ?= 1900000
+PERF_LO    ?= 1810000
+PERF_HI    ?= 1895000
 
 # Build the instrumented (commit-metrics) local bench binary -> $BENCH_BIN.
 perf-build-local:
@@ -37,6 +38,11 @@ perf-run:
 # Steady-state bottleneck attribution over the CSV window [PERF_LO, PERF_HI].
 perf-analyze:
 	"$(PERF_SH)" analyze $(PERF_LABEL) $(PERF_LO) $(PERF_HI)
+
+# Follow the running bench node's log (byte-budget drift spam filtered).
+# Pass RAW=1 to include everything, LINES=N for a different backlog size.
+perf-logs:
+	"$(PERF_SH)" logs $(PERF_LABEL)
 
 # Live metrics dashboard (auto-detects the running bench node's metrics port).
 perf-dashboard:
