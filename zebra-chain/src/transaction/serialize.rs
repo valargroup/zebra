@@ -1171,6 +1171,9 @@ impl ZcashDeserialize for Transaction {
             }
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
+                // Transaction V6 spec:
+                // https://zips.z.cash/zip-0229
+
                 // Denoted as `nVersionGroupId` in the spec.
                 let id = limited_reader.read_u32::<LittleEndian>()?;
                 if id != TX_V6_VERSION_GROUP_ID {
