@@ -197,6 +197,8 @@ impl fmt::Display for Transaction {
         fmter.field("sapling_outputs", &self.sapling_outputs().count());
         fmter.field("orchard_actions", &self.orchard_actions().count());
 
+        fmter.field("unmined_id", &self.unmined_id());
+
         fmter.finish()
     }
 }
