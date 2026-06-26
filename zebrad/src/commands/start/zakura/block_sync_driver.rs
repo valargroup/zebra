@@ -729,7 +729,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
+pub(super) async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: Arc<block::Block>,
     class: BlockApplyClass,
@@ -1354,7 +1354,7 @@ fn trace_block_range_finished(
     );
 }
 
-fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
+pub(super) fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
     match class {
         BlockApplyClass::Checkpoint => "checkpoint",
         BlockApplyClass::Full => "full",

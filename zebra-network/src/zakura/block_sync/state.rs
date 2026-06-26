@@ -243,6 +243,21 @@ impl BlockSyncHandle {
         self.apply_executor.send_replace(Some(executor));
     }
 
+    /// Report a Committer-side commit rejection (consensus-invalid body or apply
+    /// timeout) back to the Sequencer.
+    ///
+    /// The Sequencer rolls the download floor back below the failed height, drops
+    /// the body and every successor, and — for [`CommitRejection::Invalid`] —
+    /// scores the delivering peer. A no-op for the inert/handle-less constructors
+    /// that never spawn a Sequencer (no routine wiring).
+    pub fn report_commit_rejected(&self, reset: CommitterReset) {
+        if let Some(wiring) = self.routine_wiring.as_ref() {
+            let _ = wiring
+                .sequencer_control
+                .send(super::sequencer_task::SequencerControlInput::CommitRejected(reset));
+        }
+    }
+
     /// Return the currently cached peer slot snapshot.
     pub fn peer_snapshot(&self) -> ServicePeerSnapshot {
         *self.peers.borrow()

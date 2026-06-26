@@ -31,8 +31,8 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 /// flowing to trigger the inline check (e.g. once outstanding requests drain).
 const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 
-const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
+const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 600;
 
 /// Emit a `block_commit_progress` rollup at most once per this many committed
 /// bodies. Bounds row volume during fast checkpoint sync (≈ committed_blocks /
@@ -351,6 +351,13 @@ pub(super) enum SequencerControlInput {
         needed_bytes: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// The Committer rejected a body (consensus-invalid or apply-timeout). Roll the
+    /// download floor back below the failed height, drop the body and every
+    /// successor (reorder + the held-until-durable ledger + the work queue above
+    /// the rolled-back floor), and — for [`CommitRejection::Invalid`] — score the
+    /// delivering peer. This is the relocated reject/timeout tail of the former
+    /// inline apply-completion path, now driven by the out-of-task Committer.
+    CommitRejected(CommitterReset),
 }
 
 /// The committed view the reactor reacts to. A `watch` (latest-wins) send never
@@ -811,7 +818,56 @@ impl SequencerTask {
                 let _ = reply.send(self.budget.available() >= needed_bytes);
                 shed
             }
+            SequencerControlInput::CommitRejected(reset) => {
+                self.handle_commit_rejected(reset).await
+            }
         }
+    }
+
+    /// Relocated reject/timeout floor-rollback (formerly the tail of
+    /// `handle_apply_finished`), now triggered by the out-of-task Committer.
+    ///
+    /// Drops the rejected body and every successor (the held-until-durable ledger,
+    /// the reorder buffer, and the work queue above the rolled-back floor), rolls
+    /// the download floor back below the failed height so it is re-requestable, and
+    /// scores the delivering peer for a consensus-invalid body (never for a local
+    /// apply timeout).
+    ///
+    /// Guarded on the height still being live above the verified tip: a height
+    /// already dropped by a lower reset, or already committed by a coalesced durable
+    /// advance, is a no-op. This makes lowest-reset-wins fall out regardless of the
+    /// order completions resolve in. (Phase 3 adds a per-height epoch to the held
+    /// ledger so a stale completion from a superseded generation is also ignored;
+    /// `reset.epoch` is reserved for that and unused here.)
+    async fn handle_commit_rejected(&mut self, reset: CommitterReset) -> bool {
+        let height = reset.height;
+        if height <= self.sequencer.verified_tip() || self.sequencer.applying_hash(height).is_none()
+        {
+            return false;
+        }
+
+        let released = self.sequencer.release_applying_blocks_from(height);
+        self.budget.release(released);
+        self.sequencer.reset_floor_below(height);
+        let released = self.work.reset_above(self.sequencer.floor());
+        self.budget.release(released);
+        let dropped = self.sequencer.drop_reorder_from(height);
+        self.budget.release(dropped);
+
+        if matches!(reset.rejection, CommitRejection::Invalid) {
+            Self::send_action(
+                self.actions.clone(),
+                self.action_send_timeout,
+                BlockSyncAction::Misbehavior {
+                    peer: reset.source_peer.clone(),
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                },
+            )
+            .await;
+        }
+
+        self.release_contiguous_blocks().await;
+        true
     }
 
     fn release_body_input_bytes(&self, bytes: u64) {

@@ -30,14 +30,14 @@ use crate::{
 
 /// Cadence of the off-hot-path frontier read in `coalesced` mode (matches the
 /// sequencer's `CHECKPOINT_FRONTIER_REFRESH_INTERVAL`).
-const COALESCED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const COALESCED_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Where the post-commit frontier read happens relative to the apply slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum FrontierRead {
     /// Never read the durable frontier (models the optimistic-verified-tip ideal).
     None,
-    /// Read off the hot path on a 5s cadence (models the shipped coalesce).
+    /// Read off the hot path on a 200ms cadence (models the shipped coalesce).
     Coalesced,
     /// Read inside each apply, holding the slot (models the pre-coalesce baseline).
     PerBlock,
@@ -194,7 +194,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // 3. Optional trace sink (real block_sync.jsonl rollups).
     let mut bench_trace = BenchTrace::new(args.trace_dir.as_deref())?;
 
-    // Coalesced mode reads the durable frontier off the hot path on a 5s cadence,
+    // Coalesced mode reads the durable frontier off the hot path on a 200ms cadence,
     // modeling the read *load* the shipped change keeps (without holding the slot).
     let coalesced_reader = if matches!(args.frontier_read, FrontierRead::Coalesced) {
         let read_state = read_state.clone();

@@ -3504,7 +3504,7 @@ async fn sequencer_coalesces_checkpoint_frontier_refreshes() {
     .await
     .expect("checkpoint completions release submitted apply slots");
 
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_millis(200)).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             view_rx.changed().await.expect("view sender remains live");
@@ -3521,7 +3521,7 @@ async fn sequencer_coalesces_checkpoint_frontier_refreshes() {
             .lock()
             .expect("test refresh call mutex is not poisoned")
             .as_slice(),
-        &[(block::Height(0), 24)],
+        &[(block::Height(0), 600)],
         "multiple checkpoint completions before the deadline share one refresh baseline",
     );
 
