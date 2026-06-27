@@ -1922,7 +1922,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
 }
 
 #[test]
-fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
+fn shed_top_until_available_funds_lowest_pending_by_dropping_top() {
     let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
     // Budget holds exactly two worst-case blocks, both consumed by buffered bodies
     // (heights 5 and 6). Height 1 — the commit-unblocking floor gap — is pending
@@ -1956,11 +1956,12 @@ fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
     assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
     assert!(work.pending_contains(block::Height(1)));
 
-    // Shedding drops the top buffered body (6) — the one furthest from the floor —
-    // releasing its budget and returning its height to `pending` for later
-    // re-fetch, so the lower floor-gap request can now be funded. Without this the
-    // budget stays full and height 1 can never be requested (the wedge).
-    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
+    // The explicit floor-reservation rescue drops the top buffered body (6) — the
+    // one furthest from the floor — releasing its budget and returning its height
+    // to `pending` for later re-fetch, so the lower floor-gap request can now be
+    // funded. Without this the budget stays full and height 1 can never be
+    // requested (the wedge).
+    let shed = super::sequencer_task::shed_top_until_available(&mut budget, &work, &mut seq, worst);
     assert!(shed, "the top buffered body is shed");
     assert!(
         budget.available() >= worst,
@@ -1977,6 +1978,65 @@ fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
     assert!(
         work.pending_contains(block::Height(1)),
         "the floor gap is still pending and now fundable"
+    );
+    assert!(
+        work.pending_contains(block::Height(6)),
+        "the evicted height is returned to pending for re-fetch"
+    );
+}
+
+#[test]
+fn shed_top_until_available_funds_outstanding_floor_by_dropping_top() {
+    let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
+    let mut budget = ByteBudget::new(2 * worst);
+    let work = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Unknown),
+            needed(5, BlockSizeEstimate::Unknown),
+            needed(6, BlockSizeEstimate::Unknown),
+        ],
+    );
+    let mut seq = test_sequencer(0, 100);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+
+    // Height 1 is outstanding on a slow peer, so it is not pending. The top
+    // reorder bodies saturate the budget and must still be shed to make the
+    // floor retry fundable.
+    work.take_in_range(block::Height(1), block::Height(1), 1);
+    for height in [5u32, 6] {
+        work.take_in_range(block::Height(height), block::Height(height), 1);
+        assert!(budget.try_reserve(worst));
+        seq.accept_body(
+            block::Height(height),
+            block::Hash([height as u8; 32]),
+            block.clone(),
+            worst,
+            peer(0),
+        );
+    }
+    assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
+    assert!(
+        !work.pending_contains(block::Height(1)),
+        "the floor gap is outstanding, not pending"
+    );
+
+    let shed = super::sequencer_task::shed_top_until_available(&mut budget, &work, &mut seq, worst);
+    assert!(
+        shed,
+        "the top buffered body is shed even while the floor gap is outstanding"
+    );
+    assert!(
+        budget.available() >= worst,
+        "freed budget can now fund the floor retry"
+    );
+    assert!(
+        !seq.reorder_contains(block::Height(6)),
+        "the top body is evicted"
+    );
+    assert!(
+        seq.reorder_contains(block::Height(5)),
+        "the lower buffered body is kept"
     );
     assert!(
         work.pending_contains(block::Height(6)),
