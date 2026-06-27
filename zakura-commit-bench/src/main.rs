@@ -13,8 +13,12 @@ use color_eyre::eyre::Result;
 
 mod fetch;
 mod metrics_rec;
+mod mode;
+mod range;
+mod roots;
 mod run;
 mod snapshot;
+mod state_dir;
 mod stats;
 mod validate_cache;
 
@@ -59,6 +63,6 @@ async fn main() -> Result<()> {
         Command::Snapshot(args) => snapshot::run(args).await,
         Command::Fetch(args) => fetch::run(args).await,
         Command::Run(args) => run::run(args).await,
-        Command::ValidateCache(args) => validate_cache::run(args),
+        Command::ValidateCache(args) => validate_cache::run(args).await,
     }
 }

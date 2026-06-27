@@ -7,7 +7,13 @@ use color_eyre::eyre::{bail, eyre, Result, WrapErr};
 
 use zebra_chain::{block, serialization::ZcashDeserializeInto};
 
-use crate::fetch::{block_path, roots_path, CachedRoots};
+use crate::{
+    fetch::block_path,
+    mode::RunMode,
+    range::{parse_network, plan_checkpoint_range},
+    roots::parse_cached_roots,
+    state_dir::planning_tip_from_state_dir,
+};
 
 #[derive(Args, Debug)]
 pub struct ValidateArgs {
@@ -27,29 +33,32 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub end: Option<u32>,
 
+    /// Replay mode to plan for when using `--state-dir`.
+    #[arg(long, value_enum, default_value_t = RunMode::DirectVerifier)]
+    pub mode: RunMode,
+
+    /// Existing Zebra state cache dir whose finalized tip anchors planned ranges.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// Network (mainnet only for now; the embedded checkpoint list is per-network).
+    #[arg(long, default_value = "mainnet")]
+    pub network: String,
+
     /// Also require and validate cached `z_gettreestate` roots for each height.
     #[arg(long, default_value_t = false)]
     pub with_roots: bool,
 }
 
-pub fn run(args: ValidateArgs) -> Result<()> {
-    if args.end.is_none() && args.blocks == 0 {
-        bail!("--blocks must be greater than 0 when --end is not supplied");
-    }
-
-    let end = args
-        .end
-        .unwrap_or_else(|| args.start.saturating_add(args.blocks).saturating_sub(1));
-    if end < args.start {
-        bail!("--end ({end}) must be >= --start ({})", args.start);
-    }
+pub async fn run(args: ValidateArgs) -> Result<()> {
+    let (start, end) = planned_validate_range(&args).await?;
 
     let mut total_bytes = 0u64;
     let mut previous_hash = None;
     let mut first_hash = None;
     let mut last_hash = None;
 
-    for height in args.start..=end {
+    for height in start..=end {
         let path = block_path(&args.cache_dir, height);
         let bytes = std::fs::read(&path)
             .wrap_err_with(|| format!("missing cached block {height} at {}", path.display()))?;
@@ -82,12 +91,12 @@ pub fn run(args: ValidateArgs) -> Result<()> {
         );
 
         if args.with_roots {
-            validate_roots(&args.cache_dir, height)?;
+            parse_cached_roots(&args.cache_dir, block::Height(height))?;
         }
     }
 
-    let count = u64::from(end.saturating_sub(args.start)) + 1;
-    println!("cache OK:       {}..={end} ({count} blocks)", args.start);
+    let count = u64::from(end.saturating_sub(start)) + 1;
+    println!("cache OK:       {start}..={end} ({count} blocks)");
     println!("cache dir:      {}", args.cache_dir.display());
     // This lossy cast is only for human-readable MiB output, not validation logic.
     println!(
@@ -104,30 +113,40 @@ pub fn run(args: ValidateArgs) -> Result<()> {
     Ok(())
 }
 
-fn validate_roots(cache_dir: &std::path::Path, height: u32) -> Result<()> {
-    let path = roots_path(cache_dir, height);
-    let raw = std::fs::read(&path)
-        .wrap_err_with(|| format!("missing cached roots {height} at {}", path.display()))?;
-    let roots: CachedRoots = serde_json::from_slice(&raw)
-        .wrap_err_with(|| format!("cached roots {height} failed to parse"))?;
-    let sapling = roots
-        .sapling
-        .ok_or_else(|| eyre!("cached roots {height} has no sapling finalRoot"))?;
-    validate_root_hex("sapling", height, &sapling)?;
-    if let Some(orchard) = roots.orchard {
-        validate_root_hex("orchard", height, &orchard)?;
+async fn planned_validate_range(args: &ValidateArgs) -> Result<(u32, u32)> {
+    if let Some(end) = args.end {
+        if end < args.start {
+            bail!("--end ({end}) must be >= --start ({})", args.start);
+        }
+        return Ok((args.start, end));
     }
-    Ok(())
-}
 
-fn validate_root_hex(pool: &str, height: u32, hex: &str) -> Result<()> {
-    let raw = hex::decode(hex.trim())
-        .wrap_err_with(|| format!("cached {pool} root {height} is not hex"))?;
-    if raw.len() != 32 {
-        bail!(
-            "cached {pool} root {height} is {} bytes, expected 32",
-            raw.len()
-        );
+    if args.blocks == 0 {
+        bail!("--blocks must be greater than 0 when --end is not supplied");
     }
-    Ok(())
+
+    if let Some(state_dir) = &args.state_dir {
+        let network = parse_network(&args.network)?;
+        let state_tip = planning_tip_from_state_dir(state_dir, &network).await?;
+        let plan = plan_checkpoint_range(
+            &network,
+            Some(state_tip),
+            args.blocks,
+            args.mode,
+            args.with_roots,
+        )?;
+        tracing::info!(
+            state_tip = state_tip.0,
+            requested_last = plan.requested_last,
+            measured_checkpoint = plan.measured_checkpoint.0,
+            load_checkpoint = plan.load_checkpoint.0,
+            "planned validate-cache range from state dir"
+        );
+        return Ok((plan.first_height, plan.load_checkpoint.0));
+    }
+
+    Ok((
+        args.start,
+        args.start.saturating_add(args.blocks).saturating_sub(1),
+    ))
 }

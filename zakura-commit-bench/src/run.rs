@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{buffer::Buffer, util::BoxService, ServiceExt};
 
 use zebra_chain::{
-    block, orchard, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network, sapling,
+    block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network,
     serialization::ZcashDeserializeInto,
 };
 use zebra_jsonl_trace::{JsonlTraceConfig, JsonlTracer, JsonlWriteEvent};
@@ -31,27 +31,13 @@ use zebra_network::zakura::{
 };
 
 use crate::{
-    fetch::{block_path, roots_path, CachedRoots},
+    fetch::block_path,
+    mode::RunMode,
+    range::{parse_network, plan_checkpoint_range},
+    roots::parse_cached_roots,
+    state_dir::{check_state_dir_not_used, exact_fetch_command, mark_used},
     stats::Stats,
 };
-
-/// Which replay path the benchmark should use.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum RunMode {
-    /// Current benchmark path: cached blocks go straight into the real verifier/state stack.
-    DirectVerifier,
-    /// Full replay path: cached bodies feed block-sync peers, the sequencer, applyQ, and Committer.
-    ApplyQueue,
-}
-
-impl RunMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::DirectVerifier => "direct-verifier",
-            Self::ApplyQueue => "apply-queue",
-        }
-    }
-}
 
 /// Cadence of the off-hot-path frontier read in `coalesced` mode (matches the
 /// sequencer's `CHECKPOINT_FRONTIER_REFRESH_INTERVAL`).
@@ -115,19 +101,24 @@ pub struct RunArgs {
     /// post-NU5 (sandblasting) range without replaying from genesis.
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+
+    /// Allow benchmarking against a state dir that metadata says was already
+    /// mutated by a previous benchmark run.
+    #[arg(long, default_value_t = false)]
+    pub allow_used_state_dir: bool,
 }
 
 pub async fn run(args: RunArgs) -> Result<()> {
-    let network = match args.network.to_ascii_lowercase().as_str() {
-        "mainnet" => Network::Mainnet,
-        other => bail!("only --network mainnet is supported for now (got {other:?})"),
-    };
+    let network = parse_network(&args.network)?;
+    if let Some(state_dir) = &args.state_dir {
+        check_state_dir_not_used(state_dir, args.allow_used_state_dir)?;
+    }
 
     // Install the metrics recorder before the state registers its counters, so we
     // can read `state.vct.fast_path.hit/miss` at the end.
     let recorder = crate::metrics_rec::install();
 
-    let (checkpoint_list, max_checkpoint_height) =
+    let (_checkpoint_list, max_checkpoint_height) =
         zebra_consensus::router::init_checkpoint_list(zebra_consensus::Config::default(), &network);
 
     // Build state: a fresh ephemeral DB (commit from genesis), or hydrate from a
@@ -176,25 +167,37 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     // Cap the drive at the last reachable checkpoint above the anchor: the
     // verifier only commits a *complete* range to a checkpoint, so trailing
-    // blocks past it would queue forever. Mainnet checkpoints are every 400.
-    let first_height = initial_tip.map_or(0, |(h, _)| h.0.saturating_add(1));
-    let requested_last = block::Height(first_height.saturating_add(args.blocks).saturating_sub(1));
-    let last_committable = checkpoint_list
-        .max_height_in_range(block::Height(first_height)..=requested_last)
-        .ok_or_else(|| {
-            eyre!(
-                "blocks {first_height}..={} reach no checkpoint above the anchor; increase --blocks",
-                requested_last.0
-            )
-        })?;
+    // blocks past it would queue forever. In apply-queue + VCT fast-sync mode,
+    // also load one successor checkpoint range so the finalized writer can
+    // authenticate the last measured block's supplied tree roots.
+    let plan = plan_checkpoint_range(
+        &network,
+        initial_tip.map(|(height, _)| height),
+        args.blocks,
+        args.mode,
+        args.with_roots,
+    )?;
+    let first_height = plan.first_height;
+    let wait_target = plan.measured_checkpoint;
+    let load_target = plan.load_checkpoint;
     tracing::info!(
         first_height,
-        last = last_committable.0,
+        requested_last = plan.requested_last,
+        wait_target = wait_target.0,
+        load_target = load_target.0,
         "commit range (capped to a checkpoint boundary)"
     );
 
-    // Load contiguous blocks [first_height..=last_committable] from the cache.
-    let blocks = load_blocks(&args.cache_dir, first_height, last_committable.0)?;
+    // Load contiguous blocks [first_height..=load_target] from the cache.
+    let fetch_command = exact_fetch_command(
+        &args.cache_dir,
+        args.state_dir.as_deref(),
+        args.blocks,
+        args.mode,
+        args.with_roots,
+        &args.network,
+    );
+    let blocks = load_blocks(&args.cache_dir, first_height, load_target.0, &fetch_command)?;
     tracing::info!(
         count = blocks.len(),
         total_bytes = blocks.iter().map(|(_, _, b)| *b).sum::<u64>(),
@@ -203,6 +206,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     // Feed cached tree roots into the VCT fast path the same way production does:
     // commit the matching header range with one provisional root per header.
+    let preloaded_roots = if args.with_roots {
+        Some(load_roots(&args.cache_dir, &blocks, &fetch_command)?)
+    } else {
+        None
+    };
+
+    if let Some(state_dir) = &args.state_dir {
+        mark_used(state_dir, args.mode, wait_target, load_target)?;
+    }
+
     if args.with_roots {
         let Some((_, anchor)) = initial_tip else {
             bail!(
@@ -210,7 +223,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
                  above an existing snapshot tip"
             );
         };
-        preload_header_roots(&mut state_service, anchor, &blocks, &args.cache_dir).await?;
+        preload_header_roots(
+            &mut state_service,
+            anchor,
+            &blocks,
+            preloaded_roots.expect("--with-roots loaded roots"),
+        )
+        .await?;
     }
 
     let state = Buffer::new(state_service, 64);
@@ -225,6 +244,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
             chain_tip_change,
             initial_tip,
             blocks,
+            wait_target,
             max_checkpoint_height,
             recorder,
         )
@@ -341,6 +361,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     rollup.emit(&mut bench_trace); // flush the tail window
     let summary = stats.summary(started.elapsed());
     summary.print();
+    print_tip_targets(read_state.clone(), wait_target, load_target).await;
     report_fast_path(&recorder, args.with_roots);
     bench_trace.shutdown().await;
     Ok(())
@@ -356,6 +377,7 @@ async fn run_apply_queue<StateService>(
     chain_tip_change: zebra_state::ChainTipChange,
     initial_tip: Option<(block::Height, block::Hash)>,
     blocks: Vec<(block::Height, Arc<block::Block>, u64)>,
+    wait_target_height: block::Height,
     max_checkpoint_height: block::Height,
     recorder: crate::metrics_rec::BenchRecorder,
 ) -> Result<()>
@@ -395,7 +417,15 @@ where
         );
     }
 
-    let total_bytes = blocks.iter().map(|(_, _, bytes)| *bytes).sum::<u64>();
+    let measured_blocks = blocks
+        .iter()
+        .take_while(|(height, _, _)| *height <= wait_target_height)
+        .count();
+    let measured_bytes = blocks
+        .iter()
+        .take_while(|(height, _, _)| *height <= wait_target_height)
+        .map(|(_, _, bytes)| *bytes)
+        .sum::<u64>();
     let bench_trace = BenchTrace::new(args.trace_dir.as_deref(), args.mode)?;
     let trace = bench_trace.zakura_trace();
 
@@ -513,41 +543,56 @@ where
     tracing::info!(
         first = first_height.0,
         target = target_height.0,
+        wait_target = wait_target_height.0,
         disk_peers = args.disk_peers,
         concurrency = args.concurrency,
         "starting apply-queue commit benchmark"
     );
     let started = Instant::now();
-    wait_for_state_tip(read_state.clone(), target_height, shutdown.clone()).await?;
+    wait_for_state_tip(read_state.clone(), wait_target_height, shutdown.clone()).await?;
     let elapsed = started.elapsed();
 
     shutdown.cancel();
     for peer_task in peer_tasks {
         let _ = peer_task.await;
     }
-    let committed_marker = committer_task.await.unwrap_or(block::Height::MIN);
+    committer_task.abort();
+    let _ = committer_task.await;
     driver_task.abort();
     durable_task.abort();
     reactor_task.abort();
     consensus_tasks.state_checkpoint_verify_handle.abort();
+    let final_tip_height = match read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::Tip)
+        .await
+    {
+        Ok(zebra_state::ReadResponse::Tip(Some((height, _)))) => Some(height),
+        _ => None,
+    };
 
     println!("\n=== zakura-commit-bench summary ===");
     println!("mode:               {}", args.mode.as_str());
     println!("elapsed:            {:.3}s", elapsed.as_secs_f64());
-    println!("committed blocks:   {}", blocks.len());
+    println!("committed blocks:   {}", measured_blocks);
     println!(
         "committed bytes:    {} ({:.1} MiB)",
-        total_bytes,
-        total_bytes as f64 / (1024.0 * 1024.0)
+        measured_bytes,
+        measured_bytes as f64 / (1024.0 * 1024.0)
     );
     let secs = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     println!(
         "throughput:         {:.1} blk/s   {:.2} MiB/s",
-        blocks.len() as f64 / secs,
-        (total_bytes as f64 / (1024.0 * 1024.0)) / secs
+        measured_blocks as f64 / secs,
+        (measured_bytes as f64 / (1024.0 * 1024.0)) / secs
     );
-    println!("state tip:          {}", target_height.0);
-    println!("committer marker:   {}", committed_marker.0);
+    println!("measured tip:       {}", wait_target_height.0);
+    if let Some(final_tip_height) = final_tip_height {
+        println!("state tip:          {}", final_tip_height.0);
+    }
+    if target_height > wait_target_height {
+        println!("lookahead target:   {}", target_height.0);
+    }
     report_fast_path(&recorder, args.with_roots);
     bench_trace.shutdown().await;
     drop(peers);
@@ -678,14 +723,15 @@ fn load_blocks(
     cache_dir: &std::path::Path,
     lo: u32,
     hi: u32,
+    fetch_command: &str,
 ) -> Result<Vec<(block::Height, Arc<block::Block>, u64)>> {
     let mut blocks = Vec::with_capacity((hi.saturating_sub(lo) + 1) as usize);
     for height in lo..=hi {
         let path = block_path(cache_dir, height);
         let bytes = std::fs::read(&path).wrap_err_with(|| {
             format!(
-                "missing cached block {height} at {} — run `fetch` first",
-                path.display()
+                "missing cached block {height} at {}\nfetch the required range with:\n  {fetch_command}",
+                path.display(),
             )
         })?;
         let len = bytes.len() as u64;
@@ -701,14 +747,13 @@ async fn preload_header_roots<S>(
     state: &mut S,
     anchor: block::Hash,
     blocks: &[(block::Height, Arc<block::Block>, u64)],
-    cache_dir: &std::path::Path,
+    roots: Vec<BlockCommitmentRoots>,
 ) -> Result<()>
 where
     S: tower::Service<zebra_state::Request, Response = zebra_state::Response> + Send + 'static,
     S::Error: Into<tower::BoxError>,
     S::Future: Send,
 {
-    let roots = load_roots(cache_dir, blocks)?;
     if roots.len() != blocks.len() {
         bail!(
             "--with-roots needs one cached root file per replayed block: loaded {} roots for {} blocks",
@@ -772,55 +817,31 @@ where
 fn load_roots(
     cache_dir: &std::path::Path,
     blocks: &[(block::Height, Arc<block::Block>, u64)],
+    fetch_command: &str,
 ) -> Result<Vec<BlockCommitmentRoots>> {
     let mut roots = Vec::new();
     for (height, _, _) in blocks {
-        let path = roots_path(cache_dir, height.0);
-        let raw = std::fs::read(&path).wrap_err_with(|| {
-            format!(
-                "missing cached roots {} — run `fetch --with-roots` first",
-                path.display()
-            )
-        })?;
-        let cached: CachedRoots = serde_json::from_slice(&raw)
-            .wrap_err_with(|| format!("parsing cached roots {}", path.display()))?;
-        let sapling_hex = cached
-            .sapling
-            .ok_or_else(|| eyre!("cached roots {} has no sapling finalRoot", path.display()))?;
-        let sapling_root = parse_sapling_root(&sapling_hex)
-            .wrap_err_with(|| format!("sapling root {}", height.0))?;
-        let orchard_root = match cached.orchard {
-            Some(hex) => {
-                parse_orchard_root(&hex).wrap_err_with(|| format!("orchard root {}", height.0))?
-            }
-            None => orchard::tree::NoteCommitmentTree::default().root(),
-        };
-        roots.push(BlockCommitmentRoots {
-            height: *height,
-            sapling_root,
-            orchard_root,
-        });
+        roots.push(parse_cached_roots(cache_dir, *height).wrap_err_with(|| {
+            format!("fetch the required block roots with:\n  {fetch_command}")
+        })?);
     }
     Ok(roots)
 }
 
-fn decode_root_bytes(hex_str: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(hex_str.trim()).wrap_err("root hex decode")?;
-    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| eyre!("root hex was not 32 bytes"))
-}
-
-// z_gettreestate returns the root in display order (`root.reverse()` of the
-// internal bytes), so reverse it back before reconstructing the internal `Root`.
-fn parse_sapling_root(hex_str: &str) -> Result<sapling::tree::Root> {
-    let mut bytes = decode_root_bytes(hex_str)?;
-    bytes.reverse();
-    sapling::tree::Root::try_from(bytes).map_err(|e| eyre!("invalid sapling root: {e:?}"))
-}
-
-fn parse_orchard_root(hex_str: &str) -> Result<orchard::tree::Root> {
-    let mut bytes = decode_root_bytes(hex_str)?;
-    bytes.reverse();
-    orchard::tree::Root::try_from(bytes).map_err(|e| eyre!("invalid orchard root: {e:?}"))
+async fn print_tip_targets(
+    read_state: zebra_state::ReadStateService,
+    measured_target: block::Height,
+    lookahead_target: block::Height,
+) {
+    println!("measured tip:       {}", measured_target.0);
+    if let Ok(zebra_state::ReadResponse::Tip(Some((height, _)))) =
+        read_state.oneshot(zebra_state::ReadRequest::Tip).await
+    {
+        println!("state tip:          {}", height.0);
+    }
+    if lookahead_target > measured_target {
+        println!("lookahead target:   {}", lookahead_target.0);
+    }
 }
 
 /// Report whether the fed roots engaged the VCT fast path — the verification that

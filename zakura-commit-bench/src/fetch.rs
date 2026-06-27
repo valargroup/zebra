@@ -13,6 +13,12 @@ use serde_json::json;
 
 use zebra_chain::{block, serialization::ZcashDeserializeInto};
 
+use crate::{
+    mode::RunMode,
+    range::{parse_network, plan_checkpoint_range},
+    state_dir::planning_tip_from_state_dir,
+};
+
 #[derive(Args, Debug)]
 pub struct FetchArgs {
     /// JSON-RPC endpoint of a synced node (zebrad/zcashd), e.g. http://127.0.0.1:8232
@@ -31,9 +37,26 @@ pub struct FetchArgs {
     #[arg(long, default_value_t = 0)]
     pub start: u32,
 
-    /// Last height to fetch (inclusive).
-    #[arg(long, default_value_t = 19_999)]
-    pub end: u32,
+    /// Last height to fetch (inclusive). If supplied, fetches exactly
+    /// `--start..=--end` and does not add checkpoint lookahead.
+    #[arg(long)]
+    pub end: Option<u32>,
+
+    /// Number of contiguous blocks to plan when `--end` is not supplied.
+    #[arg(long, default_value_t = 20_000)]
+    pub blocks: u32,
+
+    /// Replay mode to plan for when using `--state-dir`.
+    #[arg(long, value_enum, default_value_t = RunMode::DirectVerifier)]
+    pub mode: RunMode,
+
+    /// Existing Zebra state cache dir whose finalized tip anchors planned ranges.
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// Network (mainnet only for now; the embedded checkpoint list is per-network).
+    #[arg(long, default_value = "mainnet")]
+    pub network: String,
 
     /// Directory the raw block bytes are cached under.
     #[arg(long, default_value = "target/zakura-commit-bench/blocks")]
@@ -67,9 +90,7 @@ pub struct CachedRoots {
 }
 
 pub async fn run(args: FetchArgs) -> Result<()> {
-    if args.end < args.start {
-        bail!("--end ({}) must be >= --start ({})", args.end, args.start);
-    }
+    let (start, end) = planned_fetch_range(&args).await?;
     std::fs::create_dir_all(&args.cache_dir)
         .wrap_err_with(|| format!("creating cache dir {}", args.cache_dir.display()))?;
 
@@ -81,11 +102,11 @@ pub async fn run(args: FetchArgs) -> Result<()> {
     let url = Arc::new(args.rpc_url.clone());
     let cache_dir = Arc::new(args.cache_dir.clone());
 
-    let total = (args.end - args.start + 1) as usize;
+    let total = (end - start + 1) as usize;
     let mut fetched = 0usize;
     let mut cached = 0usize;
     let mut in_flight = FuturesUnordered::new();
-    let mut next = args.start;
+    let mut next = start;
 
     let drain_one =
         |result: Result<FetchOutcome>, fetched: &mut usize, cached: &mut usize| -> Result<()> {
@@ -107,7 +128,7 @@ pub async fn run(args: FetchArgs) -> Result<()> {
         };
 
     loop {
-        while in_flight.len() < args.concurrency && next <= args.end {
+        while in_flight.len() < args.concurrency && next <= end {
             let height = next;
             next += 1;
             let client = client.clone();
@@ -130,10 +151,50 @@ pub async fn run(args: FetchArgs) -> Result<()> {
         downloaded = fetched,
         cached,
         total,
+        start,
+        end,
         cache_dir = %args.cache_dir.display(),
         "fetch complete"
     );
     Ok(())
+}
+
+async fn planned_fetch_range(args: &FetchArgs) -> Result<(u32, u32)> {
+    if let Some(end) = args.end {
+        if end < args.start {
+            bail!("--end ({end}) must be >= --start ({})", args.start);
+        }
+        return Ok((args.start, end));
+    }
+
+    if args.blocks == 0 {
+        bail!("--blocks must be greater than 0 when --end is not supplied");
+    }
+
+    if let Some(state_dir) = &args.state_dir {
+        let network = parse_network(&args.network)?;
+        let state_tip = planning_tip_from_state_dir(state_dir, &network).await?;
+        let plan = plan_checkpoint_range(
+            &network,
+            Some(state_tip),
+            args.blocks,
+            args.mode,
+            args.with_roots,
+        )?;
+        tracing::info!(
+            state_tip = state_tip.0,
+            requested_last = plan.requested_last,
+            measured_checkpoint = plan.measured_checkpoint.0,
+            load_checkpoint = plan.load_checkpoint.0,
+            "planned fetch range from state dir"
+        );
+        return Ok((plan.first_height, plan.load_checkpoint.0));
+    }
+
+    Ok((
+        args.start,
+        args.start.saturating_add(args.blocks).saturating_sub(1),
+    ))
 }
 
 enum FetchOutcome {

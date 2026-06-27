@@ -7,6 +7,10 @@ use std::{path::PathBuf, process::Command};
 use clap::Args;
 use color_eyre::eyre::{bail, eyre, Result, WrapErr};
 
+use crate::state_dir::{
+    ensure_empty_or_replace, expected_tip_from_snapshot_name, write_metadata, StateDirMetadata,
+};
+
 /// Default snapshot: pruned mainnet state at height 1,707,210 (post-NU5).
 const DEFAULT_NAME: &str = "zebra-mainnet-20260616T032721Z-1707210";
 const DEFAULT_SHA256: &str = "19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769";
@@ -36,6 +40,10 @@ pub struct SnapshotArgs {
     /// Skip download/verify; just (re)extract an already-downloaded archive.
     #[arg(long, default_value_t = false)]
     pub extract_only: bool,
+
+    /// Replace a non-empty extracted snapshot directory.
+    #[arg(long, default_value_t = false)]
+    pub replace: bool,
 }
 
 pub async fn run(args: SnapshotArgs) -> Result<()> {
@@ -54,17 +62,18 @@ pub async fn run(args: SnapshotArgs) -> Result<()> {
     };
 
     if !args.extract_only {
-        download(&archive, &urls)?;
-        verify_sha256(&archive, &args.sha256)?;
+        download(&archive, &urls, &args.sha256)?;
     } else if !archive.is_file() {
         bail!(
             "--extract-only set but {} does not exist",
             archive.display()
         );
+    } else {
+        verify_sha256(&archive, &args.sha256)?;
     }
 
     let extract_dir = dir.join(&args.name);
-    extract(&archive, &extract_dir)?;
+    extract(&archive, &extract_dir, args.replace)?;
 
     let state_dir = find_state_root(&extract_dir).ok_or_else(|| {
         eyre!(
@@ -72,13 +81,28 @@ pub async fn run(args: SnapshotArgs) -> Result<()> {
             extract_dir.display()
         )
     })?;
+    let metadata = StateDirMetadata::new_snapshot(
+        args.name.clone(),
+        args.sha256.clone(),
+        archive.clone(),
+        expected_tip_from_snapshot_name(&args.name),
+    );
+    write_metadata(&state_dir, &metadata)?;
 
     println!("\nsnapshot ready.");
     println!("  archive:   {}", archive.display());
     println!("  state dir: {}", state_dir.display());
-    println!("\nbenchmark commits above the snapshot tip with, e.g.:");
+    println!("\nprepare and benchmark commits above the snapshot tip with:");
     println!(
-        "  cargo xtask zakura-commit-bench -- run --state-dir {} --blocks 800 --with-roots",
+        "  cargo xtask zakura-commit-bench -- fetch --rpc-url http://127.0.0.1:8232 --state-dir {} --blocks 800 --mode apply-queue --with-roots",
+        state_dir.display()
+    );
+    println!(
+        "  cargo xtask zakura-commit-bench -- validate-cache --state-dir {} --blocks 800 --mode apply-queue --with-roots",
+        state_dir.display()
+    );
+    println!(
+        "  cargo xtask zakura-commit-bench -- run --state-dir {} --blocks 800 --mode apply-queue --with-roots",
         state_dir.display()
     );
     Ok(())
@@ -89,7 +113,7 @@ fn default_snapshots_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".zakura").join("snapshots"))
 }
 
-fn download(archive: &std::path::Path, urls: &[String]) -> Result<()> {
+fn download(archive: &std::path::Path, urls: &[String], expected_sha256: &str) -> Result<()> {
     if program_exists("aria2c") {
         // Parallel, multi-mirror, checksum-verified, resumable.
         let mut command = Command::new("aria2c");
@@ -104,22 +128,30 @@ fn download(archive: &std::path::Path, urls: &[String]) -> Result<()> {
         for url in urls {
             command.arg(url);
         }
-        return run_command(&mut command, "aria2c download");
+        run_command(&mut command, "aria2c download")?;
+        return verify_sha256(archive, expected_sha256);
     }
 
-    // Fallback: curl with resume from the first mirror.
-    let url = urls.first().ok_or_else(|| eyre!("no download URL"))?;
-    eprintln!("note: aria2c not found; falling back to `curl -C -` (single mirror, slower).");
-    let mut command = Command::new("curl");
-    command
-        .arg("-L")
-        .arg("--fail")
-        .arg("-C")
-        .arg("-")
-        .arg("-o")
-        .arg(archive)
-        .arg(url);
-    run_command(&mut command, "curl download")
+    eprintln!("note: aria2c not found; falling back to `curl` (single mirror at a time).");
+    let mut last_error = None;
+    for url in urls {
+        match curl_download_with_resume(archive, url) {
+            Ok(()) => match verify_sha256(archive, expected_sha256) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(error);
+                    eprintln!("checksum failed for {url}; trying next mirror");
+                    let _ = std::fs::remove_file(archive);
+                }
+            },
+            Err(error) => {
+                last_error = Some(error);
+                eprintln!("download failed from {url}; trying next mirror");
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| eyre!("no download URL")))
 }
 
 fn verify_sha256(archive: &std::path::Path, expected: &str) -> Result<()> {
@@ -149,9 +181,8 @@ fn verify_sha256(archive: &std::path::Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract(archive: &std::path::Path, extract_dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(extract_dir)
-        .wrap_err_with(|| format!("creating extract dir {}", extract_dir.display()))?;
+fn extract(archive: &std::path::Path, extract_dir: &std::path::Path, replace: bool) -> Result<()> {
+    ensure_empty_or_replace(extract_dir, replace)?;
     // tar + zstd are the available decompressors.
     let mut command = Command::new("tar");
     command
@@ -161,6 +192,46 @@ fn extract(archive: &std::path::Path, extract_dir: &std::path::Path) -> Result<(
         .arg("-C")
         .arg(extract_dir);
     run_command(&mut command, "tar extract")
+}
+
+fn curl_download_with_resume(archive: &std::path::Path, url: &str) -> Result<()> {
+    let mut command = Command::new("curl");
+    command
+        .arg("-L")
+        .arg("--fail")
+        .arg("-C")
+        .arg("-")
+        .arg("-o")
+        .arg(archive)
+        .arg(url);
+
+    match command.output().wrap_err("spawning curl download")? {
+        output if output.status.success() => Ok(()),
+        output if is_curl_resume_error(output.status.code()) => {
+            eprintln!(
+                "curl resume failed for {url}; retrying a clean full download from that mirror"
+            );
+            let _ = std::fs::remove_file(archive);
+            let mut clean = Command::new("curl");
+            clean
+                .arg("-L")
+                .arg("--fail")
+                .arg("-o")
+                .arg(archive)
+                .arg(url);
+            run_command(&mut clean, "curl clean download")
+        }
+        output => bail!(
+            "curl download failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+fn is_curl_resume_error(code: Option<i32>) -> bool {
+    // 33: range request failed. 18 can happen when resuming a truncated partial.
+    matches!(code, Some(18 | 33))
 }
 
 /// Find the directory whose child is the `state/vN/<network>` tree, i.e. the
