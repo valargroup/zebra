@@ -53,12 +53,12 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
-/// The checkpoint verifier resolves a checkpoint window only after the full
-/// contiguous range to the next checkpoint has been queued. Keep the default to
-/// one complete checkpoint range so old-pipeline applies do not cross into the
-/// next range before the current one resolves.
+/// The checkpoint verifier resolves a checkpoint window only after the whole
+/// window, including the resolving checkpoint block, is queued. A node that
+/// starts one height before a checkpoint-gap boundary can therefore need one
+/// maximum checkpoint gap plus the boundary block in flight.
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
 /// The byte budget required to hold one full worst-case checkpoint range in
 /// flight.
 ///
@@ -69,8 +69,8 @@ pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
 /// complete one: the verifier never commits, nothing becomes durable, and no
 /// bytes are ever released.
 pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
-    // `DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP`
-    // (= 400), which fits `u64` losslessly; the product (~800 MB) cannot overflow.
+    // `DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+    // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
     DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
