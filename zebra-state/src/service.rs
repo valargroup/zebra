@@ -1487,6 +1487,7 @@ where
     headers
 }
 
+// Returns the block commitment roots for the given height range
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZebraDb,
@@ -1496,16 +1497,19 @@ fn block_roots_by_height_range<C>(
 where
     C: AsRef<Chain>,
 {
+    // Cap the count to the maximum header sync height range
     let mut roots = Vec::with_capacity(
         usize::try_from(count.min(MAX_HEADER_SYNC_HEIGHT_RANGE))
             .expect("capped root count fits in usize"),
     );
 
+    // Iterate over the height range
     for offset in 0..count.min(MAX_HEADER_SYNC_HEIGHT_RANGE) {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
+        // If the height is at or below the finalized tip height, serve the roots from the finalized state
         let root = if db
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
@@ -1513,6 +1517,7 @@ where
             finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
+                // If the height is in the chain, serve the roots from the chain
         } else if let Some(chain) = chain
             .as_ref()
             .map(|chain| chain.as_ref())
@@ -1529,6 +1534,7 @@ where
                 }),
                 _ => None,
             }
+            // If the height is not in the chain, serve the roots from the zakura header commitment roots by height range
         } else {
             db.zakura_header_commitment_roots_by_height_range(height..=height)
                 .into_iter()
@@ -1549,6 +1555,7 @@ where
     roots
 }
 
+// Returns true if the given roots cover the given height range
 fn block_roots_cover_range(
     start_height: block::Height,
     count: u32,
@@ -1569,6 +1576,8 @@ fn block_roots_cover_range(
     })
 }
 
+// Return the highest known tip, but cap it to the verified block tip
+// if the header-only extension is not root-covered.
 fn root_covered_best_header_tip<C>(
     chain: Option<C>,
     db: &ZebraDb,
@@ -1578,12 +1587,15 @@ fn root_covered_best_header_tip<C>(
 where
     C: AsRef<Chain>,
 {
+    // Choose the best candidate between the best disk header tip and the verified block tip
     let best_header_tip = match (best_disk_header_tip, verified_block_tip) {
         (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => Some(block_tip),
         (Some(header_tip), _) => Some(header_tip),
         (None, block_tip) => block_tip,
     }?;
 
+    // Is the chosen candidate already at or below the verified block tip?
+    // If yes, there no header-only gap.
     let Some(verified_block_tip) = verified_block_tip else {
         return Some(best_header_tip);
     };
