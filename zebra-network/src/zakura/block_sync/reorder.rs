@@ -194,6 +194,10 @@ impl BufferedBlockBody {
         }
     }
 
+    // Drop the raw frame payload for the backlog.
+    // This is used to save memory when the body is not the next block in the sequence.
+    // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
+    // so we reain just the raw frame payload.
     pub(super) fn retain_for_backlog(self) -> Self {
         match self {
             BufferedBlockBody::DecodedWithRawFramePayload {
