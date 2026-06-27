@@ -31,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
 use super::{
-    admission::{admission_decision, max_floor_rescue_start_height, AdmissionSnapshot, RequestPriority},
+    admission::{
+        admission_decision, max_floor_rescue_start_height, AdmissionSnapshot, RequestPriority,
+    },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{

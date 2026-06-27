@@ -35,7 +35,6 @@ pub(super) fn max_floor_rescue_start_height(download_floor: block::Height) -> bl
     next_height(download_floor).unwrap_or(download_floor)
 }
 
-
 pub(super) fn request_priority(
     download_floor: block::Height,
     start_height: block::Height,
