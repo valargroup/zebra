@@ -10,7 +10,7 @@ use super::{
         DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES, DEFAULT_BS_REQUEST_TIMEOUT,
-        MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -732,6 +732,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+    );
+    assert_eq!(
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * 2
     );
     assert_eq!(
         default.submitted_apply_limit(),

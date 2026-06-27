@@ -51,14 +51,23 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
 /// Default block-count cap for speculative reorder look-ahead bookkeeping.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
-/// Default maximum submitted block applies awaiting verifier completion.
+/// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
 /// window, including the resolving checkpoint block, is queued. A node that
 /// starts one height before a checkpoint-gap boundary can therefore need one
 /// maximum checkpoint gap plus the boundary block in flight.
-pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
+pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+/// Default maximum submitted block applies awaiting verifier completion.
+///
+/// The legacy checkpoint apply driver allows two checkpoint windows to be
+/// queued so the checkpoint verifier can finish the current range while the next
+/// range is already available. Keep block-sync's submission window aligned with
+/// that glue path; otherwise block sync can stop submitting one range too early
+/// while downloaded contiguous bodies pile up in `applying`.
+pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
+    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * 2;
 /// The byte budget required to hold one full worst-case checkpoint range in
 /// flight.
 ///
@@ -69,9 +78,9 @@ pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
 /// complete one: the verifier never commits, nothing becomes durable, and no
 /// bytes are ever released.
 pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
-    // `DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+    // `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
     // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
-    DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
+    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default central floor-watchdog cadence.
@@ -294,7 +303,7 @@ impl ZakuraBlockSyncConfig {
         if self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR {
             return Err(
                 "max_inflight_block_bytes must hold one full checkpoint range \
-                 (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+                 (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
                  or checkpoint sync can deadlock",
             );
         }
