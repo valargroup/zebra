@@ -143,15 +143,20 @@ the header chain, servable only by a node holding the validated headers, and nee
 ahead of_ the committer. So they are **carried in-band on the header-sync `Headers` message**
 rather than over a separate stream. `GetHeaders` gains a `want_tree_aux_roots` flag, and a
 `Headers` response carries an **all-or-nothing** `tree_aux_roots` vector parallel to `headers`
-(§5.4). The header-sync stream version is bumped (2 → 4) for the new field.
+(§5.4). The same `Headers` response also carries a `body_sizes` vector, one advisory
+serialized-body-size hint per header. These size hints are not commitment roots and are used
+only to schedule block downloads (§5.4). The header-sync stream version is bumped (2 → 4) for
+the new field.
 
 Roots are requested and accepted **only for finalized (checkpoint-verified) header ranges** — the
 reactor rejects roots on a non-finalized range, and rejects roots a request opted out of, as
 `MalformedMessage` (§8.1). When a finalized header range commits via `CommitHeaderRange`, its
 roots are **persisted into the `zakura_header_commitment_roots_by_height` column family ahead of
 body commit** (§5.3). The committer then reads them per height through the `PeerSource` seam.
-Headers and their roots arrive together, so a range's root coverage is known before any of its
-roots can trigger the fast path.
+The same header commit stores non-zero advertised body-size hints in
+`zakura_header_body_size_by_height`, so block sync can later request realistic ranges even
+before the corresponding bodies are committed. Headers, body-size hints, and roots arrive
+together, so a range's root coverage is known before any of its roots can trigger the fast path.
 
 The one coupling to bodies: verifying a root via the ZIP-221 MMR leaf needs the block's
 tx-counts (from the body), so roots are **consumed** at commit time with bodies even though they
@@ -166,7 +171,9 @@ only ever looks up a root for a block it is about to commit, and persisted provi
 naturally bounded above by the header tip and cleaned up below it: each provisional root is
 **deleted from `zakura_header_commitment_roots_by_height` when its block body commits** (so the
 column family does not grow without bound), and header-store rollback also trims provisional
-roots above the rollback target (§5.3).
+roots above the rollback target (§5.3). Advertised body-size hints follow the same header-store
+lifecycle: header reorgs and rollbacks drop stale hints, and committed block sizes take
+precedence once the corresponding body is durable.
 
 ### 4.4 Mode selection: fast under checkpoint sync
 
@@ -290,9 +297,22 @@ places (`zebra-network/src/zakura/header_sync/wire.rs`):
 - `Headers { headers, body_sizes, tree_aux_roots }` — `tree_aux_roots` is **all-or-nothing**:
   either empty, or exactly one `BlockCommitmentRoots` per header, in ascending height order
   aligned to `start_height`. A one-byte `has_roots` marker precedes the roots on the wire.
+  `body_sizes` is always parallel to `headers`; each entry is an advisory serialized body size,
+  with `0` meaning unknown.
+
+Body-size hints are scheduling data, not consensus data. `CommitHeaderRange` persists non-zero
+advertised hints for header-ahead heights, preserving the maximum non-zero hint for the same
+header and clearing hints when a competing higher-work header chain replaces the range.
+`ReadRequest::BlockSizeHints` returns the durable committed block size when available, otherwise
+the advertised hint, otherwise `None`. Block sync uses those hints to pack contiguous
+`GetBlocks` ranges by estimated bytes and to set receive-path size-mismatch tolerance; the
+downloaded body still has to hash to the committed header, and the actual serialized size is
+settled when the body is received.
 
 Wire and DoS bounds:
 
+- The `body_sizes` count must exactly match the header count (`BodySizeCountMismatch`); there is
+  no independent untrusted body-size length to preallocate from.
 - The byte budget that bounds a `Headers` message accounts for the per-header root
   (`HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES = 4 + 32 + 32`), and the static
   range-fits-budget assertion includes it, so requesting roots reduces the per-message header
