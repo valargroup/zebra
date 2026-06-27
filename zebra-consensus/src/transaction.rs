@@ -404,6 +404,8 @@ where
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
+            check::has_enough_ironwood_flags(&tx)?;
+            check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
             // # Consensus
@@ -456,13 +458,7 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -471,6 +467,7 @@ where
 
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
+                check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
             } else if !tx.is_valid_non_coinbase() {
                 return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
             }
