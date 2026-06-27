@@ -1455,7 +1455,7 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
 
 #[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
-    // The committed floor is NOT an upper bound on a take: a peer fetches as far
+    // The download floor is NOT an upper bound on a take: a peer fetches as far
     // above the floor as its servable range allows.
     let queue = work_queue_with(
         0,
@@ -2346,10 +2346,11 @@ fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
     assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
     assert!(work.pending_contains(block::Height(1)));
 
-    // Shedding drops the top buffered body (6) — the one furthest from the floor —
-    // releasing its budget and returning its height to `pending` for later
-    // re-fetch, so the lower floor-gap request can now be funded. Without this the
-    // budget stays full and height 1 can never be requested (the wedge).
+    // The floor-reservation rescue drops the top buffered body (6) — the
+    // one furthest from the floor — releasing its budget and returning its height
+    // to `pending` for later re-fetch, so the lower floor-gap request can now be
+    // funded. Without this the budget stays full and height 1 can never be
+    // requested (the wedge).
     let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
     assert!(shed, "the top buffered body is shed");
     assert!(

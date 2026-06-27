@@ -151,7 +151,7 @@ pub(super) struct PeerRoutine {
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
     /// cannot backpressure this decode loop into stalling the transport.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-    view: watch::Receiver<SequencerView>,
+    sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
@@ -183,12 +183,12 @@ impl PeerRoutine {
         sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-        view: watch::Receiver<SequencerView>,
+        sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
     ) -> Self {
         let window = DownloadWindow::new(&config);
-        let last_reset_epoch = view.borrow().reset_epoch;
+        let last_reset_epoch = sequencer_view.borrow().reset_epoch;
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -225,7 +225,7 @@ impl PeerRoutine {
             sequencer_control,
             actions,
             routine_to_reactor,
-            view,
+            sequencer_view,
             last_reset_epoch,
             cancel,
             trace,
@@ -285,7 +285,7 @@ impl PeerRoutine {
                         None => return Ok(()),
                     }
                 }
-                changed = self.view.changed() => {
+                changed = self.sequencer_view.changed() => {
                     match changed {
                         Ok(()) => self.on_view_changed(),
                         // The Sequencer task ended (shutdown); the routine follows.
@@ -465,7 +465,7 @@ impl PeerRoutine {
     /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
-        let reset_epoch = self.view.borrow().reset_epoch;
+        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         if reset_epoch == self.last_reset_epoch {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
@@ -535,11 +535,11 @@ impl PeerRoutine {
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
         self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
-        // GC this routine's own fully-committed outstanding requests: when the
-        // committed floor passes the end of a request, its bodies are no longer
+        // GC this routine's own fully-covered outstanding requests: when the
+        // download floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
         // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* committed requests, never a fetch
+        // GC of *our own* covered requests, never a fetch
         // throttle — it replaces the previous reactor `drop_outstanding_through`
         // without the cross-peer churn the spec warned about (a partially-received
         // request whose suffix is still above the floor is left in place).
@@ -562,10 +562,13 @@ impl PeerRoutine {
             .unwrap_or(usize::MAX);
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
+            // Compute this chunk's count and byte ceiling before taking any work.
+            // The count cap is the peer/request cap; the byte cap is enforced by
+            // the budgeted work-queue take and then by the reservation below.
             let max_count = local_peer_count_cap;
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            let view = *self.view.borrow();
+            let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
             let mut request_priority = RequestPriority::Floor;
             let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
@@ -1183,7 +1186,7 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
 
-        let view = *self.view.borrow();
+        let view = *self.sequencer_view.borrow();
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
             self.work.reserved_above(view.download_floor);
         let Some(decision) = admission_decision(
@@ -1512,7 +1515,7 @@ impl PeerRoutine {
     // ===================== view reads ======================================
 
     fn download_floor(&self) -> block::Height {
-        self.view.borrow().download_floor
+        self.sequencer_view.borrow().download_floor
     }
 
     fn record_received(&self, bytes: u64) {

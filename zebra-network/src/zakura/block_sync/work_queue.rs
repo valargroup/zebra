@@ -9,11 +9,11 @@
 //! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
 //!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
 //!   bounded only by the caller's servable range and a count cap — never by how
-//!   far above the committed floor the heights already are;
+//!   far above the download floor the heights already are;
 //! - only [`return_items`](WorkQueue::return_items) (timeout/disconnect retry) and
 //!   [`reset_above`](WorkQueue::reset_above) move `in_flight → pending`;
 //! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
-//!   committed floor never throttles the fetch decision.
+//!   download floor never throttles the fetch decision.
 //!
 //! Internals are a brief `std::sync::Mutex` whose critical sections are tiny map
 //! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
@@ -149,7 +149,7 @@ impl WorkQueue {
     ///
     /// "Contiguous-ascending" stops at the first gap, so the returned chunk maps
     /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
-    /// and is **NOT** clamped to the floor (the committed floor is never an upper
+    /// and is **NOT** clamped to the floor (the download floor is never an upper
     /// bound on the fetch). Returns empty if nothing is eligible.
     pub(super) fn take_in_range(
         &self,

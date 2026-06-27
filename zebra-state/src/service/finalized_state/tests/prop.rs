@@ -1003,7 +1003,11 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
 
             // Session 2 (restart): reopen the same database, then punch a hole at the next
             // height (a peer that omitted it, or a root evicted after failing verification).
-            let mut reopened = FinalizedState::new(&config, &network, #[cfg(feature = "elasticsearch")] false);
+            // Skip the constructor-time interrupted-fast-sync resume guard: this configured
+            // network has no embedded frontiers, so `from_config` yields no source, but the
+            // test attaches a fixture source below the way a real (Mainnet) node's configured
+            // source is already present at open time.
+            let mut reopened = FinalizedState::new_without_resume_guard(&config, &network, #[cfg(feature = "elasticsearch")] false);
             prop_assert_eq!(reopened.vct_fast_synced_below(), Some(Height(handoff_height)), "the marker is still durable after reopen");
 
             let mut holed = fixture.clone();

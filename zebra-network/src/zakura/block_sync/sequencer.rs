@@ -71,6 +71,9 @@ pub(super) struct Sequencer {
     applying: BTreeMap<block::Height, ApplyingBlock>,
     submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
     next_apply_token: BlockApplyToken,
+
+    // The highest block height whose body has already been accepted into the contiguous
+    // download-apply pipeline.
     body_download_floor: block::Height,
     verified_block_tip: block::Height,
     submitted_apply_limit: usize,
@@ -247,6 +250,10 @@ impl Sequencer {
             };
         }
 
+        // Decide how much of the received body to keep before putting it in the reorder
+        // buffer.
+        // If height is the next block in the sequence, we can keep the whole body.
+        // Otherwise, we need to retain the body for the backlog.
         let body = if next_height(self.body_download_floor) == Some(height) {
             body
         } else {

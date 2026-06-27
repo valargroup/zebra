@@ -39,7 +39,9 @@ const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 /// invariant) for later re-fetch. Because another top can always be shed, a low
 /// retry never blocks on budget; the floor can never wedge behind a full buffer,
 /// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. Returns whether it shed
+/// which also bounds the reorder backlog. Floor requesters also call this
+/// synchronously through [`SequencerControlInput::FundFloorReservation`], so the
+/// rescue path is demand-driven with a periodic backstop. Returns whether it shed
 /// anything.
 pub(super) fn shed_top_until_available(
     budget: &mut ByteBudget,
@@ -148,7 +150,7 @@ pub(super) enum SequencerControlInput {
     },
 }
 
-/// The committed view the reactor reacts to. A `watch` (latest-wins) send never
+/// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug)]

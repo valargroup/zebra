@@ -30,6 +30,7 @@ pub(super) struct AdmissionDecision {
     pub(super) max_request_bytes: u64,
 }
 
+/// Return the highest start height that can be rescued by a floor request.
 pub(super) fn floor_rescue_high(download_floor: block::Height) -> block::Height {
     next_height(download_floor).unwrap_or(download_floor)
 }
@@ -38,6 +39,7 @@ pub(super) fn request_priority(
     download_floor: block::Height,
     start_height: block::Height,
 ) -> RequestPriority {
+    // The next height above the floor can still unblock the current floor.
     if start_height <= floor_rescue_high(download_floor) {
         RequestPriority::Floor
     } else {
@@ -45,6 +47,14 @@ pub(super) fn request_priority(
     }
 }
 
+/// Returns the admission decision for a candidate block response starting at `start_height`.
+///
+/// Floor-rescue requests may use any available response budget up to `response_byte_cap`.
+/// Speculative requests above the floor are admitted only while the configured reorder
+/// lookahead byte and block limits still have capacity.
+///
+/// Returns `None` when no bytes can be admitted, or when an above-floor request would
+/// exceed the lookahead limits.
 pub(super) fn admission_decision(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
@@ -53,7 +63,10 @@ pub(super) fn admission_decision(
 ) -> Option<AdmissionDecision> {
     let priority = request_priority(snapshot.download_floor, start_height);
     let max_request_bytes = match priority {
+        // Floor requests can use any available budget up to the response byte cap.
         RequestPriority::Floor => snapshot.budget_available.min(response_byte_cap),
+        // Above-floor requests are admitted only if the reorder lookahead limits have capacity
+        // and the response byte cap is not exceeded.
         RequestPriority::AboveFloor => {
             let held_bytes = snapshot
                 .reorder_buffered_bytes
