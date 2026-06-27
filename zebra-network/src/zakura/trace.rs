@@ -135,6 +135,8 @@ pub mod block_sync_trace {
     pub const APPLY_TOKEN: &str = "apply_token";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
+    /// Scheduler/query lower bound for block body requests.
+    pub const REQUEST_FLOOR: &str = "request_floor";
     /// Highest contiguous body height already submitted for apply.
     pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
     /// First height not yet in the contiguous body-download floor.
