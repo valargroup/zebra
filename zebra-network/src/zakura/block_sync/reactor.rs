@@ -21,7 +21,6 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// request; the routine never blocks on it (the only blocking routine send is the
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -102,7 +101,7 @@ pub fn spawn_block_sync_reactor(
     let sequencer_task = SequencerTask::new(
         sequencer,
         state.budget.clone(),
-        state.work.clone(),
+        state.work_queue.clone(),
         actions_tx.clone(),
         committed_throughput,
         startup.frontiers,
@@ -129,7 +128,7 @@ pub fn spawn_block_sync_reactor(
     let routine_wiring = RoutineWiring {
         config: startup.config.clone(),
         budget: state.budget.clone(),
-        work: state.work.clone(),
+        work: state.work_queue.clone(),
         registry: registry.clone(),
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
@@ -151,7 +150,7 @@ pub fn spawn_block_sync_reactor(
     };
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
-        committed_floor: startup.frontiers.verified_block_tip,
+        request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
@@ -215,15 +214,15 @@ pub(super) struct BlockSyncReactor {
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
-    /// Latest-wins committed view published by the Sequencer task.
+    /// Latest-wins progress view published by the Sequencer task.
     sequencer_view: watch::Receiver<SequencerView>,
     /// Reactor-side mirror of the Sequencer's verified tip (it no longer lives
-    /// in `state`). Updated from the committed view; initialized from startup.
+    /// in `state`). Updated from the progress view; initialized from startup.
     verified_block_tip: block::Height,
-    /// Reactor-side mirror of the Sequencer's body-download floor. Used ONLY for
-    /// the producer query lower bound, candidate prune, and stale-prefix trim —
-    /// never as a fetch decision.
-    committed_floor: block::Height,
+    /// Reactor-side scheduler/query lower bound. It follows the Sequencer's
+    /// download floor, but it is not verified state and must not be used for
+    /// serving/status advertisement.
+    request_floor: block::Height,
     /// `(verified_tip, best_header_tip, best_header_hash)` for a dispatched
     /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
     /// back yet.
@@ -257,6 +256,8 @@ impl BlockSyncReactor {
                 .status_refresh_interval
                 .max(Duration::from_millis(1)),
         );
+        let mut floor_watchdog_ticks =
+            time::interval(self.startup.config.effective_floor_watchdog_tick());
 
         self.query_needed_blocks().await;
         self.publish_metrics();
@@ -315,7 +316,7 @@ impl BlockSyncReactor {
                             let view = *self.sequencer_view.borrow_and_update();
                             self.on_sequencer_view_changed(view).await;
                             self.publish_metrics();
-                            // Snapshot the committed state on every view change, not
+                            // Snapshot the progress state on every view change, not
                             // only on the periodic tick. Commit progress (including
                             // the final `applying -> 0` settle near the tip) arrives
                             // as a view change; without a snapshot here the trace's
@@ -344,7 +345,47 @@ impl BlockSyncReactor {
                     self.trace_sync_state();
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
+                _ = floor_watchdog_ticks.tick() => {
+                    self.run_floor_watchdog(Instant::now());
+                    self.publish_metrics();
+                }
             }
+        }
+    }
+
+    fn run_floor_watchdog(&mut self, now: Instant) {
+        let Some(height) = next_height(self.request_floor) else {
+            return;
+        };
+        let (servable_peers, _) = self.registry.floor_gap_servable(height);
+        let claims = self.registry.outstanding_claims_at(height);
+        for claim in claims {
+            if claim.meta.deadline > now {
+                continue;
+            }
+
+            self.registry
+                .clear_outstanding_height(&claim.peer, claim.height);
+            if servable_peers > 2 {
+                self.registry.avoid_height_until(
+                    &claim.peer,
+                    claim.height,
+                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
+                );
+            }
+            let released = self
+                .state
+                .work_queue
+                .release_reserved_and_return_items([claim.height]);
+            self.state.budget.release(released);
+            metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
+            tracing::debug!(
+                peer = ?claim.peer,
+                height = ?claim.height,
+                estimated_bytes = claim.meta.estimated_bytes,
+                released,
+                "force-cancelled expired Zakura block-sync floor request"
+            );
         }
     }
 
@@ -636,10 +677,10 @@ impl BlockSyncReactor {
     /// floor advances. The producer (`handle_needed_blocks`) only ever *grows*
     /// `needed_heights`; this prunes the heights the floor passed so the candidate
     /// gap clears promptly without waiting for the next `NeededBlocks` snapshot.
-    /// Reads the `committed_floor` mirror (the Sequencer's floor now lives on the
-    /// task); this is a GC/candidate use, never a fetch throttle.
+    /// Reads the `request_floor` mirror (the Sequencer's download floor now lives
+    /// on the task); this is a GC/candidate use, never a fetch throttle.
     fn prune_needed_below_floor(&mut self) {
-        let floor = self.committed_floor;
+        let floor = self.request_floor;
         let before = self.state.needed_heights.len();
         self.state.needed_heights.retain(|height| *height > floor);
         if self.state.needed_heights.len() != before {
@@ -702,12 +743,12 @@ impl BlockSyncReactor {
         );
     }
 
-    /// React to the latest committed view from the Sequencer task: update the
-    /// reactor's committed mirrors, then run the serving/peer/candidate/producer
+    /// React to the latest progress view from the Sequencer task: update the
+    /// reactor's mirrors, then run the serving/peer/candidate/producer
     /// half that used to follow the inline Sequencer mutation
     /// (status refresh, candidate prune, drop-outstanding, re-query, re-schedule).
     async fn on_sequencer_view_changed(&mut self, view: SequencerView) {
-        // Always update the committed mirrors so the producer lower bound,
+        // Always update the mirrors so the producer lower bound,
         // candidate prune, and trace read the latest floor/tip — even on a
         // view change that only reflects buffering/submission. The mirrors are
         // read-only control inputs; updating them is cheap and idempotent.
@@ -719,7 +760,7 @@ impl BlockSyncReactor {
         self.last_view = view;
         self.state.finalized_height = self.state.finalized_height.max(view.finalized);
         self.verified_block_tip = view.verified_tip;
-        self.committed_floor = view.floor;
+        self.request_floor = view.download_floor;
         self.state.verified_block_hash = view.verified_hash;
         self.state.servable_high = view.verified_tip;
         self.state.servable_hash = view.verified_hash;
@@ -781,10 +822,10 @@ impl BlockSyncReactor {
         // the structural invariant "held-or-outstanding ⟺ `work.in_flight`":
         // every buffered/applying/submitted/outstanding height was taken into
         // `in_flight` at issuance and leaves only via `advance_floor` (committed)
-        // or `reset_above` (reset). So a height above the committed floor that is
+        // or `reset_above` (reset). So a height above the request floor that is
         // not in `in_flight` is genuinely missing and re-queuable; one that is
         // in `in_flight` is already claimed and must not be re-issued. The
-        // `committed_floor` mirror is the producer's lower bound only.
+        // `request_floor` mirror is the producer's lower bound only.
         //
         // `!has_outstanding_request` is kept (the registry's per-peer outstanding):
         // the `in_flight ⟺ outstanding` half of the invariant breaks transiently
@@ -799,8 +840,8 @@ impl BlockSyncReactor {
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
-                block.height > self.committed_floor
-                    && !self.state.work.in_flight_contains(block.height)
+                block.height > self.request_floor
+                    && !self.state.work_queue.in_flight_contains(block.height)
                     && !self
                         .registry
                         .has_outstanding_request(block.height, block.hash)
@@ -826,7 +867,7 @@ impl BlockSyncReactor {
         // candidate set grow (or any observer of the candidate watch) can rely on
         // the matching heights already being takeable, with no extend-vs-observe
         // race.
-        let count = self.state.work.extend(
+        let count = self.state.work_queue.extend(
             blocks
                 .into_iter()
                 .map(|block| (block.height, block.hash, block.size)),
@@ -1038,7 +1079,7 @@ impl BlockSyncReactor {
         // The whole commit-pipeline body (token validate, embedded local-frontier
         // advance, applying removal, budget release, throughput record, rollback +
         // misbehavior, drain + submit) runs on the Sequencer task. The reactor
-        // forwards the completion and reacts to the resulting committed view
+        // forwards the completion and reacts to the resulting progress view
         // (serving/status/query/schedule) on the `view` arm.
         self.trace_apply_finished(height, token, result, self.state.budget.reserved());
         let capacity = self.sequencer_input.capacity();
@@ -1095,13 +1136,13 @@ impl BlockSyncReactor {
         if !self.startup.state_queries_enabled {
             return false;
         }
-        if self.committed_floor >= self.state.best_header_tip {
+        if self.request_floor >= self.state.best_header_tip {
             self.pending_needed_query = None;
             return true;
         }
         if self
             .state
-            .work
+            .work_queue
             .max_claimed()
             .is_some_and(|height| height >= self.state.best_header_tip)
         {
@@ -1111,7 +1152,7 @@ impl BlockSyncReactor {
             return true;
         }
         let query = (
-            self.committed_floor,
+            self.request_floor,
             self.state.best_header_tip,
             self.state.best_header_hash,
         );
@@ -1119,7 +1160,7 @@ impl BlockSyncReactor {
             return true;
         }
         let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: self.committed_floor,
+            verified_block_tip: self.request_floor,
             best_header_tip: self.state.best_header_tip,
         });
         if dispatched {
@@ -1146,7 +1187,10 @@ impl BlockSyncReactor {
         // budget already bounds memory because reorder/applying hold their
         // reservation until apply-finish, so downloads may legitimately run far
         // ahead of commit up to that budget.
-        self.state.work.pending_len().saturating_add(outstanding)
+        self.state
+            .work_queue
+            .pending_len()
+            .saturating_add(outstanding)
     }
 
     fn refill_low_water_blocks(&self) -> usize {
@@ -1426,7 +1470,8 @@ impl BlockSyncReactor {
             .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
             .unwrap_or((0, 0));
         self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
-            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.floor);
+            bs_insert_height(row, bs_trace::REQUEST_FLOOR, self.request_floor);
+            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.download_floor);
             bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
             bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
             bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
@@ -1596,20 +1641,20 @@ impl BlockSyncReactor {
             bs_insert_u64(
                 row,
                 bs_trace::QUEUE_LEN,
-                self.state.work.pending_run_count() as u64,
+                self.state.work_queue.pending_run_count() as u64,
             );
             bs_insert_u64(
                 row,
                 bs_trace::QUEUE_BLOCKS,
-                self.state.work.pending_len() as u64,
+                self.state.work_queue.pending_len() as u64,
             );
-            if let Some(start) = self.state.work.min_pending() {
+            if let Some(start) = self.state.work_queue.min_pending() {
                 bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
             }
             bs_insert_u64(
                 row,
                 bs_trace::ASSIGNED_LEN,
-                self.state.work.in_flight_len() as u64,
+                self.state.work_queue.in_flight_len() as u64,
             );
             bs_insert_u64(
                 row,
@@ -1621,7 +1666,7 @@ impl BlockSyncReactor {
                 bs_trace::REFILL_LOW_WATER,
                 self.refill_low_water_blocks() as u64,
             );
-            if let Some(end) = self.state.work.max_in_flight() {
+            if let Some(end) = self.state.work_queue.max_in_flight() {
                 bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
             }
         });
@@ -1762,7 +1807,7 @@ impl BlockSyncReactor {
             bs_insert_u64(
                 row,
                 bs_trace::QUEUE_BLOCKS,
-                self.state.work.pending_len() as u64,
+                self.state.work_queue.pending_len() as u64,
             );
         });
     }
@@ -1781,21 +1826,23 @@ impl BlockSyncReactor {
         });
     }
 
-    fn floor_gap_diagnostics(&self, _now: Instant) -> Option<FloorGapDiagnostics> {
-        let height = next_height(self.committed_floor)?;
+    fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {
+        let height = next_height(self.request_floor)?;
         if height > self.state.best_header_tip {
             return None;
         }
 
-        // Servable / outstanding peer counts come from the registry (the routines
-        // mirror their outstanding heights there). The per-request deadline ages
-        // now live in the routines and are no longer reactor-visible; this trace
-        // field drops the `oldest/next deadline ms` breakdown (per-peer routines) — the periodic
-        // `BLOCK_SYNC_STATE` row still carries the slot/budget signals.
         let (servable_peers, outstanding_peers) = self.registry.floor_gap_servable(height);
+        let claims = self.registry.outstanding_claims_at(height);
         let available_peers = 0usize;
-        let oldest_outstanding_ms = None;
-        let next_deadline_ms = None;
+        let oldest_outstanding_ms = claims
+            .iter()
+            .map(|claim| elapsed_ms_u64(now.saturating_duration_since(claim.meta.queued_at)))
+            .max();
+        let next_deadline_ms = claims
+            .iter()
+            .map(|claim| elapsed_ms_u64(claim.meta.deadline.saturating_duration_since(now)))
+            .min();
 
         // Sequencer task: the Sequencer's per-height `applying`/`submitted_apply`/`reorder`
         // membership is no longer reactor-visible (it lives on the task). A height
@@ -1807,9 +1854,9 @@ impl BlockSyncReactor {
         // counts from the view.
         let state = if outstanding_peers > 0 {
             "outstanding"
-        } else if self.state.work.pending_contains(height) {
+        } else if self.state.work_queue.pending_contains(height) {
             "queued"
-        } else if self.state.work.in_flight_contains(height) {
+        } else if self.state.work_queue.in_flight_contains(height) {
             // Held in `in_flight` but no peer has an outstanding request for it:
             // a taken-then-buffered/applying height (or one whose holder dropped).
             "in_flight_without_outstanding"
@@ -2160,6 +2207,10 @@ fn bs_insert_str(
     value: &str,
 ) {
     row.insert(key.to_string(), serde_json::Value::from(value.to_string()));
+}
+
+fn elapsed_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {

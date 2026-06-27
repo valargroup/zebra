@@ -22,6 +22,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Mutex as StdMutex,
+    time::Instant,
 };
 
 use zebra_chain::block;
@@ -48,12 +49,14 @@ pub(super) struct Entry {
     /// producer filter's `!has_outstanding_request` home, now routine-owned and
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
-    pub(super) outstanding: BTreeMap<block::Height, block::Hash>,
+    pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
     /// Routine-published slot diagnostics (trace only): the per-peer download
     /// window state the reactor used to read off `PeerBlockState` for the periodic
     /// `BLOCK_SYNC_STATE` row. Updated whenever the routine issues/finishes/times
     /// out a request.
     pub(super) slots: SlotDiagnostics,
+    /// Heights this peer may not re-take until the given instant.
+    pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -77,6 +80,7 @@ impl Entry {
             max_response_bytes: config.advertised_max_response_bytes(),
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
+            retry_avoid: BTreeMap::new(),
             generation,
         }
     }
@@ -91,6 +95,23 @@ pub(super) struct SlotDiagnostics {
     pub(super) available_slots: usize,
     pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding_requests: usize,
+}
+
+/// Published metadata for one unreceived outstanding height.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct OutstandingMeta {
+    pub(super) hash: block::Hash,
+    pub(super) estimated_bytes: u64,
+    pub(super) queued_at: Instant,
+    pub(super) deadline: Instant,
+}
+
+/// Reactor-visible claim that can be force-cancelled by the floor watchdog.
+#[derive(Clone, Debug)]
+pub(super) struct OutstandingClaim {
+    pub(super) peer: ZakuraPeerId,
+    pub(super) height: block::Height,
+    pub(super) meta: OutstandingMeta,
 }
 
 /// The shared per-peer fact table. `Arc`-wrapped at the construction site so the
@@ -144,6 +165,7 @@ impl PeerRegistry {
             .and_modify(|entry| {
                 entry.direction = direction;
                 entry.outstanding.clear();
+                entry.retry_avoid.clear();
                 entry.generation = generation;
             })
             .or_insert_with(|| Entry::new(direction, config, generation));
@@ -187,7 +209,7 @@ impl PeerRegistry {
         &self,
         peer: &ZakuraPeerId,
         generation: u64,
-        outstanding: BTreeMap<block::Height, block::Hash>,
+        outstanding: BTreeMap<block::Height, OutstandingMeta>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
@@ -257,9 +279,12 @@ impl PeerRegistry {
     /// `ignore_unmatched_active` fallthrough).
     pub(super) fn has_outstanding_request(&self, height: block::Height, hash: block::Hash) -> bool {
         let peers = self.lock();
-        peers
-            .values()
-            .any(|entry| entry.outstanding.get(&height) == Some(&hash))
+        peers.values().any(|entry| {
+            entry
+                .outstanding
+                .get(&height)
+                .is_some_and(|meta| meta.hash == hash)
+        })
     }
 
     /// Whether any connected peer has an outstanding request covering `height`
@@ -271,6 +296,18 @@ impl PeerRegistry {
         peers
             .values()
             .any(|entry| entry.outstanding.contains_key(&height))
+    }
+
+    /// Whether this exact peer still owns an outstanding claim for `height`.
+    pub(super) fn peer_has_outstanding_height(
+        &self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+    ) -> bool {
+        let peers = self.lock();
+        peers
+            .get(peer)
+            .is_some_and(|entry| entry.outstanding.contains_key(&height))
     }
 
     /// Total unreceived in-flight heights summed across peers — *per request*,
@@ -307,7 +344,7 @@ impl PeerRegistry {
             entry
                 .outstanding
                 .get(&height)
-                .is_some_and(|expected| *expected != hash)
+                .is_some_and(|expected| expected.hash != hash)
         })
     }
 
@@ -387,6 +424,60 @@ impl PeerRegistry {
             }
         }
         (servable, outstanding)
+    }
+
+    /// Snapshot all peer claims for one height.
+    pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
+        let peers = self.lock();
+        peers
+            .iter()
+            .filter_map(|(peer, entry)| {
+                entry.outstanding.get(&height).map(|meta| OutstandingClaim {
+                    peer: peer.clone(),
+                    height,
+                    meta: *meta,
+                })
+            })
+            .collect()
+    }
+
+    /// Remove a published outstanding claim for `height` from `peer`.
+    pub(super) fn clear_outstanding_height(&self, peer: &ZakuraPeerId, height: block::Height) {
+        let mut peers = self.lock();
+        if let Some(entry) = peers.get_mut(peer) {
+            entry.outstanding.remove(&height);
+        }
+    }
+
+    /// Hard-exclude this peer from re-taking `height` until `until`.
+    pub(super) fn avoid_height_until(
+        &self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+        until: Instant,
+    ) {
+        let mut peers = self.lock();
+        if let Some(entry) = peers.get_mut(peer) {
+            entry.retry_avoid.insert(height, until);
+        }
+    }
+
+    /// Whether this peer is still hard-excluded from `height`.
+    pub(super) fn is_avoiding_height(
+        &self,
+        peer: &ZakuraPeerId,
+        height: block::Height,
+        now: Instant,
+    ) -> bool {
+        let mut peers = self.lock();
+        let Some(entry) = peers.get_mut(peer) else {
+            return false;
+        };
+        entry.retry_avoid.retain(|_, until| *until > now);
+        entry
+            .retry_avoid
+            .get(&height)
+            .is_some_and(|until| *until > now)
     }
 }
 

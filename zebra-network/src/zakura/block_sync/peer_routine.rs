@@ -12,9 +12,9 @@
 //!
 //! The one throughput-critical effect: the matched-body `sequencer_input.send(..).await`
 //! runs in this per-peer task, so a slow verifier (Sequencer backpressure)
-//! stalls only one routine, not the whole fleet. The download decision gates **only** on the byte budget + per-peer
-//! slots: `take_in_range(servable_low, servable_high, n)` uses `servable_high`
-//! as the *only* upper bound.
+//! stalls only one routine, not the whole fleet. The download decision gates only
+//! on the byte budget + per-peer slots: `take_in_range(servable_low,
+//! servable_high, n)` uses `servable_high` as the upper bound.
 //!
 //! The download logic is **moved, not rewritten** from the previous reactor: the
 //! want-work fill loop ports `fill_peer`, the matched-body tail ports
@@ -26,12 +26,14 @@
 
 use std::collections::BTreeMap;
 
-use tokio::sync::{futures::Notified, mpsc, watch};
+use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
 use super::{
-    config::BS_PER_BLOCK_WORST_CASE_BYTES,
+    admission::{
+        admission_decision, max_floor_rescue_start_height, AdmissionSnapshot, RequestPriority,
+    },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
@@ -40,7 +42,10 @@ use super::{
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
-    state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter},
+    state::{
+        next_height, DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter,
+        TimeoutBackoffOutcome,
+    },
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
@@ -50,7 +55,7 @@ use crate::zakura::{
     Admit, FramedRecv, OrderedSendError, SinkReject,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
-use tokio::{sync::oneshot, time};
+use tokio::time;
 use zebra_chain::{block, serialization::ZcashSerialize};
 
 /// How long a routine avoids re-taking a height it just returned on a failure
@@ -148,7 +153,7 @@ pub(super) struct PeerRoutine {
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
     /// cannot backpressure this decode loop into stalling the transport.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-    view: watch::Receiver<SequencerView>,
+    sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
@@ -180,12 +185,12 @@ impl PeerRoutine {
         sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-        view: watch::Receiver<SequencerView>,
+        sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
     ) -> Self {
         let window = DownloadWindow::new(&config);
-        let last_reset_epoch = view.borrow().reset_epoch;
+        let last_reset_epoch = sequencer_view.borrow().reset_epoch;
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -222,7 +227,7 @@ impl PeerRoutine {
             sequencer_control,
             actions,
             routine_to_reactor,
-            view,
+            sequencer_view,
             last_reset_epoch,
             cancel,
             trace,
@@ -282,16 +287,14 @@ impl PeerRoutine {
                         None => return Ok(()),
                     }
                 }
-                changed = self.view.changed() => {
+                changed = self.sequencer_view.changed() => {
                     match changed {
                         Ok(()) => self.on_view_changed(),
                         // The Sequencer task ended (shutdown); the routine follows.
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout => {
-                    self.expire_due_timeouts(Instant::now());
-                }
+                _ = &mut timeout => self.expire_due_timeouts(Instant::now())?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -341,8 +344,8 @@ impl PeerRoutine {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection
-                    // Report via the shared channel,
+                    // protocol reject for the whole connection (matches the previous
+                    // `run_peer` decode-error path). Report via the shared channel,
                     // then reject; the report is best-effort and never blocks.
                     let protocol_error =
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
@@ -464,7 +467,7 @@ impl PeerRoutine {
     /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
-        let reset_epoch = self.view.borrow().reset_epoch;
+        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         if reset_epoch == self.last_reset_epoch {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
@@ -480,8 +483,8 @@ impl PeerRoutine {
         // `reset_above`) and release their reservations exactly once.
         let outstanding = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding {
-            self.budget.release(outstanding.reserved_bytes());
-            self.work.return_items(unreceived_heights(&outstanding));
+            let released = self.return_unreceived_to_queue(&outstanding);
+            self.budget.release(released);
         }
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
@@ -523,10 +526,9 @@ impl PeerRoutine {
     /// Ported from the reactor's `fill_peer`; the only changes are where the
     /// per-peer state lives (now routine-local / the registry) and the handles.
     ///
-    /// There is no floor gate: downloads are governed solely by the byte budget
-    /// and per-peer slots — never floor-distance / near-tip lag.
+    /// There is no floor gate: downloads are governed by the byte budget and
+    /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) {
-        let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
         // Reconcile the adaptive window's hard cap with the peer's currently
         // advertised `max_inflight_requests` (it may have grown/shrunk via a
         // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
@@ -535,11 +537,11 @@ impl PeerRoutine {
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
         self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
-        // GC this routine's own fully-committed outstanding requests: when the
-        // committed floor passes the end of a request, its bodies are no longer
+        // GC this routine's own fully-covered outstanding requests: when the
+        // download floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
         // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* committed requests, never a fetch
+        // GC of *our own* covered requests, never a fetch
         // throttle — it replaces the previous reactor `drop_outstanding_through`
         // without the cross-peer churn the spec warned about (a partially-received
         // request whose suffix is still above the floor is left in place).
@@ -562,42 +564,101 @@ impl PeerRoutine {
             .unwrap_or(usize::MAX);
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
-            // Compute this chunk's byte ceiling BEFORE taking any work. The
-            // count cap is still bounded by what the global budget can reserve at
-            // worst case, so advertised sizes never weaken the existing
-            // pre-send reservation. The estimate cap only decides how many of the
-            // already-affordable heights to pack into this one request.
-            let available_bytes = self.budget.available();
-            let max_count = available_bytes
-                .checked_div(worst)
-                .map(|count| {
-                    usize::try_from(count)
-                        .unwrap_or(usize::MAX)
-                        .min(local_peer_count_cap)
-                })
-                .unwrap_or(local_peer_count_cap);
+            // Compute this chunk's count and byte ceiling before taking any work.
+            // The count cap is the peer/request cap; the byte cap is enforced by
+            // the budgeted work-queue take and then by the reservation below.
+            let max_count = local_peer_count_cap;
+            let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            // If no worst-case block fits, ask the sequencer to shed speculative
-            // high blocks so the next request can retry with available budget.
-            if max_count == 0 {
-                if self.try_free_byte_budget_for_request(worst).await {
-                    continue;
+            let sequencer_view = *self.sequencer_view.borrow();
+            let floor_high = max_floor_rescue_start_height(sequencer_view.download_floor);
+            let mut request_priority = RequestPriority::Floor;
+            let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
+                self.work.reserved_above(sequencer_view.download_floor);
+            let mut items = if servable_low <= floor_high
+                && self
+                    .work
+                    .first_pending_in_range(servable_low, servable_high.min(floor_high))
+                    .is_some()
+            {
+                let floor_available = self.budget.available().min(response_byte_cap);
+                if floor_available == 0 {
+                    Vec::new()
                 } else {
+                    let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
+                        admission_decision(
+                            &self.config,
+                            AdmissionSnapshot {
+                                download_floor: sequencer_view.download_floor,
+                                reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                                reorder_buffered_blocks: sequencer_view.reorder_len,
+                                applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                                applying_buffered_blocks: sequencer_view.applying_len,
+                                sequencer_input_queued_bytes: self
+                                    .sequencer_input_bytes
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                reserved_above_floor_bytes,
+                                reserved_above_floor_blocks,
+                                budget_available: self.budget.available(),
+                            },
+                            tail_start,
+                            response_byte_cap,
+                        )
+                    }) {
+                        Some(_) => servable_high,
+                        None => servable_high.min(floor_high),
+                    };
+                    self.work.take_in_range_budgeted(
+                        servable_low,
+                        floor_take_high,
+                        max_count,
+                        floor_available,
+                    )
+                }
+            } else {
+                Vec::new()
+            };
+
+            if items.is_empty() {
+                let Some(start_height) = self
+                    .work
+                    .first_pending_in_range(servable_low, servable_high)
+                else {
                     break;
+                };
+                let Some(decision) = admission_decision(
+                    &self.config,
+                    AdmissionSnapshot {
+                        download_floor: sequencer_view.download_floor,
+                        reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                        reorder_buffered_blocks: sequencer_view.reorder_len,
+                        applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                        applying_buffered_blocks: sequencer_view.applying_len,
+                        sequencer_input_queued_bytes: self
+                            .sequencer_input_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        reserved_above_floor_bytes,
+                        reserved_above_floor_blocks,
+                        budget_available: self.budget.available(),
+                    },
+                    start_height,
+                    response_byte_cap,
+                ) else {
+                    metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
+                    break;
+                };
+
+                if decision.priority == RequestPriority::AboveFloor {
+                    metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
+                    request_priority = RequestPriority::AboveFloor;
+                    items = self.work.take_in_range_budgeted(
+                        servable_low,
+                        servable_high,
+                        max_count,
+                        decision.max_request_bytes,
+                    );
                 }
             }
-            let max_estimated_bytes =
-                available_bytes.min(u64::from(self.max_response_bytes.max(1)));
-
-            // Take work in this peer's servable range. `servable_high` is NOT
-            // clamped to the floor: a peer fetches as far ahead of the committed
-            // floor as its servable range and the byte budget allow.
-            let mut items = self.work.take_in_range_budgeted(
-                servable_low,
-                servable_high,
-                max_count,
-                max_estimated_bytes,
-            );
             if items.is_empty() {
                 break;
             }
@@ -610,10 +671,11 @@ impl PeerRoutine {
             // self-wake into a take/return spin. If the whole chunk is still
             // avoided, break — the routine wakes to retry when the avoid window
             // expires (see `earliest_deadline_sleep`).
-            if !self.retry_avoid.is_empty() {
-                let keep_from = items
-                    .iter()
-                    .position(|(height, _)| !self.retry_avoid.contains_key(height));
+            {
+                let keep_from = items.iter().position(|(height, _)| {
+                    !self.retry_avoid.contains_key(height)
+                        && !self.registry.is_avoiding_height(&self.peer, *height, now)
+                });
                 match keep_from {
                     Some(0) => {}
                     Some(index) => {
@@ -629,21 +691,40 @@ impl PeerRoutine {
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
 
-            // `take_in_range_budgeted` already honoured the byte-capped count;
-            // every taken item has worst-case reservation capacity.
+            // Reserve the summed per-block size estimate for this request (not
+            // worst case), so the budget admits far more typically-small bodies.
+            // `take_in_range_budgeted` already bounded the summed estimate to the
+            // response-byte cap.
             let kept_count = items.len();
 
-            let reserved_bytes = worst.saturating_mul(kept_count as u64);
-            if !self.budget.try_reserve(reserved_bytes) {
+            let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
+                acc.saturating_add(item.estimated_bytes)
+            });
+            if !self
+                .reserve_request_budget(request_priority, reserved_bytes)
+                .await
+            {
                 self.return_taken_items(&items);
+                break;
+            }
+            let marked = self
+                .work
+                .mark_reserved(items.iter().map(|(height, _)| *height));
+            if marked != reserved_bytes {
+                self.budget.release(reserved_bytes);
+                let _ = self
+                    .work
+                    .release_and_return_items(items.iter().map(|(height, _)| *height));
                 break;
             }
 
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
                 Err(_) => {
-                    self.budget.release(reserved_bytes);
-                    self.return_taken_items(&items);
+                    let released = self
+                        .work
+                        .release_and_return_items(items.iter().map(|(height, _)| *height));
+                    self.budget.release(released);
                     break;
                 }
             };
@@ -651,8 +732,9 @@ impl PeerRoutine {
                 start_height: items[0].0,
                 count,
                 anchor_hash: items[0].1.hash,
-                // The reserved worst-case total (released on a send failure
-                // below); distinct from the size estimates in `expected_blocks`.
+                // The summed size-estimate reservation for this request (released
+                // on a send failure below); equals the sum of the per-height
+                // `expected_blocks` estimates.
                 estimated_bytes: reserved_bytes,
                 expected_blocks: items
                     .iter()
@@ -676,9 +758,11 @@ impl PeerRoutine {
                     ?error,
                     "failed to queue Zakura block-sync GetBlocks"
                 );
-                self.budget.release(request.estimated_bytes);
                 // Nothing was received, so return every taken height to the queue.
-                self.return_taken_items(&items);
+                let released = self
+                    .work
+                    .release_and_return_items(items.iter().map(|(height, _)| *height));
+                self.budget.release(released);
                 if matches!(error, OrderedSendError::Full) {
                     break;
                 }
@@ -715,21 +799,37 @@ impl PeerRoutine {
         }
     }
 
-    // Returns true if the sequencer made enough byte budget available for a retry.
-    async fn try_free_byte_budget_for_request(&mut self, reserved_bytes: u64) -> bool {
-        let (reply, funded) = oneshot::channel();
-        if self
-            .sequencer_control
-            .send(SequencerControlInput::FundFloorReservation {
-                needed_bytes: reserved_bytes,
-                reply,
-            })
-            .is_err()
-        {
-            return false;
+    async fn reserve_request_budget(
+        &mut self,
+        priority: RequestPriority,
+        reserved_bytes: u64,
+    ) -> bool {
+        if priority == RequestPriority::AboveFloor {
+            return self.budget.try_reserve(reserved_bytes);
         }
 
-        funded.await.unwrap_or(false)
+        loop {
+            if self.budget.try_reserve(reserved_bytes) {
+                return true;
+            }
+
+            let (reply, funded) = oneshot::channel();
+            if self
+                .sequencer_control
+                .send(SequencerControlInput::FundFloorReservation {
+                    needed_bytes: reserved_bytes,
+                    reply,
+                })
+                .is_err()
+            {
+                return false;
+            }
+
+            match funded.await {
+                Ok(true) => continue,
+                Ok(false) | Err(_) => return false,
+            }
+        }
     }
 
     /// Refill low-water mark in blocks (ported from the reactor's
@@ -764,50 +864,62 @@ impl PeerRoutine {
 
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
-    fn expire_due_timeouts(&mut self, now: Instant) {
+    fn expire_due_timeouts(&mut self, now: Instant) -> Result<(), SinkReject> {
         let mut timed_out = Vec::new();
         let mut index = 0;
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].deadline <= now {
-                self.window.reduce_outbound_window_after_timeout();
                 timed_out.push(self.window.outstanding.remove(index));
             } else {
                 index += 1;
             }
         }
         if timed_out.is_empty() {
-            return;
+            return Ok(());
         }
+        let backoff = self.window.reduce_outbound_window_after_timeout();
         for outstanding in &timed_out {
-            self.budget.release(outstanding.reserved_bytes());
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
-            self.return_unreceived_to_queue(outstanding);
+            let released = self.return_unreceived_to_queue(outstanding);
+            self.budget.release(released);
         }
         // Bias away from immediately re-grabbing the heights this peer just timed
         // out, so another peer can contest them (the peer-local timeout bias).
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
         self.note_retry_avoid(timed_out_heights);
         self.publish_outstanding();
+        if backoff == TimeoutBackoffOutcome::DisconnectPeer {
+            tracing::debug!(
+                peer = ?self.peer,
+                "disconnecting Zakura block-sync peer after repeated timeouts at minimum window"
+            );
+            return Err(SinkReject::protocol(
+                "block-sync peer repeatedly timed out at minimum window",
+            ));
+        }
+        Ok(())
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below
-    /// the committed floor: their bodies are committed and no longer needed, so
-    /// release the worst-case reservation still held for any unreceived heights
+    /// the download floor: their bodies have entered the commit pipeline or have
+    /// already been verified, so
+    /// release the size-estimate reservation still held for any unreceived heights
     /// and free the slot. No heights return to the queue (they are committed,
     /// below the floor, GC'd from the WorkQueue). A partially-committed request
     /// (suffix still above the floor) is left so its remaining bodies keep their
     /// reservation and arrive on the same request.
     fn gc_committed_outstanding(&mut self) {
-        let floor = self.committed_floor();
+        let floor = self.download_floor();
         let mut released = 0u64;
         let mut removed = false;
         let mut index = 0;
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.outstanding.remove(index);
-                released = released.saturating_add(outstanding.reserved_bytes());
+                released = released
+                    .saturating_add(self.work.release_heights(unreceived_heights(&outstanding)));
                 removed = true;
             } else {
                 index += 1;
@@ -878,6 +990,18 @@ impl PeerRoutine {
                 .await;
             return;
         }
+        if !self
+            .registry
+            .peer_has_outstanding_height(&self.peer, height)
+        {
+            tracing::debug!(
+                peer = ?self.peer,
+                ?height,
+                "ignoring late block-sync body for a claim cancelled by the floor watchdog"
+            );
+            self.finish_outstanding_at(index, Disposition::RetryMissing);
+            return;
+        }
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
@@ -906,17 +1030,33 @@ impl PeerRoutine {
         {
             self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
                 .await;
+            self.finish_outstanding_at(index, Disposition::RetryOriginal);
+            return;
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
         self.record_received(serialized_bytes);
-        // The block reserved `BS_PER_BLOCK_WORST_CASE_BYTES` at send time; shrink
-        // to the actual size (the reservation only ever decreases, so the budget
-        // can never reject a valid body). `mark_received` then stops
-        // `reserved_bytes()` counting this height; the only bytes still held are
-        // the `serialized_bytes` carried into the reorder buffer.
-        self.budget
-            .shrink(BS_PER_BLOCK_WORST_CASE_BYTES, serialized_bytes);
+        // The block reserved its size estimate at send time; settle to the actual
+        // size. When the body is no larger than its estimate this frees the
+        // slack; when it is larger (a stale/under-advertised hint) this charges
+        // the overshoot so held bodies are never under-counted.
+        // `mark_received` then stops `reserved_bytes()` counting this height; the
+        // only bytes still held are the `serialized_bytes` carried into the reorder
+        // buffer.
+        let Some(delta) = self
+            .work
+            .settle_active_reserved_height(height, serialized_bytes)
+        else {
+            tracing::debug!(
+                peer = ?self.peer,
+                ?height,
+                serialized_bytes,
+                "ignoring late block-sync body for a request already released"
+            );
+            self.finish_outstanding_at(index, Disposition::RetryMissing);
+            return;
+        };
+        self.apply_budget_delta(delta);
         self.trace_body_received(
             height,
             serialized_bytes,
@@ -952,12 +1092,12 @@ impl PeerRoutine {
 
     // ===================== unmatched fallthroughs (ported) ==================
 
-    /// Whether a response for `height` is stale (already committed or held). The
+    /// Whether a response for `height` is stale (already downloaded or held). The
     /// held-height portion is recovered through the WorkQueue's `in_flight`
-    /// (every buffered/applying height stays claimed until the floor commits past
-    /// it). Reads `committed_floor` from the view.
+    /// (every buffered/applying height stays claimed until the download floor
+    /// passes it). Reads `download_floor` from the view.
     fn is_stale_response_height(&self, height: block::Height) -> bool {
-        height <= self.committed_floor() || self.work.in_flight_contains(height)
+        height <= self.download_floor() || self.work.in_flight_contains(height)
     }
 
     async fn ignore_stale_response(&mut self, height: block::Height, response_kind: &str) -> bool {
@@ -1048,10 +1188,50 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
 
+        let view = *self.sequencer_view.borrow();
+        let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
+            self.work.reserved_above(view.download_floor);
+        let Some(decision) = admission_decision(
+            &self.config,
+            AdmissionSnapshot {
+                download_floor: view.download_floor,
+                reorder_buffered_bytes: view.reorder_buffered_bytes,
+                reorder_buffered_blocks: view.reorder_len,
+                applying_buffered_bytes: view.applying_buffered_bytes,
+                applying_buffered_blocks: view.applying_len,
+                sequencer_input_queued_bytes: self
+                    .sequencer_input_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                reserved_above_floor_bytes,
+                reserved_above_floor_blocks,
+                budget_available: self.budget.available(),
+            },
+            height,
+            serialized_bytes,
+        ) else {
+            tracing::debug!(
+                peer = ?self.peer,
+                ?height,
+                serialized_bytes,
+                "not buffering unmatched queued block-sync body at look-ahead cap"
+            );
+            return true;
+        };
+        if decision.max_request_bytes < serialized_bytes {
+            tracing::debug!(
+                peer = ?self.peer,
+                ?height,
+                serialized_bytes,
+                admitted_bytes = decision.max_request_bytes,
+                "not buffering unmatched queued block-sync body; insufficient admitted budget"
+            );
+            return true;
+        }
+
         // This queued height owns no prior reservation: reserve its actual size
         // before buffering. If the budget is genuinely full of other legitimate
         // bodies, skip buffering (the height stays queued for retry with its own
-        // worst-case reservation, so no valid body is lost overall).
+        // size-estimate reservation, so no valid body is lost overall).
         if !self.budget.try_reserve(serialized_bytes) {
             tracing::debug!(
                 peer = ?self.peer,
@@ -1066,6 +1246,8 @@ impl PeerRoutine {
         // already `in_flight` the take is a no-op and the Sequencer drops the
         // later duplicate.
         let _ = self.work.take_in_range(height, height, 1);
+        let old_charge = self.work.mark_held_direct(height, serialized_bytes);
+        self.budget.release(old_charge);
 
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
@@ -1126,7 +1308,7 @@ impl PeerRoutine {
     }
 
     /// An unmatched response for a height the peer *claims to serve*
-    /// (`committed_floor < height <= servable_high`) that no other fallthrough
+    /// (`download_floor < height <= servable_high`) that no other fallthrough
     /// claimed. The common cause is an honest, in-flight body/terminator for a
     /// height we requested before a destructive reset (reorg) then dropped from
     /// our `outstanding` and from `work` (`reset_above`), or one that simply
@@ -1139,8 +1321,7 @@ impl PeerRoutine {
     /// window — restore the no-churn property by dropping the response quietly. A
     /// response *outside* the peer's advertised range is still scored.
     fn ignore_servable_range_response(&self, height: block::Height, response_kind: &str) -> bool {
-        if !self.received_status || height <= self.committed_floor() || height > self.servable_high
-        {
+        if !self.received_status || height <= self.download_floor() || height > self.servable_high {
             return false;
         }
         metrics::counter!("sync.block.response.unmatched_servable_ignored").increment(1);
@@ -1205,14 +1386,16 @@ impl PeerRoutine {
     /// response can still match after the floor moved through its prefix; mark
     /// the stale prefix satisfied and retry only the remaining suffix.
     fn stale_adjusted_disposition(&mut self, index: usize, current: Disposition) -> Disposition {
-        let tip = self.committed_floor();
+        let tip = self.download_floor();
         let Some(outstanding) = self.window.outstanding.get_mut(index) else {
             return current;
         };
         if outstanding.request.start_height > tip {
             return current;
         }
-        let released_bytes = outstanding.mark_received_through(tip);
+        let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
+        let _ = outstanding.mark_received_through(tip);
+        let released_bytes = self.work.release_heights(released_heights);
         self.budget.release(released_bytes);
         if outstanding.is_complete() {
             Disposition::Satisfied
@@ -1232,7 +1415,8 @@ impl PeerRoutine {
     }
 
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
-        self.budget.release(outstanding.reserved_bytes());
+        let released = self.work.release_heights(unreceived_heights(&outstanding));
+        self.budget.release(released);
         match disposition {
             Disposition::Satisfied => {
                 // Every requested height was received and buffered; nothing
@@ -1243,7 +1427,8 @@ impl PeerRoutine {
             // be re-fetched, so both retry dispositions return only the unreceived
             // heights to `pending`. `return_items` is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
-                self.return_unreceived_to_queue(&outstanding);
+                let released = self.return_unreceived_to_queue(&outstanding);
+                self.budget.release(released);
                 // This peer just failed these heights (RangeUnavailable / short
                 // BlocksDone): bias away from re-grabbing them so another peer
                 // contests the range first (and so the routine cannot self-wake
@@ -1254,11 +1439,22 @@ impl PeerRoutine {
         self.publish_outstanding();
     }
 
-    fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) {
-        self.work.return_items(unreceived_heights(outstanding));
+    fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
+        self.work
+            .release_and_return_items(unreceived_heights(outstanding))
     }
 
-    /// Publish this peer's current *unreceived* in-flight height→hash set to the
+    fn apply_budget_delta(&mut self, delta: i128) {
+        if delta > 0 {
+            self.budget
+                .charge(u64::try_from(delta).expect("positive budget delta fits in u64"));
+        } else if delta < 0 {
+            self.budget
+                .release(u64::try_from(-delta).expect("negative budget delta fits in u64"));
+        }
+    }
+
+    /// Publish this peer's current *unreceived* in-flight height metadata to the
     /// registry, so the producer's `!has_outstanding_request` filter and the
     /// low-water `total_unreceived` gate read the same per-request-granularity
     /// count the previous reactor used (`expected_blocks.len() − received.len()`).
@@ -1266,11 +1462,20 @@ impl PeerRoutine {
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
     fn publish_outstanding(&self) {
-        let mut map: BTreeMap<block::Height, block::Hash> = BTreeMap::new();
+        let mut map: BTreeMap<block::Height, super::peer_registry::OutstandingMeta> =
+            BTreeMap::new();
         for outstanding in &self.window.outstanding {
             for expected in &outstanding.request.expected_blocks {
                 if !outstanding.has_received(expected.height) {
-                    map.insert(expected.height, expected.hash);
+                    map.insert(
+                        expected.height,
+                        super::peer_registry::OutstandingMeta {
+                            hash: expected.hash,
+                            estimated_bytes: expected.estimated_bytes,
+                            queued_at: outstanding.queued_at,
+                            deadline: outstanding.deadline,
+                        },
+                    );
                 }
             }
         }
@@ -1311,8 +1516,8 @@ impl PeerRoutine {
 
     // ===================== view reads ======================================
 
-    fn committed_floor(&self) -> block::Height {
-        self.view.borrow().floor
+    fn download_floor(&self) -> block::Height {
+        self.sequencer_view.borrow().download_floor
     }
 
     fn record_received(&self, bytes: u64) {
@@ -1498,6 +1703,20 @@ fn unreceived_heights(
         .map(|expected| expected.height)
 }
 
+fn outstanding_unreceived_through(
+    outstanding: &OutstandingBlockRange,
+    tip: block::Height,
+) -> impl Iterator<Item = block::Height> + '_ {
+    outstanding
+        .request
+        .expected_blocks
+        .iter()
+        .filter(move |expected| {
+            expected.height <= tip && !outstanding.has_received(expected.height)
+        })
+        .map(|expected| expected.height)
+}
+
 impl Drop for PeerRoutine {
     /// disconnect-mid-fetch correctness: on every exit path
     /// (cancel/panic/normal) return this routine's unreceived outstanding heights
@@ -1514,8 +1733,7 @@ impl Drop for PeerRoutine {
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
         for outstanding in self.window.outstanding.drain(..) {
-            self.budget.release(outstanding.reserved_bytes());
-            self.work.return_items(
+            let released = self.work.release_and_return_items(
                 outstanding
                     .request
                     .expected_blocks
@@ -1523,6 +1741,7 @@ impl Drop for PeerRoutine {
                     .filter(|expected| !outstanding.has_received(expected.height))
                     .map(|expected| expected.height),
             );
+            self.budget.release(released);
         }
         self.registry.clear_outstanding(&self.peer, self.generation);
     }

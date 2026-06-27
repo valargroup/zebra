@@ -24,15 +24,25 @@ use super::{
     *,
 };
 
-/// Favor the lowest re-requestable height over the speculative high tail.
+/// How often the Sequencer task checks whether the byte budget is starving the
+/// commit-unblocking (lowest pending) height and sheds the speculative top of the
+/// reorder buffer to fund it. Bounds the recovery latency when no bodies are
+/// flowing to trigger the inline check (e.g. once outstanding requests drain).
+const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Favor the lowest needed height over the speculative high tail.
 ///
-/// When a floor reservation cannot be funded, and the lowest re-requestable
-/// height sits *below* the highest buffered body, drop that top body: release its
-/// bytes to the budget and return its height to `pending` (it was held, hence in
-/// `work.in_flight` per the `held ⟺ in_flight` invariant) for later re-fetch. The
-/// floor requester calls this synchronously through
-/// [`SequencerControlInput::FundFloorReservation`], so the rescue path is
-/// demand-driven instead of timer-driven. Returns whether it shed anything.
+/// While the byte budget cannot fund even one worst-case request yet the lowest
+/// needed height (pending or outstanding) sits *below* the highest buffered body,
+/// drop that top body: release its bytes to the budget and return its height to
+/// `pending` (it was held, hence in `work.in_flight` per the `held ⟺ in_flight`
+/// invariant) for later re-fetch. Because another top can always be shed, a low
+/// retry never blocks on budget; the floor can never wedge behind a full buffer,
+/// and under a stall the speculative tail is shed and the chain fills bottom-up,
+/// which also bounds the reorder backlog. Floor requesters also call this
+/// synchronously through [`SequencerControlInput::FundFloorReservation`], so the
+/// rescue path is demand-driven with a periodic backstop. Returns whether it shed
+/// anything.
 pub(super) fn shed_top_until_available(
     budget: &mut ByteBudget,
     work: &WorkQueue,
@@ -59,11 +69,28 @@ pub(super) fn shed_top_until_available(
         if freed == 0 {
             break;
         }
-        budget.release(freed);
-        work.return_items([top]);
+        let released = work.release_and_return_items([top]);
+        debug_assert!(
+            released == 0 || released == freed,
+            "shed reorder release must match the per-height budget ledger when present"
+        );
+        budget.release(if released == 0 { freed } else { released });
         shed_any = true;
     }
     shed_any
+}
+
+pub(super) fn shed_top_for_floor_starvation(
+    budget: &mut ByteBudget,
+    work: &WorkQueue,
+    sequencer: &mut Sequencer,
+) -> bool {
+    shed_top_until_available(
+        budget,
+        work,
+        sequencer,
+        super::config::BS_PER_BLOCK_WORST_CASE_BYTES,
+    )
 }
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
@@ -123,14 +150,14 @@ pub(super) enum SequencerControlInput {
     },
 }
 
-/// The committed view the reactor reacts to. A `watch` (latest-wins) send never
+/// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct SequencerView {
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
-    pub(super) floor: block::Height,
+    pub(super) download_floor: block::Height,
     pub(super) finalized: block::Height,
     /// Increments only when the task performs a destructive `reset_to`, so the
     /// reactor distinguishes an advance (drop outstanding *through* tip) from a
@@ -158,7 +185,7 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
-        floor: frontiers.verified_block_tip,
+        download_floor: frontiers.verified_block_tip,
         finalized: frontiers.finalized_height,
         reset_epoch: 0,
         reaction_epoch: 0,
@@ -234,8 +261,13 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
-        // Track input closure explicitly so each channel can close independently
-        // while the task continues draining the other.
+        // Periodic shed backstop: catches budget starvation of the floor even when
+        // no bodies/control events are arriving to trigger the inline checks.
+        let mut shed_tick = tokio::time::interval(FLOOR_STARVATION_SHED_INTERVAL);
+        shed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Track input closure explicitly: the always-ready shed timer means the
+        // `select!` never falls through to an `else`, so shut down only once both
+        // input channels have closed.
         let mut control_open = true;
         let mut body_open = true;
         loop {
@@ -263,9 +295,24 @@ impl SequencerTask {
                         Some(body) => {
                             self.release_body_input_bytes(body.bytes);
                             self.handle_accept_body(body).await;
+                            shed_top_for_floor_starvation(
+                                &mut self.budget,
+                                &self.work,
+                                &mut self.sequencer,
+                            );
                             self.publish_view();
                         }
                         None => body_open = false,
+                    }
+                }
+
+                _ = shed_tick.tick() => {
+                    if shed_top_for_floor_starvation(
+                        &mut self.budget,
+                        &self.work,
+                        &mut self.sequencer,
+                    ) {
+                        self.publish_view();
                     }
                 }
             }
@@ -382,7 +429,8 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         self.budget.release(advance.release_bytes);
         if advance.changed {
-            self.work.advance_floor(frontiers.verified_block_tip);
+            let released = self.work.advance_floor(frontiers.verified_block_tip);
+            self.budget.release(released);
             self.release_contiguous_blocks().await;
         }
     }
@@ -460,7 +508,8 @@ impl SequencerTask {
         // Drop every download work item above the reset target (their buffers
         // were cleared by `reset_to`); the reactor's `query_needed_blocks`
         // re-fills.
-        self.work.reset_above(self.sequencer.floor());
+        let released = self.work.reset_above(self.sequencer.floor());
+        self.budget.release(released);
         // A destructive reset: bump the epoch so the reactor drops *all*
         // outstanding requests (not just those through the tip).
         self.reset_epoch = self.reset_epoch.saturating_add(1);
@@ -536,7 +585,8 @@ impl SequencerTask {
                 let released = self.sequencer.release_applying_blocks_from(height);
                 self.budget.release(released);
                 self.sequencer.reset_floor_below(height);
-                self.work.reset_above(self.sequencer.floor());
+                let released = self.work.reset_above(self.sequencer.floor());
+                self.budget.release(released);
                 let dropped = self.sequencer.drop_reorder_from(height);
                 self.budget.release(dropped);
                 // A `Rejected` result means consensus found the body invalid.
@@ -704,17 +754,30 @@ impl SequencerTask {
 
     fn publish_view(&mut self) {
         self.committed_throughput.sample(Instant::now());
+        let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
+        let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
+        let body_input_bytes = self
+            .body_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let expected_budget = self
+            .work
+            .reserved_bytes()
+            .saturating_add(reorder_buffered_bytes)
+            .saturating_add(applying_buffered_bytes)
+            .saturating_add(body_input_bytes);
+        self.budget
+            .audit(expected_budget, "block-sync sequencer view");
         let _ = self.view_tx.send_replace(SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
-            floor: self.sequencer.floor(),
+            download_floor: self.sequencer.floor(),
             finalized: self.finalized_height,
             reset_epoch: self.reset_epoch,
             reaction_epoch: self.reaction_epoch,
             reorder_len: self.sequencer.reorder_len() as u64,
             applying_len: self.sequencer.applying_len() as u64,
-            reorder_buffered_bytes: self.sequencer.reorder_buffered_bytes(),
-            applying_buffered_bytes: self.sequencer.applying_buffered_bytes(),
+            reorder_buffered_bytes,
+            applying_buffered_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),

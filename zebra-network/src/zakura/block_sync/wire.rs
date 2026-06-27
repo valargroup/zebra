@@ -190,9 +190,9 @@ impl BlockSyncMessage {
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
 
-        // If this is a block message, keep the original raw block payload as well
-        // this is helpful for storing it in more compact form in the backlog.
-        let (block_message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
+        // If this is a block message, keep the original raw block payload as well;
+        // it can be stored in compact form in the reorder backlog.
+        let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
             let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
             let message = Self::decode(&raw_block_payload)?;
             (message, Some(raw_block_payload))
@@ -200,13 +200,13 @@ impl BlockSyncMessage {
             (Self::decode(&frame.payload)?, None)
         };
 
-        if frame_message_type != block_message.message_type() {
+        if frame_message_type != message.message_type() {
             return Err(BlockSyncWireError::MismatchedFrameMessageType {
                 frame: frame.message_type,
-                payload: block_message.message_type(),
+                payload: message.message_type(),
             });
         }
-        Ok((block_message, raw_block_payload))
+        Ok((message, raw_block_payload))
     }
 
     /// Exact serialized length of a `Block` body, derived from the frame payload

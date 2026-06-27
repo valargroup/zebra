@@ -11,10 +11,29 @@ use crate::zakura::{
 /// [`MAX_BS_INFLIGHT_REQUESTS`]).
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
-/// Minimum additive growth after a successful response.
-const MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH: usize = 64;
-/// Fractional additive-increase divisor after a successful response.
-const OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR: usize = 8;
+/// Consecutive error-free responses that make up one window-growth epoch.
+///
+/// The adaptive window holds flat for a full epoch of successes before each
+/// growth step, so it never opens faster than the peer has demonstrably served.
+const OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES: usize = 16;
+/// Cubic coefficient for the streak-gated window ramp.
+///
+/// Target window = `growth_base + COEFF * epoch^3`, capped at the hard cap, where
+/// `epoch` counts completed [`OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES`]-success
+/// runs since the last timeout. Growth is gentle for the first few epochs and
+/// accelerates the longer the peer serves without an error, then resets on the
+/// next timeout. With the default base of 64 and a 16-success epoch, the window
+/// ramps cubically toward the peer's advertised hard cap (locally clamped to
+/// [`MAX_BS_INFLIGHT_REQUESTS`] = 32,768; the default advertisement is 32,000),
+/// reaching the default 32,000 ceiling after 16 epochs (256 consecutive
+/// error-free successes).
+const OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF: usize = 8;
+/// Cubic coefficient for the streak-gated timeout backoff.
+const OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF: usize = OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF;
+/// Consecutive timeout batches that make up one window-reduction epoch.
+const OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS: usize = OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
+/// Timeouts tolerated after the adaptive window has already reached its floor.
+const OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT: usize = 3;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -239,7 +258,7 @@ pub(super) struct BlockSyncState {
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
-    pub(super) work: Arc<WorkQueue>,
+    pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
@@ -272,7 +291,7 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            work: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
+            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
@@ -310,17 +329,55 @@ pub(super) struct DownloadWindow {
     pub(super) outbound_request_window: usize,
     pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Completed error-free responses since the last timeout-driven reduction.
+    /// Drives the streak-gated cubic ramp in
+    /// [`increase_outbound_window_after_success`](Self::increase_outbound_window_after_success).
+    consecutive_successes: usize,
+    /// Consecutive timeout batches since the last successful response.
+    ///
+    /// Drives the same streak-gated cubic shape as successful response growth,
+    /// but downward. The window holds flat for a full timeout epoch, then lowers
+    /// faster as the consecutive timeout streak grows.
+    consecutive_timeouts: usize,
+    /// Window value at the last reduction — the floor the cubic ramp grows back
+    /// up from, so probing resumes from the post-backoff window rather than the
+    /// original slow-start point.
+    growth_base: usize,
+    /// Window value when the current timeout streak began.
+    reduction_base: usize,
+    /// Consecutive timeout batches observed while the window was already at the
+    /// minimum. Once this crosses the threshold, the caller should disconnect the
+    /// peer rather than retrying indefinitely at one request.
+    floor_timeouts: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum TimeoutBackoffOutcome {
+    KeepPeer,
+    DisconnectPeer,
 }
 
 impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         let max_inflight_requests = config.advertised_max_inflight_requests();
+        // Slow-start: open at the configured initial window (clamped to the
+        // advertised hard cap) and grow toward the cap on success, rather than
+        // opening at the full `max_inflight`.
+        let initial_window = config
+            .initial_inflight_requests
+            .clamp(1, max_inflight_requests);
+        let initial_window = usize::try_from(initial_window)
+            .expect("u32 initial inflight requests fits in usize on supported targets");
         Self {
             max_inflight_requests,
-            outbound_request_window: usize::try_from(max_inflight_requests)
-                .expect("u32 max inflight requests fits in usize on supported targets"),
+            outbound_request_window: initial_window,
             timeout_recovery_slots: 0,
             outstanding: Vec::new(),
+            consecutive_successes: 0,
+            consecutive_timeouts: 0,
+            growth_base: initial_window,
+            reduction_base: initial_window,
+            floor_timeouts: 0,
         }
     }
 
@@ -336,27 +393,84 @@ impl DownloadWindow {
             .min(hard_capacity.saturating_sub(self.outstanding.len()))
     }
 
-    pub(super) fn reduce_outbound_window_after_timeout(&mut self) {
-        self.outbound_request_window = self.outbound_request_window.saturating_div(2).max(1);
+    // reduce_outbound_window_after_timeout is the per-peer backoff path for block-sync
+    // downloads. It is called when a peer times out, and it shrinks that peer's adaptive
+    // outbound request window so Zebra asks that peer for fewer block ranges
+    // concurrently.
+    pub(super) fn reduce_outbound_window_after_timeout(&mut self) -> TimeoutBackoffOutcome {
+        // If this is the first timeout in a row, reset the reduction base to the current window.
+        if self.consecutive_timeouts == 0 {
+            self.reduction_base = self.outbound_request_window;
+        }
+
+        // Increment the consecutive timeout streak.
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+
+        // Check if the window is at the minimum.
+        let was_at_floor = self.outbound_request_window == 1;
+
+        // Calculate the epoch of the timeout streak.
+        let epoch = self.consecutive_timeouts / OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
+        if epoch > 0 {
+            let cubic_reduction = epoch
+                .saturating_mul(epoch)
+                .saturating_mul(epoch)
+                .saturating_mul(OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF);
+            let target = self.reduction_base.saturating_sub(cubic_reduction).max(1);
+            // Reduction only: never grow the window on a timeout.
+            self.outbound_request_window = self.outbound_request_window.min(target).max(1);
+        }
+
+        // A timeout ends the current success streak; the cubic ramp restarts from
+        // the reduced window, so growth probes back up from the post-backoff floor.
+        self.consecutive_successes = 0;
+        self.growth_base = self.outbound_request_window;
         self.timeout_recovery_slots = self
             .timeout_recovery_slots
             .saturating_add(1)
             .min(self.hard_outbound_capacity());
+
+        if was_at_floor {
+            self.floor_timeouts = self.floor_timeouts.saturating_add(1);
+        } else {
+            self.floor_timeouts = 0;
+        }
+
+        if self.floor_timeouts >= OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT {
+            TimeoutBackoffOutcome::DisconnectPeer
+        } else {
+            TimeoutBackoffOutcome::KeepPeer
+        }
     }
 
+    /// Grow the adaptive window on a successful response using a streak-gated
+    /// cubic ramp: hold the window flat until a full epoch of consecutive
+    /// successes, then raise it to `growth_base + COEFF * epoch^3` (capped at the
+    /// hard cap). The step grows cubically with the no-error streak, so the window
+    /// opens gently at first and accelerates the longer the peer serves without a
+    /// timeout. Any timeout resets the streak and the base (see
+    /// [`reduce_outbound_window_after_timeout`](Self::reduce_outbound_window_after_timeout)).
     pub(super) fn increase_outbound_window_after_success(&mut self) {
+        self.consecutive_timeouts = 0;
+        self.reduction_base = self.outbound_request_window;
+        self.floor_timeouts = 0;
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
         let max_window = self.hard_outbound_capacity();
-        if self.outbound_request_window < max_window {
-            let growth = self
-                .outbound_request_window
-                .checked_div(OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR)
-                .unwrap_or(0)
-                .max(MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH);
-            self.outbound_request_window = self
-                .outbound_request_window
-                .saturating_add(growth)
-                .min(max_window);
+        if self.outbound_request_window >= max_window {
+            return;
         }
+        let epoch = self.consecutive_successes / OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
+        if epoch == 0 {
+            // Still inside the first flat epoch: do not open the window yet.
+            return;
+        }
+        let cubic = epoch
+            .saturating_mul(epoch)
+            .saturating_mul(epoch)
+            .saturating_mul(OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF);
+        let target = self.growth_base.saturating_add(cubic).min(max_window);
+        // Growth only: never shrink the window on a success.
+        self.outbound_request_window = self.outbound_request_window.max(target);
     }
 
     pub(super) fn record_outbound_request_scheduled(&mut self) {
@@ -460,19 +574,20 @@ pub(super) struct OutstandingBlockRange {
 }
 
 impl OutstandingBlockRange {
-    /// Worst-case bytes still reserved for this request: the per-block worst case
-    /// for every requested height not yet received. The reservation for a request
-    /// only ever shrinks, so releasing this (on timeout/disconnect/short response)
-    /// never over-releases bytes that were already handed to the reorder buffer.
+    /// Bytes still reserved for this request: the sum of the per-height size
+    /// estimates for every requested height not yet received. Each received body
+    /// shrinks its estimate toward the actual size, so releasing this (on
+    /// timeout/disconnect/short response) never over-releases bytes already handed
+    /// to the reorder buffer.
+    #[cfg(test)]
     pub(super) fn reserved_bytes(&self) -> u64 {
-        let outstanding = self
-            .request
+        self.request
             .expected_blocks
-            .len()
-            .saturating_sub(self.received.len());
-        // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
-        // product cannot overflow `u64`; `saturating_mul` is belt-and-suspenders.
-        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(outstanding as u64)
+            .iter()
+            .filter(|expected| !self.has_received(expected.height))
+            .fold(0u64, |acc, expected| {
+                acc.saturating_add(expected.estimated_bytes)
+            })
     }
 
     pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
@@ -492,11 +607,10 @@ impl OutstandingBlockRange {
     }
 
     /// Mark every requested height at or below `tip` as received and return the
-    /// worst-case bytes that those newly-received heights had reserved, so the
-    /// caller releases exactly the reservation those heights still held.
+    /// sum of the per-height size estimates those newly-received heights still
+    /// held, so the caller releases exactly the reservation those heights held.
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        let newly_received = self
-            .request
+        self.request
             .expected_blocks
             .iter()
             .filter(|expected| {
@@ -506,13 +620,79 @@ impl OutstandingBlockRange {
                         .offset_for_height(expected.height)
                         .is_some_and(|offset| self.received.insert_offset(offset))
             })
-            .count();
-        // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
-        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
+            .fold(0u64, |acc, expected| {
+                acc.saturating_add(expected.estimated_bytes)
+            })
     }
 
     pub(super) fn is_complete(&self) -> bool {
         self.received.len() == self.request.expected_blocks.len()
+    }
+}
+
+/// Pure per-height byte-accounting state.
+///
+/// The shared [`ByteBudget`] is just the atomic sink. This ledger owns the
+/// lifecycle arithmetic for one requested height:
+/// `Reserved(estimate) -> Held(actual) -> Released`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum BlockBudgetLedger {
+    Reserved(u64),
+    Held(u64),
+    Released,
+}
+
+impl BlockBudgetLedger {
+    pub(super) fn reserved(estimate: u64) -> Self {
+        Self::Reserved(estimate)
+    }
+
+    pub(super) fn current_charge(self) -> u64 {
+        match self {
+            Self::Reserved(bytes) | Self::Held(bytes) => bytes,
+            Self::Released => 0,
+        }
+    }
+
+    pub(super) fn release_reserved(&mut self) -> u64 {
+        let released = match *self {
+            Self::Reserved(bytes) => bytes,
+            Self::Held(_) | Self::Released => 0,
+        };
+        *self = Self::Released;
+        released
+    }
+
+    pub(super) fn reserved_charge(self) -> u64 {
+        match self {
+            Self::Reserved(bytes) => bytes,
+            Self::Held(_) | Self::Released => 0,
+        }
+    }
+
+    pub(super) fn is_reserved(self) -> bool {
+        matches!(self, Self::Reserved(_))
+    }
+
+    /// Move a reserved height to held bytes and return the signed budget delta.
+    ///
+    /// Positive means charge more bytes; negative means release bytes.
+    pub(super) fn settle(&mut self, actual: u64) -> i128 {
+        match *self {
+            Self::Reserved(reserved) => {
+                *self = Self::Held(actual);
+                i128::from(actual) - i128::from(reserved)
+            }
+            Self::Released => 0,
+            Self::Held(_) => 0,
+        }
+    }
+
+    /// Release the current charge exactly once.
+    pub(super) fn release(&mut self) -> u64 {
+        let charge = self.current_charge();
+        *self = Self::Released;
+        charge
     }
 }
 
