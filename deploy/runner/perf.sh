@@ -168,8 +168,7 @@ cmd_verify_isolation() {
   note "scraping $url for cohort isolation signals"
   local body
   if ! body="$(curl -fsS "$url" 2>/dev/null)"; then
-    note "no metrics at $url — start a bench first ('perf.sh run <label>'), then re-run with the run's metrics port."
-    return 0
+    die "no metrics at $url — start a bench first ('perf.sh run <label>'), then re-run with the run's metrics port."
   fi
   echo "--- zakura peer / connection metrics ---"
   echo "$body" | grep -iE 'zakura.*(peer|conn|accepted)' | grep -v '^#' || echo "(none)"
