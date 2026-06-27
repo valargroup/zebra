@@ -12,6 +12,7 @@
 
 use std::{iter, path::Path, sync::Arc};
 
+use super::super::RetentionPlan;
 use zebra_chain::{
     block::{
         self,
@@ -22,11 +23,14 @@ use zebra_chain::{
         Block, Height,
     },
     block_info::BlockInfo,
+    orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet,
         Network::{self, *},
         NetworkUpgrade,
     },
+    sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transparent::new_ordered_outputs_with_height,
     work::difficulty::ParameterDifficulty,
@@ -425,6 +429,48 @@ fn committed_body_releases_only_its_height_and_keeps_the_frontier() {
             (Height(1), block1.hash(), block1.header.clone()),
             (Height(2), block2.hash(), block2.header.clone()),
         ],
+    );
+}
+
+#[test]
+fn write_block_deletes_matching_provisional_zakura_roots() {
+    let _init_guard = zebra_test::init();
+    let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+    let mut state = ZebraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    );
+    let roots = [root_at(Height(1)), root_at(Height(2))];
+
+    write_full_block(&mut state, genesis);
+    state
+        .insert_zakura_header_commitment_roots(roots.clone())
+        .expect("provisional roots write");
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(2)),
+        roots.to_vec()
+    );
+
+    write_full_block(&mut state, block1);
+
+    assert!(state
+        .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1))
+        .is_empty());
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2)),
+        vec![root_at(Height(2))]
     );
 }
 
@@ -1129,6 +1175,32 @@ fn alternate_header(
     Arc::new(header)
 }
 
+fn root_at(height: Height) -> BlockCommitmentRoots {
+    BlockCommitmentRoots {
+        height,
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+    }
+}
+
+fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
+    let checkpoint_verified = CheckpointVerifiedBlock::from(block);
+    let finalized =
+        FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
+
+    state
+        .write_block(
+            finalized,
+            None,
+            &Mainnet,
+            "test",
+            RetentionPlan::Store,
+            None,
+            None,
+        )
+        .expect("block commit succeeds");
+}
+
 fn commit_header_range(
     state: &ZebraDb,
     anchor: block::Hash,
@@ -1282,4 +1354,91 @@ fn missing_pruning_metadata_cf_is_archive_database() {
 
     assert!(state.lowest_retained_height().is_none());
     assert!(!state.is_pruned());
+}
+
+/// POC (verified-commitment-trees): the anchor-only fast write produces the same
+/// `sapling_anchors` / `orchard_anchors` contents as the legacy full write, while
+/// skipping the per-height note-commitment tree CFs, and is idempotent.
+/// See `docs/design/verified-commitment-trees.md`.
+#[test]
+fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
+    use zebra_chain::{orchard, sapling};
+
+    fn ephemeral_db() -> ZebraDb {
+        ZebraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+    }
+
+    let sapling_tree = sapling::tree::NoteCommitmentTree::default();
+    let orchard_tree = orchard::tree::NoteCommitmentTree::default();
+    let sapling_root = sapling_tree.root();
+    let orchard_root = orchard_tree.root();
+
+    // Legacy path: the full write inserts the anchor *and* a per-height tree at each
+    // of two heights (the anchor set collapses to one key; two tree entries).
+    let legacy = ephemeral_db();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.create_sapling_tree(&legacy, &Height(10), &sapling_tree);
+        batch.create_sapling_tree(&legacy, &Height(11), &sapling_tree);
+        batch.create_orchard_tree(&legacy, &Height(10), &orchard_tree);
+        legacy.db.write(batch).expect("legacy batch writes");
+    }
+
+    // Fast path: anchor-only writes for the same roots, no per-height trees.
+    let fast = ephemeral_db();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&fast, &sapling_root);
+        batch.insert_orchard_anchor(&fast, &orchard_root);
+        fast.db.write(batch).expect("fast batch writes");
+    }
+
+    // The anchor sets are byte-identical (same count, same digest): the fast
+    // anchor-only write reproduces exactly the legacy anchor index.
+    assert_eq!(
+        legacy.vct_anchor_digest(),
+        fast.vct_anchor_digest(),
+        "fast anchor-only write must match legacy anchor set"
+    );
+
+    // The fast DB skipped the per-height Sapling tree CF; the legacy DB did not.
+    let count_sapling_trees = |db: &ZebraDb| -> usize {
+        let cf = db.db.cf_handle("sapling_note_commitment_tree").unwrap();
+        db.db
+            .zs_forward_range_iter::<_, Height, sapling::tree::NoteCommitmentTree, _>(&cf, ..)
+            .count()
+    };
+    assert_eq!(
+        count_sapling_trees(&legacy),
+        2,
+        "legacy path writes a per-height tree at each height"
+    );
+    assert_eq!(
+        count_sapling_trees(&fast),
+        0,
+        "fast path skips per-height trees entirely"
+    );
+
+    // Re-inserting an unchanged root is idempotent (anchor CF is a set).
+    let before = fast.vct_anchor_digest();
+    {
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&fast, &sapling_root);
+        fast.db.write(batch).expect("idempotent write");
+    }
+    assert_eq!(
+        fast.vct_anchor_digest(),
+        before,
+        "anchor insert is idempotent"
+    );
 }

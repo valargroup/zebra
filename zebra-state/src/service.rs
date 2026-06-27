@@ -60,6 +60,7 @@ use crate::{
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
     Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
 };
+use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
 pub mod block_iter;
 pub mod chain_tip;
@@ -87,6 +88,13 @@ use write::NonFinalizedWriteMessage;
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
 
 pub use self::traits::{ReadState, State};
+
+/// Error returned for historical note-commitment tree/subtree read requests on a
+/// verified-commitment-trees fast-synced database, where the per-height trees
+/// below the checkpoint handoff height were never written.
+const FAST_SYNCED_TREE_UNAVAILABLE_ERROR: &str =
+    "note commitment treestate is unavailable below the checkpoint on a fast-synced node; \
+     historical treestate queries require an archive node";
 
 /// A read-write service for Zebra's cached blockchain state.
 ///
@@ -986,6 +994,7 @@ impl StateService {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
@@ -999,6 +1008,7 @@ impl StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
                 rsp_tx,
             })
         {
@@ -1237,9 +1247,12 @@ impl Service<Request> for StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
             } => {
                 let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
+                    span.in_scope(|| {
+                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
+                    })
                 });
 
                 let span = Span::current();
@@ -1474,6 +1487,138 @@ where
     headers
 }
 
+// Returns the block commitment roots for the given height range
+fn block_roots_by_height_range<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    start: block::Height,
+    count: u32,
+) -> Vec<BlockCommitmentRoots>
+where
+    C: AsRef<Chain>,
+{
+    // Cap the count to the maximum header sync height range
+    let mut roots = Vec::with_capacity(
+        usize::try_from(count.min(MAX_HEADER_SYNC_HEIGHT_RANGE))
+            .expect("capped root count fits in usize"),
+    );
+
+    // Iterate over the height range
+    for offset in 0..count.min(MAX_HEADER_SYNC_HEIGHT_RANGE) {
+        let Some(height) = start + i64::from(offset) else {
+            break;
+        };
+
+        // If the height is at or below the finalized tip height, serve the roots from the finalized state
+        let root = if db
+            .finalized_tip_height()
+            .is_some_and(|finalized_tip| height <= finalized_tip)
+        {
+            finalized_state::serve_block_roots(db, height..=height)
+                .into_iter()
+                .next()
+                // If the height is in the chain, serve the roots from the chain
+        } else if let Some(chain) = chain
+            .as_ref()
+            .map(|chain| chain.as_ref())
+            .filter(|chain| chain.contains_block_height(height))
+        {
+            match (
+                chain.sapling_tree(height.into()),
+                chain.orchard_tree(height.into()),
+            ) {
+                (Some(sapling), Some(orchard)) => Some(BlockCommitmentRoots {
+                    height,
+                    sapling_root: sapling.root(),
+                    orchard_root: orchard.root(),
+                }),
+                _ => None,
+            }
+            // If the height is not in the chain, serve the roots from the zakura header commitment roots by height range
+        } else {
+            db.zakura_header_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+        };
+
+        let Some(root) = root else {
+            break;
+        };
+
+        if root.height != height {
+            break;
+        }
+
+        roots.push(root);
+    }
+
+    roots
+}
+
+// Returns true if the given roots cover the given height range
+fn block_roots_cover_range(
+    start_height: block::Height,
+    count: u32,
+    roots: &[BlockCommitmentRoots],
+) -> bool {
+    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    roots.iter().enumerate().all(|(offset, roots)| {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        start_height
+            .0
+            .checked_add(offset)
+            .is_some_and(|height| roots.height == block::Height(height))
+    })
+}
+
+// Return the highest known tip, but cap it to the verified block tip
+// if the header-only extension is not root-covered.
+fn root_covered_best_header_tip<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    best_disk_header_tip: Option<(block::Height, block::Hash)>,
+    verified_block_tip: Option<(block::Height, block::Hash)>,
+) -> Option<(block::Height, block::Hash)>
+where
+    C: AsRef<Chain>,
+{
+    // Choose the best candidate between the best disk header tip and the verified block tip
+    let best_header_tip = match (best_disk_header_tip, verified_block_tip) {
+        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => Some(block_tip),
+        (Some(header_tip), _) => Some(header_tip),
+        (None, block_tip) => block_tip,
+    }?;
+
+    // Is the chosen candidate already at or below the verified block tip?
+    // If yes, there no header-only gap.
+    let Some(verified_block_tip) = verified_block_tip else {
+        return Some(best_header_tip);
+    };
+
+    if best_header_tip.0 <= verified_block_tip.0 {
+        return Some(best_header_tip);
+    }
+
+    let Ok(start_height) = verified_block_tip.0.next() else {
+        return Some(verified_block_tip);
+    };
+    let best_header_height = best_header_tip.0;
+    let verified_block_height = verified_block_tip.0;
+    let count = best_header_height.0.checked_sub(verified_block_height.0)?;
+    let roots = block_roots_by_height_range(chain, db, start_height, count);
+
+    if block_roots_cover_range(start_height, count, &roots) {
+        Some(best_header_tip)
+    } else {
+        Some(verified_block_tip)
+    }
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -1535,6 +1680,24 @@ impl Service<ReadRequest> for ReadStateService {
 
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::IsPruned => Ok(ReadResponse::IsPruned(state.db.is_pruned())),
+
+            // The verified-commitment-trees `tree_aux` serving read (design §9).
+            ReadRequest::BlockRoots {
+                start_height,
+                count,
+            } => {
+                let roots = if count == 0 {
+                    Vec::new()
+                } else {
+                    block_roots_by_height_range(
+                        state.latest_best_chain(),
+                        &state.db,
+                        start_height,
+                        count,
+                    )
+                };
+                Ok(ReadResponse::BlockRoots(roots))
+            }
 
             // Used by the StateService.
             ReadRequest::Tip => Ok(ReadResponse::Tip(read::tip(
@@ -1709,17 +1872,15 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BestHeaderTip => {
                 let best_disk_header_tip = state.db.best_header_tip();
-                let verified_block_tip = read::tip(state.latest_best_chain(), &state.db);
+                let best_chain = state.latest_best_chain();
+                let verified_block_tip = read::tip(best_chain.clone(), &state.db);
 
-                Ok(ReadResponse::BestHeaderTip(
-                    match (best_disk_header_tip, verified_block_tip) {
-                        (Some(header_tip), Some(block_tip)) if block_tip.0 > header_tip.0 => {
-                            Some(block_tip)
-                        }
-                        (Some(header_tip), _) => Some(header_tip),
-                        (None, block_tip) => block_tip,
-                    },
-                ))
+                Ok(ReadResponse::BestHeaderTip(root_covered_best_header_tip(
+                    best_chain,
+                    &state.db,
+                    best_disk_header_tip,
+                    verified_block_tip,
+                )))
             }
 
             ReadRequest::MissingBlockBodies { from, limit } => {
@@ -1759,15 +1920,34 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => Ok(ReadResponse::SaplingTree(
-                read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::SaplingTree(hash_or_height) => {
+                if state.db.vct_historical_tree_unavailable(hash_or_height) {
+                    return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
+                }
+                Ok(ReadResponse::SaplingTree(read::sapling_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
-            ReadRequest::OrchardTree(hash_or_height) => Ok(ReadResponse::OrchardTree(
-                read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::OrchardTree(hash_or_height) => {
+                if state.db.vct_historical_tree_unavailable(hash_or_height) {
+                    return Err(FAST_SYNCED_TREE_UNAVAILABLE_ERROR.into());
+                }
+                Ok(ReadResponse::OrchardTree(read::orchard_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
             ReadRequest::SaplingSubtrees { start_index, limit } => {
+                // On a fast-synced database, subtrees below the checkpoint handoff
+                // height were never written, so a below-checkpoint range returns an
+                // empty list (the existing "no subtree at the start index" contract)
+                // rather than panicking. A typed archive-mode error for subtrees
+                // unifies with the indexing watermark in a later increment.
                 let end_index = limit
                     .and_then(|limit| start_index.0.checked_add(limit.0))
                     .map(NoteCommitmentSubtreeIndex);
@@ -1991,7 +2171,7 @@ impl Service<ReadRequest> for ReadStateService {
 
 /// Initialize a state service from the provided [`Config`].
 /// Returns a boxed state service, a read-only state service,
-/// and receivers for state chain tip updates.
+/// receivers for state chain tip updates, and a `tree_aux` roots writer if peer mode is active.
 ///
 /// Each `network` has its own separate on-disk database.
 ///
@@ -2089,12 +2269,9 @@ pub fn spawn_init_read_only(
 pub async fn init_test(
     network: &Network,
 ) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
-    // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
-    //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+    let (state_service, _, _, _) = init_test_services_inner(network).await;
 
-    Buffer::new(BoxService::new(state_service), 1)
+    state_service
 }
 
 /// Initializes a state service with an ephemeral [`Config`] and a buffer with a single slot,
@@ -2103,6 +2280,18 @@ pub async fn init_test(
 /// This can be used to create a state service for testing. See also [`init`].
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_test_services(
+    network: &Network,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    ReadStateService,
+    LatestChainTip,
+    ChainTipChange,
+) {
+    init_test_services_inner(network).await
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+async fn init_test_services_inner(
     network: &Network,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,

@@ -394,6 +394,7 @@ jobs:
           CONTAINER_ID: ${{ steps.find-container.outputs.CONTAINER_ID }}
           INSTANCE_NAME: ${{ inputs.test_id }}-${{ env.GITHUB_REF_SLUG_URL }}-${{ env.GITHUB_SHA_SHORT }}
           GCP_ZONE: ${{ vars.GCP_ZONE }}
+          CAPTURE_MAINNET_FRONTIER: ${{ contains(inputs.test_id, 'mainnet') }}
         run: |
           gcloud compute ssh "${INSTANCE_NAME}" \
             --zone "${GCP_ZONE}" \
@@ -403,6 +404,11 @@ jobs:
             --command="
             sudo docker logs ${CONTAINER_ID} 2>&1 | grep -oE '[0-9]+ [0-9a-f]{64}' > /tmp/checkpoints.txt;
             echo \"Captured \$(wc -l < /tmp/checkpoints.txt) checkpoint lines\";
+            if [ \"${CAPTURE_MAINNET_FRONTIER}\" = 'true' ]; then
+              sudo docker cp ${CONTAINER_ID}:/tmp/mainnet-frontier.bin /tmp/mainnet-frontier.bin;
+              test -s /tmp/mainnet-frontier.bin;
+              echo \"Captured Mainnet VCT frontier artifact\";
+            fi
             "
 
   # Upload the checkpoint file captured in the test-result job as a workflow
@@ -468,11 +474,34 @@ jobs:
             exit 1
           fi
 
+      - name: Pull Mainnet frontier artifact from instance
+        if: ${{ contains(inputs.test_id, 'mainnet') }}
+        run: |
+          INSTANCE_NAME="${TEST_ID}-${GITHUB_REF_SLUG_URL}-${GITHUB_SHA_SHORT}"
+
+          gcloud compute scp \
+            --zone "${GCP_ZONE}" \
+            "${INSTANCE_NAME}:/tmp/mainnet-frontier.bin" \
+            "mainnet-frontier.bin"
+
+          if [ ! -s "mainnet-frontier.bin" ]; then
+            echo "ERROR: Mainnet frontier artifact is empty"
+            exit 1
+          fi
+
       - name: Upload checkpoint artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: ${{ inputs.test_id }}-checkpoints
           path: "*-checkpoints.txt"
+          retention-days: 30
+
+      - name: Upload Mainnet frontier artifact
+        if: ${{ contains(inputs.test_id, 'mainnet') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: ${{ inputs.test_id }}-frontier
+          path: mainnet-frontier.bin
           retention-days: 30
 
   # create a state image from the instance's state disk, if requested by the caller

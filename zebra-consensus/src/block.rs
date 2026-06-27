@@ -353,17 +353,17 @@ where
             let new_outputs = Arc::into_inner(known_utxos)
                 .expect("all verification tasks using known_utxos are complete");
 
-            let prepared_block = zs::SemanticallyVerifiedBlock {
+            // The semantic verifier checks the auth-data commitment during
+            // contextual validation, so the auth-data root isn't precomputed here
+            // (`from_semantic_data` leaves it unset).
+            let prepared_block = zs::SemanticallyVerifiedBlock::from_semantic_data(
                 block,
                 hash,
                 height,
                 new_outputs,
                 transaction_hashes,
-                deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                // The semantic verifier checks the auth-data commitment during
-                // contextual validation, so it isn't precomputed here.
-                auth_data_root: None,
-            };
+                Some(deferred_pool_balance_change),
+            );
 
             // Return early for proposal requests.
             if request.is_proposal() {

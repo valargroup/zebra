@@ -175,7 +175,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_2 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_4 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -3376,7 +3376,12 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    // The legacy request stream validates responses with a legacy-message-specific budget.
+    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
+        message_type,
+        &payload,
+        limits,
+    )?);
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -3413,11 +3418,10 @@ async fn write_outbound_request_frame_inner(
     let _ = send.finish();
 
     let mut frames = Vec::new();
-    let mut state = LegacyResponseReadState::new(budget);
     loop {
         match read_frame(
             &mut recv,
-            app_frame_cap_for_stream_kind(&limits, stream_kind),
+            inbound_frame_cap_for_stream_kind(&limits, stream_kind),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -3427,11 +3431,11 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                state.validate_frame(request_id, &frame)?;
+                legacy_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                state.finish()?;
+                legacy_state.finish()?;
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
@@ -4033,18 +4037,15 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
     .max(1)
 }
 
-/// Frame cap for reading on an admitted inbound stream, never larger than the
+/// Frame cap for reading frames received from a peer, never larger than the
 /// message cap allows.
 ///
-/// On an admitted ordered/request stream a frame payload *is* the message, so
-/// `admit_inbound_message` rejects any payload over `max_message_bytes`. A peer
-/// can negotiate `max_frame_bytes > max_message_bytes` (the two caps are clamped
-/// independently in `ZakuraLocalLimits::clamp`), so the cap handed to
-/// `read_frame` must also be limited to the message size. Otherwise a frame whose
-/// `payload_len` falls between the two limits is allocated and read in full by
-/// `read_frame` before `admit_inbound_message` rejects it as oversize, letting a
-/// peer force per-frame allocation/I/O up to the larger frame cap across many
-/// streams.
+/// On ordered/request streams and requester-side responses, a frame payload *is*
+/// the message. A peer can negotiate `max_frame_bytes > max_message_bytes` (the
+/// two caps are clamped independently in `ZakuraLocalLimits::clamp`), so the cap
+/// handed to `read_frame` must also be limited to the message size. Otherwise a
+/// frame whose `payload_len` falls between the two limits is allocated and read
+/// in full before the later message-level validation rejects or decodes it.
 fn inbound_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
     let frame_header_bytes =
         u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");
@@ -4074,7 +4075,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_2: u16 = 2;
+const ZAKURA_STREAM_VERSION_4: u16 = 4;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4873,6 +4874,7 @@ mod tests {
         let get_headers_frame = HeaderSyncMessage::GetHeaders {
             start_height: block::Height(1),
             count: 1,
+            want_tree_aux_roots: false,
         }
         .encode_frame()?;
 
@@ -5100,6 +5102,7 @@ mod tests {
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: block::Height(1),
                     count: 1,
+                    want_tree_aux_roots: false,
                 },
             })
             .await?;
@@ -6431,7 +6434,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_2,
+                    version: ZAKURA_STREAM_VERSION_4,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -6451,7 +6454,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_2),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_4),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
