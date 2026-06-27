@@ -292,7 +292,7 @@ impl DiskWriteBatch {
         finalized: &FinalizedBlock,
         utxos_spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo>,
         value_pool: ValueBalance<NonNegative>,
-    ) -> Result<(), ValidateContextError> {
+    ) -> Result<ValueBalance<NonNegative>, ValidateContextError> {
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
@@ -364,6 +364,8 @@ impl DiskWriteBatch {
             &BlockInfo::new(new_value_pool, block_size as u32),
         );
 
-        Ok(())
+        // Return the running pool so a batched commit can thread it into the
+        // next block instead of re-reading the (not-yet-written) db pool.
+        Ok(new_value_pool)
     }
 }

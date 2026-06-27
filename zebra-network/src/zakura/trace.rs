@@ -229,6 +229,11 @@ pub mod block_sync_trace {
     pub const FULL_IN_FLIGHT: &str = "full_in_flight";
     /// Submit attempts deferred during an interval because an apply limit was hit.
     pub const SUBMIT_THROTTLED: &str = "submit_throttled";
+    /// Derived single-stage pipeline limiter verdict (coarse stage label). See
+    /// `docs/design/block-sync-stall-attribution.md`.
+    pub const LIMITER: &str = "limiter";
+    /// Sub-reason for the limiter verdict (e.g. budget / no_peer / on_wire).
+    pub const LIMITER_REASON: &str = "limiter_reason";
 
     /// Peer status received (servable body range advertised by the peer).
     pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";

@@ -81,6 +81,146 @@ struct FloorGapDiagnostics {
     next_deadline_ms: Option<u64>,
 }
 
+/// Seconds the commit frontier must be frozen before the limiter classifier will
+/// call the pipeline commit-bound (rather than momentarily idle between applies).
+const PIPELINE_COMMIT_STALL_SECS: u64 = 2;
+
+/// The single stage currently bounding block-sync throughput, classified by
+/// [`classify_pipeline_limiter`] and surfaced as the `sync.pipeline.limiter`
+/// gauge plus the `limiter`/`limiter_reason` fields on the `BLOCK_SYNC_STATE`
+/// trace row. See `docs/design/block-sync-stall-attribution.md`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PipelineLimiter {
+    /// Synced / idle: no body lag.
+    None,
+    /// Lag remains but no stage is starved: bandwidth-bound, all stages flowing.
+    Saturated,
+    /// A low height is unfetched because the byte budget cannot fund a request.
+    DownloadBudget,
+    /// A low height is unfetched because no peer can serve it.
+    DownloadNoPeer,
+    /// A low height's request is still on the wire.
+    DownloadOnWire,
+    /// Bodies are arriving but pooling in the reorder buffer behind a low hole.
+    Reorder,
+    /// A ready contiguous body could not submit: an apply-class limit is saturated.
+    SubmitThrottled,
+    /// Applies are in flight but the commit frontier is frozen: verify/commit bound.
+    CommitBound,
+}
+
+impl PipelineLimiter {
+    /// Stable numeric code for the `sync.pipeline.limiter` gauge.
+    fn code(self) -> i64 {
+        match self {
+            PipelineLimiter::None => 0,
+            PipelineLimiter::Saturated => 1,
+            PipelineLimiter::DownloadBudget => 2,
+            PipelineLimiter::DownloadNoPeer => 3,
+            PipelineLimiter::DownloadOnWire => 4,
+            PipelineLimiter::Reorder => 5,
+            PipelineLimiter::SubmitThrottled => 6,
+            PipelineLimiter::CommitBound => 7,
+        }
+    }
+
+    /// Coarse stage label for the trace row's `limiter` field.
+    fn stage(self) -> &'static str {
+        match self {
+            PipelineLimiter::None => "none",
+            PipelineLimiter::Saturated => "saturated",
+            PipelineLimiter::DownloadBudget
+            | PipelineLimiter::DownloadNoPeer
+            | PipelineLimiter::DownloadOnWire => "download_gap",
+            PipelineLimiter::Reorder => "reorder",
+            PipelineLimiter::SubmitThrottled => "submit_throttled",
+            PipelineLimiter::CommitBound => "commit_bound",
+        }
+    }
+
+    /// Sub-reason for the trace row's `limiter_reason` field (empty when n/a).
+    fn reason(self) -> &'static str {
+        match self {
+            PipelineLimiter::DownloadBudget => "budget",
+            PipelineLimiter::DownloadNoPeer => "no_peer",
+            PipelineLimiter::DownloadOnWire => "on_wire",
+            _ => "",
+        }
+    }
+}
+
+/// Inputs to [`classify_pipeline_limiter`], gathered once per metrics tick. Kept
+/// as a plain value struct so the classification rules can be unit-tested without
+/// a live reactor.
+#[derive(Copy, Clone, Debug, Default)]
+struct LimiterInputs {
+    body_lag: u32,
+    download_blocked_on_budget: bool,
+    /// `None` when the download floor is caught up to the header tip (no gap), so
+    /// the no-peer / on-wire rules do not apply.
+    floor_gap_servable_peers: Option<usize>,
+    floor_gap_state: Option<&'static str>,
+    /// Increase in the Sequencer's monotonic throttle counter since the last tick.
+    throttled_delta: u64,
+    applying_len: u64,
+    in_flight: u64,
+    committed_blocks_per_sec: u64,
+    commit_frontier_stall_seconds: u64,
+    reorder_len: u64,
+    reorder_buffered_bytes: u64,
+    applying_buffered_bytes: u64,
+    received_blocks_per_sec: u64,
+}
+
+/// Classify the single limiting pipeline stage (first match wins). Commit-side
+/// backpressure is tested before download starvation because a slow committer
+/// fills upstream buffers and would otherwise read as `Saturated`. See
+/// `docs/design/block-sync-stall-attribution.md` §2 for the full rationale.
+fn classify_pipeline_limiter(i: &LimiterInputs) -> PipelineLimiter {
+    if i.body_lag == 0 {
+        return PipelineLimiter::None;
+    }
+    // SubmitThrottled is only meaningful when the commit pipeline is the binding
+    // constraint — i.e. the committer is actively draining. With batched commit the
+    // apply window fills during batch *accumulation* while the committer is idle
+    // (committed_blocks_per_sec == 0, bursting only when a batch flushes); that
+    // throttle is an artifact, not commit pressure. Require non-idle commit so an
+    // idle-committer throttle falls through to the real (download/supply) limiter
+    // below. Per-tick committed_blocks_per_sec is bursty under batching, so this
+    // reports SubmitThrottled on the flush ticks and attributes the accumulation
+    // ticks to their true upstream cause. See docs/design/block-sync-stall-attribution.md §2.
+    if i.throttled_delta > 0 && i.committed_blocks_per_sec > 0 {
+        return PipelineLimiter::SubmitThrottled;
+    }
+    let download_starved = i.download_blocked_on_budget
+        || matches!(i.floor_gap_servable_peers, Some(0))
+        || matches!(i.floor_gap_state, Some("outstanding"));
+    if i.applying_len > 0
+        && i.in_flight > 0
+        && i.committed_blocks_per_sec == 0
+        && i.commit_frontier_stall_seconds >= PIPELINE_COMMIT_STALL_SECS
+        && !download_starved
+    {
+        return PipelineLimiter::CommitBound;
+    }
+    if i.download_blocked_on_budget {
+        return PipelineLimiter::DownloadBudget;
+    }
+    if matches!(i.floor_gap_servable_peers, Some(0)) {
+        return PipelineLimiter::DownloadNoPeer;
+    }
+    if matches!(i.floor_gap_state, Some("outstanding")) {
+        return PipelineLimiter::DownloadOnWire;
+    }
+    if i.reorder_len > 0
+        && i.reorder_buffered_bytes > i.applying_buffered_bytes
+        && i.received_blocks_per_sec > 0
+    {
+        return PipelineLimiter::Reorder;
+    }
+    PipelineLimiter::Saturated
+}
+
 #[derive(Copy, Clone, Debug)]
 struct RangeResponseTrace {
     start_height: block::Height,
@@ -209,6 +349,8 @@ pub fn spawn_block_sync_reactor(
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
+        prev_submit_throttled_total: 0,
+        pipeline_limiter: PipelineLimiter::None,
         startup,
         state,
         registry,
@@ -291,6 +433,12 @@ pub(super) struct BlockSyncReactor {
     /// Latest view snapshot, kept so the periodic trace tick can read the
     /// (remote) Sequencer's reorder/applying/throughput counters.
     last_view: SequencerView,
+    /// Value of `last_view.submit_throttled_total` at the previous metrics tick,
+    /// so the limiter classifier can detect throttling as a positive delta.
+    prev_submit_throttled_total: u64,
+    /// Most recent `sync.pipeline.limiter` verdict, computed in `publish_metrics`
+    /// and read by `trace_sync_state` for the `BLOCK_SYNC_STATE` row.
+    pipeline_limiter: PipelineLimiter,
 }
 
 impl BlockSyncReactor {
@@ -1471,7 +1619,10 @@ impl BlockSyncReactor {
             .lock()
             .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
             .unwrap_or((0, 0));
+        let pipeline_limiter = self.pipeline_limiter;
         self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
+            bs_insert_str(row, bs_trace::LIMITER, pipeline_limiter.stage());
+            bs_insert_str(row, bs_trace::LIMITER_REASON, pipeline_limiter.reason());
             bs_insert_height(row, bs_trace::REQUEST_FLOOR, self.request_floor);
             bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.download_floor);
             bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
@@ -1864,7 +2015,8 @@ impl BlockSyncReactor {
         })
     }
 
-    fn publish_metrics(&self) {
+    fn publish_metrics(&mut self) {
+        self.refresh_pipeline_limiter();
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
         metrics::gauge!("sync.block.best_header_tip.height")
@@ -1903,6 +2055,52 @@ impl BlockSyncReactor {
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+        metrics::gauge!("sync.pipeline.limiter").set(self.pipeline_limiter.code() as f64);
+    }
+
+    /// Gather the limiter inputs from the registry/budget/view and classify the
+    /// single bounding stage into `self.pipeline_limiter`. Runs once per
+    /// `publish_metrics` call (before the gauges and the trace row read it), and
+    /// advances `prev_submit_throttled_total` so the next tick sees a fresh delta.
+    fn refresh_pipeline_limiter(&mut self) {
+        let view = self.last_view;
+        let throttled_delta = view
+            .submit_throttled_total
+            .saturating_sub(self.prev_submit_throttled_total);
+        self.prev_submit_throttled_total = view.submit_throttled_total;
+
+        let slots = self.registry.slot_summary();
+        let peers_with_status = self.registry.peers_with_status();
+        let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
+        let download_blocked_on_budget = peers_wanting_slots > 0
+            && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES;
+
+        let floor_gap = self.floor_gap_diagnostics(Instant::now());
+        let received_blocks_per_sec = self
+            .state
+            .received_throughput
+            .lock()
+            .map(|meter| meter.blocks_per_sec())
+            .unwrap_or(0);
+
+        let inputs = LimiterInputs {
+            body_lag: self.body_lag(),
+            download_blocked_on_budget,
+            floor_gap_servable_peers: floor_gap.map(|gap| gap.servable_peers),
+            floor_gap_state: floor_gap.map(|gap| gap.state),
+            throttled_delta,
+            applying_len: view.applying_len,
+            in_flight: view
+                .checkpoint_in_flight
+                .saturating_add(view.full_in_flight),
+            committed_blocks_per_sec: view.committed_blocks_per_sec,
+            commit_frontier_stall_seconds: view.commit_frontier_stall_seconds,
+            reorder_len: view.reorder_len,
+            reorder_buffered_bytes: view.reorder_buffered_bytes,
+            applying_buffered_bytes: view.applying_buffered_bytes,
+            received_blocks_per_sec,
+        };
+        self.pipeline_limiter = classify_pipeline_limiter(&inputs);
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {
@@ -2233,4 +2431,151 @@ fn elapsed_ms_u64(duration: Duration) -> u64 {
 
 pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {
     reserved_bytes.saturating_mul(u64::from(tolerance_percent.max(100))) / 100
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::{classify_pipeline_limiter, LimiterInputs, PipelineLimiter};
+
+    /// A baseline lagging pipeline with no stage starved: classifies `Saturated`.
+    /// Each test perturbs only the fields under test from this baseline.
+    fn lagging_baseline() -> LimiterInputs {
+        LimiterInputs {
+            body_lag: 100,
+            ..LimiterInputs::default()
+        }
+    }
+
+    #[test]
+    fn no_lag_is_none() {
+        let inputs = LimiterInputs {
+            body_lag: 0,
+            // Even with throttling and a commit stall, zero lag means synced.
+            throttled_delta: 5,
+            applying_len: 10,
+            in_flight: 4,
+            commit_frontier_stall_seconds: 60,
+            ..LimiterInputs::default()
+        };
+        assert_eq!(classify_pipeline_limiter(&inputs), PipelineLimiter::None);
+    }
+
+    #[test]
+    fn throttle_with_busy_committer_wins_over_download() {
+        let inputs = LimiterInputs {
+            throttled_delta: 1,
+            // The committer is actively draining (non-idle), so a full window is
+            // genuine commit-pipeline backpressure and wins over download.
+            committed_blocks_per_sec: 200,
+            applying_len: 10,
+            in_flight: 4,
+            download_blocked_on_budget: true,
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&inputs),
+            PipelineLimiter::SubmitThrottled
+        );
+    }
+
+    #[test]
+    fn throttle_with_idle_committer_falls_through_to_real_limiter() {
+        // Batched-commit artifact: the apply window is full (throttled) but the
+        // committer is idle mid-accumulation (committed_blocks_per_sec == 0). This
+        // must NOT read as SubmitThrottled — it should surface the real upstream
+        // limiter. Here download is on the wire, so the honest verdict is a
+        // download gap, not commit pressure.
+        let inputs = LimiterInputs {
+            throttled_delta: 1,
+            committed_blocks_per_sec: 0,
+            applying_len: 800,
+            in_flight: 800,
+            floor_gap_servable_peers: Some(2),
+            floor_gap_state: Some("outstanding"),
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&inputs),
+            PipelineLimiter::DownloadOnWire
+        );
+    }
+
+    #[test]
+    fn commit_bound_when_applies_in_flight_and_frontier_frozen() {
+        let inputs = LimiterInputs {
+            applying_len: 8,
+            in_flight: 3,
+            committed_blocks_per_sec: 0,
+            commit_frontier_stall_seconds: 2,
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&inputs),
+            PipelineLimiter::CommitBound
+        );
+    }
+
+    #[test]
+    fn download_starvation_suppresses_commit_bound() {
+        // Same commit-bound shape, but the download side is starved on budget:
+        // a frozen frontier here is caused by an empty pipeline, not a slow
+        // committer, so it must not read as CommitBound.
+        let inputs = LimiterInputs {
+            applying_len: 8,
+            in_flight: 3,
+            commit_frontier_stall_seconds: 2,
+            download_blocked_on_budget: true,
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&inputs),
+            PipelineLimiter::DownloadBudget
+        );
+    }
+
+    #[test]
+    fn download_gap_reasons() {
+        let no_peer = LimiterInputs {
+            floor_gap_servable_peers: Some(0),
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&no_peer),
+            PipelineLimiter::DownloadNoPeer
+        );
+
+        let on_wire = LimiterInputs {
+            floor_gap_servable_peers: Some(3),
+            floor_gap_state: Some("outstanding"),
+            ..lagging_baseline()
+        };
+        assert_eq!(
+            classify_pipeline_limiter(&on_wire),
+            PipelineLimiter::DownloadOnWire
+        );
+    }
+
+    #[test]
+    fn reorder_when_bytes_pool_behind_a_hole() {
+        let inputs = LimiterInputs {
+            reorder_len: 5,
+            reorder_buffered_bytes: 4096,
+            applying_buffered_bytes: 0,
+            received_blocks_per_sec: 10,
+            // A floor gap exists but a peer is serving it (not starved), so the
+            // limiter is the reorder hole, not the download.
+            floor_gap_servable_peers: Some(2),
+            floor_gap_state: Some("queued"),
+            ..lagging_baseline()
+        };
+        assert_eq!(classify_pipeline_limiter(&inputs), PipelineLimiter::Reorder);
+    }
+
+    #[test]
+    fn saturated_is_the_residual() {
+        assert_eq!(
+            classify_pipeline_limiter(&lagging_baseline()),
+            PipelineLimiter::Saturated
+        );
+    }
 }

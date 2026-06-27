@@ -19,6 +19,7 @@ use std::{
     pin::Pin,
     sync::{mpsc, Arc},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{Future, FutureExt, TryFutureExt};
@@ -72,6 +73,28 @@ struct RequestBlock {
     block: CheckpointVerifiedBlock,
     /// The receiving end of the oneshot channel for this block's result.
     rx: oneshot::Receiver<Result<block::Hash, VerifyCheckpointError>>,
+}
+
+/// Keeps the `checkpoint.commit.inflight` gauge balanced across every exit path
+/// of the spawned commit task, including the early `?` returns on a dropped
+/// receiver or a failed state commit.
+struct CommitInflightGuard;
+
+impl CommitInflightGuard {
+    fn new() -> Self {
+        metrics::gauge!("checkpoint.commit.inflight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for CommitInflightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("checkpoint.commit.inflight").decrement(1.0);
+    }
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A list of unverified blocks at a particular height.
@@ -841,20 +864,101 @@ where
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
-            let hash = req_block
+            // Balances on every exit path below; see `CommitInflightGuard`.
+            let _inflight = CommitInflightGuard::new();
+            let height = req_block.block.height;
+            let block_hash = req_block.block.hash;
+
+            tracing::trace!(
+                event = "checkpoint_commit_await_start",
+                ?height,
+                ?block_hash,
+                "checkpoint commit task waiting for verified range"
+            );
+
+            // Time the head-of-line park: the block waits here until
+            // `process_checkpoint_range` fires its oneshot once the whole
+            // checkpoint range is contiguous. A high value points at the
+            // verifier's own contiguity gate (VerifierWaiting), distinct from
+            // the state write below.
+            let await_start = Instant::now();
+            let hash_result = req_block
                 .rx
                 .await
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .expect("CheckpointVerifier does not leave dangling receivers")?;
+                .expect("CheckpointVerifier does not leave dangling receivers");
+            let await_elapsed = await_start.elapsed();
+            metrics::histogram!("checkpoint.commit.await_seconds")
+                .record(await_elapsed.as_secs_f64());
+            let hash = match hash_result {
+                Ok(hash) => {
+                    tracing::trace!(
+                        event = "checkpoint_commit_await_finish",
+                        ?height,
+                        ?block_hash,
+                        elapsed_ms = duration_ms(await_elapsed),
+                        "checkpoint commit task verified range ready"
+                    );
+                    hash
+                }
+                Err(error) => {
+                    tracing::trace!(
+                        event = "checkpoint_commit_await_error",
+                        ?height,
+                        ?block_hash,
+                        elapsed_ms = duration_ms(await_elapsed),
+                        ?error,
+                        "checkpoint commit task verified range failed"
+                    );
+                    return Err(error);
+                }
+            };
 
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.
-            match state_service
+            tracing::trace!(
+                event = "checkpoint_commit_db_start",
+                ?height,
+                ?block_hash,
+                "checkpoint commit task writing block to state"
+            );
+            let db_start = Instant::now();
+            let response = match state_service
                 .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
+                .await
             {
+                Ok(response) => {
+                    let db_elapsed = db_start.elapsed();
+                    metrics::histogram!("checkpoint.commit.db_seconds")
+                        .record(db_elapsed.as_secs_f64());
+                    tracing::trace!(
+                        event = "checkpoint_commit_db_finish",
+                        ?height,
+                        ?block_hash,
+                        elapsed_ms = duration_ms(db_elapsed),
+                        "checkpoint commit task state write finished"
+                    );
+                    response
+                }
+                Err(error) => {
+                    let db_elapsed = db_start.elapsed();
+                    metrics::histogram!("checkpoint.commit.db_seconds")
+                        .record(db_elapsed.as_secs_f64());
+                    tracing::trace!(
+                        event = "checkpoint_commit_db_error",
+                        ?height,
+                        ?block_hash,
+                        elapsed_ms = duration_ms(db_elapsed),
+                        ?error,
+                        "checkpoint commit task state write failed"
+                    );
+                    return Err(error);
+                }
+            };
+
+            match response {
                 zs::Response::Committed(committed_hash) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
                     Ok(hash)
@@ -994,6 +1098,18 @@ where
                     .expect("every checkpoint height must have a hash"),
             ),
             WaitingForBlocks => {
+                // The contiguous run from the last checkpoint has a gap, so no
+                // oneshot fires and every spawned commit task stays parked. This
+                // counter makes that head-of-line stall visible (it is the
+                // `checkpoint.commit.await_seconds` cause).
+                metrics::counter!("checkpoint.commit.waiting_for_blocks").increment(1);
+                tracing::trace!(
+                    event = "checkpoint_commit_waiting_for_blocks",
+                    previous_checkpoint = ?self.previous_checkpoint_height(),
+                    queued_len = self.queued.len(),
+                    queued_max_height = ?self.queued.keys().next_back(),
+                    "checkpoint verifier waiting for a complete range"
+                );
                 return;
             }
             FinishedVerifying => {

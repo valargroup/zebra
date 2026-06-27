@@ -31,7 +31,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 /// flowing to trigger the inline check (e.g. once outstanding requests drain).
 const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 
-const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
 
 /// Emit a `block_commit_progress` rollup at most once per this many committed
@@ -384,6 +384,16 @@ pub(super) struct SequencerView {
     pub(super) commit_frontier_stall_seconds: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
+    /// Monotonic count of apply submissions blocked by a saturated apply-class
+    /// limit. The reactor diffs it per tick: a positive delta is the primary
+    /// `SubmitThrottled` discriminator for `sync.pipeline.limiter`.
+    pub(super) submit_throttled_total: u64,
+    /// Checkpoint-class applies currently in flight in the verifier/committer.
+    /// Lets the limiter classifier tell a loaded commit pipeline (`CommitBound`)
+    /// from an idle one (`Saturated`).
+    pub(super) checkpoint_in_flight: u64,
+    /// Full-class applies currently in flight; see `checkpoint_in_flight`.
+    pub(super) full_in_flight: u64,
 }
 
 /// Build the initial view from the startup frontiers, before the task runs.
@@ -407,6 +417,9 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         commit_frontier_stall_seconds: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
+        submit_throttled_total: 0,
+        checkpoint_in_flight: 0,
+        full_in_flight: 0,
     }
 }
 
@@ -442,6 +455,10 @@ pub(super) struct SequencerTask {
     next_ready_source: ReadySource,
     commit_progress: CommitProgress,
     commit_frontier_since: Instant,
+    /// Monotonic mirror of `CommitProgress::submit_throttled` that survives the
+    /// per-interval reset in `CommitProgress::take`, so the published view can
+    /// carry a counter the reactor diffs across ticks.
+    submit_throttled_total: u64,
 }
 
 impl SequencerTask {
@@ -486,6 +503,7 @@ impl SequencerTask {
             next_ready_source: ReadySource::Control,
             commit_progress: CommitProgress::new(Instant::now()),
             commit_frontier_since: Instant::now(),
+            submit_throttled_total: 0,
         }
     }
 
@@ -1086,6 +1104,7 @@ impl SequencerTask {
                 // visible in metrics and the commit-progress rollup.
                 metrics::counter!("sync.block.submit.throttled").increment(1);
                 self.commit_progress.record_throttle();
+                self.submit_throttled_total = self.submit_throttled_total.saturating_add(1);
                 self.trace_submit_throttled(item.height, item.token, class, limits);
                 break;
             }
@@ -1496,6 +1515,9 @@ impl SequencerTask {
                 .as_secs(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
+            submit_throttled_total: self.submit_throttled_total,
+            checkpoint_in_flight: self.checkpoint_in_flight as u64,
+            full_in_flight: self.full_in_flight as u64,
         });
     }
 }

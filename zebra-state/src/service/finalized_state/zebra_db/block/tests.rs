@@ -59,7 +59,7 @@ fn read_spent_utxo_uses_new_outputs_for_same_block_spends() {
     let new_outputs = HashMap::from([(outpoint, ordered_utxo.clone())]);
 
     let (read_outpoint, output_location, utxo) =
-        super::read_spent_utxo(&db, height, outpoint, &tx_hash_indexes, &new_outputs);
+        super::read_spent_utxo(&db, height, outpoint, &tx_hash_indexes, &new_outputs, None);
 
     assert_eq!(read_outpoint, outpoint);
     assert_eq!(
