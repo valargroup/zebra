@@ -24,13 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the `zakura-testkit` feature with deterministic loopback Iroh endpoint
   tooling, in-process Zakura node/cluster harnesses, a bounded inbound recorder,
   and raw hostile-peer helpers for protocol tests.
-- Added the optional `[network.zakura] dev_network` cohort tag. When set, a node
-  only forms Zakura (v2) connections with peers sharing the same tag: its
-  handshakes and signed discovery records advertise `ZakuraNetworkId::Configured`
-  and a cohort-derived chain id, so public mainnet nodes and other cohorts reject
-  it (and are rejected by it) at the Zakura layer. Consensus is unchanged, so a
-  team can test breaking Zakura changes in isolation while validating the same
-  chain.
 - Wired the legacy-gossip adapter into the running node: when `v2_p2p` is
   enabled, `init` installs `LegacyGossipSink` on the Zakura endpoint (replacing
   the drop sink) and wraps the returned peer set in `ZakuraDualStackService`, so
