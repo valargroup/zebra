@@ -416,12 +416,15 @@ fn window_request(height: u32) -> OutstandingBlockRange {
             count: 1,
             anchor_hash: block::Hash([byte; 32]),
             estimated_bytes: 1,
-            expected_hashes: vec![(block::Height(height), block::Hash([byte; 32]))],
-            expected_bytes: vec![(block::Height(height), 1)],
+            expected_blocks: vec![ExpectedBlock {
+                height: block::Height(height),
+                hash: block::Hash([byte; 32]),
+                estimated_bytes: 1,
+            }],
         },
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     }
 }
 
@@ -2166,16 +2169,23 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         anchor_hash: block::Hash([1; 32]),
         // Worst-case reservation: three blocks each reserve one worst-case share.
         estimated_bytes: worst * 3,
-        expected_hashes: vec![
-            (block::Height(1), block::Hash([1; 32])),
-            (block::Height(2), block::Hash([2; 32])),
-            (block::Height(3), block::Hash([3; 32])),
-        ],
         // Size hints below the worst case; the reservation does not depend on them.
-        expected_bytes: vec![
-            (block::Height(1), 1_000),
-            (block::Height(2), 1_000),
-            (block::Height(3), 1_000),
+        expected_blocks: vec![
+            ExpectedBlock {
+                height: block::Height(1),
+                hash: block::Hash([1; 32]),
+                estimated_bytes: 1_000,
+            },
+            ExpectedBlock {
+                height: block::Height(2),
+                hash: block::Hash([2; 32]),
+                estimated_bytes: 1_000,
+            },
+            ExpectedBlock {
+                height: block::Height(3),
+                hash: block::Hash([3; 32]),
+                estimated_bytes: 1_000,
+            },
         ],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
@@ -2183,7 +2193,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         request,
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     }
 }
 
@@ -2302,15 +2312,18 @@ fn underestimated_body_is_buffered_without_budget_drop() {
         count: 1,
         anchor_hash: block::Hash([1; 32]),
         estimated_bytes: worst,
-        expected_hashes: vec![(block::Height(1), block::Hash([1; 32]))],
-        expected_bytes: vec![(block::Height(1), hint)],
+        expected_blocks: vec![ExpectedBlock {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            estimated_bytes: hint,
+        }],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
     let mut outstanding = OutstandingBlockRange {
         request,
         queued_at: Instant::now(),
         deadline: Instant::now(),
-        received: HashSet::new(),
+        received: ReceivedBlockTracker::default(),
     };
     assert_eq!(budget.reserved(), worst);
 

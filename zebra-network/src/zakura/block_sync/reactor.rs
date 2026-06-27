@@ -664,7 +664,7 @@ impl BlockSyncReactor {
         // registry to precompute the two peer-derived halves of the reset
         // decision. Received-and-buffered heights are caught by the Sequencer's own
         // reorder/applying predicates, so reading only unreceived heights here is a
-        // benign (correct) narrowing of the original `expected_hashes` scan.
+        // benign (correct) narrowing of the original expected-blocks scan.
         let peer_has_successor_after = next_height(tip)
             .map(|next| self.registry.any_outstanding_at_or_above(next))
             .unwrap_or(false);
@@ -1131,7 +1131,7 @@ impl BlockSyncReactor {
         // The unreceived in-flight heights now live in the routines, mirrored into
         // the registry's per-peer outstanding set (per-request granularity: each
         // entry is one still-unreceived requested height). `total_unreceived` sums
-        // them — the same count the old per-peer `expected_hashes − received`
+        // them — the same count the old per-peer `expected_blocks − received`
         // produced.
         let outstanding = self.registry.total_unreceived();
 

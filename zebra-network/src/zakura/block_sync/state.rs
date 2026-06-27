@@ -454,7 +454,7 @@ pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
-    pub(super) received: HashSet<block::Height>,
+    pub(super) received: ReceivedBlockTracker,
 }
 
 impl OutstandingBlockRange {
@@ -465,7 +465,7 @@ impl OutstandingBlockRange {
     pub(super) fn reserved_bytes(&self) -> u64 {
         let outstanding = self
             .request
-            .expected_hashes
+            .expected_blocks
             .len()
             .saturating_sub(self.received.len());
         // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
@@ -478,11 +478,15 @@ impl OutstandingBlockRange {
     }
 
     pub(super) fn has_received(&self, height: block::Height) -> bool {
-        self.received.contains(&height)
+        self.request
+            .offset_for_height(height)
+            .is_some_and(|offset| self.received.contains_offset(offset))
     }
 
     pub(super) fn mark_received(&mut self, height: block::Height) {
-        self.received.insert(height);
+        if let Some(offset) = self.request.offset_for_height(height) {
+            self.received.insert_offset(offset);
+        }
     }
 
     /// Mark every requested height at or below `tip` as received and return the
@@ -491,16 +495,54 @@ impl OutstandingBlockRange {
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
         let newly_received = self
             .request
-            .expected_hashes
+            .expected_blocks
             .iter()
-            .filter(|(height, _)| *height <= tip && self.received.insert(*height))
+            .filter(|expected| {
+                expected.height <= tip
+                    && self
+                        .request
+                        .offset_for_height(expected.height)
+                        .is_some_and(|offset| self.received.insert_offset(offset))
+            })
             .count();
         // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
         BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.received.len() == self.request.expected_hashes.len()
+        self.received.len() == self.request.expected_blocks.len()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ReceivedBlockTracker {
+    bits: u128,
+    count: usize,
+}
+
+impl ReceivedBlockTracker {
+    pub(super) fn len(&self) -> usize {
+        self.count
+    }
+
+    fn contains_offset(&self, offset: u32) -> bool {
+        Self::bit_for_offset(offset).is_some_and(|bit| self.bits & bit != 0)
+    }
+
+    fn insert_offset(&mut self, offset: u32) -> bool {
+        let Some(bit) = Self::bit_for_offset(offset) else {
+            return false;
+        };
+        if self.bits & bit != 0 {
+            return false;
+        }
+        self.bits |= bit;
+        self.count = self.count.saturating_add(1);
+        true
+    }
+
+    fn bit_for_offset(offset: u32) -> Option<u128> {
+        1u128.checked_shl(offset)
     }
 }
 

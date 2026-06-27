@@ -30,10 +30,17 @@ pub(super) struct BlockRangeRequest {
     pub(super) anchor_hash: block::Hash,
     /// The reserved worst-case byte total for this request (released on
     /// timeout/disconnect/send-failure). Distinct from the per-height size
-    /// estimates in `expected_bytes`.
+    /// estimates in `expected_blocks`.
     pub(super) estimated_bytes: u64,
-    pub(super) expected_hashes: Vec<(block::Height, block::Hash)>,
-    pub(super) expected_bytes: Vec<(block::Height, u64)>,
+    pub(super) expected_blocks: Vec<ExpectedBlock>,
+}
+
+/// Per-height metadata needed to validate one body in a range request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExpectedBlock {
+    pub(super) height: block::Height,
+    pub(super) hash: block::Hash,
+    pub(super) estimated_bytes: u64,
 }
 
 impl BlockRangeRequest {
@@ -47,15 +54,21 @@ impl BlockRangeRequest {
         self.start_height <= height && height <= self.end_height()
     }
 
+    pub(super) fn offset_for_height(&self, height: block::Height) -> Option<u32> {
+        self.contains(height)
+            .then(|| height.0.checked_sub(self.start_height.0))
+            .flatten()
+    }
+
     pub(super) fn expected_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.expected_hashes
+        self.expected_blocks
             .iter()
-            .find_map(|(known_height, hash)| (*known_height == height).then_some(*hash))
+            .find_map(|expected| (expected.height == height).then_some(expected.hash))
     }
 
     pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.expected_bytes
+        self.expected_blocks
             .iter()
-            .find_map(|(known_height, bytes)| (*known_height == height).then_some(*bytes))
+            .find_map(|expected| (expected.height == height).then_some(expected.estimated_bytes))
     }
 }
