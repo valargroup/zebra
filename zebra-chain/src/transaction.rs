@@ -1096,7 +1096,7 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => sapling_shielded_data.point_encodings_are_valid(),
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
