@@ -117,7 +117,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request(zebra_consensus::Request::Commit(block0))
+        .expect_request_that(|req| req.block().hash() == block0_hash)
         .await
         .respond(block0_hash);
 
@@ -359,7 +359,7 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request(zebra_consensus::Request::Commit(block0))
+        .expect_request_that(|req| req.block().hash() == block0_hash)
         .await
         .respond(block0_hash);
 
@@ -659,7 +659,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request(zebra_consensus::Request::Commit(block0))
+        .expect_request_that(|req| req.block().hash() == block0_hash)
         .await
         .respond(block0_hash);
 
@@ -832,7 +832,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request(zebra_consensus::Request::Commit(block0))
+        .expect_request_that(|req| req.block().hash() == block0_hash)
         .await
         .respond(block0_hash);
 
@@ -1080,12 +1080,10 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
 
     let verifier_requests = Arc::new(AtomicUsize::new(0));
     let verifier_requests_in_service = Arc::clone(&verifier_requests);
-    let verifier_service = tower::service_fn(move |request| {
+    let verifier_service = tower::service_fn(move |request: zebra_consensus::Request| {
         verifier_requests_in_service.fetch_add(1, Ordering::SeqCst);
         async move {
-            let zebra_consensus::Request::Commit(block) = request else {
-                unreachable!("no other verifier request is allowed")
-            };
+            let block = request.block();
             assert_eq!(block.hash(), block0_hash);
 
             let duplicate = zs::CommitBlockError::Duplicate {
