@@ -404,6 +404,7 @@ impl FinalizedState {
             enable_elastic_db,
             read_only,
             true,
+            true,
         )
     }
 
@@ -427,6 +428,35 @@ impl FinalizedState {
             enable_elastic_db,
             read_only,
             false,
+            true,
+        )
+    }
+
+    /// Reopens an on-disk database for VCT reopen tests without enforcing the
+    /// interrupted-fast-sync resume guard.
+    ///
+    /// Production always enforces the guard: a fast sync interrupted below the
+    /// checkpoint handoff can only resume through a configured VCT root source, so
+    /// reopening one without a source (`vct.is_none()`) refuses to open. Tests model a
+    /// (Mainnet) node restart on a configured network that has no embedded frontiers,
+    /// then attach a fixture root source after construction the way a real node's
+    /// configured source would already be present at open time, so they need to skip
+    /// the constructor-time guard.
+    #[cfg(test)]
+    pub(crate) fn new_without_resume_guard(
+        config: &Config,
+        network: &Network,
+        #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
+    ) -> Self {
+        Self::new_with_debug_and_storage_validation(
+            config,
+            network,
+            false,
+            #[cfg(feature = "elasticsearch")]
+            enable_elastic_db,
+            false,
+            true,
+            false,
         )
     }
 
@@ -437,6 +467,7 @@ impl FinalizedState {
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
         validate_storage_mode: bool,
+        enforce_resume_guard: bool,
     ) -> Self {
         // Fail fast on an invalid storage configuration, before opening the database.
         if validate_storage_mode {
@@ -547,7 +578,7 @@ impl FinalizedState {
         // legacy committer, which can never supply those roots, so the node would refuse every
         // block forever. Refuse to open instead, with a clear recovery path, rather than
         // stalling silently.
-        if new_state.vct_frontier_frozen && new_state.vct.is_none() {
+        if enforce_resume_guard && new_state.vct_frontier_frozen && new_state.vct.is_none() {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the checkpoint handoff height. the fast path that supplies \
