@@ -60,14 +60,8 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
 /// Default maximum submitted block applies awaiting verifier completion.
-///
-/// The legacy checkpoint apply driver allows two checkpoint windows to be
-/// queued so the checkpoint verifier can finish the current range while the next
-/// range is already available. Keep block-sync's submission window aligned with
-/// that glue path; otherwise block sync can stop submitting one range too early
-/// while downloaded contiguous bodies pile up in `applying`.
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * 2;
+    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 /// The byte budget required to hold one full worst-case checkpoint range in
 /// flight.
 ///
@@ -303,7 +297,11 @@ impl ZakuraBlockSyncConfig {
         if self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR {
             return Err(
                 "max_inflight_block_bytes must hold one full checkpoint range \
+<<<<<<< HEAD
                  (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+=======
+                 (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+>>>>>>> 1f45a4d70 (fix(network): enforce checkpoint-safe block apply budget)
                  or checkpoint sync can deadlock",
             );
         }
