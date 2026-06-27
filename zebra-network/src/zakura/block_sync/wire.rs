@@ -190,6 +190,8 @@ impl BlockSyncMessage {
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
 
+        // If this is a block message, keep the original raw block payload as well;
+        // it can be stored in compact form in the reorder backlog.
         let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
             let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
             let message = Self::decode(&raw_block_payload)?;

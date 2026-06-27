@@ -39,7 +39,9 @@ const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 /// invariant) for later re-fetch. Because another top can always be shed, a low
 /// retry never blocks on budget; the floor can never wedge behind a full buffer,
 /// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. Returns whether it shed
+/// which also bounds the reorder backlog. Floor requesters also call this
+/// synchronously through [`SequencerControlInput::FundFloorReservation`], so the
+/// rescue path is demand-driven with a periodic backstop. Returns whether it shed
 /// anything.
 pub(super) fn shed_top_until_available(
     budget: &mut ByteBudget,
@@ -132,6 +134,12 @@ pub(super) enum SequencerControlInput {
         /// the peer-outstanding clause of `reset_tip_conflicts_with_local_work`.
         peer_outstanding_conflicts_at_tip: bool,
     },
+    /// Synchronously pop the speculative high tail until a floor request can
+    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
+    FundFloorReservation {
+        needed_bytes: u64,
+        reply: oneshot::Sender<bool>,
+    },
     /// A verifier apply completion.
     ApplyFinished {
         token: BlockApplyToken,
@@ -139,12 +147,6 @@ pub(super) enum SequencerControlInput {
         hash: block::Hash,
         result: BlockApplyResult,
         local_frontier: Option<BlockSyncFrontiers>,
-    },
-    /// Synchronously pop the speculative high tail until a floor request can
-    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
-    FundFloorReservation {
-        needed_bytes: u64,
-        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -347,16 +349,6 @@ impl SequencerTask {
                 .await;
                 true
             }
-            SequencerControlInput::ApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                self.handle_apply_finished(token, height, hash, result, local_frontier)
-                    .await
-            }
             SequencerControlInput::FundFloorReservation {
                 needed_bytes,
                 reply,
@@ -369,6 +361,16 @@ impl SequencerTask {
                 );
                 let _ = reply.send(self.budget.available() >= needed_bytes);
                 shed
+            }
+            SequencerControlInput::ApplyFinished {
+                token,
+                height,
+                hash,
+                result,
+                local_frontier,
+            } => {
+                self.handle_apply_finished(token, height, hash, result, local_frontier)
+                    .await
             }
         }
     }

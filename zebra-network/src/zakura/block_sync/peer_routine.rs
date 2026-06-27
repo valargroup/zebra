@@ -562,6 +562,9 @@ impl PeerRoutine {
             .unwrap_or(usize::MAX);
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
+            // Compute this chunk's count and byte ceiling before taking any work.
+            // The count cap is the peer/request cap; the byte cap is enforced by
+            // the budgeted work-queue take and then by the reservation below.
             let max_count = local_peer_count_cap;
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
