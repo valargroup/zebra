@@ -341,8 +341,8 @@ impl PeerRoutine {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection (matches the previous
-                    // `run_peer` decode-error path). Report via the shared channel,
+                    // protocol reject for the whole connection
+                    // Report via the shared channel,
                     // then reject; the report is best-effort and never blocks.
                     let protocol_error =
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
