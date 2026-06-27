@@ -258,7 +258,7 @@ pub(super) struct BlockSyncState {
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
-    pub(super) work: Arc<WorkQueue>,
+    pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
@@ -291,7 +291,7 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            work: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
+            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
