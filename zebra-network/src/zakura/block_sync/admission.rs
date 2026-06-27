@@ -30,8 +30,8 @@ pub(super) struct AdmissionDecision {
     pub(super) max_request_bytes: u64,
 }
 
-// Return the highest height that can be rescued by a floor-rescue request.
-pub(super) fn max_floor_rescue_start_height(download_floor: block::Height) -> block::Height {
+/// Return the highest start height that can be rescued by a floor request.
+pub(super) fn floor_rescue_high(download_floor: block::Height) -> block::Height {
     next_height(download_floor).unwrap_or(download_floor)
 }
 
@@ -39,8 +39,8 @@ pub(super) fn request_priority(
     download_floor: block::Height,
     start_height: block::Height,
 ) -> RequestPriority {
-    // This is <= because down
-    if start_height <= max_floor_rescue_start_height(download_floor) {
+    // The next height above the floor can still unblock the current floor.
+    if start_height <= floor_rescue_high(download_floor) {
         RequestPriority::Floor
     } else {
         RequestPriority::AboveFloor

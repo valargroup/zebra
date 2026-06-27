@@ -134,12 +134,6 @@ pub(super) enum SequencerControlInput {
         /// the peer-outstanding clause of `reset_tip_conflicts_with_local_work`.
         peer_outstanding_conflicts_at_tip: bool,
     },
-    /// Synchronously pop the speculative high tail until a floor request can
-    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
-    FundFloorReservation {
-        needed_bytes: u64,
-        reply: oneshot::Sender<bool>,
-    },
     /// A verifier apply completion.
     ApplyFinished {
         token: BlockApplyToken,
@@ -147,6 +141,12 @@ pub(super) enum SequencerControlInput {
         hash: block::Hash,
         result: BlockApplyResult,
         local_frontier: Option<BlockSyncFrontiers>,
+    },
+    /// Synchronously pop the speculative high tail until a floor request can
+    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
+    FundFloorReservation {
+        needed_bytes: u64,
+        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -349,6 +349,16 @@ impl SequencerTask {
                 .await;
                 true
             }
+            SequencerControlInput::ApplyFinished {
+                token,
+                height,
+                hash,
+                result,
+                local_frontier,
+            } => {
+                self.handle_apply_finished(token, height, hash, result, local_frontier)
+                    .await
+            }
             SequencerControlInput::FundFloorReservation {
                 needed_bytes,
                 reply,
@@ -361,16 +371,6 @@ impl SequencerTask {
                 );
                 let _ = reply.send(self.budget.available() >= needed_bytes);
                 shed
-            }
-            SequencerControlInput::ApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                self.handle_apply_finished(token, height, hash, result, local_frontier)
-                    .await
             }
         }
     }

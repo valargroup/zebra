@@ -31,9 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
 use super::{
-    admission::{
-        admission_decision, max_floor_rescue_start_height, AdmissionSnapshot, RequestPriority,
-    },
+    admission::{admission_decision, floor_rescue_high, AdmissionSnapshot, RequestPriority},
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
@@ -570,11 +568,11 @@ impl PeerRoutine {
             let max_count = local_peer_count_cap;
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            let sequencer_view = *self.sequencer_view.borrow();
-            let floor_high = max_floor_rescue_start_height(sequencer_view.download_floor);
+            let view = *self.sequencer_view.borrow();
+            let floor_high = floor_rescue_high(view.download_floor);
             let mut request_priority = RequestPriority::Floor;
             let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-                self.work.reserved_above(sequencer_view.download_floor);
+                self.work.reserved_above(view.download_floor);
             let mut items = if servable_low <= floor_high
                 && self
                     .work
@@ -589,11 +587,11 @@ impl PeerRoutine {
                         admission_decision(
                             &self.config,
                             AdmissionSnapshot {
-                                download_floor: sequencer_view.download_floor,
-                                reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
-                                reorder_buffered_blocks: sequencer_view.reorder_len,
-                                applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
-                                applying_buffered_blocks: sequencer_view.applying_len,
+                                download_floor: view.download_floor,
+                                reorder_buffered_bytes: view.reorder_buffered_bytes,
+                                reorder_buffered_blocks: view.reorder_len,
+                                applying_buffered_bytes: view.applying_buffered_bytes,
+                                applying_buffered_blocks: view.applying_len,
                                 sequencer_input_queued_bytes: self
                                     .sequencer_input_bytes
                                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -629,11 +627,11 @@ impl PeerRoutine {
                 let Some(decision) = admission_decision(
                     &self.config,
                     AdmissionSnapshot {
-                        download_floor: sequencer_view.download_floor,
-                        reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
-                        reorder_buffered_blocks: sequencer_view.reorder_len,
-                        applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
-                        applying_buffered_blocks: sequencer_view.applying_len,
+                        download_floor: view.download_floor,
+                        reorder_buffered_bytes: view.reorder_buffered_bytes,
+                        reorder_buffered_blocks: view.reorder_len,
+                        applying_buffered_bytes: view.applying_buffered_bytes,
+                        applying_buffered_blocks: view.applying_len,
                         sequencer_input_queued_bytes: self
                             .sequencer_input_bytes
                             .load(std::sync::atomic::Ordering::Relaxed),
@@ -1188,17 +1186,17 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
 
-        let view = *self.sequencer_view.borrow();
+        let sequencer_view = *self.sequencer_view.borrow();
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-            self.work.reserved_above(view.download_floor);
+            self.work.reserved_above(sequencer_view.download_floor);
         let Some(decision) = admission_decision(
             &self.config,
             AdmissionSnapshot {
-                download_floor: view.download_floor,
-                reorder_buffered_bytes: view.reorder_buffered_bytes,
-                reorder_buffered_blocks: view.reorder_len,
-                applying_buffered_bytes: view.applying_buffered_bytes,
-                applying_buffered_blocks: view.applying_len,
+                download_floor: sequencer_view.download_floor,
+                reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                reorder_buffered_blocks: sequencer_view.reorder_len,
+                applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                applying_buffered_blocks: sequencer_view.applying_len,
                 sequencer_input_queued_bytes: self
                     .sequencer_input_bytes
                     .load(std::sync::atomic::Ordering::Relaxed),
