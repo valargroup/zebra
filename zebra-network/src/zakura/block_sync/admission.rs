@@ -63,7 +63,10 @@ pub(super) fn admission_decision(
 ) -> Option<AdmissionDecision> {
     let priority = request_priority(snapshot.download_floor, start_height);
     let max_request_bytes = match priority {
+        // Floor requests can use any available budget up to the response byte cap.
         RequestPriority::Floor => snapshot.budget_available.min(response_byte_cap),
+        // Above-floor requests are admitted only if the reorder lookahead limits have capacity
+        // and the response byte cap is not exceeded.
         RequestPriority::AboveFloor => {
             let held_bytes = snapshot
                 .reorder_buffered_bytes

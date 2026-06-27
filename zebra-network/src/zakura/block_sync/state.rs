@@ -393,13 +393,23 @@ impl DownloadWindow {
             .min(hard_capacity.saturating_sub(self.outstanding.len()))
     }
 
+    // reduce_outbound_window_after_timeout is the per-peer backoff path for block-sync
+    // downloads. It is called when a peer times out, and it shrinks that peer's adaptive
+    // outbound request window so Zebra asks that peer for fewer block ranges
+    // concurrently.
     pub(super) fn reduce_outbound_window_after_timeout(&mut self) -> TimeoutBackoffOutcome {
+        // If this is the first timeout in a row, reset the reduction base to the current window.
         if self.consecutive_timeouts == 0 {
             self.reduction_base = self.outbound_request_window;
         }
+
+        // Increment the consecutive timeout streak.
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
 
+        // Check if the window is at the minimum.
         let was_at_floor = self.outbound_request_window == 1;
+
+        // Calculate the epoch of the timeout streak.
         let epoch = self.consecutive_timeouts / OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
         if epoch > 0 {
             let cubic_reduction = epoch
