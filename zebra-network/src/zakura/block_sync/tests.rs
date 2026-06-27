@@ -2718,6 +2718,31 @@ fn sequencer_records_and_decrements_submitted_applies() {
 }
 
 #[test]
+fn sequencer_release_applied_through_clears_submitted_applies() {
+    let mut seq = test_sequencer(0, 1);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    seq.drain_ready_into_applying();
+
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
+    assert!(seq.submitted_contains(block::Height(1)));
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "submitted-apply window is full"
+    );
+
+    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert!(!seq.submitted_contains(block::Height(1)));
+    assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
+}
+
+#[test]
 fn sequencer_advance_verified_tip_releases_bytes_and_reports_change() {
     let mut seq = test_sequencer(0, 8);
     let blocks = mainnet_blocks_1_to_3();
