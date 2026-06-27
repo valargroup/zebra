@@ -30,21 +30,32 @@ pub(super) struct AdmissionDecision {
     pub(super) max_request_bytes: u64,
 }
 
-pub(super) fn floor_rescue_high(download_floor: block::Height) -> block::Height {
+// Return the highest height that can be rescued by a floor-rescue request.
+pub(super) fn max_floor_rescue_start_height(download_floor: block::Height) -> block::Height {
     next_height(download_floor).unwrap_or(download_floor)
 }
+
 
 pub(super) fn request_priority(
     download_floor: block::Height,
     start_height: block::Height,
 ) -> RequestPriority {
-    if start_height <= floor_rescue_high(download_floor) {
+    // This is <= because down
+    if start_height <= max_floor_rescue_start_height(download_floor) {
         RequestPriority::Floor
     } else {
         RequestPriority::AboveFloor
     }
 }
 
+/// Returns the admission decision for a candidate block response starting at `start_height`.
+///
+/// Floor-rescue requests may use any available response budget up to `response_byte_cap`.
+/// Speculative requests above the floor are admitted only while the configured reorder
+/// lookahead byte and block limits still have capacity.
+///
+/// Returns `None` when no bytes can be admitted, or when an above-floor request would
+/// exceed the lookahead limits.
 pub(super) fn admission_decision(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,

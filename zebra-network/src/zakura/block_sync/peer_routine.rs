@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
 use super::{
-    admission::{admission_decision, floor_rescue_high, AdmissionSnapshot, RequestPriority},
+    admission::{admission_decision, max_floor_rescue_start_height, AdmissionSnapshot, RequestPriority},
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
@@ -151,7 +151,7 @@ pub(super) struct PeerRoutine {
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
     /// cannot backpressure this decode loop into stalling the transport.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-    view: watch::Receiver<SequencerView>,
+    sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
@@ -183,12 +183,12 @@ impl PeerRoutine {
         sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-        view: watch::Receiver<SequencerView>,
+        sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
     ) -> Self {
         let window = DownloadWindow::new(&config);
-        let last_reset_epoch = view.borrow().reset_epoch;
+        let last_reset_epoch = sequencer_view.borrow().reset_epoch;
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -225,7 +225,7 @@ impl PeerRoutine {
             sequencer_control,
             actions,
             routine_to_reactor,
-            view,
+            sequencer_view,
             last_reset_epoch,
             cancel,
             trace,
@@ -285,7 +285,7 @@ impl PeerRoutine {
                         None => return Ok(()),
                     }
                 }
-                changed = self.view.changed() => {
+                changed = self.sequencer_view.changed() => {
                     match changed {
                         Ok(()) => self.on_view_changed(),
                         // The Sequencer task ended (shutdown); the routine follows.
@@ -465,7 +465,7 @@ impl PeerRoutine {
     /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
-        let reset_epoch = self.view.borrow().reset_epoch;
+        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         if reset_epoch == self.last_reset_epoch {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
@@ -568,11 +568,11 @@ impl PeerRoutine {
             let max_count = local_peer_count_cap;
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            let view = *self.view.borrow();
-            let floor_high = floor_rescue_high(view.download_floor);
+            let sequencer_view = *self.sequencer_view.borrow();
+            let floor_high = max_floor_rescue_start_height(sequencer_view.download_floor);
             let mut request_priority = RequestPriority::Floor;
             let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-                self.work.reserved_above(view.download_floor);
+                self.work.reserved_above(sequencer_view.download_floor);
             let mut items = if servable_low <= floor_high
                 && self
                     .work
@@ -587,11 +587,11 @@ impl PeerRoutine {
                         admission_decision(
                             &self.config,
                             AdmissionSnapshot {
-                                download_floor: view.download_floor,
-                                reorder_buffered_bytes: view.reorder_buffered_bytes,
-                                reorder_buffered_blocks: view.reorder_len,
-                                applying_buffered_bytes: view.applying_buffered_bytes,
-                                applying_buffered_blocks: view.applying_len,
+                                download_floor: sequencer_view.download_floor,
+                                reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                                reorder_buffered_blocks: sequencer_view.reorder_len,
+                                applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                                applying_buffered_blocks: sequencer_view.applying_len,
                                 sequencer_input_queued_bytes: self
                                     .sequencer_input_bytes
                                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -627,11 +627,11 @@ impl PeerRoutine {
                 let Some(decision) = admission_decision(
                     &self.config,
                     AdmissionSnapshot {
-                        download_floor: view.download_floor,
-                        reorder_buffered_bytes: view.reorder_buffered_bytes,
-                        reorder_buffered_blocks: view.reorder_len,
-                        applying_buffered_bytes: view.applying_buffered_bytes,
-                        applying_buffered_blocks: view.applying_len,
+                        download_floor: sequencer_view.download_floor,
+                        reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                        reorder_buffered_blocks: sequencer_view.reorder_len,
+                        applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                        applying_buffered_blocks: sequencer_view.applying_len,
                         sequencer_input_queued_bytes: self
                             .sequencer_input_bytes
                             .load(std::sync::atomic::Ordering::Relaxed),
@@ -1186,7 +1186,7 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
 
-        let view = *self.view.borrow();
+        let view = *self.sequencer_view.borrow();
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
             self.work.reserved_above(view.download_floor);
         let Some(decision) = admission_decision(
@@ -1515,7 +1515,7 @@ impl PeerRoutine {
     // ===================== view reads ======================================
 
     fn download_floor(&self) -> block::Height {
-        self.view.borrow().download_floor
+        self.sequencer_view.borrow().download_floor
     }
 
     fn record_received(&self, bytes: u64) {

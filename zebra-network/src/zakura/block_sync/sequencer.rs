@@ -71,6 +71,9 @@ pub(super) struct Sequencer {
     applying: BTreeMap<block::Height, ApplyingBlock>,
     submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
     next_apply_token: BlockApplyToken,
+
+    // The highest block height whose body has already been accepted into the contiguous
+    // download-apply pipeline.
     body_download_floor: block::Height,
     verified_block_tip: block::Height,
     submitted_apply_limit: usize,
