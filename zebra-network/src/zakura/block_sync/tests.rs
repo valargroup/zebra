@@ -757,6 +757,12 @@ fn config_validate_rejects_degenerate_values() {
     assert!(config.validate().is_err());
 
     config = ZakuraBlockSyncConfig {
+        max_reorder_lookahead_bytes: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_blocks: 0,
         ..ZakuraBlockSyncConfig::default()
     };
