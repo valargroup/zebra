@@ -1517,7 +1517,7 @@ where
             finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
-                // If the height is in the chain, serve the roots from the chain
+            // If the height is in the chain, serve the roots from the chain
         } else if let Some(chain) = chain
             .as_ref()
             .map(|chain| chain.as_ref())

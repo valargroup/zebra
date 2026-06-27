@@ -2183,7 +2183,7 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn served_header_tree_aux_roots_use_aligned_prefix() {
+    fn served_header_tree_aux_roots_require_complete_coverage() {
         let start = block::Height(10);
         let header_heights = [
             block::Height(10),
@@ -2193,10 +2193,9 @@ mod zakura_header_sync_driver_tests {
         ];
         let roots = [root_at(block::Height(10)), root_at(block::Height(11))];
 
-        assert_eq!(
-            tree_aux_roots_for_served_header_range(start, header_heights, &roots),
-            Ok(roots.to_vec()),
-            "partial root coverage is served as the aligned prefix"
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots).is_err(),
+            "partial root coverage is reported before serving rootless headers"
         );
 
         let roots_with_gap = [
@@ -2204,10 +2203,9 @@ mod zakura_header_sync_driver_tests {
             root_at(block::Height(12)),
             root_at(block::Height(13)),
         ];
-        assert_eq!(
-            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap),
-            Ok(vec![root_at(block::Height(10))]),
-            "root gaps are served up to the aligned prefix"
+        assert!(
+            tree_aux_roots_for_served_header_range(start, header_heights, &roots_with_gap).is_err(),
+            "root gaps are reported before serving rootless headers"
         );
 
         let complete_roots = [
