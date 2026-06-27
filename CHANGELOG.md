@@ -263,6 +263,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Treat missing transaction inventory responses during mempool download as a
   recoverable download failure, avoiding a panic when public peers no longer
   have a gossiped transaction available.
+- Stop the database format-validity check from panicking with "just checked for
+  genesis block" while a verified-commitment-trees fast sync is in progress. The
+  check runs on a background thread, concurrently with block commits, and could
+  read its `is_vct_synced()` guard as `false` and then read an absent genesis
+  note-commitment tree once a concurrent fast-sync commit set the marker in
+  between. It now treats an absent genesis tree as a (mid-flight) fast-synced
+  database — where the genesis-root-caching invariant does not apply — instead of
+  panicking.
 - Roll back the Zakura header store together with finalized block data, so
   databases produced by `zebra-rollback-state` can resume Zakura body sync from
   the new body tip instead of stalling behind stale headers and falling back to

@@ -14,8 +14,8 @@ use super::*;
 use crate::{
     peer_set::ActiveConnectionCounter,
     zakura::{
-        Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
-        ZakuraUpgradeOutcome,
+        testkit::TEST_NET_TIMEOUT, Peer as ZakuraServicePeer, Service as ZakuraService, Stream,
+        ZakuraPeerId, ZakuraUpgradeOutcome,
     },
 };
 use tokio::io::duplex;
@@ -272,7 +272,7 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     // both supervisors should register the other peer once it completes.
     let local_supervisor = local_endpoint.supervisor();
     let remote_supervisor = remote_endpoint.supervisor();
-    let registered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    let registered = tokio::time::timeout(TEST_NET_TIMEOUT, async {
         loop {
             if !local_supervisor.registered_ids().await.is_empty()
                 && !remote_supervisor.registered_ids().await.is_empty()
