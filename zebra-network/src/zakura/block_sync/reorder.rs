@@ -22,6 +22,13 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
+    /// Highest buffered height, if any. The shed-for-floor-starvation path drops
+    /// this (the body furthest from the committed floor) to free budget for a
+    /// lower, commit-unblocking request.
+    pub(super) fn max_height(&self) -> Option<block::Height> {
+        self.blocks.keys().next_back().copied()
+    }
+
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }
@@ -197,7 +204,7 @@ impl BufferedBlockBody {
     // Drop the raw frame payload for the backlog.
     // This is used to save memory when the body is not the next block in the sequence.
     // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
-    // so we reain just the raw frame payload.
+    // so we retain just the raw frame payload.
     pub(super) fn retain_for_backlog(self) -> Self {
         match self {
             BufferedBlockBody::DecodedWithRawFramePayload {

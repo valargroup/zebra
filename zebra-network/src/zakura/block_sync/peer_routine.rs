@@ -39,7 +39,7 @@ use super::{
     },
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
-    sequencer_task::{SequencedBody, SequencerView},
+    sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
     state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
@@ -50,7 +50,7 @@ use crate::zakura::{
     Admit, FramedRecv, OrderedSendError, SinkReject,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
-use tokio::time;
+use tokio::{sync::oneshot, time};
 use zebra_chain::{block, serialization::ZcashSerialize};
 
 /// How long a routine avoids re-taking a height it just returned on a failure
@@ -142,6 +142,7 @@ pub(super) struct PeerRoutine {
     received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
@@ -176,6 +177,7 @@ impl PeerRoutine {
         received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         view: watch::Receiver<SequencerView>,
@@ -217,6 +219,7 @@ impl PeerRoutine {
             received_throughput,
             sequencer_input,
             sequencer_input_bytes,
+            sequencer_control,
             actions,
             routine_to_reactor,
             view,
@@ -573,8 +576,15 @@ impl PeerRoutine {
                         .min(local_peer_count_cap)
                 })
                 .unwrap_or(local_peer_count_cap);
+
+            // If no worst-case block fits, ask the sequencer to shed speculative
+            // high blocks so the next request can retry with available budget.
             if max_count == 0 {
-                break;
+                if self.try_free_byte_budget_for_request(worst).await {
+                    continue;
+                } else {
+                    break;
+                }
             }
             let max_estimated_bytes =
                 available_bytes.min(u64::from(self.max_response_bytes.max(1)));
@@ -703,6 +713,23 @@ impl PeerRoutine {
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);
         }
+    }
+
+    // Returns true if the sequencer made enough byte budget available for a retry.
+    async fn try_free_byte_budget_for_request(&mut self, reserved_bytes: u64) -> bool {
+        let (reply, funded) = oneshot::channel();
+        if self
+            .sequencer_control
+            .send(SequencerControlInput::FundFloorReservation {
+                needed_bytes: reserved_bytes,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+
+        funded.await.unwrap_or(false)
     }
 
     /// Refill low-water mark in blocks (ported from the reactor's

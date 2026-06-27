@@ -134,6 +134,7 @@ pub fn spawn_block_sync_reactor(
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
         sequencer_input_bytes: sequencer_input_bytes.clone(),
+        sequencer_control: sequencer_control_tx.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),

@@ -336,6 +336,10 @@ impl WorkQueue {
         self.lock().pending.keys().next().copied()
     }
 
+    pub(super) fn min_in_flight(&self) -> Option<block::Height> {
+        self.lock().in_flight.keys().next().copied()
+    }
+
     pub(super) fn max_in_flight(&self) -> Option<block::Height> {
         self.lock().in_flight.keys().next_back().copied()
     }

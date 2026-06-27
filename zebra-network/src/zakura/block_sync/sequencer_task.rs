@@ -24,6 +24,48 @@ use super::{
     *,
 };
 
+/// Favor the lowest re-requestable height over the speculative high tail.
+///
+/// When a floor reservation cannot be funded, and the lowest re-requestable
+/// height sits *below* the highest buffered body, drop that top body: release its
+/// bytes to the budget and return its height to `pending` (it was held, hence in
+/// `work.in_flight` per the `held ⟺ in_flight` invariant) for later re-fetch. The
+/// floor requester calls this synchronously through
+/// [`SequencerControlInput::FundFloorReservation`], so the rescue path is
+/// demand-driven instead of timer-driven. Returns whether it shed anything.
+pub(super) fn shed_top_until_available(
+    budget: &mut ByteBudget,
+    work: &WorkQueue,
+    sequencer: &mut Sequencer,
+    target_available: u64,
+) -> bool {
+    let mut shed_any = false;
+    while budget.available() < target_available {
+        let lowest_needed = match (work.min_pending(), work.min_in_flight()) {
+            (Some(pending), Some(in_flight)) => pending.min(in_flight),
+            (Some(pending), None) => pending,
+            (None, Some(in_flight)) => in_flight,
+            (None, None) => break,
+        };
+        let Some(top) = sequencer.reorder_max_height() else {
+            break;
+        };
+        // Only shed a body that sits above a starved lower height: we trade a
+        // far-from-floor body for the ability to fetch a nearer, higher-value one.
+        if lowest_needed >= top {
+            break;
+        }
+        let freed = sequencer.drop_reorder_from(top);
+        if freed == 0 {
+            break;
+        }
+        budget.release(freed);
+        work.return_items([top]);
+        shed_any = true;
+    }
+    shed_any
+}
+
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
@@ -44,7 +86,7 @@ pub(super) struct SequencedBody {
 /// budget and verifier slots, and frontier/reset events can release or discard
 /// stale body work. They are locally generated and tiny, so they use a separate
 /// unbounded channel and are prioritized by the Sequencer task.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
     FrontierAdvance {
@@ -64,6 +106,12 @@ pub(super) enum SequencerControlInput {
         /// `peers.any(outstanding.expected_hash(tip) is Some(h) && h != hash)` —
         /// the peer-outstanding clause of `reset_tip_conflicts_with_local_work`.
         peer_outstanding_conflicts_at_tip: bool,
+    },
+    /// Synchronously pop the speculative high tail until a floor request can
+    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
+    FundFloorReservation {
+        needed_bytes: u64,
+        reply: oneshot::Sender<bool>,
     },
     /// A verifier apply completion.
     ApplyFinished {
@@ -186,25 +234,40 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
+        // Track input closure explicitly so each channel can close independently
+        // while the task continues draining the other.
+        let mut control_open = true;
+        let mut body_open = true;
         loop {
+            if !control_open && !body_open {
+                break;
+            }
             tokio::select! {
                 biased;
 
-                Some(input) = self.control_input_rx.recv() => {
-                    let needs_reaction = self.handle_control_input(input).await;
-                    if needs_reaction {
-                        self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                input = self.control_input_rx.recv(), if control_open => {
+                    match input {
+                        Some(input) => {
+                            let needs_reaction = self.handle_control_input(input).await;
+                            if needs_reaction {
+                                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                            }
+                            self.publish_view();
+                        }
+                        None => control_open = false,
                     }
-                    self.publish_view();
                 }
 
-                Some(body) = self.body_input_rx.recv() => {
-                    self.release_body_input_bytes(body.bytes);
-                    self.handle_accept_body(body).await;
-                    self.publish_view();
+                body = self.body_input_rx.recv(), if body_open => {
+                    match body {
+                        Some(body) => {
+                            self.release_body_input_bytes(body.bytes);
+                            self.handle_accept_body(body).await;
+                            self.publish_view();
+                        }
+                        None => body_open = false,
+                    }
                 }
-
-                else => break,
             }
         }
     }
@@ -238,6 +301,19 @@ impl SequencerTask {
                 )
                 .await;
                 true
+            }
+            SequencerControlInput::FundFloorReservation {
+                needed_bytes,
+                reply,
+            } => {
+                let shed = shed_top_until_available(
+                    &mut self.budget,
+                    &self.work,
+                    &mut self.sequencer,
+                    needed_bytes,
+                );
+                let _ = reply.send(self.budget.available() >= needed_bytes);
+                shed
             }
             SequencerControlInput::ApplyFinished {
                 token,
