@@ -576,11 +576,11 @@ impl PeerRoutine {
                         .min(local_peer_count_cap)
                 })
                 .unwrap_or(local_peer_count_cap);
-            
-            // If the max count is 0, attempt to reserve the byte budget for the floor.
+
+            // If no worst-case block fits, ask the sequencer to shed speculative
+            // high blocks so the next request can retry with available budget.
             if max_count == 0 {
-                // It may shed the top blocks to free up enough byte budget to reserve the requested amount.
-                if self.can_reserve_byte_budget_for_floor(worst).await {
+                if self.try_free_byte_budget_for_request(worst).await {
                     continue;
                 } else {
                     break;
@@ -715,8 +715,8 @@ impl PeerRoutine {
         }
     }
 
-    // Returns true if the sequencer byte budget can be reserved, false otherwise.
-    async fn can_reserve_byte_budget_for_floor(&mut self, reserved_bytes: u64) -> bool {
+    // Returns true if the sequencer made enough byte budget available for a retry.
+    async fn try_free_byte_budget_for_request(&mut self, reserved_bytes: u64) -> bool {
         let (reply, funded) = oneshot::channel();
         if self
             .sequencer_control
