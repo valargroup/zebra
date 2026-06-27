@@ -24,7 +24,7 @@
 //! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
 //! task's own `FramedRecv` rather than a `PeerInput` channel.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -37,9 +37,9 @@ use super::{
     reactor::{
         block_sync_message_label, bs_insert_height, bs_insert_peer, bs_insert_u64, tolerated_bytes,
     },
-    request::BlockRangeRequest,
+    request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
-    state::{DownloadWindow, OutstandingBlockRange, ThroughputMeter},
+    state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter},
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
@@ -472,7 +472,8 @@ impl PeerRoutine {
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
-        for outstanding in self.window.outstanding.drain(..).collect::<Vec<_>>() {
+        let outstanding = std::mem::take(&mut self.window.outstanding);
+        for outstanding in outstanding {
             self.budget.release(outstanding.reserved_bytes());
             self.work.return_items(unreceived_heights(&outstanding));
         }
@@ -638,15 +639,15 @@ impl PeerRoutine {
                 count,
                 anchor_hash: items[0].1.hash,
                 // The reserved worst-case total (released on a send failure
-                // below); distinct from the size estimates in `expected_bytes`.
+                // below); distinct from the size estimates in `expected_blocks`.
                 estimated_bytes: reserved_bytes,
-                expected_hashes: items
+                expected_blocks: items
                     .iter()
-                    .map(|(height, item)| (*height, item.hash))
-                    .collect(),
-                expected_bytes: items
-                    .iter()
-                    .map(|(height, item)| (*height, item.estimated_bytes))
+                    .map(|(height, item)| ExpectedBlock {
+                        height: *height,
+                        hash: item.hash,
+                        estimated_bytes: item.estimated_bytes,
+                    })
                     .collect(),
             };
 
@@ -675,17 +676,20 @@ impl PeerRoutine {
             let deadline = queued_at + self.config.request_timeout;
             metrics::counter!("sync.block.request.sent").increment(1);
             self.window.record_outbound_request_scheduled();
+            let request_start_height = request.start_height;
+            let request_count = request.count;
+            let request_estimated_bytes = request.estimated_bytes;
             self.window.outstanding.push(OutstandingBlockRange {
-                request: request.clone(),
+                request,
                 queued_at,
                 deadline,
-                received: HashSet::new(),
+                received: ReceivedBlockTracker::default(),
             });
             self.publish_outstanding();
             self.trace_get_blocks_sent(
-                request.start_height,
-                request.count,
-                request.estimated_bytes,
+                request_start_height,
+                request_count,
+                request_estimated_bytes,
             );
         }
 
@@ -1222,16 +1226,16 @@ impl PeerRoutine {
     /// Publish this peer's current *unreceived* in-flight height→hash set to the
     /// registry, so the producer's `!has_outstanding_request` filter and the
     /// low-water `total_unreceived` gate read the same per-request-granularity
-    /// count the previous reactor used (`expected_hashes.len() − received.len()`).
+    /// count the previous reactor used (`expected_blocks.len() − received.len()`).
     /// Received-but-uncommitted heights are excluded here because they are held in
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
     fn publish_outstanding(&self) {
         let mut map: BTreeMap<block::Height, block::Hash> = BTreeMap::new();
         for outstanding in &self.window.outstanding {
-            for (height, hash) in &outstanding.request.expected_hashes {
-                if !outstanding.has_received(*height) {
-                    map.insert(*height, *hash);
+            for expected in &outstanding.request.expected_blocks {
+                if !outstanding.has_received(expected.height) {
+                    map.insert(expected.height, expected.hash);
                 }
             }
         }
@@ -1453,10 +1457,10 @@ fn unreceived_heights(
 ) -> impl Iterator<Item = block::Height> + '_ {
     outstanding
         .request
-        .expected_hashes
+        .expected_blocks
         .iter()
-        .filter(move |(height, _)| !outstanding.has_received(*height))
-        .map(|(height, _)| *height)
+        .filter(move |expected| !outstanding.has_received(expected.height))
+        .map(|expected| expected.height)
 }
 
 impl Drop for PeerRoutine {
@@ -1479,10 +1483,10 @@ impl Drop for PeerRoutine {
             self.work.return_items(
                 outstanding
                     .request
-                    .expected_hashes
+                    .expected_blocks
                     .iter()
-                    .filter(|(height, _)| !outstanding.has_received(*height))
-                    .map(|(height, _)| *height),
+                    .filter(|expected| !outstanding.has_received(expected.height))
+                    .map(|expected| expected.height),
             );
         }
         self.registry.clear_outstanding(&self.peer, self.generation);
