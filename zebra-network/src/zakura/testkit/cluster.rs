@@ -202,18 +202,6 @@ mod tests {
         }
     }
 
-    /// A `Headers` response with no tree-aux roots, as a peer answers a request
-    /// that did not set `want_tree_aux_roots` (a non-finalized range). The
-    /// reactor rejects roots on a non-finalized range as `MalformedMessage`.
-    fn headers_message_without_roots(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
-        let body_sizes = vec![0; headers.len()];
-        HeaderSyncMessage::Headers {
-            headers,
-            body_sizes,
-            tree_aux_roots: Vec::new(),
-        }
-    }
-
     fn root_at(height: block::Height) -> BlockCommitmentRoots {
         BlockCommitmentRoots {
             height,
@@ -898,7 +886,7 @@ mod tests {
                     peer,
                     start,
                     count,
-                    want_tree_aux_roots,
+                    want_tree_aux_roots: _,
                 } => {
                     let headers = local
                         .store
@@ -907,15 +895,7 @@ mod tests {
                         .headers_by_range(start, count);
                     let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     if let Some(target) = peer_to_index.get(&peer) {
-                        // Mirror production serving: only a finalized-range
-                        // requester (`want_tree_aux_roots`) receives roots; a
-                        // non-finalized requester must get a roots-free response
-                        // or the reactor rejects it as `MalformedMessage`.
-                        let msg = if want_tree_aux_roots {
-                            headers_message(headers)
-                        } else {
-                            headers_message_without_roots(headers)
-                        };
+                        let msg = headers_message(headers);
                         let _ = nodes[*target]
                             .handle
                             .send(HeaderSyncEvent::WireMessage {
@@ -3026,9 +3006,7 @@ mod tests {
             .inject(
                 victim,
                 out_of_range,
-                headers_message_without_roots(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES)
-                    .header
-                    .clone()]),
+                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
             )
             .await;
         cluster
@@ -3071,7 +3049,7 @@ mod tests {
             .inject(
                 victim,
                 response_too_long,
-                headers_message_without_roots(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                 ]),
@@ -3109,7 +3087,7 @@ mod tests {
             .inject(
                 bad_continuity_victim,
                 bad_continuity,
-                headers_message_without_roots(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
                 ]),
@@ -3141,7 +3119,7 @@ mod tests {
             .inject(
                 bad_pow_victim,
                 bad_pow,
-                headers_message_without_roots(vec![Arc::new(bad_pow_header)]),
+                headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
         cluster
@@ -3174,7 +3152,7 @@ mod tests {
             .inject(
                 bad_daa_victim,
                 bad_daa,
-                headers_message_without_roots(vec![
+                headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),

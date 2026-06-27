@@ -1422,6 +1422,32 @@ impl RetentionPlan {
     }
 }
 
+#[cfg(test)]
+fn inferred_header_range_roots(
+    zebra_db: &ZebraDb,
+    anchor: block::Hash,
+    count: usize,
+) -> Result<Vec<BlockCommitmentRoots>, CommitHeaderRangeError> {
+    let anchor_height = zebra_db
+        .header_height(anchor)
+        .or_else(|| (anchor == zebra_db.network().genesis_hash()).then_some(block::Height(0)))
+        .unwrap_or(block::Height(0));
+
+    (0..count)
+        .map(|index| {
+            let offset =
+                u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
+            let height = (anchor_height + i64::from(offset))
+                .ok_or(CommitHeaderRangeError::HeightOverflow)?;
+            Ok(BlockCommitmentRoots {
+                height,
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            })
+        })
+        .collect()
+}
+
 impl DiskWriteBatch {
     // Write block methods
 
@@ -1838,6 +1864,7 @@ impl DiskWriteBatch {
     }
 
     /// Prepare a database batch containing a contextually validated header range.
+    #[cfg(test)]
     pub fn prepare_header_range_batch(
         &mut self,
         zebra_db: &ZebraDb,
@@ -1845,11 +1872,12 @@ impl DiskWriteBatch {
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
-        self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &[])
+        let roots = inferred_header_range_roots(zebra_db, anchor, headers.len())?;
+        self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &roots)
     }
 
     /// Prepare a database batch containing a contextually validated header range
-    /// and optional all-or-nothing provisional tree-aux roots.
+    /// and one provisional tree-aux root per header.
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
         zebra_db: &ZebraDb,
@@ -1869,7 +1897,7 @@ impl DiskWriteBatch {
             });
         }
 
-        if !tree_aux_roots.is_empty() && headers.len() != tree_aux_roots.len() {
+        if headers.len() != tree_aux_roots.len() {
             return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
                 headers: headers.len(),
                 roots: tree_aux_roots.len(),

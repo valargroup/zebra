@@ -647,24 +647,25 @@ impl HeaderSyncReactor {
         start_height: block::Height,
         requested_count: u32,
         want_tree_aux_roots: bool,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        mut headers: Vec<Arc<block::Header>>,
+        mut body_sizes: Vec<u32>,
+        mut tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) {
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
             return;
         };
-        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err()
-            || validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len()).is_err()
-            || validate_tree_aux_root_heights(start_height, &tree_aux_roots).is_err()
-        {
+        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
             peer_state.finish_serving_headers();
             return;
         }
-        let tree_aux_roots = if want_tree_aux_roots {
-            tree_aux_roots
-        } else {
-            Vec::new()
+
+        let roots_complete = validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())
+            .and_then(|()| validate_tree_aux_root_heights(start_height, &tree_aux_roots))
+            .is_ok();
+        if !headers.is_empty() && (!want_tree_aux_roots || !roots_complete) {
+            headers.clear();
+            body_sizes.clear();
+            tree_aux_roots.clear();
         };
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
         let served_tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);

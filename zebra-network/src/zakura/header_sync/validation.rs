@@ -343,7 +343,7 @@ pub(super) fn validate_tree_aux_roots_len(
     headers: usize,
     roots: usize,
 ) -> Result<(), HeaderSyncWireError> {
-    if roots != 0 && headers != roots {
+    if headers != roots {
         return Err(HeaderSyncWireError::TreeAuxRootCountMismatch { headers, roots });
     }
     Ok(())

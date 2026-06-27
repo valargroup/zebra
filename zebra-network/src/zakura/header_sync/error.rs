@@ -45,7 +45,7 @@ pub enum HeaderSyncWireError {
         body_sizes: usize,
     },
 
-    /// A locally constructed or inbound `Headers` message had a different number of roots.
+    /// A locally constructed or inbound `Headers` message did not carry exactly one root per header.
     #[error("Zakura header-sync Headers tree-aux root count {roots} does not match header count {headers}")]
     TreeAuxRootCountMismatch {
         /// Header count.
