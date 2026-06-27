@@ -1921,6 +1921,69 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(budget.reserved(), 0);
 }
 
+#[test]
+fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
+    let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
+    // Budget holds exactly two worst-case blocks, both consumed by buffered bodies
+    // (heights 5 and 6). Height 1 — the commit-unblocking floor gap — is pending
+    // and unfunded: this is the "download ran ahead, budget full, low height
+    // needs (re-)requesting" shape that wedged sync.
+    let mut budget = ByteBudget::new(2 * worst);
+    let work = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Unknown),
+            needed(5, BlockSizeEstimate::Unknown),
+            needed(6, BlockSizeEstimate::Unknown),
+        ],
+    );
+    let mut seq = test_sequencer(0, 100);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+
+    // Heights 5 and 6 are taken (pending -> in_flight) and buffered, each holding a
+    // worst-case block of budget; height 1 stays pending and unfunded.
+    work.take_in_range(block::Height(5), block::Height(6), 2);
+    for height in [5u32, 6] {
+        assert!(budget.try_reserve(worst));
+        seq.accept_body(
+            block::Height(height),
+            block::Hash([height as u8; 32]),
+            block.clone(),
+            worst,
+            peer(0),
+        );
+    }
+    assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
+    assert!(work.pending_contains(block::Height(1)));
+
+    // Shedding drops the top buffered body (6) — the one furthest from the floor —
+    // releasing its budget and returning its height to `pending` for later
+    // re-fetch, so the lower floor-gap request can now be funded. Without this the
+    // budget stays full and height 1 can never be requested (the wedge).
+    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
+    assert!(shed, "the top buffered body is shed");
+    assert!(
+        budget.available() >= worst,
+        "freed budget can now fund the floor-gap request"
+    );
+    assert!(
+        !seq.reorder_contains(block::Height(6)),
+        "the top body is evicted"
+    );
+    assert!(
+        seq.reorder_contains(block::Height(5)),
+        "the lower buffered body is kept"
+    );
+    assert!(
+        work.pending_contains(block::Height(1)),
+        "the floor gap is still pending and now fundable"
+    );
+    assert!(
+        work.pending_contains(block::Height(6)),
+        "the evicted height is returned to pending for re-fetch"
+    );
+}
+
 // ---- Sequencer commit pipeline ----
 
 fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {

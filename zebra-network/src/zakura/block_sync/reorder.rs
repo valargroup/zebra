@@ -22,6 +22,13 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
+    /// Highest buffered height, if any. The shed-for-floor-starvation path drops
+    /// this (the body furthest from the committed floor) to free budget for a
+    /// lower, commit-unblocking request.
+    pub(super) fn max_height(&self) -> Option<block::Height> {
+        self.blocks.keys().next_back().copied()
+    }
+
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }
