@@ -54,9 +54,24 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
-/// window is queued, so this defaults to one maximum checkpoint gap.
+/// window, including the resolving checkpoint block, is queued. A node that
+/// starts one height before a checkpoint-gap boundary can therefore need one
+/// maximum checkpoint gap plus the boundary block in flight.
 pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+/// The byte budget required to hold one full worst-case checkpoint range in
+/// flight.
+///
+/// The checkpoint verifier resolves a block's commit only once the entire
+/// contiguous range to the next checkpoint has been submitted, and every
+/// submitted body stays reserved against `max_inflight_block_bytes` until it is
+/// durable. A budget that cannot hold a whole worst-case range can never
+/// complete one: the verifier never commits, nothing becomes durable, and no
+/// bytes are ever released.
+pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
+    // `DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+    // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
+    DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default central floor-watchdog cadence.
@@ -231,7 +246,8 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the non-zero verifier submission cap.
     pub fn submitted_apply_limit(&self) -> usize {
-        self.max_submitted_block_applies.max(1)
+        self.max_submitted_block_applies
+            .max(DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES)
     }
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
@@ -274,6 +290,13 @@ impl ZakuraBlockSyncConfig {
         }
         if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
+        }
+        if self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR {
+            return Err(
+                "max_inflight_block_bytes must hold one full checkpoint range \
+                 (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+                 or checkpoint sync can deadlock",
+            );
         }
         Ok(())
     }
