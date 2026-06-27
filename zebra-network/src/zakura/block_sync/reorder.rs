@@ -1,4 +1,4 @@
-use super::{state::*, *};
+use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReorderBuffer {
@@ -31,9 +31,7 @@ impl ReorderBuffer {
     }
 
     pub(super) fn hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.blocks
-            .get(&height)
-            .map(|buffered| buffered.block.hash())
+        self.blocks.get(&height).map(|buffered| buffered.hash)
     }
 
     /// Buffer a received body that already owns its `bytes` reservation.
@@ -42,10 +40,30 @@ impl ReorderBuffer {
     /// shrank that reservation to `bytes` on receipt, so the reorder buffer takes
     /// ownership of the existing reservation without touching the budget and can
     /// never fail on budget. A `Duplicate` height is left to the caller to release.
+    #[cfg(test)]
     pub(super) fn insert(
         &mut self,
         height: block::Height,
         block: Arc<block::Block>,
+        bytes: u64,
+        source_peer: ZakuraPeerId,
+    ) -> ReorderInsertResult {
+        self.insert_body(
+            height,
+            block.hash(),
+            BufferedBlockBody::Decoded(block),
+            bytes,
+            source_peer,
+        )
+    }
+
+    /// Buffer a received body, keeping raw block bytes when the peer routine can
+    /// provide them so non-contiguous backlog does not retain decoded blocks.
+    pub(super) fn insert_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
@@ -56,7 +74,8 @@ impl ReorderBuffer {
         self.blocks.insert(
             height,
             BufferedBlock {
-                block,
+                hash,
+                body,
                 bytes,
                 source_peer,
             },
@@ -77,7 +96,12 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-            released.push((next, buffered.block, buffered.bytes, buffered.source_peer));
+            released.push((
+                next,
+                buffered.body.into_block(),
+                buffered.bytes,
+                buffered.source_peer,
+            ));
             let Some(after) = next_height(next) else {
                 break;
             };
@@ -138,9 +162,58 @@ pub(super) enum ReorderInsertResult {
 
 #[derive(Clone, Debug)]
 struct BufferedBlock {
-    block: Arc<block::Block>,
+    hash: block::Hash,
+    body: BufferedBlockBody,
     bytes: u64,
     /// The peer that delivered this body, so an apply rejection can be attributed
     /// back to it for misbehavior scoring.
     source_peer: ZakuraPeerId,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum BufferedBlockBody {
+    RawFramePayload(Arc<[u8]>),
+    Decoded(Arc<block::Block>),
+    DecodedWithRawFramePayload {
+        block: Arc<block::Block>,
+        raw_frame_payload: Arc<[u8]>,
+    },
+}
+
+impl BufferedBlockBody {
+    pub(super) fn from_decoded_block(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+    ) -> Self {
+        match raw_frame_payload {
+            Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
+                block,
+                raw_frame_payload,
+            },
+            None => BufferedBlockBody::Decoded(block),
+        }
+    }
+
+    pub(super) fn retain_for_backlog(self) -> Self {
+        match self {
+            BufferedBlockBody::DecodedWithRawFramePayload {
+                raw_frame_payload, ..
+            } => BufferedBlockBody::RawFramePayload(raw_frame_payload),
+            body => body,
+        }
+    }
+
+    fn into_block(self) -> Arc<block::Block> {
+        match self {
+            BufferedBlockBody::Decoded(block) => block,
+            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
+            BufferedBlockBody::RawFramePayload(payload) => {
+                let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
+                Arc::new(
+                    block::Block::zcash_deserialize(&mut reader)
+                        .expect("raw block bytes deserialize because the peer routine decoded them before buffering"),
+                )
+            }
+        }
+    }
 }

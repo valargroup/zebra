@@ -41,6 +41,14 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
+fn raw_block_payload(block: &Arc<block::Block>) -> Arc<[u8]> {
+    let frame = BlockSyncMessage::Block(block.clone())
+        .encode_frame()
+        .expect("test block frame encodes");
+
+    Arc::from(frame.payload.into_boxed_slice())
+}
+
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
     let mut fork = block.as_ref().clone();
     let mut header = *fork.header;
@@ -1942,6 +1950,51 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
 }
 
 #[test]
+fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
+    let mut seq = test_sequencer(0, 4);
+    let blocks = mainnet_blocks_1_to_3();
+    let block1 = blocks[0].clone();
+    let block2 = blocks[1].clone();
+    let distinguishable_decoded_block2 = forked_block(&block2, 99);
+
+    assert_ne!(distinguishable_decoded_block2.hash(), block2.hash());
+    assert_eq!(
+        distinguishable_decoded_block2.coinbase_height(),
+        block2.coinbase_height()
+    );
+
+    let block2_body = BufferedBlockBody::from_decoded_block(
+        distinguishable_decoded_block2.clone(),
+        Some(raw_block_payload(&block2)),
+    );
+
+    assert_eq!(
+        seq.accept_buffered_body(block::Height(2), block2.hash(), block2_body, 200, peer(0)),
+        AcceptOutcome::Buffered {
+            covered: block::Height(2)
+        }
+    );
+    assert!(seq.drain_ready_into_applying().is_empty());
+    assert!(seq.reorder_contains(block::Height(2)));
+
+    assert_eq!(
+        seq.accept_body(block::Height(1), block1.hash(), block1, 100, peer(0)),
+        AcceptOutcome::Buffered {
+            covered: block::Height(1)
+        }
+    );
+    assert_eq!(
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
+    assert_ne!(
+        seq.applying_hash(block::Height(2)),
+        Some(distinguishable_decoded_block2.hash())
+    );
+}
+
+#[test]
 fn sequencer_accept_body_rejects_at_or_below_floor() {
     let mut seq = test_sequencer(5, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
@@ -3799,7 +3852,8 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 #[tokio::test]
 async fn reactor_accepts_unmatched_body_for_queued_height() {
     let blocks = mainnet_blocks_1_to_3();
-    let config = immediate_body_download_config();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes = u64::from(block_size(&blocks[0]));
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -5485,10 +5539,14 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         }
     });
 
-    let mut requests = Vec::new();
+    let mut requests: Vec<(block::Height, u32)> = Vec::new();
     let mut submitted = std::collections::HashSet::new();
     let primed = tokio::time::timeout(Duration::from_secs(40), async {
-        while requests.len() < 4 || !prefix.is_subset(&submitted) {
+        while !prefix.is_subset(&submitted)
+            || !requests.iter().any(|(start, count)| {
+                *start <= block::Height(HOLE_START) && start.0.saturating_add(*count) > HOLE_END
+            })
+        {
             // The old peer's `GetBlocks` arrive on its own real outbound (reading
             // that stream proves they targeted it); needed-block queries and
             // submissions come over the action channel.
