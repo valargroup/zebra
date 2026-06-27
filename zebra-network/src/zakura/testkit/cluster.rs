@@ -144,7 +144,7 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError};
+    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError, TEST_NET_TIMEOUT};
     use super::*;
     use crate::{
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
@@ -380,7 +380,7 @@ mod tests {
         label: &'static str,
         mut matches: impl FnMut(&TaskExitProbeEvent) -> bool,
     ) -> Result<TaskExitProbeEvent, BoxError> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
                 let event = events.recv().await.ok_or_else(|| -> BoxError {
                     format!("task-exit probe closed before {label}").into()
@@ -739,7 +739,7 @@ mod tests {
 
         async fn wait_for_tip(&self, node: usize, height: block::Height) -> Result<(), BoxError> {
             let handle = self.nodes[node].view.handle.clone();
-            await_until("header-sync e2e best tip", Duration::from_secs(5), || {
+            await_until("header-sync e2e best tip", TEST_NET_TIMEOUT, || {
                 handle.best_header_tip().0 >= height
             })
             .await
@@ -748,16 +748,12 @@ mod tests {
 
         async fn wait_for_body(&self, node: usize, hash: block::Hash) -> Result<(), BoxError> {
             let store = self.nodes[node].view.store.clone();
-            await_until(
-                "header-sync e2e body commit",
-                Duration::from_secs(5),
-                || {
-                    store
-                        .lock()
-                        .expect("test store mutex is not poisoned")
-                        .has_body(hash)
-                },
-            )
+            await_until("header-sync e2e body commit", TEST_NET_TIMEOUT, || {
+                store
+                    .lock()
+                    .expect("test store mutex is not poisoned")
+                    .has_body(hash)
+            })
             .await
             .map_err(Into::into)
         }
@@ -778,7 +774,7 @@ mod tests {
             node: usize,
             reason: HeaderSyncMisbehavior,
         ) -> Result<(), BoxError> {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + TEST_NET_TIMEOUT;
             loop {
                 if self.misbehavior_reasons(node).await.contains(&reason) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -787,7 +783,7 @@ mod tests {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(Box::new(WaitError::new(
                         "header-sync e2e misbehavior reason",
-                        Duration::from_secs(5),
+                        TEST_NET_TIMEOUT,
                     )));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -807,7 +803,7 @@ mod tests {
                 format!(
                     "header-sync e2e outbound getheaders peer={peer:?} start={start_height:?} count={count}"
                 ),
-                Duration::from_secs(5),
+                TEST_NET_TIMEOUT,
                 || {
                     sent.try_lock().is_ok_and(|sent| {
                         sent.iter().any(|(sent_peer, msg)| {
@@ -1341,7 +1337,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         await_until(
             "native header-sync misbehavior reason",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || {
                 misbehaviors
                     .lock()
@@ -1360,8 +1356,8 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         cluster.spawn_nodes([1, 2]).await?;
 
-        cluster.connect_full_mesh(Duration::from_secs(5)).await?;
-        cluster.await_all_connected(Duration::from_secs(5)).await?;
+        cluster.connect_full_mesh(TEST_NET_TIMEOUT).await?;
+        cluster.await_all_connected(TEST_NET_TIMEOUT).await?;
         cluster.shutdown().await;
 
         Ok(())
@@ -1417,7 +1413,7 @@ mod tests {
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
 
-        await_until("block-sync peer registered", Duration::from_secs(5), || {
+        await_until("block-sync peer registered", TEST_NET_TIMEOUT, || {
             peer_set.borrow().contains(&hostile_peer)
         })
         .await?;
@@ -1432,7 +1428,7 @@ mod tests {
             )
             .await?;
 
-        await_until("stream-6 oversize trace", Duration::from_secs(5), || {
+        await_until("stream-6 oversize trace", TEST_NET_TIMEOUT, || {
             capture.reader().is_ok_and(|reader| {
                 reader
                     .node("01")
@@ -1450,7 +1446,7 @@ mod tests {
         .await?;
         await_until(
             "oversized stream-6 frame disconnects peer",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || !peer_set.borrow().contains(&hostile_peer),
         )
         .await?;
@@ -1477,7 +1473,7 @@ mod tests {
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
 
-        await_until("block-sync peer registered", Duration::from_secs(5), || {
+        await_until("block-sync peer registered", TEST_NET_TIMEOUT, || {
             peer_set.borrow().contains(&hostile_peer)
         })
         .await?;
@@ -1499,7 +1495,7 @@ mod tests {
 
         await_until(
             "incomplete stream-6 frame disconnects peer",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || !peer_set.borrow().contains(&hostile_peer),
         )
         .await?;
@@ -1594,7 +1590,7 @@ mod tests {
                 .await?;
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
-        await_until("block-sync peer registered", Duration::from_secs(5), || {
+        await_until("block-sync peer registered", TEST_NET_TIMEOUT, || {
             peer_set.borrow().contains(&hostile_peer)
         })
         .await?;
@@ -1614,7 +1610,7 @@ mod tests {
             )
             .await?;
 
-        let (start_height, count) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (start_height, count) = tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
                 let frame = hostile.recv_ordered_frame(ZAKURA_STREAM_BLOCK_SYNC).await?;
                 match BlockSyncMessage::decode_frame(frame)
@@ -1678,7 +1674,7 @@ mod tests {
         let expected: Vec<_> = (start_height.0..end_height).map(block::Height).collect();
         await_until(
             "native block-sync submitted requested bodies",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || {
                 let mut actual = submitted
                     .lock()
@@ -1693,7 +1689,7 @@ mod tests {
 
         await_until(
             "native block-sync submitted trace rows",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || {
                 capture.reader().is_ok_and(|reader| {
                     let rows = reader.node("60").table("block_sync").rows();
@@ -1741,7 +1737,7 @@ mod tests {
         // Known kind 2 (gossip): must be delivered.
         hostile.send_frame(2, known_payload.clone()).await?;
 
-        await_until("known-kind frame delivered", Duration::from_secs(5), || {
+        await_until("known-kind frame delivered", TEST_NET_TIMEOUT, || {
             recorder.contains_payload(2, &known_payload)
         })
         .await?;
@@ -1784,7 +1780,7 @@ mod tests {
             .await?;
         hostile.send_frame(2, good.clone()).await?;
 
-        await_until("version-1 frame delivered", Duration::from_secs(5), || {
+        await_until("version-1 frame delivered", TEST_NET_TIMEOUT, || {
             recorder.contains_payload(2, &good)
         })
         .await?;
@@ -1830,7 +1826,7 @@ mod tests {
             .send_frame(ZAKURA_STREAM_HEADER_SYNC, bad_header_sync_payload.clone())
             .await?;
         hostile.send_frame(2, before.clone()).await?;
-        await_until("pre-error gossip delivered", Duration::from_secs(5), || {
+        await_until("pre-error gossip delivered", TEST_NET_TIMEOUT, || {
             recorder.contains_payload(2, &before)
         })
         .await?;
@@ -1839,7 +1835,7 @@ mod tests {
         hostile.send_frame(2, after.clone()).await?;
         await_until(
             "post-header-sync gossip delivered",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || recorder.contains_payload(2, &after),
         )
         .await?;
@@ -1896,7 +1892,7 @@ mod tests {
             .await?;
         await_until(
             "negotiated header-sync stream delivered",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &admitted_payload),
         )
         .await?;
@@ -1947,7 +1943,7 @@ mod tests {
                 break;
             }
             let frame = tokio::time::timeout(
-                Duration::from_secs(5),
+                TEST_NET_TIMEOUT,
                 discovery_peer.recv_ordered_frame(ZAKURA_STREAM_DISCOVERY),
             )
             .await??;
@@ -2022,7 +2018,7 @@ mod tests {
             .await?;
         let b_id = b.node_addr().await.node_id;
 
-        a.connect_native(&b, Duration::from_secs(5)).await?;
+        a.connect_native(&b, TEST_NET_TIMEOUT).await?;
 
         let mut learned = false;
         for _ in 0..100 {
@@ -2050,7 +2046,7 @@ mod tests {
                 .await?;
         let peer_id = discovery_peer.id()?;
 
-        await_until("discovery peer registered", Duration::from_secs(5), || {
+        await_until("discovery peer registered", TEST_NET_TIMEOUT, || {
             contains_peer(&peer_set.borrow(), peer_id.as_bytes())
         })
         .await?;
@@ -2068,7 +2064,7 @@ mod tests {
 
         await_until(
             "protocol-invalid discovery peer deregistered",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || !contains_peer(&peer_set.borrow(), peer_id.as_bytes()),
         )
         .await?;
@@ -2106,25 +2102,21 @@ mod tests {
         flooding
             .flood_stream(ZAKURA_STREAM_DISCOVERY, 'd', 16)
             .await?;
-        await_until(
-            "discovery throttling traced",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("29")
-                        .table("ratelimit")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some("message.throttled")
-                                && row.get("stream_kind").and_then(serde_json::Value::as_str)
-                                    == Some("discovery")
-                        })
-                })
-            },
-        )
+        await_until("discovery throttling traced", TEST_NET_TIMEOUT, || {
+            capture.reader().is_ok_and(|reader| {
+                reader
+                    .node("29")
+                    .table("ratelimit")
+                    .rows()
+                    .iter()
+                    .any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some("message.throttled")
+                            && row.get("stream_kind").and_then(serde_json::Value::as_str)
+                                == Some("discovery")
+                    })
+            })
+        })
         .await?;
         flooding.shutdown().await;
 
@@ -2134,7 +2126,7 @@ mod tests {
         oversized
             .oversize_frame_declared_len(ZAKURA_STREAM_DISCOVERY)
             .await?;
-        await_until("discovery oversize traced", Duration::from_secs(5), || {
+        await_until("discovery oversize traced", TEST_NET_TIMEOUT, || {
             capture.reader().is_ok_and(|reader| {
                 reader
                     .node("29")
@@ -2206,7 +2198,7 @@ mod tests {
 
         // Wait until rate limiting has clearly engaged (more frames sent than one
         // budget, so the bucket must have emptied at least once).
-        await_until("rate limiting engaged", Duration::from_secs(5), || {
+        await_until("rate limiting engaged", TEST_NET_TIMEOUT, || {
             capture.reader().is_ok_and(|reader| {
                 reader
                     .node("05")
@@ -2261,11 +2253,9 @@ mod tests {
                 .await?;
         }
 
-        await_until(
-            "ordered gossip burst delivered",
-            Duration::from_secs(5),
-            || recorder.len() >= payloads.len(),
-        )
+        await_until("ordered gossip burst delivered", TEST_NET_TIMEOUT, || {
+            recorder.len() >= payloads.len()
+        })
         .await?;
         let delivered: Vec<_> = recorder
             .drain()
@@ -2297,7 +2287,7 @@ mod tests {
         hostile
             .send_frame(ZAKURA_STREAM_GOSSIP, b"open-source-stream".to_vec())
             .await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
             while !service.contains_peer(&peer_id).await {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -2311,12 +2301,12 @@ mod tests {
         service.send_payload(&peer_id, second.clone()).await?;
 
         let received_first = tokio::time::timeout(
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             hostile.recv_ordered_frame(ZAKURA_STREAM_GOSSIP),
         )
         .await??;
         let received_second = tokio::time::timeout(
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             hostile.recv_ordered_frame(ZAKURA_STREAM_GOSSIP),
         )
         .await??;
@@ -2445,21 +2435,17 @@ mod tests {
         cluster.nodes.push(node1);
         cluster.nodes.push(node2);
 
-        cluster.connect_full_mesh(Duration::from_secs(5)).await?;
-        cluster.await_all_connected(Duration::from_secs(5)).await?;
-        await_until(
-            "native stream-5 status received",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("02")
-                        .table("header_sync")
-                        .count(hs_trace::HEADER_STATUS_RECEIVED)
-                        >= 1
-                })
-            },
-        )
+        cluster.connect_full_mesh(TEST_NET_TIMEOUT).await?;
+        cluster.await_all_connected(TEST_NET_TIMEOUT).await?;
+        await_until("native stream-5 status received", TEST_NET_TIMEOUT, || {
+            capture.reader().is_ok_and(|reader| {
+                reader
+                    .node("02")
+                    .table("header_sync")
+                    .count(hs_trace::HEADER_STATUS_RECEIVED)
+                    >= 1
+            })
+        })
         .await?;
 
         capture.flush().await;
@@ -2535,7 +2521,7 @@ mod tests {
             .await?;
         await_until(
             "native header-sync unsolicited headers violation trace",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || {
                 capture.reader().is_ok_and(|reader| {
                     reader
@@ -2560,36 +2546,32 @@ mod tests {
                 .await?;
         let oversized_peer = oversized.id()?;
         let peer_set = victim.supervisor().subscribe();
-        await_until("oversized peer registered", Duration::from_secs(5), || {
+        await_until("oversized peer registered", TEST_NET_TIMEOUT, || {
             peer_set.borrow().contains(&oversized_peer)
         })
         .await?;
         oversized
             .oversize_frame_declared_len(ZAKURA_STREAM_HEADER_SYNC)
             .await?;
-        await_until(
-            "native stream-5 oversize trace",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("11")
-                        .table("ratelimit")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some("frame.oversize")
-                                && row.get("stream_kind").and_then(serde_json::Value::as_str)
-                                    == Some("header_sync")
-                        })
-                })
-            },
-        )
+        await_until("native stream-5 oversize trace", TEST_NET_TIMEOUT, || {
+            capture.reader().is_ok_and(|reader| {
+                reader
+                    .node("11")
+                    .table("ratelimit")
+                    .rows()
+                    .iter()
+                    .any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some("frame.oversize")
+                            && row.get("stream_kind").and_then(serde_json::Value::as_str)
+                                == Some("header_sync")
+                    })
+            })
+        })
         .await?;
         await_until(
             "oversized persistent stream disconnects peer",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || !peer_set.borrow().contains(&oversized_peer),
         )
         .await?;
@@ -2716,7 +2698,7 @@ mod tests {
                 .commit_body(empty, mainnet_block(block_bytes(height)))
                 .await;
         }
-        await_until("missing body gap shrinks", Duration::from_secs(5), || {
+        await_until("missing body gap shrinks", TEST_NET_TIMEOUT, || {
             cluster
                 .nodes
                 .get(empty)
@@ -2783,22 +2765,18 @@ mod tests {
         // checkpoint range (1..=3) has actually been backfilled. Wait instead for
         // the backfilled headers to land in the store, so the `(1, 3)` commit
         // trace below is asserted only after the backward range has committed.
-        await_until(
-            "checkpoint backfill committed",
-            Duration::from_secs(5),
-            || {
-                cluster
-                    .nodes
-                    .get(checkpointed)
-                    .expect("node exists")
-                    .view
-                    .store
-                    .lock()
-                    .expect("test store mutex is not poisoned")
-                    .headers
-                    .contains_key(&block::Height(1))
-            },
-        )
+        await_until("checkpoint backfill committed", TEST_NET_TIMEOUT, || {
+            cluster
+                .nodes
+                .get(checkpointed)
+                .expect("node exists")
+                .view
+                .store
+                .lock()
+                .expect("test store mutex is not poisoned")
+                .headers
+                .contains_key(&block::Height(1))
+        })
         .await?;
 
         capture.flush().await;
@@ -2975,7 +2953,7 @@ mod tests {
             .await;
         await_until(
             "header-sync e2e unsolicited headers violation trace",
-            Duration::from_secs(5),
+            TEST_NET_TIMEOUT,
             || {
                 capture.reader().is_ok_and(|reader| {
                     reader
