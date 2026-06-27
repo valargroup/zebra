@@ -150,7 +150,7 @@ pub(super) enum SequencerControlInput {
     },
 }
 
-/// The committed view the reactor reacts to. A `watch` (latest-wins) send never
+/// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug)]

@@ -757,6 +757,12 @@ fn config_validate_rejects_degenerate_values() {
     assert!(config.validate().is_err());
 
     config = ZakuraBlockSyncConfig {
+        max_reorder_lookahead_bytes: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_blocks: 0,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -1455,7 +1461,7 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
 
 #[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
-    // The committed floor is NOT an upper bound on a take: a peer fetches as far
+    // The download floor is NOT an upper bound on a take: a peer fetches as far
     // above the floor as its servable range allows.
     let queue = work_queue_with(
         0,

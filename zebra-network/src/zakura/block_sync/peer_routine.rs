@@ -537,11 +537,11 @@ impl PeerRoutine {
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
         self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
-        // GC this routine's own fully-committed outstanding requests: when the
-        // committed floor passes the end of a request, its bodies are no longer
+        // GC this routine's own fully-covered outstanding requests: when the
+        // download floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
         // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* committed requests, never a fetch
+        // GC of *our own* covered requests, never a fetch
         // throttle — it replaces the previous reactor `drop_outstanding_through`
         // without the cross-peer churn the spec warned about (a partially-received
         // request whose suffix is still above the floor is left in place).

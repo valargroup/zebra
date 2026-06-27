@@ -266,6 +266,9 @@ impl ZakuraBlockSyncConfig {
         if self.max_inflight_block_bytes == 0 {
             return Err("max_inflight_block_bytes must be greater than zero");
         }
+        if self.max_reorder_lookahead_bytes == 0 {
+            return Err("max_reorder_lookahead_bytes must be greater than zero");
+        }
         if self.max_reorder_lookahead_blocks == 0 {
             return Err("max_reorder_lookahead_blocks must be greater than zero");
         }
