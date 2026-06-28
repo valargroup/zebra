@@ -1153,7 +1153,7 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
     // force-disable knob selects manual recomputation. Fast sync deletes nothing; the missing
     // historical trees are surfaced at the RPC boundary, not by refusing to reopen.
     let config = Config {
-        disable_vct_fast_sync: true,
+        vct_fast_sync: false,
         ..config
     };
     let reopened = FinalizedState::new(
@@ -1197,7 +1197,7 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
     // Pruning only removes historical raw transaction bytes; it does not make a completed
     // fast-sync marker unsafe to reopen with VCT force-disabled.
     let config = Config {
-        disable_vct_fast_sync: true,
+        vct_fast_sync: false,
         ..config
     };
     let reopened = FinalizedState::new(
@@ -1261,7 +1261,7 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
     let config = Config {
         cache_dir: dir.path().to_path_buf(),
         ephemeral: false,
-        disable_vct_fast_sync: true,
+        vct_fast_sync: false,
         ..Config::default()
     };
 

@@ -42,7 +42,7 @@
 
 [consensus]
 checkpoint_sync = true
-disable_vct_fast_sync = false
+vct_fast_sync = true
 
 [health]
 enforce_on_test_networks = false

@@ -518,7 +518,7 @@ impl FinalizedState {
 
         let vct = VctState::from_config(
             config.checkpoint_sync,
-            config.disable_vct_fast_sync,
+            config.vct_fast_sync,
             network,
             db.clone(),
         );
@@ -583,7 +583,7 @@ impl FinalizedState {
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the checkpoint handoff height. the fast path that supplies \
                  the verified roots needed to resume it is disabled. Set \
-                 `consensus.checkpoint_sync = true` and `consensus.disable_vct_fast_sync = false` to \
+                 `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true` to \
                  finish the fast sync, or delete the cache directory and re-sync from genesis"
             );
         }
