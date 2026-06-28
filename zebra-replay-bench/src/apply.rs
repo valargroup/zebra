@@ -1,9 +1,9 @@
 //! Phase 2: replay cached blocks through the real state committer, timed.
 //!
 //! Two modes:
-//! * **legacy** — `disable_vct_fast_sync = true`, full per-block note-commitment
+//! * **legacy** — `vct_fast_sync = false`, full per-block note-commitment
 //!   recompute; `next_checkpoint = None`.
-//! * **VCT** (`--vct-sidecar`) — `disable_vct_fast_sync = false`, the per-height
+//! * **VCT** (`--vct-sidecar`) — `vct_fast_sync = true`, the per-height
 //!   anchor roots from the sidecar are written into the base fork's header-roots
 //!   column family so the committer folds them in and skips the recompute. Each
 //!   block is committed with its successor as `next_checkpoint`, the one-block-lag
@@ -12,20 +12,12 @@
 use std::{path::Path, sync::Arc, time::Instant};
 
 use color_eyre::eyre::{bail, eyre, Result};
-use zebra_chain::{
-    block::{Block, Height},
-    parameters::Network,
-    serialization::ZcashDeserialize,
+use zebra_chain::{block::Height, parameters::Network};
+use zebra_state::FinalizedState;
+
+use crate::{
+    cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
 };
-use zebra_state::{CheckpointVerifiedBlock, FinalizedState};
-
-use crate::{cache::CacheReader, config::state_config, roots_cache::RootsSidecar, stats::Stats};
-
-fn deserialize(bytes: &[u8], height: u32) -> Result<Arc<Block>> {
-    Block::zcash_deserialize(bytes)
-        .map(Arc::new)
-        .map_err(|e| eyre!("deserializing block {height}: {e}"))
-}
 
 /// Replays every block in `cache_path` onto the writable DB at `base`.
 ///
@@ -39,7 +31,7 @@ pub fn run(
     vct_sidecar: Option<&Path>,
     network: Network,
 ) -> Result<Stats> {
-    let mut reader = CacheReader::open(cache_path)?;
+    let reader = CacheReader::open(cache_path)?;
     let header = reader.header();
     let expected_net = match network {
         Network::Mainnet => 0,
@@ -75,8 +67,8 @@ pub fn run(
         None => None,
     };
 
-    // VCT mode forces the fast path on (disable_vct_fast_sync = false); legacy
-    // mode forces the full recompute (= true).
+    // VCT mode forces the fast path on (vct_fast_sync = true); legacy
+    // mode forces the full recompute (vct_fast_sync = false).
     let force_legacy = sidecar.is_none();
     let config = state_config(base.to_path_buf(), force_legacy);
     tracing::info!(base = %base.display(), vct = sidecar.is_some(), "opening base fork writable");
@@ -107,44 +99,52 @@ pub fn run(
 
     tracing::info!(start, count = header.count, "replaying window");
 
+    // Stream the window through a bounded prefetch: a producer thread reads,
+    // deserializes, and builds each CheckpointVerifiedBlock (the verifier-side
+    // `prepare_block_data`) ahead of the committer, so the timed loop measures the
+    // committer only while memory stays bounded to the prefetch capacity. The
+    // committer keeps a one-block look-ahead for the VCT successor.
+    let (_producer, rx) = prefetch::spawn(reader, prefetch::capacity());
+
     let mut stats = Stats::default();
     let mut prev_trees = None;
-    let mut height = start;
+
+    // Pull the first prepared block before starting the clock.
+    let mut cur = match rx.recv() {
+        Ok(item) => Some(item?),
+        Err(_) => bail!("cache is empty"),
+    };
     let wall_start = Instant::now();
 
-    // First block.
-    let first = reader
-        .next_block()?
-        .ok_or_else(|| eyre!("cache is empty"))?;
-    let mut cur: Arc<Block> = deserialize(&first, height)?;
-    let mut cur_len = first.len();
-
-    loop {
-        // Look ahead one block for the successor (VCT one-block-lag); fall back to
-        // the sidecar successor for the final block.
-        let next = reader.next_block()?;
-        let next_block = match &next {
-            Some(bytes) => Some(deserialize(bytes, height + 1)?),
-            None => None,
+    while let Some(p) = cur.take() {
+        // The next prepared block is both this block's VCT successor and the next
+        // iteration's block. With a full prefetch buffer this receive does not
+        // block; if the producer lags it briefly waits (counted in the wall, not
+        // the per-commit latency).
+        let next = match rx.recv() {
+            Ok(item) => Some(item?),
+            Err(_) => None,
         };
 
-        // Build next_checkpoint for the VCT path: the successor block + its auth root.
         let next_checkpoint = if let Some(s) = &sidecar {
-            let successor = match &next_block {
-                Some(nb) => nb.clone(),
-                None => Arc::new(s.successor.clone()),
+            let (successor, auth) = match &next {
+                Some(n) => (n.block.clone(), n.auth),
+                None => {
+                    let successor = Arc::new(s.successor.clone());
+                    let auth = successor.auth_data_root();
+                    (successor, auth)
+                }
             };
-            let auth = successor.auth_data_root();
             Some((successor, Some(auth)))
         } else {
             None
         };
 
-        let cv = CheckpointVerifiedBlock::from(cur.clone());
+        let height = p.height;
         let commit_start = Instant::now();
         let (_hash, trees) = state
             .commit_finalized_direct(
-                cv.into(),
+                p.cv.into(),
                 prev_trees.take(),
                 None,
                 next_checkpoint,
@@ -158,21 +158,14 @@ pub fn run(
         let latency = commit_start.elapsed();
 
         prev_trees = Some(trees);
-        stats.record(cur_len, latency);
+        stats.record(p.len, latency);
 
         let done = height - start + 1;
         if done.is_multiple_of(5000) || done == header.count {
             tracing::info!(height, done, count = header.count, "applying");
         }
 
-        match next_block {
-            Some(nb) => {
-                cur = nb;
-                cur_len = next.as_ref().map(|b| b.len()).unwrap_or(0);
-                height += 1;
-            }
-            None => break,
-        }
+        cur = next;
     }
 
     let wall = wall_start.elapsed();

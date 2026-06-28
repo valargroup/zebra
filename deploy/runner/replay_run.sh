@@ -95,9 +95,31 @@ cmd_run() {
   rm -rf "$fork"
 }
 
+# Like cmd_run, but replays through the real zebra-state write worker
+# (apply-worker), one altitude above the direct committer.
+cmd_run_worker() {
+  local label="${1:?usage: replay_run.sh run-worker <label> [bin]}"; shift || true
+  local bin="${1:-$BIN_DEFAULT}"
+  [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
+  [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  local fork="$FORK_DIR/replay-worker-$label"
+  note "fork base $BASE_SRC -> $fork; apply-worker $CACHE (expects base tip $((START - 1)))"
+  clone_fork "$BASE_SRC" "$fork"
+  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
+    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
+    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
+    "$bin" apply-worker --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
+  else
+    "$bin" apply-worker --base "$fork" --cache "$CACHE"
+  fi
+  note "cleanup: rm -rf $fork"
+  rm -rf "$fork"
+}
+
 case "${1:-}" in
   index)       shift; cmd_index "$@" ;;
   index-roots) shift; cmd_index_roots "$@" ;;
   run)         shift; cmd_run "$@" ;;
-  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]}" >&2; exit 2 ;;
+  run-worker)  shift; cmd_run_worker "$@" ;;
+  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]}" >&2; exit 2 ;;
 esac

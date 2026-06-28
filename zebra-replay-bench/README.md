@@ -6,7 +6,7 @@ production committer (`FinalizedState::commit_finalized_direct`) — no peers, n
 header/body sync, no head-of-line noise — so the write-assembler + disk-writer
 work can be measured and A/B compared on a stable baseline.
 
-It deliberately runs the **legacy recompute path** (`disable_vct_fast_sync`), the
+It deliberately runs the **legacy recompute path** (`vct_fast_sync = false`), the
 per-block note-commitment-tree + history-tree work that dominates commit cost.
 
 ## Two phases, one flat cache
@@ -33,7 +33,40 @@ zebra-replay-bench index \
 
 # Phase 2: replay onto a fork whose tip == 1800000
 zebra-replay-bench apply --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+
+# One altitude up: replay through the real zebra-state write worker
+zebra-replay-bench apply-worker --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
 ```
+
+## Two altitudes: `apply` vs `apply-worker`
+
+`apply` calls the committer (`commit_finalized_direct`) directly in a tight loop.
+`apply-worker` drives the same blocks through the **production write worker**
+(`BlockWriteSender::spawn` / `WriteBlockWorkerTask::run`), the next rung up the
+abstraction ladder. The worker adds exactly what the node wraps around each
+commit: the in-order channel feed, the one-block look-ahead note-commitment
+**precompute overlap** (idle-core hashing), the park/poll loop, and the chain-tip
+channel updates. Both share the same cache, sidecar, config, snapshots, and
+correctness gate (final tip hash), so their throughput numbers are directly
+comparable. In legacy mode the worker's precompute overlaps the recompute, so it
+beats `apply`; in VCT mode the recompute is gone, the precompute is off, and the
+two converge (see `RESULTS.md`).
+
+Commit-only isolation: both commands stream the window through a bounded
+[`prefetch`] producer that reads, deserializes, and builds each
+`CheckpointVerifiedBlock` (the verifier-side `prepare_block_data`) off the timed
+commit thread, into a bounded channel (`ZRB_PREFETCH_CAP`, default 64). So the
+timed window measures the committer only, memory stays flat regardless of window
+size, and `apply-worker` feeds the worker with a bounded in-flight window (no 30K
+backlog, no RocksDB write-stall).
+
+VCT (`--vct-sidecar`) termination: the worker builds its `next_checkpoint` from
+the look-ahead, so every committed height needs its successor buffered. The bench
+feeds one extra trailing block (the sidecar's `successor`, height `end+1`) so the
+last counted block commits; the worker then parks on `end+1` (whose successor is
+never fed) and cannot be drained to exit. The run verifies against a cloned DB
+handle and returns without joining — the parked worker thread is reaped at process
+exit. The legacy path has no such dependency and shuts down cleanly.
 
 `--src` / `--base` are snapshot roots that contain `state/vN/<network>`.
 
@@ -63,6 +96,7 @@ cargo build --release -p zebra-replay-bench --features commit-metrics
 make perf-build-replay-bench   # build the bench binary (commit-metrics)
 make perf-replay-index         # one-time: dump the window to a block cache
 make perf-replay               # legacy replay through the committer
+make perf-replay-worker        # same window, through the write worker
 # VCT fast path:
 make perf-replay-index && deploy/runner/replay_run.sh index-roots
 make perf-replay REPLAY_VCT_SIDECAR=/path/to/win.vct

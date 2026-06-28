@@ -71,10 +71,10 @@ pub mod check;
 pub(crate) mod finalized_state;
 pub(crate) mod non_finalized_state;
 mod pending_utxos;
-mod queued_blocks;
+pub(crate) mod queued_blocks;
 pub(crate) mod read;
 mod traits;
-mod write;
+pub(crate) mod write;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub mod arbitrary;
