@@ -117,7 +117,9 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request_that(|req| req.block().hash() == block0_hash)
+        .expect_request_that(|request| {
+            !request.is_proposal() && request.block().hash() == block0_hash
+        })
         .await
         .respond(block0_hash);
 
@@ -359,7 +361,9 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request_that(|req| req.block().hash() == block0_hash)
+        .expect_request_that(|request| {
+            !request.is_proposal() && request.block().hash() == block0_hash
+        })
         .await
         .respond(block0_hash);
 
@@ -659,7 +663,9 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request_that(|req| req.block().hash() == block0_hash)
+        .expect_request_that(|request| {
+            !request.is_proposal() && request.block().hash() == block0_hash
+        })
         .await
         .respond(block0_hash);
 
@@ -832,7 +838,9 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
         ))]));
 
     block_verifier_router
-        .expect_request_that(|req| req.block().hash() == block0_hash)
+        .expect_request_that(|request| {
+            !request.is_proposal() && request.block().hash() == block0_hash
+        })
         .await
         .respond(block0_hash);
 
@@ -1083,8 +1091,11 @@ async fn request_genesis_accepts_duplicate_finalized_genesis() -> Result<(), cra
     let verifier_service = tower::service_fn(move |request: zebra_consensus::Request| {
         verifier_requests_in_service.fetch_add(1, Ordering::SeqCst);
         async move {
-            let block = request.block();
-            assert_eq!(block.hash(), block0_hash);
+            assert!(
+                !request.is_proposal(),
+                "genesis bootstrap must commit the downloaded genesis block"
+            );
+            assert_eq!(request.block().hash(), block0_hash);
 
             let duplicate = zs::CommitBlockError::Duplicate {
                 hash_or_height: None,
