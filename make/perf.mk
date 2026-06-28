@@ -9,6 +9,9 @@
 
 .PHONY: \
 	perf-build-local \
+	perf-build-replay-bench \
+	perf-replay-index \
+	perf-replay \
 	perf-run \
 	perf-run-mainnet \
 	perf-analyze \
@@ -42,6 +45,33 @@ perf-run:
 # Fork the snapshot and run against public Mainnet Zakura bootstrap peers.
 perf-run-mainnet:
 	. "$(CURDIR)/deploy/runner/cohort.env"; CONFIG_SRC="$(PERF_MAINNET_CONFIG)" "$(FEED_RUN)" $(PERF_MAINNET_LABEL) "$$BENCH_BIN" $(PERF_STOP)
+
+# ─── Offline commit-pipeline replay bench (zebra-replay-bench) ────────────────
+# Replays real mainnet blocks through the state committer with NO networking, to
+# benchmark the committer (write-assembler + disk-writer) in isolation. Forward
+# model: the base snapshot's tip must equal REPLAY_START-1 (no rollback). Paths
+# come from deploy/runner/cohort.env (REPLAY_* vars). `perf-replay-index` is a
+# one-time setup; `perf-replay` is the repeatable A/B step. Add --vct-sidecar via
+# REPLAY_VCT_SIDECAR to exercise the VCT fast path.
+#   make perf-build-replay-bench   # build the bench binary (commit-metrics)
+#   make perf-replay-index         # one-time: dump the window to a block cache
+#   make perf-replay               # replay the cache through the committer
+
+PERF_REPLAY_RUN   ?= $(CURDIR)/deploy/runner/replay_run.sh
+REPLAY_BIN        ?= $(CURDIR)/target/release/zebra-replay-bench
+PERF_REPLAY_LABEL ?= r1-replay
+
+# Build the replay bench binary (commit-metrics) into the default target dir.
+perf-build-replay-bench:
+	cargo build --release -p zebra-replay-bench --features commit-metrics --locked
+
+# One-time: dump the configured window from the block source into the cache.
+perf-replay-index:
+	REPLAY_BIN="$(REPLAY_BIN)" "$(PERF_REPLAY_RUN)" index "$(REPLAY_BIN)"
+
+# Repeatable: fork the base snapshot, apply the cache, report throughput.
+perf-replay:
+	REPLAY_BIN="$(REPLAY_BIN)" "$(PERF_REPLAY_RUN)" run $(PERF_REPLAY_LABEL) "$(REPLAY_BIN)"
 
 # Steady-state bottleneck attribution over the CSV window [PERF_LO, PERF_HI].
 perf-analyze:

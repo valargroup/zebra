@@ -1,0 +1,37 @@
+[package]
+name = "zebra-replay-bench"
+version = "0.1.0"
+authors.workspace = true
+description = "Offline benchmark that replays mainnet blocks through the Zebra state committer, isolated from the network"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "zebra-replay-bench"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable the zebra-state commit-metrics histograms and render them at the end of
+# an `apply` run. Build the bench binary with this to get per-phase attribution.
+commit-metrics = ["zebra-state/commit-metrics", "dep:metrics-exporter-prometheus"]
+
+[dependencies]
+zebra-chain = { path = "../zebra-chain", version = "9.0.0" }
+zebra-state = { path = "../zebra-state", version = "8.0.0" }
+
+clap = { workspace = true, features = ["derive"] }
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+metrics-exporter-prometheus = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

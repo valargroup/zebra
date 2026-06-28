@@ -4,6 +4,7 @@ members = [
         "zebra-chain",
         "zebra-network",
         "zebra-state",
+        "zebra-replay-bench",
         "zebra-script",
         "zebra-consensus",
         "zebra-rpc",
