@@ -2291,7 +2291,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
 }
 
 #[test]
-fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
+fn shed_top_until_available_funds_lowest_pending_by_dropping_top() {
     let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
     // Budget holds exactly two worst-case blocks, both consumed by buffered bodies
     // (heights 5 and 6). Height 1 — the commit-unblocking floor gap — is pending
@@ -2325,11 +2325,12 @@ fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
     assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
     assert!(work.pending_contains(block::Height(1)));
 
-    // Shedding drops the top buffered body (6) — the one furthest from the floor —
-    // releasing its budget and returning its height to `pending` for later
-    // re-fetch, so the lower floor-gap request can now be funded. Without this the
-    // budget stays full and height 1 can never be requested (the wedge).
-    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
+    // The explicit floor-reservation rescue drops the top buffered body (6) — the
+    // one furthest from the floor — releasing its budget and returning its height
+    // to `pending` for later re-fetch, so the lower floor-gap request can now be
+    // funded. Without this the budget stays full and height 1 can never be
+    // requested (the wedge).
+    let shed = super::sequencer_task::shed_top_until_available(&mut budget, &work, &mut seq, worst);
     assert!(shed, "the top buffered body is shed");
     assert!(
         budget.available() >= worst,
@@ -2354,7 +2355,7 @@ fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
 }
 
 #[test]
-fn shed_top_for_floor_starvation_funds_outstanding_floor_by_dropping_top() {
+fn shed_top_until_available_funds_outstanding_floor_by_dropping_top() {
     let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
     let mut budget = ByteBudget::new(2 * worst);
     let work = work_queue_with(
@@ -2389,7 +2390,7 @@ fn shed_top_for_floor_starvation_funds_outstanding_floor_by_dropping_top() {
         "the floor gap is outstanding, not pending"
     );
 
-    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
+    let shed = super::sequencer_task::shed_top_until_available(&mut budget, &work, &mut seq, worst);
     assert!(
         shed,
         "the top buffered body is shed even while the floor gap is outstanding"
@@ -2430,7 +2431,7 @@ fn shed_top_until_available_self_funds_floor_reservation() {
 
     // The floor has already been taken for a request whose reservation lost a
     // budget race. The speculative bodies saturate the budget, so the floor
-    // reservation path must pop enough high-tail bodies and retry.
+    // reservation path must pop enough high-tail bodies to reserve immediately.
     work.take_in_range(block::Height(1), block::Height(1), 1);
     for height in [8u32, 9, 10] {
         work.take_in_range(block::Height(height), block::Height(height), 1);
@@ -2593,6 +2594,56 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
     );
     assert_eq!(seq.floor(), block::Height(3));
     assert_eq!(seq.reorder_len(), 0);
+}
+
+#[test]
+fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
+    let mut seq = test_sequencer(0, 8);
+    let blocks = mainnet_blocks_1_to_3();
+    let raw_height_2 = Arc::<[u8]>::from(
+        BlockSyncMessage::Block(blocks[1].clone())
+            .encode()
+            .expect("test block encodes")
+            .into_boxed_slice(),
+    );
+
+    assert_eq!(
+        seq.accept_buffered_body(
+            block::Height(2),
+            blocks[1].hash(),
+            BufferedBlockBody::raw_and_decoded(blocks[0].clone(), raw_height_2),
+            u64::from(block_size(&blocks[1])),
+            peer(0),
+        ),
+        AcceptOutcome::Buffered {
+            covered: block::Height(2)
+        }
+    );
+
+    assert_eq!(
+        seq.accept_body(
+            block::Height(1),
+            blocks[0].hash(),
+            blocks[0].clone(),
+            u64::from(block_size(&blocks[0])),
+            peer(0),
+        ),
+        AcceptOutcome::Buffered {
+            covered: block::Height(1)
+        }
+    );
+
+    let drained = seq.drain_ready_into_applying(1);
+    assert_eq!(
+        drained
+            .iter()
+            .map(|drained| (drained.height, drained.block.hash()))
+            .collect::<Vec<_>>(),
+        vec![
+            (block::Height(1), blocks[0].hash()),
+            (block::Height(2), blocks[1].hash()),
+        ],
+    );
 }
 
 #[test]

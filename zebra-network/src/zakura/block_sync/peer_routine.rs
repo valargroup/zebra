@@ -1079,7 +1079,7 @@ impl PeerRoutine {
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
         let body = raw_block_payload
-            .map(BufferedBlockBody::RawFramePayload)
+            .map(|raw_payload| BufferedBlockBody::raw_and_decoded(block.clone(), raw_payload))
             .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
@@ -1247,7 +1247,7 @@ impl PeerRoutine {
         self.budget.release(old_charge);
 
         let body = raw_block_payload
-            .map(BufferedBlockBody::RawFramePayload)
+            .map(|raw_payload| BufferedBlockBody::raw_and_decoded(block.clone(), raw_payload))
             .unwrap_or_else(|| BufferedBlockBody::Decoded(block));
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;

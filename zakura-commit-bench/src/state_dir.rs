@@ -24,6 +24,13 @@ pub struct StateDirMetadata {
     pub used_mode: Option<String>,
     pub measured_target: Option<u32>,
     pub lookahead_target: Option<u32>,
+    pub rollback_target: Option<u32>,
+    pub rollback_old_tip: Option<u32>,
+    pub rollback_old_hash: Option<String>,
+    pub rollback_new_tip: Option<u32>,
+    pub rollback_new_hash: Option<String>,
+    pub rollback_duration_ms: Option<u64>,
+    pub rollback_at_unix_seconds: Option<u64>,
 }
 
 impl StateDirMetadata {
@@ -69,7 +76,11 @@ pub fn write_metadata(state_dir: &Path, metadata: &StateDirMetadata) -> Result<(
     Ok(())
 }
 
-pub fn check_state_dir_not_used(state_dir: &Path, allow_used: bool) -> Result<()> {
+pub async fn check_state_dir_not_used(
+    state_dir: &Path,
+    allow_used: bool,
+    network: &Network,
+) -> Result<()> {
     let Some(metadata) = read_metadata(state_dir)? else {
         eprintln!(
             "warning: {} has no {}; this benchmark will mutate the state dir",
@@ -80,13 +91,50 @@ pub fn check_state_dir_not_used(state_dir: &Path, allow_used: bool) -> Result<()
     };
 
     if metadata.used_by_bench && !allow_used {
+        let current_tip = match finalized_tip_from_state_dir(state_dir, network).await {
+            Ok(tip) => Some(tip),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "could not read used state dir tip for guard message"
+                );
+                None
+            }
+        };
         bail!(
-            "{} was already used by zakura-commit-bench; pass --allow-used-state-dir to reuse it",
-            state_dir.display()
+            "{}",
+            used_state_dir_message(state_dir, &metadata, current_tip)
         );
     }
 
     Ok(())
+}
+
+fn used_state_dir_message(
+    state_dir: &Path,
+    metadata: &StateDirMetadata,
+    current_tip: Option<block::Height>,
+) -> String {
+    let base = format!(
+        "{} was already used by zakura-commit-bench",
+        state_dir.display()
+    );
+
+    match (metadata.rollback_target, current_tip) {
+        (Some(target), Some(current_tip)) if current_tip.0 == target => format!(
+            "{base}; the DB tip is back at the recorded rollback target {target}, but metadata \
+             is still marked used. Run `zakura-commit-bench status --state-dir {}` to inspect it, \
+             or pass --allow-used-state-dir if this state is intentionally reusable",
+            state_dir.display()
+        ),
+        (Some(target), Some(current_tip)) => format!(
+            "{base}; current tip is {}, recorded rollback target is {target}. Let the default \
+             rollback complete, run with --rollback-dry-run to inspect the state, or pass \
+             --allow-used-state-dir to override",
+            current_tip.0
+        ),
+        _ => format!("{base}; pass --allow-used-state-dir to reuse it"),
+    }
 }
 
 pub fn mark_used(
@@ -97,16 +145,37 @@ pub fn mark_used(
 ) -> Result<()> {
     let mut metadata = read_metadata(state_dir)?.unwrap_or_default();
     metadata.used_by_bench = true;
-    metadata.used_at_unix_seconds = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    );
+    metadata.used_at_unix_seconds = Some(now_unix_seconds());
     metadata.used_mode = Some(mode.as_str().to_string());
     metadata.measured_target = Some(measured_target.0);
     metadata.lookahead_target = Some(lookahead_target.0);
     write_metadata(state_dir, &metadata)
+}
+
+pub fn mark_rollback_success(
+    state_dir: &Path,
+    target: block::Height,
+    old_tip: (block::Height, block::Hash),
+    new_tip: (block::Height, block::Hash),
+    duration: std::time::Duration,
+) -> Result<()> {
+    let mut metadata = read_metadata(state_dir)?.unwrap_or_default();
+    metadata.used_by_bench = false;
+    metadata.rollback_target = Some(target.0);
+    metadata.rollback_old_tip = Some(old_tip.0 .0);
+    metadata.rollback_old_hash = Some(old_tip.1.to_string());
+    metadata.rollback_new_tip = Some(new_tip.0 .0);
+    metadata.rollback_new_hash = Some(new_tip.1.to_string());
+    metadata.rollback_duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    metadata.rollback_at_unix_seconds = Some(now_unix_seconds());
+    write_metadata(state_dir, &metadata)
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub async fn planning_tip_from_state_dir(
@@ -122,7 +191,7 @@ pub async fn planning_tip_from_state_dir(
     finalized_tip_from_state_dir(state_dir, network).await
 }
 
-async fn finalized_tip_from_state_dir(
+pub async fn finalized_tip_from_state_dir(
     state_dir: &Path,
     network: &Network,
 ) -> Result<block::Height> {
@@ -232,16 +301,57 @@ mod tests {
     #[test]
     fn used_state_dir_requires_explicit_allow() {
         let temp = tempfile::tempdir().unwrap();
-        write_metadata(
+        let metadata = StateDirMetadata {
+            used_by_bench: true,
+            ..StateDirMetadata::default()
+        };
+        write_metadata(temp.path(), &metadata).unwrap();
+
+        assert!(
+            used_state_dir_message(temp.path(), &metadata, None).contains("--allow-used-state-dir")
+        );
+    }
+
+    #[test]
+    fn used_state_dir_message_mentions_recorded_rollback_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = StateDirMetadata {
+            used_by_bench: true,
+            rollback_target: Some(42),
+            ..StateDirMetadata::default()
+        };
+
+        let message = used_state_dir_message(temp.path(), &metadata, Some(block::Height(42)));
+
+        assert!(message.contains("recorded rollback target 42"));
+        assert!(message.contains("status --state-dir"));
+    }
+
+    #[test]
+    fn rollback_success_marks_state_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        mark_used(
             temp.path(),
-            &StateDirMetadata {
-                used_by_bench: true,
-                ..StateDirMetadata::default()
-            },
+            RunMode::ApplyQueue,
+            block::Height(50),
+            block::Height(60),
         )
         .unwrap();
 
-        assert!(check_state_dir_not_used(temp.path(), false).is_err());
-        check_state_dir_not_used(temp.path(), true).unwrap();
+        mark_rollback_success(
+            temp.path(),
+            block::Height(40),
+            (block::Height(60), block::Hash([1; 32])),
+            (block::Height(40), block::Hash([2; 32])),
+            std::time::Duration::from_millis(123),
+        )
+        .unwrap();
+
+        let metadata = read_metadata(temp.path()).unwrap().unwrap();
+        assert!(!metadata.used_by_bench);
+        assert_eq!(metadata.rollback_target, Some(40));
+        assert_eq!(metadata.rollback_old_tip, Some(60));
+        assert_eq!(metadata.rollback_new_tip, Some(40));
+        assert_eq!(metadata.rollback_duration_ms, Some(123));
     }
 }

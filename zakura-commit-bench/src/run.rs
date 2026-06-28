@@ -35,13 +35,14 @@ use crate::{
     mode::RunMode,
     range::{parse_network, plan_checkpoint_range},
     roots::parse_cached_roots,
-    state_dir::{check_state_dir_not_used, exact_fetch_command, mark_used},
+    state_dir::{check_state_dir_not_used, exact_fetch_command, mark_rollback_success, mark_used},
     stats::Stats,
 };
 
 /// Cadence of the off-hot-path frontier read in `coalesced` mode (matches the
 /// sequencer's `CHECKPOINT_FRONTIER_REFRESH_INTERVAL`).
 const COALESCED_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_HEADER_ROOT_PRELOAD_CHUNK: usize = 4_000;
 
 /// Where the post-commit frontier read happens relative to the apply slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -74,7 +75,7 @@ pub struct RunArgs {
     pub concurrency: usize,
 
     /// Number of synthetic disk-backed stream-6 peers in `apply-queue` mode.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     pub disk_peers: usize,
 
     /// Where the post-commit frontier read happens.
@@ -106,12 +107,22 @@ pub struct RunArgs {
     /// mutated by a previous benchmark run.
     #[arg(long, default_value_t = false)]
     pub allow_used_state_dir: bool,
+
+    /// Do not roll `--state-dir` back to its startup finalized tip after a
+    /// successful benchmark.
+    #[arg(long, default_value_t = false)]
+    pub no_rollback: bool,
+
+    /// Preview rollback for the startup finalized tip and exit before mutating
+    /// state.
+    #[arg(long, default_value_t = false)]
+    pub rollback_dry_run: bool,
 }
 
 pub async fn run(args: RunArgs) -> Result<()> {
     let network = parse_network(&args.network)?;
     if let Some(state_dir) = &args.state_dir {
-        check_state_dir_not_used(state_dir, args.allow_used_state_dir)?;
+        check_state_dir_not_used(state_dir, args.allow_used_state_dir, &network).await?;
     }
 
     // Install the metrics recorder before the state registers its counters, so we
@@ -135,6 +146,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         ),
         None => (zebra_state::Config::ephemeral(), false),
     };
+    let rollback_state_config = state_config.clone();
     let (mut state_service, read_state, latest_chain_tip, chain_tip_change) = zebra_state::init(
         state_config,
         &network,
@@ -164,6 +176,27 @@ pub async fn run(args: RunArgs) -> Result<()> {
     } else {
         None
     };
+
+    if args.rollback_dry_run {
+        let Some((target_height, _)) = initial_tip else {
+            println!(
+                "rollback dry run: no --state-dir was supplied, so rollback is not applicable"
+            );
+            return Ok(());
+        };
+        drop(state_service);
+        drop(read_state);
+        drop(latest_chain_tip);
+        drop(chain_tip_change);
+        preview_benchmark_rollback(
+            rollback_state_config,
+            network,
+            target_height,
+            max_checkpoint_height,
+        )
+        .await?;
+        return Ok(());
+    }
 
     // Cap the drive at the last reachable checkpoint above the anchor: the
     // verifier only commits a *complete* range to a checkpoint, so trailing
@@ -233,9 +266,14 @@ pub async fn run(args: RunArgs) -> Result<()> {
     }
 
     let state = Buffer::new(state_service, 64);
+    let rollback = (!args.no_rollback)
+        .then(|| args.state_dir.clone().zip(initial_tip))
+        .flatten();
+    let rollback_network = network.clone();
+    let rollback_state_config = rollback_state_config.clone();
 
     if matches!(args.mode, RunMode::ApplyQueue) {
-        return run_apply_queue(
+        run_apply_queue(
             args,
             network,
             state,
@@ -248,9 +286,60 @@ pub async fn run(args: RunArgs) -> Result<()> {
             max_checkpoint_height,
             recorder,
         )
-        .await;
+        .await?;
+    } else {
+        run_direct_verifier(
+            args,
+            network,
+            state,
+            read_state,
+            initial_tip,
+            blocks,
+            wait_target,
+            load_target,
+            max_checkpoint_height,
+            recorder,
+        )
+        .await?;
     }
 
+    if let Some((state_dir, target_tip)) = rollback {
+        rollback_after_success(
+            state_dir,
+            rollback_state_config,
+            rollback_network,
+            target_tip,
+            max_checkpoint_height,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_direct_verifier<StateService>(
+    args: RunArgs,
+    network: Network,
+    state: StateService,
+    read_state: zebra_state::ReadStateService,
+    initial_tip: Option<(block::Height, block::Hash)>,
+    blocks: Vec<(block::Height, Arc<block::Block>, u64)>,
+    wait_target: block::Height,
+    load_target: block::Height,
+    max_checkpoint_height: block::Height,
+    recorder: crate::metrics_rec::BenchRecorder,
+) -> Result<()>
+where
+    StateService: tower::Service<
+            zebra_state::Request,
+            Response = zebra_state::Response,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    StateService::Future: Send + 'static,
+{
     let checkpoint_verifier =
         zebra_consensus::CheckpointVerifier::new(&network, initial_tip, state);
     let verifier = Buffer::new(
@@ -365,6 +454,109 @@ pub async fn run(args: RunArgs) -> Result<()> {
     report_fast_path(&recorder, args.with_roots);
     bench_trace.shutdown().await;
     Ok(())
+}
+
+async fn preview_benchmark_rollback(
+    state_config: zebra_state::Config,
+    network: Network,
+    target_height: block::Height,
+    max_checkpoint_height: block::Height,
+) -> Result<()> {
+    let preview = tokio::task::spawn_blocking(move || {
+        let options = rollback_options(target_height, max_checkpoint_height);
+        zebra_state::preview_rollback_finalized_state(state_config, &network, options)
+    })
+    .await
+    .wrap_err("rollback dry run task failed")?;
+
+    match preview {
+        Ok(summary) => print_rollback_summary("rollback dry run", &summary),
+        Err(zebra_state::RollbackFinalizedStateError::TargetIsTip { target }) => {
+            println!(
+                "rollback dry run: finalized state is already at startup tip {}",
+                target.0
+            );
+        }
+        Err(error) => return Err(eyre!(error)).wrap_err("rollback dry run failed"),
+    }
+
+    Ok(())
+}
+
+async fn rollback_after_success(
+    state_dir: PathBuf,
+    state_config: zebra_state::Config,
+    network: Network,
+    target_tip: (block::Height, block::Hash),
+    max_checkpoint_height: block::Height,
+) -> Result<()> {
+    let target_height = target_tip.0;
+    println!(
+        "rolling back state dir {} to startup tip {}",
+        state_dir.display(),
+        target_height.0
+    );
+
+    let started = Instant::now();
+    let rollback = tokio::task::spawn_blocking(move || {
+        let options = rollback_options(target_height, max_checkpoint_height);
+        zebra_state::rollback_finalized_state(state_config, &network, options)
+    })
+    .await
+    .wrap_err("rollback task failed")?;
+    let duration = started.elapsed();
+
+    match rollback {
+        Ok(summary) => {
+            print_rollback_summary("rollback complete", &summary);
+            mark_rollback_success(
+                &state_dir,
+                target_height,
+                summary.old_tip,
+                summary.new_tip,
+                duration,
+            )?;
+        }
+        Err(zebra_state::RollbackFinalizedStateError::TargetIsTip { target }) => {
+            println!(
+                "rollback complete: finalized state is already at tip {}",
+                target.0
+            );
+            mark_rollback_success(&state_dir, target_height, target_tip, target_tip, duration)?;
+        }
+        Err(error) => {
+            return Err(eyre!(error)).wrap_err(format!(
+                "benchmark succeeded, but rollback to startup tip {} failed; state metadata remains marked used",
+                target_height.0
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn rollback_options(
+    target_height: block::Height,
+    max_checkpoint_height: block::Height,
+) -> zebra_state::RollbackFinalizedStateOptions {
+    zebra_state::RollbackFinalizedStateOptions {
+        target_height,
+        keep_rolled_back_blocks: false,
+        max_checkpoint_height: Some(max_checkpoint_height),
+    }
+}
+
+fn print_rollback_summary(label: &str, summary: &zebra_state::RollbackFinalizedStateSummary) {
+    println!("{label}:");
+    println!(
+        "  old finalized tip: height {}, hash {}",
+        summary.old_tip.0 .0, summary.old_tip.1
+    );
+    println!(
+        "  new finalized tip: height {}, hash {}",
+        summary.new_tip.0 .0, summary.new_tip.1
+    );
+    println!("  rolled-back blocks: {}", summary.rolled_back_count);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -781,34 +973,66 @@ where
         .last()
         .map(|(height, _, _)| *height)
         .expect("non-empty block range has a last block");
+    let chunk_count = header_root_preload_chunk_count(headers.len());
 
-    match state
-        .ready()
-        .await
-        .map_err(|error| {
-            let error: tower::BoxError = error.into();
-            eyre!("state service not ready for header root preload: {error}")
-        })?
-        .call(zebra_state::Request::CommitHeaderRange {
-            anchor,
-            headers,
-            body_sizes,
-            tree_aux_roots: roots,
-        })
-        .await
+    let mut anchor = anchor;
+    for (chunk_index, ((headers, body_sizes), roots)) in headers
+        .chunks(MAX_HEADER_ROOT_PRELOAD_CHUNK)
+        .zip(body_sizes.chunks(MAX_HEADER_ROOT_PRELOAD_CHUNK))
+        .zip(roots.chunks(MAX_HEADER_ROOT_PRELOAD_CHUNK))
+        .enumerate()
     {
-        Ok(zebra_state::Response::Committed(tip_hash)) => {
-            tracing::info!(
-                start = start.0,
-                end = end.0,
-                %tip_hash,
-                "preloaded header roots through CommitHeaderRange"
-            );
-            Ok(())
+        let chunk_start = roots
+            .first()
+            .map(|roots| roots.height)
+            .expect("non-empty root chunk");
+        let chunk_end = roots
+            .last()
+            .map(|roots| roots.height)
+            .expect("non-empty root chunk");
+
+        match state
+            .ready()
+            .await
+            .map_err(|error| {
+                let error: tower::BoxError = error.into();
+                eyre!("state service not ready for header root preload: {error}")
+            })?
+            .call(zebra_state::Request::CommitHeaderRange {
+                anchor,
+                headers: headers.to_vec(),
+                body_sizes: body_sizes.to_vec(),
+                tree_aux_roots: roots.to_vec(),
+            })
+            .await
+        {
+            Ok(zebra_state::Response::Committed(tip_hash)) => {
+                tracing::info!(
+                    chunk_index,
+                    start = chunk_start.0,
+                    end = chunk_end.0,
+                    %tip_hash,
+                    "preloaded header roots chunk through CommitHeaderRange"
+                );
+                anchor = tip_hash;
+            }
+            Ok(response) => bail!("unexpected CommitHeaderRange response: {response:?}"),
+            Err(error) => bail!("CommitHeaderRange root preload failed: {}", error.into()),
         }
-        Ok(response) => bail!("unexpected CommitHeaderRange response: {response:?}"),
-        Err(error) => bail!("CommitHeaderRange root preload failed: {}", error.into()),
     }
+
+    tracing::info!(
+        start = start.0,
+        end = end.0,
+        chunk_count,
+        tip_hash = %anchor,
+        "preloaded header roots through CommitHeaderRange"
+    );
+    Ok(())
+}
+
+fn header_root_preload_chunk_count(item_count: usize) -> usize {
+    item_count.div_ceil(MAX_HEADER_ROOT_PRELOAD_CHUNK)
 }
 
 /// Load cached `z_gettreestate` roots and rebuild `BlockCommitmentRoots`. Heights
@@ -1081,5 +1305,21 @@ mod tests {
             }
             other => panic!("unexpected FinalizedTip response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn header_root_preload_chunks_large_ranges_under_state_limit() {
+        assert_eq!(header_root_preload_chunk_count(0), 0);
+        assert_eq!(header_root_preload_chunk_count(4_000), 1);
+        assert_eq!(header_root_preload_chunk_count(4_001), 2);
+        assert_eq!(header_root_preload_chunk_count(10_000), 3);
+
+        let chunk_lengths: Vec<_> = (0..10_000)
+            .collect::<Vec<_>>()
+            .chunks(MAX_HEADER_ROOT_PRELOAD_CHUNK)
+            .map(<[_]>::len)
+            .collect();
+
+        assert_eq!(chunk_lengths, vec![4_000, 4_000, 2_000]);
     }
 }

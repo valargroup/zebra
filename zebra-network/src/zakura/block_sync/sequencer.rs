@@ -205,7 +205,7 @@ impl Sequencer {
         &mut self,
         height: block::Height,
         hash: block::Hash,
-        body: BufferedBlockBody,
+        mut body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
@@ -216,6 +216,10 @@ impl Sequencer {
             return AcceptOutcome::Redundant {
                 release_bytes: bytes,
             };
+        }
+
+        if next_height(self.body_download_floor) != Some(height) {
+            body = body.into_non_contiguous_backlog();
         }
 
         match self

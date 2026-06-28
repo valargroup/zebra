@@ -182,12 +182,33 @@ struct BufferedBlock {
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
     Decoded(Arc<block::Block>),
+    DecodedWithRawFramePayload {
+        block: Arc<block::Block>,
+        raw_payload: Arc<[u8]>,
+    },
 }
 
 impl BufferedBlockBody {
+    pub(super) fn raw_and_decoded(
+        block: Arc<block::Block>,
+        raw_payload: Arc<[u8]>,
+    ) -> BufferedBlockBody {
+        BufferedBlockBody::DecodedWithRawFramePayload { block, raw_payload }
+    }
+
+    pub(super) fn into_non_contiguous_backlog(self) -> BufferedBlockBody {
+        match self {
+            BufferedBlockBody::DecodedWithRawFramePayload { raw_payload, .. } => {
+                BufferedBlockBody::RawFramePayload(raw_payload)
+            }
+            body => body,
+        }
+    }
+
     fn into_block(self) -> Arc<block::Block> {
         match self {
             BufferedBlockBody::Decoded(block) => block,
+            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
             BufferedBlockBody::RawFramePayload(payload) => {
                 let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
                 Arc::new(

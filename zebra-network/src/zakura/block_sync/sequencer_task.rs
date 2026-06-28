@@ -26,12 +26,6 @@ use super::{
     *,
 };
 
-/// How often the Sequencer task checks whether the byte budget is starving the
-/// commit-unblocking (lowest pending) height and sheds the speculative top of the
-/// reorder buffer to fund it. Bounds the recovery latency when no bodies are
-/// flowing to trigger the inline check (e.g. once outstanding requests drain).
-const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
-
 #[derive(Copy, Clone, Debug)]
 enum ReadySource {
     Control,
@@ -63,14 +57,13 @@ impl ReadySource {
 
 /// Favor the lowest needed height over the speculative high tail.
 ///
-/// While the byte budget cannot fund even one worst-case request yet the lowest
-/// needed height (pending or outstanding) sits *below* the highest buffered body,
-/// drop that top body: release its bytes to the budget and return its height to
-/// `pending` (it was held, hence in `work.in_flight` per the `held ⟺ in_flight`
-/// invariant) for later re-fetch. Because another top can always be shed, a low
-/// retry never blocks on budget; the floor can never wedge behind a full buffer,
-/// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. Returns whether it shed anything.
+/// When a floor reservation cannot be funded, and the lowest needed height
+/// (pending or outstanding) sits *below* the highest buffered body, drop that top
+/// body: release its bytes to the budget and return its height to `pending` (it
+/// was held, hence in `work.in_flight` per the `held ⟺ in_flight` invariant) for
+/// later re-fetch. The floor requester calls this synchronously through
+/// [`SequencerControlInput::FundFloorReservation`], so the rescue path is
+/// demand-driven instead of timer-driven. Returns whether it shed anything.
 pub(super) fn shed_top_until_available(
     budget: &mut ByteBudget,
     work: &WorkQueue,
@@ -106,19 +99,6 @@ pub(super) fn shed_top_until_available(
         shed_any = true;
     }
     shed_any
-}
-
-pub(super) fn shed_top_for_floor_starvation(
-    budget: &mut ByteBudget,
-    work: &WorkQueue,
-    sequencer: &mut Sequencer,
-) -> bool {
-    shed_top_until_available(
-        budget,
-        work,
-        sequencer,
-        super::config::BS_PER_BLOCK_WORST_CASE_BYTES,
-    )
 }
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
@@ -308,16 +288,9 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
-        // Periodic shed backstop: catches budget starvation of the floor even when
-        // no sequencer inputs are arriving to trigger the inline checks. (The
-        // download-side backstops are retained by the scoped apply-side change; only
-        // the 200 ms checkpoint-frontier poll and the apply-window were removed.)
-        let mut shed_tick = tokio::time::interval(FLOOR_STARVATION_SHED_INTERVAL);
-        shed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.publish_view();
-        // Track input closure explicitly: the always-ready shed timer means the
-        // `select!` never falls through to an `else`, so shut down only once both
-        // input channels have closed.
+        // Track input closure explicitly so each channel can close independently
+        // while the task continues draining the other.
         let mut control_open = true;
         let mut body_open = true;
         loop {
@@ -345,15 +318,6 @@ impl SequencerTask {
                     match body {
                         Some(body) => self.process_body_input(body).await,
                         None => body_open = false,
-                    }
-                }
-                _ = shed_tick.tick() => {
-                    if shed_top_for_floor_starvation(
-                        &mut self.budget,
-                        &self.work,
-                        &mut self.sequencer,
-                    ) {
-                        self.publish_view();
                     }
                 }
             }
@@ -428,7 +392,6 @@ impl SequencerTask {
     async fn process_body_input(&mut self, body: SequencedBody) {
         self.release_body_input_bytes(body.bytes);
         self.handle_accept_body(body).await;
-        shed_top_for_floor_starvation(&mut self.budget, &self.work, &mut self.sequencer);
         self.publish_view();
     }
 

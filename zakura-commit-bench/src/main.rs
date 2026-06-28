@@ -20,6 +20,7 @@ mod run;
 mod snapshot;
 mod state_dir;
 mod stats;
+mod status;
 mod validate_cache;
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -44,6 +45,8 @@ enum Command {
     Run(run::RunArgs),
     /// Validate a contiguous cached block range before replaying it.
     ValidateCache(validate_cache::ValidateArgs),
+    /// Discover local snapshots, caches, and traces.
+    Status(status::StatusArgs),
 }
 
 #[tokio::main]
@@ -64,5 +67,20 @@ async fn main() -> Result<()> {
         Command::Fetch(args) => fetch::run(args).await,
         Command::Run(args) => run::run(args).await,
         Command::ValidateCache(args) => validate_cache::run(args).await,
+        Command::Status(args) => status::run(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_disk_peers_default_is_four() {
+        let cli = Cli::parse_from(["zakura-commit-bench", "run"]);
+        let Command::Run(args) = cli.command else {
+            panic!("run command parsed");
+        };
+        assert_eq!(args.disk_peers, 4);
     }
 }

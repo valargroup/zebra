@@ -31,6 +31,7 @@ from `z_gettreestate`, then preloads them through the production
 
 ```bash
 cargo xtask zakura-commit-bench -- snapshot   # → ~/.zakura/snapshots/<name>, prints --state-dir
+cargo xtask zakura-commit-bench -- status
 ```
 
 Downloads (resumable; `aria2c` if present, else `curl -C -`), checksum-verifies,
@@ -51,14 +52,30 @@ cargo xtask zakura-commit-bench -- run \
   --state-dir ~/.zakura/snapshots/<name> --blocks 800 \
   --cache-dir target/zakura-commit-bench/blocks \
   --with-roots \
-  --disk-peers 1 \
+  --disk-peers 4 \
   --trace-dir target/zakura-commit-bench/traces
 ```
 
 `--with-roots` requires one `*.roots.json` file per replayed block and currently
 requires `--state-dir`, because the header-root preload anchors above the
 snapshot finalized tip. The summary's `VCT fast path: N hit / M miss` line
-verifies whether the roots engaged.
+verifies whether the roots engaged. After a successful hydrated run,
+`zakura-commit-bench` rolls the state dir back to its startup finalized tip and
+marks `.zakura-commit-bench.json` reusable. Failed or interrupted runs leave the
+state marked used for debugging. Pass `--no-rollback` to keep the mutated state,
+or `--rollback-dry-run` to check rollback access without running the benchmark.
+
+`status` discovers local artifacts in this order:
+
+- explicit `--state-dir` and `--cache-dir` paths,
+- `ZAKURA_COMMIT_BENCH_ARTIFACT_ROOTS` colon-separated roots,
+- repo-local `target/zakura-commit-bench`,
+- `$HOME/.zakura/snapshots`,
+- Valar-local roots under `/home/evan/src/valar/experiments/commit-bench` and
+  `/home/evan/src/valar/art/debug/benchmark/glue`.
+
+Use `status --deep` when you need current DB tips; plain `status` avoids opening
+RocksDB and reports metadata, archives, caches, roots sidecars, and traces.
 
 ## 1. Fetch real blocks (once, cached)
 
@@ -138,8 +155,12 @@ cargo xtask zakura-commit-bench -- run \
   --blocks 800 \
   --cache-dir target/zakura-commit-bench/blocks \
   --with-roots \
-  --disk-peers 1
+  --disk-peers 4
 ```
+
+The default `--disk-peers` is `4`; `--disk-peers 0` is invalid. Each peer is a
+real outbound block-sync service peer over in-memory stream-6 channels, backed
+by the cached block files.
 
 ### `--frontier-read` is the A/B knob for the coalesce change
 

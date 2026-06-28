@@ -229,6 +229,29 @@ fn p2p_v2_unknown_future_config_fields_are_rejected() {
 }
 
 #[test]
+fn p2p_v2_block_sync_config_validation_rejects_degenerate_values() {
+    let _init_guard = zebra_test::init();
+
+    let err = toml::from_str::<Config>(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 0
+        "#,
+    )
+    .expect_err("top-level config deserialization validates block-sync settings");
+
+    let err = err.to_string();
+    assert!(
+        err.contains("invalid zakura.block_sync config"),
+        "unexpected error for invalid block-sync config: {err}",
+    );
+    assert!(
+        err.contains("max_inflight_block_bytes must be greater than zero"),
+        "unexpected validation reason for invalid block-sync config: {err}",
+    );
+}
+
+#[test]
 fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     let _init_guard = zebra_test::init();
 
