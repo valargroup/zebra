@@ -26,8 +26,8 @@ pub struct Config {
     ///
     /// Disabling this option makes Zebra start full validation earlier.
     /// It is slower and less secure.
-    /// To keep checkpoint sync enabled but force-disable the initial VCT fast-sync rollout, use
-    /// [`disable_vct_fast_sync`](Self::disable_vct_fast_sync) instead.
+    /// To keep checkpoint sync enabled but opt out of the initial VCT fast-sync rollout, set
+    /// [`vct_fast_sync`](Self::vct_fast_sync) to `false`.
     ///
     /// Zebra requires some checkpoints to simplify validation of legacy network upgrades.
     /// Required checkpoints are always active, even when this option is `false`.
@@ -38,26 +38,26 @@ pub struct Config {
     /// release.
     pub checkpoint_sync: bool,
 
-    /// Force-disable the verified-commitment-trees fast sync path during its initial rollout.
+    /// Use the verified-commitment-trees fast sync path during its initial rollout.
     ///
-    /// This keeps [`checkpoint_sync`](Self::checkpoint_sync) enabled while forcing the legacy
-    /// per-block Sapling/Orchard tree recompute in both Archive and Pruned storage modes. Set to
-    /// `false` by default: checkpoint sync uses VCT fast sync on networks with embedded handoff
-    /// frontiers.
-    pub disable_vct_fast_sync: bool,
+    /// `true` by default: checkpoint sync folds in verified Sapling/Orchard roots and skips the
+    /// per-block tree recompute on networks with embedded handoff frontiers. Set to `false` to
+    /// keep [`checkpoint_sync`](Self::checkpoint_sync) enabled while forcing the legacy per-block
+    /// recompute in both Archive and Pruned storage modes.
+    pub vct_fast_sync: bool,
 }
 
 impl From<InnerConfig> for Config {
     fn from(
         InnerConfig {
             checkpoint_sync,
-            disable_vct_fast_sync,
+            vct_fast_sync,
             ..
         }: InnerConfig,
     ) -> Self {
         Self {
             checkpoint_sync,
-            disable_vct_fast_sync,
+            vct_fast_sync,
         }
     }
 }
@@ -66,12 +66,12 @@ impl From<Config> for InnerConfig {
     fn from(
         Config {
             checkpoint_sync,
-            disable_vct_fast_sync,
+            vct_fast_sync,
         }: Config,
     ) -> Self {
         Self {
             checkpoint_sync,
-            disable_vct_fast_sync,
+            vct_fast_sync,
             _debug_skip_parameter_preload: false,
         }
     }
@@ -88,7 +88,7 @@ pub struct InnerConfig {
     pub checkpoint_sync: bool,
 
     /// See [`Config`] for more details.
-    pub disable_vct_fast_sync: bool,
+    pub vct_fast_sync: bool,
 
     #[serde(skip_serializing, rename = "debug_skip_parameter_preload")]
     /// Unused config field for backwards compatibility.
@@ -102,7 +102,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             checkpoint_sync: true,
-            disable_vct_fast_sync: false,
+            vct_fast_sync: true,
         }
     }
 }
@@ -111,7 +111,7 @@ impl Default for InnerConfig {
     fn default() -> Self {
         Self {
             checkpoint_sync: Config::default().checkpoint_sync,
-            disable_vct_fast_sync: Config::default().disable_vct_fast_sync,
+            vct_fast_sync: Config::default().vct_fast_sync,
             _debug_skip_parameter_preload: false,
         }
     }
@@ -122,19 +122,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disable_vct_fast_sync_defaults_false_and_converts_through_inner_config() {
-        assert!(!Config::default().disable_vct_fast_sync);
+    fn vct_fast_sync_defaults_true_and_converts_through_inner_config() {
+        assert!(Config::default().vct_fast_sync);
 
         let force_disabled = Config::from(InnerConfig {
             checkpoint_sync: true,
-            disable_vct_fast_sync: true,
+            vct_fast_sync: false,
             _debug_skip_parameter_preload: false,
         });
 
         assert!(force_disabled.checkpoint_sync);
-        assert!(force_disabled.disable_vct_fast_sync);
+        assert!(!force_disabled.vct_fast_sync);
 
         let inner = InnerConfig::from(force_disabled);
-        assert!(inner.disable_vct_fast_sync);
+        assert!(!inner.vct_fast_sync);
     }
 }

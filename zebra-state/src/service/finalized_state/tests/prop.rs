@@ -1345,7 +1345,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             }
 
             let manual_config = Config {
-                disable_vct_fast_sync: true,
+                vct_fast_sync: false,
                 ..fast_config
             };
             let mut manual = FinalizedState::new(&manual_config, &network, #[cfg(feature = "elasticsearch")] false);
@@ -1368,7 +1368,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             let manual_prefix_config = Config {
                 cache_dir: manual_to_fast_dir.path().to_path_buf(),
                 ephemeral: false,
-                disable_vct_fast_sync: true,
+                vct_fast_sync: false,
                 ..Config::default()
             };
             {
@@ -1382,7 +1382,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             }
 
             let fast_suffix_config = Config {
-                disable_vct_fast_sync: false,
+                vct_fast_sync: true,
                 ..manual_prefix_config
             };
             let mut fast_suffix = FinalizedState::new(&fast_suffix_config, &network, #[cfg(feature = "elasticsearch")] false);

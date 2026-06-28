@@ -16,13 +16,10 @@
 //! on the byte budget + per-peer slots: `take_in_range(servable_low,
 //! servable_high, n)` uses `servable_high` as the upper bound.
 //!
-//! The download logic is **moved, not rewritten** from the previous reactor: the
-//! want-work fill loop ports `fill_peer`, the matched-body tail ports
-//! `handle_block`, and the unmatched fallthroughs port `accept_unmatched_queued_body`
-//! / the `ignore_*` helpers / `stale_adjusted_outstanding_disposition` verbatim,
-//! changing only where the state lives (now routine-local or the
-//! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
-//! task's own `FramedRecv` rather than a `PeerInput` channel.
+//! All per-peer download state lives routine-local or in the shared
+//! [`PeerRegistry`], and inbound traffic arrives as decoded frames from this
+//! task's own `FramedRecv`: a want-work fill loop, the matched-body tail, and the
+//! unmatched-body fallthroughs all run in this one task.
 
 use std::collections::BTreeMap;
 
@@ -60,11 +57,10 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 /// (RangeUnavailable / timeout / send-failure / disconnect-retry) before it will
 /// contest that height again. The window only has to be long enough that, on the
 /// single-threaded test runtime, the other routines woken by the same failure
-/// `return_items` get a chance to take the contested work first — it is the
-/// peer-local retry bias the central `fill_rotation_cursor` used to provide
-///. It is
-/// negligible against real sync timescales, and the height stays `pending` and
-/// fully contestable by every other peer throughout.
+/// `return_items` get a chance to take the contested work first — a peer-local
+/// bias away from work this routine just failed. It is negligible against real
+/// sync timescales, and the height stays `pending` and fully contestable by every
+/// other peer throughout.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -81,8 +77,7 @@ fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
     );
 }
 
-/// Outcome classification for finishing an outstanding request (ported verbatim
-/// from the reactor's `OutstandingRangeDisposition`).
+/// Outcome classification for finishing an outstanding request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Disposition {
     Satisfied,
@@ -119,13 +114,13 @@ pub(super) struct PeerRoutine {
     /// registry for the reactor's serving-side reads).
     max_blocks_per_response: u32,
     max_response_bytes: u32,
-    /// Rate meter for sending our `Status` reply to this peer's inbound `Status`
-    /// (the previous `unsolicited` meter; the reply decision is routine-local now,
-    /// the actual send stays reactor-side via `RoutineToReactor::StatusReceived`).
+    /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
+    /// The reply decision is routine-local; the actual send stays reactor-side via
+    /// `RoutineToReactor::StatusReceived`.
     status_reply_meter: super::state::RateMeter,
-    /// Rate meter gating how often this peer's `Status` frames are applied at all
-    /// (the previous `inbound_status` meter), so a status flood cannot spin the
-    /// routine. A status that grows the servable range bypasses the meter.
+    /// Rate meter gating how often this peer's `Status` frames are applied at all,
+    /// so a status flood cannot spin the routine. A status that grows the servable
+    /// range bypasses the meter.
     inbound_status_meter: super::state::RateMeter,
     /// Heights this routine recently returned on a failure, mapped to the instant
     /// after which it may re-take them. While avoided, the routine leaves the
@@ -195,8 +190,7 @@ impl PeerRoutine {
         );
         // Defer the first Status reply: the reactor already sends a connect-status
         // on `PeerConnected`, so the peer's first inbound `Status` should not also
-        // trigger an immediate reply (matches the previous `peer_connected`
-        // `unsolicited.mark_taken`).
+        // trigger an immediate reply.
         let mut status_reply_meter = status_reply_meter;
         status_reply_meter.mark_taken(Instant::now());
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
@@ -234,7 +228,7 @@ impl PeerRoutine {
 
     /// Run the pipe-routine until stream close, cancellation, or a protocol
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
-    /// pipe tears the whole connection down, matching the previous `run_peer`.
+    /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
@@ -243,7 +237,7 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
-        // The per-connection oversize guard the previous pipe applied at ingress.
+        // The per-connection oversize guard applied to inbound frames at ingress.
         let mut guard = block_sync_guard();
         loop {
             // missed-wake safety: register both `Notify`s via
@@ -276,9 +270,8 @@ impl PeerRoutine {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
-                        // the supervised pipe cancels the connection (matches the
-                        // previous `run_peer` reject path); the `Drop` guard returns
-                        // unreceived work on the way out.
+                        // the supervised pipe cancels the connection; the `Drop`
+                        // guard returns unreceived work on the way out.
                         Some(frame) => self.handle_frame(&mut guard, frame).await?,
                         // Stream closed (peer gone): exit cleanly. `Drop` returns
                         // unreceived outstanding heights and releases their budget.
@@ -342,9 +335,8 @@ impl PeerRoutine {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection (matches the previous
-                    // `run_peer` decode-error path). Report via the shared channel,
-                    // then reject; the report is best-effort and never blocks.
+                    // protocol reject for the whole connection. Report via the shared
+                    // channel, then reject; the report is best-effort and never blocks.
                     let protocol_error =
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
                     tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
@@ -410,9 +402,8 @@ impl PeerRoutine {
 
     /// Apply this peer's `Status` locally (servable range, caps, `received_status`)
     /// and into the registry, then ping the reactor to advertise our reply and
-    /// republish the candidate. Ports the reactor's previous `handle_status`
-    /// validate / rate-meter / upsert; the servable read for want-work is now this
-    /// routine's own fields.
+    /// republish the candidate. Runs the validate / rate-meter / upsert; the
+    /// servable read for want-work is this routine's own fields.
     fn handle_status(&mut self, status: BlockSyncStatus) {
         if status.servable_low > status.servable_high {
             let _ = self
@@ -520,29 +511,26 @@ impl PeerRoutine {
     // ===================== want-work fill loop (ports `fill_peer`) ===========
 
     /// Fill this peer's available slots in a single pass, letting the byte budget
-    /// (re-checked each iteration via `try_reserve`) be the congestion window.
-    /// Ported from the reactor's `fill_peer`; the only changes are where the
-    /// per-peer state lives (now routine-local / the registry) and the handles.
+    /// (re-checked each iteration via `try_reserve`) be the congestion window. The
+    /// per-peer state is routine-local / in the registry.
     ///
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) {
         // Reconcile the adaptive window's hard cap with the peer's currently
         // advertised `max_inflight_requests` (it may have grown/shrunk via a
-        // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
-        // the previous `handle_status` clamp of the window / recovery slots to the
-        // new hard capacity.
+        // `Status`; `handle_status` set `window.max_inflight_requests`), clamping
+        // the window / recovery slots to the new hard capacity.
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
         self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
         // GC this routine's own fully-covered outstanding requests: when the
         // download floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
-        // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* covered requests, never a fetch
-        // throttle — it replaces the previous reactor `drop_outstanding_through`
-        // without the cross-peer churn the spec warned about (a partially-received
-        // request whose suffix is still above the floor is left in place).
+        // than waiting for the request's own timeout. This GCs *our own* covered
+        // requests; it is never a fetch throttle and never churns other peers (a
+        // partially-received request whose suffix is still above the floor is left
+        // in place).
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
@@ -830,8 +818,7 @@ impl PeerRoutine {
         }
     }
 
-    /// Refill low-water mark in blocks (ported from the reactor's
-    /// `refill_low_water_blocks`, but for a single peer's caps).
+    /// Refill low-water mark in blocks, computed from a single peer's caps.
     fn refill_low_water_blocks(&self) -> usize {
         let max_blocks_per_response =
             usize::try_from(self.config.advertised_max_blocks_per_response()).unwrap_or(usize::MAX);
@@ -1143,11 +1130,10 @@ impl PeerRoutine {
         self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
     }
 
-    /// Ported from the reactor's `accept_unmatched_queued_body`, minus the
-    /// disconnected-peer branch (a routine only runs for a live peer): a queued
-    /// height served by a peer that lost its original requester returns to the
-    /// queue. The routine reserves the body's actual size, claims the height into
-    /// `in_flight`, and forwards it.
+    /// Accept a queued body whose original requester is gone (a routine only runs
+    /// for a live peer, so there is no disconnected-peer branch): the routine
+    /// reserves the body's actual size, claims the height into `in_flight`, and
+    /// forwards it.
     async fn accept_unmatched_queued_body(
         &mut self,
         height: block::Height,
@@ -1291,8 +1277,7 @@ impl PeerRoutine {
         // We reach this only when *this* peer has no outstanding request starting
         // at `start_height`; the registry answers whether another peer is actively
         // requesting a range covering it (cross-peer fanout/retry race), in which
-        // case the terminator is dropped quietly rather than scored. A faithful
-        // (slightly wider) superset of the previous start-keyed check.
+        // case the terminator is dropped quietly rather than scored.
         if !self.registry.has_outstanding_height(start_height) {
             return false;
         }
@@ -1313,11 +1298,11 @@ impl PeerRoutine {
     /// raced ahead of the producer's asynchronous `work.extend`. The peer asked
     /// for and served this range honestly, so scoring it the *hard*
     /// `UnsolicitedBlock`/`UnsolicitedDone` (immediate, thresholdless disconnect)
-    /// would churn honest peers on every reorg. The previous serial reactor
-    /// avoided this by dropping outstanding in the same loop turn as the reset;
-    /// the Sequencer-task split (Sequencer task) made that drop asynchronous, opening this
-    /// window — restore the no-churn property by dropping the response quietly. A
-    /// response *outside* the peer's advertised range is still scored.
+    /// would churn honest peers on every reorg. The reset that drops outstanding
+    /// runs on the Sequencer task asynchronously, so an honest in-flight response
+    /// can arrive after its `outstanding` entry is gone — drop it quietly to keep
+    /// the no-churn property. A response *outside* the peer's advertised range is
+    /// still scored.
     fn ignore_servable_range_response(&self, height: block::Height, response_kind: &str) -> bool {
         if !self.received_status || height <= self.download_floor() || height > self.servable_high {
             return false;
@@ -1380,9 +1365,8 @@ impl PeerRoutine {
         self.finish_outstanding_at(index, disposition);
     }
 
-    /// Ported from the reactor's `stale_adjusted_outstanding_disposition`: a late
-    /// response can still match after the floor moved through its prefix; mark
-    /// the stale prefix satisfied and retry only the remaining suffix.
+    /// A late response can still match after the floor moved through its prefix;
+    /// mark the stale prefix satisfied and retry only the remaining suffix.
     fn stale_adjusted_disposition(&mut self, index: usize, current: Disposition) -> Disposition {
         let tip = self.download_floor();
         let Some(outstanding) = self.window.outstanding.get_mut(index) else {
@@ -1455,7 +1439,7 @@ impl PeerRoutine {
     /// Publish this peer's current *unreceived* in-flight height metadata to the
     /// registry, so the producer's `!has_outstanding_request` filter and the
     /// low-water `total_unreceived` gate read the same per-request-granularity
-    /// count the previous reactor used (`expected_blocks.len() − received.len()`).
+    /// count (`expected_blocks.len() − received.len()`).
     /// Received-but-uncommitted heights are excluded here because they are held in
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
@@ -1553,9 +1537,9 @@ impl PeerRoutine {
         });
     }
 
-    /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
-    /// now emitted in the routine that decoded it). Records the message kind only;
-    /// the per-variant field detail lives on the reactor's heavier trace path.
+    /// Trace a decoded inbound message in the routine that decoded it. Records the
+    /// message kind only; the per-variant field detail lives on the reactor's
+    /// heavier trace path.
     fn trace_message_received(&self, msg: &BlockSyncMessage) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
             row.insert(

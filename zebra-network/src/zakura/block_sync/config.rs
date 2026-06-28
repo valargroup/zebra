@@ -76,8 +76,6 @@ pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// Default central floor-watchdog cadence.
-pub const DEFAULT_BS_FLOOR_WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
 /// Default block-sync status refresh interval reserved for later advertisement.
@@ -176,9 +174,6 @@ pub struct ZakuraBlockSyncConfig {
     pub max_reorder_lookahead_bytes: u64,
     /// Maximum speculative body heights tracked above the download floor.
     pub max_reorder_lookahead_blocks: u32,
-    /// Cadence for the central floor watchdog that rescues expired floor claims.
-    #[serde(with = "humantime_serde")]
-    pub floor_watchdog_tick: Duration,
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]
     pub floor_peer_avoid_cooldown: Duration,
@@ -218,7 +213,6 @@ impl Default for ZakuraBlockSyncConfig {
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
             max_reorder_lookahead_bytes: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
             max_reorder_lookahead_blocks: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
-            floor_watchdog_tick: DEFAULT_BS_FLOOR_WATCHDOG_TICK,
             floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
@@ -256,13 +250,6 @@ impl ZakuraBlockSyncConfig {
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
         self.max_reorder_lookahead_bytes
             .min(self.max_inflight_block_bytes)
-    }
-
-    /// Return the watchdog tick clamped to a positive duration no larger than the request timeout.
-    pub fn effective_floor_watchdog_tick(&self) -> Duration {
-        self.floor_watchdog_tick
-            .min(self.request_timeout)
-            .max(Duration::from_millis(1))
     }
 
     /// Return the floor avoid cooldown clamped to a positive duration.

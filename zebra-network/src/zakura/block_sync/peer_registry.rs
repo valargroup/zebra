@@ -51,9 +51,8 @@ pub(super) struct Entry {
     /// reject-rollback window.
     pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
     /// Routine-published slot diagnostics (trace only): the per-peer download
-    /// window state the reactor used to read off `PeerBlockState` for the periodic
-    /// `BLOCK_SYNC_STATE` row. Updated whenever the routine issues/finishes/times
-    /// out a request.
+    /// window state the reactor reads for the periodic `BLOCK_SYNC_STATE` row.
+    /// Updated whenever the routine issues/finishes/times out a request.
     pub(super) slots: SlotDiagnostics,
     /// Heights this peer may not re-take until the given instant.
     pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
@@ -426,6 +425,20 @@ impl PeerRegistry {
         (servable, outstanding)
     }
 
+    /// The soonest deadline among all peer claims for one height, if any. Lets the
+    /// reactor arm its floor watchdog to the exact expiry without allocating a
+    /// claim snapshot on every loop iteration.
+    pub(super) fn earliest_outstanding_deadline_at(
+        &self,
+        height: block::Height,
+    ) -> Option<Instant> {
+        let peers = self.lock();
+        peers
+            .values()
+            .filter_map(|entry| entry.outstanding.get(&height).map(|meta| meta.deadline))
+            .min()
+    }
+
     /// Snapshot all peer claims for one height.
     pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
         let peers = self.lock();
@@ -502,7 +515,7 @@ pub(super) struct DirectionStatusCounts {
 }
 
 /// Hard outbound concurrency ceiling for a peer with the given advertised
-/// in-flight cap (the routine's slot bound; mirrors `PeerBlockState`).
+/// in-flight cap (the routine's slot bound).
 pub(super) fn hard_outbound_capacity(max_inflight_requests: u32) -> usize {
     usize::try_from(max_inflight_requests)
         .expect("u32 max inflight requests fits in usize on supported targets")

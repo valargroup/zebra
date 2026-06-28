@@ -33,7 +33,7 @@ mandatory-roots rule on _ranged_ requests does not starve the tip.
 1. **`zebra-state` proptest `service::finalized_state::tests::prop::vct_frozen_frontier_survives_reopen`.**
    Panics at `finalized_state.rs:551`: "database was previously synced in verified
    commitment tree mode ... fast path ... is disabled. Set `consensus.checkpoint_sync = true`
-   and `consensus.disable_vct_fast_sync = false`...". This is #254's VCT fast-sync resume
+   and `consensus.vct_fast_sync = true`...". This is #254's VCT fast-sync resume
    gate; the proptest reopen config doesn't satisfy the resume preconditions. Verified to
    fail identically on the base branch. Relies on later VCT-resume wiring → flup.
 

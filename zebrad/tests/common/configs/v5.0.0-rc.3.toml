@@ -42,7 +42,7 @@
 
 [consensus]
 checkpoint_sync = true
-disable_vct_fast_sync = false
+vct_fast_sync = true
 
 [health]
 enforce_on_test_networks = false
@@ -91,7 +91,6 @@ stream_open_rate_per_second = 16
 [network.zakura.block_sync]
 fanout = 1
 floor_peer_avoid_cooldown = "8s"
-floor_watchdog_tick = "1s"
 initial_inflight_requests = 64
 max_blocks_per_response = 1
 max_inflight_block_bytes = 2147483648
