@@ -1,6 +1,6 @@
 use super::{config::*, events::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    cause, handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -381,7 +381,7 @@ impl Service for BlockSyncService {
             peer.service_cancel_token(),
         );
         let service_cancel_token = session.cancel_token();
-        let connection_cancel_token = peer.close_handle();
+        let connection_cancel_token = peer.close();
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
@@ -421,7 +421,7 @@ impl Service for BlockSyncService {
         };
         let on_panic = {
             let connection_cancel_token = connection_cancel_token.clone();
-            move || connection_cancel_token.cancel("peer_task_panic")
+            move || connection_cancel_token.close(cause::PEER_PANIC)
         };
         // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
         // a protocol reject still cancels the whole connection via
@@ -467,7 +467,7 @@ impl Service for BlockSyncService {
                 handle_pipe_exit(
                     "block-sync",
                     &connection_cancel_token,
-                    "block_sync_protocol_reject",
+                    cause::BLOCK_REJECT,
                     result,
                 );
             }

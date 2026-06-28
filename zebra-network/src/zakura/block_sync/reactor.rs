@@ -1724,6 +1724,13 @@ impl BlockSyncReactor {
         });
     }
 
+    fn trace_peer_violation(&self, peer: &ZakuraPeerId, reason: BlockSyncMisbehavior) {
+        self.emit_trace(bs_trace::BLOCK_PEER_VIOLATION, |row| {
+            bs_insert_peer(row, bs_trace::PEER, peer);
+            bs_insert_str(row, bs_trace::REASON, block_misbehavior_label(reason));
+        });
+    }
+
     fn trace_message_sent(
         &self,
         peer: &ZakuraPeerId,
@@ -1956,6 +1963,7 @@ impl BlockSyncReactor {
         // Misbehavior is record-only: trace and forward it, but never cancel the
         // session. Peer scoring no longer drives disconnects.
         metrics::counter!("sync.block.peer.violation").increment(1);
+        self.trace_peer_violation(&peer, reason);
         // The Misbehavior action carries the violation to the driver as a record.
         // Deliver it without ever blocking the reactor: awaiting a full `actions`
         // channel here was the backpressure stall that delayed request timeouts and

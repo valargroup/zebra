@@ -323,7 +323,7 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_connection_cancel_service_token(
+            service.add_peer(Peer::new_with_close_service_token(
                 peer_id.clone(),
                 remote_ip,
                 negotiated,
@@ -366,7 +366,7 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_connection_cancel_service_token(
+            service.add_peer(Peer::new_with_close_service_token(
                 peer_id.clone(),
                 remote_ip,
                 negotiated,

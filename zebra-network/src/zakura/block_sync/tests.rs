@@ -17,6 +17,7 @@ use super::{
     sequencer::*,
     state::*,
 };
+use crate::zakura::testkit::{TraceCapture, TraceValue};
 use crate::zakura::{
     framed_channel, ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange,
     FrontierUpdate, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
@@ -3514,7 +3515,10 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     // and the connection-cancel.
     let config = ZakuraBlockSyncConfig::default();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
+    let mut capture =
+        TraceCapture::for_test("add_peer_decode_failure_reports_malformed_and_cancels_connection")
+            .unwrap();
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -3524,6 +3528,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         tip_rx,
         config.clone(),
     );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (handle, mut actions, _reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
@@ -3567,6 +3572,20 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
         .await
         .expect("malformed frame cancels the connection");
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    let block_sync = reader.table(BLOCK_SYNC_TABLE.table());
+    let peer_label = trace_peer_label(&peer);
+    block_sync.assert_row(
+        bs_trace::BLOCK_PEER_VIOLATION,
+        &[
+            (bs_trace::PEER, TraceValue::Str(&peer_label)),
+            (bs_trace::REASON, TraceValue::Str("malformed_message")),
+        ],
+    );
+
+    let _ = capture.finish().await.unwrap();
 }
 
 #[tokio::test]

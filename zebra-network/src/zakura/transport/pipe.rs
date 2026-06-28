@@ -17,7 +17,7 @@ use std::future::Future;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{ConnectionCancel, Frame, FramedRecv, SinkReject};
+use super::{Close, Frame, FramedRecv, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
 use crate::zakura::ZakuraPeerId;
 
@@ -401,7 +401,7 @@ pub(crate) fn spawn_supervised_peer_task(
 /// Map a finished pipe run to its connection-teardown effect — the single place
 /// the "is this exit fatal to the whole connection?" decision lives.
 ///
-/// A protocol reject is fatal: it cancels the shared `connection_cancel` token so
+/// A protocol reject is fatal: it closes the shared `connection_cancel` handle so
 /// the whole connection tears down. A local reject (e.g. a closed service queue)
 /// tears down only this stream — the per-service token is already cancelled by
 /// the [`PipeTeardown`] — so it is logged and the connection is left for other
@@ -410,7 +410,7 @@ pub(crate) fn spawn_supervised_peer_task(
 /// `Result` to inspect.
 pub(crate) fn handle_pipe_exit(
     service: &'static str,
-    connection_cancel: &ConnectionCancel,
+    connection_cancel: &Close,
     protocol_reject_reason: &'static str,
     result: Result<(), SinkReject>,
 ) {
@@ -422,7 +422,7 @@ pub(crate) fn handle_pipe_exit(
                 service,
                 "Zakura stream rejected protocol-invalid frame"
             );
-            connection_cancel.cancel(protocol_reject_reason);
+            connection_cancel.close(protocol_reject_reason);
         }
         Err(SinkReject::Local(error)) => {
             tracing::debug!(?error, service, "Zakura stream stopped on local error");

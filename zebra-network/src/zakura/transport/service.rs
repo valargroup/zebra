@@ -23,31 +23,70 @@ use super::Frame;
 /// Boxed future returned by object-safe stream handlers.
 pub type BoxRunFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Shared per-connection cancellation handle with a bounded first-cause label.
-#[derive(Clone, Debug)]
-pub(crate) struct ConnectionCancel {
-    token: CancellationToken,
-    reason: Arc<Mutex<Option<&'static str>>>,
+/// Bounded connection close-cause labels written to conn.jsonl.
+pub(crate) mod cause {
+    pub const CANCELLED: &str = "cancelled";
+    pub const SHUTDOWN: &str = "shutdown";
+    pub const IDLE_TIMEOUT: &str = "idle_timeout";
+    pub const ACCEPT_FAILED: &str = "accept_failed";
+    pub const OUTBOUND_CLOSED: &str = "outbound_closed";
+    pub const BAD_RESPONSE: &str = "bad_response";
+
+    pub const MANUAL_DISCONNECT: &str = "manual_disconnect";
+    pub const DUPLICATE_EVICTED: &str = "duplicate_evicted";
+    pub const RESOURCE_STREAMS: &str = "resource_streams";
+    pub const RESOURCE_QUEUE: &str = "resource_queue";
+    pub const SETUP_FAILED: &str = "setup_failed";
+
+    pub const UNEXPECTED_STREAM: &str = "unexpected_stream";
+    pub const DUPLICATE_STREAM: &str = "duplicate_stream";
+    pub const UNEXPECTED_REQ_ID: &str = "unexpected_request_id";
+    pub const REQUEST_WITHOUT_ID: &str = "request_without_id";
+
+    pub const FRAME_TIMEOUT: &str = "frame_timeout";
+    pub const FRAME_OVERSIZE: &str = "frame_oversize";
+    pub const MSG_OVERSIZE: &str = "msg_oversize";
+    pub const MSG_RATE_LIMITED: &str = "msg_rate_limited";
+    pub const STREAM_PROTOCOL: &str = "stream_protocol_error";
+    pub const WRITE_FAILED: &str = "write_failed";
+
+    pub const REQUEST_TIMEOUT: &str = "request_timeout";
+    pub const REQUEST_INVALID: &str = "request_invalid";
+    pub const REQUEST_OVERSIZE: &str = "request_oversize";
+    pub const REQUEST_REJECTED: &str = "request_rejected";
+
+    pub const HEADER_REJECT: &str = "header_reject";
+    pub const BLOCK_REJECT: &str = "block_reject";
+    pub const DISCOVERY_REJECT: &str = "discovery_reject";
+    pub const GOSSIP_REJECT: &str = "gossip_reject";
+    pub const PEER_PANIC: &str = "peer_panic";
 }
 
-impl ConnectionCancel {
+/// Shared per-connection close handle with a bounded first-cause label.
+#[derive(Clone, Debug)]
+pub(crate) struct Close {
+    token: CancellationToken,
+    cause: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl Close {
     /// Wrap an existing connection cancellation token.
     pub(crate) fn new(token: CancellationToken) -> Self {
         Self {
             token,
-            reason: Arc::new(Mutex::new(None)),
+            cause: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Cancel the connection, preserving the first specific reason.
-    pub(crate) fn cancel(&self, reason: &'static str) {
+    /// Close the connection, preserving the first specific cause.
+    pub(crate) fn close(&self, cause: &'static str) {
         {
             let mut stored = self
-                .reason
+                .cause
                 .lock()
-                .expect("Zakura connection cancel reason mutex is never poisoned");
+                .expect("Zakura connection close cause mutex is never poisoned");
             if stored.is_none() {
-                *stored = Some(reason);
+                *stored = Some(cause);
             }
         }
         self.token.cancel();
@@ -59,7 +98,7 @@ impl ConnectionCancel {
     }
 
     /// Return a child token for stream-local work.
-    pub(crate) fn child_token(&self) -> CancellationToken {
+    pub(crate) fn child(&self) -> CancellationToken {
         self.token.child_token()
     }
 
@@ -68,11 +107,11 @@ impl ConnectionCancel {
         self.token.is_cancelled()
     }
 
-    /// Return the first recorded reason, or `default` when only the raw token fired.
-    pub(crate) fn reason_or(&self, default: &'static str) -> &'static str {
-        self.reason
+    /// Return the first recorded cause, or `default` when only the raw token fired.
+    pub(crate) fn cause_or(&self, default: &'static str) -> &'static str {
+        self.cause
             .lock()
-            .expect("Zakura connection cancel reason mutex is never poisoned")
+            .expect("Zakura connection close cause mutex is never poisoned")
             .unwrap_or(default)
     }
 }
@@ -132,7 +171,7 @@ pub struct Peer {
     pub direction: ServicePeerDirection,
     streams: HashMap<u16, ServiceStream>,
     cancel_token: CancellationToken,
-    close: ConnectionCancel,
+    close: Close,
     service_cancel_token: CancellationToken,
 }
 
@@ -184,24 +223,24 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
     ) -> Self {
-        let close = ConnectionCancel::new(cancel_token);
-        Self::new_with_connection_cancel(id, remote_ip, negotiated, direction, streams, close)
+        let close = Close::new(cancel_token);
+        Self::new_with_close(id, remote_ip, negotiated, direction, streams, close)
     }
 
-    pub(crate) fn new_with_connection_cancel(
+    pub(crate) fn new_with_close(
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
-        close: ConnectionCancel,
+        close: Close,
     ) -> Self {
         let service_cancel_token = streams
             .values()
             .next()
             .map(|stream| stream.cancel_token.clone())
-            .unwrap_or_else(|| close.child_token());
-        Self::new_with_connection_cancel_service_token(
+            .unwrap_or_else(|| close.child());
+        Self::new_with_close_service_token(
             id,
             remote_ip,
             negotiated,
@@ -212,13 +251,13 @@ impl Peer {
         )
     }
 
-    pub(crate) fn new_with_connection_cancel_service_token(
+    pub(crate) fn new_with_close_service_token(
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
-        close: ConnectionCancel,
+        close: Close,
         service_cancel_token: CancellationToken,
     ) -> Self {
         let cancel_token = close.token();
@@ -250,7 +289,7 @@ impl Peer {
     }
 
     /// Return the connection close-cause handle for fatal service paths.
-    pub(crate) fn close_handle(&self) -> ConnectionCancel {
+    pub(crate) fn close(&self) -> Close {
         self.close.clone()
     }
 
@@ -272,7 +311,7 @@ impl Peer {
         ServicePeerDirection,
         HashMap<u16, ServiceStream>,
         CancellationToken,
-        ConnectionCancel,
+        Close,
     ) {
         (
             self.id,
@@ -418,34 +457,34 @@ mod tests {
     }
 
     #[test]
-    fn connection_cancel_first_reason_wins() {
-        let close = ConnectionCancel::new(CancellationToken::new());
+    fn close_first_cause_wins() {
+        let close = Close::new(CancellationToken::new());
 
-        close.cancel("frame_timeout");
-        close.cancel("shutdown");
+        close.close(cause::FRAME_TIMEOUT);
+        close.close(cause::SHUTDOWN);
 
         assert!(close.is_cancelled());
-        assert_eq!(close.reason_or("cancelled"), "frame_timeout");
+        assert_eq!(close.cause_or(cause::CANCELLED), cause::FRAME_TIMEOUT);
     }
 
     #[test]
-    fn connection_cancel_plain_token_cancel_falls_back() {
+    fn close_plain_token_cancel_falls_back() {
         let token = CancellationToken::new();
-        let close = ConnectionCancel::new(token.clone());
+        let close = Close::new(token.clone());
 
         token.cancel();
 
         assert!(close.is_cancelled());
-        assert_eq!(close.reason_or("cancelled"), "cancelled");
+        assert_eq!(close.cause_or(cause::CANCELLED), cause::CANCELLED);
     }
 
     #[test]
-    fn connection_cancel_cleanup_does_not_overwrite_specific_cause() {
-        let close = ConnectionCancel::new(CancellationToken::new());
+    fn close_cleanup_does_not_overwrite_specific_cause() {
+        let close = Close::new(CancellationToken::new());
 
-        close.cancel("message_oversize");
-        close.cancel("cleanup");
+        close.close(cause::MSG_OVERSIZE);
+        close.close(cause::SHUTDOWN);
 
-        assert_eq!(close.reason_or("cancelled"), "message_oversize");
+        assert_eq!(close.cause_or(cause::CANCELLED), cause::MSG_OVERSIZE);
     }
 }

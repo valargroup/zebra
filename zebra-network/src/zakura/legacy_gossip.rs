@@ -40,7 +40,7 @@ use crate::{
 };
 
 use super::{
-    spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
+    cause, spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
     FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
     SinkReject, Stream, StreamMode, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
     ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES,
@@ -2322,7 +2322,7 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let peer_id = peer.id.clone();
-        let close = peer.close_handle();
+        let close = peer.close();
         let cancel_token = close.token();
         let session = LegacyGossipPeerSession::new(peer_id.clone(), send);
 
@@ -2335,7 +2335,7 @@ impl ZakuraService for LegacyGossipSink {
             replay_task_peer_id,
             || {},
             move || {
-                replay_panic_cancel.cancel("peer_task_panic");
+                replay_panic_cancel.close(cause::PEER_PANIC);
                 replay_panic_outbound.remove(&replay_panic_peer_id);
             },
             {
@@ -2357,7 +2357,7 @@ impl ZakuraService for LegacyGossipSink {
             recv_task_peer_id,
             || {},
             move || {
-                recv_panic_cancel.cancel("peer_task_panic");
+                recv_panic_cancel.close(cause::PEER_PANIC);
                 recv_panic_outbound.remove(&recv_panic_peer_id);
             },
             async move {
@@ -2389,7 +2389,7 @@ impl ZakuraService for LegacyGossipSink {
                                 ?peer_id,
                                 "legacy gossip stream rejected protocol-invalid frame"
                             );
-                            close.cancel("legacy_gossip_protocol_reject");
+                            close.close(cause::GOSSIP_REJECT);
                             outbound.remove(&peer_id);
                             return;
                         }

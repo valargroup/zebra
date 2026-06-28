@@ -5,9 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{events::*, pipe::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
-    Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle,
+    cause, handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv,
+    FramedSend, OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection,
+    SessionGuard, Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle,
     ZAKURA_CAP_HEADER_SYNC,
 };
 
@@ -334,7 +334,7 @@ impl Service for HeaderSyncService {
         // a normal/parked exit — parking one service must not tear down the
         // shared connection that other services (discovery, block-sync) ride on.
         let service_cancel_token = session.cancel_token();
-        let connection_cancel_token = peer.close_handle();
+        let connection_cancel_token = peer.close();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let header_sync_session =
             HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
@@ -368,7 +368,7 @@ impl Service for HeaderSyncService {
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
-                "header_sync_protocol_reject",
+                cause::HEADER_REJECT,
                 run_peer(pipe, recv, pipe_cancel_token).await,
             );
         };
@@ -386,7 +386,7 @@ impl Service for HeaderSyncService {
                 teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
         };
         let panic_connection_cancel_token = connection_cancel_token.clone();
-        let on_panic = move || panic_connection_cancel_token.cancel("peer_task_panic");
+        let on_panic = move || panic_connection_cancel_token.close(cause::PEER_PANIC);
 
         // Reuse the single supervised launcher; let the returned handle drop to
         // detach the task (the `PipeTeardown` still runs on every exit path).
@@ -470,7 +470,7 @@ impl Service for HeaderSyncPassthroughService {
 
         let inner = self.inner.clone();
         let peer_id = peer.id.clone();
-        let close = peer.close_handle();
+        let close = peer.close();
         let cancel_token = close.token();
 
         task::spawn(async move {
@@ -488,7 +488,7 @@ impl Service for HeaderSyncPassthroughService {
                         ?peer_id,
                         "header-sync passthrough rejected protocol-invalid frame"
                     );
-                    close.cancel("header_sync_protocol_reject");
+                    close.close(cause::HEADER_REJECT);
                 }
                 Err(SinkReject::Local(error)) => {
                     tracing::debug!(
