@@ -201,10 +201,16 @@ where
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
-        tree.push(network, block, &sapling_root, &orchard_root)
-            .map_err(Arc::new)
-            .map_err(ValidateContextError::from)
-            .map_err(|error| (height, error))?;
+        tree.push(
+            network,
+            block,
+            &sapling_root,
+            &orchard_root,
+            &Default::default(),
+        )
+        .map_err(Arc::new)
+        .map_err(ValidateContextError::from)
+        .map_err(|error| (height, error))?;
     }
 
     Ok(tree)
@@ -231,8 +237,14 @@ mod tests {
                 .zcash_deserialize_into::<Block>()
                 .expect("genesis deserializes"),
         );
-        HistoryTree::from_block(&Mainnet, genesis, &Default::default(), &Default::default())
-            .expect("empty history tree for a pre-Heartwood block")
+        HistoryTree::from_block(
+            &Mainnet,
+            genesis,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .expect("empty history tree for a pre-Heartwood block")
     }
 
     /// A distinct, valid Orchard root that is *not* the empty-tree root, for the
