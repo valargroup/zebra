@@ -808,7 +808,10 @@ fn config_clamps_below_floor_inflight_block_bytes() {
     };
     assert!(below.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     below.clamp_inflight_block_bytes_to_floor();
-    assert_eq!(below.max_inflight_block_bytes, BS_CHECKPOINT_RANGE_BYTE_FLOOR);
+    assert_eq!(
+        below.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+    );
 
     // A budget at or above the floor is left untouched.
     let mut at_floor = ZakuraBlockSyncConfig {
