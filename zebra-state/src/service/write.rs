@@ -244,7 +244,7 @@ impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
 /// `finalized_state` or `non_finalized_state` and channels for sending
 /// it blocks.
 #[derive(Clone, Debug)]
-pub(super) struct BlockWriteSender {
+pub struct BlockWriteSender {
     /// A channel to send blocks to the `block_write_task`,
     /// so they can be written to the [`NonFinalizedState`].
     pub non_finalized: Option<tokio::sync::mpsc::UnboundedSender<NonFinalizedWriteMessage>>,

@@ -9325,6 +9325,7 @@ dependencies = [
  "color-eyre",
  "metrics-exporter-prometheus",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "zebra-chain",

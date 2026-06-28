@@ -25,6 +25,7 @@ zebra-state = { path = "../zebra-state", version = "8.0.0" }
 
 clap = { workspace = true, features = ["derive"] }
 color-eyre.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
