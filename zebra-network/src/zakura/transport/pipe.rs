@@ -416,13 +416,16 @@ pub(crate) fn handle_pipe_exit(
 ) {
     match result {
         Ok(()) => {}
-        Err(SinkReject::Protocol(error)) => {
+        Err(SinkReject::Protocol {
+            error,
+            close_reason,
+        }) => {
             tracing::debug!(
                 ?error,
                 service,
                 "Zakura stream rejected protocol-invalid frame"
             );
-            connection_cancel.cancel(protocol_reject_reason);
+            connection_cancel.cancel(close_reason.unwrap_or(protocol_reject_reason));
         }
         Err(SinkReject::Local(error)) => {
             tracing::debug!(?error, service, "Zakura stream stopped on local error");
@@ -549,6 +552,37 @@ mod tests {
         // A disallowed type rejects the peer.
         send.send(frame(2)).await.expect("channel has capacity");
         assert!(sink.run().await.is_err());
+    }
+
+    #[test]
+    fn handle_pipe_exit_uses_protocol_reject_fallback_reason() {
+        let close = ConnectionCancel::new(CancellationToken::new());
+
+        handle_pipe_exit(
+            "test",
+            &close,
+            "service_protocol_reject",
+            Err(SinkReject::protocol("bad frame")),
+        );
+
+        assert_eq!(close.reason_or("cancelled"), "service_protocol_reject");
+    }
+
+    #[test]
+    fn handle_pipe_exit_prefers_protocol_reject_close_reason() {
+        let close = ConnectionCancel::new(CancellationToken::new());
+
+        handle_pipe_exit(
+            "test",
+            &close,
+            "service_protocol_reject",
+            Err(SinkReject::protocol_with_reason(
+                "bad frame",
+                "specific_protocol_reject",
+            )),
+        );
+
+        assert_eq!(close.reason_or("cancelled"), "specific_protocol_reject");
     }
 
     #[tokio::test]

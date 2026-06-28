@@ -68,9 +68,24 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CLOSE_BLOCK_SYNC_GUARD_BAD_TYPE: &str = "block_sync_guard_bad_type";
+const CLOSE_BLOCK_SYNC_GUARD_DISALLOWED_TYPE: &str = "block_sync_guard_disallowed_type";
+const CLOSE_BLOCK_SYNC_GUARD_OVERSIZE: &str = "block_sync_guard_oversize";
+const CLOSE_BLOCK_SYNC_GUARD_REJECT: &str = "block_sync_guard_reject";
+const CLOSE_BLOCK_SYNC_MALFORMED_FRAME: &str = "block_sync_malformed_frame";
+const CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT: &str = "block_sync_repeated_timeout";
 
 fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
     frame.payload.first().copied() == Some(MSG_BS_BLOCK)
+}
+
+pub(super) fn block_sync_guard_close_reason(reason: &str) -> &'static str {
+    match reason {
+        "bad type" => CLOSE_BLOCK_SYNC_GUARD_BAD_TYPE,
+        "disallowed type" => CLOSE_BLOCK_SYNC_GUARD_DISALLOWED_TYPE,
+        "oversize" => CLOSE_BLOCK_SYNC_GUARD_OVERSIZE,
+        _ => CLOSE_BLOCK_SYNC_GUARD_REJECT,
+    }
 }
 
 fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
@@ -314,6 +329,10 @@ impl PeerRoutine {
         guard: &mut crate::zakura::SessionGuard,
         frame: crate::zakura::Frame,
     ) -> Result<(), SinkReject> {
+        let frame_message_type = frame.message_type;
+        let frame_flags = frame.flags;
+        let frame_payload_len = u64::try_from(frame.payload.len()).unwrap_or(u64::MAX);
+
         match guard.admit(&frame) {
             Admit::Pass => {}
             Admit::Throttle => {
@@ -322,10 +341,18 @@ impl PeerRoutine {
                 ));
             }
             Admit::Reject(reason) => {
-                return Err(SinkReject::protocol(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                let close_reason = block_sync_guard_close_reason(reason);
+                self.trace_protocol_reject_frame(
+                    close_reason,
                     reason,
-                )));
+                    frame_message_type,
+                    frame_flags,
+                    frame_payload_len,
+                );
+                return Err(SinkReject::protocol_with_reason(
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, reason),
+                    close_reason,
+                ));
             }
         }
 
@@ -345,8 +372,16 @@ impl PeerRoutine {
                     // protocol reject for the whole connection (matches the previous
                     // `run_peer` decode-error path). Report via the shared channel,
                     // then reject; the report is best-effort and never blocks.
+                    let error = error.to_string();
+                    self.trace_protocol_reject_frame(
+                        CLOSE_BLOCK_SYNC_MALFORMED_FRAME,
+                        &error,
+                        frame_message_type,
+                        frame_flags,
+                        frame_payload_len,
+                    );
                     let protocol_error =
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone());
                     tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
                     let _ = self
                         .routine_to_reactor
@@ -354,7 +389,10 @@ impl PeerRoutine {
                             peer: self.peer.clone(),
                             reason: BlockSyncMisbehavior::MalformedMessage,
                         });
-                    return Err(SinkReject::protocol(protocol_error));
+                    return Err(SinkReject::protocol_with_reason(
+                        protocol_error,
+                        CLOSE_BLOCK_SYNC_MALFORMED_FRAME,
+                    ));
                 }
             };
         let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
@@ -886,12 +924,15 @@ impl PeerRoutine {
         self.note_retry_avoid(timed_out_heights);
         self.publish_outstanding();
         if backoff == TimeoutBackoffOutcome::DisconnectPeer {
+            let error = "block-sync peer repeatedly timed out at minimum window";
+            self.trace_protocol_reject_timeout(error, timed_out.len());
             tracing::debug!(
                 peer = ?self.peer,
                 "disconnecting Zakura block-sync peer after repeated timeouts at minimum window"
             );
-            return Err(SinkReject::protocol(
-                "block-sync peer repeatedly timed out at minimum window",
+            return Err(SinkReject::protocol_with_reason(
+                error,
+                CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT,
             ));
         }
         Ok(())
@@ -1550,6 +1591,73 @@ impl PeerRoutine {
             row.insert(
                 "reason".to_string(),
                 serde_json::Value::String(reason.to_string()),
+            );
+        });
+    }
+
+    fn trace_protocol_reject_frame(
+        &self,
+        reason: &'static str,
+        error: &str,
+        frame_message_type: u16,
+        frame_flags: u16,
+        payload_len: u64,
+    ) {
+        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            row.insert(
+                bs_trace::REASON.to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+            row.insert(
+                bs_trace::ERROR.to_string(),
+                serde_json::Value::String(error.to_string()),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::FRAME_MESSAGE_TYPE,
+                u64::from(frame_message_type),
+            );
+            bs_insert_u64(row, bs_trace::FRAME_FLAGS, u64::from(frame_flags));
+            bs_insert_u64(row, bs_trace::PAYLOAD_LEN, payload_len);
+        });
+    }
+
+    fn trace_protocol_reject_timeout(&self, error: &str, timed_out: usize) {
+        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            row.insert(
+                bs_trace::REASON.to_string(),
+                serde_json::Value::String(CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT.to_string()),
+            );
+            row.insert(
+                bs_trace::ERROR.to_string(),
+                serde_json::Value::String(error.to_string()),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::OUTSTANDING,
+                u64::try_from(self.window.outstanding.len()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "timed_out",
+                u64::try_from(timed_out).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "outbound_request_window",
+                u64::try_from(self.window.outbound_request_window).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "timeout_recovery_slots",
+                u64::try_from(self.window.timeout_recovery_slots).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "available_slots",
+                u64::try_from(self.window.available_slots()).unwrap_or(u64::MAX),
             );
         });
     }

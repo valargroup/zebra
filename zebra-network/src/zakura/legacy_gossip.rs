@@ -2383,7 +2383,7 @@ impl ZakuraService for LegacyGossipSink {
 
                     match Self::enqueue_gossip_frame(&inbound_tx, peer_id.clone(), frame) {
                         Ok(()) => {}
-                        Err(SinkReject::Protocol(error)) => {
+                        Err(SinkReject::Protocol { error, .. }) => {
                             debug!(
                                 ?error,
                                 ?peer_id,

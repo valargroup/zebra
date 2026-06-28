@@ -451,7 +451,7 @@ mod tests {
 
         let flow = deliver(&handle, None, peer(), headers_frame(Vec::new()));
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol { .. })));
         match events.try_recv() {
             Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders));
@@ -471,7 +471,7 @@ mod tests {
 
         let flow = deliver(&handle, Some(expected), peer(), headers_frame(Vec::new()));
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol { .. })));
         match events.try_recv() {
             Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
                 assert!(matches!(reason, HeaderSyncMisbehavior::MalformedMessage));
@@ -642,7 +642,7 @@ mod tests {
         match flow {
             Flow::Done => {}
             Flow::Continue(()) => panic!("unexpected successful forward"),
-            Flow::Reject(SinkReject::Protocol(_)) => panic!("unexpected protocol reject"),
+            Flow::Reject(SinkReject::Protocol { .. }) => panic!("unexpected protocol reject"),
             Flow::Reject(SinkReject::Local(_)) => panic!("unexpected local reject"),
         }
 

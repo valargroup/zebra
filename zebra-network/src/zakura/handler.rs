@@ -3140,7 +3140,7 @@ async fn request_stream_worker(
         .await
     {
         Ok(frames) => frames,
-        Err(SinkReject::Protocol(error)) => {
+        Err(SinkReject::Protocol { error, .. }) => {
             debug!(
                 ?error,
                 "Zakura inbound sink rejected protocol-invalid request"
@@ -4976,7 +4976,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+        assert!(matches!(rejected, Err(SinkReject::Protocol { .. })));
 
         shutdown.cancel();
         task.await?;
@@ -5012,7 +5012,7 @@ mod tests {
         let malformed_result =
             service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
         assert!(
-            matches!(malformed_result, Err(SinkReject::Protocol(_))),
+            matches!(malformed_result, Err(SinkReject::Protocol { .. })),
             "malformed stream-5 frames must disconnect independently of reactor queue availability"
         );
 

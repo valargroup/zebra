@@ -224,7 +224,7 @@ mod tests {
             payload: Vec::new(),
         });
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol { .. })));
         assert!(pipe.local_mut().take_decoded().is_none());
     }
 
@@ -240,7 +240,7 @@ mod tests {
             payload: Vec::new(),
         });
 
-        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol { .. })));
         assert!(pipe.local_mut().take_decoded().is_none());
     }
 

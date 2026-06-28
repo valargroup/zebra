@@ -135,6 +135,14 @@ pub mod block_sync_trace {
     pub const APPLY_TOKEN: &str = "apply_token";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
+    /// Exact protocol error field.
+    pub const ERROR: &str = "error";
+    /// Transport frame message-type field.
+    pub const FRAME_MESSAGE_TYPE: &str = "frame_message_type";
+    /// Transport frame flags field.
+    pub const FRAME_FLAGS: &str = "frame_flags";
+    /// Transport frame payload length field.
+    pub const PAYLOAD_LEN: &str = "payload_len";
     /// Scheduler/query lower bound for block body requests.
     pub const REQUEST_FLOOR: &str = "request_floor";
     /// Highest contiguous body height already submitted for apply.
@@ -218,6 +226,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
+    /// Block-sync peer sent protocol-invalid data that will close the connection.
+    pub const BLOCK_PEER_PROTOCOL_REJECT: &str = "block_peer_protocol_reject";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.

@@ -482,7 +482,7 @@ impl Service for HeaderSyncPassthroughService {
 
             match sink.run(recv).await {
                 Ok(()) => {}
-                Err(SinkReject::Protocol(error)) => {
+                Err(SinkReject::Protocol { error, .. }) => {
                     tracing::debug!(
                         ?error,
                         ?peer_id,
@@ -540,7 +540,15 @@ impl Sink for HeaderSyncPassthroughSink {
                     frame,
                 ) {
                     Ok(()) => {}
-                    Err(SinkReject::Protocol(error)) => return Err(SinkReject::Protocol(error)),
+                    Err(SinkReject::Protocol {
+                        error,
+                        close_reason,
+                    }) => {
+                        return Err(SinkReject::Protocol {
+                            error,
+                            close_reason,
+                        });
+                    }
                     Err(SinkReject::Local(error)) => {
                         tracing::debug!(
                             ?error,

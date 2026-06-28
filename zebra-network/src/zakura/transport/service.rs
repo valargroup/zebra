@@ -382,8 +382,14 @@ pub trait Source: Send + 'static {
 #[derive(Debug, Error)]
 pub enum SinkReject {
     /// The peer sent protocol-invalid data, so the connection should close.
-    #[error("inbound sink rejected protocol-invalid frame: {0}")]
-    Protocol(#[source] BoxError),
+    #[error("inbound sink rejected protocol-invalid frame: {error}")]
+    Protocol {
+        /// Exact protocol error, preserved for logs and traces.
+        #[source]
+        error: BoxError,
+        /// Optional bounded connection-close reason for metrics labels.
+        close_reason: Option<&'static str>,
+    },
 
     /// Local sink state prevented delivery; the peer is not at fault.
     #[error("inbound sink could not accept frame locally: {0}")]
@@ -393,7 +399,18 @@ pub enum SinkReject {
 impl SinkReject {
     /// Build a fatal peer-protocol rejection.
     pub fn protocol(error: impl Into<BoxError>) -> Self {
-        Self::Protocol(error.into())
+        Self::Protocol {
+            error: error.into(),
+            close_reason: None,
+        }
+    }
+
+    /// Build a fatal peer-protocol rejection with a bounded close reason.
+    pub fn protocol_with_reason(error: impl Into<BoxError>, close_reason: &'static str) -> Self {
+        Self::Protocol {
+            error: error.into(),
+            close_reason: Some(close_reason),
+        }
     }
 
     /// Build a non-fatal local-delivery rejection.
@@ -411,7 +428,7 @@ mod tests {
         let protocol = SinkReject::protocol("bad frame");
         let local = SinkReject::local("closed queue");
 
-        assert!(matches!(protocol, SinkReject::Protocol(_)));
+        assert!(matches!(protocol, SinkReject::Protocol { .. }));
         assert!(matches!(local, SinkReject::Local(_)));
         assert!(protocol.to_string().contains("protocol-invalid"));
         assert!(local.to_string().contains("locally"));

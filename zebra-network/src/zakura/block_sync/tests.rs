@@ -20,9 +20,11 @@ use super::{
     work_queue::WorkQueue,
 };
 use crate::zakura::{
-    framed_channel, ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange,
-    FrontierUpdate, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
-    ZakuraBlockSyncCandidateState, ZakuraSyncExchange,
+    framed_channel,
+    testkit::{TraceCapture, TraceValue},
+    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
+    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
+    ZakuraSyncExchange,
 };
 use zebra_chain::{
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -947,6 +949,26 @@ fn status_decode_clamps_peer_capacity_advertisements() {
     assert_eq!(status.max_blocks_per_response, MAX_BS_BLOCKS_PER_REQUEST);
     assert_eq!(status.max_inflight_requests, MAX_BS_INFLIGHT_REQUESTS);
     assert_eq!(status.max_response_bytes, MAX_BS_RESPONSE_BYTES);
+}
+
+#[test]
+fn guard_reject_reasons_map_to_bounded_block_sync_close_reasons() {
+    assert_eq!(
+        peer_routine::block_sync_guard_close_reason("bad type"),
+        "block_sync_guard_bad_type"
+    );
+    assert_eq!(
+        peer_routine::block_sync_guard_close_reason("oversize"),
+        "block_sync_guard_oversize"
+    );
+    assert_eq!(
+        peer_routine::block_sync_guard_close_reason("disallowed type"),
+        "block_sync_guard_disallowed_type"
+    );
+    assert_eq!(
+        peer_routine::block_sync_guard_close_reason("future guard reject"),
+        "block_sync_guard_reject"
+    );
 }
 
 #[test]
@@ -3410,9 +3432,12 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     // which `handle_pipe_exit` turns into a connection cancel). With real reactor
     // wiring the routine runs; we observe the `Misbehavior(MalformedMessage)` action
     // and the connection-cancel.
+    let mut capture =
+        TraceCapture::for_test("add_peer_decode_failure_reports_malformed_and_cancels_connection")
+            .expect("trace capture initializes");
     let config = ZakuraBlockSyncConfig::default();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -3422,6 +3447,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         tip_rx,
         config.clone(),
     );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (handle, mut actions, _reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
@@ -3465,6 +3491,41 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
         .await
         .expect("malformed frame cancels the connection");
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    let block_sync = reader.table("block_sync");
+    block_sync.assert_row(
+        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        &[
+            (
+                bs_trace::REASON,
+                TraceValue::Str("block_sync_malformed_frame"),
+            ),
+            (
+                bs_trace::FRAME_MESSAGE_TYPE,
+                TraceValue::U64(u64::from(MSG_BS_STATUS)),
+            ),
+            (bs_trace::FRAME_FLAGS, TraceValue::U64(0)),
+            (bs_trace::PAYLOAD_LEN, TraceValue::U64(0)),
+        ],
+    );
+    let reject_row = block_sync
+        .rows()
+        .into_iter()
+        .find(|row| {
+            row.get(bs_trace::EVENT).and_then(serde_json::Value::as_str)
+                == Some(bs_trace::BLOCK_PEER_PROTOCOL_REJECT)
+        })
+        .expect("protocol reject row is present");
+    let exact_error = reject_row
+        .get(bs_trace::ERROR)
+        .and_then(serde_json::Value::as_str)
+        .expect("protocol reject row includes exact error");
+    assert_eq!(
+        exact_error,
+        "Zakura block-sync wire I/O error: failed to fill whole buffer"
+    );
 }
 
 #[tokio::test]
