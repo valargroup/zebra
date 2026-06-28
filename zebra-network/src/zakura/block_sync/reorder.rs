@@ -96,6 +96,7 @@ impl ReorderBuffer {
         verified_block_tip: block::Height,
     ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
         let mut released = Vec::new();
+
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
             None => return released,
@@ -181,43 +182,12 @@ struct BufferedBlock {
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
     Decoded(Arc<block::Block>),
-    DecodedWithRawFramePayload {
-        block: Arc<block::Block>,
-        raw_frame_payload: Arc<[u8]>,
-    },
 }
 
 impl BufferedBlockBody {
-    pub(super) fn from_decoded_block(
-        block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
-    ) -> Self {
-        match raw_frame_payload {
-            Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
-                block,
-                raw_frame_payload,
-            },
-            None => BufferedBlockBody::Decoded(block),
-        }
-    }
-
-    // Drop the raw frame payload for the backlog.
-    // This is used to save memory when the body is not the next block in the sequence.
-    // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
-    // so we retain just the raw frame payload.
-    pub(super) fn retain_for_backlog(self) -> Self {
-        match self {
-            BufferedBlockBody::DecodedWithRawFramePayload {
-                raw_frame_payload, ..
-            } => BufferedBlockBody::RawFramePayload(raw_frame_payload),
-            body => body,
-        }
-    }
-
     fn into_block(self) -> Arc<block::Block> {
         match self {
             BufferedBlockBody::Decoded(block) => block,
-            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
             BufferedBlockBody::RawFramePayload(payload) => {
                 let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
                 Arc::new(

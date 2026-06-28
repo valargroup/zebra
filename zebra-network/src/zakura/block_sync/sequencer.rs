@@ -1,7 +1,7 @@
 //! The serial commit pipeline for Zakura block sync.
 //!
 //! The [`Sequencer`] owns the consensus-critical reorder → applying →
-//! `SubmitBlock` → apply-finished machinery and nothing else. It deliberately
+//! `ApplySubmitted` → apply completion machinery and nothing else. It deliberately
 //! never touches download-side state — the byte budget, the work scheduler,
 //! peers, emitted actions, or state queries. Two rules keep that boundary clean:
 //!
@@ -45,13 +45,17 @@ pub(super) enum AcceptOutcome {
 }
 
 /// A body the Sequencer has assigned a token and marked submitted; the reactor
-/// dispatches the matching `SubmitBlock` action.
+/// dispatches the matching `ApplySubmitted` action.
 #[derive(Clone, Debug)]
 pub(super) struct SubmitItem {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
     pub(super) token: BlockApplyToken,
     pub(super) block: Arc<block::Block>,
+    /// The body's reserved byte size, carried to the apply completion so commit
+    /// throughput can be attributed even if the `applying` entry is reaped (by a
+    /// coalesced checkpoint frontier refresh) before the completion is drained.
+    pub(super) bytes: u64,
 }
 
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
@@ -64,16 +68,13 @@ pub(super) struct AdvanceOutcome {
     pub(super) changed: bool,
 }
 
-/// The reorder → applying → submit → apply-finished commit pipeline.
+/// The reorder → applying → submit → apply completion commit pipeline.
 #[derive(Clone, Debug)]
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
     applying: BTreeMap<block::Height, ApplyingBlock>,
     submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
     next_apply_token: BlockApplyToken,
-
-    // The highest block height whose body has already been accepted into the contiguous
-    // download-apply pipeline.
     body_download_floor: block::Height,
     verified_block_tip: block::Height,
     submitted_apply_limit: usize,
@@ -123,6 +124,14 @@ impl Sequencer {
 
     pub(super) fn applying_len(&self) -> usize {
         self.applying.len()
+    }
+
+    pub(super) fn lowest_applying_height(&self) -> Option<block::Height> {
+        self.applying.keys().next().copied()
+    }
+
+    pub(super) fn lowest_submitted_height(&self) -> Option<block::Height> {
+        self.submitted_applies.keys().next().copied()
     }
 
     pub(super) fn applying_buffered_bytes(&self) -> u64 {
@@ -250,16 +259,6 @@ impl Sequencer {
             };
         }
 
-        // Decide how much of the received body to keep before putting it in the reorder
-        // buffer.
-        // If height is the next block in the sequence, we can keep the whole body.
-        // Otherwise, we need to retain the body for the backlog.
-        let body = if next_height(self.body_download_floor) == Some(height) {
-            body
-        } else {
-            body.retain_for_backlog()
-        };
-
         match self
             .reorder
             .insert_body(height, hash, body, bytes, source_peer)
@@ -322,6 +321,10 @@ impl Sequencer {
     /// item. `None` if the height is no longer applying (the token counter is
     /// not consumed in that case).
     pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
+        debug_assert!(
+            !self.has_unsubmitted_applying_below(height),
+            "must submit applying blocks in contiguous height order"
+        );
         let block = self
             .applying
             .get(&height)
@@ -335,7 +338,14 @@ impl Sequencer {
             hash: applying.hash,
             token,
             block,
+            bytes: applying.bytes,
         })
+    }
+
+    fn has_unsubmitted_applying_below(&self, height: block::Height) -> bool {
+        self.applying
+            .range(..height)
+            .any(|(_, applying)| !applying.submitted)
     }
 
     /// Roll back a submit whose dispatch failed (only if the token still matches,
@@ -397,10 +407,10 @@ impl Sequencer {
         }
     }
 
-    fn clear_submitted_applies_through(&mut self, tip: block::Height) {
+    fn clear_submitted_applies_through(&mut self, through: block::Height) {
         let heights: Vec<_> = self
             .submitted_applies
-            .range(..=tip)
+            .range(..=through)
             .map(|(height, _)| *height)
             .collect();
         for height in heights {
@@ -411,7 +421,7 @@ impl Sequencer {
     // ---- apply finished ----
 
     /// The `(token, hash)` of the body currently applying at `height`, for
-    /// validating an apply-finished completion against the live submission.
+    /// validating an apply completion completion against the live submission.
     pub(super) fn applying_token_hash(
         &self,
         height: block::Height,
@@ -463,13 +473,13 @@ impl Sequencer {
             .range(..=tip)
             .map(|(height, _)| *height)
             .collect();
-        self.clear_submitted_applies_through(tip);
         let mut released = 0u64;
         for height in applied {
             if let Some(applying) = self.applying.remove(&height) {
                 released = released.saturating_add(applying.bytes);
             }
         }
+        self.clear_submitted_applies_through(tip);
         released
     }
 

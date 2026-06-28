@@ -49,11 +49,15 @@ mod tests;
 mod wire;
 mod work_queue;
 
-pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-    BlockSyncMisbehavior,
+    BlockApplyClass, BlockApplyExecutor, BlockApplyExecutorPort, BlockApplyLimits,
+    BlockApplyOutput, BlockApplyRequest, BlockApplyResult, BlockApplyToken, BlockSyncAction,
+    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;

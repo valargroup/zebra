@@ -1090,14 +1090,14 @@ mod tests {
                             .collect();
                         let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                     }
-                    BlockSyncAction::SubmitBlock { token, block } => {
+                    BlockSyncAction::ApplySubmitted { token, block } => {
                         let height = block.coinbase_height().expect("submitted block has height");
                         submitted
                             .lock()
                             .expect("submitted list mutex is not poisoned")
                             .push(height);
                         let _ = handle
-                            .send(BlockSyncEvent::BlockApplyFinished {
+                            .send(BlockSyncEvent::TestApplyDone {
                                 token,
                                 height,
                                 hash: block.hash(),
@@ -2676,6 +2676,17 @@ mod tests {
         assert_eq!(source, 0);
         cluster.start_drivers();
         cluster.connect_all().await;
+
+        // Keep this convergence test deterministic: status delivery timing is
+        // covered by the status-specific e2e test above.
+        let source_peer = cluster.nodes[source].view.peer_id.clone();
+        let empty_peer = cluster.nodes[empty].view.peer_id.clone();
+        cluster
+            .inject(source, empty_peer, status_for_tip(0, 4, 1))
+            .await;
+        cluster
+            .inject(empty, source_peer, status_for_tip(4, 4, 1))
+            .await;
         cluster.wait_for_tip(empty, block::Height(4)).await?;
 
         let missing = cluster.missing_bodies(empty).await;

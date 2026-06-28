@@ -527,7 +527,7 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::SubmitBlock { token, block } => {
+                BlockSyncAction::ApplySubmitted { token, block } => {
                     let Some(apply) = &apply else {
                         continue;
                     };
@@ -541,7 +541,7 @@ async fn drive_mock_block_sync_actions(
                         }
                     }
                     let _ = handle
-                        .send(BlockSyncEvent::BlockApplyFinished {
+                        .send(BlockSyncEvent::TestApplyDone {
                             token,
                             height,
                             hash: block.hash(),

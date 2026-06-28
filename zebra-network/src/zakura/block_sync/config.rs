@@ -51,8 +51,6 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
 /// Default block-count cap for speculative reorder look-ahead bookkeeping.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
-/// Minimum submitted block applies required to resolve one checkpoint range.
-///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
 /// window, including the resolving checkpoint block, is queued. A node that
 /// starts one height before a checkpoint-gap boundary can therefore need one
