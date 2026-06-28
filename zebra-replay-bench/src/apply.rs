@@ -80,7 +80,7 @@ pub fn run(
     let force_legacy = sidecar.is_none();
     let config = state_config(base.to_path_buf(), force_legacy);
     tracing::info!(base = %base.display(), vct = sidecar.is_some(), "opening base fork writable");
-    let mut state = FinalizedState::new(&config, &network);
+    let mut state = FinalizedState::new_writable(&config, &network);
 
     match state.db.finalized_tip_height() {
         Some(tip) if tip.0 == expected_parent => {}

@@ -28,7 +28,7 @@ pub fn run(src: &Path, cache_path: &Path, start: u32, end: u32, network: Network
     // pristine snapshot. No format upgrade runs when the fork already matches the
     // code version.
     tracing::info!(src = %src.display(), "opening source fork (writable, for CF creation)");
-    let state = FinalizedState::new(&config, &network);
+    let state = FinalizedState::new_writable(&config, &network);
 
     let tip = state
         .db
@@ -98,7 +98,7 @@ pub fn run_roots(
 
     let config = state_config(src.to_path_buf(), true);
     tracing::info!(src = %src.display(), "opening source fork (writable, for CF creation)");
-    let state = FinalizedState::new(&config, &network);
+    let state = FinalizedState::new_writable(&config, &network);
 
     let tip = state
         .db
