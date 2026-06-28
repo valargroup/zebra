@@ -308,6 +308,40 @@ impl FinalizedState {
         )
     }
 
+    /// Opens (or creates) the on-disk finalized state database read-write, for
+    /// offline tooling (e.g. the replay benchmark).
+    ///
+    /// Equivalent to [`FinalizedState::new`] but without the `elasticsearch`
+    /// feature's `enable_elastic_db` parameter, so callers compile unchanged
+    /// regardless of feature flags (elasticsearch is never enabled here).
+    pub fn new_writable(config: &Config, network: &Network) -> Self {
+        Self::new_with_debug(
+            config,
+            network,
+            false,
+            #[cfg(feature = "elasticsearch")]
+            false,
+            false,
+        )
+    }
+
+    /// Opens an existing on-disk finalized state database in **read-only** mode.
+    ///
+    /// Intended for offline tooling (e.g. the replay benchmark) that reads
+    /// committed blocks from a snapshot without triggering format upgrades or any
+    /// writes to the source database. Read-only opens skip format upgrades, so the
+    /// pristine snapshot is never mutated.
+    pub fn new_read_only(config: &Config, network: &Network) -> Self {
+        Self::new_with_debug(
+            config,
+            network,
+            false,
+            #[cfg(feature = "elasticsearch")]
+            false,
+            true,
+        )
+    }
+
     /// Returns an on-disk database instance with the supplied production and debug settings.
     /// If there is no existing database, creates a new database on disk.
     ///
