@@ -116,10 +116,32 @@ cmd_run_worker() {
   rm -rf "$fork"
 }
 
+# Like cmd_run_worker, but replays through the real zebra-consensus checkpoint
+# verifier (which commits to a real StateService), one altitude above the worker.
+cmd_run_verifier() {
+  local label="${1:?usage: replay_run.sh run-verifier <label> [bin]}"; shift || true
+  local bin="${1:-$BIN_DEFAULT}"
+  [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
+  [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  local fork="$FORK_DIR/replay-verifier-$label"
+  note "fork base $BASE_SRC -> $fork; apply-verifier $CACHE (expects base tip $((START - 1)))"
+  clone_fork "$BASE_SRC" "$fork"
+  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
+    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
+    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
+    "$bin" apply-verifier --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
+  else
+    "$bin" apply-verifier --base "$fork" --cache "$CACHE"
+  fi
+  note "cleanup: rm -rf $fork"
+  rm -rf "$fork"
+}
+
 case "${1:-}" in
-  index)       shift; cmd_index "$@" ;;
-  index-roots) shift; cmd_index_roots "$@" ;;
-  run)         shift; cmd_run "$@" ;;
-  run-worker)  shift; cmd_run_worker "$@" ;;
-  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]}" >&2; exit 2 ;;
+  index)        shift; cmd_index "$@" ;;
+  index-roots)  shift; cmd_index_roots "$@" ;;
+  run)          shift; cmd_run "$@" ;;
+  run-worker)   shift; cmd_run_worker "$@" ;;
+  run-verifier) shift; cmd_run_verifier "$@" ;;
+  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]|run-verifier <label> [bin]}" >&2; exit 2 ;;
 esac

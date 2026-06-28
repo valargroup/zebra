@@ -36,7 +36,31 @@ zebra-replay-bench apply --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
 
 # One altitude up: replay through the real zebra-state write worker
 zebra-replay-bench apply-worker --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+
+# Two altitudes up: replay through the real zebra-consensus checkpoint verifier
+zebra-replay-bench apply-verifier --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
 ```
+
+## Third altitude: `apply-verifier`
+
+`apply-verifier` drives blocks through the real `zebra-consensus::CheckpointVerifier`,
+which internally commits to a real `zebra-state` `StateService` (→ write worker →
+committer). It adds the per-block work the lower rungs skip: proof-of-work
+(difficulty + equihash) and Merkle-root validity, plus checkpoint-range batching.
+Unlike `apply`/`apply-worker` (sync), it runs on a multi-thread tokio runtime
+because the verifier is a Tower service. Comparing its throughput to `apply-worker`
+isolates what verification adds on top of the commit pipeline.
+
+Checkpoint batching + the VCT successor boundary: the verifier only releases a
+block once its whole checkpoint range is contiguous, and the worker's VCT fast path
+can't commit a block until its successor is buffered. The final checkpoint's
+successor is in the dropped tail (its range can't complete past the window), so the
+bench **feeds** up to the last checkpoint `<= end` (to deliver the successors the
+worker needs) but **counts/gates** to the second-to-last checkpoint, checking that
+block's committed hash against the embedded checkpoint hash. As with the other
+rungs, blocks are read/parsed off-thread by the bounded prefetch and fed with a
+bounded in-flight window (`ZRB_PREFETCH_CAP`, at least one checkpoint gap so ranges
+always complete); a periodic progress log makes any stall observable.
 
 ## Two altitudes: `apply` vs `apply-worker`
 
@@ -97,6 +121,7 @@ make perf-build-replay-bench   # build the bench binary (commit-metrics)
 make perf-replay-index         # one-time: dump the window to a block cache
 make perf-replay               # legacy replay through the committer
 make perf-replay-worker        # same window, through the write worker
+make perf-replay-verifier      # same window, through the checkpoint verifier
 # VCT fast path:
 make perf-replay-index && deploy/runner/replay_run.sh index-roots
 make perf-replay REPLAY_VCT_SIDECAR=/path/to/win.vct

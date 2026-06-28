@@ -1,10 +1,12 @@
 # zebra-replay-bench — commit-pipeline results
 
-Offline A/B of the Zebra finalized-state commit pipeline at two abstraction
-levels: the **direct committer** (`apply` → `FinalizedState::commit_finalized_direct`)
-and the **write worker** one rung up (`apply-worker` → `BlockWriteSender::spawn` /
-`WriteBlockWorkerTask::run`). Goal: isolate each layer's cost and find the next
-optimization lever.
+Offline A/B of the Zebra checkpoint-sync pipeline at three abstraction levels: the
+**direct committer** (`apply` → `FinalizedState::commit_finalized_direct`), the
+**write worker** one rung up (`apply-worker` → `BlockWriteSender::spawn` /
+`WriteBlockWorkerTask::run`), and the **checkpoint verifier** above that
+(`apply-verifier` → `zebra-consensus::CheckpointVerifier`, committing to a real
+`StateService`). Goal: isolate each layer's cost and find the next optimization
+lever.
 
 ## Provenance
 
@@ -112,16 +114,50 @@ With the unbounded feed (all 30K pushed up front), the worker's max commit laten
 was 37,279 ms — a RocksDB L0 write-stall from the backlog. The bounded in-flight
 window (≤64) removes it: max latency is now 504 ms, in line with the direct bench.
 
+## Third rung: checkpoint verifier (`apply-verifier`)
+
+`apply-verifier` drives blocks through the real `zebra-consensus::CheckpointVerifier`,
+which internally commits to a real `StateService` (→ write worker → committer) on a
+multi-thread tokio runtime. It adds the per-block work the lower rungs skip:
+proof-of-work (difficulty + equihash) and Merkle-root validity, plus
+checkpoint-range batching.
+
+The boundary: the verifier only releases a block once its whole checkpoint range is
+contiguous, and the worker's VCT fast path can't commit a block until its successor
+is buffered (the one-block-lag root authentication). The final checkpoint's successor
+is in the dropped tail, which the verifier never releases — so the bench **feeds** up
+to the last checkpoint `<= end` (so the last range delivers the successors the worker
+needs) but **counts/gates** to the second-to-last checkpoint, whose committed hash is
+checked against the embedded checkpoint hash.
+
+| run (30K) | committed to | throughput | p50 | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| legacy | ckpt 1,831,990 | **49.9 blk/s** | 13.99 ms | 2.35 GiB |
+| VCT | ckpt 1,831,959 | **133.0 blk/s** | 4.04 ms | ~2.4 GiB |
+
+The legacy row was measured before the second-to-last-checkpoint gate (legacy needs
+no successor, so it commits the full window and its rate is unaffected by that fix).
+
+**Verification overlaps the commit for free, in both modes.** Legacy verifier ≈ the
+legacy commit-alone rate (~50 blk/s): the rayon-parallel equihash + Merkle work
+overlaps the single-threaded note-tree recompute that bottlenecks legacy. VCT
+verifier (133 blk/s) is actually _slightly above_ the VCT worker (123.8) and direct
+(127.7) — with the recompute gone the committer is cheap, yet the concurrent
+verify→commit pipeline still hides verification behind it. So at this window,
+checkpoint verification is **not** a throughput bottleneck on top of the commit.
+
+> Diagnosis note: an earlier draft reported VCT here as "stall-bound / slower than
+> legacy." That was wrong — a one-block bench bug (the final checkpoint block had no
+> successor delivered, so it hung forever while everything else committed at ~500
+> blk/s). Adding a periodic progress log (fed/done/front-height) pinned it to exactly
+> that block; the second-to-last-checkpoint gate fixes it. Lesson: instrument before
+> concluding.
+
 ## Open / next
 
-- **Legacy 30K commit-only** not yet run at scale; a 500-block prefetch smoke
-  shows direct 95.1 / worker 115.8 blk/s — small-sample, but the direction is the
-  point: in legacy the worker's note-commitment precompute **is** active, so it
-  overlaps the recompute and beats the direct committer (the real worker win,
-  unlike VCT where the two converge). Re-run at 30K for a clean legacy row.
-- **Larger windows (100K+)** are now unblocked: memory is flat (~0.9 GiB), so the
-  cache size, not RAM, is the only limit.
-- **Next layer up:** with prep and commit isolated and converged in VCT, the
-  committer itself is the floor (~128 blk/s, ~4.5 ms/block p50). Profiling the
-  commit (`prepare`/`update_trees`/`batch_prep`/`rocksdb.batch_commit` histograms
-  via `--features commit-metrics`) is the next lever.
+- **Larger windows (100K+)** are unblocked across all three rungs: memory is flat
+  (verifier peak ~2.4 GiB, bounded), so the cache size, not RAM, is the limit.
+- **Profiling the committer floor:** with all three rungs converging in VCT
+  (~124–133 blk/s) and verification shown to overlap for free, the committer remains
+  the floor. The `prepare`/`update_trees`/`batch_prep`/`rocksdb.batch_commit`
+  histograms (`--features commit-metrics`) are the next lever.
