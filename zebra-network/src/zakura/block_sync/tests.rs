@@ -779,11 +779,15 @@ fn config_validate_rejects_degenerate_values() {
     };
     assert!(config.validate().is_err());
 
+    // A positive budget below the checkpoint-range floor is no longer rejected by
+    // `validate`: it is clamped up to the floor (with a warning) at load instead,
+    // so older configs keep starting. See
+    // `config_clamps_below_floor_inflight_block_bytes`.
     config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
         ..ZakuraBlockSyncConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate().is_ok());
 
     config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
@@ -791,6 +795,62 @@ fn config_validate_rejects_degenerate_values() {
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn config_clamps_below_floor_inflight_block_bytes() {
+    // A positive budget below the checkpoint-range floor is clamped up to the
+    // floor so checkpoint sync cannot deadlock (instead of refusing to start).
+    let mut below = ZakuraBlockSyncConfig {
+        // 256 MiB, the historical `v4.5.0-zakura-blocksync.toml` value, which is
+        // below the ~802 MB checkpoint-range floor.
+        max_inflight_block_bytes: 256 * 1024 * 1024,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(below.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
+    below.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(
+        below.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+    );
+
+    // A budget at or above the floor is left untouched.
+    let mut at_floor = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    at_floor.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(
+        at_floor.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1
+    );
+
+    // Zero is left untouched so `validate` still rejects it as a misconfiguration.
+    let mut zero = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    zero.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(zero.max_inflight_block_bytes, 0);
+    assert!(zero.validate().is_err());
+}
+
+#[test]
+fn config_deserialize_clamps_below_floor_inflight_block_bytes() {
+    // Regression: an older config with a too-small `max_inflight_block_bytes`
+    // (e.g. the stored `v4.5.0-zakura-blocksync.toml`) must still load -- clamped
+    // up to the checkpoint-range floor -- rather than being rejected at startup.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 268435456
+        "#,
+    )
+    .expect("a below-floor max_inflight_block_bytes config still loads");
+    assert_eq!(
+        config.zakura.block_sync.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+    );
 }
 
 #[test]
