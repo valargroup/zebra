@@ -7,7 +7,7 @@ use crate::{
     transaction::Transaction,
 };
 
-/// Returns true if all Sapling, Orchard, or Ironwood outputs, if any, decrypt successfully with
+/// Returns true if all Sapling or Orchard outputs, if any, decrypt successfully with
 /// an all-zeroes outgoing viewing key.
 pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height) -> bool {
     let nu = NetworkUpgrade::current(network, height);
@@ -39,21 +39,9 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
         }
     }
 
-    let null_orchard_ovk = orchard::keys::OutgoingViewingKey::from([0u8; 32]);
-
     if let Some(bundle) = tx.orchard_bundle() {
         for act in bundle.actions() {
-            let Some((coinbase_note, _, _)) = zcash_note_encryption::try_output_recovery_with_ovk(
-                &orchard::note_encryption::OrchardDomain::for_action(act),
-                &null_orchard_ovk,
-                act,
-                act.cv_net(),
-                &act.encrypted_note().out_ciphertext,
-            ) else {
-                return false;
-            };
-
-            if !is_valid_orchard_coinbase_note_version(coinbase_note.version()) {
+            if !orchard_action_decrypts_successfully(act) {
                 return false;
             }
         }
@@ -62,17 +50,7 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
     #[cfg(zcash_unstable = "nu6.3")]
     if let Some(bundle) = tx.ironwood_bundle() {
         for act in bundle.actions() {
-            let Some((coinbase_note, _, _)) = zcash_note_encryption::try_output_recovery_with_ovk(
-                &orchard::note_encryption::OrchardDomain::for_action(act),
-                &null_orchard_ovk,
-                act,
-                act.cv_net(),
-                &act.encrypted_note().out_ciphertext,
-            ) else {
-                return false;
-            };
-
-            if !is_valid_ironwood_coinbase_note_version(coinbase_note.version()) {
+            if !ironwood_action_decrypts_successfully(act) {
                 return false;
             }
         }
@@ -81,233 +59,136 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
     true
 }
 
-fn is_valid_orchard_coinbase_note_version(note_version: orchard::NoteVersion) -> bool {
-    note_version == orchard::NoteVersion::V2
+fn orchard_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
+    zcash_note_encryption::try_output_recovery_with_ovk(
+        &orchard::note_encryption::OrchardDomain::for_action(act),
+        &orchard::keys::OutgoingViewingKey::from([0u8; 32]),
+        act,
+        act.cv_net(),
+        &act.encrypted_note().out_ciphertext,
+    )
+    .is_some()
 }
 
 #[cfg(zcash_unstable = "nu6.3")]
-fn is_valid_ironwood_coinbase_note_version(note_version: orchard::NoteVersion) -> bool {
-    note_version == orchard::NoteVersion::V3
+fn ironwood_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
+    zcash_note_encryption::try_output_recovery_with_ovk(
+        &orchard::note_encryption::IronwoodDomain::for_action(act),
+        &orchard::keys::OutgoingViewingKey::from([0u8; 32]),
+        act,
+        act.cv_net(),
+        &act.encrypted_note().out_ciphertext,
+    )
+    .is_some()
 }
 
+#[cfg(zcash_unstable = "nu6.3")]
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use group::ff::PrimeField;
+    use group::{prime::PrimeCurveAffine, GroupEncoding};
     use halo2::pasta::pallas;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha20Rng;
-    use zcash_protocol::value::{ZatBalance, Zatoshis};
+    use orchard::{
+        note::{
+            ExtractedNoteCommitment, NoteVersion, Nullifier, RandomSeed, TransmittedNoteCiphertext,
+        },
+        note_encryption::IronwoodNoteEncryption,
+        primitives::redpallas::{SpendAuth, VerificationKey},
+        value::{NoteValue, ValueCommitment},
+        Action, Address, Note,
+    };
+    use rand_core::OsRng;
+    use zcash_note_encryption::Domain;
 
     #[cfg(zcash_unstable = "nu6.3")]
-    use crate::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
-    use crate::{
-        amount::{Amount, NegativeAllowed},
-        orchard::{
-            self as zebra_orchard, AuthorizedAction, EncryptedNote, ShieldedData, ValueCommitment,
-            WrappedNoteKey,
-        },
-        parameters::NetworkUpgrade,
-        primitives::Halo2Proof,
-        serialization::AtLeastOne,
-        transaction::LockTime,
-    };
+    #[test]
+    fn orchard_and_ironwood_domains_accept_only_their_plaintext_versions() {
+        let vector = zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR
+            .first()
+            .expect("test vectors are non-empty");
+        let v2_action = v2_action_from_test_vector(vector);
+        let v3_action = v3_action_from_test_vector(vector);
 
-    fn null_ovk() -> orchard::keys::OutgoingViewingKey {
-        orchard::keys::OutgoingViewingKey::from([0u8; 32])
-    }
+        for (domain_name, plaintext_lead_byte, action, expected) in [
+            ("Orchard", 0x02, &v2_action, true),
+            ("Orchard", 0x03, &v3_action, false),
+            ("Ironwood", 0x02, &v2_action, false),
+            ("Ironwood", 0x03, &v3_action, true),
+        ] {
+            let actual = match domain_name {
+                "Orchard" => super::orchard_action_decrypts_successfully(action),
+                "Ironwood" => super::ironwood_action_decrypts_successfully(action),
+                _ => unreachable!("test cases are exhaustive"),
+            };
 
-    fn orchard_recipient() -> orchard::Address {
-        let fvk = orchard::keys::FullViewingKey::from(
-            &orchard::keys::SpendingKey::from_bytes([0; 32]).unwrap(),
-        );
-        fvk.address_at(0u32, orchard::keys::Scope::External)
-    }
-
-    fn mainnet_nu5_height() -> Height {
-        NetworkUpgrade::Nu5
-            .activation_height(&Network::Mainnet)
-            .expect("NU5 is active on mainnet")
-    }
-
-    fn orchard_shielded_data(protocol: orchard::BundleProtocol) -> ShieldedData {
-        let value = Zatoshis::const_from_u64(10_000);
-        let mut builder = orchard::builder::Builder::new(
-            protocol,
-            orchard::builder::BundleType::Coinbase,
-            orchard::Anchor::empty_tree(),
-        );
-
-        builder
-            .add_output(
-                Some(null_ovk()),
-                orchard_recipient(),
-                orchard::value::NoteValue::from_raw(value.into()),
-                [0u8; 512],
-            )
-            .expect("can add an Orchard-style coinbase output");
-
-        let (bundle, _) = builder
-            .build::<ZatBalance>(&mut ChaCha20Rng::from_seed([0; 32]))
-            .expect("can build an Orchard-style coinbase bundle")
-            .expect("builder with one output creates a bundle");
-
-        let actions = bundle
-            .actions()
-            .iter()
-            .map(|action| {
-                let encrypted_note = action.encrypted_note();
-
-                AuthorizedAction {
-                    action: zebra_orchard::Action {
-                        cv: ValueCommitment::try_from(action.cv_net().to_bytes())
-                            .expect("builder creates valid value commitments"),
-                        nullifier: action
-                            .nullifier()
-                            .to_bytes()
-                            .try_into()
-                            .expect("builder creates valid nullifiers"),
-                        rk: <[u8; 32]>::from(action.rk().clone()).into(),
-                        cm_x: pallas::Base::from_repr(action.cmx().to_bytes())
-                            .expect("builder creates valid note commitment x-coordinates"),
-                        ephemeral_key: encrypted_note
-                            .epk_bytes
-                            .try_into()
-                            .expect("builder creates valid ephemeral keys"),
-                        enc_ciphertext: EncryptedNote::from(encrypted_note.enc_ciphertext),
-                        out_ciphertext: WrappedNoteKey::from(encrypted_note.out_ciphertext),
-                    },
-                    spend_auth_sig: [0u8; 64].into(),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        ShieldedData {
-            flags: zebra_orchard::Flags::ENABLE_OUTPUTS,
-            value_balance: Amount::<NegativeAllowed>::try_from(-10_000)
-                .expect("test value is in range"),
-            shared_anchor: zebra_orchard::tree::Root::default(),
-            proof: Halo2Proof(vec![
-                0u8;
-                orchard::Proof::expected_proof_size(actions.len())
-            ]),
-            actions: AtLeastOne::try_from(actions).expect("test bundle has one action"),
-            binding_sig: [0u8; 64].into(),
+            assert_eq!(
+                actual, expected,
+                "{domain_name} domain result for note plaintext {plaintext_lead_byte:#04x}"
+            );
         }
     }
 
-    fn orchard_coinbase_transaction() -> (Transaction, Height) {
-        let height = mainnet_nu5_height();
-        let orchard_shielded_data = orchard_shielded_data(orchard::BundleProtocol::OrchardPreNu6_3);
-
-        (
-            Transaction::V5 {
-                network_upgrade: NetworkUpgrade::Nu5,
-                lock_time: LockTime::unlocked(),
-                expiry_height: height,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                sapling_shielded_data: None,
-                orchard_shielded_data: Some(orchard_shielded_data),
+    fn v2_action_from_test_vector(v: &zebra_test::vectors::TestVector) -> Action<()> {
+        Action::from_parts(
+            Nullifier::from_bytes(&v.rho).expect("test vector has a valid nullifier"),
+            test_rk(),
+            ExtractedNoteCommitment::from_bytes(&v.cmx)
+                .expect("test vector has a valid note commitment"),
+            TransmittedNoteCiphertext {
+                epk_bytes: v.ephemeral_key,
+                enc_ciphertext: v.c_enc,
+                out_ciphertext: v.c_out,
             },
-            height,
+            ValueCommitment::from_bytes(&v.cv_net)
+                .expect("test vector has a valid value commitment"),
+            (),
         )
+        .expect("test vector fields form a valid action")
     }
 
-    #[test]
-    fn orchard_coinbase_output_decrypts_with_v2_note() {
-        let (transaction, height) = orchard_coinbase_transaction();
+    fn v3_action_from_test_vector(v: &zebra_test::vectors::TestVector) -> Action<()> {
+        let rho = orchard::note::Rho::from_bytes(&v.rho).expect("test vector has valid rho");
+        let rseed = RandomSeed::from_bytes(v.rseed, &rho)
+            .expect("test vector has a valid note random seed");
+        let address = test_vector_address(v);
+        let note = Note::from_parts(
+            address,
+            NoteValue::from_raw(v.v),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .expect("test vector components form a V3 note");
+        let cmx = ExtractedNoteCommitment::from(note.commitment());
+        let cv_net = ValueCommitment::from_bytes(&v.cv_net)
+            .expect("test vector has a valid value commitment");
+        let ovk = orchard::keys::OutgoingViewingKey::from([0; 32]);
+        let encryptor = IronwoodNoteEncryption::new(Some(ovk), note, v.memo);
+        let mut rng = OsRng;
 
-        assert!(decrypts_successfully(
-            &transaction,
-            &Network::Mainnet,
-            height
-        ));
-    }
-
-    #[test]
-    #[cfg(zcash_unstable = "nu6.3")]
-    fn ironwood_coinbase_output_rejects_v2_orchard_note() {
-        let (transaction, height) = orchard_coinbase_transaction();
-        let Transaction::V5 {
-            lock_time,
-            expiry_height,
-            inputs,
-            outputs,
-            sapling_shielded_data,
-            orchard_shielded_data: Some(orchard_shielded_data),
-            ..
-        } = transaction
-        else {
-            panic!("test transaction is V5 with Orchard shielded data");
-        };
-        let transaction = Transaction::V6 {
-            network_upgrade: NetworkUpgrade::Nu6_3,
-            lock_time,
-            expiry_height,
-            inputs,
-            outputs,
-            sapling_shielded_data,
-            orchard_shielded_data: None,
-            ironwood_shielded_data: Some(orchard_shielded_data),
-        };
-        let network = Network::new_regtest(RegtestParameters {
-            activation_heights: ConfiguredActivationHeights {
-                before_overwinter: Some(1),
-                overwinter: Some(2),
-                sapling: Some(3),
-                blossom: Some(4),
-                heartwood: Some(5),
-                canopy: Some(6),
-                nu5: Some(7),
-                nu6: Some(8),
-                nu6_1: Some(9),
-                nu6_2: Some(10),
-                nu6_3: Some(height.0),
-                nu7: None,
+        Action::from_parts(
+            Nullifier::from_bytes(&v.rho).expect("test vector has a valid nullifier"),
+            test_rk(),
+            cmx,
+            TransmittedNoteCiphertext {
+                epk_bytes: orchard::note_encryption::IronwoodDomain::epk_bytes(encryptor.epk()).0,
+                enc_ciphertext: encryptor.encrypt_note_plaintext(),
+                out_ciphertext: encryptor.encrypt_outgoing_plaintext(&cv_net, &cmx, &mut rng),
             },
-            ..Default::default()
-        });
-
-        assert!(!decrypts_successfully(&transaction, &network, height));
+            cv_net,
+            (),
+        )
+        .expect("test vector fields form a valid action")
     }
 
-    #[test]
-    #[cfg(zcash_unstable = "nu6.3")]
-    fn ironwood_coinbase_output_decrypts_with_v3_note() {
-        let height = Height(11);
-        let ironwood_shielded_data =
-            orchard_shielded_data(orchard::BundleProtocol::IronwoodPostNu6_3);
-        let activation_heights = ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(2),
-            sapling: Some(3),
-            blossom: Some(4),
-            heartwood: Some(5),
-            canopy: Some(6),
-            nu5: Some(7),
-            nu6: Some(8),
-            nu6_1: Some(9),
-            nu6_2: Some(10),
-            nu6_3: Some(height.0),
-            nu7: None,
-        };
-        let network = Network::new_regtest(RegtestParameters {
-            activation_heights,
-            ..Default::default()
-        });
-        let transaction = Transaction::V6 {
-            network_upgrade: NetworkUpgrade::Nu6_3,
-            lock_time: LockTime::unlocked(),
-            expiry_height: height,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            sapling_shielded_data: None,
-            orchard_shielded_data: None,
-            ironwood_shielded_data: Some(ironwood_shielded_data),
-        };
+    fn test_vector_address(v: &zebra_test::vectors::TestVector) -> Address {
+        let mut bytes = [0; 43];
+        bytes[..11].copy_from_slice(&v.default_d);
+        bytes[11..].copy_from_slice(&v.default_pk_d);
+        Address::from_raw_address_bytes(&bytes).expect("test vector has a valid address")
+    }
 
-        assert!(decrypts_successfully(&transaction, &network, height));
+    fn test_rk() -> VerificationKey<SpendAuth> {
+        VerificationKey::<SpendAuth>::try_from(pallas::Affine::generator().to_bytes())
+            .expect("Pallas generator is a valid RedPallas verification key")
     }
 }
