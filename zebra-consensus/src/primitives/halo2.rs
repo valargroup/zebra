@@ -4,7 +4,6 @@ use std::{
     fmt,
     future::Future,
     mem,
-    ops::Deref,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -104,22 +103,6 @@ lazy_static::lazy_static! {
     /// restriction.
     pub static ref VERIFYING_KEY_NU6_3_ONWARD: ItemVerifyingKey =
         ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
-}
-
-/// Deprecated compatibility name for [`VERIFYING_KEY_NU6_2`].
-#[deprecated(since = "8.0.0", note = "use VERIFYING_KEY_NU6_2 instead")]
-pub static VERIFYING_KEY_POST_NU6_2: DeprecatedPostNu6_2VerifyingKey =
-    DeprecatedPostNu6_2VerifyingKey;
-
-/// Compatibility wrapper for the deprecated post-NU6.2 verifying key name.
-pub struct DeprecatedPostNu6_2VerifyingKey;
-
-impl Deref for DeprecatedPostNu6_2VerifyingKey {
-    type Target = ItemVerifyingKey;
-
-    fn deref(&self) -> &Self::Target {
-        &VERIFYING_KEY_NU6_2
-    }
 }
 
 /// A Halo2 verification item, used as the request type of the service.
@@ -275,21 +258,6 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 pub static VERIFIER_NU6_2: Lazy<VerifierService> =
     Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2));
 
-/// Deprecated compatibility name for [`VERIFIER_NU6_2`].
-#[deprecated(since = "8.0.0", note = "use VERIFIER_NU6_2 instead")]
-pub static VERIFIER_POST_NU6_2: DeprecatedPostNu6_2Verifier = DeprecatedPostNu6_2Verifier;
-
-/// Compatibility wrapper for the deprecated post-NU6.2 verifier name.
-pub struct DeprecatedPostNu6_2Verifier;
-
-impl Deref for DeprecatedPostNu6_2Verifier {
-    type Target = VerifierService;
-
-    fn deref(&self) -> &Self::Target {
-        &VERIFIER_NU6_2
-    }
-}
-
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
 /// Items routed here are verified against [`VERIFYING_KEY_NU6_3_ONWARD`] (the NU6.3 circuit, which
@@ -323,7 +291,7 @@ pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
 /// The mapping is an explicit, exhaustive `match` on every [`NetworkUpgrade`] variant: there is
 /// no version-comparison fallthrough and no default-to-insecure arm, so adding a future upgrade
 /// is a compile error here until it is bound to a key on purpose.
-pub fn verifier_for_orchard_circuit(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
+pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     use NetworkUpgrade::*;
 
     match network_upgrade {
