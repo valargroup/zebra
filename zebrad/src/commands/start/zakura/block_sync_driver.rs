@@ -546,12 +546,21 @@ pub(crate) fn coalesce_ready_needed_block_queries(
         }
     }
 
-    latest_query.map(
-        |(verified_block_tip, best_header_tip)| BlockSyncAction::QueryNeededBlocks {
+    let latest_query = latest_query.map(|(verified_block_tip, best_header_tip)| {
+        BlockSyncAction::QueryNeededBlocks {
             verified_block_tip,
             best_header_tip,
-        },
-    )
+        }
+    });
+
+    if !deferred_actions.is_empty() {
+        if let Some(query) = latest_query {
+            deferred_actions.push_back(query);
+        }
+        return None;
+    }
+
+    latest_query
 }
 
 pub(crate) fn coalesce_stale_needed_block_queries(
