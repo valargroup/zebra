@@ -397,6 +397,17 @@ impl Sequencer {
         }
     }
 
+    fn clear_submitted_applies_through(&mut self, tip: block::Height) {
+        let heights: Vec<_> = self
+            .submitted_applies
+            .range(..=tip)
+            .map(|(height, _)| *height)
+            .collect();
+        for height in heights {
+            self.submitted_applies.remove(&height);
+        }
+    }
+
     // ---- apply finished ----
 
     /// The `(token, hash)` of the body currently applying at `height`, for
@@ -452,6 +463,7 @@ impl Sequencer {
             .range(..=tip)
             .map(|(height, _)| *height)
             .collect();
+        self.clear_submitted_applies_through(tip);
         let mut released = 0u64;
         for height in applied {
             if let Some(applying) = self.applying.remove(&height) {

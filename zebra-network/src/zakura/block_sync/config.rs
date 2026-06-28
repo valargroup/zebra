@@ -51,12 +51,29 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
 /// Default block-count cap for speculative reorder look-ahead bookkeeping.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
-/// Default maximum submitted block applies awaiting verifier completion.
+/// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
-/// window is queued, so this defaults to one maximum checkpoint gap.
-pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+/// window, including the resolving checkpoint block, is queued. A node that
+/// starts one height before a checkpoint-gap boundary can therefore need one
+/// maximum checkpoint gap plus the boundary block in flight.
+pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
+    zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+/// Default maximum submitted block applies awaiting verifier completion.
+pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+/// The byte budget required to hold one full worst-case checkpoint range in
+/// flight.
+///
+/// The checkpoint verifier resolves a block's commit only once the entire
+/// contiguous range to the next checkpoint has been submitted, and every
+/// submitted body stays reserved against `max_inflight_block_bytes` until it is
+/// durable. A budget that cannot hold a whole worst-case range can never
+/// complete one: the verifier never commits, nothing becomes durable, and no
+/// bytes are ever released.
+pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
+    // `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+    // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
+    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default central floor-watchdog cadence.
@@ -231,7 +248,8 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the non-zero verifier submission cap.
     pub fn submitted_apply_limit(&self) -> usize {
-        self.max_submitted_block_applies.max(1)
+        self.max_submitted_block_applies
+            .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
     }
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
@@ -276,6 +294,32 @@ impl ZakuraBlockSyncConfig {
             return Err("max_inflight_block_bytes must exceed one floor request");
         }
         Ok(())
+    }
+
+    /// Raise `max_inflight_block_bytes` up to the checkpoint-range floor when it
+    /// is configured below it, warning once.
+    ///
+    /// A positive budget below [`BS_CHECKPOINT_RANGE_BYTE_FLOOR`] cannot hold one
+    /// full worst-case checkpoint range. The checkpoint verifier only commits a
+    /// range once the whole range is submitted, and every submitted body stays
+    /// reserved against the budget until it is durable, so a budget below the
+    /// floor would deadlock: the verifier never commits, nothing becomes durable,
+    /// and no bytes are ever released. Rather than refuse to start -- which would
+    /// break older configs that set a smaller budget -- clamp the budget up to the
+    /// floor and warn. Zero is left untouched so [`validate`](Self::validate)
+    /// still rejects it as an explicit misconfiguration.
+    pub fn clamp_inflight_block_bytes_to_floor(&mut self) {
+        if self.max_inflight_block_bytes > 0
+            && self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR
+        {
+            tracing::warn!(
+                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
+                checkpoint_range_byte_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+                "zakura.block_sync.max_inflight_block_bytes is below the checkpoint-range \
+                 floor; clamping it up so checkpoint sync cannot deadlock",
+            );
+            self.max_inflight_block_bytes = BS_CHECKPOINT_RANGE_BYTE_FLOOR;
+        }
     }
 
     /// Build the inert local status used before the block-sync reactor is wired.

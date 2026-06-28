@@ -57,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
+- Use V3 chain-history entries from NU6.3 onward, including Ironwood note
+  commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
@@ -179,6 +181,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   between. It now treats an absent genesis tree as a (mid-flight) fast-synced
   database — where the genesis-root-caching invariant does not apply — instead of
   panicking.
+- Treat missing transaction inventory responses during mempool download as a
+  recoverable download failure, avoiding a panic when public peers no longer
+  have a gossiped transaction available.
 - Roll back the Zakura header store together with finalized block data, so
   databases produced by `zebra-rollback-state` can resume Zakura body sync from
   the new body tip instead of stalling behind stale headers and falling back to
