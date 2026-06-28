@@ -63,8 +63,10 @@ pub use service::{
     finalized_state::FinalizedState,
     init, init_read_only,
     non_finalized_state::NonFinalizedState,
+    queued_blocks::QueuedCheckpointVerified,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
+    write::BlockWriteSender,
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
 
