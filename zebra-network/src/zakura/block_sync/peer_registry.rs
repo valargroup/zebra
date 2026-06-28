@@ -50,17 +50,15 @@ pub(super) struct Entry {
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
     pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
-    /// Routine-published slot diagnostics (trace only): the per-peer download
-    /// window state the reactor used to read off `PeerBlockState` for the periodic
-    /// `BLOCK_SYNC_STATE` row. Updated whenever the routine issues/finishes/times
-    /// out a request.
+    /// Routine-published slot diagnostics for the periodic `BLOCK_SYNC_STATE` row.
+    /// Updated whenever the routine issues, finishes, or times out a request.
     pub(super) slots: SlotDiagnostics,
     /// Heights this peer may not re-take until the given instant.
     pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
-    /// generation still matches, so an old Drop racing a reset respawn cannot wipe
-    /// the live routine's published outstanding.
+    /// generation still matches, so a stale Drop racing a reset respawn cannot
+    /// wipe the live routine's published outstanding.
     pub(super) generation: u64,
 }
 

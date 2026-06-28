@@ -60,8 +60,7 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
 /// Default maximum submitted block applies awaiting verifier completion.
-pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize =
-    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 /// The byte budget required to hold one full worst-case checkpoint range in
 /// flight.
 ///

@@ -320,9 +320,9 @@ impl BlockSyncState {
 
 /// Adaptive per-peer outbound request window + outstanding requests.
 ///
-/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
-/// while the per-peer download state moves into the spawned
-/// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
+/// Adaptive window state embedded by each
+/// [`PeerRoutine`](super::peer_routine), kept separate so the window math stays
+/// unit-testable.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,

@@ -762,8 +762,7 @@ impl BlockSyncReactor {
     }
 
     /// React to the latest progress view from the Sequencer task: update the
-    /// reactor's mirrors, then run the serving/peer/candidate/producer
-    /// half that used to follow the inline Sequencer mutation
+    /// reactor's mirrors, then run the serving/peer/candidate/producer reaction
     /// (status refresh, candidate prune, drop-outstanding, re-query, re-schedule).
     async fn on_sequencer_view_changed(&mut self, view: SequencerView) {
         // Always update the mirrors so the producer lower bound,
@@ -783,12 +782,10 @@ impl BlockSyncReactor {
         self.state.servable_high = view.verified_tip;
         self.state.servable_hash = view.verified_hash;
 
-        // The heavy serving/peer/candidate/producer reaction (drop-outstanding,
-        // prune, status, query, schedule) ran in the single-task version for a
-        // frontier advance, reset, or apply-finished — never for a pure body
-        // buffer/submit, which only reschedules the forwarding peer (the reactor
-        // already did that after forwarding `AcceptBody`). The `reaction_epoch`
-        // advances exactly for those inputs.
+        // Run the heavy serving/peer/candidate/producer reaction only after
+        // frontier advances, resets, or apply-finished events. Pure body
+        // buffer/submit events only need the forwarding peer to reschedule.
+        // The `reaction_epoch` advances exactly for those inputs.
         if !reaction_advanced {
             return;
         }
@@ -878,7 +875,7 @@ impl BlockSyncReactor {
         // the new work up via `work.subscribe_available()` (the wake), so the
         // reactor no longer schedules here. Stale-hash pruning of an *outstanding*
         // request is now owned by the routine (and reset = in-place clear) rather
-        // than the reactor's old `drop_ranges_not_in_needed`.
+        // than this producer.
         //
         // `extend` runs BEFORE the candidate publish so the candidate watch update
         // is a reliable "work is now in `pending`" signal: a routine that sees the
@@ -1188,11 +1185,9 @@ impl BlockSyncReactor {
     }
 
     fn local_body_work_blocks(&self) -> usize {
-        // The unreceived in-flight heights now live in the routines, mirrored into
-        // the registry's per-peer outstanding set (per-request granularity: each
-        // entry is one still-unreceived requested height). `total_unreceived` sums
-        // them — the same count the old per-peer `expected_blocks − received`
-        // produced.
+        // Unreceived in-flight heights live in the routines, mirrored into the
+        // registry's per-peer outstanding set (per-request granularity: each entry
+        // is one still-unreceived requested height).
         let outstanding = self.registry.total_unreceived();
 
         // Count only the download pipeline (pending WorkQueue heights + the

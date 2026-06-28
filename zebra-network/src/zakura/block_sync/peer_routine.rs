@@ -16,13 +16,10 @@
 //! on the byte budget + per-peer slots: `take_in_range(servable_low,
 //! servable_high, n)` uses `servable_high` as the upper bound.
 //!
-//! The download logic is **moved, not rewritten** from the previous reactor: the
-//! want-work fill loop ports `fill_peer`, the matched-body tail ports
-//! `handle_block`, and the unmatched fallthroughs port `accept_unmatched_queued_body`
-//! / the `ignore_*` helpers / `stale_adjusted_outstanding_disposition` verbatim,
-//! changing only where the state lives (now routine-local or the
-//! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
-//! task's own `FramedRecv` rather than a `PeerInput` channel.
+//! The routine keeps request issuance, body matching, unmatched-body handling,
+//! timeout recovery, and retry classification with the peer-local state it owns.
+//! Shared state changes are published back through [`PeerRegistry`] or
+//! [`RoutineToReactor`].
 
 use std::collections::BTreeMap;
 
@@ -61,8 +58,7 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 /// contest that height again. The window only has to be long enough that, on the
 /// single-threaded test runtime, the other routines woken by the same failure
 /// `return_items` get a chance to take the contested work first — it is the
-/// peer-local retry bias the central `fill_rotation_cursor` used to provide
-///. It is
+/// peer-local retry bias for contested retry heights. It is
 /// negligible against real sync timescales, and the height stays `pending` and
 /// fully contestable by every other peer throughout.
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
@@ -81,8 +77,7 @@ fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
     );
 }
 
-/// Outcome classification for finishing an outstanding request (ported verbatim
-/// from the reactor's `OutstandingRangeDisposition`).
+/// Outcome classification for finishing an outstanding request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Disposition {
     Satisfied,
@@ -137,7 +132,7 @@ pub(super) struct PeerRoutine {
     // ---- shared primitives (clones) ----
     /// Generation this routine was spawned with; gates its registry writes (and
     /// its `Drop`) so a superseded routine (e.g. a session replacement before the
-    /// old task's async Drop runs) cannot corrupt the live entry.
+    /// cancelled task's async Drop runs) cannot corrupt the live entry.
     generation: u64,
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
@@ -529,9 +524,7 @@ impl PeerRoutine {
     async fn try_fill(&mut self) {
         // Reconcile the adaptive window's hard cap with the peer's currently
         // advertised `max_inflight_requests` (it may have grown/shrunk via a
-        // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
-        // the previous `handle_status` clamp of the window / recovery slots to the
-        // new hard capacity.
+        // `Status`; `handle_status` set `window.max_inflight_requests`).
         let hard = self.window.hard_outbound_capacity();
         self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
         self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
@@ -539,10 +532,8 @@ impl PeerRoutine {
         // download floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
         // than waiting for the request's own timeout. This is the floor used for
-        // GC of *our own* covered requests, never a fetch
-        // throttle — it replaces the previous reactor `drop_outstanding_through`
-        // without the cross-peer churn the spec warned about (a partially-received
-        // request whose suffix is still above the floor is left in place).
+        // GC of *our own* covered requests, never a fetch throttle. A partially
+        // received request whose suffix is still above the floor is left in place.
         self.gc_committed_outstanding();
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
@@ -1455,7 +1446,7 @@ impl PeerRoutine {
     /// Publish this peer's current *unreceived* in-flight height metadata to the
     /// registry, so the producer's `!has_outstanding_request` filter and the
     /// low-water `total_unreceived` gate read the same per-request-granularity
-    /// count the previous reactor used (`expected_blocks.len() − received.len()`).
+    /// count.
     /// Received-but-uncommitted heights are excluded here because they are held in
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
@@ -1483,8 +1474,7 @@ impl PeerRoutine {
             self.registry
                 .set_outstanding(&self.peer, self.generation, map);
         }
-        // Publish the window slot diagnostics for the reactor's periodic trace row
-        // (trace only; the reactor lost direct visibility into the routine window).
+        // Publish the window slot diagnostics for the reactor's periodic trace row.
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.registry.publish_slots(
             &self.peer,
@@ -1553,9 +1543,8 @@ impl PeerRoutine {
         });
     }
 
-    /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
-    /// now emitted in the routine that decoded it). Records the message kind only;
-    /// the per-variant field detail lives on the reactor's heavier trace path.
+    /// Trace a decoded inbound message. Records the message kind only; the
+    /// per-variant field detail lives on the reactor's heavier trace path.
     fn trace_message_received(&self, msg: &BlockSyncMessage) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
             row.insert(
@@ -1725,8 +1714,8 @@ impl Drop for PeerRoutine {
     /// The guard clears the peer's *outstanding* rather than removing the whole
     /// registry entry: a reset respawns the routine (the reactor cancels + spawns
     /// a fresh one) while the peer stays connected, so its servable/caps must
-    /// survive. If the guard removed the entry, an old routine's async Drop could
-    /// race *after* the respawned routine re-inserted and nuke the live entry.
+    /// survive. If the guard removed the entry, a cancelled routine's async Drop
+    /// could race *after* the respawned routine re-inserted and nuke the live entry.
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {

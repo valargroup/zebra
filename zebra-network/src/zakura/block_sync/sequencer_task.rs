@@ -363,9 +363,8 @@ impl SequencerTask {
         );
     }
 
-    /// Body-acceptance tail (verbatim from `handle_block` ~885-907 and
-    /// `accept_unmatched_queued_body` ~1170-1183): offer the body, release on
-    /// `Redundant`, then drain ready prefix into applying and submit.
+    /// Offer the body to the Sequencer, release redundant reservations, then
+    /// drain the ready prefix into applying and submit.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
@@ -385,20 +384,16 @@ impl SequencerTask {
         self.release_contiguous_blocks().await;
     }
 
-    /// Sequencer half of `apply_state_frontiers_changed` (verbatim from
-    /// reactor.rs ~447-478, including the stale guard).
+    /// Apply a verified frontier advance to the Sequencer, including the stale
+    /// update guard.
     async fn handle_frontier_advance(
         &mut self,
         frontiers: BlockSyncFrontiers,
         release_applied: bool,
     ) {
-        // Fold the finalized height forward unconditionally (matches the original's
-        // first line), then drop a stale update. The verified tip is monotonic: an
-        // advance whose target is below our verified tip must be a no-op, never a
-        // regression. This guard is the original `apply_state_frontiers_changed`'s
-        // `verified_block_tip < verified_tip() => return None`; without it the
-        // second growth-reset path (`< floor`, which permits `< verified_tip`) would
-        // call `advance_verified_tip` with a lower tip and regress it.
+        // Fold the finalized height forward unconditionally, then drop stale
+        // updates. The verified tip is monotonic: an advance whose target is below
+        // our verified tip must be a no-op, never a regression.
         self.finalized_height = self.finalized_height.max(frontiers.finalized_height);
         if frontiers.verified_block_tip < self.sequencer.verified_tip() {
             return;
@@ -415,9 +410,8 @@ impl SequencerTask {
         }
     }
 
-    /// The Sequencer/work/budget body of `handle_chain_tip_reset` (verbatim from
-    /// reactor.rs 502-576). The peer-outstanding reads are replaced by the
-    /// precomputed `peer_*` bools.
+    /// Reset Sequencer/work/budget state after a chain-tip reset. Peer-outstanding
+    /// reads are passed in as precomputed `peer_*` bools.
     async fn handle_frontier_reset(
         &mut self,
         frontiers: BlockSyncFrontiers,
@@ -594,8 +588,7 @@ impl SequencerTask {
         true
     }
 
-    /// Drain the contiguous reorder prefix into applying and submit (verbatim
-    /// from `release_contiguous_blocks` + `submit_pending_blocks`).
+    /// Drain the contiguous reorder prefix into applying, then submit ready blocks.
     async fn release_contiguous_blocks(&mut self) {
         let _ = self.sequencer.drain_ready_into_applying();
         self.submit_pending_blocks().await;

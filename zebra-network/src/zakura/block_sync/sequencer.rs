@@ -12,8 +12,8 @@
 //!   re-query, attribute misbehavior) is expressed as a value the reactor acts
 //!   on, not performed here.
 //!
-//! The logic is preserved verbatim from the reactor; only its boundary changes.
-//! That boundary is what lets a later stage move the Sequencer onto its own task.
+//! This boundary keeps sequencing logic isolated so the commit pipeline can run
+//! independently from peer and scheduler state.
 
 use super::{events::BlockApplyToken, reorder::*, state::*, *};
 

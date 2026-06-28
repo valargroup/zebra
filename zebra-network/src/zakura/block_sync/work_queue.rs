@@ -505,8 +505,7 @@ impl WorkQueue {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// Number of contiguous runs across `pending` (the old `queue_len` meaning:
-    /// one queued range per maximal contiguous run of heights).
+    /// Number of contiguous runs across `pending`.
     pub(super) fn pending_run_count(&self) -> usize {
         let inner = self.lock();
         let mut runs = 0usize;
@@ -559,8 +558,7 @@ impl WorkQueue {
             .max(inner.in_flight.keys().next_back().copied())
     }
 
-    /// Expected hash for a height in `pending` or `in_flight` (late-response
-    /// recovery; replaces the old `queued_hash_for_height`).
+    /// Expected hash for a height in `pending` or `in_flight`.
     pub(super) fn hash_for_height(&self, height: block::Height) -> Option<block::Hash> {
         let inner = self.lock();
         inner
