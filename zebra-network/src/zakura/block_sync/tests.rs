@@ -432,14 +432,15 @@ fn peer_outbound_request_window_backs_off_and_grows_with_streaks() {
     }
     assert_eq!(window.outbound_request_window, 1);
     assert_eq!(window.available_slots(), window.timeout_recovery_slots);
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
+    // Pinned at the floor, the peer is tolerated for two full reduction epochs
+    // (2 * 16 = 32 consecutive timeouts, ~256s at the 8s request timeout) before
+    // being disconnected.
+    for _ in 0..31 {
+        assert_eq!(
+            window.reduce_outbound_window_after_timeout(),
+            TimeoutBackoffOutcome::KeepPeer
+        );
+    }
     assert_eq!(
         window.reduce_outbound_window_after_timeout(),
         TimeoutBackoffOutcome::DisconnectPeer

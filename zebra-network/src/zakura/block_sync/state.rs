@@ -32,8 +32,17 @@ const OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF: usize = 8;
 const OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF: usize = OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF;
 /// Consecutive timeout batches that make up one window-reduction epoch.
 const OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS: usize = OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
-/// Timeouts tolerated after the adaptive window has already reached its floor.
-const OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT: usize = 3;
+/// Timeouts tolerated after the adaptive window has already reached its floor of
+/// one in-flight request, before the peer is disconnected.
+///
+/// Set to two full reduction epochs. Once a peer has been backed off all the way
+/// down to a single in-flight request, we keep probing it for
+/// `2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS` consecutive timeouts before
+/// giving up — at the default 8s request timeout that is ~256s of uninterrupted
+/// failure at the floor. Any successful response (even a single block) resets the
+/// streak, so only a peer that serves nothing across the whole window is dropped.
+const OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT: usize =
+    2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
