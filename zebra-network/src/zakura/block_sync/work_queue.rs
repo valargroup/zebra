@@ -200,6 +200,15 @@ impl WorkQueue {
         max_count: usize,
         max_estimated_bytes: u64,
     ) -> Vec<(block::Height, WorkItem)> {
+        // An empty count or inverted range is a caller bug, not a real "nothing to
+        // take": every caller computes `low <= high` and a positive count before
+        // calling. Assert it in debug/test builds; still return empty in release so
+        // a miscomputation degrades to a no-op rather than panicking a live node.
+        debug_assert!(
+            max_count > 0 && low <= high,
+            "take_in_range_budgeted requires a positive count and low <= high, \
+             got max_count={max_count}, low={low:?}, high={high:?}"
+        );
         if max_count == 0 || low > high {
             return Vec::new();
         }
@@ -496,8 +505,8 @@ impl WorkQueue {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// Number of contiguous runs across `pending` (the old `queue_len` meaning:
-    /// one queued range per maximal contiguous run of heights).
+    /// Number of contiguous runs across `pending` (one queued range per maximal
+    /// contiguous run of heights).
     pub(super) fn pending_run_count(&self) -> usize {
         let inner = self.lock();
         let mut runs = 0usize;
@@ -551,7 +560,7 @@ impl WorkQueue {
     }
 
     /// Expected hash for a height in `pending` or `in_flight` (late-response
-    /// recovery; replaces the old `queued_hash_for_height`).
+    /// recovery).
     pub(super) fn hash_for_height(&self, height: block::Height) -> Option<block::Hash> {
         let inner = self.lock();
         inner

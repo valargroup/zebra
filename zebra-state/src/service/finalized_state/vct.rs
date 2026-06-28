@@ -3,7 +3,7 @@
 //! This module holds the embedded-frontier plumbing and run counters for the
 //! verified-commitment-trees fast path. On networks with an embedded handoff frontier,
 //! the default source is the peer `tree_aux` source. `checkpoint_sync = false` or
-//! `consensus.disable_vct_fast_sync = true` selects legacy recompute.
+//! `consensus.vct_fast_sync = false` selects legacy recompute.
 //!
 //! [`super`] (`finalized_state.rs`) holds only the commit-path hook (the checkpoint
 //! handoff write and the fast-sync marker); everything about *where the data comes
@@ -58,7 +58,7 @@ pub enum FinalFrontiersValidationError {
 ///
 /// A checkpoint-trusting sync (`checkpoint_sync = true`) uses the peer `tree_aux` source by
 /// default on networks with embedded final frontiers; `checkpoint_sync = false` or
-/// `disable_vct_fast_sync = true` opts out to the legacy per-block recompute (no VCT state).
+/// `vct_fast_sync = false` opts out to the legacy per-block recompute (no VCT state).
 #[derive(Debug)]
 pub(crate) struct VctState {
     /// Fast mode: skip the per-block frontier recompute and fold the source's roots
@@ -92,15 +92,15 @@ enum SourceMode {
 /// unit-testable without touching embedded-frontier files. The fast verified path
 /// (peer source) is the default whenever the node syncs under checkpoint trust and
 /// the network has an embedded handoff frontier. `checkpoint_sync = false` or
-/// `disable_vct_fast_sync = true` selects the legacy recompute; a network with no embedded
+/// `vct_fast_sync = false` selects the legacy recompute; a network with no embedded
 /// frontier also falls back to legacy. Storage mode (Archive vs. Pruned) is orthogonal and not
 /// an input here.
 fn select_source_mode(
     checkpoint_sync: bool,
-    disable_vct_fast_sync: bool,
+    vct_fast_sync: bool,
     has_embedded_frontiers: bool,
 ) -> SourceMode {
-    if !checkpoint_sync || disable_vct_fast_sync || !has_embedded_frontiers {
+    if !checkpoint_sync || !vct_fast_sync || !has_embedded_frontiers {
         SourceMode::Legacy
     } else {
         SourceMode::Peer
@@ -109,14 +109,14 @@ fn select_source_mode(
 
 impl VctState {
     /// Build the committer state from `checkpoint_sync` (the mirror of
-    /// `consensus.checkpoint_sync`) and the `disable_vct_fast_sync` force-disable knob.
+    /// `consensus.checkpoint_sync`) and the `vct_fast_sync` knob.
     /// On networks with an embedded handoff frontier (Mainnet) a checkpoint-trusting sync
-    /// defaults to the peer (`tree_aux`) fast source; disabling checkpoint sync, setting the
-    /// force-disable knob, or using a network without an embedded frontier returns `None` for a
-    /// zero-overhead legacy committer that recomputes the trees per block.
+    /// defaults to the peer (`tree_aux`) fast source; disabling checkpoint sync, setting
+    /// `vct_fast_sync = false`, or using a network without an embedded frontier returns `None` for
+    /// a zero-overhead legacy committer that recomputes the trees per block.
     pub(super) fn from_config(
         checkpoint_sync: bool,
-        disable_vct_fast_sync: bool,
+        vct_fast_sync: bool,
         network: &Network,
         db: ZebraDb,
     ) -> Option<Arc<Self>> {
@@ -125,7 +125,7 @@ impl VctState {
         // parsed value.
         let embedded = embedded_final_frontiers(network);
 
-        match select_source_mode(checkpoint_sync, disable_vct_fast_sync, embedded.is_some()) {
+        match select_source_mode(checkpoint_sync, vct_fast_sync, embedded.is_some()) {
             // Default: the peer (`tree_aux`) source on any network with embedded final
             // frontiers (Mainnet). Per-block roots arrive from peers into a shared cache
             // filled by the driver; the committer reads them per height and folds them in,
@@ -379,24 +379,24 @@ mod tests {
     #[test]
     fn source_mode_precedence() {
         use SourceMode::*;
-        // Args are (checkpoint_sync, disable_vct_fast_sync, has_embedded_frontiers).
+        // Args are (checkpoint_sync, vct_fast_sync, has_embedded_frontiers).
 
-        // The default: a checkpoint-trusting sync uses the peer source wherever embedded
-        // frontiers exist (Mainnet). Storage mode (Archive/Pruned) is not an input, so this
-        // covers both Archive and Pruned.
-        assert_eq!(select_source_mode(true, false, true), Peer);
-        // `disable_vct_fast_sync = true` keeps checkpoint sync on but forces the legacy
-        // recompute, regardless of embedded frontiers.
-        assert_eq!(select_source_mode(true, true, true), Legacy);
-        assert_eq!(select_source_mode(true, true, false), Legacy);
+        // The default: a checkpoint-trusting sync with VCT fast sync on uses the peer source
+        // wherever embedded frontiers exist (Mainnet). Storage mode (Archive/Pruned) is not an
+        // input, so this covers both Archive and Pruned.
+        assert_eq!(select_source_mode(true, true, true), Peer);
+        // `vct_fast_sync = false` keeps checkpoint sync on but forces the legacy recompute,
+        // regardless of embedded frontiers.
+        assert_eq!(select_source_mode(true, false, true), Legacy);
+        assert_eq!(select_source_mode(true, false, false), Legacy);
         // `checkpoint_sync = false` also fully recomputes the trees: legacy, never peer,
-        // regardless of the force-disable knob or embedded frontiers.
-        assert_eq!(select_source_mode(false, false, true), Legacy);
-        assert_eq!(select_source_mode(false, false, false), Legacy);
+        // regardless of the fast-sync knob or embedded frontiers.
         assert_eq!(select_source_mode(false, true, true), Legacy);
         assert_eq!(select_source_mode(false, true, false), Legacy);
+        assert_eq!(select_source_mode(false, false, true), Legacy);
+        assert_eq!(select_source_mode(false, false, false), Legacy);
         // No embedded frontiers (e.g. Testnet): legacy, never peer, even under checkpoint sync.
-        assert_eq!(select_source_mode(true, false, false), Legacy);
+        assert_eq!(select_source_mode(true, true, false), Legacy);
     }
 
     #[test]

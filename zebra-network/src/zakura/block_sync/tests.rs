@@ -6,11 +6,10 @@ use super::*;
 use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
-        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_FLOOR_WATCHDOG_TICK,
-        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES, DEFAULT_BS_REQUEST_TIMEOUT,
-        MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -708,7 +707,6 @@ fn block_sync_config_defaults_and_round_trips() {
         default.max_reorder_lookahead_blocks,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS
     );
-    assert_eq!(default.floor_watchdog_tick, DEFAULT_BS_FLOOR_WATCHDOG_TICK);
     assert_eq!(
         default.floor_peer_avoid_cooldown,
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
@@ -720,10 +718,6 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(
         default.floor_request_byte_reservation(),
         u64::from(DEFAULT_BS_MAX_RESPONSE_BYTES)
-    );
-    assert_eq!(
-        default.effective_floor_watchdog_tick(),
-        DEFAULT_BS_FLOOR_WATCHDOG_TICK
     );
     assert_eq!(
         default.effective_floor_peer_avoid_cooldown(),

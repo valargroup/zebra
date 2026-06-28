@@ -329,9 +329,9 @@ impl BlockSyncState {
 
 /// Adaptive per-peer outbound request window + outstanding requests.
 ///
-/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
-/// while the per-peer download state moves into the spawned
-/// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
+/// Kept as a standalone type so the window math stays unit-testable; the per-peer
+/// download state lives in the spawned [`PeerRoutine`](super::peer_routine), which
+/// embeds one of these.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
@@ -522,9 +522,9 @@ pub(super) struct PeerBlockState {
     pub(super) direction: ServicePeerDirection,
     /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
     /// (serving-tip change broadcast + retry to peers that have not acknowledged
-    /// our Status). The previous `unsolicited` meter was dual-use; its inbound-status
-    /// *reply* half moved to the routine's `status_reply_meter`. This half stays
-    /// reactor-side because the reactor owns serving-tip advertisement.
+    /// our Status). The inbound-status *reply* half lives on the routine's
+    /// `status_reply_meter`; this half stays reactor-side because the reactor owns
+    /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
     pub(super) served_blocks_inflight: u32,
     pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,

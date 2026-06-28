@@ -114,8 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   no untrusted data can influence consensus state. This is the default whenever
   `consensus.checkpoint_sync = true` on a network with an embedded handoff frontier
   (Mainnet), for both Archive and Pruned storage modes. The new
-  `consensus.disable_vct_fast_sync` flag (default `false`) keeps checkpoint sync
-  enabled while forcing the legacy per-block recompute. Bumps the state database
+  `consensus.vct_fast_sync` flag (default `true`) selects this fast path; set it to
+  `false` to keep checkpoint sync enabled while forcing the legacy per-block
+  recompute. Bumps the state database
   format to 27.3.0 (new column families only; no data migration).
 - Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.

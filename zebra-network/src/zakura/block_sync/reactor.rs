@@ -256,14 +256,19 @@ impl BlockSyncReactor {
                 .status_refresh_interval
                 .max(Duration::from_millis(1)),
         );
-        let mut floor_watchdog_ticks =
-            time::interval(self.startup.config.effective_floor_watchdog_tick());
 
         self.query_needed_blocks().await;
         self.publish_metrics();
         self.refresh_throughput();
         self.trace_sync_state();
         loop {
+            // Arm the floor watchdog to the earliest outstanding floor-claim
+            // deadline (event-driven, like the per-peer routine's own-timeout
+            // arm): force-cancel an expired floor request exactly when it expires
+            // instead of polling. Rebuilt each iteration, so any event that adds,
+            // completes, or advances the floor re-arms it to the next deadline.
+            let floor_watchdog = self.earliest_floor_deadline_sleep();
+            tokio::pin!(floor_watchdog);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
@@ -345,11 +350,24 @@ impl BlockSyncReactor {
                     self.trace_sync_state();
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
-                _ = floor_watchdog_ticks.tick() => {
+                _ = &mut floor_watchdog => {
                     self.run_floor_watchdog(Instant::now());
                     self.publish_metrics();
                 }
             }
+        }
+    }
+
+    /// Sleep future resolving at the earliest outstanding floor-claim deadline, so
+    /// the reactor force-cancels an expired floor request exactly when it expires
+    /// rather than on a fixed poll. Defaults to a long idle sleep when no floor
+    /// claim is outstanding; any reactor event recomputes it on the next iteration.
+    fn earliest_floor_deadline_sleep(&self) -> time::Sleep {
+        let earliest = next_height(self.request_floor)
+            .and_then(|height| self.registry.earliest_outstanding_deadline_at(height));
+        match earliest {
+            Some(deadline) => time::sleep(deadline.saturating_duration_since(Instant::now())),
+            None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
@@ -537,8 +555,7 @@ impl BlockSyncReactor {
         let mut peer_state = PeerBlockState::new(session, &self.startup.config);
         // Consume the status-advertisement refresh allowance: the connect Status
         // below counts as this peer's first advertisement, so the next periodic
-        // refresh must wait a full interval before re-sending (matches the previous
-        // `unsolicited.mark_taken` at connect).
+        // refresh must wait a full interval before re-sending.
         peer_state.refresh_meter.mark_taken(Instant::now());
         self.state.peers.insert(peer.clone(), peer_state);
 
@@ -744,8 +761,7 @@ impl BlockSyncReactor {
     }
 
     /// React to the latest progress view from the Sequencer task: update the
-    /// reactor's mirrors, then run the serving/peer/candidate/producer
-    /// half that used to follow the inline Sequencer mutation
+    /// reactor's mirrors, then run the serving/peer/candidate/producer half
     /// (status refresh, candidate prune, drop-outstanding, re-query, re-schedule).
     async fn on_sequencer_view_changed(&mut self, view: SequencerView) {
         // Always update the mirrors so the producer lower bound,
@@ -766,11 +782,11 @@ impl BlockSyncReactor {
         self.state.servable_hash = view.verified_hash;
 
         // The heavy serving/peer/candidate/producer reaction (drop-outstanding,
-        // prune, status, query, schedule) ran in the single-task version for a
-        // frontier advance, reset, or apply-finished — never for a pure body
-        // buffer/submit, which only reschedules the forwarding peer (the reactor
-        // already did that after forwarding `AcceptBody`). The `reaction_epoch`
-        // advances exactly for those inputs.
+        // prune, status, query, schedule) runs only for a frontier advance, reset,
+        // or apply-finished — never for a pure body buffer/submit, which only
+        // reschedules the forwarding peer (the reactor already did that after
+        // forwarding `AcceptBody`). The `reaction_epoch` advances exactly for those
+        // inputs.
         if !reaction_advanced {
             return;
         }
@@ -1170,11 +1186,9 @@ impl BlockSyncReactor {
     }
 
     fn local_body_work_blocks(&self) -> usize {
-        // The unreceived in-flight heights now live in the routines, mirrored into
-        // the registry's per-peer outstanding set (per-request granularity: each
-        // entry is one still-unreceived requested height). `total_unreceived` sums
-        // them — the same count the old per-peer `expected_blocks − received`
-        // produced.
+        // The unreceived in-flight heights live in the routines, mirrored into the
+        // registry's per-peer outstanding set (per-request granularity: each entry
+        // is one still-unreceived requested height). `total_unreceived` sums them.
         let outstanding = self.registry.total_unreceived();
 
         // Count only the download pipeline (pending WorkQueue heights + the

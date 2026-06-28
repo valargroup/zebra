@@ -12,8 +12,8 @@
 //!   re-query, attribute misbehavior) is expressed as a value the reactor acts
 //!   on, not performed here.
 //!
-//! The logic is preserved verbatim from the reactor; only its boundary changes.
-//! That boundary is what lets a later stage move the Sequencer onto its own task.
+//! Keeping the Sequencer free of download-side state is what lets it run on its
+//! own serial task ([`super::sequencer_task`]), off the reactor's thread.
 
 use super::{events::BlockApplyToken, reorder::*, state::*, *};
 
