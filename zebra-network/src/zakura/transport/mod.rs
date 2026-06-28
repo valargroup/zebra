@@ -25,9 +25,9 @@ pub(crate) use pipe::{
     NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub use registry::{RegistryError, ServiceRegistry};
-pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
     StreamMode,
 };
+pub(crate) use service::{ConnectionCancel, ServiceStream};
 pub use session::{OrderedSendError, PeerStreamSession};

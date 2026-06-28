@@ -381,7 +381,7 @@ impl Service for BlockSyncService {
             peer.service_cancel_token(),
         );
         let service_cancel_token = session.cancel_token();
-        let connection_cancel_token = peer.cancel_token();
+        let connection_cancel_token = peer.close_handle();
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
@@ -421,7 +421,7 @@ impl Service for BlockSyncService {
         };
         let on_panic = {
             let connection_cancel_token = connection_cancel_token.clone();
-            move || connection_cancel_token.cancel()
+            move || connection_cancel_token.cancel("peer_task_panic")
         };
         // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
         // a protocol reject still cancels the whole connection via
@@ -464,7 +464,12 @@ impl Service for BlockSyncService {
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
-                handle_pipe_exit("block-sync", &connection_cancel_token, result);
+                handle_pipe_exit(
+                    "block-sync",
+                    &connection_cancel_token,
+                    "block_sync_protocol_reject",
+                    result,
+                );
             }
         };
         // Let the returned handle drop to detach the supervised task (like

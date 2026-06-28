@@ -2322,19 +2322,20 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let peer_id = peer.id.clone();
-        let cancel_token = peer.cancel_token();
+        let close = peer.close_handle();
+        let cancel_token = close.token();
         let session = LegacyGossipPeerSession::new(peer_id.clone(), send);
 
         outbound.insert(session.clone());
         let replay_task_peer_id = peer_id.clone();
         let replay_panic_peer_id = replay_task_peer_id.clone();
         let replay_panic_outbound = outbound.clone();
-        let replay_panic_cancel = cancel_token.clone();
+        let replay_panic_cancel = close.clone();
         spawn_supervised_peer_task(
             replay_task_peer_id,
             || {},
             move || {
-                replay_panic_cancel.cancel();
+                replay_panic_cancel.cancel("peer_task_panic");
                 replay_panic_outbound.remove(&replay_panic_peer_id);
             },
             {
@@ -2351,12 +2352,12 @@ impl ZakuraService for LegacyGossipSink {
         let recv_task_peer_id = peer_id.clone();
         let recv_panic_peer_id = recv_task_peer_id.clone();
         let recv_panic_outbound = outbound.clone();
-        let recv_panic_cancel = cancel_token.clone();
+        let recv_panic_cancel = close.clone();
         spawn_supervised_peer_task(
             recv_task_peer_id,
             || {},
             move || {
-                recv_panic_cancel.cancel();
+                recv_panic_cancel.cancel("peer_task_panic");
                 recv_panic_outbound.remove(&recv_panic_peer_id);
             },
             async move {
@@ -2388,7 +2389,7 @@ impl ZakuraService for LegacyGossipSink {
                                 ?peer_id,
                                 "legacy gossip stream rejected protocol-invalid frame"
                             );
-                            cancel_token.cancel();
+                            close.cancel("legacy_gossip_protocol_reject");
                             outbound.remove(&peer_id);
                             return;
                         }

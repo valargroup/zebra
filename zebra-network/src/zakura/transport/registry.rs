@@ -304,7 +304,7 @@ impl ServiceRegistry {
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token) =
+        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close) =
             peer.into_parts();
 
         for service in self.services_for_negotiated(negotiated) {
@@ -323,13 +323,13 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
+            service.add_peer(Peer::new_with_connection_cancel_service_token(
                 peer_id.clone(),
                 remote_ip,
                 negotiated,
                 direction,
                 service_streams,
-                cancel_token.clone(),
+                close.clone(),
                 service_cancel_token,
             ));
         }
@@ -340,7 +340,7 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token) =
+        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close) =
             peer.into_parts();
         let mut admitted_capabilities = 0;
 
@@ -366,13 +366,13 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
+            service.add_peer(Peer::new_with_connection_cancel_service_token(
                 peer_id.clone(),
                 remote_ip,
                 negotiated,
                 direction,
                 service_streams,
-                cancel_token.clone(),
+                close.clone(),
                 service_cancel_token,
             ));
         }
@@ -449,7 +449,7 @@ mod tests {
         }
 
         fn add_peer(&self, peer: Peer) {
-            let (peer_id, _remote_ip, _negotiated, _direction, streams, _cancel_token) =
+            let (peer_id, _remote_ip, _negotiated, _direction, streams, _cancel_token, _close) =
                 peer.into_parts();
             self.added
                 .lock()

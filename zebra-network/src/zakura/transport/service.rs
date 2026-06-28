@@ -1,6 +1,13 @@
 //! Zakura protocol service trait surface.
 
-use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +22,60 @@ use super::Frame;
 
 /// Boxed future returned by object-safe stream handlers.
 pub type BoxRunFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Shared per-connection cancellation handle with a bounded first-cause label.
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionCancel {
+    token: CancellationToken,
+    reason: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl ConnectionCancel {
+    /// Wrap an existing connection cancellation token.
+    pub(crate) fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            reason: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Cancel the connection, preserving the first specific reason.
+    pub(crate) fn cancel(&self, reason: &'static str) {
+        {
+            let mut stored = self
+                .reason
+                .lock()
+                .expect("Zakura connection cancel reason mutex is never poisoned");
+            if stored.is_none() {
+                *stored = Some(reason);
+            }
+        }
+        self.token.cancel();
+    }
+
+    /// Return the underlying token for wait-only code.
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    /// Return a child token for stream-local work.
+    pub(crate) fn child_token(&self) -> CancellationToken {
+        self.token.child_token()
+    }
+
+    /// Returns whether the underlying token is cancelled.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Return the first recorded reason, or `default` when only the raw token fired.
+    pub(crate) fn reason_or(&self, default: &'static str) -> &'static str {
+        self.reason
+            .lock()
+            .expect("Zakura connection cancel reason mutex is never poisoned")
+            .unwrap_or(default)
+    }
+}
 
 /// Transport mode for a service-declared stream.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -71,6 +132,7 @@ pub struct Peer {
     pub direction: ServicePeerDirection,
     streams: HashMap<u16, ServiceStream>,
     cancel_token: CancellationToken,
+    close: ConnectionCancel,
     service_cancel_token: CancellationToken,
 }
 
@@ -122,31 +184,44 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
     ) -> Self {
-        let service_cancel_token = streams
-            .values()
-            .next()
-            .map(|stream| stream.cancel_token.clone())
-            .unwrap_or_else(|| cancel_token.child_token());
-        Self::new_with_service_cancel_token(
-            id,
-            remote_ip,
-            negotiated,
-            direction,
-            streams,
-            cancel_token,
-            service_cancel_token,
-        )
+        let close = ConnectionCancel::new(cancel_token);
+        Self::new_with_connection_cancel(id, remote_ip, negotiated, direction, streams, close)
     }
 
-    pub(crate) fn new_with_service_cancel_token(
+    pub(crate) fn new_with_connection_cancel(
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
-        cancel_token: CancellationToken,
+        close: ConnectionCancel,
+    ) -> Self {
+        let service_cancel_token = streams
+            .values()
+            .next()
+            .map(|stream| stream.cancel_token.clone())
+            .unwrap_or_else(|| close.child_token());
+        Self::new_with_connection_cancel_service_token(
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            close,
+            service_cancel_token,
+        )
+    }
+
+    pub(crate) fn new_with_connection_cancel_service_token(
+        id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        streams: HashMap<u16, ServiceStream>,
+        close: ConnectionCancel,
         service_cancel_token: CancellationToken,
     ) -> Self {
+        let cancel_token = close.token();
         Self {
             id,
             remote_ip,
@@ -154,6 +229,7 @@ impl Peer {
             direction,
             streams,
             cancel_token,
+            close,
             service_cancel_token,
         }
     }
@@ -171,6 +247,11 @@ impl Peer {
     /// fires when this peer disconnects or the local node shuts down.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// Return the connection close-cause handle for fatal service paths.
+    pub(crate) fn close_handle(&self) -> ConnectionCancel {
+        self.close.clone()
     }
 
     /// Return the cancellation token for this service's local session work.
@@ -191,6 +272,7 @@ impl Peer {
         ServicePeerDirection,
         HashMap<u16, ServiceStream>,
         CancellationToken,
+        ConnectionCancel,
     ) {
         (
             self.id,
@@ -199,6 +281,7 @@ impl Peer {
             self.direction,
             self.streams,
             self.cancel_token,
+            self.close,
         )
     }
 }
@@ -332,5 +415,37 @@ mod tests {
         assert!(matches!(local, SinkReject::Local(_)));
         assert!(protocol.to_string().contains("protocol-invalid"));
         assert!(local.to_string().contains("locally"));
+    }
+
+    #[test]
+    fn connection_cancel_first_reason_wins() {
+        let close = ConnectionCancel::new(CancellationToken::new());
+
+        close.cancel("frame_timeout");
+        close.cancel("shutdown");
+
+        assert!(close.is_cancelled());
+        assert_eq!(close.reason_or("cancelled"), "frame_timeout");
+    }
+
+    #[test]
+    fn connection_cancel_plain_token_cancel_falls_back() {
+        let token = CancellationToken::new();
+        let close = ConnectionCancel::new(token.clone());
+
+        token.cancel();
+
+        assert!(close.is_cancelled());
+        assert_eq!(close.reason_or("cancelled"), "cancelled");
+    }
+
+    #[test]
+    fn connection_cancel_cleanup_does_not_overwrite_specific_cause() {
+        let close = ConnectionCancel::new(CancellationToken::new());
+
+        close.cancel("message_oversize");
+        close.cancel("cleanup");
+
+        assert_eq!(close.reason_or("cancelled"), "message_oversize");
     }
 }

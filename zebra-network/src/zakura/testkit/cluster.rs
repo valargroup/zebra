@@ -1471,6 +1471,21 @@ mod tests {
             || !peer_set.borrow().contains(&hostile_peer),
         )
         .await?;
+        await_until(
+            "stream-6 oversize close reason",
+            Duration::from_secs(5),
+            || {
+                capture.reader().is_ok_and(|reader| {
+                    reader.node("01").table("conn").rows().iter().any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some("closed.neutral")
+                            && row.get("reason").and_then(serde_json::Value::as_str)
+                                == Some("frame_oversize")
+                    })
+                })
+            },
+        )
+        .await?;
 
         hostile.shutdown().await;
         cluster.shutdown().await;

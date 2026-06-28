@@ -17,7 +17,7 @@ use std::future::Future;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Frame, FramedRecv, SinkReject};
+use super::{ConnectionCancel, Frame, FramedRecv, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
 use crate::zakura::ZakuraPeerId;
 
@@ -410,7 +410,8 @@ pub(crate) fn spawn_supervised_peer_task(
 /// `Result` to inspect.
 pub(crate) fn handle_pipe_exit(
     service: &'static str,
-    connection_cancel: &CancellationToken,
+    connection_cancel: &ConnectionCancel,
+    protocol_reject_reason: &'static str,
     result: Result<(), SinkReject>,
 ) {
     match result {
@@ -421,7 +422,7 @@ pub(crate) fn handle_pipe_exit(
                 service,
                 "Zakura stream rejected protocol-invalid frame"
             );
-            connection_cancel.cancel();
+            connection_cancel.cancel(protocol_reject_reason);
         }
         Err(SinkReject::Local(error)) => {
             tracing::debug!(?error, service, "Zakura stream stopped on local error");
