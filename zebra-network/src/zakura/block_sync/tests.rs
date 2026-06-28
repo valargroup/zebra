@@ -5,11 +5,12 @@ use proptest::{prop_assert, prop_assert_eq};
 use super::*;
 use super::{
     config::{
-        BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-        DEFAULT_BS_FLOOR_WATCHDOG_TICK, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
+        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_FLOOR_WATCHDOG_TICK,
+        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES, DEFAULT_BS_REQUEST_TIMEOUT,
+        MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -732,6 +733,10 @@ fn block_sync_config_defaults_and_round_trips() {
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
     );
+    assert_eq!(
+        default.submitted_apply_limit(),
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+    );
     assert_eq!(default.request_timeout, DEFAULT_BS_REQUEST_TIMEOUT);
     assert_eq!(default.fanout, DEFAULT_BS_FANOUT);
 
@@ -748,6 +753,10 @@ fn block_sync_config_defaults_and_round_trips() {
     )
     .expect("nested Zakura block-sync config deserializes");
     assert_eq!(config.zakura.block_sync.max_submitted_block_applies, 9);
+    assert_eq!(
+        config.zakura.block_sync.submitted_apply_limit(),
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+    );
 }
 
 #[test]
@@ -770,11 +779,78 @@ fn config_validate_rejects_degenerate_values() {
     };
     assert!(config.validate().is_err());
 
+    // A positive budget below the checkpoint-range floor is no longer rejected by
+    // `validate`: it is clamped up to the floor (with a warning) at load instead,
+    // so older configs keep starting. See
+    // `config_clamps_below_floor_inflight_block_bytes`.
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: u64::from(DEFAULT_BS_MAX_RESPONSE_BYTES),
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
         ..ZakuraBlockSyncConfig::default()
     };
-    assert!(config.validate().is_err());
+    assert!(config.validate().is_ok());
+
+    config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_reorder_lookahead_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn config_clamps_below_floor_inflight_block_bytes() {
+    // A positive budget below the checkpoint-range floor is clamped up to the
+    // floor so checkpoint sync cannot deadlock (instead of refusing to start).
+    let mut below = ZakuraBlockSyncConfig {
+        // 256 MiB, the historical `v4.5.0-zakura-blocksync.toml` value, which is
+        // below the ~802 MB checkpoint-range floor.
+        max_inflight_block_bytes: 256 * 1024 * 1024,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(below.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
+    below.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(
+        below.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+    );
+
+    // A budget at or above the floor is left untouched.
+    let mut at_floor = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    at_floor.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(
+        at_floor.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1
+    );
+
+    // Zero is left untouched so `validate` still rejects it as a misconfiguration.
+    let mut zero = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    zero.clamp_inflight_block_bytes_to_floor();
+    assert_eq!(zero.max_inflight_block_bytes, 0);
+    assert!(zero.validate().is_err());
+}
+
+#[test]
+fn config_deserialize_clamps_below_floor_inflight_block_bytes() {
+    // Regression: an older config with a too-small `max_inflight_block_bytes`
+    // (e.g. the stored `v4.5.0-zakura-blocksync.toml`) must still load -- clamped
+    // up to the checkpoint-range floor -- rather than being rejected at startup.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 268435456
+        "#,
+    )
+    .expect("a below-floor max_inflight_block_bytes config still loads");
+    assert_eq!(
+        config.zakura.block_sync.max_inflight_block_bytes,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+    );
 }
 
 #[test]
@@ -2699,6 +2775,31 @@ fn sequencer_records_and_decrements_submitted_applies() {
     seq.decrement_submitted_apply(block::Height(1), hash);
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
+}
+
+#[test]
+fn sequencer_release_applied_through_clears_submitted_applies() {
+    let mut seq = test_sequencer(0, 1);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    seq.drain_ready_into_applying();
+
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
+    assert!(seq.submitted_contains(block::Height(1)));
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "submitted-apply window is full"
+    );
+
+    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert!(!seq.submitted_contains(block::Height(1)));
+    assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
 #[test]
@@ -9372,7 +9473,7 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
 }
 
 #[tokio::test]
-async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
+async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = u64::MAX;
@@ -9426,67 +9527,27 @@ async fn reactor_caps_submitted_applies_until_completion_releases_slot() {
     }
 
     let mut submitted = Vec::new();
-    while submitted.len() < 2 {
+    while submitted.len() < 4 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { token, block } => submitted.push((
-                token,
+            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
                 block
                     .coinbase_height()
                     .expect("submitted test block has height"),
-                block.hash(),
-            )),
+            ),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before cap reached: {action:?}"),
+            action => panic!("unexpected action while collecting submissions: {action:?}"),
         }
     }
-    assert_eq!(submitted[0].1, block::Height(1));
-    assert_eq!(submitted[1].1, block::Height(2));
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                match actions.recv().await {
-                    Some(BlockSyncAction::SubmitBlock { block, .. }) => {
-                        return block.coinbase_height();
-                    }
-                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
-                    Some(action) => panic!("unexpected action while capped: {action:?}"),
-                    None => return None,
-                }
-            }
-        })
-        .await
-        .is_err(),
-        "third body must wait until an apply completion releases a slot",
+    assert_eq!(
+        submitted,
+        vec![
+            block::Height(1),
+            block::Height(2),
+            block::Height(3),
+            block::Height(4),
+        ],
+        "tiny configured submit caps are raised to the checkpoint-safe floor"
     );
-
-    let (token, height, hash) = submitted[0];
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
-            token,
-            height,
-            hash,
-            result: BlockApplyResult::Committed,
-            local_frontier: None,
-        })
-        .await
-        .expect("apply completion queues");
-
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
-                assert_eq!(
-                    block
-                        .coinbase_height()
-                        .expect("submitted test block has height"),
-                    block::Height(3)
-                );
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action after slot release: {action:?}"),
-        }
-    }
 
     reactor_task.abort();
 }
