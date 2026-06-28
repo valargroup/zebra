@@ -50,8 +50,8 @@ use crate::{
     zakura::{
         direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, Clock, Frame, FramedRecv, FramedSend, Frontier,
-        FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
+        BlockSyncService, BlockSyncStartup, Clock, ConnectionCancel, Frame, FramedRecv, FramedSend,
+        Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
         Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
         StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraControlAck,
@@ -693,7 +693,7 @@ impl ZakuraEndpoint {
                 }
             }
         }
-        self.supervisor.shutdown();
+        self.supervisor.shutdown().await;
         let _ = self.router.shutdown().await;
     }
 
@@ -794,7 +794,7 @@ struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
     active_by_peer: HashMap<ZakuraPeerId, [u8; TRANSCRIPT_HASH_BYTES]>,
     outbound_by_peer: HashMap<ZakuraPeerId, ZakuraPeerHandle>,
-    disconnect_by_peer: HashMap<ZakuraPeerId, CancellationToken>,
+    disconnect_by_peer: HashMap<ZakuraPeerId, ConnectionCancel>,
     caps_by_peer: HashMap<ZakuraPeerId, u64>,
     /// When each authenticated peer's current connection registered, used to
     /// decide whether a duplicate may evict a stale incumbent (see
@@ -931,7 +931,7 @@ impl ZakuraSupervisorHandle {
         };
 
         if let Some(token) = token {
-            token.cancel();
+            token.cancel("manual_disconnect");
             true
         } else {
             false
@@ -944,7 +944,7 @@ impl ZakuraSupervisorHandle {
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
-        disconnect_token: CancellationToken,
+        disconnect_token: ConnectionCancel,
         accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         let mut state = self.inner.lock().await;
@@ -1022,7 +1022,7 @@ impl ZakuraSupervisorHandle {
                 if let Some(registered_at) = state.registered_at.get(&peer_id) {
                     if registered_at.elapsed() >= ZAKURA_DUPLICATE_EVICT_MIN_AGE {
                         if let Some(token) = state.disconnect_by_peer.get(&peer_id) {
-                            token.cancel();
+                            token.cancel("duplicate_evicted_stale");
                             metrics::counter!("zakura.p2p.conn.duplicate.evicted_stale")
                                 .increment(1);
                         }
@@ -1055,7 +1055,12 @@ impl ZakuraSupervisorHandle {
         self.peer_set_tx.send_replace(registered_ids);
     }
 
-    fn shutdown(&self) {
+    async fn shutdown(&self) {
+        let state = self.inner.lock().await;
+        for close in state.disconnect_by_peer.values() {
+            close.cancel("shutdown");
+        }
+        drop(state);
         self.shutdown.cancel();
     }
 
@@ -1089,7 +1094,7 @@ enum ZakuraRegistration {
     Registered {
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
-        disconnect_token: CancellationToken,
+        disconnect_token: ConnectionCancel,
     },
     Duplicate {
         peer_id: ZakuraPeerId,
@@ -1146,6 +1151,7 @@ struct StreamAdmission<'a> {
     workers: &'a mut JoinSet<()>,
     limits: ZakuraConnectionLimits,
     accepted_capabilities: u64,
+    close: ConnectionCancel,
     connection_token: CancellationToken,
     freshness_tx: watch::Sender<Instant>,
 }
@@ -1174,7 +1180,7 @@ struct ConnectionServeContext {
 struct RegisteredConnectionServeContext {
     limits: ZakuraConnectionLimits,
     conn: ZakuraConnTrace,
-    connection_token: CancellationToken,
+    close: ConnectionCancel,
     accepted_capabilities: u64,
     /// Whether this side dialed the connection. The dialer (initiator) opens all
     /// of its demanded ordered streams as before; the responder additionally
@@ -1194,6 +1200,7 @@ struct StreamWorkerContext {
     _permit: OwnedSemaphorePermit,
     limits: ZakuraConnectionLimits,
     message_bucket: SharedMessageBucket,
+    close: ConnectionCancel,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
     freshness_tx: watch::Sender<Instant>,
@@ -1640,7 +1647,8 @@ impl ZakuraProtocolHandler {
     ) -> Result<(), ZakuraHandlerError> {
         let limits = context.limits;
         let conn = context.conn;
-        let connection_token = context.connection_token;
+        let close = context.close;
+        let connection_token = close.token();
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
@@ -1687,7 +1695,7 @@ impl ZakuraProtocolHandler {
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             close_reason = "resource_ordered_streams";
-            connection_token.cancel();
+            close.cancel("resource_ordered_streams");
         } else if !ordered_streams.is_empty()
             && usize::from(limits.max_inbound_queue_depth) < ordered_streams.len()
         {
@@ -1698,7 +1706,7 @@ impl ZakuraProtocolHandler {
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"queue split");
             close_reason = "resource_queue_split";
-            connection_token.cancel();
+            close.cancel("resource_queue_split");
         }
         let ordered_kinds: HashSet<u16> = negotiated_ordered_streams
             .iter()
@@ -1719,16 +1727,16 @@ impl ZakuraProtocolHandler {
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
         if negotiated_ordered_streams.is_empty() {
-            self.registry.add_peer(Peer::new_with_direction(
+            self.registry.add_peer(Peer::new_with_connection_cancel(
                 peer_id.clone(),
                 remote_ip,
                 accepted_capabilities,
                 context.direction,
                 HashMap::new(),
-                connection_token.clone(),
+                close.clone(),
             ));
             admitted_capabilities = accepted_capabilities;
-        } else if !connection_token.is_cancelled() {
+        } else if !close.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
                 opened_capabilities |= stream.capability;
@@ -1741,7 +1749,7 @@ impl ZakuraProtocolHandler {
                         &mut message_buckets,
                         limits,
                         per_stream_queue_depth,
-                        connection_token.clone(),
+                        close.clone(),
                         freshness_tx.clone(),
                         conn.clone(),
                         peer_id.clone(),
@@ -1760,7 +1768,7 @@ impl ZakuraProtocolHandler {
                             b"ordered stream setup",
                         );
                         close_reason = "stream_setup_failed";
-                        connection_token.cancel();
+                        close.cancel("stream_setup_failed");
                         break;
                     }
                 };
@@ -1770,19 +1778,19 @@ impl ZakuraProtocolHandler {
                     ServiceStream::new(admitted.recv, admitted.send, admitted.cancel_token),
                 );
             }
-            if !connection_token.is_cancelled() {
+            if !close.is_cancelled() {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
                 admitted_capabilities |=
                     self.registry
-                        .add_escalated_peer(Peer::new_with_service_streams(
+                        .add_escalated_peer(Peer::new_with_connection_cancel(
                             peer_id.clone(),
                             remote_ip,
                             opened_capabilities,
                             context.direction,
                             std::mem::take(&mut service_streams),
-                            connection_token.clone(),
+                            close.clone(),
                         ));
             }
         }
@@ -1814,6 +1822,7 @@ impl ZakuraProtocolHandler {
                                 workers: &mut workers,
                                 limits,
                                 accepted_capabilities,
+                                close: close.clone(),
                                 connection_token: connection_token.clone(),
                                 freshness_tx: freshness_tx.clone(),
                             };
@@ -1832,7 +1841,7 @@ impl ZakuraProtocolHandler {
                                         "closing peer after unexpected ordered stream"
                                     );
                                     close_reason = "unexpected_stream";
-                                    connection_token.cancel();
+                                    close.cancel("unexpected_stream");
                                     continue;
                                 }
 
@@ -1868,7 +1877,7 @@ impl ZakuraProtocolHandler {
                                         "closing peer after unexpected ordered stream"
                                     );
                                     close_reason = "unexpected_stream";
-                                    connection_token.cancel();
+                                    close.cancel("unexpected_stream");
                                     continue;
                                 }
 
@@ -1881,7 +1890,7 @@ impl ZakuraProtocolHandler {
                                         "closing peer after duplicate ordered stream"
                                     );
                                     close_reason = "duplicate_stream";
-                                    connection_token.cancel();
+                                    close.cancel("duplicate_stream");
                                     continue;
                                 }
 
@@ -1927,13 +1936,13 @@ impl ZakuraProtocolHandler {
                                 // `add_peer` replaces our own opened session for
                                 // this peer (see `can_admit_peer`).
                                 admitted_capabilities |= self.registry.add_escalated_peer(
-                                    Peer::new_with_service_streams(
+                                    Peer::new_with_connection_cancel(
                                         peer_id.clone(),
                                         remote_ip,
                                         accepted_capabilities,
                                         context.direction,
                                         service_streams,
-                                        connection_token.clone(),
+                                        close.clone(),
                                     ),
                                 );
                             }
@@ -1989,7 +1998,7 @@ impl ZakuraProtocolHandler {
                                         b"malformed response",
                                     );
                                     close_reason = "bad_response";
-                                    connection_token.cancel();
+                                    close.cancel("bad_response");
                                     let _ = completion.send(Err(error));
                                 }
                             }
@@ -2017,7 +2026,8 @@ impl ZakuraProtocolHandler {
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         self.trace.emit(
             CONN_TABLE,
-            conn.event("closed.neutral").reason(close_reason),
+            conn.event("closed.neutral")
+                .reason(close.reason_or(close_reason)),
         );
         Ok(())
     }
@@ -2032,7 +2042,7 @@ impl ZakuraProtocolHandler {
         message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
         per_stream_queue_depth: usize,
-        connection_token: CancellationToken,
+        close: ConnectionCancel,
         freshness_tx: watch::Sender<Instant>,
         conn: ZakuraConnTrace,
         peer_id: ZakuraPeerId,
@@ -2066,7 +2076,8 @@ impl ZakuraProtocolHandler {
             limits.message_rate_per_second,
             RealClock,
         );
-        let stream_token = connection_token.child_token();
+        let connection_token = close.token();
+        let stream_token = close.child_token();
         let context = StreamWorkerContext {
             trace: self.trace.clone(),
             conn: conn.clone(),
@@ -2075,6 +2086,7 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits,
             message_bucket,
+            close,
             connection_token,
             stream_token,
             freshness_tx,
@@ -2200,7 +2212,7 @@ impl ZakuraProtocolHandler {
         if stream.mode != StreamMode::RequestResponse && prelude.request_id.is_some() {
             debug!("rejecting non-request Zakura stream with request id");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            admission.connection_token.cancel();
+            admission.close.cancel("unexpected_request_id");
             metrics::counter!("zakura.p2p.stream.rejected.unexpected_request_id").increment(1);
             admission.trace.emit(
                 STREAM_TABLE,
@@ -2214,7 +2226,7 @@ impl ZakuraProtocolHandler {
         if stream.mode == StreamMode::RequestResponse && prelude.request_id.is_none() {
             debug!("rejecting Zakura request stream without request id");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            admission.connection_token.cancel();
+            admission.close.cancel("request_without_id");
             metrics::counter!("zakura.p2p.stream.rejected.request_without_id").increment(1);
             admission.trace.emit(
                 STREAM_TABLE,
@@ -2243,7 +2255,7 @@ impl ZakuraProtocolHandler {
             admission.limits.message_rate_per_second,
             RealClock,
         );
-        let stream_token = admission.connection_token.child_token();
+        let stream_token = admission.close.child_token();
 
         let context = StreamWorkerContext {
             trace: admission.trace.clone(),
@@ -2253,6 +2265,7 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits: admission.limits,
             message_bucket,
+            close: admission.close.clone(),
             connection_token: admission.connection_token.clone(),
             stream_token,
             freshness_tx: admission.freshness_tx.clone(),
@@ -2325,6 +2338,7 @@ impl ZakuraProtocolHandler {
             sender: outbound_tx,
         };
         let connection_token = self.shutdown.child_token();
+        let close = ConnectionCancel::new(connection_token);
         let registration = self
             .supervisor
             .register(
@@ -2332,7 +2346,7 @@ impl ZakuraProtocolHandler {
                 remote_ip,
                 context.transcript_hash,
                 outbound_handle,
-                connection_token.clone(),
+                close.clone(),
                 context.accepted_capabilities,
             )
             .await;
@@ -2360,7 +2374,7 @@ impl ZakuraProtocolHandler {
                     RegisteredConnectionServeContext {
                         limits: context.limits,
                         conn: context.conn,
-                        connection_token: disconnect_token,
+                        close: disconnect_token,
                         accepted_capabilities: context.accepted_capabilities,
                         is_initiator: context.role == "initiator",
                         i_open_collision_winner: context.i_open_collision_winner,
@@ -2410,6 +2424,7 @@ impl ProtocolHandler for ZakuraProtocolHandler {
     }
 
     async fn shutdown(&self) {
+        self.supervisor.shutdown().await;
         self.shutdown.cancel();
     }
 }
@@ -2950,11 +2965,15 @@ async fn persistent_stream_worker(
             // the disconnect is guaranteed even if the main loop tore the worker
             // down for a stopped outbound write before processing it.
             let is_terminal = message.is_err();
-            let must_disconnect =
-                matches!(&message, Err(error) if !matches!(error, ZakuraHandlerError::Closed));
+            let cancel_reason = match &message {
+                Err(error) if !matches!(error, ZakuraHandlerError::Closed) => {
+                    Some(persistent_stream_cancel_reason(error))
+                }
+                _ => None,
+            };
             let forward_failed = frame_tx.send(message).await.is_err();
-            if must_disconnect {
-                reader_context.connection_token.cancel();
+            if let Some(reason) = cancel_reason {
+                reader_context.close.cancel(reason);
             }
             if forward_failed || is_terminal {
                 break;
@@ -2983,7 +3002,7 @@ async fn persistent_stream_worker(
                             }
                             debug!(?error, "closing Zakura ordered stream writer");
                             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                            context.connection_token.cancel();
+                            context.close.cancel("ordered_write_failed");
                             break;
                         }
                     }
@@ -3012,12 +3031,12 @@ async fn persistent_stream_worker(
                     // The reader signalled an oversize message: disconnect it.
                     Some(Err(ZakuraHandlerError::Oversize)) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-                        context.connection_token.cancel();
+                        context.close.cancel("message_oversize");
                         break;
                     }
                     Some(Err(ZakuraHandlerError::RateLimited)) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-                        context.connection_token.cancel();
+                        context.close.cancel("message_rate_limited");
                         break;
                     }
                     Some(Err(ZakuraHandlerError::Closed)) | None => {
@@ -3027,7 +3046,7 @@ async fn persistent_stream_worker(
                     Some(Err(error)) => {
                         debug!(?error, "closing Zakura stream worker");
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                        context.connection_token.cancel();
+                        context.close.cancel(persistent_stream_cancel_reason(&error));
                         break;
                     }
                 }
@@ -3039,6 +3058,28 @@ async fn persistent_stream_worker(
     // guarantees a prompt exit on the paths that break without cancelling one
     // (e.g. a peer that stopped receiving, or the local service receiver closing).
     reader.abort();
+}
+
+fn persistent_stream_cancel_reason(error: &ZakuraHandlerError) -> &'static str {
+    match error {
+        ZakuraHandlerError::Timeout(_) => "frame_timeout",
+        ZakuraHandlerError::OversizeFrame { .. } => "frame_oversize",
+        ZakuraHandlerError::Oversize => "message_oversize",
+        ZakuraHandlerError::RateLimited => "message_rate_limited",
+        ZakuraHandlerError::Closed => "cancelled",
+        _ => "stream_protocol_error",
+    }
+}
+
+fn request_frame_cancel_reason(error: &ZakuraHandlerError) -> &'static str {
+    match error {
+        ZakuraHandlerError::Timeout(_) => "request_frame_timeout",
+        ZakuraHandlerError::Oversize | ZakuraHandlerError::OversizeFrame { .. } => {
+            "request_message_oversize"
+        }
+        ZakuraHandlerError::Closed => "cancelled",
+        _ => "request_frame_invalid",
+    }
 }
 
 fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
@@ -3057,7 +3098,7 @@ async fn request_stream_worker(
 ) {
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-        context.connection_token.cancel();
+        context.close.cancel("request_without_id");
         return;
     };
 
@@ -3083,7 +3124,7 @@ async fn request_stream_worker(
                 "closing Zakura request stream with invalid request frame"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.connection_token.cancel();
+            context.close.cancel(request_frame_cancel_reason(&error));
             return;
         }
     };
@@ -3093,7 +3134,7 @@ async fn request_stream_worker(
         InboundMessageAdmission::Admit => {}
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
-            context.connection_token.cancel();
+            context.close.cancel("request_message_oversize");
             return;
         }
         InboundMessageAdmission::Throttled => {
@@ -3122,7 +3163,7 @@ async fn request_stream_worker(
                 "Zakura inbound sink rejected protocol-invalid request"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-            context.connection_token.cancel();
+            context.close.cancel("request_sink_rejected");
             return;
         }
         Err(SinkReject::Local(error)) => {
@@ -4597,7 +4638,7 @@ mod tests {
                 None,
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                 outbound_handle,
-                disconnect_token,
+                ConnectionCancel::new(disconnect_token),
                 ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
             )
             .await;
@@ -5362,7 +5403,7 @@ mod tests {
                     None,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
-                    token,
+                    ConnectionCancel::new(token),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -5431,7 +5472,7 @@ mod tests {
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
-                    token,
+                    ConnectionCancel::new(token),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await
@@ -5569,7 +5610,8 @@ mod tests {
         limits.idle_timeout = Duration::from_millis(50);
         let stream_kind = DISCOVERY_STREAM_KIND;
         let connection_token = CancellationToken::new();
-        let stream_token = connection_token.child_token();
+        let close = ConnectionCancel::new(connection_token.clone());
+        let stream_token = close.child_token();
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let (outbound_tx, outbound_rx) = mpsc::channel(1);
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
@@ -5584,6 +5626,7 @@ mod tests {
             _permit: permit,
             limits,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            close: close.clone(),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
             freshness_tx,
@@ -5730,6 +5773,7 @@ mod tests {
         limits.idle_timeout = idle_timeout;
         let stream_kind = LEGACY_GOSSIP_STREAM_KIND;
         let connection_token = CancellationToken::new();
+        let close = ConnectionCancel::new(connection_token.clone());
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
 
         let spawn_ordered_worker = |send: SendStream, recv: RecvStream, stream_id: u64| {
@@ -5746,8 +5790,9 @@ mod tests {
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
                 ))),
+                close: close.clone(),
                 connection_token: connection_token.clone(),
-                stream_token: connection_token.child_token(),
+                stream_token: close.child_token(),
                 freshness_tx: freshness_tx.clone(),
             };
             let prelude = StreamPrelude {
@@ -6269,6 +6314,7 @@ mod tests {
         let mut message_buckets = MessageRateBuckets::new();
         let mut workers = JoinSet::new();
         let connection_token = CancellationToken::new();
+        let close = ConnectionCancel::new(connection_token.clone());
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
 
         let mut admission = StreamAdmission {
@@ -6281,6 +6327,7 @@ mod tests {
             workers: &mut workers,
             limits: test_connection_limits(),
             accepted_capabilities: 0,
+            close,
             connection_token: connection_token.clone(),
             freshness_tx,
         };
@@ -6973,7 +7020,7 @@ mod tests {
                     remote_ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
                     outbound_handle,
-                    CancellationToken::new(),
+                    ConnectionCancel::new(CancellationToken::new()),
                     ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
                 )
                 .await

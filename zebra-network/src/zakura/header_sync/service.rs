@@ -334,7 +334,7 @@ impl Service for HeaderSyncService {
         // a normal/parked exit — parking one service must not tear down the
         // shared connection that other services (discovery, block-sync) ride on.
         let service_cancel_token = session.cancel_token();
-        let connection_cancel_token = peer.cancel_token();
+        let connection_cancel_token = peer.close_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let header_sync_session =
             HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
@@ -368,6 +368,7 @@ impl Service for HeaderSyncService {
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
+                "header_sync_protocol_reject",
                 run_peer(pipe, recv, pipe_cancel_token).await,
             );
         };
@@ -385,7 +386,7 @@ impl Service for HeaderSyncService {
                 teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
         };
         let panic_connection_cancel_token = connection_cancel_token.clone();
-        let on_panic = move || panic_connection_cancel_token.cancel();
+        let on_panic = move || panic_connection_cancel_token.cancel("peer_task_panic");
 
         // Reuse the single supervised launcher; let the returned handle drop to
         // detach the task (the `PipeTeardown` still runs on every exit path).
@@ -469,7 +470,8 @@ impl Service for HeaderSyncPassthroughService {
 
         let inner = self.inner.clone();
         let peer_id = peer.id.clone();
-        let cancel_token = peer.cancel_token();
+        let close = peer.close_handle();
+        let cancel_token = close.token();
 
         task::spawn(async move {
             let sink = Box::new(HeaderSyncPassthroughSink {
@@ -486,7 +488,7 @@ impl Service for HeaderSyncPassthroughService {
                         ?peer_id,
                         "header-sync passthrough rejected protocol-invalid frame"
                     );
-                    cancel_token.cancel();
+                    close.cancel("header_sync_protocol_reject");
                 }
                 Err(SinkReject::Local(error)) => {
                     tracing::debug!(
