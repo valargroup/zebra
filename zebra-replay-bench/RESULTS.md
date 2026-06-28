@@ -1,0 +1,127 @@
+# zebra-replay-bench — commit-pipeline results
+
+Offline A/B of the Zebra finalized-state commit pipeline at two abstraction
+levels: the **direct committer** (`apply` → `FinalizedState::commit_finalized_direct`)
+and the **write worker** one rung up (`apply-worker` → `BlockWriteSender::spawn` /
+`WriteBlockWorkerTask::run`). Goal: isolate each layer's cost and find the next
+optimization lever.
+
+## Provenance
+
+- **Base:** branched from `feat/pre-release-main`, rebased onto `087428377`
+  (#295). Measurements were taken on the equivalent code at `c787831c0` (the #305
+  commit that introduced the bench); the only base delta since is the
+  behavior-preserving `disable_vct_fast_sync` → `vct_fast_sync` config rename, so
+  the numbers are unchanged.
+- **Changes measured:** the `apply-worker` extension (`apply_worker.rs` +
+  subcommand), the bounded `prefetch.rs` producer, the `apply.rs` commit-only
+  refactor, and the zebra-state worker-type exports (`BlockWriteSender`,
+  `QueuedCheckpointVerified`).
+
+## Environment
+
+- 8 cores (DO Premium Intel), 31 GiB RAM, Linux.
+- Snapshots under `/mnt/roman-dev-2-data`: base = `zebra-ckpt-1800000-warm`
+  (archive 27.3.0, tip 1,802,000); block + root source = `zebra-cache`
+  (tip 3,376,789).
+- Window: heights **1,802,001–1,832,000** (30,000 blocks, ~19.1 GiB of bodies);
+  VCT roots sidecar derived from the same source over the same window.
+- Forward replay, no rollback. Each run executes on a fresh hard-link fork of the
+  base; the final tip-hash gate (byte-identical to the source snapshot tip
+  1,832,000) passes on every run.
+
+## Methodology — commit-only isolation via a bounded prefetch
+
+The committer's input — a `CheckpointVerifiedBlock` — is built by `prepare_block_data`
+(`zebra-state/src/request.rs`): per-tx txid + ZIP-244 auth digest, the auth-data
+Merkle root, and the new-outputs (UTXO) map. That is **verifier-side prep** that
+runs upstream of the committer in production, so it must not be in the timed
+window of either bench.
+
+Both benches stream the window through a shared **bounded prefetch** (`prefetch.rs`):
+a producer thread reads the cache, deserializes, and builds each
+`CheckpointVerifiedBlock` ahead of the committer, into a bounded channel
+(capacity 64). The timed consumer only commits. This:
+
+- keeps block read + parse + prep **off** the timed commit thread (commit-only),
+- bounds memory to the channel depth (~0.9 GiB here) regardless of window size, so
+  the bench scales to 100K+ without holding the window in RAM, and
+- mirrors production (verifier prepares blocks upstream of the writer).
+
+`apply` (direct) keeps a one-block look-ahead for the VCT successor and times each
+`commit_finalized_direct`. `apply-worker` feeds the prefetched blocks into the
+real write worker with a **bounded in-flight window** (≤64 sent-but-not-committed),
+which also prevents dumping a 30K backlog into the worker's unbounded channel.
+
+## Results — VCT, 30K, commit-only
+
+| run | wall | throughput | p50 | p90 | p99 | max | peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| direct (`apply --vct-sidecar`) | 235.0 s | **127.7 blk/s** (81.2 MiB/s) | 4.48 ms | 14.09 ms | 77.70 ms | 611 ms | 0.84 GiB |
+| worker (`apply-worker --vct-sidecar`) | 242.3 s | **123.8 blk/s** (78.8 MiB/s) | 4.47 ms | 15.69 ms | 85.52 ms | 504 ms | 0.95 GiB |
+
+Both committed all 30,000 blocks to the identical tip hash.
+
+**Direct and worker converge** (127.7 vs 123.8 blk/s, identical p50). Once
+`prepare_block_data` is pipelined off the commit thread on both sides, the write
+worker has **no** commit-only throughput advantage over the direct committer in
+VCT mode — it is marginally slower from the channel/oneshot plumbing. The worker's
+value (look-ahead note-commitment precompute) is switched off in VCT because the
+recompute it would overlap is eliminated; the residual is just coordination cost.
+
+### How the measurement converged (direct, VCT, what's in the timed wall)
+
+| what the timed wall includes | throughput | peak RSS |
+| --- | ---: | ---: |
+| block read + parse + prep + commit (original `apply`) | 99.6 blk/s | — |
+| prep + commit (window pre-loaded, CV built in the loop) | 121.2 blk/s | — |
+| commit only (all CVs pre-built up front, no contention) | 148.0 blk/s | 20.7 GiB |
+| commit only (bounded prefetch: prep concurrent, flat memory) | 127.7 blk/s | 0.84 GiB |
+
+Excluding parse and prep raised direct from 99.6 → 148.0 (a pure committer with no
+other work running). The bounded prefetch gives back some of that (148 → 127.7)
+because the producer's `prepare_block_data` (rayon, multi-core) now runs
+**concurrently** and contends for cores with the committer — but it is the
+scalable, production-like design (prep always runs alongside commit in a real
+node) and it bounds memory to ~0.84 GiB, so it is the figure used for the A/B.
+
+## Prefetch depth: contention, not lookahead
+
+Sweeping the prefetch depth (`ZRB_PREFETCH_CAP`) on VCT direct shows deeper
+buffering does **not** help — it is flat within run-to-run noise:
+
+| prefetch depth | throughput | peak RSS |
+| ---: | ---: | ---: |
+| 64 (default) | 127.7 blk/s | 0.84 GiB |
+| 2048 | 131.0 blk/s | 2.84 GiB |
+| 16384 | 120.2 blk/s | 8.2 GiB |
+| all pre-built (no concurrent producer) | 148.0 blk/s | 20.7 GiB |
+
+Depth 64 already keeps the committer fed (no buffer-starvation stalls for a bigger
+lookahead to remove). The only configuration that reaches 148 is pre-building the
+whole window so **no** producer runs during timing — i.e. the committer gets all 8
+cores. The ~15% gap is CPU contention from running `prepare_block_data` (rayon,
+multi-core) concurrently with the commit, which is inherent to a streaming
+pipeline and realistic for production. So depth 64 (flat ~0.9 GiB) is the right
+operating point; the lever to approach 148 would be capping the producer's core
+usage, not deepening the buffer.
+
+## Worker in-flight bound also removed a write-stall
+
+With the unbounded feed (all 30K pushed up front), the worker's max commit latency
+was 37,279 ms — a RocksDB L0 write-stall from the backlog. The bounded in-flight
+window (≤64) removes it: max latency is now 504 ms, in line with the direct bench.
+
+## Open / next
+
+- **Legacy 30K commit-only** not yet run at scale; a 500-block prefetch smoke
+  shows direct 95.1 / worker 115.8 blk/s — small-sample, but the direction is the
+  point: in legacy the worker's note-commitment precompute **is** active, so it
+  overlaps the recompute and beats the direct committer (the real worker win,
+  unlike VCT where the two converge). Re-run at 30K for a clean legacy row.
+- **Larger windows (100K+)** are now unblocked: memory is flat (~0.9 GiB), so the
+  cache size, not RAM, is the only limit.
+- **Next layer up:** with prep and commit isolated and converged in VCT, the
+  committer itself is the floor (~128 blk/s, ~4.5 ms/block p50). Profiling the
+  commit (`prepare`/`update_trees`/`batch_prep`/`rocksdb.batch_commit` histograms
+  via `--features commit-metrics`) is the next lever.
