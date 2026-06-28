@@ -11,10 +11,14 @@ use super::{
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES, DEFAULT_BS_REQUEST_TIMEOUT,
 <<<<<<< HEAD
+<<<<<<< HEAD
         MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
 =======
         MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
 >>>>>>> 1f45a4d70 (fix(network): enforce checkpoint-safe block apply budget)
+=======
+        MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+>>>>>>> 2bd2f9267 (Revert "fix(network): align block sync submit window with checkpoints")
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,

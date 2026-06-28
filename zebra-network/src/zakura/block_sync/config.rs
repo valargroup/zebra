@@ -298,10 +298,14 @@ impl ZakuraBlockSyncConfig {
             return Err(
                 "max_inflight_block_bytes must hold one full checkpoint range \
 <<<<<<< HEAD
+<<<<<<< HEAD
                  (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
 =======
                  (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
 >>>>>>> 1f45a4d70 (fix(network): enforce checkpoint-safe block apply budget)
+=======
+                 (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+>>>>>>> 2bd2f9267 (Revert "fix(network): align block sync submit window with checkpoints")
                  or checkpoint sync can deadlock",
             );
         }
