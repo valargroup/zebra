@@ -22,12 +22,14 @@ use DbFormatChange::*;
 
 use crate::service::finalized_state::ZebraDb;
 
+pub(crate) mod add_ironwood_activation_tree;
 pub(crate) mod add_subtrees;
 pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
+pub(crate) mod rebuild_history_tree;
 pub(crate) mod tree_keys_and_caches_upgrade;
 
 #[cfg(not(feature = "indexer"))]
@@ -110,7 +112,9 @@ fn format_upgrades(
             "add Zakura header body size hints",
             Version::new(27, 2, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 7])
+        Box::new(add_ironwood_activation_tree::Upgrade),
+        Box::new(rebuild_history_tree::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 9])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -876,8 +880,10 @@ fn format_upgrades_are_in_version_order() {
 #[test]
 fn zakura_header_body_size_cf_upgrade_is_no_migration() {
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 1, 0))).collect();
+    let upgrade = upgrades
+        .iter()
+        .find(|upgrade| upgrade.version() == Version::new(27, 2, 0))
+        .expect("Zakura header body size upgrade should be present");
 
-    assert_eq!(upgrades.len(), 1);
-    assert_eq!(upgrades[0].version(), Version::new(27, 2, 0));
-    assert!(!upgrades[0].needs_migration());
+    assert!(!upgrade.needs_migration());
 }

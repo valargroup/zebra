@@ -1068,8 +1068,6 @@ fn binding_signatures() {
 
                             bvk.verify(sighash.as_ref(), &sapling_shielded_data.binding_sig)
                                 .expect("verification passes");
-
-                            at_least_one_v5_checked = true;
                         }
                     }
                 }
@@ -1283,11 +1281,48 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     );
 }
 
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_padded_orchard_proof_is_rejected_on_deserialize() {
+    let _init_guard = zebra_test::init();
+
+    let orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_tx = |orchard_shielded_data| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ironwood_shielded_data: None,
+    };
+
+    // Control: the same tx with a canonical proof must round-trip, so any
+    // rejection below is attributable to the padding, not the test vector.
+    let canonical_bytes = make_tx(orchard_shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("serialize");
+    Transaction::zcash_deserialize(&canonical_bytes[..])
+        .expect("v6 tx with a canonical Orchard proof round-trips");
+
+    let mut padded = orchard_shielded_data;
+    padded.proof.0.push(0);
+    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
+    Transaction::zcash_deserialize(&padded_bytes[..]).expect_err(
+        "v6 transaction with a padded Orchard proof must be rejected on deserialization",
+    );
+}
+
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.
 ///
-/// A v5 transaction whose Orchard action has `rk = [0u8; 32]` (the Pallas
-/// identity point) **deserializes successfully** — Zebra performs no
-/// identity-point check in [`crate::orchard::Action::zcash_deserialize`].
+/// A transaction whose Orchard action has `rk = [0u8; 32]` (the Pallas
+/// identity point) **deserializes successfully** unless Zebra validates it
+/// using the corresponding librustzcash transaction parser before returning.
 ///
 /// When the same transaction is subsequently fed to the Orchard Halo2 batch
 /// verifier via [`orchard::bundle::BatchValidator::add_bundle`], the call
@@ -1306,7 +1341,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 /// (`zebra-chain/src/orchard/keys.rs:225-238`), demonstrating the correct
 /// pattern.
 #[test]
-fn orchard_rk_identity_point() {
+fn orchard_rk_identity_point_rejected_during_deserialization() {
     use group::prime::PrimeCurveAffine;
     use reddsa::Signature;
 
@@ -1353,7 +1388,7 @@ fn orchard_rk_identity_point() {
         binding_sig: Signature::from([0u8; 64]),
     };
 
-    let tx = Transaction::V5 {
+    let v5_tx = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
@@ -1363,13 +1398,39 @@ fn orchard_rk_identity_point() {
         orchard_shielded_data: Some(shielded_data),
     };
 
-    // Step 1: serialize the transaction.
-    let tx_bytes = tx
+    let v5_tx_bytes = v5_tx
         .zcash_serialize_to_vec()
-        .expect("crafted transaction must serialize without error");
+        .expect("crafted V5 transaction must serialize without error");
 
-    // Step 2: deserialize
-    Transaction::zcash_deserialize(&tx_bytes[..]).expect_err("rk = identity should fail");
+    Transaction::zcash_deserialize(&v5_tx_bytes[..]).expect_err("V5 rk = identity should fail");
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    {
+        let Transaction::V5 {
+            orchard_shielded_data,
+            ..
+        } = v5_tx
+        else {
+            unreachable!("test transaction is V5");
+        };
+
+        let v6_tx = Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data,
+            ironwood_shielded_data: None,
+        };
+
+        let v6_tx_bytes = v6_tx
+            .zcash_serialize_to_vec()
+            .expect("crafted V6 transaction must serialize without error");
+
+        Transaction::zcash_deserialize(&v6_tx_bytes[..]).expect_err("V6 rk = identity should fail");
+    }
 }
 
 /// Reproduction for GHSA-rgwx-8r98-p34c:

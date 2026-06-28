@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tracing::trace;
-use zebra_chain::transaction::Transaction;
+use zebra_chain::{ironwood, transaction::Transaction};
 
 use crate::{
     error::DuplicateNullifierError,
@@ -29,8 +29,8 @@ use crate::service;
 ///
 /// > A nullifier MUST NOT repeat either within a transaction,
 /// > or across transactions in a valid blockchain.
-/// > Sprout and Sapling and Orchard nullifiers are considered disjoint,
-/// > even if they have the same bit pattern.
+/// > Sprout, Sapling, Orchard, and Ironwood nullifiers are considered
+/// > disjoint, even if they have the same bit pattern.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#nullifierset>
 #[tracing::instrument(skip(semantically_verified, finalized_state))]
@@ -53,6 +53,12 @@ pub(crate) fn no_duplicates_in_finalized_chain(
     for nullifier in semantically_verified.block.orchard_nullifiers() {
         if finalized_state.contains_orchard_nullifier(nullifier) {
             Err(nullifier.duplicate_nullifier_error(true))?;
+        }
+    }
+
+    for nullifier in semantically_verified.block.ironwood_nullifiers() {
+        if finalized_state.contains_ironwood_nullifier(nullifier) {
+            Err(duplicate_ironwood_nullifier_error(nullifier, true))?;
         }
     }
 
@@ -87,6 +93,32 @@ where
     Ok(())
 }
 
+// Ironwood reuses `orchard::Nullifier` (`ironwood::Nullifier` is a re-export),
+// so it can't have its own `impl DuplicateNullifierError` without conflicting
+// with the Orchard impl (E0119).
+fn duplicate_ironwood_nullifier_error(
+    nullifier: &ironwood::Nullifier,
+    in_finalized_state: bool,
+) -> ValidateContextError {
+    ValidateContextError::DuplicateIronwoodNullifier {
+        nullifier: *nullifier,
+        in_finalized_state,
+    }
+}
+
+fn remap_ironwood_nullifier_error(error: ValidateContextError) -> ValidateContextError {
+    match error {
+        ValidateContextError::DuplicateOrchardNullifier {
+            nullifier,
+            in_finalized_state,
+        } => ValidateContextError::DuplicateIronwoodNullifier {
+            nullifier,
+            in_finalized_state,
+        },
+        error => error,
+    }
+}
+
 /// Reject double-spends of nullifiers:
 /// - one from this [`Transaction`], and the other already committed to the
 ///   provided non-finalized [`Chain`] or [`ZebraDb`].
@@ -95,8 +127,8 @@ where
 ///
 /// > A nullifier MUST NOT repeat either within a transaction,
 /// > or across transactions in a valid blockchain.
-/// > Sprout and Sapling and Orchard nullifiers are considered disjoint,
-/// > even if they have the same bit pattern.
+/// > Sprout, Sapling, Orchard, and Ironwood nullifiers are considered
+/// > disjoint, even if they have the same bit pattern.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#nullifierset>
 #[tracing::instrument(skip_all)]
@@ -126,16 +158,25 @@ pub(crate) fn tx_no_duplicates_in_chain(
             .map(|chain| |nullifier| chain.orchard_nullifiers.contains_key(nullifier)),
     )?;
 
+    find_duplicate_nullifier(
+        transaction.ironwood_nullifiers(),
+        |nullifier| finalized_chain.contains_ironwood_nullifier(nullifier),
+        non_finalized_chain
+            .map(|chain| |nullifier| chain.ironwood_nullifiers.contains_key(nullifier)),
+    )
+    .map_err(remap_ironwood_nullifier_error)?;
+
     Ok(())
 }
 
 /// Reject double-spends of nullifers:
 /// - both within the same `JoinSplit` (sprout only),
-/// - from different `JoinSplit`s, [`sapling::Spend`][2]s or
-///   [`orchard::Action`][3]s in this [`Transaction`][1]'s shielded data, or
+/// - from different `JoinSplit`s, [`sapling::Spend`][2]s,
+///   [`orchard::Action`][3]s, or Ironwood actions in this
+///   [`Transaction`]'s shielded data, or
 /// - one from this shielded data, and another from:
 ///   - a previous transaction in this [`Block`][4], or
-///   - a previous block in this non-finalized [`Chain`][5].
+///   - a previous block in this non-finalized [`Chain`].
 ///
 /// (Duplicate finalized nullifiers are rejected during service contextual validation,
 /// see [`no_duplicates_in_finalized_chain`] for details.)
@@ -144,22 +185,19 @@ pub(crate) fn tx_no_duplicates_in_chain(
 ///
 /// > A nullifier MUST NOT repeat either within a transaction,
 /// > or across transactions in a valid blockchain.
-/// > Sprout and Sapling and Orchard nullifiers are considered disjoint,
-/// > even if they have the same bit pattern.
+/// > Sprout, Sapling, Orchard, and Ironwood nullifiers are considered
+/// > disjoint, even if they have the same bit pattern.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#nullifierset>
 ///
 /// We comply with the "disjoint" rule by storing the nullifiers for each
-/// pool in separate sets (also with different types), so that even if
-/// different pools have nullifiers with same bit pattern, they won't be
-/// considered the same when determining uniqueness. This is enforced by the
-/// callers of this function.
+/// pool in separate sets, so that even if different pools have nullifiers
+/// with same bit pattern, they won't be considered the same when determining
+/// uniqueness. This is enforced by the callers of this function.
 ///
-/// [1]: zebra_chain::transaction::Transaction
 /// [2]: zebra_chain::sapling::Spend
 /// [3]: zebra_chain::orchard::Action
 /// [4]: zebra_chain::block::Block
-/// [5]: service::non_finalized_state::Chain
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
     chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
@@ -182,6 +220,16 @@ where
     }
 
     Ok(())
+}
+
+#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
+    chain_nullifiers: &mut HashMap<ironwood::Nullifier, SpendingTransactionId>,
+    shielded_data_nullifiers: impl IntoIterator<Item = &'block ironwood::Nullifier>,
+    revealing_tx_id: SpendingTransactionId,
+) -> Result<(), ValidateContextError> {
+    add_to_non_finalized_chain_unique(chain_nullifiers, shielded_data_nullifiers, revealing_tx_id)
+        .map_err(remap_ironwood_nullifier_error)
 }
 
 /// Remove nullifiers that were previously added to this non-finalized
