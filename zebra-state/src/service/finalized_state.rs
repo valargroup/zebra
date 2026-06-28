@@ -1120,10 +1120,17 @@ impl FinalizedState {
                     let history_tree_mut = Arc::make_mut(&mut history_tree);
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
+                    let ironwood_root = Default::default();
                     timed_commit_phase!(
                         "zebra.state.commit.history_push.duration_seconds",
                         history_tree_mut
-                            .push(&network, block.clone(), &sapling_root, &orchard_root)
+                            .push(
+                                &network,
+                                block.clone(),
+                                &sapling_root,
+                                &orchard_root,
+                                &ironwood_root,
+                            )
                             .map_err(Arc::new)
                             .map_err(ValidateContextError::from)
                     )?;
