@@ -8,11 +8,12 @@
 //! events over a non-blocking control channel. The reactor learns committed
 //! progress back over a non-blocking `watch` ([`SequencerView`]).
 //!
-//! The logic in each input handler is the **verbatim** logic that used to run
-//! inline in the matching reactor handler (`handle_block`'s body-acceptance tail,
-//! `apply_state_frontiers_changed`'s Sequencer half, `handle_chain_tip_reset`,
-//! `handle_block_apply_finished`); only its location and the budget/work/actions
-//! handles it uses move here. See the  "Sequencer task".
+//! Each input handler owns one stage of the commit pipeline: the body-acceptance
+//! tail (`handle_accept_body`), the verified-tip frontier advance
+//! (`handle_frontier_advance`), the chain-tip reset (`handle_frontier_reset`), and
+//! the apply completion (`handle_apply_finished`). They mutate the `Sequencer`,
+//! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
+//! actions on the same channel the reactor uses.
 
 use super::{
     events::*,
@@ -24,12 +25,6 @@ use super::{
     *,
 };
 
-/// How often the Sequencer task checks whether the byte budget is starving the
-/// commit-unblocking (lowest pending) height and sheds the speculative top of the
-/// reorder buffer to fund it. Bounds the recovery latency when no bodies are
-/// flowing to trigger the inline check (e.g. once outstanding requests drain).
-const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
-
 /// Favor the lowest needed height over the speculative high tail.
 ///
 /// While the byte budget cannot fund even one worst-case request yet the lowest
@@ -39,10 +34,10 @@ const FLOOR_STARVATION_SHED_INTERVAL: Duration = Duration::from_millis(500);
 /// invariant) for later re-fetch. Because another top can always be shed, a low
 /// retry never blocks on budget; the floor can never wedge behind a full buffer,
 /// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. Floor requesters also call this
-/// synchronously through [`SequencerControlInput::FundFloorReservation`], so the
-/// rescue path is demand-driven with a periodic backstop. Returns whether it shed
-/// anything.
+/// which also bounds the reorder backlog. The rescue path is purely demand-driven:
+/// it runs inline after each accepted body and synchronously when a floor requester
+/// needs budget through [`SequencerControlInput::FundFloorReservation`]. Returns
+/// whether it shed anything.
 pub(super) fn shed_top_until_available(
     budget: &mut ByteBudget,
     work: &WorkQueue,
@@ -165,9 +160,9 @@ pub(super) struct SequencerView {
     pub(super) reset_epoch: u64,
     /// Increments once per processed frontier/reset/apply input (NOT per accepted
     /// body). The reactor runs its heavy serving/producer/schedule reaction only
-    /// when this advances, mirroring the single-task version where a pure body
-    /// buffer/submit reran nothing but the forwarding peer's reschedule, while a
-    /// frontier advance, reset, or apply-finished always reran query/schedule.
+    /// when this advances: a pure body buffer/submit needs nothing but the
+    /// forwarding peer's own reschedule, while a frontier advance, reset, or
+    /// apply-finished must re-query and reschedule.
     pub(super) reaction_epoch: u64,
     pub(super) reorder_len: u64,
     pub(super) applying_len: u64,
@@ -261,13 +256,9 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
-        // Periodic shed backstop: catches budget starvation of the floor even when
-        // no bodies/control events are arriving to trigger the inline checks.
-        let mut shed_tick = tokio::time::interval(FLOOR_STARVATION_SHED_INTERVAL);
-        shed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Track input closure explicitly: the always-ready shed timer means the
-        // `select!` never falls through to an `else`, so shut down only once both
-        // input channels have closed.
+        // Track input closure explicitly so the loop exits once both inputs close:
+        // a `select!` whose arms are all disabled with no `else` panics, so the
+        // top-of-loop guard breaks out before the last open channel is gated off.
         let mut control_open = true;
         let mut body_open = true;
         loop {
@@ -305,26 +296,15 @@ impl SequencerTask {
                         None => body_open = false,
                     }
                 }
-
-                _ = shed_tick.tick() => {
-                    if shed_top_for_floor_starvation(
-                        &mut self.budget,
-                        &self.work,
-                        &mut self.sequencer,
-                    ) {
-                        self.publish_view();
-                    }
-                }
             }
         }
     }
 
     async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
-        // Each handler reports whether it did work that the single-task version
-        // would have followed with the reactor's heavy serving/producer/schedule
-        // tail. Bumping `reaction_epoch` only then keeps the reactor from
-        // re-querying/-scheduling on a pure body buffer/submit or a no-op
-        // (stale/duplicate) apply completion.
+        // Each handler reports whether it did work that needs the reactor's heavy
+        // serving/producer/schedule tail. Bumping `reaction_epoch` only then keeps
+        // the reactor from re-querying/-scheduling on a pure body buffer/submit or
+        // a no-op (stale/duplicate) apply completion.
         match input {
             SequencerControlInput::FrontierAdvance {
                 frontiers,

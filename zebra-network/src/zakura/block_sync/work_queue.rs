@@ -200,6 +200,15 @@ impl WorkQueue {
         max_count: usize,
         max_estimated_bytes: u64,
     ) -> Vec<(block::Height, WorkItem)> {
+        // An empty count or inverted range is a caller bug, not a real "nothing to
+        // take": every caller computes `low <= high` and a positive count before
+        // calling. Assert it in debug/test builds; still return empty in release so
+        // a miscomputation degrades to a no-op rather than panicking a live node.
+        debug_assert!(
+            max_count > 0 && low <= high,
+            "take_in_range_budgeted requires a positive count and low <= high, \
+             got max_count={max_count}, low={low:?}, high={high:?}"
+        );
         if max_count == 0 || low > high {
             return Vec::new();
         }

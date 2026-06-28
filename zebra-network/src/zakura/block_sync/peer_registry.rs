@@ -426,6 +426,20 @@ impl PeerRegistry {
         (servable, outstanding)
     }
 
+    /// The soonest deadline among all peer claims for one height, if any. Lets the
+    /// reactor arm its floor watchdog to the exact expiry without allocating a
+    /// claim snapshot on every loop iteration.
+    pub(super) fn earliest_outstanding_deadline_at(
+        &self,
+        height: block::Height,
+    ) -> Option<Instant> {
+        let peers = self.lock();
+        peers
+            .values()
+            .filter_map(|entry| entry.outstanding.get(&height).map(|meta| meta.deadline))
+            .min()
+    }
+
     /// Snapshot all peer claims for one height.
     pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
         let peers = self.lock();

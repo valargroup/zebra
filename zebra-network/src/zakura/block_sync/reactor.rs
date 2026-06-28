@@ -256,14 +256,19 @@ impl BlockSyncReactor {
                 .status_refresh_interval
                 .max(Duration::from_millis(1)),
         );
-        let mut floor_watchdog_ticks =
-            time::interval(self.startup.config.effective_floor_watchdog_tick());
 
         self.query_needed_blocks().await;
         self.publish_metrics();
         self.refresh_throughput();
         self.trace_sync_state();
         loop {
+            // Arm the floor watchdog to the earliest outstanding floor-claim
+            // deadline (event-driven, like the per-peer routine's own-timeout
+            // arm): force-cancel an expired floor request exactly when it expires
+            // instead of polling. Rebuilt each iteration, so any event that adds,
+            // completes, or advances the floor re-arms it to the next deadline.
+            let floor_watchdog = self.earliest_floor_deadline_sleep();
+            tokio::pin!(floor_watchdog);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
@@ -345,11 +350,24 @@ impl BlockSyncReactor {
                     self.trace_sync_state();
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
-                _ = floor_watchdog_ticks.tick() => {
+                _ = &mut floor_watchdog => {
                     self.run_floor_watchdog(Instant::now());
                     self.publish_metrics();
                 }
             }
+        }
+    }
+
+    /// Sleep future resolving at the earliest outstanding floor-claim deadline, so
+    /// the reactor force-cancels an expired floor request exactly when it expires
+    /// rather than on a fixed poll. Defaults to a long idle sleep when no floor
+    /// claim is outstanding; any reactor event recomputes it on the next iteration.
+    fn earliest_floor_deadline_sleep(&self) -> time::Sleep {
+        let earliest = next_height(self.request_floor)
+            .and_then(|height| self.registry.earliest_outstanding_deadline_at(height));
+        match earliest {
+            Some(deadline) => time::sleep(deadline.saturating_duration_since(Instant::now())),
+            None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
