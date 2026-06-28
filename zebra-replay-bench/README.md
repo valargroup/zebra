@@ -6,7 +6,7 @@ production committer (`FinalizedState::commit_finalized_direct`) — no peers, n
 header/body sync, no head-of-line noise — so the write-assembler + disk-writer
 work can be measured and A/B compared on a stable baseline.
 
-It deliberately runs the **legacy recompute path** (`disable_vct_fast_sync`), the
+It deliberately runs the **legacy recompute path** (`vct_fast_sync = false`), the
 per-block note-commitment-tree + history-tree work that dominates commit cost.
 
 ## Two phases, one flat cache

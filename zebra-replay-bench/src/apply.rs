@@ -1,9 +1,9 @@
 //! Phase 2: replay cached blocks through the real state committer, timed.
 //!
 //! Two modes:
-//! * **legacy** — `disable_vct_fast_sync = true`, full per-block note-commitment
+//! * **legacy** — `vct_fast_sync = false`, full per-block note-commitment
 //!   recompute; `next_checkpoint = None`.
-//! * **VCT** (`--vct-sidecar`) — `disable_vct_fast_sync = false`, the per-height
+//! * **VCT** (`--vct-sidecar`) — `vct_fast_sync = true`, the per-height
 //!   anchor roots from the sidecar are written into the base fork's header-roots
 //!   column family so the committer folds them in and skips the recompute. Each
 //!   block is committed with its successor as `next_checkpoint`, the one-block-lag
@@ -75,8 +75,8 @@ pub fn run(
         None => None,
     };
 
-    // VCT mode forces the fast path on (disable_vct_fast_sync = false); legacy
-    // mode forces the full recompute (= true).
+    // VCT mode forces the fast path on (vct_fast_sync = true); legacy
+    // mode forces the full recompute (vct_fast_sync = false).
     let force_legacy = sidecar.is_none();
     let config = state_config(base.to_path_buf(), force_legacy);
     tracing::info!(base = %base.display(), vct = sidecar.is_some(), "opening base fork writable");
