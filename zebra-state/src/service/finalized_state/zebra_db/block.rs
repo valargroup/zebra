@@ -37,7 +37,7 @@ use crate::{
         MAX_BLOCK_REORG_HEIGHT, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_PRUNE_HEIGHTS_PER_COMMIT,
     },
     error::{CommitCheckpointVerifiedError, CommitHeaderRangeError},
-    request::FinalizedBlock,
+    request::{AuthenticatedCheckpointHash, FinalizedBlock},
     service::check,
     service::finalized_state::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
@@ -403,6 +403,83 @@ impl ZebraDb {
         }
     }
 
+    /// Returns the hash at `height` from a committed body, falling back to a persisted Zakura
+    /// header-only row. `None` if neither is present.
+    fn header_hash_at(&self, height: block::Height) -> Option<block::Hash> {
+        self.hash(height)
+            .or_else(|| self.zakura_header_hash(height))
+    }
+
+    /// Returns the highest checkpoint height whose header hash is positively re-established against
+    /// the hardcoded checkpoint list. Every height at or below this is checkpoint-authenticated.
+    ///
+    /// Used to bound checkpoint-class body scheduling (airtight ordering): the Zakura checkpoint
+    /// fast-commit path has no fallback, so a checkpoint-class body must never be requested before
+    /// its height is authenticated here.
+    pub fn authenticated_header_tip(&self) -> Option<block::Height> {
+        let checkpoints = self.network().checkpoint_list();
+        let persisted_tip = self.best_header_tip().map(|(height, _)| height)?;
+
+        // Walk checkpoints down from the highest at/below the persisted tip until one is positively
+        // authenticated. Normally the first matches; we do not trust persistence to have checked it
+        // (see `authenticated_checkpoint_hash`). The body tip's enclosing checkpoint is always
+        // authenticated because it was committed from a verified block, so this terminates.
+        let mut candidate = checkpoints.max_height_in_range(..=persisted_tip);
+        while let Some(c) = candidate {
+            if self.header_hash_at(c) == checkpoints.hash(c) {
+                return Some(c);
+            }
+            candidate = c
+                .previous()
+                .ok()
+                .and_then(|below| checkpoints.max_height_in_range(..=below));
+        }
+
+        None
+    }
+
+    /// Returns the Zakura-authenticated header hash at `height`, if `height` is a header-only
+    /// frontier height (above the committed body tip) whose enclosing checkpoint has been reached
+    /// and authenticated; otherwise `None`.
+    ///
+    /// The hash is taken **strictly from the Zakura header store**, never from committed body state,
+    /// so the token means exactly "the checkpoint-authenticated Zakura header hash for `height`".
+    /// Authentication is established positively at the gate: for the next checkpoint `C >= height`,
+    /// the persisted Zakura header hash at `C` must equal the hardcoded `checkpoint_list.hash(C)`.
+    ///
+    /// Continuity is sound because `height` and `C` are both in the un-trimmed frontier above the
+    /// body tip (the Zakura store releases a row only once its body commits), so every height in
+    /// `[height, C]` is also in the frontier; header sync persists only anchor-linked contiguous
+    /// ranges, so continuity from `height` up to the pinned `C` authenticates `height`'s hash. An
+    /// already-committed height returns `None` here (its Zakura row has been released), so the fast
+    /// path never re-commits or authenticates from body state.
+    ///
+    /// This is the only constructor of [`AuthenticatedCheckpointHash`].
+    pub fn authenticated_checkpoint_hash(
+        &self,
+        height: block::Height,
+    ) -> Option<AuthenticatedCheckpointHash> {
+        let checkpoints = self.network().checkpoint_list();
+
+        // The next checkpoint at or above `height`. `None` => above the last checkpoint, i.e. not a
+        // checkpoint-anchored height (the caller must not fast-commit it).
+        let next_checkpoint = checkpoints.min_height_in_range(height..)?;
+
+        // Construct strictly from the Zakura header frontier: `height` must be a header-only frontier
+        // height. (`None` for an already-committed height, so we never authenticate from body
+        // state.)
+        let header_hash = self.zakura_header_hash(height)?;
+
+        // Positively re-check the checkpoint anchor against the Zakura frontier. If the frontier has
+        // not reached `C`, or the persisted hash there does not match the hardcoded checkpoint,
+        // `height` is not yet authenticated.
+        if self.zakura_header_hash(next_checkpoint) != checkpoints.hash(next_checkpoint) {
+            return None;
+        }
+
+        Some(AuthenticatedCheckpointHash::new(header_hash))
+    }
+
     /// Returns a contiguous ascending header range from full blocks and Zakura header rows.
     pub fn headers_by_height_range(
         &self,
@@ -482,10 +559,21 @@ impl ZebraDb {
 
         let count = limit.min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
 
+        // Airtight ordering: never schedule a checkpoint-class body (`height <= checkpoint_max`)
+        // before header sync has checkpoint-authenticated that height. The Zakura checkpoint
+        // fast-commit path has no fallback, so requesting such a body early would later trip a hard
+        // invariant. Full-class heights (above the last checkpoint) are unaffected.
+        let checkpoint_max = self.network().checkpoint_list().max_height();
+        let authenticated_header_tip = self.authenticated_header_tip();
+
         self.headers_by_height_range(start, count)
             .into_iter()
             .map(|(height, _, _)| height)
             .filter(|height| !self.contains_body_at_height(*height))
+            .filter(|height| {
+                *height > checkpoint_max
+                    || authenticated_header_tip.is_some_and(|tip| *height <= tip)
+            })
             .take(limit as usize)
             .collect()
     }
@@ -985,6 +1073,8 @@ impl ZebraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZebraDb = self;
+        #[cfg(feature = "commit-metrics")]
+        let spent_reads_start = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
             Option<Vec<RawBytes>>,
@@ -1035,6 +1125,9 @@ impl ZebraDb {
                 }
             },
         );
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.spent_utxo_reads.duration_seconds")
+            .record(spent_reads_start.elapsed().as_secs_f64());
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -1101,6 +1194,8 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
+        #[cfg(feature = "commit-metrics")]
+        let address_reads_start = std::time::Instant::now();
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
                 self.address_balance_location(addr)
@@ -1110,10 +1205,15 @@ impl ZebraDb {
                 Some(self.address_balance_location(addr)?.into_new_change())
             }))
         };
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zebra.state.write.address_reads.duration_seconds")
+            .record(address_reads_start.elapsed().as_secs_f64());
 
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
+        #[cfg(feature = "commit-metrics")]
+        let batch_prep_start = std::time::Instant::now();
         batch.prepare_block_batch(
             self,
             network,
@@ -1139,6 +1239,13 @@ impl ZebraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+        #[cfg(feature = "commit-metrics")]
+        {
+            metrics::histogram!("zebra.state.write.batch_prep.duration_seconds")
+                .record(batch_prep_start.elapsed().as_secs_f64());
+            metrics::histogram!("zebra.state.write.batch_bytes")
+                .record(batch.size_in_bytes() as f64);
+        }
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();

@@ -211,6 +211,36 @@ where
                 .boxed();
         }
 
+        // A Zakura header-authenticated checkpoint body: validate in isolation and release
+        // immediately, no range accumulation. Policy lives here — this is checkpoint-range only.
+        if let Request::CommitCheckpointAuthenticated {
+            block,
+            expected_hash,
+        } = request
+        {
+            let max_checkpoint_height = self.max_checkpoint_height;
+            return match block.coinbase_height() {
+                Some(height) if height <= max_checkpoint_height => self
+                    .checkpoint
+                    .call_authenticated(block, expected_hash)
+                    .map_err(Into::into)
+                    .boxed(),
+                Some(height) => async move {
+                    Err(VerifyCheckpointError::TooHigh {
+                        height,
+                        max_height: max_checkpoint_height,
+                    })?
+                }
+                .boxed(),
+                None => async move {
+                    Err(VerifyCheckpointError::CoinbaseHeight {
+                        hash: expected_hash.hash(),
+                    })?
+                }
+                .boxed(),
+            };
+        }
+
         let block = request.block();
 
         match block.coinbase_height() {

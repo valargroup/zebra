@@ -1894,18 +1894,46 @@ impl BlockSyncReactor {
     fn publish_metrics(&self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
+        let view = self.last_view;
+
         metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
-        metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
+        metrics::gauge!("sync.block.verified_tip.height").set(view.verified_tip.0 as f64);
+        metrics::gauge!("sync.block.download_floor.height").set(view.download_floor.0 as f64);
+        metrics::gauge!("sync.block.commit_gap.height")
+            .set(view.download_floor.0.saturating_sub(view.verified_tip.0) as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
         metrics::gauge!("sync.block.budget.reserved_bytes")
             .set(self.state.budget.reserved() as f64);
+        metrics::gauge!("sync.block.reorder").set(view.reorder_len as f64);
+        metrics::gauge!("sync.block.reorder.buffered_blocks").set(view.reorder_len as f64);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
-            .set(self.last_view.reorder_buffered_bytes as f64);
-        metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
+            .set(view.reorder_buffered_bytes as f64);
+        metrics::gauge!("sync.block.applying").set(view.applying_len as f64);
+        metrics::gauge!("sync.block.unsubmitted_applying")
+            .set(view.unsubmitted_applying_count as f64);
+        metrics::gauge!("sync.block.submitted_applying").set(view.submitted_applying_count as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+
+        if let Some(floor_gap) = self.floor_gap_diagnostics(Instant::now()) {
+            metrics::gauge!("sync.block.floor_gap.height").set(floor_gap.height.0 as f64);
+            metrics::gauge!("sync.block.floor_gap.servable_peers")
+                .set(floor_gap.servable_peers as f64);
+            metrics::gauge!("sync.block.floor_gap.available_peers")
+                .set(floor_gap.available_peers as f64);
+            metrics::gauge!("sync.block.floor_gap.outstanding_peers")
+                .set(floor_gap.outstanding_peers as f64);
+            metrics::gauge!("sync.block.commit_frontier_stall.seconds").set(
+                floor_gap
+                    .oldest_outstanding_ms
+                    .map(|age| age as f64 / 1000.0)
+                    .unwrap_or(0.0),
+            );
+            metrics::counter!("sync.block.floor_gap.state_ticks", "state" => floor_gap.state)
+                .increment(1);
+        }
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {

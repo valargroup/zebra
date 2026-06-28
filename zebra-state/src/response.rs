@@ -395,6 +395,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
+    /// Response to [`ReadRequest::AuthenticatedCheckpointHash`].
+    AuthenticatedCheckpointHash(Option<crate::request::AuthenticatedCheckpointHash>),
+
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
 
@@ -580,6 +583,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
             | ReadResponse::BestHeaderTip(_)
+            | ReadResponse::AuthenticatedCheckpointHash(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
