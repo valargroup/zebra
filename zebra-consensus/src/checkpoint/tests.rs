@@ -95,6 +95,87 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn authenticated_checkpoint_release_test() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block0 =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let hash0 = block0.hash();
+
+    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
+        [(block0.coinbase_height().unwrap(), hash0)]
+            .iter()
+            .cloned()
+            .collect();
+
+    let state_service = zebra_state::init_test(&Mainnet).await;
+    let mut checkpoint_verifier =
+        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
+            .map_err(|e| eyre!(e))?;
+
+    // The authenticated fast path commits the block against its authenticated hash, with no other
+    // height queued, and without touching the range/progress state.
+    let token = zebra_state::AuthenticatedCheckpointHash::new_for_test(hash0);
+    let response = timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+        checkpoint_verifier.call_authenticated(block0.clone(), token),
+    )
+    .await
+    .expect("timeout should not happen")
+    .expect("authenticated block should commit");
+
+    assert_eq!(response, hash0);
+    // The fast path must not enqueue anything or walk/advance the checkpoint range state.
+    assert!(checkpoint_verifier.queued.is_empty());
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        BeforeGenesis
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_checkpoint_hash_mismatch_test() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block0 =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let hash0 = block0.hash();
+    let block1 = Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_1_BYTES[..])?;
+    let wrong_hash = block1.hash();
+
+    let genesis_checkpoint_list: BTreeMap<block::Height, block::Hash> =
+        [(block0.coinbase_height().unwrap(), hash0)]
+            .iter()
+            .cloned()
+            .collect();
+
+    let state_service = zebra_state::init_test(&Mainnet).await;
+    let mut checkpoint_verifier =
+        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
+            .map_err(|e| eyre!(e))?;
+
+    // A body whose hash disagrees with the authenticated header is a hard invariant violation:
+    // there is no fallback, and nothing is released or queued.
+    let token = zebra_state::AuthenticatedCheckpointHash::new_for_test(wrong_hash);
+    let result = timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+        checkpoint_verifier.call_authenticated(block0.clone(), token),
+    )
+    .await
+    .expect("timeout should not happen");
+
+    assert!(matches!(
+        result,
+        Err(VerifyCheckpointError::AuthenticatedHashMismatch { .. })
+    ));
+    assert!(checkpoint_verifier.queued.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn multi_item_checkpoint_list_test() -> Result<(), Report> {
     multi_item_checkpoint_list().await
 }

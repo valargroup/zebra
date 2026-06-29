@@ -124,6 +124,14 @@ pub struct DiskWriteBatch {
     batch: rocksdb::WriteBatch,
 }
 
+#[cfg(feature = "commit-metrics")]
+impl DiskWriteBatch {
+    /// Returns the serialized size of this pending RocksDB write batch.
+    pub(crate) fn size_in_bytes(&self) -> usize {
+        self.batch.size_in_bytes()
+    }
+}
+
 impl Debug for DiskWriteBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiskWriteBatch")
