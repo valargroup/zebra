@@ -17,16 +17,24 @@ use crate::{
     sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
-    transparent,
-    LedgerState,
+    transparent, LedgerState,
 };
 
 fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
     prop_oneof![
         v5_tx_strategy(Just(None).boxed(), Just(None).boxed()),
-        v5_tx_strategy(sapling_outputs_only().prop_map(Some).boxed(), Just(None).boxed()),
-        v5_tx_strategy(sapling_with_spends().prop_map(Some).boxed(), Just(None).boxed()),
-        v5_tx_strategy(Just(None).boxed(), any::<orchard::ShieldedData>().prop_map(Some).boxed()),
+        v5_tx_strategy(
+            sapling_outputs_only().prop_map(Some).boxed(),
+            Just(None).boxed()
+        ),
+        v5_tx_strategy(
+            sapling_with_spends().prop_map(Some).boxed(),
+            Just(None).boxed()
+        ),
+        v5_tx_strategy(
+            Just(None).boxed(),
+            any::<orchard::ShieldedData>().prop_map(Some).boxed()
+        ),
         v5_tx_strategy(
             any::<sapling::ShieldedData<sapling::SharedAnchor>>()
                 .prop_map(Some)
