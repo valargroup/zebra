@@ -49,9 +49,9 @@ on:
         required: true
         default: "1730000"
       wall_cap_seconds:
-        description: "Hard wall-clock cap for a single run"
+        description: "Hard wall-clock cap for a single run, capped at 2000 seconds"
         required: false
-        default: "2400"
+        default: "2000"
       feed_peer:
         description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
         required: false
