@@ -56,6 +56,32 @@ proptest! {
         prop_assert_eq![auth_digest, tx.auth_digest()];
     }
 
+    /// The native ZIP-244 txid + authorizing-data digest implementation
+    /// (`transaction::zip244`) must be byte-for-byte identical to the
+    /// `librustzcash` conversion it replaces. This is the consensus-critical
+    /// correctness proof for the native path, exercised across thousands of
+    /// random v5 transaction shapes (coinbase, spends-only, outputs-only, empty
+    /// shielded bundles, multi-action orchard, both NU5 and NU6 branch ids).
+    #[test]
+    fn native_zip244_matches_librustzcash(tx in Transaction::v5_strategy(LedgerState::default())) {
+        let _init_guard = zebra_test::init();
+
+        let (native_txid, native_auth) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+            .expect("v5 transaction has a native ZIP-244 digest");
+        let (ref_txid, ref_auth) =
+            crate::primitives::zcash_primitives::txid_and_auth_digest_via_librustzcash(&tx);
+
+        prop_assert_eq!(native_txid, ref_txid, "native txid must match librustzcash");
+        prop_assert_eq!(native_auth, ref_auth, "native auth digest must match librustzcash");
+
+        // The separate native entry points must agree with the combined one.
+        prop_assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5"), native_txid);
+        prop_assert_eq!(
+            crate::transaction::zip244::auth_digest(&tx).expect("v5"),
+            native_auth
+        );
+    }
+
     #[test]
     fn transaction_hash_struct_display_roundtrip(hash in any::<Hash>()) {
         let _init_guard = zebra_test::init();
