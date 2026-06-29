@@ -15,9 +15,10 @@
 //!
 //! The output is **byte-for-byte identical** to the `librustzcash` computation;
 //! this is consensus-critical and is proven by the differential property test
-//! `native_matches_librustzcash` (and `txid_and_auth_digest_matches_separate`)
-//! in `transaction/tests/prop.rs`, plus the existing ZIP-244 known-answer
-//! vectors and a clean differential mainnet sync.
+//! `native_zip244_matches_librustzcash` (and
+//! `txid_and_auth_digest_matches_separate`) in `transaction/tests/prop.rs`, plus
+//! the existing ZIP-244 known-answer vectors and a clean differential mainnet
+//! sync.
 //!
 //! Specified in [ZIP-244] and [ZIP-225]. The personalizations and field
 //! orderings mirror `zcash_primitives::transaction::txid` and
