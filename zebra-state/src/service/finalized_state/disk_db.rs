@@ -124,9 +124,10 @@ pub struct DiskWriteBatch {
     batch: rocksdb::WriteBatch,
 }
 
-#[cfg(feature = "commit-metrics")]
 impl DiskWriteBatch {
     /// Returns the serialized size of this pending RocksDB write batch.
+    // Always compiled: the commit-pressure trace (`PreparedCommitTrace`) reads it
+    // independently of the `commit-metrics` feature.
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.batch.size_in_bytes()
     }
@@ -545,6 +546,25 @@ impl ReadDisk for DiskDb {
     }
 }
 
+/// A point-in-time snapshot of RocksDB compaction/flush pressure, summed across
+/// column families, sampled right after a commit for [`super::commit_pressure`].
+pub(super) struct PressureSnapshot {
+    /// Total SST files sitting at L0 across all CFs (the write-stall trigger).
+    pub(super) l0_files: u64,
+    /// Estimated bytes of pending compaction work across all CFs.
+    pub(super) pending_compaction_bytes: u64,
+    /// Compactions currently running (database-wide).
+    pub(super) running_compactions: u64,
+    /// Memtable flushes currently running (database-wide).
+    pub(super) running_flushes: u64,
+    /// Total memtable (mutable + immutable) bytes across all CFs.
+    pub(super) memtable_bytes: u64,
+    /// Total on-disk SST bytes across all CFs.
+    pub(super) total_sst_bytes: u64,
+    /// Estimated live (post-compaction) data bytes across all CFs.
+    pub(super) live_data_bytes: u64,
+}
+
 impl DiskWriteBatch {
     /// Creates and returns a new transactional batch write.
     ///
@@ -557,6 +577,16 @@ impl DiskWriteBatch {
         DiskWriteBatch {
             batch: rocksdb::WriteBatch::default(),
         }
+    }
+
+    /// Returns the number of operations (puts + deletes) queued in this batch.
+    pub fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    /// Returns whether this batch has no queued operations.
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
     }
 }
 
@@ -684,6 +714,48 @@ impl DiskDb {
                 metrics::gauge!("zebra.state.rocksdb.num_files_at_level", "level" => level.to_string())
                     .set(count as f64);
             }
+        }
+    }
+
+    /// Samples RocksDB compaction/flush pressure across all column families, for the
+    /// optional per-commit pressure trace ([`super::commit_pressure`]). Reads only
+    /// in-memory RocksDB properties (no disk I/O); called on the rare slow-commit path.
+    pub(super) fn pressure_snapshot(&self) -> PressureSnapshot {
+        let db: &Arc<DB> = &self.db;
+        let db_options = DiskDb::options();
+
+        let mut l0_files = 0;
+        let mut pending_compaction_bytes = 0;
+        let mut memtable_bytes = 0;
+        let mut total_sst_bytes = 0;
+        let mut live_data_bytes = 0;
+
+        for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), []) {
+            let Some(cf_handle) = db.cf_handle(cf_descriptor.name()) else {
+                continue;
+            };
+            let cf_u64 = |prop: &str| {
+                db.property_int_value_cf(cf_handle, prop)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+            };
+            l0_files += cf_u64("rocksdb.num-files-at-level0");
+            pending_compaction_bytes += cf_u64("rocksdb.estimate-pending-compaction-bytes");
+            memtable_bytes += cf_u64("rocksdb.size-all-mem-tables");
+            total_sst_bytes += cf_u64("rocksdb.total-sst-files-size");
+            live_data_bytes += cf_u64("rocksdb.estimate-live-data-size");
+        }
+
+        let db_u64 = |prop: &str| db.property_int_value(prop).ok().flatten().unwrap_or(0);
+        PressureSnapshot {
+            l0_files,
+            pending_compaction_bytes,
+            running_compactions: db_u64("rocksdb.num-running-compactions"),
+            running_flushes: db_u64("rocksdb.num-running-flushes"),
+            memtable_bytes,
+            total_sst_bytes,
+            live_data_bytes,
         }
     }
 

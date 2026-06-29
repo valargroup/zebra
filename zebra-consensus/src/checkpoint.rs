@@ -603,14 +603,24 @@ where
 
         // Cheap proof-of-work checks run *before* the expensive precomputation,
         // so a flood of invalid-PoW blocks can't make us do per-transaction work.
+        let pow_start = std::time::Instant::now();
         self.check_proof_of_work(&block.header, height, hash)?;
+        let pow = pow_start.elapsed();
 
         // Precompute the per-transaction hashes and auth data root, which scale
         // with block weight. (The precomputed path does this concurrently in the
         // caller and skips it here.)
+        let precompute_start = std::time::Instant::now();
         let block = CheckpointVerifiedBlock::with_hash(block, hash);
+        let precompute = precompute_start.elapsed();
+        metrics::histogram!("zebra.consensus.checkpoint.precompute.duration_seconds")
+            .record(precompute.as_secs_f64());
 
-        self.finish_validation(block)
+        let merkle_start = std::time::Instant::now();
+        let block = self.finish_validation(block)?;
+        crate::verify_timing::record(height.0, pow, precompute, merkle_start.elapsed());
+
+        Ok(block)
     }
 
     /// Check a [`CheckpointVerifiedBlock`] whose precomputation (txids, auth data
@@ -636,6 +646,7 @@ where
         height: block::Height,
         hash: block::Hash,
     ) -> Result<(), VerifyCheckpointError> {
+        let pow_start = std::time::Instant::now();
         if self.network.disable_pow() {
             crate::block::check::difficulty_threshold_is_valid(
                 header,
@@ -647,6 +658,8 @@ where
             crate::block::check::difficulty_is_valid(header, &self.network, &height, &hash)?;
             crate::block::check::equihash_solution_is_valid(header)?;
         }
+        metrics::histogram!("zebra.consensus.checkpoint.pow.duration_seconds")
+            .record(pow_start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -671,11 +684,14 @@ where
                 .map(DeferredPoolBalanceChange::new),
         );
 
+        let merkle_start = std::time::Instant::now();
         crate::block::check::merkle_root_validity(
             &self.network,
             &block.block,
             &block.transaction_hashes,
         )?;
+        metrics::histogram!("zebra.consensus.checkpoint.merkle.duration_seconds")
+            .record(merkle_start.elapsed().as_secs_f64());
 
         Ok(block)
     }

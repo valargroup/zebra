@@ -245,7 +245,11 @@ fn pipelined_commit_matches_synchronous() -> Result<()> {
                 let height = assembled.height;
                 pipe_state
                     .db
-                    .flush_block_batch(assembled.batch, "pipelined_commit_matches_synchronous flush");
+                    .flush_block_batch(
+                        assembled.batch,
+                        assembled.commit_trace,
+                        "pipelined_commit_matches_synchronous flush",
+                    );
                 pipeline.retire_through(height);
             }
 

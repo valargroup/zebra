@@ -284,10 +284,7 @@ async fn pipelined_state_service_commits_chain() -> Result<()> {
         committed, expected,
         "every queued block should commit through the pipeline"
     );
-    assert!(
-        expected >= 2,
-        "the test chain must have at least two blocks"
-    );
+    assert!(expected >= 2, "the test chain must have at least two blocks");
 
     Ok(())
 }

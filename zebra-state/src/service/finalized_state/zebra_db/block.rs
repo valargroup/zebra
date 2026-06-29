@@ -1041,7 +1041,7 @@ impl ZebraDb {
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         vct_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
-        let (batch, hash, _contribution) = self.assemble_block_batch(
+        let (batch, hash, _contribution, commit_trace) = self.assemble_block_batch(
             finalized,
             prev_note_commitment_trees,
             network,
@@ -1050,7 +1050,7 @@ impl ZebraDb {
             vct_sync_below,
             None,
         )?;
-        self.flush_block_batch(batch, source);
+        self.flush_block_batch(batch, commit_trace, source);
         Ok(hash)
     }
 
@@ -1091,9 +1091,11 @@ impl ZebraDb {
             DiskWriteBatch,
             block::Hash,
             Option<PipelineBatchContribution>,
+            super::super::commit_pressure::PreparedCommitTrace,
         ),
         CommitCheckpointVerifiedError,
     > {
+        let write_start = std::time::Instant::now();
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1151,7 +1153,6 @@ impl ZebraDb {
                     &finalized.new_outputs,
                 )
             };
-        #[cfg(feature = "commit-metrics")]
         let spent_reads_start = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
@@ -1181,9 +1182,10 @@ impl ZebraDb {
                 }
             },
         );
+        let reads_dur = spent_reads_start.elapsed();
         #[cfg(feature = "commit-metrics")]
         metrics::histogram!("zebra.state.write.spent_utxo_reads.duration_seconds")
-            .record(spent_reads_start.elapsed().as_secs_f64());
+            .record(reads_dur.as_secs_f64());
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -1261,7 +1263,6 @@ impl ZebraDb {
             }
             self.address_balance_location(addr)
         };
-        #[cfg(feature = "commit-metrics")]
         let address_reads_start = std::time::Instant::now();
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
@@ -1272,9 +1273,10 @@ impl ZebraDb {
                 Some(lookup_balance(addr)?.into_new_change())
             }))
         };
+        let address_reads_dur = address_reads_start.elapsed();
         #[cfg(feature = "commit-metrics")]
         metrics::histogram!("zebra.state.write.address_reads.duration_seconds")
-            .record(address_reads_start.elapsed().as_secs_f64());
+            .record(address_reads_dur.as_secs_f64());
 
         // The value pool and `vct_upgrade_height` marker are threaded forward in
         // memory by the run-ahead pipeline; with `overlay = None` they come from
@@ -1288,6 +1290,7 @@ impl ZebraDb {
             .unwrap_or(false);
         let capture_pipeline_outputs = overlay.is_some();
 
+        let assembly_start = std::time::Instant::now();
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1320,6 +1323,7 @@ impl ZebraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+        let batch_assembly_dur = assembly_start.elapsed();
         #[cfg(feature = "commit-metrics")]
         {
             metrics::histogram!("zebra.state.write.batch_prep.duration_seconds")
@@ -1360,7 +1364,26 @@ impl ZebraDb {
             }
         });
 
-        Ok((batch, finalized.hash, contribution))
+        let commit_trace = super::super::commit_pressure::PreparedCommitTrace {
+            height: finalized.height.0,
+            block: finalized.block.clone(),
+            tx_count: finalized.transaction_hashes.len(),
+            output_count: finalized.new_outputs.len(),
+            batch_keys: batch.len(),
+            batch_bytes: batch.size_in_bytes(),
+            reads: reads_dur,
+            address_reads: address_reads_dur,
+            batch_assembly: batch_assembly_dur,
+            // The VCT fold runs before `assemble_block_batch`; the caller
+            // (`assemble_finalized_direct`) sets this after it returns.
+            fold: std::time::Duration::ZERO,
+            // Self-time of the read/compute half (excludes the queue-wait + flush
+            // that `commit_total` also captures).
+            assemble_self: write_start.elapsed(),
+            write_start,
+        };
+
+        Ok((batch, finalized.hash, contribution, commit_trace))
     }
 
     /// Flush a previously [`assemble_block_batch`](Self::assemble_block_batch)d
@@ -1370,14 +1393,32 @@ impl ZebraDb {
     /// on the dedicated disk-writer thread so it overlaps the next block's
     /// assembly; in tip mode it runs inline. A rocksdb write failure is fatal, as
     /// before.
-    pub(crate) fn flush_block_batch(&self, batch: DiskWriteBatch, source: &str) {
+    pub(crate) fn flush_block_batch(
+        &self,
+        batch: DiskWriteBatch,
+        commit_trace: super::super::commit_pressure::PreparedCommitTrace,
+        source: &str,
+    ) {
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db
             .write(batch)
             .expect("unexpected rocksdb error while writing block");
+        let batch_commit = batch_start.elapsed();
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
-            .record(batch_start.elapsed().as_secs_f64());
+            .record(batch_commit.as_secs_f64());
+        let total_dur = commit_trace.write_start.elapsed();
+        // Optional per-slow-commit pressure row (inert unless ZEBRA_COMMIT_PRESSURE_TRACE
+        // is set): pairs this commit's latency with RocksDB L0/compaction/flush state.
+        // Timed separately because, when enabled, it re-serializes the block and samples
+        // RocksDB stats on the disk-writer's critical path (a Heisenberg cost to subtract).
+        let record_start = std::time::Instant::now();
+        super::super::commit_pressure::record_commit(&self.db, commit_trace, batch_commit);
+        metrics::histogram!("zebra.state.write.commit_trace_record.duration_seconds")
+            .record(record_start.elapsed().as_secs_f64());
+
+        metrics::histogram!("zebra.state.write.total.duration_seconds")
+            .record(total_dur.as_secs_f64());
 
         tracing::trace!(?source, "committed block from");
     }
@@ -1419,6 +1460,42 @@ impl ZebraDb {
             .map_err(|error| CommitHeaderRangeError::StorageWriteError {
                 error: error.to_string(),
             })
+    }
+
+    /// Seeds the Zakura header store with frontier header rows for a contiguous run
+    /// of blocks whose bodies have **not** been committed (heights strictly above the
+    /// body tip), writing in chunked batches.
+    ///
+    /// Offline-bench only: this stands in for what header sync would persist, so the
+    /// header-authenticated checkpoint fast path (`authenticated_checkpoint_hash`) can
+    /// run against a snapshot with no live header sync. Each row is independent and the
+    /// insert is idempotent, so callers may seed in any order.
+    pub fn seed_zakura_headers_from_blocks(
+        &self,
+        blocks: impl IntoIterator<Item = (block::Height, Arc<block::Block>)>,
+    ) -> Result<(), CommitHeaderRangeError> {
+        let write = |batch: DiskWriteBatch| {
+            self.db
+                .write(batch)
+                .map_err(|error| CommitHeaderRangeError::StorageWriteError {
+                    error: error.to_string(),
+                })
+        };
+
+        let mut batch = DiskWriteBatch::new();
+        let mut pending = 0usize;
+        for (height, block) in blocks {
+            batch.prepare_zakura_header_from_committed_block(&self.db, height, &block)?;
+            pending += 1;
+            if pending >= 2000 {
+                write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            write(batch)?;
+        }
+        Ok(())
     }
 }
 

@@ -30,7 +30,8 @@ use crate::{
     service::{
         check,
         finalized_state::{
-            spawn_note_precompute, DiskWriteBatch, FinalizedPipeline, FinalizedState, ZebraDb,
+            spawn_note_precompute, DiskWriteBatch, FinalizedPipeline, FinalizedState,
+            PreparedCommitTrace, ZebraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -65,6 +66,7 @@ type PendingPrecompute = (
 /// the overlay.
 struct PipelineFlush {
     batch: DiskWriteBatch,
+    commit_trace: PreparedCommitTrace,
     hash: block::Hash,
     height: Height,
     rsp_tx: oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
@@ -81,21 +83,42 @@ fn run_finalized_writer(
     batch_receiver: std::sync::mpsc::Receiver<PipelineFlush>,
     ack_sender: std::sync::mpsc::Sender<Height>,
 ) {
-    while let Ok(PipelineFlush {
-        batch,
-        hash,
-        height,
-        rsp_tx,
-    }) = batch_receiver.recv()
-    {
-        db.flush_block_batch(batch, "commit checkpoint-verified request (pipelined)");
+    loop {
+        // Time blocked waiting for the next batch: ~0 means the disk-writer is the
+        // bottleneck (a full queue feeding it), high means it is starved (the
+        // assembler upstream is the bottleneck).
+        let recv_start = std::time::Instant::now();
+        let Ok(PipelineFlush {
+            batch,
+            commit_trace,
+            hash,
+            height,
+            rsp_tx,
+        }) = batch_receiver.recv()
+        else {
+            break;
+        };
+        metrics::histogram!("zebra.state.write.disk_writer_recv_wait.duration_seconds")
+            .record(recv_start.elapsed().as_secs_f64());
+
+        // Full per-block service time on the disk-writer (flush + acks): the inverse
+        // of this is the disk-writer's max throughput.
+        let service_start = std::time::Instant::now();
+        db.flush_block_batch(
+            batch,
+            commit_trace,
+            "commit checkpoint-verified request (pipelined)",
+        );
 
         // Ack-after-flush: the commit response only resolves once the block is
         // durable on disk.
         let _ = rsp_tx.send(Ok(hash));
 
         // If the assembler has gone away (shutdown), stop.
-        if ack_sender.send(height).is_err() {
+        let stop = ack_sender.send(height).is_err();
+        metrics::histogram!("zebra.state.write.disk_writer_service.duration_seconds")
+            .record(service_start.elapsed().as_secs_f64());
+        if stop {
             break;
         }
     }
@@ -563,7 +586,15 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
+                        // Starved: no finalized block available. Time the park so we can
+                        // tell "assembler is upstream-starved (verify/driver/feed slow)"
+                        // apart from "assembler is the bottleneck".
+                        let park = std::time::Instant::now();
                         std::thread::park_timeout(Duration::from_millis(10));
+                        metrics::histogram!(
+                            "zebra.state.write.assembler_empty_park.duration_seconds"
+                        )
+                        .record(park.elapsed().as_secs_f64());
                         continue;
                     }
                     Err(TryRecvError::Disconnected) => break,
@@ -583,6 +614,7 @@ impl WriteBlockWorkerTask {
             // So if there has been a block commit error,
             // we need to drop all the descendants of that block,
             // until we receive a block at the required next height.
+            //
             // The next block must be the child of the current tip. In the run-ahead
             // pipeline the assembler runs *ahead* of the durable disk tip (ack-after-
             // flush), so the next valid height follows the in-memory assembled tip
@@ -641,7 +673,17 @@ impl WriteBlockWorkerTask {
                     "VCT: deferring fast checkpoint commit until successor is buffered"
                 );
                 retry_finalized_block = Some(ordered_block);
+                // VCT one-block look-ahead stall: this fast block can't commit until its
+                // successor is buffered (needed to authenticate its supplied roots). If
+                // this dominates, the 10ms poll granularity (not real work) is the gate.
+                let park = std::time::Instant::now();
                 std::thread::park_timeout(Duration::from_millis(10));
+                metrics::counter!("zebra.state.write.assembler_successor_defer.count")
+                    .increment(1);
+                metrics::histogram!(
+                    "zebra.state.write.assembler_successor_park.duration_seconds"
+                )
+                .record(park.elapsed().as_secs_f64());
                 continue;
             }
 
@@ -720,6 +762,7 @@ impl WriteBlockWorkerTask {
                             .expect("flush sender is present while the pipeline is active")
                             .send(PipelineFlush {
                                 batch: assembled.batch,
+                                commit_trace: assembled.commit_trace,
                                 hash: assembled.hash,
                                 height: assembled.height,
                                 rsp_tx,
