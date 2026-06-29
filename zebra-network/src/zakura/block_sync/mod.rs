@@ -31,6 +31,8 @@ use super::{
 };
 
 mod admission;
+#[cfg(feature = "internal-bench")]
+mod bench;
 mod config;
 mod error;
 mod events;
@@ -49,6 +51,11 @@ mod tests;
 mod wire;
 mod work_queue;
 
+#[cfg(feature = "internal-bench")]
+pub use bench::{
+    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
+    BenchSubmit, SequencerProgress,
+};
 pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{
