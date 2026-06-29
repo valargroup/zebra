@@ -499,6 +499,30 @@ fn committed_block_releases_matching_zakura_header() {
         .is_none());
 }
 
+#[test]
+fn authenticated_checkpoint_hash_requires_zakura_frontier_row() {
+    let _init_guard = zebra_test::init();
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let network = checkpoint_test_network(genesis.hash(), block1.hash());
+    let state = state_with_genesis(&network, genesis.clone());
+
+    commit_header_range(&state, genesis.hash(), std::slice::from_ref(&block1.header));
+
+    let authenticated_hash = state
+        .authenticated_checkpoint_hash(Height(1))
+        .expect("checkpoint-authenticated header-only frontier hash is available");
+    assert_eq!(authenticated_hash.hash(), block1.hash());
+
+    write_full_block_header_and_transactions(&state, block1.clone());
+
+    assert_eq!(
+        state.headers_by_height_range(Height(1), 1),
+        vec![(Height(1), block1.hash(), block1.header.clone())],
+    );
+    assert!(state.authenticated_checkpoint_hash(Height(1)).is_none());
+}
+
 /// Committing a body at the bottom of a header-only frontier releases just that
 /// height from the Zakura header store while the higher frontier rows remain,
 /// and reads span the body/frontier boundary.
