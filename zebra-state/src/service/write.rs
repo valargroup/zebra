@@ -583,9 +583,18 @@ impl WriteBlockWorkerTask {
             // So if there has been a block commit error,
             // we need to drop all the descendants of that block,
             // until we receive a block at the required next height.
-            let next_valid_height = finalized_state
-                .db
-                .finalized_tip_height()
+            // The next block must be the child of the current tip. In the run-ahead
+            // pipeline the assembler runs *ahead* of the durable disk tip (ack-after-
+            // flush), so the next valid height follows the in-memory assembled tip
+            // (`pipeline.tip()`), not the on-disk tip — otherwise a block whose parent
+            // is assembled-but-not-yet-flushed is wrongly dropped as "wrong height".
+            // `pipeline.tip()` is `None` until the first block is assembled (seeded),
+            // so the first block correctly falls back to the durable tip.
+            let next_valid_height = pipeline_state
+                .as_ref()
+                .and_then(|pipeline| pipeline.tip())
+                .map(|(height, _hash)| height)
+                .or_else(|| finalized_state.db.finalized_tip_height())
                 .map(|height| (height + 1).expect("committed heights are valid"))
                 .unwrap_or(Height(0));
 
