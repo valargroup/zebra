@@ -7,19 +7,17 @@ use super::{error::*, wire::*, *};
 pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Default advertised hard cap on concurrent in-flight block requests per peer.
 ///
-/// This is the ceiling the adaptive per-peer window grows *toward*, **not** the
-/// opening window. Scheduling starts at [`DEFAULT_BS_INITIAL_INFLIGHT`] and ramps
-/// up to the peer-advertised value (this default, clamped to
-/// [`MAX_BS_INFLIGHT_REQUESTS`]) only after sustained error-free responses (see
-/// the streak-gated cubic ramp on `DownloadWindow`). In a homogeneous fleet this
-/// is the per-peer concurrency ceiling every peer offers.
+/// This is the safety ceiling the BBR-lite cwnd is clamped to, **not** the
+/// operating point: the binding per-peer concurrency is the measured
+/// bandwidth-delay product (see `DownloadWindow`'s BBR controller), which is
+/// normally far below this. In a homogeneous fleet this is the per-peer
+/// concurrency ceiling every peer offers.
 pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 32000;
-/// Initial per-peer outbound request window (slow-start point).
+/// Initial per-peer cwnd (cold-start point), in blocks.
 ///
-/// The adaptive window starts here and grows toward the peer-advertised hard cap
-/// on successful responses, rather than opening at the full `max_inflight`. This
-/// keeps the opening burst modest so a peer is not flooded before its latency is
-/// known.
+/// The BBR cwnd opens here and converges to the BDP-derived target once the first
+/// delivery sample arrives, rather than opening at the full `max_inflight`. This
+/// keeps the opening burst modest before a peer's rate/latency is known.
 pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 /// Maximum peer-advertised in-flight request count accepted by this node.
 ///
@@ -95,9 +93,6 @@ pub const DEFAULT_BS_FANOUT: usize = 1;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
-/// Default BBR-lite controller master switch. When disabled the per-peer window
-/// falls back to the legacy cubic-AIMD ramp (rollback / A-B baseline).
-pub const DEFAULT_BS_BBR_ENABLED: bool = true;
 /// Default steady-state cwnd gain, as a percent of the bandwidth-delay product.
 pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 200;
 /// Default ProbeBW up-probe pacing gain, percent.
@@ -190,8 +185,8 @@ pub struct ZakuraBlockSyncConfig {
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
     pub max_inflight_requests: u32,
-    /// Initial per-peer outbound request window (slow-start point); grows toward
-    /// the advertised hard cap on success. Clamped to `[1, max_inflight_requests]`.
+    /// Initial per-peer BBR cwnd (cold-start point), in blocks; converges to the
+    /// BDP-derived target once the first delivery is measured.
     pub initial_inflight_requests: u32,
     /// Maximum total response bytes this node advertises per `GetBlocks` response.
     pub max_response_bytes: u32,
@@ -217,9 +212,6 @@ pub struct ZakuraBlockSyncConfig {
     pub size_deviation_tolerance: u32,
     /// Number of peers later range scheduling may fan out to for the same body gap.
     pub fanout: usize,
-    /// Enable the BBR-lite per-peer download controller. When false the legacy
-    /// cubic-AIMD window is used (instant rollback / A-B baseline).
-    pub bbr_enabled: bool,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,
     /// ProbeBW up-probe pacing gain, percent.
@@ -271,7 +263,6 @@ impl Default for ZakuraBlockSyncConfig {
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             fanout: DEFAULT_BS_FANOUT,
-            bbr_enabled: DEFAULT_BS_BBR_ENABLED,
             bbr_cwnd_gain_percent: DEFAULT_BS_BBR_CWND_GAIN_PERCENT,
             bbr_probe_bw_gain_percent: DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT,
             bbr_probe_rtt_interval: DEFAULT_BS_BBR_PROBE_RTT_INTERVAL,
