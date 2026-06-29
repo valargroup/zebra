@@ -2,37 +2,42 @@
 //!
 //! # Why this upgrade exists
 //!
-//! The history-tree node [`Entry`](zebra_chain::primitives::zcash_history::Entry) is a fixed-size
-//! buffer whose length is `zcash_history::MAX_ENTRY_SIZE`. Adding Ironwood (`V3`) to the
-//! `zcash_history` dependency grew `MAX_ENTRY_SIZE` (V3 node data carries the extra Ironwood tree
-//! roots and tx count), so the buffer went from 253 to 326 bytes.
+//! The history-tree node [`Entry`](zebra_chain::primitives::zcash_history::Entry)
+//! is a fixed-size buffer whose length is `zcash_history::MAX_ENTRY_SIZE`.
+//! Adding Ironwood (`V3`) to the `zcash_history` dependency grew
+//! `MAX_ENTRY_SIZE` (V3 node data carries the extra Ironwood tree roots and tx
+//! count), so the buffer went from 253 to 326 bytes.
 //!
 //! [`HistoryTreeParts`](crate::service::finalized_state::disk_format::chain::HistoryTreeParts)
-//! bincode-serializes the tip tree's `peaks: BTreeMap<u32, Entry>`. Databases written before the
-//! Ironwood `MAX_ENTRY_SIZE` bump stored each `Entry` at the *smaller* size. The new code reads the
-//! *larger* fixed array per entry, overrunning the bincode stream and panicking with
-//! `Io(UnexpectedEof)` the first time anything deserializes the history-tree column family (for
-//! example in `history_tree()` during backup restore, in the block-write task, or in the
+//! bincode-serializes the tip tree's `peaks: BTreeMap<u32, Entry>`. Databases
+//! written before the Ironwood `MAX_ENTRY_SIZE` bump stored each `Entry` at the
+//! *smaller* size. The new code reads the *larger* fixed array per entry,
+//! overrunning the bincode stream and panicking with `Io(UnexpectedEof)` the
+//! first time anything deserializes the history-tree column family (for example
+//! in `history_tree()` during backup restore, in the block-write task, or in the
 //! `z_gettreestate` RPC).
 //!
-//! Because bincode is not self-describing and uses varint encoding here, there is no clean way to
-//! detect-and-read the old layout in place. Instead, this upgrade *rebuilds* the single tip tree
-//! from data that is still readable — the finalized blocks and the per-height Sapling/Orchard/
-//! Ironwood note commitment tree roots — and writes it back, which re-serializes it in the current
-//! `Entry` format. The MMR root is a pure function of that node data, so the rebuilt tree is
-//! byte-for-byte equivalent in consensus terms (same `peaks`, same `size`, same root) to the tree a
-//! fresh sync would produce.
+//! Because bincode is not self-describing and uses varint encoding here, there
+//! is no clean way to detect-and-read the old layout in place. Instead, this
+//! upgrade *rebuilds* the single tip tree from data that is still readable: the
+//! finalized blocks and the per-height Sapling/Orchard/Ironwood note commitment
+//! tree roots. It then writes it back, which re-serializes it in the current
+//! `Entry` format. The MMR root is a pure function of that node data, so the
+//! rebuilt tree is byte-for-byte equivalent in consensus terms (same `peaks`,
+//! same `size`, same root) to the tree a fresh sync would produce.
 //!
 //! # When the rebuild runs
 //!
-//! The rebuild MUST complete before any reader deserializes the history-tree column family.
-//! [`run`](Upgrade::run) is invoked from the *background* format-upgrade thread, which races
-//! synchronous readers that run during state open (backup restore, the block-write task, the
-//! `z_gettreestate` RPC). So the rebuild is actually performed *synchronously* while the database is
-//! being opened, by [`rebuild_tip_history_tree_if_needed`], before the background thread is spawned
-//! and before any reader runs. By the time [`run`](Upgrade::run) executes in the background,
-//! [`needs_rebuild`] is already `false`, so [`run`](Upgrade::run) is a no-op that only participates
-//! in version-marking and validation in the normal upgrade loop.
+//! The rebuild MUST complete before any reader deserializes the history-tree
+//! column family. [`run`](Upgrade::run) is invoked from the *background*
+//! format-upgrade thread, which races synchronous readers that run during state
+//! open (backup restore, the block-write task, the `z_gettreestate` RPC). So the
+//! rebuild is actually performed *synchronously* while the database is being
+//! opened, by [`rebuild_tip_history_tree_if_needed`], before the background
+//! thread is spawned and before any reader runs. By the time [`run`](Upgrade::run)
+//! executes in the background, [`needs_rebuild`] is already `false`, so
+//! [`run`](Upgrade::run) is a no-op that only participates in version-marking
+//! and validation in the normal upgrade loop.
 
 use std::sync::Arc;
 
@@ -58,12 +63,13 @@ use super::{CancelFormatChange, DiskFormatUpgrade};
 /// An error that prevents the tip history tree from being rebuilt.
 #[derive(Debug, Error)]
 pub enum RebuildError {
-    /// A block, or a note commitment tree, required to rebuild the history tree is missing from the
-    /// database.
+    /// A block, or a note commitment tree, required to rebuild the history tree
+    /// is missing from the database.
     ///
-    /// This happens when a database has an old-format (pre-Ironwood) history-tree entry — so it
-    /// needs a rebuild — but was *pruned* before the Ironwood bump, dropping the historical blocks
-    /// or trees the rebuild reads. Such a database cannot be repaired in place.
+    /// This happens when a database has an old-format (pre-Ironwood)
+    /// history-tree entry, so it needs a rebuild, but was *pruned* before the
+    /// Ironwood bump, dropping the historical blocks or trees the rebuild
+    /// reads. Such a database cannot be repaired in place.
     #[error(
         "cannot rebuild the tip history tree: the data at height {height:?} needed for the rebuild \
          is missing, which happens on a database that was pruned before the Ironwood upgrade. \
@@ -78,11 +84,13 @@ pub enum RebuildError {
 /// Implements [`DiskFormatUpgrade`] for rebuilding the tip history tree in the current `Entry`
 /// format.
 ///
-/// This upgrade is the capstone of the bump to database format major version 28: the Ironwood tree,
-/// value pool, and index data are backfilled by earlier upgrades, and this upgrade rebuilds the
-/// stored history tree entry so it uses the Ironwood-capable entry size. Its [`version`] is
-/// therefore the in-code format version, so an upgraded database ends at the running version and the
-/// standalone rollback/prune tools (which require an exact version match) accept it.
+/// This upgrade is the capstone of the bump to database format major version 28:
+/// the Ironwood tree, value pool, and index data are backfilled by earlier
+/// upgrades, and this upgrade rebuilds the stored history tree entry so it uses
+/// the Ironwood-capable entry size. Its [`version`] is therefore the in-code
+/// format version, so an upgraded database ends at the running version and the
+/// standalone rollback/prune tools (which require an exact version match) accept
+/// it.
 ///
 /// [`version`]: Upgrade::version
 pub struct Upgrade;
@@ -143,21 +151,24 @@ impl DiskFormatUpgrade for Upgrade {
     }
 }
 
-/// Rebuilds the tip history tree in the current `Entry` format if the stored entry is in an older,
-/// unreadable format, writing the rebuilt tree back under the same `()` key.
+/// Rebuilds the tip history tree in the current `Entry` format if the stored
+/// entry is in an older, unreadable format, writing the rebuilt tree back under
+/// the same `()` key.
 ///
-/// This is called *synchronously* while the database is being opened, before any code path
-/// deserializes the history-tree column family, so the unreadable entry is replaced before it can
-/// trigger a panic. It is a no-op for databases that are already in the current format (including
-/// newly created and freshly synced databases), so it is safe to call unconditionally on the node's
-/// open path.
+/// This is called *synchronously* while the database is being opened, before any
+/// code path deserializes the history-tree column family, so the unreadable
+/// entry is replaced before it can trigger a panic. It is a no-op for databases
+/// that are already in the current format (including newly created and freshly
+/// synced databases), so it is safe to call unconditionally on the node's open
+/// path.
 ///
 /// # Errors
 ///
-/// Returns [`RebuildError::MissingData`] if a block or note commitment tree the rebuild needs is
-/// absent (a database pruned before the Ironwood bump). The caller should treat this as fatal and
-/// ask the operator to delete and re-sync, because the database has an unreadable history-tree entry
-/// that cannot be repaired.
+/// Returns [`RebuildError::MissingData`] if a block or note commitment tree the
+/// rebuild needs is absent (a database pruned before the Ironwood bump). The
+/// caller should treat this as fatal and ask the operator to delete and re-sync,
+/// because the database has an unreadable history-tree entry that cannot be
+/// repaired.
 #[allow(clippy::unwrap_in_result)]
 pub(crate) fn rebuild_tip_history_tree_if_needed(
     db: &ZebraDb,
@@ -295,12 +306,23 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RebuildError::MissingData { height })?
         .root();
-    // Ironwood trees are only stored from the Ironwood activation height onwards, and are
-    // de-duplicated, so search backwards for the most recent one. Before Ironwood activation the
-    // root is the empty-tree root, which the pre-Ironwood history tree versions ignore.
+    // Ironwood trees are only stored from the Ironwood activation height
+    // onwards, and are de-duplicated, so search backwards for the most recent
+    // one.
+    //
+    // The synchronous open-path repair can run before the normal
+    // `add_ironwood_activation_tree` format upgrade. That is safe for old
+    // databases because finalized Ironwood note commitments cannot exist before
+    // NU6.3 activation, and code that finalizes NU6.3 Ironwood blocks also
+    // writes Ironwood note commitment trees.
+    //
+    // Check that invariant here: if a block contains Ironwood commitments but
+    // no Ironwood tree is available, the rebuild is missing data and must not
+    // silently use the empty-tree root.
     let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
         Some((_height, tree)) => tree.root(),
-        None => Default::default(),
+        None if block.ironwood_note_commitments().next().is_none() => Default::default(),
+        None => return Err(RebuildError::MissingData { height }),
     };
 
     Ok((block, sapling_root, orchard_root, ironwood_root))

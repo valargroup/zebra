@@ -176,23 +176,28 @@ impl ZebraDb {
 
         // # Correctness
         //
-        // The Ironwood `zcash_history` bump grew the history-tree `Entry` size, so a tip history-tree
-        // entry written by a pre-Ironwood Zebra version can no longer be deserialized: any reader of
-        // the history-tree column family panics with a bincode `UnexpectedEof`. The corresponding
-        // format upgrade (`rebuild_history_tree`) rewrites that entry, but it runs in the *background*
-        // upgrade thread spawned just below, which returns immediately and races synchronous readers
-        // that run during state open (non-finalized backup restore, the block-write task, and the
-        // `z_gettreestate` RPC).
+        // The Ironwood `zcash_history` bump grew the history-tree `Entry` size,
+        // so a tip history-tree entry written by a pre-Ironwood Zebra version
+        // can no longer be deserialized: any reader of the history-tree column
+        // family panics with a bincode `UnexpectedEof`. The corresponding
+        // format upgrade (`rebuild_history_tree`) rewrites that entry, but it
+        // runs in the *background* upgrade thread spawned just below, which
+        // returns immediately and races synchronous readers that run during
+        // state open (non-finalized backup restore, the block-write task, and
+        // the `z_gettreestate` RPC).
         //
-        // So we repair the entry *synchronously* here, before the background thread is spawned and
-        // before `ZebraDb::new` returns, guaranteeing no reader can observe the old-format entry. The
-        // registered upgrade still runs (idempotently — `needs_rebuild` is now false) to mark the
+        // So we repair the entry *synchronously* here, before the background
+        // thread is spawned and before `ZebraDb::new` returns, guaranteeing no
+        // reader can observe the old-format entry. The registered upgrade still
+        // runs (idempotently, because `needs_rebuild` is now false) to mark the
         // version and validate.
         //
-        // This is gated exactly like `spawn_format_change`: skipped for read-only handles and when
-        // format upgrades are disabled (offline tools check the exact version before opening, so they
-        // never reach an old-format database). It is also a no-op unless this is an upgrade from an
-        // older on-disk format whose entry actually fails to deserialize.
+        // This is gated exactly like `spawn_format_change`: skipped for
+        // read-only handles and when format upgrades are disabled (offline tools
+        // check the exact version before opening, so they never reach an
+        // old-format database). It is also a no-op unless this is an upgrade
+        // from an older on-disk format whose entry actually fails to
+        // deserialize.
         if !debug_skip_format_upgrades && format_change.is_upgrade() {
             if let Some(tip_height) = db.finalized_tip_height() {
                 upgrade::rebuild_history_tree::rebuild_tip_history_tree_if_needed(&db, tip_height)
