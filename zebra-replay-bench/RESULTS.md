@@ -24,11 +24,14 @@ and find the next optimization lever.
 ## Environment
 
 - 8 cores (DO Premium Intel), 31 GiB RAM, Linux.
-- Snapshots under `/mnt/roman-dev-2-data`: base = `zebra-ckpt-1800000-warm`
-  (archive 27.3.0, tip 1,802,000); block + root source = `zebra-cache`
-  (tip 3,376,789).
-- Window: heights **1,802,001–1,832,000** (30,000 blocks, ~19.1 GiB of bodies);
-  VCT roots sidecar derived from the same source over the same window.
+- Snapshots under `/mnt/roman-dev-2-data`: base = `zebra-ckpt-1850000-warm-pruned`
+  (pruned 27.3.0, tip 1,849,957). It is a *cleanly-pruned* base — produced by
+  replaying the older `zebra-ckpt-1800000-warm-pruned` forward past the checkpoint
+  raw-tx archive backlog, so forking it does not trigger a startup `DrainBacklog`
+  delete storm (the older base did, polluting the first ~10K blocks of every run).
+  Block + root source = `zebra-cache` (tip 3,376,789).
+- Window: heights **1,849,958–1,899,957** (50,000 blocks); cache `win-1850k.zrb`,
+  VCT roots sidecar `win-1850k.vct` derived from the same source over the same window.
 - Forward replay, no rollback. Each run executes on a fresh hard-link fork of the
   base; the final tip-hash gate (byte-identical to the source snapshot tip
   1,832,000) passes on every run.

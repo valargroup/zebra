@@ -53,8 +53,8 @@ mod work_queue;
 
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
-    BenchSubmit, SequencerProgress,
+    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchDriverParts, BenchSequencerHandle,
+    BenchSubmissions, BenchSubmit, SequencerProgress,
 };
 pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;

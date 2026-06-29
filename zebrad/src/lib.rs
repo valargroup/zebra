@@ -150,5 +150,14 @@ pub mod components;
 pub mod config;
 pub mod prelude;
 
+/// Narrow internal API for the offline `zebra-replay-bench`: the production Zakura
+/// block-sync apply driver, so the bench can drive the real apply/commit/report loop
+/// instead of a hand-rolled one. Feature-gated; not part of any release.
+#[cfg(feature = "internal-bench")]
+pub mod bench_api {
+    pub use crate::commands::start::zakura::drive_block_sync_actions;
+    pub use crate::commands::start::zakura::throughput_probe::BlocksyncThroughputProbe;
+}
+
 #[cfg(feature = "sentry")]
 pub(crate) mod sentry;

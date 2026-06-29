@@ -9324,7 +9324,9 @@ dependencies = [
  "zebra-chain",
  "zebra-consensus",
  "zebra-network",
+ "zebra-node-services",
  "zebra-state",
+ "zebrad",
 ]
 
 [[package]]

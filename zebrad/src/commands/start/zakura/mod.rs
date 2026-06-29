@@ -12,7 +12,7 @@ pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
 
-pub(crate) use block_sync_driver::drive_block_sync_actions;
+pub use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
 pub(crate) use block_sync_driver::{
     apply_block_sync_body, block_apply_class, block_sync_missing_body_window,

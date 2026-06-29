@@ -15,12 +15,18 @@ use zebra_state::{Config, StorageMode};
 /// work this benchmark exists to measure. Left on (the default), Mainnet would
 /// select the VCT peer-source fast path and skip the recompute.
 pub fn state_config(cache_dir: PathBuf, force_legacy: bool) -> Config {
-    Config {
+    let mut config = Config {
         cache_dir,
         ephemeral: false,
         checkpoint_sync: true,
         vct_fast_sync: !force_legacy,
         storage_mode: StorageMode::Archive,
         ..Config::default()
-    }
+    };
+    // Run-ahead finalized-commit pipeline depth (PR #309). 0 = synchronous (default).
+    config.finalized_block_pipeline_depth = std::env::var("ZRB_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    config
 }

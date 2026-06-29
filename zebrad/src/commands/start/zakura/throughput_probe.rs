@@ -24,7 +24,7 @@ use zebra_network::zakura::{BlockApplyResult, BlockSyncFrontiers};
 /// expected block at the next height; the probe only confirms contiguity and
 /// takes the body's own hash as the new tip.
 #[derive(Clone, Debug)]
-pub(crate) struct BlocksyncThroughputProbe {
+pub struct BlocksyncThroughputProbe {
     inner: Arc<Mutex<BlocksyncThroughputProbeState>>,
 }
 

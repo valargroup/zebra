@@ -65,6 +65,11 @@ indexer = ["zebra-state/indexer"]
 # Per-block commit-phase timing histograms (zebra.state.write.*), for perf profiling
 commit-metrics = ["zebra-state/commit-metrics"]
 
+# Exposes the production Zakura block-sync apply driver (`drive_block_sync_actions`)
+# from the crate root so the offline `zebra-replay-bench` can drive the real apply
+# pipeline. Not part of any release; no production behavior change.
+internal-bench = ["zebra-network/internal-bench"]
+
 # Experimental internal miner support
 internal-miner = [
     "thread-priority",
