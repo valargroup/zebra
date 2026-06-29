@@ -79,6 +79,30 @@ async fn fuzz_steady() {
     run_checked("fuzz_steady", scenario, 32).await;
 }
 
+/// Steady state under the experimental byte cwnd unit: the controller budgets in-flight
+/// work by reserved body bytes instead of request count. End-to-end seam check — the
+/// byte-denominated `available_slots` gate must still drive the real reactor to the tip
+/// without stalling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_steady_bytes_unit() {
+    let blocks = 300;
+    let config = ZakuraBlockSyncConfig {
+        bbr_cwnd_unit: crate::zakura::CwndUnit::Bytes,
+        ..fuzz_config()
+    };
+    let scenario = Scenario::new(
+        blocks,
+        0x57ea_0008,
+        config,
+        vec![
+            PeerSpec::fast(1, target(blocks)),
+            PeerSpec::fast(2, target(blocks)),
+            PeerSpec::fast(3, target(blocks)),
+        ],
+    );
+    run_checked("fuzz_steady_bytes_unit", scenario, 32).await;
+}
+
 /// Head-of-line: one slow, high-latency peer alongside fast peers. The trace-proven
 /// regime the BBR work targets. For now we only require convergence; once BBR lands we
 /// compare the per-peer queue depth / HoL latency in the report across controllers.

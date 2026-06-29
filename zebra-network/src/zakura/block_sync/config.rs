@@ -117,6 +117,22 @@ pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
 
+/// Unit the per-peer BBR cwnd budgets in-flight work against. The controller itself is
+/// unit-agnostic (it sizes a cwnd from measured delivery rate × RTprop); the unit only
+/// changes how outstanding work is counted against that cwnd in `available_slots`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CwndUnit {
+    /// Count outstanding *requests* against the cwnd (one request ≈ one slot). The
+    /// shipped default — equal weight regardless of body size.
+    #[default]
+    Blocks,
+    /// Count reserved body *bytes* against the cwnd (the cwnd's request budget scaled by
+    /// the advertised per-response byte cap), so a peer serving large bodies holds fewer
+    /// in flight. Experimental.
+    Bytes,
+}
+
 /// Block-sync peer status advertisement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncStatus {
@@ -241,6 +257,9 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd: u32,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
+    /// Unit the BBR cwnd budgets in-flight work against (`blocks` = request count,
+    /// default; `bytes` = reserved body bytes).
+    pub bbr_cwnd_unit: CwndUnit,
     /// Slots a floor (lowest-missing-height) request may borrow beyond the BBR cwnd, up
     /// to the peer's advertised hard cap. Lets the floor be fetched even when every
     /// servable peer is saturated at its cwnd; `0` disables the bypass.
@@ -284,6 +303,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_startup_growth_percent: DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT,
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
+            bbr_cwnd_unit: CwndUnit::Blocks,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
         }

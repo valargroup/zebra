@@ -52,7 +52,7 @@ mod work_queue;
 
 pub use apply_item::{ApplyItem, CommitRejection, CommitterReset};
 pub use config::{
-    BlockSyncStatus, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
     MAX_BS_RESPONSE_BYTES,
 };
 pub use error::BlockSyncWireError;
