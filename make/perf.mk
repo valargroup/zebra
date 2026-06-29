@@ -16,6 +16,8 @@
 	perf-replay-index \
 	perf-replay \
 	perf-replay-worker \
+	perf-replay-verifier \
+	perf-replay-sequencer \
 	perf-run \
 	perf-run-mainnet \
 	perf-analyze \
@@ -77,6 +79,8 @@ perf-run-mainnet:
 #   make perf-replay-index         # one-time: dump the window to a block cache
 #   make perf-replay               # replay the cache through the committer
 #   make perf-replay-worker        # same window, through the write worker
+#   make perf-replay-verifier      # same window, through the checkpoint verifier
+#   make perf-replay-sequencer     # same window, through the block-sync Sequencer (VCT)
 
 PERF_REPLAY_RUN   ?= $(CURDIR)/deploy/runner/replay_run.sh
 REPLAY_BIN        ?= $(CURDIR)/target/release/zebra-replay-bench
@@ -98,6 +102,23 @@ perf-replay:
 # (one altitude above the direct committer). Set REPLAY_VCT_SIDECAR for VCT mode.
 perf-replay-worker:
 	REPLAY_BIN="$(REPLAY_BIN)" "$(PERF_REPLAY_RUN)" run-worker $(PERF_REPLAY_LABEL) "$(REPLAY_BIN)"
+
+# Repeatable: same window, through the real zebra-consensus checkpoint verifier
+# (commits to a real StateService; one altitude above the worker). Adds PoW/
+# equihash + Merkle verification. Set REPLAY_VCT_SIDECAR for VCT mode.
+perf-replay-verifier:
+	REPLAY_BIN="$(REPLAY_BIN)" "$(PERF_REPLAY_RUN)" run-verifier $(PERF_REPLAY_LABEL) "$(REPLAY_BIN)"
+
+# Repeatable: same window, through the real Zakura block-sync Sequencer (reorder +
+# ordered submit to the verifier->state; one altitude above the verifier). VCT-only:
+# requires REPLAY_VCT_SIDECAR. Commits in Pruned storage mode by default (BASE_SRC must
+# be a pruned snapshot), matching the production mainnet config. Optional knobs:
+#   REPLAY_ARCHIVE=1          commit in Archive storage mode instead (needs an archive base)
+#   REPLAY_TRACE_DIR=<dir>    write structured Zakura JSONL traces (block_sync.jsonl),
+#                             the same tables perf-run-mainnet emits via trace_dir; plot
+#                             with .cursor/skills/zakura-trace-plots
+perf-replay-sequencer:
+	REPLAY_BIN="$(REPLAY_BIN)" "$(PERF_REPLAY_RUN)" run-sequencer $(PERF_REPLAY_LABEL) "$(REPLAY_BIN)"
 
 # Steady-state bottleneck attribution over the CSV window [PERF_LO, PERF_HI].
 perf-analyze:

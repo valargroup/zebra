@@ -13,6 +13,8 @@
 #![allow(clippy::print_stderr)]
 
 mod apply;
+mod apply_sequencer;
+mod apply_verifier;
 mod apply_worker;
 mod cache;
 mod config;
@@ -117,6 +119,44 @@ enum Cmd {
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
     },
+    /// Replay a cache through the real Zakura block-sync `Sequencer` (which reorders
+    /// bodies and submits them to the checkpoint verifier → state). VCT-only; one
+    /// altitude above `apply-verifier`. Requires `--vct-sidecar`.
+    ApplySequencer {
+        /// Base fork root (opened writable; must be at height start-1).
+        #[arg(long)]
+        base: PathBuf,
+        /// Cache file produced by `index`.
+        #[arg(long)]
+        cache: PathBuf,
+        /// VCT roots sidecar produced by `index-roots` (required).
+        #[arg(long)]
+        vct_sidecar: Option<PathBuf>,
+        /// Commit in Archive storage mode (full raw-tx + indexes). The default is
+        /// Pruned (the base must already be a pruned snapshot; pruning is one-way).
+        #[arg(long)]
+        archive: bool,
+        /// Write structured Zakura JSONL trace tables to this directory (the same
+        /// tables `perf-run-mainnet` produces via `[network.zakura] trace_dir`).
+        #[arg(long)]
+        trace_dir: Option<PathBuf>,
+    },
+    /// Replay a cache through the real `zebra-consensus` checkpoint verifier, which
+    /// commits to a real `StateService` (tip must be `start-1`). One altitude above
+    /// `apply-worker`; adds PoW/equihash + Merkle verification and checkpoint
+    /// batching. Commits up to the last checkpoint `<= end`.
+    ApplyVerifier {
+        /// Base fork root (opened writable; must be at height start-1).
+        #[arg(long)]
+        base: PathBuf,
+        /// Cache file produced by `index`.
+        #[arg(long)]
+        cache: PathBuf,
+        /// VCT roots sidecar produced by `index-roots`. When set, the committer
+        /// drives the VCT fast path; otherwise the legacy full-recompute path runs.
+        #[arg(long)]
+        vct_sidecar: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -190,6 +230,41 @@ fn main() -> Result<()> {
             let handle = install_metrics();
 
             apply_worker::run(&base, &cache, vct_sidecar.as_deref(), network)?;
+
+            #[cfg(feature = "commit-metrics")]
+            render_metrics(handle);
+        }
+        Cmd::ApplyVerifier {
+            base,
+            cache,
+            vct_sidecar,
+        } => {
+            #[cfg(feature = "commit-metrics")]
+            let handle = install_metrics();
+
+            apply_verifier::run(&base, &cache, vct_sidecar.as_deref(), network)?;
+
+            #[cfg(feature = "commit-metrics")]
+            render_metrics(handle);
+        }
+        Cmd::ApplySequencer {
+            base,
+            cache,
+            vct_sidecar,
+            archive,
+            trace_dir,
+        } => {
+            #[cfg(feature = "commit-metrics")]
+            let handle = install_metrics();
+
+            apply_sequencer::run(
+                &base,
+                &cache,
+                vct_sidecar.as_deref(),
+                network,
+                archive,
+                trace_dir.as_deref(),
+            )?;
 
             #[cfg(feature = "commit-metrics")]
             render_metrics(handle);
