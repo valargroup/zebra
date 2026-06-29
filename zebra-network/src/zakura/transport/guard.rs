@@ -147,18 +147,15 @@ impl ByteBudget {
 
     /// Audit the shared counter against an externally-derived expected value.
     ///
+    /// The expected value can be a cross-task snapshot, so transient handoff
+    /// skew is recorded as a metric rather than emitted as a warning.
+    ///
     /// Returns `true` when the budget matches.
-    pub(crate) fn audit(&self, expected: u64, context: &'static str) -> bool {
+    pub(crate) fn audit(&self, expected: u64, _context: &'static str) -> bool {
         let actual = self.reserved();
         let ok = actual == expected;
         if !ok {
             metrics::counter!("sync.block.budget.audit_drift").increment(1);
-            tracing::warn!(
-                actual,
-                expected,
-                context,
-                "Zakura block-sync byte-budget audit drift"
-            );
         }
         ok
     }
