@@ -29,12 +29,14 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
+        finalized_state::{
+            spawn_note_precompute, DiskWriteBatch, FinalizedPipeline, FinalizedState, ZebraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    CommitCheckpointVerifiedError, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -52,6 +54,99 @@ type PendingPrecompute = (
     crossbeam_channel::Receiver<BlockNotePrecompute>,
     Arc<AtomicBool>,
 );
+
+/// A finalized block batch handed to the disk-writer thread for flushing, in the
+/// run-ahead committer.
+///
+/// The assembler thread builds these against the in-memory overlay and sends them
+/// over a bounded channel; the disk-writer thread flushes each one to disk in
+/// height order, sends the per-block commit response only once durable, then acks
+/// the flushed height back so the assembler can advance the chain tip and retire
+/// the overlay.
+struct PipelineFlush {
+    batch: DiskWriteBatch,
+    hash: block::Hash,
+    height: Height,
+    rsp_tx: oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+}
+
+/// The disk-writer thread loop for the run-ahead finalized committer.
+///
+/// Flushes each assembled batch to disk in arrival (height) order, sends the
+/// per-block commit response only once the write is durable (ack-after-flush),
+/// then acks the flushed height back to the assembler. A rocksdb write failure is
+/// fatal, as on the synchronous path.
+fn run_finalized_writer(
+    db: ZebraDb,
+    batch_receiver: std::sync::mpsc::Receiver<PipelineFlush>,
+    ack_sender: std::sync::mpsc::Sender<Height>,
+) {
+    while let Ok(PipelineFlush {
+        batch,
+        hash,
+        height,
+        rsp_tx,
+    }) = batch_receiver.recv()
+    {
+        db.flush_block_batch(batch, "commit checkpoint-verified request (pipelined)");
+
+        // Ack-after-flush: the commit response only resolves once the block is
+        // durable on disk.
+        let _ = rsp_tx.send(Ok(hash));
+
+        // If the assembler has gone away (shutdown), stop.
+        if ack_sender.send(height).is_err() {
+            break;
+        }
+    }
+}
+
+/// Process the disk-writer thread's flush acknowledgements: for each acked height,
+/// advance the finalized chain tip, retire the now-durable overlay entries, and run
+/// the configured stop-height check (which exits the process if matched).
+///
+/// With `block_until_empty`, waits for every in-flight block to be acked (used at
+/// the checkpoint→non-finalized handoff and after a stop-height block); otherwise
+/// drains only the acks already available.
+fn drain_finalized_acks(
+    finalized_state: &mut FinalizedState,
+    pipeline: &mut FinalizedPipeline,
+    ack_receiver: &std::sync::mpsc::Receiver<Height>,
+    in_flight: &mut VecDeque<(Height, block::Hash, ChainTipBlock)>,
+    chain_tip_sender: &mut ChainTipSender,
+    block_until_empty: bool,
+) {
+    while !in_flight.is_empty() {
+        let acked = if block_until_empty {
+            match ack_receiver.recv() {
+                Ok(height) => height,
+                // The writer thread is gone; stop draining.
+                Err(_) => break,
+            }
+        } else {
+            match ack_receiver.try_recv() {
+                Ok(height) => height,
+                Err(_) => break,
+            }
+        };
+
+        let (height, hash, tip_block) = in_flight
+            .pop_front()
+            .expect("each ack corresponds to an in-flight block");
+        debug_assert_eq!(height, acked, "the writer acks blocks in height order");
+
+        chain_tip_sender.set_finalized_tip(tip_block);
+        pipeline.retire_through(height);
+
+        // The block is now durable, so the stop-height check (which exits the
+        // process) is safe to run here.
+        finalized_state.finalized_stop_at_height_if_configured(
+            height,
+            hash,
+            "commit checkpoint-verified request",
+        );
+    }
+}
 
 /// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
 const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
@@ -395,6 +490,45 @@ impl WriteBlockWorkerTask {
         let mut vct_root_stall: Option<(Height, Instant)> = None;
         let mut vct_root_stall_logged = false;
 
+        // Run-ahead finalized-commit pipeline. Enabled only below the last
+        // checkpoint (the reorg-free region, where the committer is processing the
+        // finalized block channel) and once format upgrades are finished (so the
+        // overlay serves absolute `Insert` address balances, not merge deltas). When
+        // active, the committer assembles each block's batch against the in-memory
+        // overlay and hands it to a dedicated disk-writer thread; the chain tip and
+        // overlay retirement trail the writer's flush acks (ack-after-flush).
+        let pipeline_depth = finalized_state.db.config().finalized_block_pipeline_depth;
+        let pipeline_active = pipeline_depth > 0 && finalized_state.db.finished_format_upgrades();
+
+        let mut pipeline_state: Option<FinalizedPipeline> = None;
+        let mut pipeline_flush_sender: Option<std::sync::mpsc::SyncSender<PipelineFlush>> = None;
+        let mut pipeline_ack_receiver: Option<std::sync::mpsc::Receiver<Height>> = None;
+        let mut pipeline_writer_handle: Option<std::thread::JoinHandle<()>> = None;
+        let mut pipeline_in_flight: VecDeque<(Height, block::Hash, ChainTipBlock)> =
+            VecDeque::new();
+
+        if pipeline_active {
+            // The bounded batch channel is the backpressure: at most `pipeline_depth`
+            // assembled-but-not-yet-flushed blocks are in flight, bounding the overlay.
+            let (flush_sender, flush_receiver) =
+                std::sync::mpsc::sync_channel::<PipelineFlush>(pipeline_depth);
+            let (ack_sender, ack_receiver) = std::sync::mpsc::channel::<Height>();
+            let writer_db = finalized_state.db.clone();
+            let writer_span = Span::current();
+            let handle = std::thread::Builder::new()
+                .name("zebra-finalized-writer".to_string())
+                .spawn(move || {
+                    writer_span
+                        .in_scope(|| run_finalized_writer(writer_db, flush_receiver, ack_sender))
+                })
+                .expect("failed to spawn the finalized disk-writer thread");
+
+            pipeline_state = Some(FinalizedPipeline::new());
+            pipeline_flush_sender = Some(flush_sender);
+            pipeline_ack_receiver = Some(ack_receiver);
+            pipeline_writer_handle = Some(handle);
+        }
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
@@ -548,17 +682,60 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
-            let next_block_took_vct_path =
-                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+            let committed_height = ordered_block.0.height;
+            let next_block_took_vct_path = finalized_state.vct_fast_will_apply(committed_height);
 
-            // Try committing the block
-            match finalized_state.commit_finalized(
-                ordered_block,
-                prev_note_commitment_trees,
-                note_precompute,
-                next_checkpoint,
-            ) {
-                Ok((finalized, note_commitment_trees)) => {
+            // Commit the block. When the run-ahead pipeline is active, assemble the
+            // block against the overlay and hand its batch to the disk-writer thread
+            // (the chain tip advances later, on the writer's flush ack); otherwise
+            // assemble and flush it synchronously here, advancing the tip inline.
+            let commit_result: Result<
+                NoteCommitmentTrees,
+                (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+            > = if let Some(pipeline) = pipeline_state.as_mut() {
+                let (checkpoint_verified, rsp_tx) = ordered_block;
+                let tip_block = ChainTipBlock::from(checkpoint_verified.clone());
+                match finalized_state.commit_finalized_pipelined(
+                    checkpoint_verified.clone().into(),
+                    prev_note_commitment_trees,
+                    note_precompute,
+                    next_checkpoint,
+                    pipeline,
+                ) {
+                    Ok(assembled) => {
+                        pipeline_in_flight.push_back((assembled.height, assembled.hash, tip_block));
+                        // Bounded send: applies backpressure once `pipeline_depth`
+                        // blocks are already in flight to the disk-writer thread.
+                        let _ = pipeline_flush_sender
+                            .as_ref()
+                            .expect("flush sender is present while the pipeline is active")
+                            .send(PipelineFlush {
+                                batch: assembled.batch,
+                                hash: assembled.hash,
+                                height: assembled.height,
+                                rsp_tx,
+                            });
+                        Ok(assembled.note_commitment_trees)
+                    }
+                    Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+                }
+            } else {
+                finalized_state
+                    .commit_finalized(
+                        ordered_block,
+                        prev_note_commitment_trees,
+                        note_precompute,
+                        next_checkpoint,
+                    )
+                    .map(|(finalized, note_commitment_trees)| {
+                        let tip_block = ChainTipBlock::from(finalized);
+                        chain_tip_sender.set_finalized_tip(tip_block);
+                        note_commitment_trees
+                    })
+            };
+
+            match commit_result {
+                Ok(note_commitment_trees) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -581,9 +758,35 @@ impl WriteBlockWorkerTask {
                         vct_root_stall_logged = false;
                     }
 
-                    let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-                    chain_tip_sender.set_finalized_tip(tip_block);
+
+                    // In the pipeline, advance the chain tip and retire the overlay
+                    // for any blocks the writer has already flushed. If this block is
+                    // the configured stop height, then wait for it to become durable,
+                    // so the stop check fires after the flush and no later block is
+                    // assembled past it.
+                    if let (Some(pipeline), Some(ack_receiver)) =
+                        (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+                    {
+                        drain_finalized_acks(
+                            finalized_state,
+                            pipeline,
+                            ack_receiver,
+                            &mut pipeline_in_flight,
+                            chain_tip_sender,
+                            false,
+                        );
+                        if finalized_state.is_at_stop_height(committed_height) {
+                            drain_finalized_acks(
+                                finalized_state,
+                                pipeline,
+                                ack_receiver,
+                                &mut pipeline_in_flight,
+                                chain_tip_sender,
+                                true,
+                            );
+                        }
+                    }
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
@@ -675,6 +878,30 @@ impl WriteBlockWorkerTask {
                         return;
                     }
                 }
+            }
+        }
+
+        // The finalized block channel has closed (the checkpoint→non-finalized
+        // handoff). Drain the run-ahead pipeline to durability before switching to
+        // the non-finalized loop: drop the batch sender so the writer finishes its
+        // queue and exits, advance the chain tip and retire the overlay for every
+        // remaining in-flight block, then join the writer thread.
+        if pipeline_active {
+            drop(pipeline_flush_sender.take());
+            if let (Some(pipeline), Some(ack_receiver)) =
+                (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+            {
+                drain_finalized_acks(
+                    finalized_state,
+                    pipeline,
+                    ack_receiver,
+                    &mut pipeline_in_flight,
+                    chain_tip_sender,
+                    true,
+                );
+            }
+            if let Some(handle) = pipeline_writer_handle.take() {
+                let _ = handle.join();
             }
         }
 

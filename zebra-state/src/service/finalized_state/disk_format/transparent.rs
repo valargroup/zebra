@@ -284,9 +284,11 @@ impl From<AddressBalanceLocationInner<NegativeAllowed>> for AddressBalanceLocati
 
 /// Represents a change in the [`AddressBalanceLocation`] of a transparent address
 /// in the finalized state.
+#[derive(Clone)]
 pub struct AddressBalanceLocationChange(AddressBalanceLocationInner<NegativeAllowed>);
 
 /// Represents a set of updates to address balance locations in the database.
+#[derive(Clone)]
 pub enum AddressBalanceLocationUpdates {
     /// A set of [`AddressBalanceLocationChange`]s that should be merged into the existing values in the database.
     Merge(HashMap<transparent::Address, AddressBalanceLocationChange>),

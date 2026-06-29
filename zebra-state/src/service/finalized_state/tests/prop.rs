@@ -21,7 +21,7 @@ use crate::{
 
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
+    CheckpointVerifiedBlock, DiskWriteBatch, FinalizedPipeline, FinalizedState,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -171,6 +171,96 @@ fn blocks_with_v5_transactions() -> Result<()> {
                 prop_assert_eq!(hash, block.hash);
                 height = Height(height.0 + 1);
             }
+    });
+
+    Ok(())
+}
+
+/// Committing a chain through the run-ahead pipeline produces byte-identical
+/// finalized state to the synchronous committer.
+///
+/// Every block is assembled against the in-memory overlay *before any of them are
+/// flushed*, so later blocks read earlier blocks' not-yet-durable effects from the
+/// overlay (spent UTXOs, address balances, value pool, history/note trees, tip
+/// cursor). The batches are then flushed in height order. The resulting finalized
+/// tip, height, and value pool must match a synchronous `commit_finalized_direct`
+/// of the same chain.
+#[test]
+fn pipelined_commit_matches_synchronous() -> Result<()> {
+    let _init_guard = zebra_test::init();
+    proptest!(ProptestConfig::with_cases(env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES)),
+        |((chain, count, network, _history_tree) in PreparedChain::default())| {
+            let blocks: Vec<_> = chain.iter().take(count).cloned().collect();
+
+            // Synchronous baseline.
+            let mut sync_state = FinalizedState::new(
+                &Config::ephemeral(),
+                &network,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            );
+            for block in &blocks {
+                let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
+                sync_state
+                    .commit_finalized_direct(
+                        checkpoint_verified.into(),
+                        None,
+                        None,
+                        None,
+                        "pipelined_commit_matches_synchronous sync",
+                    )
+                    .unwrap();
+            }
+
+            // Run-ahead: assemble every block against the overlay (threading the
+            // note-commitment trees forward), buffer the batches, then flush them in
+            // height order — mirroring what the disk-writer thread does, single-threaded.
+            let mut pipe_state = FinalizedState::new(
+                &Config::ephemeral(),
+                &network,
+                #[cfg(feature = "elasticsearch")]
+                false,
+            );
+            let mut pipeline = FinalizedPipeline::new();
+            let mut prev_trees = None;
+            let mut pending = std::collections::VecDeque::new();
+            for block in &blocks {
+                let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
+                let assembled = pipe_state
+                    .commit_finalized_pipelined(
+                        checkpoint_verified.into(),
+                        prev_trees.take(),
+                        None,
+                        None,
+                        &mut pipeline,
+                    )
+                    .unwrap();
+                prev_trees = Some(assembled.note_commitment_trees.clone());
+                pending.push_back(assembled);
+            }
+            for assembled in pending {
+                let height = assembled.height;
+                pipe_state
+                    .db
+                    .flush_block_batch(assembled.batch, "pipelined_commit_matches_synchronous flush");
+                pipeline.retire_through(height);
+            }
+
+            prop_assert_eq!(
+                sync_state.finalized_tip_hash(),
+                pipe_state.finalized_tip_hash()
+            );
+            prop_assert_eq!(
+                sync_state.finalized_tip_height(),
+                pipe_state.finalized_tip_height()
+            );
+            prop_assert_eq!(
+                sync_state.finalized_value_pool(),
+                pipe_state.finalized_value_pool()
+            );
     });
 
     Ok(())

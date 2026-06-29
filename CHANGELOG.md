@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Add a run-ahead finalized-commit pipeline that overlaps the next block's batch
+  assembly with the current block's disk write, raising checkpoint-sync commit
+  throughput from `assemble + flush` per block toward `max(assemble, flush)`. The
+  committer is split into an assemble half (`assemble_finalized_direct` /
+  `assemble_block_batch` — treestate compute + batch build, no writes) and a flush
+  half (`flush_finalized_direct` / `flush_block_batch` — the rocksdb write and
+  post-commit bookkeeping). When enabled, the committer assembles each block's
+  batch on its thread and hands it to a dedicated disk-writer thread over a bounded
+  channel (the channel depth is the backpressure). A new `FinalizedPipeline` (in
+  `zebra-state/src/service/finalized_state/pipeline.rs`) carries the in-memory tip
+  state — history tree, note-commitment trees, value pool, `vct_upgrade_height`
+  marker, tip cursor — and a read-through overlay for not-yet-flushed spent UTXOs
+  and address balances, so a block assembled ahead of the durable write reads its
+  parent's effects from memory. The externally-visible finalized tip, the per-block
+  commit response, and the download budget all trail the durable flush
+  (ack-after-flush), so crash recovery is unchanged. Only the checkpoint
+  (reorg-free) region uses the pipeline; near the tip the committer stays
+  synchronous. The new `Config::finalized_block_pipeline_depth` defaults to `0`
+  (synchronous), so behavior is byte-identical to the previous committer until the
+  depth is raised. See `CHANGELOG_PARAMS.md`.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both
