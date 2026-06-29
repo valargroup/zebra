@@ -443,6 +443,28 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     }
 }
 
+fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
+    let byte = u8::try_from(start).expect("test heights fit in u8");
+    OutstandingBlockRange {
+        request: BlockRangeRequest {
+            start_height: block::Height(start),
+            count,
+            anchor_hash: block::Hash([byte; 32]),
+            estimated_bytes: u64::from(count),
+            expected_blocks: (start..start + count)
+                .map(|height| ExpectedBlock {
+                    height: block::Height(height),
+                    hash: block::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+                    estimated_bytes: 1,
+                })
+                .collect(),
+        },
+        queued_at: Instant::now(),
+        deadline: Instant::now(),
+        received: ReceivedBlockTracker::default(),
+    }
+}
+
 #[test]
 fn peer_outbound_request_window_backs_off_and_grows_with_streaks() {
     let mut window = download_window();
@@ -454,53 +476,36 @@ fn peer_outbound_request_window_backs_off_and_grows_with_streaks() {
     assert_eq!(window.available_slots(), max_inflight - 1);
 
     for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(
         window.outbound_request_window, max_inflight,
         "window holds flat within the first timeout epoch"
     );
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
+    window.reduce_outbound_window_after_timeout();
     assert_eq!(window.outbound_request_window, max_inflight - 8);
 
     for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(window.outbound_request_window, max_inflight - 64);
 
     for _ in 0..(16 * 16) {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
         if window.outbound_request_window == 1 {
             break;
         }
     }
     assert_eq!(window.outbound_request_window, 1);
-    assert_eq!(window.available_slots(), window.timeout_recovery_slots);
-    // Pinned at the floor, the peer is tolerated for two full reduction epochs
-    // (2 * 16 = 32 consecutive timeouts, ~256s at the 8s request timeout) before
-    // being disconnected.
-    for _ in 0..31 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
     assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::DisconnectPeer
+        window.available_slots(),
+        0,
+        "timeout recovery slots do not create extra concurrency at the floor"
     );
+    for _ in 0..64 {
+        window.reduce_outbound_window_after_timeout();
+    }
+    assert_eq!(window.outbound_request_window, 1);
 
     // Streak-gated cubic ramp: the window holds flat for a full epoch of
     // consecutive successes, then steps up. From the reduced base of 1, the first
@@ -546,10 +551,7 @@ fn peer_timeout_recovery_slot_replaces_timed_out_request_above_reduced_window() 
     assert_eq!(window.available_slots(), 0);
 
     for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(window.outbound_request_window, 1);
     assert_eq!(window.timeout_recovery_slots, 8);
@@ -562,18 +564,154 @@ fn peer_timeout_recovery_slot_replaces_timed_out_request_above_reduced_window() 
     window.outstanding.remove(0);
     assert_eq!(
         window.available_slots(),
+        0,
+        "timeout recovery slots do not add concurrency at the window floor"
+    );
+
+    window.outstanding.clear();
+    assert_eq!(
+        window.available_slots(),
         1,
-        "a timeout recovery slot lets the retry replace the timed-out request"
+        "clearing outstanding at the floor leaves exactly one regular slot"
+    );
+}
+
+#[test]
+fn peer_timeout_recovery_slot_replaces_timed_out_request_above_floor() {
+    let mut window = download_window();
+    window.max_inflight_requests = 8;
+    window.outbound_request_window = 4;
+
+    for height in 1u32..=5 {
+        window.outstanding.push(window_request(height));
+    }
+
+    assert_eq!(window.available_slots(), 0);
+    window.reduce_outbound_window_after_timeout();
+    assert_eq!(window.outbound_request_window, 4);
+    assert_eq!(window.timeout_recovery_slots, 1);
+
+    window.outstanding.remove(0);
+    assert_eq!(
+        window.available_slots(),
+        1,
+        "above the floor, a recovery slot lets the retry replace timed-out work"
     );
 
     window.record_outbound_request_scheduled();
-    assert_eq!(window.timeout_recovery_slots, 7);
-    window.outstanding.push(window_request(9));
+    assert_eq!(window.timeout_recovery_slots, 0);
+    window.outstanding.push(window_request(5));
     assert_eq!(
         window.available_slots(),
         0,
         "regular scheduling remains held below the reduced adaptive window"
     );
+}
+
+#[test]
+fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
+    let config = ZakuraBlockSyncConfig::default();
+    let timeout = config.effective_liveness_timeout();
+    assert_eq!(timeout, Duration::from_secs(32));
+
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    assert_eq!(
+        window.check_liveness(now + timeout - Duration::from_millis(1)),
+        LivenessOutcome::Ok
+    );
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect
+    );
+}
+
+#[test]
+fn block_liveness_never_disconnects_idle_peer() {
+    let now = Instant::now();
+    let mut window = download_window();
+
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+
+    window.block_liveness_deadline = Some(now);
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
+    window.disarm_liveness_if_idle();
+    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+}
+
+#[test]
+fn block_liveness_progress_before_deadline_keeps_peer_alive() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let mut now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    for _ in 0..4 {
+        now += timeout - Duration::from_millis(1);
+        assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+        window.note_block_progress(now, timeout);
+        assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+    }
+}
+
+#[test]
+fn block_liveness_disarms_when_outstanding_drains() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    window.outstanding.clear();
+    window.disarm_liveness_if_idle();
+
+    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
+}
+
+#[test]
+fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.outstanding.clear();
+    window.disarm_liveness_if_idle();
+
+    let resumed = now + Duration::from_secs(60);
+    window.outstanding.push(window_request(2));
+    window.arm_liveness(resumed, timeout);
+
+    assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
+}
+
+#[test]
+fn block_liveness_multi_block_range_progress_resets_each_body() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let start = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request_range(1, 3));
+    window.arm_liveness(start, timeout);
+
+    let first = start + Duration::from_secs(4);
+    window.note_block_progress(first, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(first + timeout));
+
+    let second = first + Duration::from_secs(4);
+    assert_eq!(window.check_liveness(second), LivenessOutcome::Ok);
+    window.note_block_progress(second, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(second + timeout));
+
+    let third = second + Duration::from_secs(4);
+    assert_eq!(window.check_liveness(third), LivenessOutcome::Ok);
+    window.note_block_progress(third, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(third + timeout));
 }
 
 // The old `BlockRangeScheduler` single-pass timeout-retry bias
@@ -2189,6 +2327,100 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
+    let mut capture =
+        TraceCapture::for_test("block_liveness_disconnects_silent_peer_and_traces_reason")
+            .expect("trace capture initializes");
+    let mut config = immediate_body_download_config();
+    config.fanout = 1;
+    config.request_timeout = Duration::from_millis(400);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x51);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), block::Hash([1; 32])))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        }]))
+        .await
+        .expect("needed metadata queues");
+
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    tokio::time::timeout(Duration::from_secs(3), connection_cancel.cancelled())
+        .await
+        .expect("silent active peer is disconnected by block-progress liveness");
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        &[
+            (
+                bs_trace::REASON,
+                TraceValue::Str("block_sync_no_block_progress"),
+            ),
+            (bs_trace::OUTSTANDING, TraceValue::U64(1)),
+        ],
+    );
+
+    reactor_task.abort();
+}
+
 // The old covered-prefix / assigned-key / queued-retry-ordering scheduler tests
 // (`scheduler_partial_*`, `scheduler_drops_*`, `scheduler_splits_*`,
 // `scheduler_retries_only_uncovered_suffix`, `scheduler_keeps_queued_*`,
@@ -2570,23 +2802,14 @@ fn window_reduction_uses_consecutive_timeout_streak() {
     window.outbound_request_window = 256;
 
     for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(window.outbound_request_window, 256);
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
+    window.reduce_outbound_window_after_timeout();
     assert_eq!(window.outbound_request_window, 248);
 
     for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(window.outbound_request_window, 192);
 
@@ -2595,16 +2818,10 @@ fn window_reduction_uses_consecutive_timeout_streak() {
     // streak.
     window.increase_outbound_window_after_success();
     for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
+        window.reduce_outbound_window_after_timeout();
     }
     assert_eq!(window.outbound_request_window, 192);
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
+    window.reduce_outbound_window_after_timeout();
     assert_eq!(window.outbound_request_window, 184);
 }
 
