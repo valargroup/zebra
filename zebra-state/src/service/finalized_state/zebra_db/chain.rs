@@ -286,13 +286,15 @@ impl DiskWriteBatch {
     /// [`chain_value_pool_change`]: zebra_chain::block::Block::chain_value_pool_change
     /// [`add_chain_value_pool_change`]: ValueBalance::add_chain_value_pool_change
     #[allow(clippy::unwrap_in_result)]
+    /// Returns the chain value pool after applying this block, so the run-ahead
+    /// committer can thread it forward in memory to the next block's assembly.
     pub fn prepare_chain_value_pools_batch(
         &mut self,
         db: &ZebraDb,
         finalized: &FinalizedBlock,
         utxos_spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo>,
         value_pool: ValueBalance<NonNegative>,
-    ) -> Result<(), ValidateContextError> {
+    ) -> Result<ValueBalance<NonNegative>, ValidateContextError> {
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
@@ -364,6 +366,6 @@ impl DiskWriteBatch {
             &BlockInfo::new(new_value_pool, block_size as u32),
         );
 
-        Ok(())
+        Ok(new_value_pool)
     }
 }

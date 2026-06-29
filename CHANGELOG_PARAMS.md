@@ -28,4 +28,5 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `Config::finalized_block_pipeline_depth` | `zebra-state/src/config.rs` | _(new)_ → `0` | _(this PR)_ | Run-ahead finalized-commit pipeline depth (blocks the assembler may build ahead of the durable disk write). Defaults to `0` = synchronous (original behavior); `> 0` overlaps the next block's assembly with the current block's flush, bounded so the in-memory overlay stays small. |
 | `OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT` | `zebra-network/src/zakura/block_sync/state.rs` | `3` → `2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS` (`32`) | [#303](https://github.com/valargroup/zebra/pull/303) | Tolerate two full reduction epochs (~256s at the 8s request timeout) of floor-pinned timeouts before disconnecting a block-sync peer, instead of ~24s, so briefly-congested peers are not churned. Any successful response resets the streak. |

@@ -136,6 +136,23 @@ pub struct Config {
     #[serde(skip)]
     pub vct_fast_sync: bool,
 
+    /// Maximum number of checkpoint-verified blocks the finalized committer may
+    /// assemble ahead of the durable disk write (the run-ahead pipeline depth).
+    ///
+    /// When `0` (the default), the committer is fully synchronous: each block is
+    /// assembled and flushed to disk before the next is assembled — the original
+    /// behavior. When greater than `0`, the committer assembles up to this many
+    /// blocks ahead on the assembler thread while a dedicated disk-writer thread
+    /// flushes earlier blocks, so per-block wall time approaches `max(assemble,
+    /// flush)` instead of their sum. The externally-visible finalized tip and the
+    /// download budget still trail the durable flush (ack-after-flush), so crash
+    /// recovery is unchanged.
+    ///
+    /// Only applies below the last checkpoint (the reorg-free region); near the
+    /// tip the committer is always synchronous. The bound caps the in-memory
+    /// overlay of not-yet-flushed blocks.
+    pub finalized_block_pipeline_depth: usize,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -430,6 +447,9 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            // Off by default: the committer is synchronous (assemble then flush)
+            // until run-ahead is explicitly enabled and validated.
+            finalized_block_pipeline_depth: 0,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,

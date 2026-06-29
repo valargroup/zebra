@@ -417,6 +417,10 @@ impl DiskWriteBatch {
     /// If this method returns an error, it will be propagated,
     /// and the batch should not be written to the database.
     #[allow(clippy::too_many_arguments)]
+    /// When `capture_balances` is true, returns the absolute address balances
+    /// after applying this block, so the run-ahead committer can serve the
+    /// next block's address reads from memory before the write is durable.
+    /// Returns `None` otherwise, avoiding a clone on the synchronous path.
     pub fn prepare_transparent_transaction_batch(
         &mut self,
         zebra_db: &ZebraDb,
@@ -430,7 +434,8 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
-    ) {
+        capture_balances: bool,
+    ) -> Option<AddressBalanceLocationUpdates> {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
 
@@ -478,7 +483,13 @@ impl DiskWriteBatch {
             );
         }
 
+        // Capture the post-block absolute balances for the pipeline overlay before
+        // they are moved into the write batch (cheap clone, only when running ahead).
+        let captured = capture_balances.then(|| address_balances.clone());
+
         self.prepare_transparent_balances_batch(db, address_balances);
+
+        captured
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,

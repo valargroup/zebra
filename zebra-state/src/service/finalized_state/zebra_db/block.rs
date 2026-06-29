@@ -56,6 +56,8 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
+use super::super::pipeline::{BlockBatchOutputs, FinalizedPipeline, PipelineBatchContribution};
+
 #[cfg(test)]
 mod tests;
 
@@ -1007,18 +1009,26 @@ impl ZebraDb {
 
     // Write block methods
 
-    /// Write `finalized` to the finalized state.
+    /// Commit `finalized` to the finalized state: assemble its [`DiskWriteBatch`]
+    /// and immediately flush it to disk.
     ///
-    /// Uses:
-    /// - `history_tree`: the current tip's history tree
-    /// - `network`: the configured network
-    /// - `source`: the source of the block in log messages
+    /// This is the synchronous (tip-mode) entry point. The run-ahead committer
+    /// instead calls [`assemble_block_batch`](Self::assemble_block_batch) on the
+    /// assembler thread and [`flush_block_batch`](Self::flush_block_batch) on a
+    /// separate disk-writer thread, so the next block's assembly overlaps this
+    /// block's flush.
+    ///
+    /// Production commits go through [`FinalizedState::assemble_finalized_direct`]
+    /// and [`FinalizedState::flush_finalized_direct`], which call the two halves
+    /// below directly; this combined wrapper is retained as a synchronous one-shot
+    /// for tests, so it is unused in lib-only builds.
     ///
     /// # Errors
     ///
     /// - Propagates any errors from writing to the DB
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
+    #[allow(dead_code)]
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
@@ -1028,12 +1038,62 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
+    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        let (batch, hash, _contribution) = self.assemble_block_batch(
+            finalized,
+            prev_note_commitment_trees,
+            network,
+            retention,
+            vct_anchor_roots,
+            vct_sync_below,
+            None,
+        )?;
+        self.flush_block_batch(batch, source);
+        Ok(hash)
+    }
+
+    /// Assemble the [`DiskWriteBatch`] for `finalized` without writing it to disk.
+    ///
+    /// This is the read/compute half of a block commit: it reads the spent UTXOs,
+    /// changed-address balances, and current value pool, applies the transparent
+    /// and shielded batch preparation, and returns the fully-built batch plus the
+    /// committed block hash. It performs no writes, so it can run on the assembler
+    /// thread (or the look-ahead) while a previously-assembled batch is being
+    /// flushed by the disk-writer thread.
+    ///
+    /// The reads it performs (`read_spent_utxo`, [`address_balance_location`], the
+    /// value pool) depend on the parent block. In run-ahead (sync) mode the parent
+    /// may not yet be durable on disk, so those reads must be served from the
+    /// in-memory pipeline overlay before falling back to disk; see the caller.
+    ///
+    /// [`address_balance_location`]: ZebraDb::address_balance_location
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn assemble_block_batch(
+        &self,
+        finalized: FinalizedBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        network: &Network,
+        retention: RetentionPlan,
         // When `Some`, skip per-height tree writes and fold these roots into
         // the anchor set.
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         // When `Some(height)`, mark the database as vct-synced.
         vct_sync_below: Option<Height>,
-    ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
+        // The run-ahead pipeline's in-memory tip state and overlay. When `Some`,
+        // the parent-block reads (spent UTXOs, address balances, value pool, and
+        // the `vct_upgrade_height` marker) are served from it before falling back
+        // to disk, and this block's contribution is captured and returned.
+        overlay: Option<&FinalizedPipeline>,
+    ) -> Result<
+        (
+            DiskWriteBatch,
+            block::Hash,
+            Option<PipelineBatchContribution>,
+        ),
+        CommitCheckpointVerifiedError,
+    > {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1073,6 +1133,24 @@ impl ZebraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZebraDb = self;
+        // Resolve a spent output from the run-ahead overlay first (it may have been
+        // created by a not-yet-flushed block), then from disk / this block's own
+        // new outputs. With `overlay = None` this is exactly the disk read.
+        let read_one_spent =
+            |outpoint: transparent::OutPoint| -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
+                if let Some(overlay) = overlay {
+                    if let Some((out_loc, utxo)) = overlay.spent_utxo_override(&outpoint) {
+                        return (outpoint, out_loc, utxo);
+                    }
+                }
+                read_spent_utxo(
+                    db,
+                    finalized.height,
+                    outpoint,
+                    &tx_hash_indexes,
+                    &finalized.new_outputs,
+                )
+            };
         #[cfg(feature = "commit-metrics")]
         let spent_reads_start = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
@@ -1082,31 +1160,9 @@ impl ZebraDb {
             || {
                 if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                     use rayon::prelude::*;
-                    outpoints
-                        .into_par_iter()
-                        .map(|outpoint| {
-                            read_spent_utxo(
-                                db,
-                                finalized.height,
-                                outpoint,
-                                &tx_hash_indexes,
-                                &finalized.new_outputs,
-                            )
-                        })
-                        .collect()
+                    outpoints.into_par_iter().map(&read_one_spent).collect()
                 } else {
-                    outpoints
-                        .into_iter()
-                        .map(|outpoint| {
-                            read_spent_utxo(
-                                db,
-                                finalized.height,
-                                outpoint,
-                                &tx_hash_indexes,
-                                &finalized.new_outputs,
-                            )
-                        })
-                        .collect()
+                    outpoints.into_iter().map(&read_one_spent).collect()
                 }
             },
             || {
@@ -1194,27 +1250,50 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
+        // Resolve an address balance from the run-ahead overlay first (it may have
+        // been updated by a not-yet-flushed block), then from disk. With
+        // `overlay = None` this is exactly the disk read.
+        let lookup_balance = |addr: &transparent::Address| {
+            if let Some(overlay) = overlay {
+                if let Some(balance) = overlay.address_balance_override(addr) {
+                    return Some(balance);
+                }
+            }
+            self.address_balance_location(addr)
+        };
         #[cfg(feature = "commit-metrics")]
         let address_reads_start = std::time::Instant::now();
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
             AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
+                lookup_balance(addr)
             }))
         } else {
             AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
+                Some(lookup_balance(addr)?.into_new_change())
             }))
         };
         #[cfg(feature = "commit-metrics")]
         metrics::histogram!("zebra.state.write.address_reads.duration_seconds")
             .record(address_reads_start.elapsed().as_secs_f64());
 
+        // The value pool and `vct_upgrade_height` marker are threaded forward in
+        // memory by the run-ahead pipeline; with `overlay = None` they come from
+        // disk exactly as before. `capture_pipeline_outputs` is set only when
+        // running ahead, so the synchronous path avoids the balance clone.
+        let value_pool = overlay
+            .map(|overlay| overlay.value_pool())
+            .unwrap_or_else(|| self.finalized_value_pool());
+        let pipeline_vct_marker_set = overlay
+            .map(|overlay| overlay.vct_upgrade_marker_set())
+            .unwrap_or(false);
+        let capture_pipeline_outputs = overlay.is_some();
+
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
         #[cfg(feature = "commit-metrics")]
         let batch_prep_start = std::time::Instant::now();
-        batch.prepare_block_batch(
+        let block_outputs = batch.prepare_block_batch(
             self,
             network,
             &finalized,
@@ -1224,12 +1303,14 @@ impl ZebraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
-            self.finalized_value_pool(),
+            value_pool,
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
             vct_anchor_roots,
             vct_sync_below,
+            pipeline_vct_marker_set,
+            capture_pipeline_outputs,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1247,6 +1328,49 @@ impl ZebraDb {
                 .record(batch.size_in_bytes() as f64);
         }
 
+        // When running ahead, capture this block's overlay contribution: the
+        // outputs it created (so the next block can spend them from memory) and
+        // the absolute address balances it updated.
+        let contribution = overlay.map(|_| {
+            let created_outputs = finalized
+                .new_outputs
+                .iter()
+                .map(|(outpoint, ordered_utxo)| {
+                    (
+                        *outpoint,
+                        lookup_out_loc(finalized.height, outpoint, &tx_hash_indexes),
+                        ordered_utxo.utxo.clone(),
+                    )
+                })
+                .collect();
+            let updated_balances = match block_outputs.address_balances {
+                Some(AddressBalanceLocationUpdates::Insert(balances)) => {
+                    balances.into_iter().collect()
+                }
+                // The pipeline only runs once format upgrades are finished (the
+                // `Insert` path), so `Merge`/`None` contribute no balances.
+                _ => Vec::new(),
+            };
+
+            PipelineBatchContribution {
+                value_pool: block_outputs.value_pool,
+                wrote_vct_upgrade_marker: block_outputs.wrote_vct_upgrade_marker,
+                created_outputs,
+                updated_balances,
+            }
+        });
+
+        Ok((batch, finalized.hash, contribution))
+    }
+
+    /// Flush a previously [`assemble_block_batch`](Self::assemble_block_batch)d
+    /// batch to disk.
+    ///
+    /// This is the write half of a block commit. In run-ahead (sync) mode it runs
+    /// on the dedicated disk-writer thread so it overlaps the next block's
+    /// assembly; in tip mode it runs inline. A rocksdb write failure is fatal, as
+    /// before.
+    pub(crate) fn flush_block_batch(&self, batch: DiskWriteBatch, source: &str) {
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         self.db
@@ -1256,8 +1380,6 @@ impl ZebraDb {
             .record(batch_start.elapsed().as_secs_f64());
 
         tracing::trace!(?source, "committed block from");
-
-        Ok(finalized.hash)
     }
 
     /// Writes the given batch to the database.
@@ -1569,7 +1691,7 @@ impl DiskWriteBatch {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_block_batch(
+    pub(crate) fn prepare_block_batch(
         &mut self,
         zebra_db: &ZebraDb,
         network: &Network,
@@ -1588,7 +1710,13 @@ impl DiskWriteBatch {
         precomputed_raw_txs: Option<Vec<RawBytes>>,
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         vct_sync_below: Option<Height>,
-    ) -> Result<(), CommitCheckpointVerifiedError> {
+        // When `true`, a not-yet-flushed pipeline block already wrote the set-once
+        // `vct_upgrade_height` marker, so this block must not write it again.
+        pipeline_vct_marker_set: bool,
+        // When `true`, capture and return this block's post-update value pool and
+        // absolute address balances for the run-ahead pipeline overlay.
+        capture_pipeline_outputs: bool,
+    ) -> Result<BlockBatchOutputs, CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zebra_db,
@@ -1609,12 +1737,21 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zebra_db, finalized);
+
+        // The `vct_upgrade_height` marker is written once, by the first block this
+        // binary commits. In the run-ahead pipeline an earlier not-yet-flushed block
+        // may have already set it in memory (`pipeline_vct_marker_set`), in which case
+        // its disk write is still pending, so the disk read would wrongly look absent;
+        // suppress the duplicate write here and report which block actually wrote it.
+        let wrote_vct_upgrade_marker =
+            !pipeline_vct_marker_set && zebra_db.vct_upgrade_height().is_none();
         self.prepare_trees_batch(
             zebra_db,
             finalized,
             prev_note_commitment_trees,
             vct_anchor_roots,
             vct_sync_below,
+            wrote_vct_upgrade_marker,
         );
 
         // # Consensus
@@ -1627,9 +1764,10 @@ impl DiskWriteBatch {
         // So we ignore the genesis UTXO, transparent address index, and value pool updates
         // for the genesis block. This also ignores genesis shielded value pool updates, but there
         // aren't any of those on mainnet or testnet.
+        let mut captured_address_balances = None;
         if !finalized.height.is_min() {
             // Commit transaction indexes
-            self.prepare_transparent_transaction_batch(
+            captured_address_balances = self.prepare_transparent_transaction_batch(
                 zebra_db,
                 network,
                 finalized,
@@ -1639,11 +1777,14 @@ impl DiskWriteBatch {
                 #[cfg(feature = "indexer")]
                 &out_loc_by_outpoint,
                 address_balances,
+                capture_pipeline_outputs,
             );
         }
 
-        // Commit UTXOs and value pools
-        self.prepare_chain_value_pools_batch(
+        // Commit UTXOs and value pools. This runs for every height, including
+        // genesis (which writes the initial pool and block info), matching the
+        // original commit path.
+        let new_value_pool = self.prepare_chain_value_pools_batch(
             zebra_db,
             finalized,
             spent_utxos_by_outpoint,
@@ -1653,7 +1794,11 @@ impl DiskWriteBatch {
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
 
-        Ok(())
+        Ok(BlockBatchOutputs {
+            value_pool: new_value_pool,
+            address_balances: captured_address_balances,
+            wrote_vct_upgrade_marker,
+        })
     }
 
     /// Adds deletes for pruned raw transaction data to this batch, for the
