@@ -1033,7 +1033,8 @@ impl PeerRoutine {
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
-        let request_elapsed_ms = elapsed_ms_u64(outstanding.queued_at.elapsed());
+        let request_elapsed = outstanding.queued_at.elapsed();
+        let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
 
         // The body's transactions are not validated against the header here;
         // consensus does it on apply (`handle_block_apply_finished` attributes a
@@ -1102,6 +1103,12 @@ impl PeerRoutine {
                 completed = Some(self.window.outstanding.remove(index));
                 self.window.increase_outbound_window_after_success();
             }
+        }
+        if completed.is_some() {
+            // Feed the BBR estimators on request completion: the round-trip (RTprop)
+            // and the per-ack delivery rate (BtlBw) for this request's block count.
+            self.window
+                .record_delivery(Instant::now(), request_elapsed, request_range_count);
         }
         if let Some(outstanding) = completed {
             self.finish_detached(outstanding, Disposition::Satisfied);
@@ -1726,6 +1733,16 @@ impl PeerRoutine {
             if let Some(request_elapsed_ms) = request_elapsed_ms {
                 bs_insert_u64(row, "request_elapsed_ms", request_elapsed_ms);
             }
+            if let Some(cwnd) = self.window.bbr_cwnd_target() {
+                bs_insert_u64(row, "bbr_cwnd", u64::try_from(cwnd).unwrap_or(u64::MAX));
+            }
+            if let Some(rtprop_ms) = self.window.bbr_rtprop_ms() {
+                bs_insert_u64(row, "bbr_rtprop_ms", rtprop_ms);
+            }
+            if let Some(btlbw) = self.window.bbr_btlbw_milliblocks() {
+                bs_insert_u64(row, "bbr_btlbw_milliblocks_per_sec", btlbw);
+            }
+            bs_insert_u64(row, "bbr_delivered", self.window.bbr_delivered());
         });
     }
 

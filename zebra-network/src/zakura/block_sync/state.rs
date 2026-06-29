@@ -316,17 +316,152 @@ impl BlockSyncState {
     }
 }
 
-/// Adaptive per-peer outbound request window + outstanding requests.
-///
-/// Kept as a standalone type so the window math stays unit-testable; the per-peer
-/// download state lives in the spawned [`PeerRoutine`](super::peer_routine), which
-/// embeds one of these.
+/// A time-windowed set of `f64` samples supporting `min` (RTprop) and `max` (BtlBw)
+/// filters — the BBR-lite estimators. Samples older than `horizon` are pruned on
+/// insert; the windows are small (seconds of per-request samples) so the linear
+/// scan is cheap and runs once per completed request.
+#[derive(Clone, Debug)]
+struct WindowedSamples {
+    horizon: Duration,
+    samples: Vec<(Instant, f64)>,
+}
+
+impl WindowedSamples {
+    fn new(horizon: Duration) -> Self {
+        Self {
+            horizon,
+            samples: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, now: Instant, value: f64) {
+        self.samples.push((now, value));
+        if let Some(cutoff) = now.checked_sub(self.horizon) {
+            self.samples.retain(|(at, _)| *at >= cutoff);
+        }
+    }
+
+    fn min(&self) -> Option<f64> {
+        self.samples
+            .iter()
+            .map(|(_, value)| *value)
+            .reduce(f64::min)
+    }
+
+    fn max(&self) -> Option<f64> {
+        self.samples
+            .iter()
+            .map(|(_, value)| *value)
+            .reduce(f64::max)
+    }
+}
+
+/// Per-peer BBR-lite control parameters extracted from config (Copy, lock-free).
+#[derive(Copy, Clone, Debug)]
+struct BbrParams {
+    cwnd_gain: f64,
+    min_cwnd: usize,
+    rtprop_window: Duration,
+    delivery_rate_window: Duration,
+}
+
+impl BbrParams {
+    fn from_config(config: &ZakuraBlockSyncConfig) -> Self {
+        Self {
+            cwnd_gain: f64::from(config.bbr_cwnd_gain_percent) / 100.0,
+            min_cwnd: usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1),
+            rtprop_window: config.bbr_rtprop_window,
+            delivery_rate_window: config.bbr_delivery_rate_window,
+        }
+    }
+}
+
+/// Per-peer BBR-lite estimators: an RTprop min-filter over request round-trips, a
+/// BtlBw max-filter over per-ack delivery rate, and a delivered-block counter. The
+/// owning routine samples these lock-free on each completed request. Stage 1 measures
+/// and traces them; the control law (`available_slots`) consumes them in a later stage.
+#[derive(Clone, Debug)]
+struct BbrState {
+    params: BbrParams,
+    rtprop_secs: WindowedSamples,
+    btlbw_blocks_per_sec: WindowedSamples,
+    delivered: u64,
+}
+
+impl BbrState {
+    fn new(config: &ZakuraBlockSyncConfig) -> Self {
+        let params = BbrParams::from_config(config);
+        Self {
+            rtprop_secs: WindowedSamples::new(params.rtprop_window),
+            btlbw_blocks_per_sec: WindowedSamples::new(params.delivery_rate_window),
+            delivered: 0,
+            params,
+        }
+    }
+
+    /// Record a completed request: `elapsed` from send to the final body, `blocks` in
+    /// it. The RTprop sample is the round-trip; the BtlBw sample is the delivery rate,
+    /// with the interval floored at the current RTprop so a burst of buffered bodies
+    /// arriving within one tick cannot inflate the bandwidth estimate.
+    fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
+        let secs = elapsed.as_secs_f64();
+        self.rtprop_secs.observe(now, secs);
+        let floor = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
+        let rate = f64::from(blocks) / secs.max(floor);
+        self.btlbw_blocks_per_sec.observe(now, rate);
+        self.delivered = self.delivered.saturating_add(u64::from(blocks));
+    }
+
+    /// Bandwidth-delay product in blocks: BtlBw (blocks/s) × RTprop (s). `None` until
+    /// at least one delivery sample exists (cold start).
+    fn bdp_blocks(&self) -> Option<f64> {
+        match (self.btlbw_blocks_per_sec.max(), self.rtprop_secs.min()) {
+            (Some(rate), Some(rtprop)) => Some(rate * rtprop),
+            _ => None,
+        }
+    }
+
+    /// Target cwnd in blocks = `max(min_cwnd, BDP × gain)`. `None` until the first
+    /// delivery sample exists, so the caller falls back to slow-start.
+    fn cwnd_target(&self) -> Option<usize> {
+        let bdp = self.bdp_blocks()?;
+        let scaled = (bdp * self.params.cwnd_gain).round();
+        // BDP × gain is a non-negative, finite product of measured rates; clamp
+        // defensively and the cast is safe.
+        let cwnd = if scaled.is_finite() && scaled >= 0.0 {
+            scaled as usize
+        } else {
+            self.params.min_cwnd
+        };
+        Some(cwnd.max(self.params.min_cwnd))
+    }
+
+    fn rtprop_ms(&self) -> Option<u64> {
+        // A rounded non-negative round-trip in milliseconds fits u64 for any real RTT.
+        self.rtprop_secs
+            .min()
+            .map(|secs| (secs * 1000.0).round() as u64)
+    }
+
+    fn btlbw_milliblocks_per_sec(&self) -> Option<u64> {
+        // A rounded non-negative rate scaled by 1000 fits u64 for any real rate.
+        self.btlbw_blocks_per_sec
+            .max()
+            .map(|rate| (rate * 1000.0).round() as u64)
+    }
+}
+
+/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
+/// while the per-peer download state moves into the spawned
+/// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
     pub(super) outbound_request_window: usize,
     pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Per-peer BBR-lite estimators, sampled on each completed request.
+    bbr: BbrState,
     /// Completed error-free responses since the last timeout-driven reduction.
     /// Drives the streak-gated cubic ramp in
     /// [`increase_outbound_window_after_success`](Self::increase_outbound_window_after_success).
@@ -372,6 +507,7 @@ impl DownloadWindow {
             outbound_request_window: initial_window,
             timeout_recovery_slots: 0,
             outstanding: Vec::new(),
+            bbr: BbrState::new(config),
             consecutive_successes: 0,
             consecutive_timeouts: 0,
             growth_base: initial_window,
@@ -379,6 +515,31 @@ impl DownloadWindow {
             block_liveness_deadline: None,
             last_block_at: None,
         }
+    }
+
+    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered).
+    pub(super) fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
+        self.bbr.record_delivery(now, elapsed, blocks);
+    }
+
+    /// The BBR target cwnd in blocks, or `None` before the first delivery sample.
+    pub(super) fn bbr_cwnd_target(&self) -> Option<usize> {
+        self.bbr.cwnd_target()
+    }
+
+    /// The current RTprop estimate in milliseconds, for tracing.
+    pub(super) fn bbr_rtprop_ms(&self) -> Option<u64> {
+        self.bbr.rtprop_ms()
+    }
+
+    /// The current BtlBw estimate in milli-blocks/sec (blocks/sec × 1000), for tracing.
+    pub(super) fn bbr_btlbw_milliblocks(&self) -> Option<u64> {
+        self.bbr.btlbw_milliblocks_per_sec()
+    }
+
+    /// Total blocks delivered through this peer's completed requests, for tracing.
+    pub(super) fn bbr_delivered(&self) -> u64 {
+        self.bbr.delivered
     }
 
     pub(super) fn available_slots(&self) -> usize {
