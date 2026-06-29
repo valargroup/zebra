@@ -1,12 +1,13 @@
 # zebra-replay-bench — commit-pipeline results
 
-Offline A/B of the Zebra checkpoint-sync pipeline at three abstraction levels: the
+Offline A/B of the Zebra checkpoint-sync pipeline at four abstraction levels: the
 **direct committer** (`apply` → `FinalizedState::commit_finalized_direct`), the
 **write worker** one rung up (`apply-worker` → `BlockWriteSender::spawn` /
-`WriteBlockWorkerTask::run`), and the **checkpoint verifier** above that
+`WriteBlockWorkerTask::run`), the **checkpoint verifier** above that
 (`apply-verifier` → `zebra-consensus::CheckpointVerifier`, committing to a real
-`StateService`). Goal: isolate each layer's cost and find the next optimization
-lever.
+`StateService`), and the **block-sync Sequencer** above that (`apply-sequencer` →
+`zebra-network`'s Zakura `Sequencer`, VCT-only). Goal: isolate each layer's cost
+and find the next optimization lever.
 
 ## Provenance
 
@@ -153,10 +154,38 @@ checkpoint verification is **not** a throughput bottleneck on top of the commit.
 > that block; the second-to-last-checkpoint gate fixes it. Lesson: instrument before
 > concluding.
 
+## Fourth rung: block-sync Sequencer (`apply-sequencer`, VCT POC)
+
+`apply-sequencer` drives blocks through the **real Zakura block-sync `Sequencer`**
+(`zebra-network`, via a feature-gated `spawn_bench_sequencer` helper): bodies are fed
+into its reorder queue, it drains the contiguous prefix into `applying` and emits
+ordered `SubmitBlock`s, and a thin driver commits each through the same real
+`CheckpointVerifier` → `StateService`, reporting the commit back so the frontier
+advances. VCT-only; for this POC bodies are fed **in height order** (random / multi-peer
+out-of-order arrival — the reorder buffer's real stress case — is a future knob).
+
+**VCT, 30K** (committed 29,959 blocks to checkpoint 1,831,959, hash gated):
+**123.5 blk/s**, p50 4.71 ms, peak RSS 5.7 GiB. That lands right on the worker (123.8)
+and ~7% under the verifier (133.0): the sequencer adds the body-reorder + submit/apply
+control plumbing on top of verify+commit, and on an **in-order** feed the reorder does
+no real work (`reorder_len` stays 0), so the gap is the channel hops + apply-finished
+round-trips, not reordering. The higher RSS is the `applying` buffer filling under the
+bench's unbounded byte budget (it drains by end-of-window); a finite budget would cap it.
+
+The interesting measurement is still ahead: feeding bodies **out of order** (the future
+knob) is what actually exercises the ReorderBuffer and the sequencer's backpressure —
+this POC establishes the in-order baseline and that the real `SequencerTask` drives
+cleanly offline.
+
 ## Open / next
 
-- **Larger windows (100K+)** are unblocked across all three rungs: memory is flat
-  (verifier peak ~2.4 GiB, bounded), so the cache size, not RAM, is the limit.
+- **Out-of-order / multi-peer feed for `apply-sequencer`:** the POC feeds in height
+  order, so the reorder buffer is idle. Shuffling within a window (and simulating
+  per-peer arrival) is what measures the sequencer's actual job.
+
+- **Larger windows (100K+)** are unblocked for the committer/worker/verifier rungs:
+  memory is flat (verifier peak ~2.4 GiB), so cache size, not RAM, is the limit.
+  (The sequencer rung needs a finite byte budget first — see its RSS note.)
 - **Profiling the committer floor:** with all three rungs converging in VCT
   (~124–133 blk/s) and verification shown to overlap for free, the committer remains
   the floor. The `prepare`/`update_trees`/`batch_prep`/`rocksdb.batch_commit`

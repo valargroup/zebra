@@ -23,6 +23,7 @@ commit-metrics = ["zebra-state/commit-metrics", "dep:metrics-exporter-prometheus
 zebra-chain = { path = "../zebra-chain", version = "9.0.0" }
 zebra-state = { path = "../zebra-state", version = "8.0.0" }
 zebra-consensus = { path = "../zebra-consensus", version = "8.0.0" }
+zebra-network = { path = "../zebra-network", version = "8.0.0", features = ["internal-bench"] }
 
 clap = { workspace = true, features = ["derive"] }
 color-eyre.workspace = true

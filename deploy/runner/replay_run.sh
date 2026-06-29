@@ -137,11 +137,29 @@ cmd_run_verifier() {
   rm -rf "$fork"
 }
 
+# Like cmd_run_verifier, but replays through the real Zakura block-sync Sequencer
+# (reorder + ordered submit to the verifier->state). VCT-only.
+cmd_run_sequencer() {
+  local label="${1:?usage: replay_run.sh run-sequencer <label> [bin]}"; shift || true
+  local bin="${1:-$BIN_DEFAULT}"
+  [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
+  [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  [ -n "${REPLAY_VCT_SIDECAR:-}" ] || die "apply-sequencer is VCT-only; set REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
+  [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR"
+  local fork="$FORK_DIR/replay-sequencer-$label"
+  note "fork base $BASE_SRC -> $fork; apply-sequencer $CACHE (VCT; expects base tip $((START - 1)))"
+  clone_fork "$BASE_SRC" "$fork"
+  "$bin" apply-sequencer --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
+  note "cleanup: rm -rf $fork"
+  rm -rf "$fork"
+}
+
 case "${1:-}" in
-  index)        shift; cmd_index "$@" ;;
-  index-roots)  shift; cmd_index_roots "$@" ;;
-  run)          shift; cmd_run "$@" ;;
-  run-worker)   shift; cmd_run_worker "$@" ;;
-  run-verifier) shift; cmd_run_verifier "$@" ;;
-  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]|run-verifier <label> [bin]}" >&2; exit 2 ;;
+  index)         shift; cmd_index "$@" ;;
+  index-roots)   shift; cmd_index_roots "$@" ;;
+  run)           shift; cmd_run "$@" ;;
+  run-worker)    shift; cmd_run_worker "$@" ;;
+  run-verifier)  shift; cmd_run_verifier "$@" ;;
+  run-sequencer) shift; cmd_run_sequencer "$@" ;;
+  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]|run-verifier <label> [bin]|run-sequencer <label> [bin]}" >&2; exit 2 ;;
 esac
