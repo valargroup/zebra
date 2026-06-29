@@ -1,6 +1,6 @@
 //! Randomised property tests for transactions.
 
-use proptest::prelude::*;
+use proptest::{collection::vec, prelude::*};
 
 use std::io::Cursor;
 
@@ -11,11 +11,100 @@ use hex::{FromHex, ToHex};
 use super::super::*;
 
 use crate::{
-    block::Block,
+    block::{Block, Height},
+    orchard,
+    parameters::NetworkUpgrade,
+    sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
+    transparent,
     LedgerState,
 };
+
+fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
+    prop_oneof![
+        v5_tx_strategy(Just(None).boxed(), Just(None).boxed()),
+        v5_tx_strategy(sapling_outputs_only().prop_map(Some).boxed(), Just(None).boxed()),
+        v5_tx_strategy(sapling_with_spends().prop_map(Some).boxed(), Just(None).boxed()),
+        v5_tx_strategy(Just(None).boxed(), any::<orchard::ShieldedData>().prop_map(Some).boxed()),
+        v5_tx_strategy(
+            any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+                .prop_map(Some)
+                .boxed(),
+            orchard_with_multiple_actions().prop_map(Some).boxed(),
+        ),
+    ]
+    .boxed()
+}
+
+fn v5_tx_strategy(
+    sapling_shielded_data: BoxedStrategy<Option<sapling::ShieldedData<sapling::SharedAnchor>>>,
+    orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedData>>,
+) -> BoxedStrategy<Transaction> {
+    (
+        nu5_or_later_upgrade(),
+        any::<LockTime>(),
+        any::<Height>(),
+        vec(any_with::<transparent::Input>(None), 0..MAX_ARBITRARY_ITEMS),
+        vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
+        sapling_shielded_data,
+        orchard_shielded_data,
+    )
+        .prop_map(
+            |(
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+            )| Transaction::V5 {
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+            },
+        )
+        .boxed()
+}
+
+fn nu5_or_later_upgrade() -> BoxedStrategy<NetworkUpgrade> {
+    prop_oneof![
+        Just(NetworkUpgrade::Nu5),
+        Just(NetworkUpgrade::Nu6),
+        Just(NetworkUpgrade::Nu6_1),
+        Just(NetworkUpgrade::Nu6_2),
+    ]
+    .boxed()
+}
+
+fn sapling_outputs_only() -> BoxedStrategy<sapling::ShieldedData<sapling::SharedAnchor>> {
+    any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+        .prop_filter("Sapling outputs-only bundle", |sapling| {
+            sapling.spends().next().is_none() && sapling.outputs().next().is_some()
+        })
+        .boxed()
+}
+
+fn sapling_with_spends() -> BoxedStrategy<sapling::ShieldedData<sapling::SharedAnchor>> {
+    any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+        .prop_filter("Sapling bundle with spends", |sapling| {
+            sapling.spends().next().is_some()
+        })
+        .boxed()
+}
+
+fn orchard_with_multiple_actions() -> BoxedStrategy<orchard::ShieldedData> {
+    any::<orchard::ShieldedData>()
+        .prop_filter("Orchard bundle with multiple actions", |orchard| {
+            orchard.actions().count() > 1
+        })
+        .boxed()
+}
 
 proptest! {
     #[test]
@@ -59,11 +148,11 @@ proptest! {
     /// The native ZIP-244 txid + authorizing-data digest implementation
     /// (`transaction::zip244`) must be byte-for-byte identical to the
     /// `librustzcash` conversion it replaces. This is the consensus-critical
-    /// correctness proof for the native path, exercised across thousands of
-    /// random v5 transaction shapes (coinbase, spends-only, outputs-only, empty
-    /// shielded bundles, multi-action orchard, both NU5 and NU6 branch ids).
+    /// correctness proof for the native path, exercised across random v5
+    /// transaction shapes: transparent-only, Sapling outputs-only, Sapling
+    /// spends, Orchard, combined Sapling+Orchard, and multiple NU5+ branch ids.
     #[test]
-    fn native_zip244_matches_librustzcash(tx in Transaction::v5_strategy(LedgerState::default())) {
+    fn native_zip244_matches_librustzcash(tx in native_zip244_tx_strategy()) {
         let _init_guard = zebra_test::init();
 
         let (native_txid, native_auth) = crate::transaction::zip244::txid_and_auth_digest(&tx)
