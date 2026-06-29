@@ -41,6 +41,7 @@ async fn run_checked(
         peak_budget_reserved = report.peak_budget_reserved,
         final_budget_reserved = report.final_budget_reserved,
         protocol_rejects = report.protocol_rejects,
+        floor_bypass_requests = report.floor_bypass_requests,
         "blocksync fuzz scenario complete",
     );
     assert_core_invariants(&scenario, &outcome, &report, outstanding_slack);

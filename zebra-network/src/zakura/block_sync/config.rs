@@ -113,6 +113,9 @@ pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
 pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
+/// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
+/// lowest missing height is fetched even when every servable peer is at its cwnd.
+pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
 
 /// Block-sync peer status advertisement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -238,6 +241,10 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd: u32,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
+    /// Slots a floor (lowest-missing-height) request may borrow beyond the BBR cwnd, up
+    /// to the peer's advertised hard cap. Lets the floor be fetched even when every
+    /// servable peer is saturated at its cwnd; `0` disables the bypass.
+    pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
 }
@@ -277,6 +284,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_startup_growth_percent: DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT,
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
+            floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
         }
     }

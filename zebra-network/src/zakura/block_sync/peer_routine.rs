@@ -584,9 +584,16 @@ impl PeerRoutine {
         let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
         loop {
-            if !self.received_status || self.window.available_slots() == 0 {
+            let floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
+            let normal_slots = self.window.available_slots();
+            let floor_slots = self.window.available_slots_with_bonus(floor_bonus);
+            // Break only when even a bypassed floor request has no slot. A cwnd that is
+            // saturated for above-floor work (`normal_slots == 0`) still leaves up to
+            // `floor_bonus` slots so the lowest missing height keeps moving.
+            if !self.received_status || floor_slots == 0 {
                 break;
             }
+            let in_bypass = normal_slots == 0;
             // One contiguous chunk up to the peer's per-request count cap; the
             // outer loop fills the rest of the peer's slots.
             let local_peer_count_cap = usize::try_from(
@@ -605,7 +612,17 @@ impl PeerRoutine {
             let mut request_priority = RequestPriority::Floor;
             let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
                 self.work.reserved_above(view.download_floor);
-            let mut items = if servable_low <= floor_high
+            // In the bypass region (cwnd saturated), only borrow a floor slot if no
+            // other servable peer can take the floor through its normal capacity — a
+            // deadlock-free floor→best-peer bias: the unsaturated peer re-fills on its
+            // next completion (`try_fill` runs every routine-loop turn), and if every
+            // server is saturated this is `false` and we bypass so the floor still moves.
+            let floor_arm_allowed = !in_bypass
+                || !self
+                    .registry
+                    .floor_has_unsaturated_other_server(view.download_floor, &self.peer);
+            let mut items = if floor_arm_allowed
+                && servable_low <= floor_high
                 && self
                     .work
                     .first_pending_in_range(servable_low, servable_high.min(floor_high))
@@ -650,6 +667,11 @@ impl PeerRoutine {
             };
 
             if items.is_empty() {
+                if in_bypass {
+                    // Saturated cwnd: the floor bypass funds the floor only, never a
+                    // speculative above-floor fetch. Nothing more to take this pass.
+                    break;
+                }
                 let Some(start_height) = self
                     .work
                     .first_pending_in_range(servable_low, servable_high)
@@ -802,6 +824,10 @@ impl PeerRoutine {
 
             let deadline = queued_at + self.config.request_timeout;
             metrics::counter!("sync.block.request.sent").increment(1);
+            if in_bypass {
+                // A floor request borrowed a bypass slot while the cwnd was saturated.
+                metrics::counter!("sync.block.request.floor_bypass").increment(1);
+            }
             let request_start_height = request.start_height;
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
@@ -818,6 +844,7 @@ impl PeerRoutine {
                 request_start_height,
                 request_count,
                 request_estimated_bytes,
+                in_bypass,
             );
         }
 
@@ -1723,7 +1750,13 @@ impl PeerRoutine {
         });
     }
 
-    fn trace_get_blocks_sent(&self, start_height: block::Height, count: u32, estimated_bytes: u64) {
+    fn trace_get_blocks_sent(
+        &self,
+        start_height: block::Height,
+        count: u32,
+        estimated_bytes: u64,
+        floor_bypass: bool,
+    ) {
         self.emit(bs_trace::BLOCK_GET_BLOCKS_SENT, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_height(row, bs_trace::RANGE_START, start_height);
@@ -1735,6 +1768,9 @@ impl PeerRoutine {
                 "peer_outstanding",
                 self.window.outstanding.len() as u64,
             );
+            // A floor request issued while the peer was saturated at its cwnd — borrowed
+            // a floor-bypass slot. Lets the analysis confirm the bypass actually fired.
+            bs_insert_u64(row, "floor_bypass", u64::from(floor_bypass));
         });
     }
 
