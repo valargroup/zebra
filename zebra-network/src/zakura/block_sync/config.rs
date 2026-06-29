@@ -95,6 +95,29 @@ pub const DEFAULT_BS_FANOUT: usize = 1;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
+/// Default BBR-lite controller master switch. When disabled the per-peer window
+/// falls back to the legacy cubic-AIMD ramp (rollback / A-B baseline).
+pub const DEFAULT_BS_BBR_ENABLED: bool = true;
+/// Default steady-state cwnd gain, as a percent of the bandwidth-delay product.
+pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 200;
+/// Default ProbeBW up-probe pacing gain, percent.
+pub const DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT: u32 = 125;
+/// Default ProbeRTT cadence: how often to drain to re-measure the min-RTT.
+pub const DEFAULT_BS_BBR_PROBE_RTT_INTERVAL: Duration = Duration::from_secs(10);
+/// Default ProbeRTT hold time at the drained cwnd.
+pub const DEFAULT_BS_BBR_PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
+/// Default windowed-min horizon for the RTprop (min-RTT) estimate. Kept equal to
+/// the ProbeRTT interval so a stale min is always re-probed before it expires.
+pub const DEFAULT_BS_BBR_RTPROP_WINDOW: Duration = Duration::from_secs(10);
+/// Default max-filter horizon for the BtlBw (delivery-rate) estimate.
+pub const DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Default per-RTT Startup growth (percent ⇒ ≈2×/RTT exponential ramp).
+pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
+/// Default minimum cwnd in blocks — keeps the pipe primed and lets ProbeRTT send.
+pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
+/// Default delay-gradient down-adjust threshold, percent of RTprop.
+pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
+
 /// Block-sync peer status advertisement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncStatus {
@@ -194,6 +217,31 @@ pub struct ZakuraBlockSyncConfig {
     pub size_deviation_tolerance: u32,
     /// Number of peers later range scheduling may fan out to for the same body gap.
     pub fanout: usize,
+    /// Enable the BBR-lite per-peer download controller. When false the legacy
+    /// cubic-AIMD window is used (instant rollback / A-B baseline).
+    pub bbr_enabled: bool,
+    /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
+    pub bbr_cwnd_gain_percent: u32,
+    /// ProbeBW up-probe pacing gain, percent.
+    pub bbr_probe_bw_gain_percent: u32,
+    /// How often to enter ProbeRTT to refresh the min-RTT estimate.
+    #[serde(with = "humantime_serde")]
+    pub bbr_probe_rtt_interval: Duration,
+    /// How long to hold the drained cwnd during ProbeRTT.
+    #[serde(with = "humantime_serde")]
+    pub bbr_probe_rtt_duration: Duration,
+    /// Windowed-min horizon for the RTprop (min-RTT) estimate.
+    #[serde(with = "humantime_serde")]
+    pub bbr_rtprop_window: Duration,
+    /// Max-filter horizon for the delivery-rate (BtlBw) estimate.
+    #[serde(with = "humantime_serde")]
+    pub bbr_delivery_rate_window: Duration,
+    /// Per-RTT Startup cwnd growth, percent.
+    pub bbr_startup_growth_percent: u32,
+    /// Minimum cwnd, in blocks.
+    pub bbr_min_cwnd: u32,
+    /// Delay-gradient down-adjust threshold, percent of RTprop.
+    pub bbr_delay_gradient_percent: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
 }
@@ -223,6 +271,16 @@ impl Default for ZakuraBlockSyncConfig {
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             fanout: DEFAULT_BS_FANOUT,
+            bbr_enabled: DEFAULT_BS_BBR_ENABLED,
+            bbr_cwnd_gain_percent: DEFAULT_BS_BBR_CWND_GAIN_PERCENT,
+            bbr_probe_bw_gain_percent: DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT,
+            bbr_probe_rtt_interval: DEFAULT_BS_BBR_PROBE_RTT_INTERVAL,
+            bbr_probe_rtt_duration: DEFAULT_BS_BBR_PROBE_RTT_DURATION,
+            bbr_rtprop_window: DEFAULT_BS_BBR_RTPROP_WINDOW,
+            bbr_delivery_rate_window: DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW,
+            bbr_startup_growth_percent: DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT,
+            bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
+            bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
             peer_limits: ServicePeerLimits::default(),
         }
     }
@@ -290,6 +348,19 @@ impl ZakuraBlockSyncConfig {
         }
         if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
+        }
+        if self.bbr_min_cwnd == 0 {
+            return Err("bbr_min_cwnd must be greater than zero");
+        }
+        if self.bbr_cwnd_gain_percent < 100
+            || self.bbr_probe_bw_gain_percent < 100
+            || self.bbr_startup_growth_percent < 100
+            || self.bbr_delay_gradient_percent < 100
+        {
+            return Err("bbr gain/threshold percentages must be at least 100");
+        }
+        if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
+            return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
         Ok(())
     }
