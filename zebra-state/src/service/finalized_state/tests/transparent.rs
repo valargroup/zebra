@@ -183,6 +183,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         #[cfg(feature = "indexer")]
         &HashMap::new(),
         address_balances,
+        false,
     );
 
     // Write the batch and confirm the final on-disk balance matches the consensus value

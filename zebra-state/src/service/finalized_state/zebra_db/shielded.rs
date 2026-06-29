@@ -653,6 +653,11 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
         vct_sync_below: Option<Height>,
+        // Whether to write the set-once `vct_upgrade_height` marker for this block.
+        // Computed by the caller (`!already_set && marker_is_absent`) so the run-ahead
+        // pipeline can suppress a duplicate write when an earlier not-yet-flushed block
+        // already set it.
+        write_vct_upgrade_marker: bool,
     ) {
         let FinalizedBlock {
             height,
@@ -670,7 +675,7 @@ impl DiskWriteBatch {
         // a node that upgrades above the last checkpoint (legacy path only). Set-once: the marker
         // is never moved, so the boundary stays stable as the chain grows. Commits are sequential,
         // so the absent check sees the previous block's committed marker, not a half-written batch.
-        if zebra_db.vct_upgrade_height().is_none() {
+        if write_vct_upgrade_marker {
             self.update_vct_upgrade_marker(zebra_db, *height);
         }
 

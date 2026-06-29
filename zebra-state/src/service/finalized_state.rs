@@ -116,16 +116,70 @@ pub(crate) fn spawn_note_precompute(
     (rx, cancel)
 }
 
+/// A fully-assembled finalized-block commit that has not yet been flushed to disk.
+///
+/// Produced by [`FinalizedState::assemble_finalized_direct`] (the read/compute half
+/// of a block commit) and consumed by [`FinalizedState::flush_finalized_direct`] (the
+/// disk-write half). Carrying the batch and its post-commit bookkeeping inputs lets
+/// the run-ahead committer hand the batch to a separate disk-writer thread while it
+/// assembles the next block.
+pub struct AssembledCommit {
+    /// The fully-prepared write batch, ready to flush.
+    batch: DiskWriteBatch,
+    /// The committed block's hash.
+    hash: block::Hash,
+    /// The committed block's height.
+    height: block::Height,
+    /// The note-commitment trees after this block, threaded to the next block.
+    note_commitment_trees: NoteCommitmentTrees,
+    /// The retention plan, needed for post-flush archive-backlog bookkeeping.
+    retention: RetentionPlan,
+    /// This block's run-ahead pipeline contribution, captured only when the
+    /// committer is running ahead (`None` on the synchronous path). The committer
+    /// records it into the [`FinalizedPipeline`](pipeline::FinalizedPipeline)
+    /// before handing the batch to the disk-writer thread.
+    ///
+    /// Read by the disk-writer-thread integration in `write.rs`; until that lands,
+    /// it is only ever the `None` produced by the synchronous path.
+    #[allow(dead_code)]
+    pipeline_contribution: Option<BlockPipelineContribution>,
+    /// The committed block, for elasticsearch indexing after the flush.
+    #[cfg(feature = "elasticsearch")]
+    finalized_block: Arc<Block>,
+}
+
+/// The subset of a run-ahead [`AssembledCommit`] the disk-writer thread and the
+/// committer's ack handling need, returned by
+/// [`FinalizedState::commit_finalized_pipelined`].
+///
+/// The overlay-specific fields of `AssembledCommit` have already been folded into
+/// the pipeline by the time this is returned, so this carries only the batch to
+/// flush and the scalars used to advance the chain tip and thread the trees.
+pub(crate) struct PipelineAssembled {
+    /// The fully-prepared write batch, handed to the disk-writer thread.
+    pub batch: DiskWriteBatch,
+    /// The committed block's hash (sent on the commit response after the flush).
+    pub hash: block::Hash,
+    /// The committed block's height (acked by the writer to advance the tip).
+    pub height: block::Height,
+    /// The note-commitment trees after this block, threaded to the next block.
+    pub note_commitment_trees: NoteCommitmentTrees,
+}
+
 pub mod column_family;
 
 mod commitment_aux;
 mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+mod pipeline;
 mod vct;
 mod zebra_db;
 
 use vct::VctState;
+
+use pipeline::BlockPipelineContribution;
+pub(crate) use pipeline::FinalizedPipeline;
 
 /// The verified-commitment-trees `tree_aux` serving read path (design §9): the per-block
 /// commitment roots for a height range, derived from the per-height trees.
@@ -824,12 +878,79 @@ impl FinalizedState {
         }
     }
 
+    /// Assemble a checkpoint-verified block for the run-ahead pipeline: build its
+    /// write batch against the in-memory `pipeline` overlay, record the block's
+    /// contribution into the overlay, run the committer-owned post-assemble
+    /// bookkeeping, and return the batch (plus the scalars the disk-writer thread
+    /// needs) without writing anything to disk.
+    ///
+    /// The caller hands the returned batch to the disk-writer thread, and advances
+    /// the chain tip and retires the overlay once that thread acknowledges the
+    /// durable flush (ack-after-flush).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same assembly errors as
+    /// [`assemble_finalized_direct`](Self::assemble_finalized_direct) (including the
+    /// retryable verified-commitment-trees stalls), without mutating the overlay.
+    pub(crate) fn commit_finalized_pipelined(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        note_precompute: Option<BlockNotePrecompute>,
+        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
+        pipeline: &mut pipeline::FinalizedPipeline,
+    ) -> Result<PipelineAssembled, CommitCheckpointVerifiedError> {
+        pipeline.seed(&self.db);
+
+        let assembled = self.assemble_finalized_direct(
+            finalizable_block,
+            prev_note_commitment_trees,
+            note_precompute,
+            next_checkpoint,
+            Some(pipeline),
+            "commit checkpoint-verified request",
+        )?;
+
+        let AssembledCommit {
+            batch,
+            hash,
+            height,
+            note_commitment_trees,
+            retention,
+            pipeline_contribution,
+            // Elasticsearch indexing is skipped on the run-ahead path.
+            ..
+        } = assembled;
+
+        let contribution =
+            pipeline_contribution.expect("overlay was supplied, so a contribution is captured");
+        pipeline.record_block(contribution);
+
+        // Evict committed roots and clear the archive backlog now: a block that has
+        // been assembled into a pipeline batch is guaranteed to flush in order (the
+        // checkpoint region is reorg-free), so this need not wait for the flush.
+        self.pipeline_post_assemble(height, retention);
+
+        Ok(PipelineAssembled {
+            batch,
+            hash,
+            height,
+            note_commitment_trees,
+        })
+    }
+
     /// Immediately commit a `finalized` block to the finalized state.
     ///
     /// This can be called either by the non-finalized state (when finalizing
     /// a block) or by the checkpoint verifier.
     ///
     /// Use `source` as the source of the block in log messages.
+    ///
+    /// This is the synchronous (tip-mode) entry point: it
+    /// [assembles](Self::assemble_finalized_direct) the block's batch and
+    /// [flushes](Self::flush_finalized_direct) it to disk in one call. The
+    /// run-ahead committer calls those two halves on separate threads instead.
     ///
     /// # Errors
     ///
@@ -843,14 +964,54 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
+        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
+        source: &str,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let assembled = self.assemble_finalized_direct(
+            finalizable_block,
+            prev_note_commitment_trees,
+            note_precompute,
+            next_checkpoint,
+            None,
+            source,
+        )?;
+        Ok(self.flush_finalized_direct(assembled, source))
+    }
+
+    /// Assemble (but do not flush) the [`DiskWriteBatch`] for `finalizable_block`.
+    ///
+    /// This is the read/compute half of [`commit_finalized_direct`](Self::commit_finalized_direct):
+    /// it updates the note-commitment and history trees, runs the verified-commitment-trees
+    /// fast path or legacy recompute, checks the ordering asserts, and builds the
+    /// batch — but performs no disk writes. The returned [`AssembledCommit`] is
+    /// handed to [`flush_finalized_direct`](Self::flush_finalized_direct).
+    ///
+    /// Splitting assembly from the flush lets the run-ahead committer build the
+    /// next block's batch while the disk-writer thread flushes this one.
+    ///
+    /// # Errors
+    ///
+    /// - Propagates any errors from updating history and note commitment trees
+    /// - If `hashFinalSaplingRoot` / `hashLightClientRoot` / `hashBlockCommitments`
+    ///   does not match the expected value
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn assemble_finalized_direct(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        note_precompute: Option<BlockNotePrecompute>,
         // The next checkpoint block (and its precomputed
         // auth data root), used to verify this block's fixture roots before the fast
         // path trusts them. `None` is only valid for fast blocks at the checkpoint
         // handoff, where the embedded final frontiers independently authenticate
         // this height's roots, or outside the checkpoint commit path.
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
+        // The run-ahead pipeline's in-memory tip state and overlay. When `Some`, the
+        // parent history tree and ordering-assert tip cursor are read from it, and
+        // the block's contribution is captured into the returned `AssembledCommit`.
+        overlay: Option<&pipeline::FinalizedPipeline>,
         source: &str,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+    ) -> Result<AssembledCommit, CommitCheckpointVerifiedError> {
         let (
             height,
             hash,
@@ -874,8 +1035,13 @@ impl FinalizedState {
                 // so the commitment check below doesn't recompute it here on the
                 // single-threaded committer. `AuthDataRoot` is `Copy`.
                 let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
-                let mut history_tree = self.db.history_tree();
+                // The parent history tree is read fresh from disk per block, so when
+                // running ahead it must come from the in-memory pipeline tip instead.
+                let mut history_tree = overlay
+                    .map(|overlay| overlay.history_tree())
+                    .unwrap_or_else(|| self.db.history_tree());
                 let prev_note_commitment_trees = prev_note_commitment_trees
+                    .or_else(|| overlay.map(|overlay| overlay.note_commitment_trees()))
                     .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
                 let mut note_commitment_trees = prev_note_commitment_trees.clone();
@@ -1175,11 +1341,21 @@ impl FinalizedState {
             }
         };
 
-        let committed_tip_hash = self.db.finalized_tip_hash();
-        let committed_tip_height = self.db.finalized_tip_height();
+        // The finalized tip is read fresh from disk per block for the ordering
+        // asserts, so when running ahead it must come from the in-memory pipeline
+        // tip (which is seeded from disk and equals it when nothing is in flight).
+        let (committed_tip_hash, committed_tip_height, db_is_empty) =
+            match overlay.and_then(|overlay| overlay.tip()) {
+                Some((tip_height, tip_hash)) => (tip_hash, Some(tip_height), false),
+                None => (
+                    self.db.finalized_tip_hash(),
+                    self.db.finalized_tip_height(),
+                    self.db.is_empty(),
+                ),
+            };
 
         // Assert that callers (including unit tests) get the chain order correct
-        if self.db.is_empty() {
+        if db_is_empty {
             assert_eq!(
                 committed_tip_hash, finalized.block.header.previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
@@ -1205,8 +1381,11 @@ impl FinalizedState {
         #[cfg(feature = "elasticsearch")]
         let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
+        // Captured for the run-ahead pipeline's in-memory tip state (the history
+        // tree is otherwise read fresh from disk per block); cheap `Arc` clone.
+        let history_tree = finalized.treestate.history_tree.clone();
 
-        // Run `write_block` directly on the committer thread rather than entering the
+        // Assemble the write batch on the committer thread rather than entering the
         // dedicated commit-compute pool via `install()`.
         //
         // The committer is not a member of `COMMIT_COMPUTE_POOL`, so `install()` is a
@@ -1214,59 +1393,142 @@ impl FinalizedState {
         // picks up the job, runs it, and signals back. The look-ahead note-commitment
         // precompute (`spawn_note_precompute`) keeps those workers busy, so the handoff
         // waits on a contended pool, and that wait dominates the isolation it was meant
-        // to provide for `write_block`'s internal rayon (`join`/`par_iter`). Running
-        // `write_block` here removes the per-block round-trip; its internal rayon uses
+        // to provide for the batch's internal rayon (`join`/`par_iter`). Running
+        // assembly here removes the per-block round-trip; its internal rayon uses
         // the global pool instead. Measured net win on the sandblast region (see PR).
         let network = self.network();
-        let result = self.db.write_block(
+        // `assemble_block_batch` also returns `finalized.hash`, which equals the
+        // `hash` already destructured above; keep the outer binding and ignore it.
+        let (batch, _hash, batch_contribution) = self.db.assemble_block_batch(
             finalized,
             prev_note_commitment_trees,
             &network,
-            source,
             retention,
             fast_anchor_roots,
             fast_sync_below,
-        );
+            overlay,
+        )?;
 
-        if result.is_ok() {
-            if let Some(vct) = &self.vct {
-                vct.evict_committed_roots_through(height);
-            }
+        // When running ahead, fold this block's batch contribution together with its
+        // tip cursor and trees into the contribution the committer records into the
+        // pipeline before handing the batch to the disk-writer thread.
+        let pipeline_contribution =
+            batch_contribution.map(|contribution| BlockPipelineContribution {
+                tip: (height, hash),
+                history_tree,
+                note_commitment_trees: note_commitment_trees.clone(),
+                value_pool: contribution.value_pool,
+                wrote_vct_upgrade_marker: contribution.wrote_vct_upgrade_marker,
+                created_outputs: contribution.created_outputs,
+                updated_balances: contribution.updated_balances,
+            });
 
-            if retention.clears_archive_backlog() {
-                self.checkpoint_raw_tx_archive_backlog
-                    .store(false, Ordering::Relaxed);
-            }
-
-            // Save blocks to elasticsearch if the feature is enabled.
+        Ok(AssembledCommit {
+            batch,
+            hash,
+            height,
+            note_commitment_trees,
+            retention,
+            pipeline_contribution,
             #[cfg(feature = "elasticsearch")]
-            self.elasticsearch(&finalized_inner_block);
+            finalized_block: finalized_inner_block,
+        })
+    }
 
-            // TODO: move the stop height check to the syncer (#3442)
-            if self.is_at_stop_height(height) {
-                tracing::info!(
-                    ?height,
-                    ?hash,
-                    block_source = ?source,
-                    "stopping at configured height, flushing database to disk"
-                );
+    /// Flush a previously [`assemble_finalized_direct`](Self::assemble_finalized_direct)d
+    /// batch to disk and run the post-commit bookkeeping (root eviction, archive
+    /// backlog clearing, elasticsearch, and the configured stop-height check).
+    ///
+    /// This is the write half of [`commit_finalized_direct`](Self::commit_finalized_direct).
+    /// In run-ahead (sync) mode the disk write runs on the disk-writer thread; the
+    /// bookkeeping that mutates committer-owned state runs back on the assembler.
+    /// A rocksdb write failure is fatal, as before.
+    pub fn flush_finalized_direct(
+        &mut self,
+        assembled: AssembledCommit,
+        source: &str,
+    ) -> (block::Hash, NoteCommitmentTrees) {
+        let AssembledCommit {
+            batch,
+            hash,
+            height,
+            note_commitment_trees,
+            retention,
+            // Recorded into the pipeline by the committer before the flush, so the
+            // disk-writer side ignores it here.
+            pipeline_contribution: _,
+            #[cfg(feature = "elasticsearch")]
+            finalized_block,
+        } = assembled;
 
-                // POC: emit the equivalence digest + fast-path summary before exit.
-                self.vct_log_equivalence_digest();
+        self.db.flush_block_batch(batch, source);
 
-                // We're just about to do a forced exit, so it's ok to do a forced db shutdown
-                self.db.shutdown(true);
+        self.pipeline_post_assemble(height, retention);
 
-                // Drops tracing log output that's hasn't already been written to stdout
-                // since this exits before calling drop on the WorkerGuard for the logger thread.
-                // This is okay for now because this is test-only code
-                //
-                // TODO: Call ZebradApp.shutdown or drop its Tracing component before calling exit_process to flush logs to stdout
-                Self::exit_process();
-            }
+        // Save blocks to elasticsearch if the feature is enabled.
+        #[cfg(feature = "elasticsearch")]
+        self.elasticsearch(&finalized_block);
+
+        self.finalized_stop_at_height_if_configured(height, hash, source);
+
+        (hash, note_commitment_trees)
+    }
+
+    /// Run the committer-owned bookkeeping for a block that has been assembled
+    /// (and, on the synchronous path, flushed): evict its now-committed
+    /// verified-commitment-tree roots and clear the archive backlog flag if the
+    /// retention plan says it is now drained.
+    ///
+    /// In the run-ahead pipeline this runs on the assembler thread right after a
+    /// block is assembled (it only frees memory / clears a flag, so it does not
+    /// need to wait for the durable flush); the synchronous
+    /// [`flush_finalized_direct`](Self::flush_finalized_direct) runs it after the
+    /// flush.
+    fn pipeline_post_assemble(&self, height: block::Height, retention: RetentionPlan) {
+        if let Some(vct) = &self.vct {
+            vct.evict_committed_roots_through(height);
         }
 
-        result.map(|hash| (hash, note_commitment_trees))
+        if retention.clears_archive_backlog() {
+            self.checkpoint_raw_tx_archive_backlog
+                .store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// If `height` is the configured `debug_stop_at_height`, flush the database and
+    /// exit the process.
+    ///
+    /// This must only be called once the block at `height` is durable on disk, so
+    /// the run-ahead pipeline calls it from the assembler after the disk-writer
+    /// thread acknowledges the flush of that height.
+    pub(crate) fn finalized_stop_at_height_if_configured(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        source: &str,
+    ) {
+        // TODO: move the stop height check to the syncer (#3442)
+        if self.is_at_stop_height(height) {
+            tracing::info!(
+                ?height,
+                ?hash,
+                block_source = ?source,
+                "stopping at configured height, flushing database to disk"
+            );
+
+            // POC: emit the equivalence digest + fast-path summary before exit.
+            self.vct_log_equivalence_digest();
+
+            // We're just about to do a forced exit, so it's ok to do a forced db shutdown
+            self.db.shutdown(true);
+
+            // Drops tracing log output that's hasn't already been written to stdout
+            // since this exits before calling drop on the WorkerGuard for the logger thread.
+            // This is okay for now because this is test-only code
+            //
+            // TODO: Call ZebradApp.shutdown or drop its Tracing component before calling exit_process to flush logs to stdout
+            Self::exit_process();
+        }
     }
 
     /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will
@@ -1508,7 +1770,7 @@ impl FinalizedState {
 
     /// Stop the process if `block_height` is greater than or equal to the
     /// configured stop height.
-    fn is_at_stop_height(&self, block_height: block::Height) -> bool {
+    pub(crate) fn is_at_stop_height(&self, block_height: block::Height) -> bool {
         let debug_stop_at_height = match self.debug_stop_at_height {
             Some(debug_stop_at_height) => debug_stop_at_height,
             None => return false,
