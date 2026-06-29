@@ -233,7 +233,9 @@ pub struct ZakuraBlockSyncConfig {
     pub fanout: usize,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,
-    /// ProbeBW up-probe pacing gain, percent.
+    /// ProbeBW up-probe pacing gain, percent. Reserved: the ProbeBW gain cycle is not
+    /// yet wired into the controller, so this knob is currently inert (the BtlBw
+    /// max-filter already adopts higher delivery rates without an explicit up-probe).
     pub bbr_probe_bw_gain_percent: u32,
     /// How often to enter ProbeRTT to refresh the min-RTT estimate.
     #[serde(with = "humantime_serde")]
@@ -247,7 +249,9 @@ pub struct ZakuraBlockSyncConfig {
     /// Max-filter horizon for the delivery-rate (BtlBw) estimate.
     #[serde(with = "humantime_serde")]
     pub bbr_delivery_rate_window: Duration,
-    /// Per-RTT Startup cwnd growth, percent.
+    /// Per-RTT Startup cwnd growth, percent. Reserved: there is no separate Startup ramp
+    /// phase yet, so this knob is currently inert (cold start uses
+    /// `initial_inflight_requests` and the BDP estimate takes over once samples arrive).
     pub bbr_startup_growth_percent: u32,
     /// Minimum cwnd, in blocks.
     pub bbr_min_cwnd: u32,
