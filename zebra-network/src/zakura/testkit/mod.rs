@@ -1,6 +1,8 @@
 //! Test tooling for the default-off Zakura Iroh/QUIC stack.
 
 mod block_sync_peer;
+#[cfg(test)]
+mod blocksync_fuzz;
 mod clock;
 mod cluster;
 mod endpoint;
