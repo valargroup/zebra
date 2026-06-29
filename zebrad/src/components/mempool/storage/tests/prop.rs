@@ -19,6 +19,8 @@ use zebra_chain::{
     transaction::{self, JoinSplitData, Transaction, UnminedTxId, VerifiedUnminedTx},
     transparent, LedgerState,
 };
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use zebra_chain::{block, ironwood, parameters::NetworkUpgrade};
 
 use crate::components::mempool::tests::{
     standard_verified_unmined_tx_strategy, standardize_transaction,
@@ -359,6 +361,83 @@ proptest! {
         }
     }
 
+    /// Test if removing a V6 transaction clears its Ironwood nullifiers from the mempool's
+    /// in-memory spend conflict cache.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[test]
+    fn exact_removal_clears_ironwood_spend_conflicts(
+        first in transaction_v6_strategy().prop_map(DisplayToDebug),
+        second in transaction_v6_strategy().prop_map(DisplayToDebug),
+        conflict in any::<IronwoodSpendConflict>(),
+    ) {
+        let mut storage: Storage = Storage::new(&Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        });
+
+        let (first_transaction, second_transaction) =
+            verified_v6_transactions_with_ironwood_conflict(first, second, conflict);
+
+        let first_id = first_transaction.transaction.id;
+        let second_id = second_transaction.transaction.id;
+
+        prop_assert_eq!(
+            storage.insert(first_transaction, Vec::new(), None),
+            Ok(first_id)
+        );
+
+        let exact_wtxids_to_remove = HashSet::from([first_id]);
+        prop_assert_eq!(storage.remove_exact(&exact_wtxids_to_remove), 1);
+
+        prop_assert_eq!(
+            storage.insert(second_transaction, Vec::new(), None),
+            Ok(second_id)
+        );
+    }
+
+    /// Test if a mined V6 transaction's Ironwood nullifiers remove mempool transactions that
+    /// duplicate the same spend, and clear the removed transaction's Ironwood conflict cache entry.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[test]
+    fn same_effects_removal_clears_ironwood_spend_conflicts(
+        first in transaction_v6_strategy().prop_map(DisplayToDebug),
+        second in transaction_v6_strategy().prop_map(DisplayToDebug),
+        conflict in any::<IronwoodSpendConflict>(),
+    ) {
+        let mut storage: Storage = Storage::new(&Config {
+            tx_cost_limit: 160_000_000,
+            eviction_memory_time: EVICTION_MEMORY_TIME,
+            ..Default::default()
+        });
+
+        let (first_transaction, second_transaction) =
+            verified_v6_transactions_with_ironwood_conflict(first, second, conflict);
+
+        let first_id = first_transaction.transaction.id;
+        let second_id = second_transaction.transaction.id;
+
+        prop_assert_eq!(
+            storage.insert(first_transaction, Vec::new(), None),
+            Ok(first_id)
+        );
+
+        let mined_ids_to_remove = HashSet::<transaction::Hash>::new();
+        let removed = storage.reject_and_remove_same_effects(
+            &mined_ids_to_remove,
+            vec![second_transaction.transaction.transaction.clone()],
+        );
+
+        prop_assert!(removed.mined.is_empty());
+        prop_assert_eq!(removed.invalidated, HashSet::from([first_id]));
+        prop_assert!(!storage.contains_transaction_exact(&first_id.mined_id()));
+
+        prop_assert_eq!(
+            storage.insert(second_transaction, Vec::new(), None),
+            Ok(second_id)
+        );
+    }
+
     /// Test if multiple transactions are properly removed.
     ///
     /// Attempting to remove multiple transactions must remove all of them and leave all of the
@@ -453,6 +532,18 @@ enum SpendConflictTestInput {
 
         conflict: SpendConflictForTransactionV5,
     },
+
+    /// Test V6 transactions to include Ironwood nullifier conflicts.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    V6 {
+        #[proptest(strategy = "transaction_v6_strategy().prop_map(DisplayToDebug)")]
+        first: DisplayToDebug<Transaction>,
+
+        #[proptest(strategy = "transaction_v6_strategy().prop_map(DisplayToDebug)")]
+        second: DisplayToDebug<Transaction>,
+
+        conflict: SpendConflictForTransactionV6,
+    },
 }
 
 impl SpendConflictTestInput {
@@ -470,6 +561,17 @@ impl SpendConflictTestInput {
                 (first, second)
             }
             SpendConflictTestInput::V5 {
+                mut first,
+                mut second,
+                conflict,
+            } => {
+                conflict.clone().apply_to(&mut first);
+                conflict.apply_to(&mut second);
+
+                (first, second)
+            }
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            SpendConflictTestInput::V6 {
                 mut first,
                 mut second,
                 conflict,
@@ -511,12 +613,15 @@ impl SpendConflictTestInput {
         let (mut first, mut second) = match self {
             SpendConflictTestInput::V4 { first, second, .. } => (first, second),
             SpendConflictTestInput::V5 { first, second, .. } => (first, second),
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            SpendConflictTestInput::V6 { first, second, .. } => (first, second),
         };
 
         Self::remove_transparent_conflicts(&mut first, &mut second);
         Self::remove_sprout_conflicts(&mut first, &mut second);
         Self::remove_sapling_conflicts(&mut first, &mut second);
         Self::remove_orchard_conflicts(&mut first, &mut second);
+        Self::remove_ironwood_conflicts(&mut first, &mut second);
 
         standardize_transaction(&mut first.0);
         standardize_transaction(&mut second.0);
@@ -779,6 +884,64 @@ impl SpendConflictTestInput {
             }
         }
     }
+
+    /// Find identical Ironwood nullifiers revealed by both transactions, then remove the actions
+    /// that contain them from both transactions.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn remove_ironwood_conflicts(first: &mut Transaction, second: &mut Transaction) {
+        let first_nullifiers: HashSet<_> = first.ironwood_nullifiers().copied().collect();
+        let second_nullifiers: HashSet<_> = second.ironwood_nullifiers().copied().collect();
+
+        let conflicts: HashSet<_> = first_nullifiers
+            .intersection(&second_nullifiers)
+            .copied()
+            .collect();
+
+        for transaction in [first, second] {
+            match transaction {
+                Transaction::V6 {
+                    ironwood_shielded_data,
+                    ..
+                } => {
+                    Self::remove_ironwood_actions_with_conflicts(ironwood_shielded_data, &conflicts)
+                }
+
+                // No Ironwood spends.
+                Transaction::V1 { .. }
+                | Transaction::V2 { .. }
+                | Transaction::V3 { .. }
+                | Transaction::V4 { .. }
+                | Transaction::V5 { .. } => {}
+            }
+        }
+    }
+
+    #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+    fn remove_ironwood_conflicts(_first: &mut Transaction, _second: &mut Transaction) {}
+
+    /// Remove from a transaction's Ironwood shielded data the actions that contain nullifiers
+    /// present in the `conflicts` set.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn remove_ironwood_actions_with_conflicts(
+        maybe_shielded_data: &mut Option<ironwood::ShieldedData>,
+        conflicts: &HashSet<ironwood::Nullifier>,
+    ) {
+        if let Some(shielded_data) = maybe_shielded_data.take() {
+            let updated_actions: Vec<_> = shielded_data
+                .actions
+                .to_vec()
+                .into_iter()
+                .filter(|action| !conflicts.contains(&action.action.nullifier))
+                .collect();
+
+            if let Ok(actions) = AtLeastOne::try_from(updated_actions) {
+                *maybe_shielded_data = Some(ironwood::ShieldedData {
+                    actions,
+                    ..shielded_data
+                });
+            }
+        }
+    }
 }
 
 /// A spend conflict valid for V4 transactions.
@@ -795,6 +958,16 @@ enum SpendConflictForTransactionV5 {
     Transparent(Box<TransparentSpendConflict>),
     Sapling(Box<SaplingSpendConflict<sapling::SharedAnchor>>),
     Orchard(Box<OrchardSpendConflict>),
+}
+
+/// A spend conflict valid for V6 transactions.
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[derive(Arbitrary, Clone, Debug)]
+enum SpendConflictForTransactionV6 {
+    Transparent(Box<TransparentSpendConflict>),
+    Sapling(Box<SaplingSpendConflict<sapling::SharedAnchor>>),
+    Orchard(Box<OrchardSpendConflict>),
+    Ironwood(Box<IronwoodSpendConflict>),
 }
 
 /// A conflict caused by spending the same UTXO.
@@ -821,6 +994,13 @@ struct SaplingSpendConflict<A: sapling::AnchorVariant + Clone> {
 #[derive(Arbitrary, Clone, Debug)]
 struct OrchardSpendConflict {
     new_shielded_data: DisplayToDebug<orchard::ShieldedData>,
+}
+
+/// A conflict caused by revealing the same Ironwood nullifier.
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[derive(Arbitrary, Clone, Debug)]
+struct IronwoodSpendConflict {
+    new_shielded_data: DisplayToDebug<ironwood::ShieldedData>,
 }
 
 impl SpendConflictForTransactionV4 {
@@ -867,6 +1047,39 @@ impl SpendConflictForTransactionV5 {
             Transparent(transparent_conflict) => transparent_conflict.apply_to(inputs),
             Sapling(sapling_conflict) => sapling_conflict.apply_to(sapling_shielded_data),
             Orchard(orchard_conflict) => orchard_conflict.apply_to(orchard_shielded_data),
+        }
+    }
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+impl SpendConflictForTransactionV6 {
+    /// Apply a spend conflict to a V6 transaction.
+    ///
+    /// Changes the `transaction_v6` to include the spend that will result in a conflict.
+    pub fn apply_to(self, transaction_v6: &mut Transaction) {
+        let (inputs, sapling_shielded_data, orchard_shielded_data, ironwood_shielded_data) =
+            match transaction_v6 {
+                Transaction::V6 {
+                    inputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                ),
+                _ => unreachable!("incorrect transaction version generated for test"),
+            };
+
+        use SpendConflictForTransactionV6::*;
+        match self {
+            Transparent(transparent_conflict) => transparent_conflict.apply_to(inputs),
+            Sapling(sapling_conflict) => sapling_conflict.apply_to(sapling_shielded_data),
+            Orchard(orchard_conflict) => orchard_conflict.apply_to(orchard_shielded_data),
+            Ironwood(ironwood_conflict) => ironwood_conflict.apply_to(ironwood_shielded_data),
         }
     }
 }
@@ -984,6 +1197,106 @@ impl OrchardSpendConflict {
             *orchard_shielded_data = Some(self.new_shielded_data.0);
         }
     }
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+impl IronwoodSpendConflict {
+    /// Apply an Ironwood spend conflict.
+    ///
+    /// Ensures that a transaction's `ironwood_shielded_data` has a nullifier used to represent a
+    /// conflict. If the transaction already has Ironwood shielded data, the first action's nullifier
+    /// is replaced. Otherwise, fallback Ironwood shielded data is inserted.
+    ///
+    /// The transaction will then conflict with any other transaction with the same new nullifier.
+    pub fn apply_to(self, ironwood_shielded_data: &mut Option<ironwood::ShieldedData>) {
+        if let Some(shielded_data) = ironwood_shielded_data.as_mut() {
+            shielded_data
+                .actions
+                .iter_mut()
+                .next()
+                .unwrap()
+                .action
+                .nullifier = self.new_shielded_data.actions.first().action.nullifier;
+        } else {
+            *ironwood_shielded_data = Some(self.new_shielded_data.0);
+        }
+    }
+}
+
+/// Generate a V6 transaction for mempool storage tests.
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn transaction_v6_strategy() -> BoxedStrategy<Transaction> {
+    (
+        Transaction::v5_strategy(LedgerState::default()),
+        prop_oneof![Just(None), any::<ironwood::ShieldedData>().prop_map(Some),],
+    )
+        .prop_map(|(transaction, ironwood_shielded_data)| match transaction {
+            Transaction::V5 {
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ironwood_shielded_data,
+            },
+
+            _ => unreachable!("v5 strategy always generates V5 transactions"),
+        })
+        .boxed()
+}
+
+/// Create two verified V6 transactions that only conflict on an Ironwood nullifier.
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn verified_v6_transactions_with_ironwood_conflict(
+    mut first: DisplayToDebug<Transaction>,
+    mut second: DisplayToDebug<Transaction>,
+    conflict: IronwoodSpendConflict,
+) -> (VerifiedUnminedTx, VerifiedUnminedTx) {
+    SpendConflictTestInput::remove_transparent_conflicts(&mut first, &mut second);
+    SpendConflictTestInput::remove_sprout_conflicts(&mut first, &mut second);
+    SpendConflictTestInput::remove_sapling_conflicts(&mut first, &mut second);
+    SpendConflictTestInput::remove_orchard_conflicts(&mut first, &mut second);
+    SpendConflictTestInput::remove_ironwood_conflicts(&mut first, &mut second);
+
+    SpendConflictForTransactionV6::Ironwood(Box::new(conflict.clone())).apply_to(&mut first);
+    SpendConflictForTransactionV6::Ironwood(Box::new(conflict)).apply_to(&mut second);
+
+    *first.0.expiry_height_mut() = block::Height(1);
+    *second.0.expiry_height_mut() = block::Height(2);
+
+    standardize_transaction(&mut first.0);
+    standardize_transaction(&mut second.0);
+
+    (
+        VerifiedUnminedTx::new(
+            first.0.into(),
+            // make sure miner fee is big enough for all cases
+            Amount::try_from(1_000_000).expect("valid amount"),
+            0,
+            0,
+            std::sync::Arc::new(vec![]),
+        )
+        .expect("verification should pass"),
+        VerifiedUnminedTx::new(
+            second.0.into(),
+            // make sure miner fee is big enough for all cases
+            Amount::try_from(1_000_000).expect("valid amount"),
+            0,
+            0,
+            std::sync::Arc::new(vec![]),
+        )
+        .expect("verification should pass"),
+    )
 }
 
 /// A series of transactions and a sub-set of them to remove.

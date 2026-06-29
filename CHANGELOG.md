@@ -145,6 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Track Ironwood nullifiers in the mempool conflict cache so V6 transactions
+  with duplicate Ironwood spends are rejected or removed consistently.
 - Treat missing transaction inventory responses during mempool download as a
   recoverable download failure, avoiding a panic when public peers no longer
   have a gossiped transaction available.
