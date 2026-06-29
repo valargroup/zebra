@@ -802,8 +802,16 @@ impl DownloadWindow {
         match self.cwnd_unit {
             CwndUnit::Blocks => cwnd_slots.saturating_sub(self.outstanding.len()),
             CwndUnit::Bytes => {
-                // Scale the request-denominated cwnd into a byte budget, then subtract
-                // the bytes already reserved for in-flight requests.
+                // The peer's advertised request-count cap still binds in byte mode: a peer
+                // serving tiny bodies must never be issued more in-flight *requests* than it
+                // advertised it will service, however much byte headroom the cwnd still
+                // shows. Once the request count reaches the hard cap there is no slot,
+                // regardless of bytes — mirroring the blocks-unit ceiling.
+                if self.outstanding.len() >= self.hard_outbound_capacity() {
+                    return 0;
+                }
+                // Otherwise scale the request-denominated cwnd into a byte budget and
+                // subtract the bytes already reserved for in-flight requests.
                 let cwnd_bytes = (cwnd_slots as u64).saturating_mul(self.nominal_request_bytes);
                 let remaining = cwnd_bytes.saturating_sub(self.outstanding_reserved_bytes());
                 usize::try_from(remaining).unwrap_or(usize::MAX)
@@ -1482,6 +1490,36 @@ mod bbr_tests {
         let mut big = DownloadWindow::new(&cfg);
         push_outstanding_bytes(&mut big, 2, 4000);
         assert_eq!(big.available_slots(), 0);
+    }
+
+    #[test]
+    fn cwnd_unit_bytes_enforces_the_request_count_hard_cap() {
+        // A peer advertising a small inflight cap but serving tiny bodies must not be
+        // issued more *requests* than it will service, however much byte headroom the
+        // cwnd's byte budget still shows — the advertised request-count cap binds first.
+        let cfg = ZakuraBlockSyncConfig {
+            bbr_cwnd_unit: CwndUnit::Bytes,
+            initial_inflight_requests: 4,
+            max_inflight_requests: 4,    // advertised hard cap = 4 requests
+            max_response_bytes: 100_000, // large per-request byte weight
+            ..bbr_test_config()
+        };
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(window.hard_outbound_capacity(), 4);
+        // cwnd 4 × 100_000 B = 400_000 B of byte headroom — room for many tiny bodies.
+        assert!(window.available_slots() > 0);
+
+        // Four tiny (10 B) requests reach the request-count hard cap. The byte budget is
+        // nowhere near exhausted (40 B of 400_000 B), but the advertised cap must bind:
+        // no further request may be issued.
+        push_outstanding_bytes(&mut window, 4, 10);
+        assert_eq!(
+            window.available_slots(),
+            0,
+            "the advertised request-count cap must bind even with byte headroom left",
+        );
+        // The floor bypass must not breach the advertised cap either.
+        assert_eq!(window.available_slots_with_bonus(2), 0);
     }
 
     #[test]
