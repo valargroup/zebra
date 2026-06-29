@@ -370,11 +370,13 @@ run_one() {
   local fork="$BENCH_HOME/forks/$run_id"
   local logf="/dev/shm/zebra-bench-$run_id.log"
   local csv="$OUT_DIR/samples-$prefix.csv"
+  local trace_dir="$OUT_DIR/zakura-traces-$prefix"
   local cfg="$fork.config.toml"
 
   log "fork: cp -al master -> $fork"
   rm -rf "$fork"; cp -al "$MASTER" "$fork"; CUR_FORK="$fork"
   find "$fork" -name LOCK -delete 2>/dev/null || true
+  rm -rf "$trace_dir"; mkdir -p "$trace_dir"
 
   # $1 = write the P2P toggles (present only on v5.0.0+ "Zakura" releases)
   write_config() {
@@ -401,6 +403,7 @@ run_one() {
       echo ''
       if [[ "$1" == "with_p2p_toggles" && "$should_use_v2_p2p" == "1" ]]; then
         echo '[network.zakura]'
+        echo "trace_dir = \"$trace_dir\""
         echo 'bootstrap_peers = ['
         local peer
         for peer in "${ZAKURA_BOOTSTRAP_PEERS[@]}"; do
