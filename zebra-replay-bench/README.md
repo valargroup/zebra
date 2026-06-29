@@ -83,6 +83,20 @@ It uses the real `SequencerTask` via a feature-gated helper
 future knob). Same checkpoint-batching boundary as `apply-verifier`: feed to the
 last checkpoint, commit/gate to the second-to-last.
 
+Two optional flags:
+
+- Storage mode is **Pruned by default** (the `--base` snapshot must already be pruned;
+  pruning is one-way), matching the production mainnet config. Pass `--archive` to commit
+  in Archive mode instead (full raw-tx + indexes, ~2× the bytes written; needs an archive
+  base).
+- `--trace-dir <dir>` writes the **structured Zakura JSONL trace tables** (the
+  `block_sync` body lifecycle: `block_body_accepted` / `block_body_submitted` with
+  queue-elapsed and apply tokens) — the same tables `perf-run-mainnet` emits via
+  `[network.zakura] trace_dir`, through the real `ZakuraTrace`/`JsonlTracer`. The
+  writer is flushed at end-of-run. Without it the tracer is `noop()` (zero overhead).
+  Via the harness: `REPLAY_TRACE_DIR=<dir> make perf-replay-sequencer` (add
+  `REPLAY_ARCHIVE=1` for archive mode).
+
 ## Two altitudes: `apply` vs `apply-worker`
 
 `apply` calls the committer (`commit_finalized_direct`) directly in a tight loop.

@@ -149,7 +149,21 @@ cmd_run_sequencer() {
   local fork="$FORK_DIR/replay-sequencer-$label"
   note "fork base $BASE_SRC -> $fork; apply-sequencer $CACHE (VCT; expects base tip $((START - 1)))"
   clone_fork "$BASE_SRC" "$fork"
-  "$bin" apply-sequencer --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
+  local args=(apply-sequencer --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR")
+  # Storage mode: Pruned by default (BASE_SRC must already be a pruned snapshot; pruning
+  # is one-way). REPLAY_ARCHIVE=1 opts back into Archive (needs an archive base).
+  if [ -n "${REPLAY_ARCHIVE:-}" ]; then
+    note "storage mode: archive"
+    args+=(--archive)
+  else
+    note "storage mode: pruned (default)"
+  fi
+  # Structured Zakura JSONL traces, like perf-run-mainnet's [network.zakura] trace_dir.
+  if [ -n "${REPLAY_TRACE_DIR:-}" ]; then
+    note "Zakura JSONL traces -> $REPLAY_TRACE_DIR"
+    args+=(--trace-dir "$REPLAY_TRACE_DIR")
+  fi
+  "$bin" "${args[@]}"
   note "cleanup: rm -rf $fork"
   rm -rf "$fork"
 }

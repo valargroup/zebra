@@ -30,7 +30,7 @@ use zebra_chain::{
 };
 use zebra_consensus::CheckpointVerifier;
 use zebra_network::zakura::{spawn_bench_sequencer, BenchSubmit};
-use zebra_state::FinalizedState;
+use zebra_state::{FinalizedState, PruningConfig, StorageMode};
 
 use crate::{
     cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
@@ -43,6 +43,12 @@ const STATE_BUFFER_BOUND: usize = 1024;
 /// Concurrency limit passed to `zebra_state::init` (same as `apply_verifier`).
 const STATE_CHECKPOINT_CONCURRENCY: usize = 1000;
 
+/// Byte budget for the sequencer's in-flight bodies (reorder + applying). Bounds
+/// memory: the sequencer backpressures the feed once this many body bytes are
+/// buffered, so the `applying` set can't grow with the whole window. 4 GiB is plenty
+/// of pipeline depth (>> one checkpoint range) while staying well within RAM.
+const SEQUENCER_MAX_INFLIGHT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Replays the cache through the real block-sync `Sequencer` (which submits to the
 /// checkpoint verifier → state) onto the writable base fork at `base`. VCT only.
 pub fn run(
@@ -50,6 +56,8 @@ pub fn run(
     cache_path: &Path,
     vct_sidecar: Option<&Path>,
     network: Network,
+    archive: bool,
+    trace_dir: Option<&Path>,
 ) -> Result<Stats> {
     let reader = CacheReader::open(cache_path)?;
     let header = reader.header();
@@ -87,7 +95,22 @@ pub fn run(
         s
     };
 
-    let config = state_config(base.to_path_buf(), /* force_legacy */ false);
+    // VCT (force_legacy = false). Storage mode: Pruned by default (the base must
+    // already be a pruned snapshot — pruning is one-way), matching the production
+    // mainnet config; `--archive` opts back into full raw-tx + indexes.
+    let mut config = state_config(base.to_path_buf(), /* force_legacy */ false);
+    if !archive {
+        config.storage_mode = StorageMode::Pruned(PruningConfig::default());
+    }
+    let storage_label = if archive { "archive" } else { "pruned" };
+
+    // Optional structured Zakura JSONL traces (same tables `perf-run-mainnet` writes
+    // via `[network.zakura] trace_dir`). Created up front so a stale dir surfaces early.
+    let trace_dir = trace_dir.map(|p| p.to_path_buf());
+    if let Some(dir) = trace_dir.as_deref() {
+        std::fs::create_dir_all(dir).map_err(|e| eyre!("creating trace dir {dir:?}: {e}"))?;
+        tracing::info!(trace_dir = ?dir, "Zakura JSONL tracing enabled for the sequencer");
+    }
 
     // Open the fork directly first: assert the tip, capture the parent hash (the
     // sequencer/verifier initial tip), inject the per-height VCT roots. Drop before
@@ -181,11 +204,13 @@ pub fn run(
         );
 
         // Spawn the real block-sync Sequencer starting from the base tip.
-        let (feeder, mut submissions, committer) = spawn_bench_sequencer(
+        let (feeder, mut submissions, mut committer) = spawn_bench_sequencer(
             Height(expected_parent),
             Height(expected_parent),
             parent_hash,
             in_flight,
+            SEQUENCER_MAX_INFLIGHT_BYTES,
+            trace_dir.clone(),
         )
         .into_parts();
 
@@ -228,6 +253,13 @@ pub fn run(
         let wall_start = Instant::now();
         let mut last = wall_start;
 
+        // Cadence for the `block_sync_state` trace snapshots (only when tracing is on).
+        // Dense enough for a smooth throughput/applying curve; the plotter downsamples.
+        let tracing_on = trace_dir.is_some();
+        if tracing_on {
+            committer.emit_state_snapshot();
+        }
+
         // Drive: pull ordered submissions and verify+commit them concurrently; report
         // each commit back so the sequencer frontier advances. The sequencer's submit
         // limit bounds the in-flight set.
@@ -248,6 +280,9 @@ pub fn run(
                     let now = Instant::now();
                     stats.record(len as usize, now - last);
                     last = now;
+                    if tracing_on && (done.is_multiple_of(20) || done == target) {
+                        committer.emit_state_snapshot();
+                    }
                     if done.is_multiple_of(5000) || done == target {
                         let p = committer.progress();
                         tracing::info!(
@@ -298,12 +333,18 @@ pub fn run(
             }
         }
 
+        // Drain + flush the JSONL trace writer so the tables are complete on disk.
+        committer.flush_trace().await;
+
         tracing::info!(
             committed = done,
             last_checkpoint = last_checkpoint.0,
             "replay verified (sequencer, vct): committed through the second-to-last checkpoint; hash matches"
         );
-        println!("mode=sequencer (vct)");
+        println!("mode=sequencer (vct, {storage_label})");
+        if let Some(dir) = trace_dir.as_deref() {
+            println!("zakura-traces={}", dir.display());
+        }
         println!("{}", stats.report(wall));
         Ok::<Stats, color_eyre::Report>(stats)
     })?;

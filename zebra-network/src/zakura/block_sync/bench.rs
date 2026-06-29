@@ -18,6 +18,7 @@
 //! feature-gated (`internal-bench`) and is not part of the production API.
 
 use std::{
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -25,16 +26,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::Value;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
 use zebra_chain::block::{self, Block};
+use zebra_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
 
-use crate::zakura::{transport::ByteBudget, ZakuraPeerId, ZakuraTrace};
+use crate::zakura::{
+    trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
+    transport::ByteBudget,
+    ZakuraPeerId, ZakuraTrace,
+};
 
 use super::{
     events::{BlockApplyResult, BlockApplyToken, BlockSyncAction},
+    reactor::{bs_insert_height, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
@@ -97,19 +105,36 @@ pub struct BenchSubmissions {
 pub struct BenchCommitter {
     control: mpsc::UnboundedSender<SequencerControlInput>,
     view: watch::Receiver<SequencerView>,
+    // A clone of the sequencer's trace emitter, so the bench driver can write the
+    // periodic `block_sync_state` snapshot rows the full reactor emits in production
+    // (the rows the zakura-trace-plots skill consumes).
+    trace: ZakuraTrace,
     finalized_height: block::Height,
+    // The JSONL trace writer guard (when `trace_dir` was supplied). Flushed via
+    // [`BenchCommitter::flush_trace`] so the trace tables are complete for review.
+    trace_guard: Option<JsonlTraceGuard>,
     // Keeps the sequencer task alive for the lifetime of the committer.
     _join: JoinHandle<()>,
 }
 
-/// Spawns the real `SequencerTask` with an unbounded byte budget (the caller bounds
-/// in-flight work via `submit_in_flight_limit` and its own feed loop), starting from
-/// `verified_block_tip` (typically `start - 1`). No peers, no reactor.
+/// Spawns the real `SequencerTask` starting from `verified_block_tip` (typically
+/// `start - 1`), with no peers and no reactor.
+///
+/// `submit_in_flight_limit` caps blocks submitted-but-not-applied; `max_inflight_bytes`
+/// caps total in-flight body bytes (reorder + applying), which backpressures the feed
+/// so the `applying` buffer can't grow unbounded — keep it finite for large windows.
+///
+/// When `trace_dir` is `Some`, the sequencer's structured Zakura JSONL trace tables
+/// (the `BLOCK_SYNC_STATE` body lifecycle, etc.) are written there — the same tables
+/// `perf-run-mainnet` produces via `[network.zakura] trace_dir`. The writer is flushed
+/// by [`BenchCommitter::flush_trace`]. `None` runs with a no-op tracer (zero overhead).
 pub fn spawn_bench_sequencer(
     finalized_height: block::Height,
     verified_block_tip: block::Height,
     verified_block_hash: block::Hash,
     submit_in_flight_limit: usize,
+    max_inflight_bytes: u64,
+    trace_dir: Option<PathBuf>,
 ) -> BenchSequencerHandle {
     let frontiers = BlockSyncFrontiers {
         finalized_height,
@@ -118,9 +143,20 @@ pub fn spawn_bench_sequencer(
     };
     let limit = submit_in_flight_limit.max(1);
 
+    // Real JSONL trace (same path as production) when a directory is supplied; the
+    // guard is handed to the committer so the bench can flush+drain it at the end.
+    let (trace, trace_guard) = match trace_dir {
+        Some(dir) => {
+            let guard = JsonlTracer::spawn_guard(dir);
+            let trace = ZakuraTrace::new(guard.tracer(), "01");
+            (trace, Some(guard))
+        }
+        None => (ZakuraTrace::noop(), None),
+    };
+
     let sequencer = Sequencer::new(verified_block_tip, limit);
     let throughput = ThroughputMeter::new(Instant::now());
-    let budget = ByteBudget::new(u64::MAX);
+    let budget = ByteBudget::new(max_inflight_bytes.max(1));
     let work = Arc::new(WorkQueue::new(verified_block_tip));
 
     let (actions_tx, actions_rx) = mpsc::channel(limit + 128);
@@ -141,7 +177,7 @@ pub fn spawn_bench_sequencer(
         body_input_bytes.clone(),
         view_tx,
         BENCH_ACTION_SEND_TIMEOUT,
-        ZakuraTrace::noop(),
+        trace.clone(),
     );
     let join = tokio::spawn(task.run());
 
@@ -157,7 +193,9 @@ pub fn spawn_bench_sequencer(
         committer: BenchCommitter {
             control: control_tx,
             view: view_rx,
+            trace,
             finalized_height,
+            trace_guard,
             _join: join,
         },
     }
@@ -235,6 +273,46 @@ impl BenchCommitter {
             result: BlockApplyResult::Committed,
             local_frontier: Some(local_frontier),
         });
+    }
+
+    /// Emit one `block_sync_state` snapshot row into `block_sync.jsonl`, mirroring the
+    /// periodic row the full block-sync reactor writes in production (the row the
+    /// zakura-trace-plots skill reads: `verified_block_tip`, `applying`, `reorder`,
+    /// `submitted_applies`, and the in-flight byte counters). Cheap and non-blocking;
+    /// a no-op when tracing is disabled. Call it on a cadence from the bench driver.
+    pub fn emit_state_snapshot(&self) {
+        let view = *self.view.borrow();
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                Value::String(bs_trace::BLOCK_SYNC_STATE.to_string()),
+            );
+            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
+            bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
+            bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
+            bs_insert_u64(
+                row,
+                bs_trace::SUBMITTED_APPLIES,
+                view.submitted_applying_count,
+            );
+            bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
+            bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
+            bs_insert_u64(
+                row,
+                "retained_pipeline_wire_bytes",
+                view.applying_buffered_bytes
+                    .saturating_add(view.reorder_buffered_bytes),
+            );
+        });
+    }
+
+    /// Flush and drain the JSONL trace writer (if tracing was enabled), so the trace
+    /// tables on disk are complete before the bench process exits. A no-op when no
+    /// `trace_dir` was supplied. Call after the drive loop finishes.
+    pub async fn flush_trace(&mut self) {
+        if let Some(guard) = self.trace_guard.take() {
+            guard.shutdown().await;
+        }
     }
 
     /// Latest progress snapshot from the sequencer view.

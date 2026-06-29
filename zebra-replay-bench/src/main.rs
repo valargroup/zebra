@@ -132,6 +132,14 @@ enum Cmd {
         /// VCT roots sidecar produced by `index-roots` (required).
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
+        /// Commit in Archive storage mode (full raw-tx + indexes). The default is
+        /// Pruned (the base must already be a pruned snapshot; pruning is one-way).
+        #[arg(long)]
+        archive: bool,
+        /// Write structured Zakura JSONL trace tables to this directory (the same
+        /// tables `perf-run-mainnet` produces via `[network.zakura] trace_dir`).
+        #[arg(long)]
+        trace_dir: Option<PathBuf>,
     },
     /// Replay a cache through the real `zebra-consensus` checkpoint verifier, which
     /// commits to a real `StateService` (tip must be `start-1`). One altitude above
@@ -243,11 +251,20 @@ fn main() -> Result<()> {
             base,
             cache,
             vct_sidecar,
+            archive,
+            trace_dir,
         } => {
             #[cfg(feature = "commit-metrics")]
             let handle = install_metrics();
 
-            apply_sequencer::run(&base, &cache, vct_sidecar.as_deref(), network)?;
+            apply_sequencer::run(
+                &base,
+                &cache,
+                vct_sidecar.as_deref(),
+                network,
+                archive,
+                trace_dir.as_deref(),
+            )?;
 
             #[cfg(feature = "commit-metrics")]
             render_metrics(handle);

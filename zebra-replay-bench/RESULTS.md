@@ -177,6 +177,98 @@ knob) is what actually exercises the ReorderBuffer and the sequencer's backpress
 this POC establishes the in-order baseline and that the real `SequencerTask` drives
 cleanly offline.
 
+## 100K, pruned storage, with per-phase decomposition
+
+Re-indexed to a **100,000-block** window (heights 1,802,001–1,902,000, ~72.7 GiB of
+bodies) and run through `apply-sequencer` in **Pruned** storage mode (the default; base =
+`zebra-ckpt-1800000-warm-pruned`). Committed 99,465 blocks to checkpoint 1,901,465
+(hash gated). A finite 4 GiB in-flight byte budget (`SEQUENCER_MAX_INFLIGHT_BYTES`)
+backpressures the feed so `applying` stays bounded (peak RSS 3.79 GiB, vs the unbounded
+Archive run that filled RAM).
+
+| run | committed | throughput | p50 | p90 | p99 | max | peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sequencer, VCT, **pruned**, 100K | 99,465 | **103.2 blk/s** (77.2 MiB/s) | 2.59 ms | 15.26 ms | 218 ms | 824 ms | 3.79 GiB |
+
+**Throughput degrades with DB size, not work per block.** 133 blk/s (verifier, 30K) →
+123.5 (sequencer, 30K) → 103.2 (sequencer, 100K). Same per-block work; the drop is
+RocksDB compaction/L0 pressure as the store grows. That is the disk-writer-bound
+signature, and the decomposition confirms it.
+
+### Per-phase commit decomposition (`--features commit-metrics`)
+
+Means are `sum/count` of the `zebra_state.*` histograms over the 100K run:
+
+| phase | calls | mean | p50 | p99 | where |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `write.update_trees` | **0** | — | — | — | committer (timed) |
+| `write.commitment_check` | 0 | — | — | — | committer (timed) |
+| `rocksdb.batch_commit` | 99,467 | **1.74 ms** | 0.17 ms | 0.25 ms | committer (timed) |
+| `prepare.txid_auth_digest` | 199,732 | 1.31 ms | 0.02 ms | 0.21 ms | off-thread (prefetch) |
+| `prepare.new_ordered_outputs` | 199,732 | 0.02 ms | — | 0.19 ms | off-thread (prefetch) |
+| block size: `tx_count` / `output_count` / v5 | — | 4.14 / 22.95 / 0.96 | 2 / 6 / 0 | 12 / 541 / 2 | per block |
+
+Findings:
+
+- **VCT eliminates the note-tree recompute.** `write.update_trees` (the single-threaded
+  Pedersen/Sinsemilla recompute that bottlenecks legacy at ~50 blk/s) records **zero
+  calls** — the VCT fast path folds supplied roots instead. `commitment_check` is also
+  not on the per-block timed path. So the **only** timed committer phase that fires is
+  the RocksDB write.
+- **The committer is disk-writer bound.** `rocksdb.batch_commit` mean (1.74 ms) is far
+  above its p50/p99 (0.17/0.25 ms): the distribution is a fast common case with rare
+  multi-hundred-ms stalls (max commit 824 ms) — periodic L0 flush / compaction. The lever
+  is RocksDB write/compaction tuning (or pruning, which already roughly halves the bytes
+  written), not CPU.
+- **`prepare_*` runs ~2× per block (199,732 vs ~99,866).** In the sequencer/verifier path
+  the prefetch builds a `CheckpointVerifiedBlock` that is **discarded** (we feed the raw
+  `Arc<Block>`; the real state-commit re-runs `prepare_block_data`). It is off the timed
+  commit thread, so it does not change the committer number, but it is wasted producer CPU
+  that contends for cores — a cleanup opportunity for the sequencer rung specifically.
+- **Block size:** ~0.75 MiB/block, mean 4.1 tx / 23 outputs, with a heavy output tail
+  (p99 541 outputs) — the source of the commit-latency tail.
+
+### Structured Zakura traces (`--trace-dir`)
+
+`apply-sequencer --trace-dir <dir>` writes the **same structured JSONL trace tables** that
+`perf-run-mainnet` produces via `[network.zakura] trace_dir` — built through the real
+`ZakuraTrace`/`JsonlTracer` (production path), not a bench stub. The sequencer emits the
+`block_sync` table: one `block_body_accepted` row (with `sequencer_queue_elapsed_us`) and
+one `block_body_submitted` row (with `apply_token`) per body, e.g.:
+
+```json
+{"event":"block_body_accepted","height":1802001,"node":"01","result":"buffered","sequencer_queue_elapsed_us":28,"ts":994}
+{"apply_token":1,"event":"block_body_submitted","height":1802001,"node":"01","ts":1040}
+```
+
+The writer is flushed/drained at end-of-run (`BenchCommitter::flush_trace`) so the tables
+are complete for review. Enabled per-run via `REPLAY_TRACE_DIR=<dir> make perf-replay-sequencer`
+(and `REPLAY_ARCHIVE=1` for archive mode). With no `--trace-dir` the tracer is `noop()`
+(zero overhead), so the throughput numbers above are trace-free.
+
+### Throughput vs block size over height
+
+Joining the per-segment commit rate (from the `block_sync_state` trace / progress log)
+with mean block size per height bucket (read straight from the block cache's per-record
+lengths) shows throughput is governed by block content, in two regimes:
+
+| height region | mean block size | throughput | implied | bound by |
+| --- | ---: | ---: | ---: | --- |
+| 1.84M–1.88M (heavy) | ~1.0 MiB | ~60–80 blk/s | ~70 MiB/s | per-byte write |
+| 1.825M, 1.89M (tiny) | ~20–30 KiB | ~240–480 blk/s | ~7 MiB/s | per-block overhead |
+
+So the committer hits **two different ceilings**: heavy blocks saturate the RocksDB
+write at ~70 MiB/s, while tiny blocks can't exceed ~480 blk/s no matter how small (fixed
+per-commit cost — batch assembly, channel hops, the per-block RocksDB write). The heavy
+1.84M–1.88M region is what drags the 100K average to ~103–108 blk/s. The skill's height
+plot makes this visible; `reorder` stays 0 and there are no HoL stalls (in-order feed),
+and `applying` is held near the 4 GiB budget (peak 4,648 blocks / 2.15 GiB).
+
+> Caveat: the segment-rate vs height join is coarse (5,000-block buckets) and the
+> `verified_tip`-based rate lags the true commit by the in-flight window, so treat the
+> regime boundary as approximate. Per-block alignment (trace `ts` joined to per-block
+> cache size) would sharpen it.
+
 ## Open / next
 
 - **Out-of-order / multi-peer feed for `apply-sequencer`:** the POC feeds in height
