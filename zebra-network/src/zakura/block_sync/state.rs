@@ -32,17 +32,6 @@ const OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF: usize = 8;
 const OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF: usize = OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF;
 /// Consecutive timeout batches that make up one window-reduction epoch.
 const OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS: usize = OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
-/// Timeouts tolerated after the adaptive window has already reached its floor of
-/// one in-flight request, before the peer is disconnected.
-///
-/// Set to two full reduction epochs. Once a peer has been backed off all the way
-/// down to a single in-flight request, we keep probing it for
-/// `2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS` consecutive timeouts before
-/// giving up — at the default 8s request timeout that is ~256s of uninterrupted
-/// failure at the floor. Any successful response (even a single block) resets the
-/// streak, so only a peer that serves nothing across the whole window is dropped.
-const OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT: usize =
-    2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -354,16 +343,17 @@ pub(super) struct DownloadWindow {
     growth_base: usize,
     /// Window value when the current timeout streak began.
     reduction_base: usize,
-    /// Consecutive timeout batches observed while the window was already at the
-    /// minimum. Once this crosses the threshold, the caller should disconnect the
-    /// peer rather than retrying indefinitely at one request.
-    floor_timeouts: usize,
+    /// Deadline by which an active peer must send another accepted full block.
+    pub(super) block_liveness_deadline: Option<Instant>,
+    /// Last time this peer sent an accepted full block body.
+    pub(super) last_block_at: Option<Instant>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum TimeoutBackoffOutcome {
-    KeepPeer,
-    DisconnectPeer,
+pub(super) enum LivenessOutcome {
+    Ok,
+    Disarm,
+    Disconnect,
 }
 
 impl DownloadWindow {
@@ -386,7 +376,8 @@ impl DownloadWindow {
             consecutive_timeouts: 0,
             growth_base: initial_window,
             reduction_base: initial_window,
-            floor_timeouts: 0,
+            block_liveness_deadline: None,
+            last_block_at: None,
         }
     }
 
@@ -398,27 +389,21 @@ impl DownloadWindow {
             return adaptive_slots;
         }
 
+        if self.outbound_request_window == 1 {
+            return 0;
+        }
+
         self.timeout_recovery_slots
             .min(hard_capacity.saturating_sub(self.outstanding.len()))
     }
 
-    // reduce_outbound_window_after_timeout is the per-peer backoff path for block-sync
-    // downloads. It is called when a peer times out, and it shrinks that peer's adaptive
-    // outbound request window so Zebra asks that peer for fewer block ranges
-    // concurrently.
-    pub(super) fn reduce_outbound_window_after_timeout(&mut self) -> TimeoutBackoffOutcome {
-        // If this is the first timeout in a row, reset the reduction base to the current window.
+    pub(super) fn reduce_outbound_window_after_timeout(&mut self) {
         if self.consecutive_timeouts == 0 {
             self.reduction_base = self.outbound_request_window;
         }
 
-        // Increment the consecutive timeout streak.
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
 
-        // Check if the window is at the minimum.
-        let was_at_floor = self.outbound_request_window == 1;
-
-        // Calculate the epoch of the timeout streak.
         let epoch = self.consecutive_timeouts / OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
         if epoch > 0 {
             let cubic_reduction = epoch
@@ -438,18 +423,6 @@ impl DownloadWindow {
             .timeout_recovery_slots
             .saturating_add(1)
             .min(self.hard_outbound_capacity());
-
-        if was_at_floor {
-            self.floor_timeouts = self.floor_timeouts.saturating_add(1);
-        } else {
-            self.floor_timeouts = 0;
-        }
-
-        if self.floor_timeouts >= OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT {
-            TimeoutBackoffOutcome::DisconnectPeer
-        } else {
-            TimeoutBackoffOutcome::KeepPeer
-        }
     }
 
     /// Grow the adaptive window on a successful response using a streak-gated
@@ -462,7 +435,6 @@ impl DownloadWindow {
     pub(super) fn increase_outbound_window_after_success(&mut self) {
         self.consecutive_timeouts = 0;
         self.reduction_base = self.outbound_request_window;
-        self.floor_timeouts = 0;
         self.consecutive_successes = self.consecutive_successes.saturating_add(1);
         let max_window = self.hard_outbound_capacity();
         if self.outbound_request_window >= max_window {
@@ -488,6 +460,36 @@ impl DownloadWindow {
             .min(self.outbound_request_window);
         if self.outstanding.len() >= adaptive_limit && self.timeout_recovery_slots > 0 {
             self.timeout_recovery_slots = self.timeout_recovery_slots.saturating_sub(1);
+        }
+    }
+
+    pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+        if self.block_liveness_deadline.is_none() {
+            self.block_liveness_deadline = Some(now + timeout);
+        }
+    }
+
+    pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
+        self.last_block_at = Some(now);
+        self.block_liveness_deadline = if self.outstanding.is_empty() {
+            None
+        } else {
+            Some(now + timeout)
+        };
+    }
+
+    pub(super) fn disarm_liveness_if_idle(&mut self) {
+        if self.outstanding.is_empty() {
+            self.block_liveness_deadline = None;
+        }
+    }
+
+    pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
+        match self.block_liveness_deadline {
+            None => LivenessOutcome::Ok,
+            Some(deadline) if now < deadline => LivenessOutcome::Ok,
+            Some(_) if self.outstanding.is_empty() => LivenessOutcome::Disarm,
+            Some(_) => LivenessOutcome::Disconnect,
         }
     }
 
