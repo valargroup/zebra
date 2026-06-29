@@ -641,6 +641,11 @@ pub(super) struct DownloadWindow {
     pub(super) outstanding: Vec<OutstandingBlockRange>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller.
     bbr: BbrState,
+    /// Whether the cwnd budgets outstanding work in request slots or reserved bytes.
+    cwnd_unit: CwndUnit,
+    /// Per-request byte weight used to scale the request-denominated cwnd into a byte
+    /// budget under [`CwndUnit::Bytes`] (the advertised per-response byte cap).
+    nominal_request_bytes: u64,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -660,6 +665,8 @@ impl DownloadWindow {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
             bbr: BbrState::new(config),
+            cwnd_unit: config.bbr_cwnd_unit,
+            nominal_request_bytes: u64::from(config.max_response_bytes.max(1)),
             block_liveness_deadline: None,
             last_block_at: None,
         }
@@ -715,22 +722,46 @@ impl DownloadWindow {
         self.available_slots_with_bonus(0)
     }
 
-    /// Available slots allowing `bonus` extra in-flight requests beyond the BBR cwnd,
+    /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
     /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
     /// (above-floor) capacity used by [`available_slots`]; a small positive `bonus` is
     /// the floor bypass — it lets the lowest missing height be fetched even when the
     /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
+    ///
+    /// The return value is non-zero exactly when there is room for at least one more
+    /// request; callers use it as a gate, not an absolute count. Under
+    /// [`CwndUnit::Bytes`] the cwnd's request budget is scaled by the per-request byte
+    /// weight and compared against reserved body bytes, so a peer serving large bodies
+    /// holds fewer in flight. The controller itself is unit-agnostic — only this
+    /// comparison changes — which is the seam that makes switching units a small change.
     pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
-        // BBR-lite is the sole congestion controller: cap in-flight at the
-        // BDP-derived cwnd (clamped to the hard cap), so a peer's queue stays at
-        // ~one BDP and head-of-line latency tracks RTprop instead of growing with
-        // the byte budget. The floor bypass adds at most `bonus` slots on top.
-        let cwnd = self
+        // BBR-lite is the sole congestion controller: cap in-flight at the BDP-derived
+        // cwnd (clamped to the hard cap), so a peer's queue stays at ~one BDP and
+        // head-of-line latency tracks RTprop. The floor bypass adds `bonus` on top.
+        let cwnd_slots = self
             .bbr
             .effective_cwnd()
             .saturating_add(bonus)
             .min(self.hard_outbound_capacity());
-        cwnd.saturating_sub(self.outstanding.len())
+        match self.cwnd_unit {
+            CwndUnit::Blocks => cwnd_slots.saturating_sub(self.outstanding.len()),
+            CwndUnit::Bytes => {
+                // Scale the request-denominated cwnd into a byte budget, then subtract
+                // the bytes already reserved for in-flight requests.
+                let cwnd_bytes = (cwnd_slots as u64).saturating_mul(self.nominal_request_bytes);
+                let remaining = cwnd_bytes.saturating_sub(self.outstanding_reserved_bytes());
+                usize::try_from(remaining).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// Bytes reserved across this peer's in-flight requests (the per-request size
+    /// estimates of heights not yet received). Recomputed on demand — the byte unit is
+    /// experimental; a hot path would maintain a running counter instead.
+    fn outstanding_reserved_bytes(&self) -> u64 {
+        self.outstanding.iter().fold(0u64, |acc, range| {
+            acc.saturating_add(range.reserved_bytes())
+        })
     }
 
     /// Apply the BBR cwnd dip on a real request timeout (one multiplicative dip,
@@ -866,7 +897,6 @@ impl OutstandingBlockRange {
     /// shrinks its estimate toward the actual size, so releasing this (on
     /// timeout/disconnect/short response) never over-releases bytes already handed
     /// to the reorder buffer.
-    #[cfg(test)]
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.request
             .expected_blocks
@@ -1337,6 +1367,58 @@ mod bbr_tests {
             bbr.delay_cap().is_some(),
             "the ceiling should have bound the cwnd",
         );
+    }
+
+    /// Push `count` single-height requests each reserving `bytes_each` estimated bytes.
+    fn push_outstanding_bytes(window: &mut DownloadWindow, count: usize, bytes_each: u64) {
+        let now = Instant::now();
+        for i in 0..count {
+            // A `u32` index; the test count is tiny so the cast is safe.
+            let height = block::Height(1 + i as u32);
+            window.outstanding.push(OutstandingBlockRange {
+                request: BlockRangeRequest {
+                    start_height: height,
+                    count: 1,
+                    anchor_hash: block::Hash([0; 32]),
+                    estimated_bytes: bytes_each,
+                    expected_blocks: vec![ExpectedBlock {
+                        height,
+                        hash: block::Hash([0; 32]),
+                        estimated_bytes: bytes_each,
+                    }],
+                },
+                queued_at: now,
+                deadline: now,
+                received: ReceivedBlockTracker::default(),
+            });
+        }
+    }
+
+    #[test]
+    fn cwnd_unit_bytes_budgets_in_flight_by_reserved_bytes() {
+        // cold-start cwnd 8 requests × 1000 B/request = an 8000 B in-flight budget.
+        let cfg = ZakuraBlockSyncConfig {
+            bbr_cwnd_unit: CwndUnit::Bytes,
+            initial_inflight_requests: 8,
+            max_inflight_requests: 256,
+            max_response_bytes: 1000,
+            ..bbr_test_config()
+        };
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(window.available_slots(), 8000);
+
+        // Six 1000 B requests leave 2000 B of headroom...
+        push_outstanding_bytes(&mut window, 6, 1000);
+        assert_eq!(window.available_slots(), 2000);
+        // ...and two more exhaust the byte budget.
+        push_outstanding_bytes(&mut window, 2, 1000);
+        assert_eq!(window.available_slots(), 0);
+
+        // A peer serving 4 KB bodies fills the same cwnd with far fewer requests — the
+        // point of the byte unit. Two 4000 B requests already saturate the 8000 B budget.
+        let mut big = DownloadWindow::new(&cfg);
+        push_outstanding_bytes(&mut big, 2, 4000);
+        assert_eq!(big.available_slots(), 0);
     }
 
     #[test]

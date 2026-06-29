@@ -56,7 +56,10 @@ pub use bench::{
     spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
     BenchSubmit, SequencerProgress,
 };
-pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::BlockSyncWireError;
 pub use events::{
     BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
