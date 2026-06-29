@@ -155,7 +155,7 @@ mkdir -p "$OUT_DIR"
 # ---- 0. dependencies + disk --------------------------------------------------
 ensure_deps() {
   local missing=()
-  for t in zstd tar jq curl awk sha256sum; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
+  for t in zstd tar jq curl awk sha256sum python3; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
   if ((${#missing[@]})); then
     log "installing missing tools: ${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
@@ -356,6 +356,34 @@ scrape_height() {
   [[ -n "$v" ]] && echo "$v"
 }
 
+zip_trace_dir() {
+  local trace_dir="$1" zip_path="$2"
+
+  if [[ ! -d "$trace_dir" ]]; then
+    log "Zakura trace dir missing; no trace zip created: $trace_dir"
+    return
+  fi
+  if [[ -z "$(find "$trace_dir" -type f -print -quit 2>/dev/null)" ]]; then
+    log "Zakura trace dir is empty; no trace zip created: $trace_dir"
+    return
+  fi
+
+  rm -f "$zip_path"
+  TRACE_DIR="$trace_dir" ZIP_PATH="$zip_path" python3 <<'PY'
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+import os
+
+trace_dir = Path(os.environ["TRACE_DIR"])
+zip_path = Path(os.environ["ZIP_PATH"])
+
+with ZipFile(zip_path, "w", ZIP_DEFLATED) as archive:
+    for path in sorted(p for p in trace_dir.rglob("*") if p.is_file()):
+        archive.write(path, path.relative_to(trace_dir.parent))
+PY
+  log "Zakura traces zipped: $zip_path"
+}
+
 # ---- 3-7. one benchmark run for a given tag ----------------------------------
 # usage: run_one TAG OUTPREFIX SHOULD_USE_V2_P2P SHOULD_USE_LEGACY_P2P ; sets RESULT_* globals
 run_one() {
@@ -511,6 +539,7 @@ run_one() {
   errs="$(grep -iE 'panic|ERROR committing|resetting state queue' "$logf" 2>/dev/null \
             | grep -viE 'zebra_network|peer' | head -3 || true)"
   cp "$logf" "$OUT_DIR/node-$prefix.log" 2>/dev/null || true
+  [[ "$should_use_v2_p2p" == "1" ]] && zip_trace_dir "$trace_dir" "$OUT_DIR/zakura-traces-$prefix.zip"
 
   local blocks=$((end_height - START_HEIGHT))
   local total=$((t_end - t0))
