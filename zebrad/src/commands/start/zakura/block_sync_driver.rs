@@ -91,8 +91,16 @@ impl CheckpointFrontierRefresh {
     }
 }
 
+/// Drives the Zakura block-sync apply pipeline: consumes `BlockSyncAction`s from the
+/// sequencer, applies submitted bodies through the consensus router into state
+/// (checkpoint-class blocks take the header-authenticated fast path), drains applies
+/// concurrently under the checkpoint/full/combined limits, and reports completions
+/// back to the sequencer via `block_sync`. Runs until `shutdown` resolves.
+///
+/// This is the production sync driver; it is also reused by the offline
+/// `zebra-replay-bench` (via `zebrad::bench_api`) to benchmark the real apply path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
+pub async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     // Retained so the disconnect capability stays wired into the driver, even
     // though peer scoring no longer drives disconnects (misbehavior is record-only).

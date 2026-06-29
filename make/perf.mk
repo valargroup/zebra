@@ -114,6 +114,7 @@ perf-replay-verifier:
 # requires REPLAY_VCT_SIDECAR. Commits in Pruned storage mode by default (BASE_SRC must
 # be a pruned snapshot), matching the production mainnet config. Optional knobs:
 #   REPLAY_ARCHIVE=1          commit in Archive storage mode instead (needs an archive base)
+#   REPLAY_STOP_HEIGHT=<h>    stop at the last checkpoint <= h (bench a sub-range of the cache)
 #   REPLAY_TRACE_DIR=<dir>    write structured Zakura JSONL traces (block_sync.jsonl),
 #                             the same tables perf-run-mainnet emits via trace_dir; plot
 #                             with .cursor/skills/zakura-trace-plots

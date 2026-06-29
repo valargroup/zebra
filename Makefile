@@ -17,7 +17,7 @@ help:
 	@echo "  perf-replay-worker               Replay through the real write worker (one rung up)"
 	@echo "  perf-replay-verifier             Replay through the checkpoint verifier (adds PoW + Merkle)"
 	@echo "  perf-replay-sequencer            Replay through the Zakura block-sync Sequencer (VCT-only,"
-	@echo "                                   pruned by default; REPLAY_ARCHIVE=1 for archive, REPLAY_TRACE_DIR=<dir> for traces)"
+	@echo "                                   pruned by default; REPLAY_ARCHIVE=1 archive, REPLAY_STOP_HEIGHT=<h> sub-range, REPLAY_TRACE_DIR=<dir> traces)"
 	@echo "  perf-analyze                     Bottleneck attribution over the CSV window (PERF_LABEL/PERF_LO/PERF_HI)"
 	@echo "  perf-dashboard                   Live metrics dashboard for the running bench node"
 	@echo "  perf-verify-isolation            Confirm the bench sees only the two cohort peers"

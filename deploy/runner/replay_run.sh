@@ -28,11 +28,16 @@ RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DBREL="${BENCH_DB_REL:-state/v27/mainnet}"
 SRC="${REPLAY_SRC:-/mnt/roman-dev-2-data/zebra-cache}"
-BASE_SRC="${REPLAY_BASE_SRC:-/mnt/roman-dev-2-data/zebra-ckpt-1800000-warm}"
-CACHE="${REPLAY_CACHE:-/mnt/roman-dev-2-data/win-fwd.zrb}"
-SIDECAR="${REPLAY_SIDECAR:-/mnt/roman-dev-2-data/win-fwd.vct}"
-START="${REPLAY_START:-1802001}"
-END="${REPLAY_END:-1832000}"
+# Base = the cleanly-pruned snapshot at tip 1849957 (START-1). It was produced by
+# replaying the older 1800000 pruned base forward past 1849957 so the checkpoint
+# raw-tx archive backlog is already drained: forking it for a `run` does NOT
+# trigger a startup DrainBacklog (the earlier 1800000-warm-pruned base did, which
+# polluted the first ~10K blocks of every run with delete/compaction churn).
+BASE_SRC="${REPLAY_BASE_SRC:-/mnt/roman-dev-2-data/zebra-ckpt-1850000-warm-pruned}"
+CACHE="${REPLAY_CACHE:-/mnt/roman-dev-2-data/win-1850k.zrb}"
+SIDECAR="${REPLAY_SIDECAR:-/mnt/roman-dev-2-data/win-1850k.vct}"
+START="${REPLAY_START:-1849958}"
+END="${REPLAY_END:-1899957}"
 FORK_DIR="${BENCH_FORK_DIR:-/mnt/roman-dev-2-data}"
 BIN_DEFAULT="${REPLAY_BIN:-/root/wal-bench/zebra-replay-bench}"
 
@@ -157,6 +162,12 @@ cmd_run_sequencer() {
     args+=(--archive)
   else
     note "storage mode: pruned (default)"
+  fi
+  # Clamp the committed window to a sub-range of the cache (stops at the last
+  # checkpoint <= REPLAY_STOP_HEIGHT). Lets a smaller window reuse a larger cache.
+  if [ -n "${REPLAY_STOP_HEIGHT:-}" ]; then
+    note "stop height: $REPLAY_STOP_HEIGHT"
+    args+=(--stop-height "$REPLAY_STOP_HEIGHT")
   fi
   # Structured Zakura JSONL traces, like perf-run-mainnet's [network.zakura] trace_dir.
   if [ -n "${REPLAY_TRACE_DIR:-}" ]; then

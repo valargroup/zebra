@@ -37,18 +37,19 @@ use zebra_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
     transport::ByteBudget,
-    ZakuraPeerId, ZakuraTrace,
+    ServicePeerSnapshot, ZakuraBlockSyncCandidateState, ZakuraPeerId, ZakuraTrace,
 };
 
 use super::{
-    events::{BlockApplyResult, BlockApplyToken, BlockSyncAction},
+    config::ZakuraBlockSyncConfig,
+    events::{BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncEvent},
     reactor::{bs_insert_height, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
         initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
     },
-    state::{BlockSyncFrontiers, ThroughputMeter},
+    state::{BlockSyncFrontiers, BlockSyncHandle, ThroughputMeter},
     work_queue::WorkQueue,
 };
 
@@ -71,6 +72,8 @@ pub struct BenchSubmit {
 pub struct SequencerProgress {
     /// Verified block tip (last committed height the sequencer knows about).
     pub verified_tip: block::Height,
+    /// Hash of the verified block tip (the committed hash reported for `verified_tip`).
+    pub verified_hash: block::Hash,
     /// Bodies buffered out-of-order in the reorder queue.
     pub reorder_len: u64,
     /// Bodies drained into the contiguous `applying` set.
@@ -207,6 +210,89 @@ impl BenchSequencerHandle {
     pub fn into_parts(self) -> (BenchBodyFeeder, BenchSubmissions, BenchCommitter) {
         (self.feeder, self.submissions, self.committer)
     }
+
+    /// Production-driver split: returns the raw `BlockSyncAction` stream and an inert
+    /// [`BlockSyncHandle`] so the bench can drive the **real** block-sync apply driver
+    /// (`zebrad`'s `drive_block_sync_actions`) directly, instead of a hand-rolled
+    /// verify/commit loop. The driver reports completions through
+    /// [`BlockSyncHandle::send_control`]; with no reactor present, a spawned translator
+    /// forwards each `BlockApplyFinished` into the sequencer's `ApplyFinished` control
+    /// input — the exact hop `reactor::handle_block_apply_finished` performs in
+    /// production. Every other handle channel is inert: the bench feeds bodies directly,
+    /// so the driver never emits peer queries or reads peer/status/candidate state.
+    pub fn into_driver_parts(self) -> BenchDriverParts {
+        let BenchSequencerHandle {
+            feeder,
+            submissions,
+            committer,
+        } = self;
+
+        let control = committer.control.clone();
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel::<BlockSyncEvent>();
+        tokio::spawn(async move {
+            while let Some(event) = lifecycle_rx.recv().await {
+                if let BlockSyncEvent::BlockApplyFinished {
+                    token,
+                    height,
+                    hash,
+                    result,
+                    local_frontier,
+                } = event
+                {
+                    if control
+                        .send(SequencerControlInput::ApplyFinished {
+                            token,
+                            height,
+                            hash,
+                            result,
+                            local_frontier,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let config = ZakuraBlockSyncConfig::default();
+        let (events, _events_rx) = mpsc::channel(1);
+        let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+        let (_status_tx, status) = watch::channel(config.initial_status());
+        let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        let block_sync = BlockSyncHandle {
+            events,
+            lifecycle: lifecycle_tx,
+            peers,
+            status,
+            candidates,
+            routine_wiring: None,
+        };
+
+        BenchDriverParts {
+            feeder,
+            actions: submissions.actions,
+            block_sync,
+            committer,
+        }
+    }
+}
+
+/// The driver-shaped split returned by [`BenchSequencerHandle::into_driver_parts`].
+///
+/// Hand `actions` + `block_sync` to the production `drive_block_sync_actions`, feed
+/// cached bodies through `feeder`, and use `committer` for progress/trace snapshots
+/// (it also keeps the sequencer task alive).
+pub struct BenchDriverParts {
+    /// Feeds cached bodies into the sequencer's reorder queue.
+    pub feeder: BenchBodyFeeder,
+    /// The ordered `SubmitBlock` (and other) actions the sequencer emits.
+    pub actions: mpsc::Receiver<BlockSyncAction>,
+    /// Inert handle the production driver reports completions through; its
+    /// `BlockApplyFinished` events are forwarded to the sequencer.
+    pub block_sync: BlockSyncHandle,
+    /// Progress/trace snapshots; retained to keep the sequencer task alive.
+    pub committer: BenchCommitter,
 }
 
 impl BenchBodyFeeder {
@@ -315,11 +401,26 @@ impl BenchCommitter {
         }
     }
 
+    /// Awaits sequencer progress until the verified tip reaches `target` (or the
+    /// sequencer task ends). Used to detect completion when the production driver owns
+    /// the apply loop and the bench no longer sees individual commits.
+    pub async fn wait_for_verified_tip(&mut self, target: block::Height) {
+        loop {
+            if self.view.borrow().verified_tip >= target {
+                return;
+            }
+            if self.view.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Latest progress snapshot from the sequencer view.
     pub fn progress(&self) -> SequencerProgress {
         let view = *self.view.borrow();
         SequencerProgress {
             verified_tip: view.verified_tip,
+            verified_hash: view.verified_hash,
             reorder_len: view.reorder_len,
             applying_len: view.applying_len,
             committed_blocks_per_sec: view.committed_blocks_per_sec,

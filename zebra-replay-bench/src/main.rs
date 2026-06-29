@@ -22,6 +22,7 @@ mod index;
 mod prefetch;
 mod rollback;
 mod roots_cache;
+mod seed_headers;
 mod stats;
 
 use std::path::PathBuf;
@@ -136,10 +137,28 @@ enum Cmd {
         /// Pruned (the base must already be a pruned snapshot; pruning is one-way).
         #[arg(long)]
         archive: bool,
+        /// Stop after committing up to this height, clamping the cache window (to bench
+        /// a sub-range of a larger cache). Defaults to the full cache end.
+        #[arg(long)]
+        stop_height: Option<u32>,
         /// Write structured Zakura JSONL trace tables to this directory (the same
         /// tables `perf-run-mainnet` produces via `[network.zakura] trace_dir`).
         #[arg(long)]
         trace_dir: Option<PathBuf>,
+    },
+    /// Seed the Zakura header store on a base snapshot for every cached block height,
+    /// so the production block-sync driver's header-authenticated checkpoint fast path
+    /// can run offline. Run once on the base (tip must be `start-1`); forks inherit it.
+    SeedHeaders {
+        /// Base fork root (opened writable, mutated in place; must be at start-1).
+        #[arg(long)]
+        base: PathBuf,
+        /// Cache file produced by `index`.
+        #[arg(long)]
+        cache: PathBuf,
+        /// Seed against an Archive-mode base. Default mirrors the run (Pruned).
+        #[arg(long)]
+        archive: bool,
     },
     /// Replay a cache through the real `zebra-consensus` checkpoint verifier, which
     /// commits to a real `StateService` (tip must be `start-1`). One altitude above
@@ -208,6 +227,13 @@ fn main() -> Result<()> {
         Cmd::Rollback { base, target } => {
             rollback::run(&base, target, network)?;
         }
+        Cmd::SeedHeaders {
+            base,
+            cache,
+            archive,
+        } => {
+            seed_headers::run(&base, &cache, network, archive)?;
+        }
         Cmd::Apply {
             base,
             cache,
@@ -252,6 +278,7 @@ fn main() -> Result<()> {
             cache,
             vct_sidecar,
             archive,
+            stop_height,
             trace_dir,
         } => {
             #[cfg(feature = "commit-metrics")]
@@ -263,6 +290,7 @@ fn main() -> Result<()> {
                 vct_sidecar.as_deref(),
                 network,
                 archive,
+                stop_height,
                 trace_dir.as_deref(),
             )?;
 
@@ -289,7 +317,10 @@ fn render_metrics(handle: metrics_exporter_prometheus::PrometheusHandle) {
         if line.starts_with('#') {
             continue;
         }
-        if line.starts_with("zebra_state_") || line.starts_with("state_vct_") {
+        if line.starts_with("zebra_state_")
+            || line.starts_with("state_vct_")
+            || line.starts_with("zebra_consensus_")
+        {
             println!("{line}");
         }
     }

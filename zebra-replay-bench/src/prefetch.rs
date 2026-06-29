@@ -45,6 +45,16 @@ pub fn capacity() -> usize {
         .unwrap_or(DEFAULT_PREFETCH_CAPACITY)
 }
 
+/// One raw block ready to feed into an upstream verifier or sequencer.
+///
+/// This path avoids verifier-side precomputation when the consumer will submit the
+/// raw block to the real verifier anyway.
+pub struct RawBlock {
+    pub block: Arc<Block>,
+    pub len: usize,
+    pub height: u32,
+}
+
 /// One prepared block ready to commit: the verified block plus the per-block prep
 /// the committer's `next_checkpoint` needs (the block handle and its auth-data
 /// root), with its height and serialized byte length.
@@ -96,6 +106,47 @@ pub fn spawn(reader: CacheReader, capacity: usize) -> (JoinHandle<()>, Receiver<
             }))
             .is_err()
         {
+            // Consumer dropped the receiver: stop producing.
+            return;
+        }
+        height += 1;
+    });
+
+    (handle, rx)
+}
+
+/// Spawns a raw-block prefetch producer over `reader`.
+///
+/// Use this for paths that feed raw blocks into the real verifier. Unlike
+/// [`spawn`], this does not build [`CheckpointVerifiedBlock`] values that would
+/// be discarded before the verifier rebuilds them.
+pub fn spawn_raw(
+    reader: CacheReader,
+    capacity: usize,
+) -> (JoinHandle<()>, Receiver<Result<RawBlock>>) {
+    let (tx, rx) = sync_channel(capacity);
+    let mut reader = reader;
+    let mut height = reader.header().start_height;
+
+    let handle = thread::spawn(move || loop {
+        let bytes = match reader.next_block() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(e) => {
+                let _ = tx.send(Err(eyre!("reading block {height}: {e}")));
+                return;
+            }
+        };
+        let len = bytes.len();
+        let block = match Block::zcash_deserialize(&bytes[..]) {
+            Ok(block) => Arc::new(block),
+            Err(e) => {
+                let _ = tx.send(Err(eyre!("deserializing block {height}: {e}")));
+                return;
+            }
+        };
+
+        if tx.send(Ok(RawBlock { block, len, height })).is_err() {
             // Consumer dropped the receiver: stop producing.
             return;
         }
