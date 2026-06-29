@@ -1734,6 +1734,7 @@ impl PeerRoutine {
                 bs_insert_u64(row, "bbr_btlbw_milliblocks_per_sec", btlbw);
             }
             bs_insert_u64(row, "bbr_delivered", self.window.bbr_delivered());
+            bs_insert_u64(row, "bbr_phase", self.window.bbr_phase_code());
         });
     }
 

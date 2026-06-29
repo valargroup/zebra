@@ -346,6 +346,11 @@ struct BbrParams {
     startup_cwnd: usize,
     rtprop_window: Duration,
     delivery_rate_window: Duration,
+    /// How long between ProbeRTT drains (the cadence at which RTprop is refreshed).
+    probe_rtt_interval: Duration,
+    /// How long to hold the cwnd at `min_cwnd` once the queue has drained, so at
+    /// least one uncontended request completes and yields a clean RTprop sample.
+    probe_rtt_duration: Duration,
 }
 
 impl BbrParams {
@@ -361,6 +366,29 @@ impl BbrParams {
             startup_cwnd,
             rtprop_window: config.bbr_rtprop_window,
             delivery_rate_window: config.bbr_delivery_rate_window,
+            probe_rtt_interval: config.bbr_probe_rtt_interval,
+            probe_rtt_duration: config.bbr_probe_rtt_duration,
+        }
+    }
+}
+
+/// BBR-lite control phase. `ProbeBw` is the steady state (cwnd tracks BDP × gain);
+/// `ProbeRtt` periodically drains the queue to `min_cwnd` to take a fresh, uncontended
+/// RTprop sample. Without ProbeRtt, a peer's RTprop min-filter stays inflated under a
+/// sustained queue (the round-trip we measure is queue + serve + RTT), so the cwnd never
+/// collapses for a genuinely slow peer.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BbrPhase {
+    ProbeBw,
+    ProbeRtt,
+}
+
+impl BbrPhase {
+    /// Numeric code for the JSONL trace (0 = ProbeBw, 1 = ProbeRtt).
+    fn trace_code(self) -> u64 {
+        match self {
+            BbrPhase::ProbeBw => 0,
+            BbrPhase::ProbeRtt => 1,
         }
     }
 }
@@ -377,8 +405,17 @@ struct BbrState {
     delivered: u64,
     /// Effective cwnd in blocks currently applied by `available_slots`: the
     /// BDP-derived target once measured, the startup window before that, dipped on
-    /// timeouts. Never below `min_cwnd`.
+    /// timeouts. Never below `min_cwnd`. Ignored while in `ProbeRtt` (which forces
+    /// `min_cwnd`) but preserved so the cwnd restores on exit.
     cwnd_cap: usize,
+    /// Current control phase.
+    phase: BbrPhase,
+    /// When the last ProbeRtt completed (or the first delivery, to anchor the first
+    /// probe one interval out). `None` until the first delivery is recorded.
+    last_probe_rtt_at: Option<Instant>,
+    /// Set the moment the queue first drains to `min_cwnd` during a ProbeRtt; the
+    /// `probe_rtt_duration` hold timer runs from here.
+    probe_rtt_drained_at: Option<Instant>,
 }
 
 impl BbrState {
@@ -389,16 +426,20 @@ impl BbrState {
             btlbw_blocks_per_sec: WindowedSamples::new(params.delivery_rate_window),
             delivered: 0,
             cwnd_cap: params.startup_cwnd,
+            phase: BbrPhase::ProbeBw,
+            last_probe_rtt_at: None,
+            probe_rtt_drained_at: None,
             params,
         }
     }
 
     /// Record a completed request: `elapsed` from send to the final body, `blocks` in
-    /// it. The RTprop sample is the round-trip; the BtlBw sample is the delivery rate,
-    /// with the interval floored at the current RTprop so a burst of buffered bodies
-    /// arriving within one tick cannot inflate the bandwidth estimate. Re-derives the
-    /// applied cwnd from the fresh BDP estimate.
-    fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
+    /// it, `inflight` = requests still outstanding to this peer *after* this completion.
+    /// The RTprop sample is the round-trip; the BtlBw sample is the delivery rate, with
+    /// the interval floored at the current RTprop so a burst of buffered bodies arriving
+    /// within one tick cannot inflate the bandwidth estimate. Re-derives the applied cwnd
+    /// from the fresh BDP estimate, then advances the ProbeBw/ProbeRtt phase machine.
+    fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32, inflight: usize) {
         let secs = elapsed.as_secs_f64();
         self.rtprop_secs.observe(now, secs);
         let floor = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
@@ -408,16 +449,60 @@ impl BbrState {
         if let Some(target) = self.cwnd_target() {
             self.cwnd_cap = target;
         }
+        self.advance_phase(now, inflight);
     }
 
-    /// The effective cwnd in blocks currently applied (never below `min_cwnd`).
+    /// Drive the ProbeBw/ProbeRtt cycle off completed deliveries (the only event that
+    /// carries both a fresh timestamp and the current inflight count). ProbeRtt forces
+    /// the cwnd to `min_cwnd`, which drains the queue; once drained, it holds for
+    /// `probe_rtt_duration` so an uncontended request completes and refreshes RTprop.
+    fn advance_phase(&mut self, now: Instant, inflight: usize) {
+        // Anchor the first probe one interval after the first delivery.
+        let anchor = *self.last_probe_rtt_at.get_or_insert(now);
+        match self.phase {
+            BbrPhase::ProbeBw => {
+                if now.saturating_duration_since(anchor) >= self.params.probe_rtt_interval {
+                    self.phase = BbrPhase::ProbeRtt;
+                    self.probe_rtt_drained_at = None;
+                }
+            }
+            BbrPhase::ProbeRtt => {
+                // Start the hold timer the moment the queue first reaches the floor.
+                if self.probe_rtt_drained_at.is_none() && inflight <= self.params.min_cwnd {
+                    self.probe_rtt_drained_at = Some(now);
+                }
+                if let Some(drained_at) = self.probe_rtt_drained_at {
+                    if now.saturating_duration_since(drained_at) >= self.params.probe_rtt_duration {
+                        // Exit: a clean RTprop sample has been taken at low queue depth.
+                        self.phase = BbrPhase::ProbeBw;
+                        self.last_probe_rtt_at = Some(now);
+                        self.probe_rtt_drained_at = None;
+                        if let Some(target) = self.cwnd_target() {
+                            self.cwnd_cap = target;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The effective cwnd in blocks currently applied (never below `min_cwnd`). During
+    /// ProbeRtt the cwnd is pinned to `min_cwnd` to drain the queue.
     fn effective_cwnd(&self) -> usize {
-        self.cwnd_cap.max(self.params.min_cwnd)
+        match self.phase {
+            BbrPhase::ProbeRtt => self.params.min_cwnd,
+            BbrPhase::ProbeBw => self.cwnd_cap.max(self.params.min_cwnd),
+        }
     }
 
     /// Apply one multiplicative dip on a real timeout (BBR-style), bounded by the
-    /// minimum cwnd. Does not run the cubic backoff ladder.
+    /// minimum cwnd. Does not run the cubic backoff ladder. Suppressed during ProbeRtt,
+    /// where the cwnd is already pinned to `min_cwnd` and timeouts are an expected
+    /// consequence of the drain, not congestion signal.
     fn dip_on_timeout(&mut self) {
+        if self.phase == BbrPhase::ProbeRtt {
+            return;
+        }
         let scaled = (self.cwnd_cap as f64 * BBR_TIMEOUT_DIP).round();
         // A non-negative product of a usize and 0.85; the cast is safe.
         let dipped = if scaled.is_finite() && scaled >= 0.0 {
@@ -465,6 +550,11 @@ impl BbrState {
             .max()
             .map(|rate| (rate * 1000.0).round() as u64)
     }
+
+    /// Numeric phase code for the trace (0 = ProbeBw, 1 = ProbeRtt).
+    fn phase_code(&self) -> u64 {
+        self.phase.trace_code()
+    }
 }
 
 /// Carved out of the old `PeerBlockState` so the window math stays unit-testable
@@ -500,9 +590,13 @@ impl DownloadWindow {
         }
     }
 
-    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered).
+    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
+    /// and advance the ProbeRtt phase machine. Call after removing the completed request
+    /// from `outstanding`, so `outstanding.len()` is the inflight count the ProbeRtt
+    /// drain check needs.
     pub(super) fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
-        self.bbr.record_delivery(now, elapsed, blocks);
+        let inflight = self.outstanding.len();
+        self.bbr.record_delivery(now, elapsed, blocks, inflight);
     }
 
     /// The effective BBR cwnd in blocks currently applied.
@@ -523,6 +617,11 @@ impl DownloadWindow {
     /// Total blocks delivered through this peer's completed requests, for tracing.
     pub(super) fn bbr_delivered(&self) -> u64 {
         self.bbr.delivered
+    }
+
+    /// The current BBR phase as a numeric code (0 = ProbeBw, 1 = ProbeRtt), for tracing.
+    pub(super) fn bbr_phase_code(&self) -> u64 {
+        self.bbr.phase_code()
     }
 
     pub(super) fn available_slots(&self) -> usize {
@@ -918,4 +1017,125 @@ pub(super) fn previous_height(height: block::Height) -> Option<block::Height> {
 
 pub(super) fn height_after_count(start: block::Height, count: u32) -> Option<block::Height> {
     start.0.checked_add(count).map(block::Height)
+}
+
+#[cfg(test)]
+mod bbr_tests {
+    use super::*;
+
+    /// A config with a short ProbeRTT cadence and predictable cwnd math for the unit
+    /// tests below. The probe interval/duration are scaled down so a handful of
+    /// deliveries crosses a full ProbeBw → ProbeRtt → ProbeBw cycle.
+    fn bbr_test_config() -> ZakuraBlockSyncConfig {
+        ZakuraBlockSyncConfig {
+            bbr_min_cwnd: 4,
+            bbr_cwnd_gain_percent: 200,
+            bbr_probe_rtt_interval: Duration::from_secs(1),
+            bbr_probe_rtt_duration: Duration::from_millis(200),
+            bbr_rtprop_window: Duration::from_secs(10),
+            bbr_delivery_rate_window: Duration::from_secs(10),
+            initial_inflight_requests: 16,
+            ..Default::default()
+        }
+    }
+
+    /// A clean delivery: 40 blocks in 10 ms ⇒ rate 4000 blk/s, RTprop 0.01 s,
+    /// BDP 40 blocks, ×2 gain ⇒ cwnd target 80.
+    const CLEAN_ELAPSED: Duration = Duration::from_millis(10);
+    const CLEAN_BLOCKS: u32 = 40;
+    const EXPECTED_CWND: usize = 80;
+
+    #[test]
+    fn cwnd_tracks_bdp_after_first_delivery() {
+        let mut bbr = BbrState::new(&bbr_test_config());
+        let t0 = Instant::now();
+        // Cold start: the configured initial window until the first BDP sample.
+        assert_eq!(bbr.effective_cwnd(), 16);
+        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+        assert_eq!(bbr.phase, BbrPhase::ProbeBw);
+    }
+
+    #[test]
+    fn probe_rtt_pins_min_cwnd_then_drains_and_exits() {
+        let cfg = bbr_test_config();
+        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+
+        // Establish a healthy cwnd; anchors the first probe at t0.
+        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        // One interval later, a delivery trips ProbeRtt: cwnd pins to min_cwnd even
+        // though the BDP estimate is unchanged.
+        let t1 = t0 + Duration::from_millis(1_100);
+        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
+        assert_eq!(bbr.effective_cwnd(), min_cwnd);
+
+        // Queue not yet drained (inflight still above min): hold ProbeRtt, no timer.
+        let t2 = t1 + Duration::from_millis(50);
+        bbr.record_delivery(t2, CLEAN_ELAPSED, 10, min_cwnd + 5);
+        assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
+        assert!(bbr.probe_rtt_drained_at.is_none());
+
+        // Queue drains to the floor: the hold timer starts here.
+        let t3 = t2 + Duration::from_millis(20);
+        bbr.record_delivery(t3, CLEAN_ELAPSED, 10, min_cwnd - 1);
+        assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
+        assert_eq!(bbr.probe_rtt_drained_at, Some(t3));
+
+        // Before the hold elapses, still draining.
+        let t4 = t3 + Duration::from_millis(100);
+        bbr.record_delivery(t4, CLEAN_ELAPSED, 10, 1);
+        assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
+
+        // After probe_rtt_duration past the drain, exit to ProbeBw and restore cwnd.
+        let t5 = t3 + Duration::from_millis(200);
+        bbr.record_delivery(t5, CLEAN_ELAPSED, 10, 1);
+        assert_eq!(bbr.phase, BbrPhase::ProbeBw);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+        assert_eq!(bbr.last_probe_rtt_at, Some(t5));
+    }
+
+    #[test]
+    fn probe_rtt_collapses_cwnd_for_a_slow_peer() {
+        // The headline case: a peer whose RTprop inflated under a deep queue. ProbeRtt
+        // forces the cwnd to min_cwnd while it drains, regardless of the (stale, large)
+        // BDP estimate — this is the slow-peer collapse the trace analysis motivated.
+        let cfg = bbr_test_config();
+        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        let t1 = t0 + Duration::from_millis(1_100);
+        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), min_cwnd);
+    }
+
+    #[test]
+    fn timeout_dip_applies_in_probe_bw_but_is_suppressed_in_probe_rtt() {
+        let cfg = bbr_test_config();
+        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        // In ProbeBw a timeout dips the cwnd by the multiplicative factor.
+        bbr.dip_on_timeout();
+        let expected_dip = (EXPECTED_CWND as f64 * BBR_TIMEOUT_DIP).round() as usize;
+        assert_eq!(bbr.effective_cwnd(), expected_dip);
+
+        // Enter ProbeRtt; a timeout there is an expected drain consequence, not
+        // congestion signal, so cwnd_cap is left untouched.
+        let t1 = t0 + Duration::from_millis(1_100);
+        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
+        let cap_before = bbr.cwnd_cap;
+        bbr.dip_on_timeout();
+        assert_eq!(bbr.cwnd_cap, cap_before);
+        assert_eq!(bbr.effective_cwnd(), min_cwnd);
+    }
 }
