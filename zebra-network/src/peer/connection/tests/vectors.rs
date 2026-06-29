@@ -662,6 +662,63 @@ async fn connection_run_loop_receive_timeout() {
     assert_eq!(outbound_message, None);
 }
 
+#[tokio::test]
+async fn repeated_connection_receive_timeouts_close_connection() {
+    let _init_guard = zebra_test::init();
+
+    tokio::time::pause();
+
+    let (_peer_tx, peer_rx) = mpsc::channel(1);
+    let (
+        connection,
+        mut client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_test_connection();
+
+    let mut connection_join_handle = tokio::spawn(connection.run(peer_rx));
+
+    for _ in 0..2 {
+        let (request_tx, mut request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::Peers,
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .expect("channel is valid before repeated timeout threshold");
+
+        assert_eq!(peer_outbound_messages.next().await, Some(Message::GetAddr));
+        tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+
+        assert_eq!(
+            request_rx
+                .try_recv()
+                .expect("peer internal response channel is valid")
+                .expect("response is present")
+                .expect_err("response is an error")
+                .inner_debug(),
+            "ConnectionReceiveTimeout",
+        );
+    }
+
+    inbound_service.expect_no_requests().await;
+
+    let error = shared_error_slot
+        .try_get_error()
+        .expect("repeated receive timeouts close the connection");
+    assert_eq!(error.inner_debug(), "ConnectionReceiveTimeout");
+
+    let connection_result = futures::poll!(&mut connection_join_handle);
+    assert!(
+        matches!(connection_result, Poll::Ready(Ok(()))),
+        "expected run loop termination after repeated timeouts: {connection_result:?}",
+    );
+}
+
 /// Check basic properties of overload probabilities
 #[test]
 fn overload_probability_reduces_over_time() {
