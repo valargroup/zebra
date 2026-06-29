@@ -261,12 +261,21 @@ impl FuzzOutcome {
 
 /// A default block-sync config for harness runs: generous byte budget (memory is not
 /// the constraint under test by default), moderate per-response/inflight caps.
+///
+/// The BBR ProbeRTT cadence is scaled down to sub-second so the mechanism is exercised
+/// within a fuzzer run's compressed wall-clock (production defaults are 10 s / 200 ms,
+/// which never fire in a ~1 s run). `rtprop_window` matches the probe interval so a
+/// stale (queue-inflated) RTprop sample ages out one interval after the probe that
+/// replaced it.
 pub(crate) fn fuzz_config() -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
         max_blocks_per_response: 16,
         max_inflight_requests: 256,
         max_inflight_block_bytes: u64::MAX,
         request_timeout: Duration::from_secs(30),
+        bbr_probe_rtt_interval: Duration::from_millis(150),
+        bbr_probe_rtt_duration: Duration::from_millis(30),
+        bbr_rtprop_window: Duration::from_millis(150),
         ..ZakuraBlockSyncConfig::default()
     }
 }
