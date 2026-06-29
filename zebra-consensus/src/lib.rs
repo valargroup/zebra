@@ -38,6 +38,7 @@ mod block;
 mod checkpoint;
 mod primitives;
 mod script;
+mod verify_timing;
 
 pub mod config;
 pub mod error;

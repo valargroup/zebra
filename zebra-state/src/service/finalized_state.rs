@@ -134,6 +134,8 @@ pub struct AssembledCommit {
     note_commitment_trees: NoteCommitmentTrees,
     /// The retention plan, needed for post-flush archive-backlog bookkeeping.
     retention: RetentionPlan,
+    /// Commit-pressure trace metadata prepared during batch assembly.
+    commit_trace: PreparedCommitTrace,
     /// This block's run-ahead pipeline contribution, captured only when the
     /// committer is running ahead (`None` on the synchronous path). The committer
     /// records it into the [`FinalizedPipeline`](pipeline::FinalizedPipeline)
@@ -164,10 +166,14 @@ pub(crate) struct PipelineAssembled {
     pub height: block::Height,
     /// The note-commitment trees after this block, threaded to the next block.
     pub note_commitment_trees: NoteCommitmentTrees,
+    /// Commit-pressure trace metadata prepared during batch assembly.
+    pub commit_trace: PreparedCommitTrace,
 }
 
 pub mod column_family;
 
+mod commit_pressure;
+pub(crate) use commit_pressure::PreparedCommitTrace;
 mod commitment_aux;
 mod commitment_aux_verify;
 mod disk_db;
@@ -918,6 +924,7 @@ impl FinalizedState {
             height,
             note_commitment_trees,
             retention,
+            commit_trace,
             pipeline_contribution,
             // Elasticsearch indexing is skipped on the run-ahead path.
             ..
@@ -937,6 +944,7 @@ impl FinalizedState {
             hash,
             height,
             note_commitment_trees,
+            commit_trace,
         })
     }
 
@@ -1012,6 +1020,11 @@ impl FinalizedState {
         overlay: Option<&pipeline::FinalizedPipeline>,
         source: &str,
     ) -> Result<AssembledCommit, CommitCheckpointVerifiedError> {
+        // VCT commitment-root verification time (the `verify_commitment_roots` fold),
+        // set inside the checkpoint match arm below and stamped onto the commit trace
+        // after assembly. It runs before `assemble_block_batch`'s `write_start`, so it
+        // is CPU not otherwise counted in `commit_total`. `ZERO` for legacy commits.
+        let mut fold_dur = std::time::Duration::ZERO;
         let (
             height,
             hash,
@@ -1121,6 +1134,7 @@ impl FinalizedState {
                     // Verifies this block's own header, folds its supplied roots into
                     // the candidate tree, and when buffered checks the successor header
                     // against that candidate (the one-block lag).
+                    let fold_start = std::time::Instant::now();
                     let candidate = COMMIT_COMPUTE_POOL
                         .install(|| {
                             commitment_aux_verify::verify_commitment_roots(
@@ -1133,6 +1147,10 @@ impl FinalizedState {
                             self.vct_prevalidated_next = None;
                             self.vct_reject_supplied_root(height, error)
                         })?;
+                    fold_dur = fold_start.elapsed();
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.write.vct_verify.duration_seconds")
+                        .record(fold_dur.as_secs_f64());
 
                     if let Some((next_block, _next_auth)) = &next_checkpoint {
                         self.vct_prevalidated_next = Some((
@@ -1399,7 +1417,7 @@ impl FinalizedState {
         let network = self.network();
         // `assemble_block_batch` also returns `finalized.hash`, which equals the
         // `hash` already destructured above; keep the outer binding and ignore it.
-        let (batch, _hash, batch_contribution) = self.db.assemble_block_batch(
+        let (batch, _hash, batch_contribution, mut commit_trace) = self.db.assemble_block_batch(
             finalized,
             prev_note_commitment_trees,
             &network,
@@ -1408,6 +1426,9 @@ impl FinalizedState {
             fast_sync_below,
             overlay,
         )?;
+        // The fold runs before `assemble_block_batch`'s `write_start`, so record it on
+        // the trace here (it is CPU not otherwise visible in `commit_total`).
+        commit_trace.fold = fold_dur;
 
         // When running ahead, fold this block's batch contribution together with its
         // tip cursor and trees into the contribution the committer records into the
@@ -1429,6 +1450,7 @@ impl FinalizedState {
             height,
             note_commitment_trees,
             retention,
+            commit_trace,
             pipeline_contribution,
             #[cfg(feature = "elasticsearch")]
             finalized_block: finalized_inner_block,
@@ -1454,6 +1476,7 @@ impl FinalizedState {
             height,
             note_commitment_trees,
             retention,
+            commit_trace,
             // Recorded into the pipeline by the committer before the flush, so the
             // disk-writer side ignores it here.
             pipeline_contribution: _,
@@ -1461,7 +1484,7 @@ impl FinalizedState {
             finalized_block,
         } = assembled;
 
-        self.db.flush_block_batch(batch, source);
+        self.db.flush_block_batch(batch, commit_trace, source);
 
         self.pipeline_post_assemble(height, retention);
 
