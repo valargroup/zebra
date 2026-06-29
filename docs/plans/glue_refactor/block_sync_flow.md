@@ -634,15 +634,22 @@ The sequencer decides whether the reset is actually growth-classified or
 destructive. A destructive reset clears reorder/applying, resets the work queue
 above the new tip, bumps apply epoch, and increments `reset_epoch`.
 
-### Peer Timeout / Short Response / Unavailable
+### Congestion Control And Peer Liveness
 
-These are peer-local in `PeerRoutine`:
+These are peer-local in `PeerRoutine` and `DownloadWindow`:
 
-- timeouts reduce the adaptive window and can eventually protocol-reject the
-  peer after repeated floor timeouts,
-- unreceived heights return to `WorkQueue`,
-- received-and-buffered heights stay in-flight until the floor advances,
-- the routine publishes updated outstanding state to `PeerRegistry`.
+- `request_timeout` is a rescue timer, not a peer-eviction timer.
+- Request timeouts return unreceived heights to `WorkQueue`.
+- `DownloadWindow` controls adaptive concurrency: cubic growth after successful
+  responses, cubic backoff after timeout batches, with a floor of 1.
+- `timeout_recovery_slots` can replace timed-out requests above the floor, but
+  never create extra floor concurrency.
+- Peer eviction is progress-based: while outstanding requests exist, the peer
+  must deliver at least one accepted full block within 32s by default
+  (`request_timeout * 4`).
+- Idle peers are never disconnected by block-sync liveness.
+- Received-and-buffered heights stay in-flight until the floor advances.
+- The routine publishes updated outstanding state to `PeerRegistry`.
 
 ### Floor Watchdog
 

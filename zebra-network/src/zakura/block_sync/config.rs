@@ -77,6 +77,8 @@ pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Request-timeout windows allowed before block-progress liveness disconnects.
+const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
 /// Default central floor-watchdog cadence.
 pub const DEFAULT_BS_FLOOR_WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
@@ -269,6 +271,13 @@ impl ZakuraBlockSyncConfig {
     /// Return the floor avoid cooldown clamped to a positive duration.
     pub fn effective_floor_peer_avoid_cooldown(&self) -> Duration {
         self.floor_peer_avoid_cooldown.max(Duration::from_millis(1))
+    }
+
+    /// Return the maximum time an active block-sync peer may go without serving
+    /// an accepted full block body.
+    pub(super) fn effective_liveness_timeout(&self) -> Duration {
+        self.request_timeout
+            .saturating_mul(BLOCK_PROGRESS_TIMEOUT_REQUESTS)
     }
 
     /// Return the largest byte reservation a single floor request can need.

@@ -41,8 +41,8 @@ use super::{
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
     state::{
-        next_height, DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter,
-        TimeoutBackoffOutcome,
+        next_height, DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
+        ThroughputMeter,
     },
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
@@ -73,7 +73,7 @@ const CLOSE_BLOCK_SYNC_GUARD_DISALLOWED_TYPE: &str = "block_sync_guard_disallowe
 const CLOSE_BLOCK_SYNC_GUARD_OVERSIZE: &str = "block_sync_guard_oversize";
 const CLOSE_BLOCK_SYNC_GUARD_REJECT: &str = "block_sync_guard_reject";
 const CLOSE_BLOCK_SYNC_MALFORMED_FRAME: &str = "block_sync_malformed_frame";
-const CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT: &str = "block_sync_repeated_timeout";
+const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
 fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
     frame.payload.first().copied() == Some(MSG_BS_BLOCK)
@@ -276,18 +276,18 @@ impl PeerRoutine {
             if self.session.outbound_capacity() > 0 {
                 self.try_fill().await;
             }
-            let outbound_has_capacity = self.session.outbound_capacity() > 0;
+            let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep();
             tokio::pin!(timeout);
-            let outbound_capacity = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
-            tokio::pin!(outbound_capacity);
+            let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
+            tokio::pin!(outbound_queue_poll);
 
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv(), if outbound_has_capacity => {
+                frame = self.recv.recv(), if outbound_queue_has_capacity => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -307,14 +307,14 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout => self.expire_due_timeouts(Instant::now())?,
+                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
                 _ = &mut available => {
                     self.trace_wake("work_added");
                 }
-                _ = &mut outbound_capacity, if !outbound_has_capacity => {}
+                _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
         }
     }
@@ -525,15 +525,16 @@ impl PeerRoutine {
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
+        self.window.disarm_liveness_if_idle();
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
     }
 
     /// Sleep future resolving at the earliest wake the routine schedules for
-    /// itself: the soonest outstanding request deadline (own-timeout) **or** the
-    /// soonest retry-avoid expiry (so a routine that quiet-returned its only work
-    /// re-runs want-work once the bias lifts, even if no external event arrives).
-    /// Defaults to a long idle sleep when neither exists.
+    /// itself: the soonest outstanding request deadline (own-timeout), block
+    /// liveness deadline, **or** the soonest retry-avoid expiry (so a routine that
+    /// quiet-returned its only work re-runs want-work once the bias lifts, even if
+    /// no external event arrives). Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self) -> time::Sleep {
         let now = Instant::now();
         let earliest_deadline = self
@@ -542,11 +543,12 @@ impl PeerRoutine {
             .iter()
             .map(|outstanding| outstanding.deadline)
             .min();
+        let liveness_deadline = self.window.block_liveness_deadline;
         let earliest_avoid = self.retry_avoid.values().min().copied();
-        let earliest = match (earliest_deadline, earliest_avoid) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (only, None) | (None, only) => only,
-        };
+        let earliest = [earliest_deadline, liveness_deadline, earliest_avoid]
+            .into_iter()
+            .flatten()
+            .min();
         match earliest {
             // Floor the wait at the deadline so a far-future request still wakes
             // promptly; an already-due deadline wakes immediately.
@@ -815,6 +817,8 @@ impl PeerRoutine {
                 deadline,
                 received: ReceivedBlockTracker::default(),
             });
+            self.window
+                .arm_liveness(queued_at, self.config.effective_liveness_timeout());
             self.publish_outstanding();
             self.trace_get_blocks_sent(
                 request_start_height,
@@ -897,7 +901,15 @@ impl PeerRoutine {
 
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
-    fn expire_due_timeouts(&mut self, now: Instant) -> Result<(), SinkReject> {
+    async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
+        let rescued_timed_out = self.expire_due_timeouts(now);
+        if rescued_timed_out && self.session.outbound_capacity() > 0 {
+            self.try_fill().await;
+        }
+        self.check_block_liveness(now)
+    }
+
+    fn expire_due_timeouts(&mut self, now: Instant) -> bool {
         let mut timed_out = Vec::new();
         let mut index = 0;
         while index < self.window.outstanding.len() {
@@ -908,9 +920,9 @@ impl PeerRoutine {
             }
         }
         if timed_out.is_empty() {
-            return Ok(());
+            return false;
         }
-        let backoff = self.window.reduce_outbound_window_after_timeout();
+        self.window.reduce_outbound_window_after_timeout();
         for outstanding in &timed_out {
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
@@ -923,19 +935,40 @@ impl PeerRoutine {
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
         self.note_retry_avoid(timed_out_heights);
         self.publish_outstanding();
-        if backoff == TimeoutBackoffOutcome::DisconnectPeer {
-            let error = "block-sync peer repeatedly timed out at minimum window";
-            self.trace_protocol_reject_timeout(error, timed_out.len());
-            tracing::debug!(
-                peer = ?self.peer,
-                "disconnecting Zakura block-sync peer after repeated timeouts at minimum window"
-            );
-            return Err(SinkReject::protocol_with_reason(
-                error,
-                CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT,
-            ));
+        true
+    }
+
+    fn check_block_liveness(&mut self, now: Instant) -> Result<(), SinkReject> {
+        match self.window.check_liveness(now) {
+            LivenessOutcome::Ok => Ok(()),
+            LivenessOutcome::Disarm => {
+                self.window.disarm_liveness_if_idle();
+                Ok(())
+            }
+            LivenessOutcome::Disconnect if self.session.outbound_capacity() == 0 => {
+                // This is local ordered-stream backpressure, not the peer's request
+                // window. While the outbound queue is full, the select loop above
+                // does not drain inbound frames, so a useful block may already be
+                // waiting behind our own write-side congestion.
+                self.window.block_liveness_deadline =
+                    Some(now + self.config.effective_liveness_timeout());
+                Ok(())
+            }
+            LivenessOutcome::Disconnect => {
+                let error =
+                    "block-sync peer made no accepted block progress before liveness deadline";
+                self.trace_protocol_reject_liveness(error);
+                tracing::debug!(
+                    peer = ?self.peer,
+                    outstanding = self.window.outstanding.len(),
+                    "disconnecting Zakura block-sync peer after no accepted block progress"
+                );
+                Err(SinkReject::protocol_with_reason(
+                    error,
+                    CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS,
+                ))
+            }
         }
-        Ok(())
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below
@@ -966,6 +999,7 @@ impl PeerRoutine {
         }
         if removed {
             self.publish_outstanding();
+            self.window.disarm_liveness_if_idle();
         }
     }
 
@@ -1101,6 +1135,8 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let mut completed = None;
         if let Some(outstanding) = self.window.outstanding.get_mut(index) {
             outstanding.mark_received(height);
@@ -1477,6 +1513,7 @@ impl PeerRoutine {
             }
         }
         self.publish_outstanding();
+        self.window.disarm_liveness_if_idle();
     }
 
     fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
@@ -1623,12 +1660,12 @@ impl PeerRoutine {
         });
     }
 
-    fn trace_protocol_reject_timeout(&self, error: &str, timed_out: usize) {
+    fn trace_protocol_reject_liveness(&self, error: &str) {
         self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             row.insert(
                 bs_trace::REASON.to_string(),
-                serde_json::Value::String(CLOSE_BLOCK_SYNC_REPEATED_TIMEOUT.to_string()),
+                serde_json::Value::String(CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS.to_string()),
             );
             row.insert(
                 bs_trace::ERROR.to_string(),
@@ -1638,11 +1675,6 @@ impl PeerRoutine {
                 row,
                 bs_trace::OUTSTANDING,
                 u64::try_from(self.window.outstanding.len()).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                "timed_out",
-                u64::try_from(timed_out).unwrap_or(u64::MAX),
             );
             bs_insert_u64(
                 row,
@@ -1659,6 +1691,13 @@ impl PeerRoutine {
                 "available_slots",
                 u64::try_from(self.window.available_slots()).unwrap_or(u64::MAX),
             );
+            if let Some(last_block_at) = self.window.last_block_at {
+                bs_insert_u64(
+                    row,
+                    "last_block_age_ms",
+                    elapsed_ms_u64(last_block_at.elapsed()),
+                );
+            }
         });
     }
 
