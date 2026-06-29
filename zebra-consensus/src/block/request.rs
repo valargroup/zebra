@@ -6,7 +6,7 @@ use zebra_chain::{
     block::{self, Block},
     parameters::Network,
 };
-use zebra_state::CheckpointVerifiedBlock;
+use zebra_state::{AuthenticatedCheckpointHash, CheckpointVerifiedBlock};
 
 use crate::checkpoint::VerifyCheckpointError;
 
@@ -25,6 +25,25 @@ pub enum Request {
     /// validity checks (proof of work, Merkle root, height). Used by the syncer,
     /// which can build these blocks concurrently across many download tasks.
     CommitCheckpointPrecomputed(CheckpointVerifiedBlock),
+
+    /// Commits a checkpoint-range block whose expected hash has already been
+    /// authenticated against the hardcoded checkpoint list by Zakura header sync.
+    ///
+    /// The verifier validates the block in isolation (proof of work, Merkle root,
+    /// height) and asserts `block.hash() == expected_hash`, then releases it to the
+    /// state commit pipeline immediately — it does **not** accumulate or walk the
+    /// checkpoint range. `expected_hash` is an [`AuthenticatedCheckpointHash`], a
+    /// provenance token the caller can only obtain from the state's authenticated
+    /// header frontier, so this request cannot be forged from a raw block hash.
+    ///
+    /// Only valid at or below the checkpoint height. There is no fallback: a height
+    /// above the checkpoint, or a hash mismatch, is a hard invariant violation.
+    CommitCheckpointAuthenticated {
+        /// The downloaded block body.
+        block: Arc<Block>,
+        /// The checkpoint-authenticated expected hash for this height.
+        expected_hash: AuthenticatedCheckpointHash,
+    },
 
     /// Performs semantic validation but skips checking proof of work,
     /// then asks the state to perform contextual validation.
@@ -81,6 +100,7 @@ impl Request {
         match self {
             Request::Commit(block) => Arc::clone(block),
             Request::CommitCheckpointPrecomputed(block) => Arc::clone(&block.block),
+            Request::CommitCheckpointAuthenticated { block, .. } => Arc::clone(block),
             Request::CheckProposal(block) => Arc::clone(block),
         }
     }
@@ -88,7 +108,9 @@ impl Request {
     /// Returns `true` if the request is a proposal
     pub fn is_proposal(&self) -> bool {
         match self {
-            Request::Commit(_) | Request::CommitCheckpointPrecomputed(_) => false,
+            Request::Commit(_)
+            | Request::CommitCheckpointPrecomputed(_)
+            | Request::CommitCheckpointAuthenticated { .. } => false,
             Request::CheckProposal(_) => true,
         }
     }

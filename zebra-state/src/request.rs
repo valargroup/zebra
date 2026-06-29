@@ -1264,6 +1264,41 @@ impl Request {
     }
 }
 
+/// A block hash that has been positively authenticated against the hardcoded checkpoint list
+/// via the Zakura header chain.
+///
+/// The inner hash is private and can only be constructed by the state (after re-establishing the
+/// checkpoint anchor for the height — see
+/// [`ReadRequest::AuthenticatedCheckpointHash`]). This makes it impossible to fabricate one from a
+/// raw `block.hash()`: it is the provenance marker the Zakura checkpoint fast-commit path relies on
+/// to prove a body's expected hash came from authenticated headers, not from the body itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedCheckpointHash(block::Hash);
+
+impl AuthenticatedCheckpointHash {
+    /// Construct an authenticated checkpoint hash.
+    ///
+    /// Crate-internal: only the state may call this, and only after positively re-establishing the
+    /// checkpoint anchor that authenticates `hash`.
+    pub(crate) fn new(hash: block::Hash) -> Self {
+        Self(hash)
+    }
+
+    /// The authenticated block hash.
+    pub fn hash(&self) -> block::Hash {
+        self.0
+    }
+
+    /// Construct an authenticated checkpoint hash directly, bypassing the state's authentication.
+    ///
+    /// Test-only: this exists so other crates' tests can exercise the checkpoint fast-commit path.
+    /// It is never compiled into production builds, preserving the provenance guarantee.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn new_for_test(hash: block::Hash) -> Self {
+        Self(hash)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A read-only query about the chain state, via the
 /// [`ReadStateService`](crate::service::ReadStateService).
@@ -1486,6 +1521,19 @@ pub enum ReadRequest {
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
+    /// Returns the checkpoint-authenticated hash at `height`, if `height` is at or below the
+    /// checkpoint-authenticated header frontier; otherwise `None`.
+    ///
+    /// The hash is positively re-established against the hardcoded checkpoint list (the next
+    /// checkpoint `C >= height` is re-checked, and the persisted header store is a contiguous
+    /// continuity-verified frontier, so continuity pins `height`'s hash to `C`). The returned
+    /// [`AuthenticatedCheckpointHash`] is the provenance token the Zakura checkpoint fast-commit
+    /// path requires.
+    AuthenticatedCheckpointHash {
+        /// The height to authenticate.
+        height: block::Height,
+    },
+
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
         /// First height to consider.
@@ -1683,6 +1731,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::BestHeaderTip => "best_header_tip",
+            ReadRequest::AuthenticatedCheckpointHash { .. } => "authenticated_checkpoint_hash",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",

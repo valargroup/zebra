@@ -37,7 +37,7 @@ use zebra_chain::{
     },
     work::equihash,
 };
-use zebra_state::{self as zs, CheckpointVerifiedBlock};
+use zebra_state::{self as zs, AuthenticatedCheckpointHash, CheckpointVerifiedBlock};
 
 use crate::{
     block::VerifyBlockError,
@@ -900,6 +900,103 @@ where
         .boxed()
     }
 
+    /// Verify and release a Zakura header-authenticated checkpoint block.
+    ///
+    /// This is the narrow fast path: it validates the block in isolation (height, proof of work,
+    /// Merkle root) and asserts the body matches the checkpoint-authenticated header hash, then
+    /// releases it straight to the state commit pipeline. It does **not** enqueue the block, walk
+    /// the checkpoint range, or touch `verifier_progress`.
+    ///
+    /// Zakura checkpoint heights always take this path (there is no fallback into range
+    /// accumulation), so the verifier's range/progress state is never consulted for them; the
+    /// `check_height` bound stays correct because progress only ever lags the committed tip, which
+    /// is lenient (no false `AlreadyVerified`). The router enforces that `block` is at or below the
+    /// checkpoint height before calling this.
+    pub(crate) fn call_authenticated(
+        &mut self,
+        block: Arc<Block>,
+        expected_hash: AuthenticatedCheckpointHash,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        // Per-block validity checks (height, proof of work, Merkle root), the same checks the
+        // accumulation path runs per block — defense in depth on top of the authenticated header.
+        let block = match self.check_block(block) {
+            Ok(block) => block,
+            Err(e) => return async move { Err(e) }.boxed(),
+        };
+
+        // Bind the body to the authenticated header. A mismatch means the downloaded body and the
+        // checkpoint-authenticated header disagree: a hard invariant violation, never recoverable.
+        let expected = expected_hash.hash();
+        if block.hash != expected {
+            let (height, found) = (block.height, block.hash);
+            return async move {
+                Err(VerifyCheckpointError::AuthenticatedHashMismatch {
+                    height,
+                    expected,
+                    found,
+                })
+            }
+            .boxed();
+        }
+
+        self.commit_authenticated_block(block)
+    }
+
+    /// Release an already-validated, authenticated checkpoint block straight to the state commit
+    /// pipeline.
+    ///
+    /// Mirrors the commit/reset behavior of [`Self::verify_and_commit`] but without the range
+    /// release channel: the block is committed directly (DB mutation stays parent-ordered in the
+    /// state write task), and on a commit error the verifier is reset to the state tip.
+    fn commit_authenticated_block(
+        &mut self,
+        block: CheckpointVerifiedBlock,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        let hash = block.hash;
+
+        let state_service = self.state_service.clone();
+        let commit_checkpoint_verified = tokio::spawn(async move {
+            match state_service
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(block))
+                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                .await?
+            {
+                zs::Response::Committed(committed_hash) => {
+                    assert_eq!(committed_hash, hash, "state must commit correct hash");
+                    Ok(hash)
+                }
+                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
+            }
+        });
+
+        let state_service = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
+        async move {
+            let result = commit_checkpoint_verified.await;
+            let result = if zebra_chain::shutdown::is_shutting_down() {
+                Err(VerifyCheckpointError::ShuttingDown)
+            } else {
+                result.expect("commit_checkpoint_verified should not panic")
+            };
+            if result.is_err() {
+                // Keep the verifier consistent with the state for any later legacy caller.
+                let tip = match state_service
+                    .oneshot(zs::Request::Tip)
+                    .await
+                    .map_err(VerifyCheckpointError::Tip)?
+                {
+                    zs::Response::Tip(tip) => tip,
+                    _ => unreachable!("wrong response for Tip"),
+                };
+                let _ = reset_sender.send(tip);
+            }
+            result
+        }
+        .boxed()
+    }
+
     /// During checkpoint range processing, process all the blocks at `height`.
     ///
     /// Returns the first valid block. If there is no valid block, returns None.
@@ -1203,6 +1300,15 @@ pub enum VerifyCheckpointError {
     },
     #[error("zebra is shutting down")]
     ShuttingDown,
+    #[error(
+        "authenticated checkpoint body at {height:?} has hash {found:?}, \
+         but the authenticated header hash is {expected:?}"
+    )]
+    AuthenticatedHashMismatch {
+        height: block::Height,
+        expected: block::Hash,
+        found: block::Hash,
+    },
 }
 
 impl From<VerifyBlockError> for VerifyCheckpointError {
