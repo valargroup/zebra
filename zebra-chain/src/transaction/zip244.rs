@@ -43,6 +43,9 @@ use crate::{
     transparent,
 };
 
+// Reference implementation for the ZIP-244 txid/auth personalizations:
+// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L33-L68
+//
 // txid tree root personalization (`ZcashTxHash_` ‖ consensus_branch_id LE32)
 const ZCASH_TX_PERSONALIZATION_PREFIX: &[u8; 12] = b"ZcashTxHash_";
 
@@ -156,6 +159,9 @@ fn consensus_branch_id(parts: &V5Parts) -> u32 {
 // --- txid digest (ZIP-244 §T) -------------------------------------------------
 
 /// ZIP-244 §T.1 header digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L170
 fn hash_header(parts: &V5Parts) -> Blake2bHash {
     let mut h = hasher(ZCASH_HEADERS_HASH_PERSONALIZATION);
     // header: fOverwintered (set for v5) in the high bit, version 5 in the low bits.
@@ -170,6 +176,9 @@ fn hash_header(parts: &V5Parts) -> Blake2bHash {
 }
 
 /// ZIP-244 §T.2a prevouts digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L85
 fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
     let mut h = hasher(ZCASH_PREVOUTS_HASH_PERSONALIZATION);
     for input in inputs {
@@ -187,6 +196,9 @@ fn hash_prevouts(inputs: &[transparent::Input]) -> Blake2bHash {
 }
 
 /// ZIP-244 §T.2b sequence digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L71
 fn hash_sequence(inputs: &[transparent::Input]) -> Blake2bHash {
     let mut h = hasher(ZCASH_SEQUENCE_HASH_PERSONALIZATION);
     for input in inputs {
@@ -196,6 +208,9 @@ fn hash_sequence(inputs: &[transparent::Input]) -> Blake2bHash {
 }
 
 /// ZIP-244 §T.2c outputs digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L85
 fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
     let mut h = hasher(ZCASH_OUTPUTS_HASH_PERSONALIZATION);
     for output in outputs {
@@ -205,6 +220,9 @@ fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
 }
 
 /// ZIP-244 §T.2 transparent digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L196
 fn hash_transparent_txid(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
@@ -221,6 +239,9 @@ fn hash_transparent_txid(
 }
 
 /// ZIP-244 §T.3a sapling spends digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L100
 fn hash_sapling_spends(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) -> Blake2bHash {
     let mut h = hasher(ZCASH_SAPLING_SPENDS_HASH_PERSONALIZATION);
     if sapling.spends().next().is_some() {
@@ -246,6 +267,9 @@ fn hash_sapling_spends(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) -
 }
 
 /// ZIP-244 §T.3b sapling outputs digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L132
 fn hash_sapling_outputs(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) -> Blake2bHash {
     let mut h = hasher(ZCASH_SAPLING_OUTPUTS_HASH_PERSONALIZATION);
     if sapling.outputs().next().is_some() {
@@ -271,6 +295,9 @@ fn hash_sapling_outputs(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) 
 }
 
 /// ZIP-244 §T.3 sapling digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L209
 fn hash_sapling_txid(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
 ) -> Blake2bHash {
@@ -288,6 +315,9 @@ fn hash_sapling_txid(
 }
 
 /// ZIP-244 §T.4 orchard digest (mirrors `orchard::bundle::commitments::hash_bundle_txid_data`).
+///
+/// Reference implementation:
+/// https://github.com/zcash/orchard/blob/82e0739ced29e1c113804e1abba48976bbfc665e/src/bundle/commitments.rs#L30
 fn hash_orchard_txid(orchard: Option<&orchard::ShieldedData>) -> Blake2bHash {
     let mut h = hasher(ZCASH_ORCHARD_HASH_PERSONALIZATION);
     if let Some(orchard) = orchard {
@@ -318,6 +348,9 @@ fn hash_orchard_txid(orchard: Option<&orchard::ShieldedData>) -> Blake2bHash {
 }
 
 /// Combine the four level-1 digests into the txid (ZIP-244 txid digest).
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426
 fn txid_inner(parts: &V5Parts) -> Hash {
     let header = hash_header(parts);
     let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
@@ -345,6 +378,9 @@ fn txid_inner(parts: &V5Parts) -> Hash {
 // --- auth digest (ZIP-244 authorizing-data commitment) ------------------------
 
 /// ZIP-244 transparent script-sig digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L379-L390
 fn hash_transparent_auth(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
@@ -370,6 +406,9 @@ fn hash_transparent_auth(
 }
 
 /// ZIP-244 sapling auth digest.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L392
 fn hash_sapling_auth(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
 ) -> Blake2bHash {
@@ -390,6 +429,9 @@ fn hash_sapling_auth(
 }
 
 /// ZIP-244 orchard auth digest (mirrors `orchard::bundle::commitments::hash_bundle_auth_data`).
+///
+/// Reference implementation:
+/// https://github.com/zcash/orchard/blob/82e0739ced29e1c113804e1abba48976bbfc665e/src/bundle/commitments.rs#L69-L92
 fn hash_orchard_auth(orchard: Option<&orchard::ShieldedData>) -> Blake2bHash {
     let mut h = hasher(ZCASH_ORCHARD_SIGS_HASH_PERSONALIZATION);
     if let Some(orchard) = orchard {
@@ -403,6 +445,9 @@ fn hash_orchard_auth(orchard: Option<&orchard::ShieldedData>) -> Blake2bHash {
 }
 
 /// Combine the three authorizing-data digests into the ZIP-244 auth commitment.
+///
+/// Reference implementation:
+/// https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426-L448
 fn auth_digest_inner(parts: &V5Parts) -> AuthDigest {
     let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
     let sapling = hash_sapling_auth(parts.sapling);
