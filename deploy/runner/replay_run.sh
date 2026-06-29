@@ -116,10 +116,64 @@ cmd_run_worker() {
   rm -rf "$fork"
 }
 
+# Like cmd_run_worker, but replays through the real zebra-consensus checkpoint
+# verifier (which commits to a real StateService), one altitude above the worker.
+cmd_run_verifier() {
+  local label="${1:?usage: replay_run.sh run-verifier <label> [bin]}"; shift || true
+  local bin="${1:-$BIN_DEFAULT}"
+  [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
+  [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  local fork="$FORK_DIR/replay-verifier-$label"
+  note "fork base $BASE_SRC -> $fork; apply-verifier $CACHE (expects base tip $((START - 1)))"
+  clone_fork "$BASE_SRC" "$fork"
+  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
+    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
+    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
+    "$bin" apply-verifier --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
+  else
+    "$bin" apply-verifier --base "$fork" --cache "$CACHE"
+  fi
+  note "cleanup: rm -rf $fork"
+  rm -rf "$fork"
+}
+
+# Like cmd_run_verifier, but replays through the real Zakura block-sync Sequencer
+# (reorder + ordered submit to the verifier->state). VCT-only.
+cmd_run_sequencer() {
+  local label="${1:?usage: replay_run.sh run-sequencer <label> [bin]}"; shift || true
+  local bin="${1:-$BIN_DEFAULT}"
+  [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
+  [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  [ -n "${REPLAY_VCT_SIDECAR:-}" ] || die "apply-sequencer is VCT-only; set REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
+  [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR"
+  local fork="$FORK_DIR/replay-sequencer-$label"
+  note "fork base $BASE_SRC -> $fork; apply-sequencer $CACHE (VCT; expects base tip $((START - 1)))"
+  clone_fork "$BASE_SRC" "$fork"
+  local args=(apply-sequencer --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR")
+  # Storage mode: Pruned by default (BASE_SRC must already be a pruned snapshot; pruning
+  # is one-way). REPLAY_ARCHIVE=1 opts back into Archive (needs an archive base).
+  if [ -n "${REPLAY_ARCHIVE:-}" ]; then
+    note "storage mode: archive"
+    args+=(--archive)
+  else
+    note "storage mode: pruned (default)"
+  fi
+  # Structured Zakura JSONL traces, like perf-run-mainnet's [network.zakura] trace_dir.
+  if [ -n "${REPLAY_TRACE_DIR:-}" ]; then
+    note "Zakura JSONL traces -> $REPLAY_TRACE_DIR"
+    args+=(--trace-dir "$REPLAY_TRACE_DIR")
+  fi
+  "$bin" "${args[@]}"
+  note "cleanup: rm -rf $fork"
+  rm -rf "$fork"
+}
+
 case "${1:-}" in
-  index)       shift; cmd_index "$@" ;;
-  index-roots) shift; cmd_index_roots "$@" ;;
-  run)         shift; cmd_run "$@" ;;
-  run-worker)  shift; cmd_run_worker "$@" ;;
-  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]}" >&2; exit 2 ;;
+  index)         shift; cmd_index "$@" ;;
+  index-roots)   shift; cmd_index_roots "$@" ;;
+  run)           shift; cmd_run "$@" ;;
+  run-worker)    shift; cmd_run_worker "$@" ;;
+  run-verifier)  shift; cmd_run_verifier "$@" ;;
+  run-sequencer) shift; cmd_run_sequencer "$@" ;;
+  *) echo "usage: replay_run.sh {index|index-roots|run <label> [bin]|run-worker <label> [bin]|run-verifier <label> [bin]|run-sequencer <label> [bin]}" >&2; exit 2 ;;
 esac

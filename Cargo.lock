@@ -9323,12 +9323,16 @@ version = "0.1.0"
 dependencies = [
  "clap 4.6.1",
  "color-eyre",
+ "futures",
  "metrics-exporter-prometheus",
  "tempfile",
  "tokio",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "zebra-chain",
+ "zebra-consensus",
+ "zebra-network",
  "zebra-state",
 ]
 
