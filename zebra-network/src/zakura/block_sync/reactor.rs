@@ -22,54 +22,6 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 
-#[cfg(test)]
-#[derive(Debug)]
-struct ImmediateTestBlockApplyExecutor;
-
-#[cfg(test)]
-impl BlockApplyExecutor for ImmediateTestBlockApplyExecutor {
-    fn block_apply_class(&self, _block: &block::Block) -> BlockApplyClass {
-        BlockApplyClass::Full
-    }
-
-    fn apply(
-        &self,
-        request: BlockApplyRequest,
-    ) -> futures::future::BoxFuture<'static, BlockApplyOutput> {
-        use futures::FutureExt;
-
-        async move {
-            let height = request
-                .block
-                .coinbase_height()
-                .expect("submitted test block has height");
-            let hash = request.block.hash();
-            BlockApplyOutput {
-                token: request.token,
-                height,
-                hash,
-                result: BlockApplyResult::Committed,
-                local_frontier: Some(BlockSyncFrontiers {
-                    finalized_height: height,
-                    verified_block_tip: height,
-                    verified_block_hash: hash,
-                }),
-            }
-        }
-        .boxed()
-    }
-
-    fn refresh_checkpoint_frontier(
-        &self,
-        _baseline_verified_tip: block::Height,
-        _attempts_remaining: usize,
-    ) -> futures::future::BoxFuture<'static, Option<BlockSyncFrontiers>> {
-        use futures::FutureExt;
-
-        async { None }.boxed()
-    }
-}
-
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -129,10 +81,7 @@ pub fn spawn_block_sync_reactor(
     // bodies use a bounded input channel; progress-critical frontier/apply control
     // events use a separate non-blocking channel so body backlog cannot halt
     // budget release and scheduling.
-    let sequencer = Sequencer::new(
-        startup.frontiers.verified_block_tip,
-        startup.config.submitted_apply_limit(),
-    );
+    let sequencer = Sequencer::new(startup.frontiers.verified_block_tip);
     let committed_throughput = ThroughputMeter::new(Instant::now());
     // Bound the body input channel at the submission window so a slow verifier
     // backpressures body intake without an unbounded block queue. Control events
@@ -140,7 +89,11 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
-    let (apply_executor_tx, apply_executor_rx) = watch::channel(None);
+    // The applyQ: contiguous, hash-verified bodies the Sequencer drains onto and the
+    // node-side `Committer` drains off. Unbounded so the serial Sequencer task never
+    // blocks (and never drops) on a push; the byte budget bounds total in-flight
+    // memory (every queued item is a reserved, held block).
+    let (apply_tx, apply_rx) = mpsc::unbounded_channel::<ApplyItem>();
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
@@ -153,7 +106,7 @@ pub fn spawn_block_sync_reactor(
         startup.frontiers,
         sequencer_body_input_rx,
         sequencer_control_rx,
-        apply_executor_rx,
+        apply_tx,
         sequencer_input_bytes.clone(),
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
@@ -190,18 +143,12 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
-        apply_executor: apply_executor_tx,
+        apply_queue_rx: Arc::new(std::sync::Mutex::new(Some(apply_rx))),
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
         routine_wiring: Some(routine_wiring),
     };
-    #[cfg(test)]
-    {
-        let _ = handle.install_block_apply_executor(BlockApplyExecutorPort::new(
-            std::sync::Arc::new(ImmediateTestBlockApplyExecutor),
-        ));
-    }
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
@@ -463,8 +410,6 @@ impl BlockSyncReactor {
             BlockSyncEvent::NeededBlocks(blocks) => {
                 self.handle_needed_blocks(blocks).await;
             }
-            #[cfg(test)]
-            BlockSyncEvent::TestApplyDone { .. } => {}
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
                 start_height,
@@ -1464,7 +1409,6 @@ impl BlockSyncReactor {
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
         let view = self.last_view;
-        let submitted_applies = view.submitted_applying_count;
         let (received_bytes_per_sec, received_blocks_per_sec) = self
             .state
             .received_throughput
@@ -1478,7 +1422,6 @@ impl BlockSyncReactor {
             bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
             bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
             bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
-            bs_insert_u64(row, bs_trace::SUBMITTED_APPLIES, submitted_applies);
             bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
             bs_insert_u64(row, bs_trace::OUTSTANDING, outstanding as u64);
             if let Some(floor_gap) = floor_gap {
@@ -1541,16 +1484,6 @@ impl BlockSyncReactor {
             );
             bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
             bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
-            bs_insert_u64(
-                row,
-                "unsubmitted_applying_count",
-                view.unsubmitted_applying_count,
-            );
-            bs_insert_u64(
-                row,
-                "submitted_applying_bytes",
-                view.submitted_applying_bytes,
-            );
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
@@ -1884,14 +1817,6 @@ impl BlockSyncReactor {
                 .map(|height| f64::from(height.0))
                 .unwrap_or(0.0),
         );
-        metrics::gauge!("sync.block.lowest_submitted.height").set(
-            self.last_view
-                .lowest_submitted_height
-                .map(|height| f64::from(height.0))
-                .unwrap_or(0.0),
-        );
-        metrics::gauge!("sync.block.unsubmitted_applying")
-            .set(self.last_view.unsubmitted_applying_count as f64);
         metrics::gauge!("sync.block.commit_frontier_stall.seconds")
             .set(self.last_view.commit_frontier_stall_seconds as f64);
         metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
@@ -1999,27 +1924,6 @@ impl BlockSyncReactor {
                     bs_insert_height(row, bs_trace::RANGE_START, first.height);
                 }
             }
-            #[cfg(test)]
-            BlockSyncEvent::TestApplyDone {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                bs_insert_str(row, bs_trace::KIND, "test_apply_finished");
-                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
-                bs_insert_height(row, bs_trace::HEIGHT, *height);
-                bs_insert_hash(row, bs_trace::HASH, *hash);
-                bs_insert_str(
-                    row,
-                    bs_trace::RESULT,
-                    block_apply_result_label_for_test(*result),
-                );
-                if let Some(frontiers) = local_frontier {
-                    bs_insert_frontiers(row, frontiers);
-                }
-            }
             BlockSyncEvent::BlockRangeResponseFinished {
                 peer,
                 start_height,
@@ -2063,15 +1967,6 @@ impl BlockSyncReactor {
                 bs_insert_height(row, bs_trace::RANGE_START, *start);
                 bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
             }
-            #[cfg(test)]
-            BlockSyncAction::ApplySubmitted { token, block } => {
-                bs_insert_str(row, bs_trace::KIND, "apply_submitted");
-                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
-                bs_insert_hash(row, bs_trace::HASH, block.hash());
-                if let Some(height) = block.coinbase_height() {
-                    bs_insert_height(row, bs_trace::HEIGHT, height);
-                }
-            }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 bs_insert_str(row, bs_trace::KIND, "misbehavior");
                 bs_insert_peer(row, bs_trace::PEER, peer);
@@ -2084,16 +1979,6 @@ impl BlockSyncReactor {
 pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
-}
-
-#[cfg(test)]
-fn block_apply_result_label_for_test(result: BlockApplyResult) -> &'static str {
-    match result {
-        BlockApplyResult::Committed => "committed",
-        BlockApplyResult::Duplicate => "duplicate",
-        BlockApplyResult::Rejected => "rejected",
-        BlockApplyResult::TimedOut => "timed_out",
-    }
 }
 
 pub(super) fn bs_insert_peer(

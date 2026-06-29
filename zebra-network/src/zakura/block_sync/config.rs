@@ -67,11 +67,14 @@ pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize = MIN_BS_CHECKPOINT_SUBM
 /// submitted body stays reserved against `max_inflight_block_bytes` until it is
 /// durable. A budget that cannot hold a whole worst-case range can never
 /// complete one: the verifier never commits, nothing becomes durable, and no
-/// bytes are ever released.
+/// bytes are ever released. The old
+/// apply-window encoded this as a block *count*
+/// ([`DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES`], one max gap plus the boundary
+/// block); the byte budget must encode the same guarantee in bytes.
 pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
-    // `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+    // `DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
     // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
-    MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
+    DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default central floor-watchdog cadence.
@@ -290,6 +293,18 @@ impl ZakuraBlockSyncConfig {
         }
         if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
+        }
+        // The byte budget must hold a full checkpoint range in flight, or the
+        // checkpoint verifier never resolves a partially-submitted range:
+        // nothing becomes durable, no bytes are released, and checkpoint sync
+        // deadlocks below the boundary. The release-on-durable design makes this
+        // a hard precondition (the old apply-window encoded it as a block count).
+        if self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR {
+            return Err(
+                "max_inflight_block_bytes must hold one full checkpoint range \
+                 (DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES * BS_PER_BLOCK_WORST_CASE_BYTES) \
+                 or checkpoint sync can deadlock",
+            );
         }
         Ok(())
     }

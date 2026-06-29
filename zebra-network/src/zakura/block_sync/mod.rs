@@ -31,6 +31,7 @@ use super::{
 };
 
 mod admission;
+mod apply_item;
 mod config;
 mod error;
 mod events;
@@ -49,15 +50,15 @@ mod tests;
 mod wire;
 mod work_queue;
 
+pub use apply_item::{ApplyItem, CommitRejection, CommitterReset};
 pub use config::{
     BlockSyncStatus, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
     MAX_BS_RESPONSE_BYTES,
 };
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyClass, BlockApplyExecutor, BlockApplyExecutorPort, BlockApplyLimits,
-    BlockApplyOutput, BlockApplyRequest, BlockApplyResult, BlockApplyToken, BlockSyncAction,
-    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyClass, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
