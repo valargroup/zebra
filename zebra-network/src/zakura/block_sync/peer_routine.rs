@@ -628,40 +628,46 @@ impl PeerRoutine {
                     .first_pending_in_range(servable_low, servable_high.min(floor_high))
                     .is_some()
             {
-                let floor_available = self.budget.available().min(response_byte_cap);
-                if floor_available == 0 {
-                    Vec::new()
-                } else {
-                    let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
-                        admission_decision(
-                            &self.config,
-                            AdmissionSnapshot {
-                                download_floor: view.download_floor,
-                                reorder_buffered_bytes: view.reorder_buffered_bytes,
-                                reorder_buffered_blocks: view.reorder_len,
-                                applying_buffered_bytes: view.applying_buffered_bytes,
-                                applying_buffered_blocks: view.applying_len,
-                                sequencer_input_queued_bytes: self
-                                    .sequencer_input_bytes
-                                    .load(std::sync::atomic::Ordering::Relaxed),
-                                reserved_above_floor_bytes,
-                                reserved_above_floor_blocks,
-                                budget_available: self.budget.available(),
-                            },
-                            tail_start,
-                            response_byte_cap,
-                        )
-                    }) {
-                        Some(_) => servable_high,
-                        None => servable_high.min(floor_high),
-                    };
-                    self.work.take_in_range_budgeted(
-                        servable_low,
-                        floor_take_high,
-                        max_count,
-                        floor_available,
+                // Size the floor take by the live budget as usual, but never below one
+                // byte. `take_in_range_budgeted` always takes its first item regardless of
+                // the byte cap, so a `>= 1` cap guarantees the floor block itself is taken
+                // even when the budget is exactly full — which reaches
+                // `reserve_request_budget`'s floor path, whose `FundFloorReservation` sheds
+                // an above-floor reorder body to fund the floor. The bare `budget.available()`
+                // cap collapsed to an *empty* take at `available() == 0`, breaking the fill
+                // loop before the funding path and wedging the floor permanently. The
+                // `.min(response_byte_cap)` still bounds the speculative above-floor tail to
+                // the live budget, so a funded floor request never over-commits.
+                let floor_available = self.budget.available().min(response_byte_cap).max(1);
+                let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
+                    admission_decision(
+                        &self.config,
+                        AdmissionSnapshot {
+                            download_floor: view.download_floor,
+                            reorder_buffered_bytes: view.reorder_buffered_bytes,
+                            reorder_buffered_blocks: view.reorder_len,
+                            applying_buffered_bytes: view.applying_buffered_bytes,
+                            applying_buffered_blocks: view.applying_len,
+                            sequencer_input_queued_bytes: self
+                                .sequencer_input_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            reserved_above_floor_bytes,
+                            reserved_above_floor_blocks,
+                            budget_available: self.budget.available(),
+                        },
+                        tail_start,
+                        response_byte_cap,
                     )
-                }
+                }) {
+                    Some(_) => servable_high,
+                    None => servable_high.min(floor_high),
+                };
+                self.work.take_in_range_budgeted(
+                    servable_low,
+                    floor_take_high,
+                    max_count,
+                    floor_available,
+                )
             } else {
                 Vec::new()
             };
@@ -1940,5 +1946,129 @@ impl Drop for PeerRoutine {
             self.budget.release(released);
         }
         self.registry.clear_outstanding(&self.peer, self.generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use tokio::sync::{mpsc, watch};
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+    use zebra_chain::block;
+
+    use super::super::peer_registry::PeerRegistry;
+    use super::super::request::BlockSizeEstimate;
+    use super::super::sequencer_task::{initial_view, SequencerControlInput};
+    use super::super::state::{ByteBudget, ThroughputMeter};
+    use super::super::work_queue::WorkQueue;
+    use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
+    use super::PeerRoutine;
+    use crate::zakura::framed_channel;
+    use crate::zakura::trace::ZakuraTrace;
+    use crate::zakura::ZakuraPeerId;
+
+    /// A floor request whose byte reservation cannot be met must still reach the
+    /// sequencer's floor-funding path so the rescue shed can free room — even when the
+    /// byte budget is *exactly* full.
+    ///
+    /// Regression guard for the wedge where `try_fill`'s floor arm sized its take by
+    /// `budget.available()`: at `available() == 0` the take came back empty, the fill
+    /// loop broke, and `reserve_request_budget` (the only caller that emits
+    /// `FundFloorReservation`) was never reached — so the shed that would rescue the
+    /// floor never fired and the floor wedged permanently. The fix sizes the floor take
+    /// by one response and lets the reservation shed; here we assert the funding request
+    /// is emitted with a non-zero need.
+    #[tokio::test]
+    async fn exhausted_budget_floor_request_still_reaches_the_funding_path() {
+        let config = ZakuraBlockSyncConfig::default();
+
+        // A byte budget reserved down to exactly zero free: the case that used to wedge.
+        let mut budget = ByteBudget::new(8_192);
+        assert!(budget.try_reserve(8_192));
+        assert_eq!(budget.available(), 0, "the budget is exactly full");
+
+        // The floor height (1) is pending and servable by this peer; the download floor
+        // is 0 so height 1 is the floor.
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        assert_eq!(
+            work.extend([(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )]),
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        // The routine learns these from a `Status` frame in production; set them directly
+        // so a single `try_fill` pass exercises the floor arm.
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+
+        let fill = tokio::spawn(async move {
+            routine.try_fill().await;
+        });
+
+        let message = timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("an exhausted floor must request funding within the timeout")
+            .expect("the sequencer-control channel stays open");
+        match message {
+            SequencerControlInput::FundFloorReservation {
+                needed_bytes,
+                reply,
+            } => {
+                assert!(
+                    needed_bytes > 0,
+                    "the floor reservation funds a non-zero request",
+                );
+                // No reorder body to shed in this unit-level test: deny the funding. The
+                // routine returns the taken floor height and exits the pass cleanly.
+                let _ = reply.send(false);
+            }
+            other => panic!("expected FundFloorReservation, got {other:?}"),
+        }
+
+        fill.await
+            .expect("try_fill completes after the funding decision");
     }
 }

@@ -48,6 +48,23 @@ impl BlockSyncPeerSession {
         }
     }
 
+    /// Build a session directly from a `FramedSend` for routine-level unit tests,
+    /// bypassing a full `PeerStreamSession`. The `send` half feeds a `framed_channel`
+    /// the test reads, and `cancel_token` lets the test tear the routine down.
+    #[cfg(test)]
+    pub(super) fn for_test(
+        peer_id: ZakuraPeerId,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            peer_id,
+            direction: ServicePeerDirection::Outbound,
+            send,
+            cancel_token,
+        }
+    }
+
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
