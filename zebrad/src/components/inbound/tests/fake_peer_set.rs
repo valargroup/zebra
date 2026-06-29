@@ -34,8 +34,9 @@ use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
-            gossip_mempool_transaction_id, Config as MempoolConfig, Mempool, MempoolError,
-            SameEffectsChainRejectionError, UnboxMempoolError,
+            downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, gossip_mempool_transaction_id,
+            Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
+            UnboxMempoolError,
         },
         sync::{self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY},
     },
@@ -156,7 +157,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     // Test `Request::PushTransaction`
     let request = inbound_service
         .clone()
-        .oneshot(Request::PushTransaction(tx.clone().into()));
+        .oneshot(Request::PushTransaction(tx.clone().into(), None));
     // Simulate a successful transaction verification
     let verification = tx_verifier.expect_request_that(|_| true).map(|responder| {
         let transaction = responder
@@ -207,6 +208,93 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
     hs.insert(tx.unmined_id());
     peer_set
         .expect_request(Request::AdvertiseTransactionIds(hs, None))
+        .await
+        .respond(Response::Nil);
+
+    let sync_gossip_result = sync_gossip_task_handle.now_or_never();
+    assert!(
+        sync_gossip_result.is_none(),
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
+    );
+
+    let tx_gossip_result = tx_gossip_task_handle.now_or_never();
+    assert!(
+        tx_gossip_result.is_none(),
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), crate::BoxError> {
+    let block: Arc<Block> =
+        zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
+    let tx = block.transactions[1].clone();
+    let test_transaction_id = tx.unmined_id();
+
+    let (
+        inbound_service,
+        _mempool_guard,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let peer_source =
+        zebra_network::PeerSource::LegacySocket(SocketAddr::from(([127, 0, 0, 1], 8233)).into());
+    let request = inbound_service.clone().oneshot(Request::PushTransaction(
+        tx.clone().into(),
+        Some(peer_source),
+    ));
+
+    let verification = tx_verifier.expect_request_that(|_| true).map(|responder| {
+        let transaction = responder
+            .request()
+            .clone()
+            .mempool_transaction()
+            .expect("unexpected non-mempool request");
+
+        responder.respond(transaction::Response::from(
+            VerifiedUnminedTx::new(
+                transaction,
+                Amount::try_from(1_000_000).expect("valid amount"),
+                0,
+                0,
+                std::sync::Arc::new(vec![]),
+            )
+            .expect("verification should pass"),
+        ));
+    });
+
+    let (push_response, _) = futures::join!(request, verification);
+    assert_eq!(
+        push_response.expect("unexpected error response from inbound service"),
+        Response::Nil,
+        "peer-pushed transactions should queue successfully",
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mempool_response = inbound_service
+        .clone()
+        .oneshot(Request::MempoolTransactionIds)
+        .await;
+    assert_eq!(
+        mempool_response.expect("unexpected error response from mempool"),
+        Response::TransactionIds(vec![test_transaction_id]),
+    );
+
+    peer_set
+        .expect_request(Request::AdvertiseTransactionIds(
+            HashSet::from([test_transaction_id]),
+            None,
+        ))
         .await
         .respond(Response::Nil);
 
@@ -336,6 +424,82 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn peer_mempool_full_queue_is_reported_as_overload() -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool_guard,
+        _committed_blocks,
+        _added_transactions,
+        _tx_verifier,
+        mut peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let peer_id = zebra_network::zakura::ZakuraPeerId::new(vec![7; 32])
+        .expect("test peer id is within bounds");
+    let source = zebra_network::PeerSource::Zakura(peer_id);
+    let txid = |index: u8| UnminedTxId::from_legacy_id(zebra_chain::transaction::Hash([index; 32]));
+
+    for index in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        let response = inbound_service
+            .clone()
+            .oneshot(Request::AdvertiseTransactionIds(
+                HashSet::from([txid(u8::try_from(index).expect("test index fits u8"))]),
+                Some(source.clone()),
+            ))
+            .await?;
+        assert_eq!(response, Response::Nil);
+    }
+
+    let error = inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseTransactionIds(
+            HashSet::from([txid(99)]),
+            Some(source.clone()),
+        ))
+        .await
+        .expect_err("peer-caused full queue should be surfaced as overload");
+    assert!(
+        error
+            .downcast_ref::<tower::load_shed::error::Overloaded>()
+            .is_some(),
+        "expected overload error, got {error:?}",
+    );
+
+    for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        peer_set
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    Request::TransactionsByIdFrom {
+                        source: request_source,
+                        ..
+                    } if request_source == &source
+                )
+            })
+            .await
+            .respond(Response::Transactions(Vec::new()));
+    }
+
+    let sync_gossip_result = sync_gossip_task_handle.now_or_never();
+    assert!(
+        sync_gossip_result.is_none(),
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
+    );
+
+    let tx_gossip_result = tx_gossip_task_handle.now_or_never();
+    assert!(
+        tx_gossip_result.is_none(),
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -369,7 +533,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Push test transaction
     let request = inbound_service
         .clone()
-        .oneshot(Request::PushTransaction(tx1.clone().into()));
+        .oneshot(Request::PushTransaction(tx1.clone().into(), None));
     // Simulate a successful transaction verification
     let verification = tx_verifier.expect_request_that(|_| true).map(|responder| {
         tx1_id = responder.request().tx_id();
@@ -510,7 +674,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Push a second transaction to trigger `remove_expired_transactions()`
     let request = inbound_service
         .clone()
-        .oneshot(Request::PushTransaction(tx2.clone().into()));
+        .oneshot(Request::PushTransaction(tx2.clone().into(), None));
     // Simulate a successful transaction verification
     let verification = tx_verifier.expect_request_that(|_| true).map(|responder| {
         tx2_id = responder.request().tx_id();
