@@ -14,6 +14,12 @@ pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGH
 /// BBR-lite multiplicative cwnd dip applied on a real request timeout (one dip,
 /// not the cubic ladder), bounded below by `bbr_min_cwnd`.
 const BBR_TIMEOUT_DIP: f64 = 0.85;
+/// EWMA weight for the smoothed request round-trip the delay-gradient compares against
+/// RTprop (higher = more responsive, noisier).
+const BBR_DELAY_EWMA_ALPHA: f64 = 0.25;
+/// Multiplicative shrink applied to the delay-gradient ceiling on each delivery whose
+/// smoothed round-trip exceeds `RTprop × delay_gradient` (queue building).
+const BBR_DELAY_CAP_DOWN: f64 = 0.9;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -351,6 +357,10 @@ struct BbrParams {
     /// How long to hold the cwnd at `min_cwnd` once the queue has drained, so at
     /// least one uncontended request completes and yields a clean RTprop sample.
     probe_rtt_duration: Duration,
+    /// Smoothed-RTT / RTprop ratio above which the queue is judged to be building and
+    /// the delay-gradient ceiling ratchets the cwnd down (e.g. 1.5 = shrink once the
+    /// recent round-trip runs 50% over the uncontended minimum).
+    delay_gradient: f64,
 }
 
 impl BbrParams {
@@ -368,6 +378,7 @@ impl BbrParams {
             delivery_rate_window: config.bbr_delivery_rate_window,
             probe_rtt_interval: config.bbr_probe_rtt_interval,
             probe_rtt_duration: config.bbr_probe_rtt_duration,
+            delay_gradient: f64::from(config.bbr_delay_gradient_percent.max(100)) / 100.0,
         }
     }
 }
@@ -416,6 +427,15 @@ struct BbrState {
     /// Set the moment the queue first drains to `min_cwnd` during a ProbeRtt; the
     /// `probe_rtt_duration` hold timer runs from here.
     probe_rtt_drained_at: Option<Instant>,
+    /// EWMA of the request round-trip, compared against RTprop by the delay-gradient.
+    smoothed_elapsed_secs: Option<f64>,
+    /// Delay-gradient ceiling on the effective cwnd. Starts unbounded (`usize::MAX`) so
+    /// it never limits an uncongested peer; ratchets down toward the true operating
+    /// point whenever the smoothed round-trip rises above `RTprop × delay_gradient`, and
+    /// relaxes back up when the queue clears. Guards against a `BtlBw × RTprop` BDP that
+    /// overshoots the sustainable rate (max-rate and min-RTT can come from different
+    /// samples under variable queueing), which would otherwise inflate the cwnd.
+    delay_cap: usize,
 }
 
 impl BbrState {
@@ -429,6 +449,8 @@ impl BbrState {
             phase: BbrPhase::ProbeBw,
             last_probe_rtt_at: None,
             probe_rtt_drained_at: None,
+            smoothed_elapsed_secs: None,
+            delay_cap: usize::MAX,
             params,
         }
     }
@@ -449,7 +471,44 @@ impl BbrState {
         if let Some(target) = self.cwnd_target() {
             self.cwnd_cap = target;
         }
+        // Delay-gradient runs in ProbeBw only: the drained round-trips ProbeRtt produces
+        // are artificially short and would spuriously relax the ceiling. `phase` here is
+        // still the pre-`advance_phase` value, so a tick that flips into ProbeRtt this
+        // call last updated the ceiling under genuine ProbeBw conditions.
+        if self.phase == BbrPhase::ProbeBw {
+            self.update_delay_cap(secs);
+        }
         self.advance_phase(now, inflight);
+    }
+
+    /// Update the delay-gradient ceiling from this delivery's round-trip. When the
+    /// smoothed round-trip rises above `RTprop × delay_gradient` the queue is building,
+    /// so ratchet the ceiling down from the current operating cwnd; otherwise relax it
+    /// back up so a cleared queue lets the cwnd re-probe for bandwidth.
+    fn update_delay_cap(&mut self, secs: f64) {
+        let smoothed = match self.smoothed_elapsed_secs {
+            Some(prev) => prev * (1.0 - BBR_DELAY_EWMA_ALPHA) + secs * BBR_DELAY_EWMA_ALPHA,
+            None => secs,
+        };
+        self.smoothed_elapsed_secs = Some(smoothed);
+        let rtprop = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
+        if smoothed > rtprop * self.params.delay_gradient {
+            // Queue building: shrink the ceiling relative to the current operating cwnd.
+            let operating = self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd);
+            let shrunk = (operating as f64 * BBR_DELAY_CAP_DOWN).round();
+            // A non-negative product of a usize and 0.9; the cast is safe.
+            let shrunk = if shrunk.is_finite() && shrunk >= 0.0 {
+                shrunk as usize
+            } else {
+                self.params.min_cwnd
+            };
+            self.delay_cap = shrunk.max(self.params.min_cwnd);
+        } else {
+            // Headroom: relax the ceiling up (~12%/delivery), saturating so an
+            // uncongested peer's ceiling stays effectively unbounded.
+            let grow = (self.delay_cap / 8).max(1);
+            self.delay_cap = self.delay_cap.saturating_add(grow);
+        }
     }
 
     /// Drive the ProbeBw/ProbeRtt cycle off completed deliveries (the only event that
@@ -487,18 +546,20 @@ impl BbrState {
     }
 
     /// The effective cwnd in blocks currently applied (never below `min_cwnd`). During
-    /// ProbeRtt the cwnd is pinned to `min_cwnd` to drain the queue.
+    /// ProbeRtt the cwnd is pinned to `min_cwnd` to drain the queue; in ProbeBw it is the
+    /// BDP-derived cwnd capped by the delay-gradient ceiling.
     fn effective_cwnd(&self) -> usize {
         match self.phase {
             BbrPhase::ProbeRtt => self.params.min_cwnd,
-            BbrPhase::ProbeBw => self.cwnd_cap.max(self.params.min_cwnd),
+            BbrPhase::ProbeBw => self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd),
         }
     }
 
     /// Apply one multiplicative dip on a real timeout (BBR-style), bounded by the
     /// minimum cwnd. Does not run the cubic backoff ladder. Suppressed during ProbeRtt,
     /// where the cwnd is already pinned to `min_cwnd` and timeouts are an expected
-    /// consequence of the drain, not congestion signal.
+    /// consequence of the drain, not congestion signal. A timeout is strong congestion
+    /// evidence, so it also ratchets the delay-gradient ceiling down to the dipped cwnd.
     fn dip_on_timeout(&mut self) {
         if self.phase == BbrPhase::ProbeRtt {
             return;
@@ -511,6 +572,7 @@ impl BbrState {
             self.params.min_cwnd
         };
         self.cwnd_cap = dipped.max(self.params.min_cwnd);
+        self.delay_cap = self.delay_cap.min(self.cwnd_cap);
     }
 
     /// Bandwidth-delay product in blocks: BtlBw (blocks/s) × RTprop (s). `None` until
@@ -554,6 +616,19 @@ impl BbrState {
     /// Numeric phase code for the trace (0 = ProbeBw, 1 = ProbeRtt).
     fn phase_code(&self) -> u64 {
         self.phase.trace_code()
+    }
+
+    /// The smoothed request round-trip in milliseconds, for tracing the delay-gradient.
+    fn smoothed_elapsed_ms(&self) -> Option<u64> {
+        // A rounded non-negative round-trip in milliseconds fits u64 for any real RTT.
+        self.smoothed_elapsed_secs
+            .map(|secs| (secs * 1000.0).round() as u64)
+    }
+
+    /// The delay-gradient ceiling in blocks once it has bound the cwnd (`None` while
+    /// still unbounded), for tracing.
+    fn delay_cap(&self) -> Option<usize> {
+        (self.delay_cap != usize::MAX).then_some(self.delay_cap)
     }
 }
 
@@ -622,6 +697,18 @@ impl DownloadWindow {
     /// The current BBR phase as a numeric code (0 = ProbeBw, 1 = ProbeRtt), for tracing.
     pub(super) fn bbr_phase_code(&self) -> u64 {
         self.bbr.phase_code()
+    }
+
+    /// The smoothed request round-trip in milliseconds the delay-gradient tracks.
+    pub(super) fn bbr_smoothed_elapsed_ms(&self) -> Option<u64> {
+        self.bbr.smoothed_elapsed_ms()
+    }
+
+    /// The delay-gradient cwnd ceiling in blocks once it binds (`None` while unbounded).
+    pub(super) fn bbr_delay_cap(&self) -> Option<u64> {
+        self.bbr
+            .delay_cap()
+            .map(|cap| u64::try_from(cap).unwrap_or(u64::MAX))
     }
 
     pub(super) fn available_slots(&self) -> usize {
@@ -1196,6 +1283,60 @@ mod bbr_tests {
         // Saturated even into the bonus region: nothing left for anyone.
         fill_outstanding(&mut window, 2);
         assert_eq!(window.available_slots_with_bonus(2), 0);
+    }
+
+    #[test]
+    fn delay_gradient_does_not_bind_an_uncongested_peer() {
+        // Every delivery's round-trip equals RTprop (no queue), so the delay ceiling
+        // stays unbounded and the cwnd tracks the full BDP target.
+        let mut bbr = BbrState::new(&bbr_test_config());
+        let mut now = Instant::now();
+        for _ in 0..20 {
+            bbr.record_delivery(now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+            now += Duration::from_millis(5);
+        }
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+        assert!(bbr.delay_cap().is_none(), "ceiling should stay unbounded");
+    }
+
+    #[test]
+    fn delay_gradient_caps_cwnd_when_the_round_trip_inflates() {
+        // RTprop is established low (10 ms), then every round-trip runs far above it
+        // (queue building) while the BtlBw×RTprop target stays high — exactly the cwnd
+        // overshoot the delay-gradient must contain. The ceiling ratchets the effective
+        // cwnd well below the (inflated) BDP target.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        // One clean delivery anchors RTprop at 10 ms and the BDP target at 80.
+        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        // Now deliveries keep arriving at the same low RTprop sample for the min-filter
+        // (so the target stays 80) but with long *smoothed* round-trips — model that with
+        // a low-elapsed sample to hold RTprop and the cwnd target, interleaved with the
+        // queue signal. Here we simply feed inflated round-trips: RTprop min stays 10 ms
+        // (the first sample is in-window), smoothed climbs, the ceiling ratchets down.
+        let inflated = Duration::from_millis(120);
+        let mut now = t0;
+        for _ in 0..40 {
+            now += Duration::from_millis(5);
+            bbr.record_delivery(now, inflated, CLEAN_BLOCKS, 50);
+        }
+        assert_eq!(
+            bbr.phase,
+            BbrPhase::ProbeBw,
+            "stay in ProbeBw for this test"
+        );
+        assert!(
+            bbr.effective_cwnd() < EXPECTED_CWND,
+            "delay-gradient should cap the cwnd below the BDP target, got {}",
+            bbr.effective_cwnd(),
+        );
+        assert!(
+            bbr.delay_cap().is_some(),
+            "the ceiling should have bound the cwnd",
+        );
     }
 
     #[test]

@@ -1771,6 +1771,12 @@ impl PeerRoutine {
             }
             bs_insert_u64(row, "bbr_delivered", self.window.bbr_delivered());
             bs_insert_u64(row, "bbr_phase", self.window.bbr_phase_code());
+            if let Some(smoothed_ms) = self.window.bbr_smoothed_elapsed_ms() {
+                bs_insert_u64(row, "bbr_smoothed_elapsed_ms", smoothed_ms);
+            }
+            if let Some(delay_cap) = self.window.bbr_delay_cap() {
+                bs_insert_u64(row, "bbr_delay_cap", delay_cap);
+            }
         });
     }
 
