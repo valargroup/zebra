@@ -36,7 +36,66 @@ zebra-replay-bench apply --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
 
 # One altitude up: replay through the real zebra-state write worker
 zebra-replay-bench apply-worker --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+
+# Two altitudes up: replay through the real zebra-consensus checkpoint verifier
+zebra-replay-bench apply-verifier --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+
+# Three altitudes up: replay through the real Zakura block-sync Sequencer (VCT-only)
+zebra-replay-bench apply-sequencer --base /path/to/fork-at-1800000 --cache /tmp/win.zrb --vct-sidecar /tmp/win.vct
 ```
+
+## Third altitude: `apply-verifier`
+
+`apply-verifier` drives blocks through the real `zebra-consensus::CheckpointVerifier`,
+which internally commits to a real `zebra-state` `StateService` (→ write worker →
+committer). It adds the per-block work the lower rungs skip: proof-of-work
+(difficulty + equihash) and Merkle-root validity, plus checkpoint-range batching.
+Unlike `apply`/`apply-worker` (sync), it runs on a multi-thread tokio runtime
+because the verifier is a Tower service. Comparing its throughput to `apply-worker`
+isolates what verification adds on top of the commit pipeline.
+
+Checkpoint batching + the VCT successor boundary: the verifier only releases a
+block once its whole checkpoint range is contiguous, and the worker's VCT fast path
+can't commit a block until its successor is buffered. The final checkpoint's
+successor is in the dropped tail (its range can't complete past the window), so the
+bench **feeds** up to the last checkpoint `<= end` (to deliver the successors the
+worker needs) but **counts/gates** to the second-to-last checkpoint, checking that
+block's committed hash against the embedded checkpoint hash. As with the other
+rungs, blocks are read/parsed off-thread by the bounded prefetch and fed with a
+bounded in-flight window (`ZRB_PREFETCH_CAP`, at least one checkpoint gap so ranges
+always complete); a periodic progress log makes any stall observable.
+
+## Fourth altitude: `apply-sequencer` (VCT-only, POC)
+
+`apply-sequencer` drives blocks through the **real Zakura block-sync `Sequencer`**
+(`zebra-network`), one rung above the verifier. The sequencer is the body reorder +
+ordered-submit pipeline: bodies are fed into its reorder queue, it drains the
+contiguous prefix into `applying` and emits `SubmitBlock`s, and a thin driver here
+commits each through the same real `CheckpointVerifier` → `StateService` as
+`apply-verifier`, reporting the commit back so the sequencer frontier advances and
+releases the next blocks. Comparing to `apply-verifier` isolates the sequencer's
+reorder/ordering/backpressure overhead.
+
+It uses the real `SequencerTask` via a feature-gated helper
+(`zebra_network::zakura::spawn_bench_sequencer`, `internal-bench`). **VCT-only**
+(the Zakura fast-sync path) and, for this POC, bodies are fed **in height order**
+(random / out-of-order multi-peer arrival — the reorder buffer's stress case — is a
+future knob). Same checkpoint-batching boundary as `apply-verifier`: feed to the
+last checkpoint, commit/gate to the second-to-last.
+
+Two optional flags:
+
+- Storage mode is **Pruned by default** (the `--base` snapshot must already be pruned;
+  pruning is one-way), matching the production mainnet config. Pass `--archive` to commit
+  in Archive mode instead (full raw-tx + indexes, ~2× the bytes written; needs an archive
+  base).
+- `--trace-dir <dir>` writes the **structured Zakura JSONL trace tables** (the
+  `block_sync` body lifecycle: `block_body_accepted` / `block_body_submitted` with
+  queue-elapsed and apply tokens) — the same tables `perf-run-mainnet` emits via
+  `[network.zakura] trace_dir`, through the real `ZakuraTrace`/`JsonlTracer`. The
+  writer is flushed at end-of-run. Without it the tracer is `noop()` (zero overhead).
+  Via the harness: `REPLAY_TRACE_DIR=<dir> make perf-replay-sequencer` (add
+  `REPLAY_ARCHIVE=1` for archive mode).
 
 ## Two altitudes: `apply` vs `apply-worker`
 
@@ -97,6 +156,8 @@ make perf-build-replay-bench   # build the bench binary (commit-metrics)
 make perf-replay-index         # one-time: dump the window to a block cache
 make perf-replay               # legacy replay through the committer
 make perf-replay-worker        # same window, through the write worker
+make perf-replay-verifier      # same window, through the checkpoint verifier
+make perf-replay-sequencer     # same window, through the block-sync Sequencer (VCT)
 # VCT fast path:
 make perf-replay-index && deploy/runner/replay_run.sh index-roots
 make perf-replay REPLAY_VCT_SIDECAR=/path/to/win.vct
