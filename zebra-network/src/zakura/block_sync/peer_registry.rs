@@ -439,6 +439,28 @@ impl PeerRegistry {
             .min()
     }
 
+    /// Whether some peer other than `self_peer` is servable for `height` and has a
+    /// free normal (non-bypass) slot. Drives the floor→best-peer bias: a peer that is
+    /// saturated at its cwnd should not borrow a floor-bypass slot when another peer
+    /// can take the floor through its normal capacity. Deadlock-free — deferral only
+    /// happens when a peer with an actually-free slot exists, so the floor still
+    /// progresses; if every servable peer is saturated this returns false and the
+    /// caller bypasses. Uses the per-peer `available_slots` published by the routines.
+    pub(super) fn floor_has_unsaturated_other_server(
+        &self,
+        height: block::Height,
+        self_peer: &ZakuraPeerId,
+    ) -> bool {
+        let peers = self.lock();
+        peers.iter().any(|(peer, entry)| {
+            peer != self_peer
+                && entry.received_status
+                && entry.servable_low <= height
+                && height <= entry.servable_high
+                && entry.slots.available_slots > 0
+        })
+    }
+
     /// Snapshot all peer claims for one height.
     pub(super) fn outstanding_claims_at(&self, height: block::Height) -> Vec<OutstandingClaim> {
         let peers = self.lock();
@@ -520,4 +542,78 @@ pub(super) fn hard_outbound_capacity(max_inflight_requests: u32) -> usize {
     usize::try_from(max_inflight_requests)
         .expect("u32 max inflight requests fits in usize on supported targets")
         .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
+}
+
+#[cfg(test)]
+mod floor_bias_tests {
+    use super::*;
+
+    fn peer(byte: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
+    }
+
+    /// Register `peer` as servable for `[low, high]` with `available` free slots.
+    fn register(
+        reg: &PeerRegistry,
+        config: &super::super::ZakuraBlockSyncConfig,
+        peer: &ZakuraPeerId,
+        low: u32,
+        high: u32,
+        available: usize,
+    ) {
+        let generation = reg.admit(peer, ServicePeerDirection::Outbound, config);
+        reg.upsert_status(
+            peer,
+            generation,
+            BlockSyncStatus {
+                servable_low: block::Height(low),
+                servable_high: block::Height(high),
+                ..BlockSyncStatus::default()
+            },
+        );
+        reg.publish_slots(
+            peer,
+            generation,
+            SlotDiagnostics {
+                available_slots: available,
+                ..SlotDiagnostics::default()
+            },
+        );
+    }
+
+    #[test]
+    fn defers_to_an_unsaturated_other_server() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (a, b) = (peer(1), peer(2));
+        // A is saturated; B serves the floor and has a free slot.
+        register(&reg, &config, &a, 0, 1000, 0);
+        register(&reg, &config, &b, 0, 1000, 3);
+        // A should defer (B can take the floor through its normal capacity)…
+        assert!(reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+        // …but B itself has no other unsaturated server (A is saturated), so B bypasses.
+        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &b));
+    }
+
+    #[test]
+    fn bypasses_when_every_server_is_saturated() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (a, b) = (peer(1), peer(2));
+        register(&reg, &config, &a, 0, 1000, 0);
+        register(&reg, &config, &b, 0, 1000, 0);
+        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+    }
+
+    #[test]
+    fn ignores_an_unsaturated_peer_that_cannot_serve_the_floor() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (a, b) = (peer(1), peer(2));
+        register(&reg, &config, &a, 0, 1000, 0);
+        // B has a free slot but only serves heights 500..=1000 — it cannot take a floor
+        // request at height 100, so A must still bypass.
+        register(&reg, &config, &b, 500, 1000, 3);
+        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+    }
 }

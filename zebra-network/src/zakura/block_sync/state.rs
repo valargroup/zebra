@@ -625,11 +625,24 @@ impl DownloadWindow {
     }
 
     pub(super) fn available_slots(&self) -> usize {
+        self.available_slots_with_bonus(0)
+    }
+
+    /// Available slots allowing `bonus` extra in-flight requests beyond the BBR cwnd,
+    /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
+    /// (above-floor) capacity used by [`available_slots`]; a small positive `bonus` is
+    /// the floor bypass — it lets the lowest missing height be fetched even when the
+    /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
+    pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
         // BBR-lite is the sole congestion controller: cap in-flight at the
         // BDP-derived cwnd (clamped to the hard cap), so a peer's queue stays at
         // ~one BDP and head-of-line latency tracks RTprop instead of growing with
-        // the byte budget.
-        let cwnd = self.bbr.effective_cwnd().min(self.hard_outbound_capacity());
+        // the byte budget. The floor bypass adds at most `bonus` slots on top.
+        let cwnd = self
+            .bbr
+            .effective_cwnd()
+            .saturating_add(bonus)
+            .min(self.hard_outbound_capacity());
         cwnd.saturating_sub(self.outstanding.len())
     }
 
@@ -1137,5 +1150,67 @@ mod bbr_tests {
         bbr.dip_on_timeout();
         assert_eq!(bbr.cwnd_cap, cap_before);
         assert_eq!(bbr.effective_cwnd(), min_cwnd);
+    }
+
+    /// Push `n` placeholder outstanding requests onto a window to drive its slot count.
+    fn fill_outstanding(window: &mut DownloadWindow, n: usize) {
+        let now = Instant::now();
+        for _ in 0..n {
+            window.outstanding.push(OutstandingBlockRange {
+                request: BlockRangeRequest {
+                    start_height: block::Height(0),
+                    count: 1,
+                    anchor_hash: block::Hash([0; 32]),
+                    estimated_bytes: 0,
+                    expected_blocks: Vec::new(),
+                },
+                queued_at: now,
+                deadline: now,
+                received: ReceivedBlockTracker::default(),
+            });
+        }
+    }
+
+    #[test]
+    fn floor_bypass_grants_bonus_slots_only_when_cwnd_is_saturated() {
+        // Cold-start cwnd 8, hard cap well above it so the bonus is not clamped.
+        let cfg = ZakuraBlockSyncConfig {
+            initial_inflight_requests: 8,
+            max_inflight_requests: 256,
+            ..bbr_test_config()
+        };
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(window.bbr_effective_cwnd(), 8);
+
+        // Below cwnd: normal capacity already covers the floor, bonus adds nothing extra
+        // beyond the same headroom.
+        fill_outstanding(&mut window, 6);
+        assert_eq!(window.available_slots(), 2);
+        assert_eq!(window.available_slots_with_bonus(2), 4);
+
+        // Saturated at cwnd: normal capacity is 0 but the floor may borrow the bonus.
+        fill_outstanding(&mut window, 2);
+        assert_eq!(window.available_slots(), 0);
+        assert_eq!(window.available_slots_with_bonus(2), 2);
+
+        // Saturated even into the bonus region: nothing left for anyone.
+        fill_outstanding(&mut window, 2);
+        assert_eq!(window.available_slots_with_bonus(2), 0);
+    }
+
+    #[test]
+    fn floor_bypass_never_exceeds_the_advertised_hard_cap() {
+        // cwnd == hard cap (8): the bypass must not push in-flight past what the peer
+        // advertised it will service.
+        let cfg = ZakuraBlockSyncConfig {
+            initial_inflight_requests: 8,
+            max_inflight_requests: 8,
+            ..bbr_test_config()
+        };
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(window.hard_outbound_capacity(), 8);
+        fill_outstanding(&mut window, 8);
+        assert_eq!(window.available_slots(), 0);
+        assert_eq!(window.available_slots_with_bonus(2), 0);
     }
 }

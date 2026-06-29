@@ -25,6 +25,9 @@ pub(crate) struct InvariantReport {
     pub(crate) final_budget_reserved: u64,
     /// Liveness-reaper / protocol-reject disconnects observed.
     pub(crate) protocol_rejects: usize,
+    /// `block_get_blocks_sent` requests issued via the floor bypass (a floor request
+    /// sent while the peer was saturated at its BBR cwnd).
+    pub(crate) floor_bypass_requests: usize,
 }
 
 /// Extract the report from a flushed trace reader.
@@ -54,6 +57,13 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
+    let floor_bypass_requests = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| event(row) == Some("block_get_blocks_sent"))
+        .filter(|row| u64_field(row, "floor_bypass") == Some(1))
+        .count();
 
     InvariantReport {
         state_samples: state_rows.len(),
@@ -61,6 +71,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         peak_budget_reserved,
         final_budget_reserved,
         protocol_rejects,
+        floor_bypass_requests,
     }
 }
 
