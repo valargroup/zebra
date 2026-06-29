@@ -11,27 +11,9 @@ use crate::zakura::{
 /// [`MAX_BS_INFLIGHT_REQUESTS`]).
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
-/// Consecutive error-free responses that make up one window-growth epoch.
-///
-/// The adaptive window holds flat for a full epoch of successes before each
-/// growth step, so it never opens faster than the peer has demonstrably served.
-const OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES: usize = 16;
-/// Cubic coefficient for the streak-gated window ramp.
-///
-/// Target window = `growth_base + COEFF * epoch^3`, capped at the hard cap, where
-/// `epoch` counts completed [`OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES`]-success
-/// runs since the last timeout. Growth is gentle for the first few epochs and
-/// accelerates the longer the peer serves without an error, then resets on the
-/// next timeout. With the default base of 64 and a 16-success epoch, the window
-/// ramps cubically toward the peer's advertised hard cap (locally clamped to
-/// [`MAX_BS_INFLIGHT_REQUESTS`] = 32,768; the default advertisement is 32,000),
-/// reaching the default 32,000 ceiling after 16 epochs (256 consecutive
-/// error-free successes).
-const OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF: usize = 8;
-/// Cubic coefficient for the streak-gated timeout backoff.
-const OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF: usize = OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF;
-/// Consecutive timeout batches that make up one window-reduction epoch.
-const OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS: usize = OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
+/// BBR-lite multiplicative cwnd dip applied on a real request timeout (one dip,
+/// not the cubic ladder), bounded below by `bbr_min_cwnd`.
+const BBR_TIMEOUT_DIP: f64 = 0.85;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -417,15 +399,22 @@ impl WindowedSamples {
 struct BbrParams {
     cwnd_gain: f64,
     min_cwnd: usize,
+    startup_cwnd: usize,
     rtprop_window: Duration,
     delivery_rate_window: Duration,
 }
 
 impl BbrParams {
     fn from_config(config: &ZakuraBlockSyncConfig) -> Self {
+        let min_cwnd = usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1);
+        // Cold start opens at the configured initial window until the first BDP sample.
+        let startup_cwnd = usize::try_from(config.initial_inflight_requests)
+            .unwrap_or(min_cwnd)
+            .max(min_cwnd);
         Self {
             cwnd_gain: f64::from(config.bbr_cwnd_gain_percent) / 100.0,
-            min_cwnd: usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1),
+            min_cwnd,
+            startup_cwnd,
             rtprop_window: config.bbr_rtprop_window,
             delivery_rate_window: config.bbr_delivery_rate_window,
         }
@@ -442,6 +431,10 @@ struct BbrState {
     rtprop_secs: WindowedSamples,
     btlbw_blocks_per_sec: WindowedSamples,
     delivered: u64,
+    /// Effective cwnd in blocks currently applied by `available_slots`: the
+    /// BDP-derived target once measured, the startup window before that, dipped on
+    /// timeouts. Never below `min_cwnd`.
+    cwnd_cap: usize,
 }
 
 impl BbrState {
@@ -451,6 +444,7 @@ impl BbrState {
             rtprop_secs: WindowedSamples::new(params.rtprop_window),
             btlbw_blocks_per_sec: WindowedSamples::new(params.delivery_rate_window),
             delivered: 0,
+            cwnd_cap: params.startup_cwnd,
             params,
         }
     }
@@ -458,7 +452,8 @@ impl BbrState {
     /// Record a completed request: `elapsed` from send to the final body, `blocks` in
     /// it. The RTprop sample is the round-trip; the BtlBw sample is the delivery rate,
     /// with the interval floored at the current RTprop so a burst of buffered bodies
-    /// arriving within one tick cannot inflate the bandwidth estimate.
+    /// arriving within one tick cannot inflate the bandwidth estimate. Re-derives the
+    /// applied cwnd from the fresh BDP estimate.
     fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
         let secs = elapsed.as_secs_f64();
         self.rtprop_secs.observe(now, secs);
@@ -466,6 +461,27 @@ impl BbrState {
         let rate = f64::from(blocks) / secs.max(floor);
         self.btlbw_blocks_per_sec.observe(now, rate);
         self.delivered = self.delivered.saturating_add(u64::from(blocks));
+        if let Some(target) = self.cwnd_target() {
+            self.cwnd_cap = target;
+        }
+    }
+
+    /// The effective cwnd in blocks currently applied (never below `min_cwnd`).
+    fn effective_cwnd(&self) -> usize {
+        self.cwnd_cap.max(self.params.min_cwnd)
+    }
+
+    /// Apply one multiplicative dip on a real timeout (BBR-style), bounded by the
+    /// minimum cwnd. Does not run the cubic backoff ladder.
+    fn dip_on_timeout(&mut self) {
+        let scaled = (self.cwnd_cap as f64 * BBR_TIMEOUT_DIP).round();
+        // A non-negative product of a usize and 0.85; the cast is safe.
+        let dipped = if scaled.is_finite() && scaled >= 0.0 {
+            scaled as usize
+        } else {
+            self.params.min_cwnd
+        };
+        self.cwnd_cap = dipped.max(self.params.min_cwnd);
     }
 
     /// Bandwidth-delay product in blocks: BtlBw (blocks/s) × RTprop (s). `None` until
@@ -478,7 +494,7 @@ impl BbrState {
     }
 
     /// Target cwnd in blocks = `max(min_cwnd, BDP × gain)`. `None` until the first
-    /// delivery sample exists, so the caller falls back to slow-start.
+    /// delivery sample exists, so the cwnd stays at the cold-start value until then.
     fn cwnd_target(&self) -> Option<usize> {
         let bdp = self.bdp_blocks()?;
         let scaled = (bdp * self.params.cwnd_gain).round();
@@ -513,27 +529,9 @@ impl BbrState {
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outbound_request_window: usize,
-    pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
-    /// Per-peer BBR-lite estimators, sampled on each completed request.
+    /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller.
     bbr: BbrState,
-    /// Completed error-free responses since the last timeout-driven reduction.
-    /// Drives the streak-gated cubic ramp in
-    /// [`increase_outbound_window_after_success`](Self::increase_outbound_window_after_success).
-    consecutive_successes: usize,
-    /// Consecutive timeout batches since the last successful response.
-    ///
-    /// Drives the same streak-gated cubic shape as successful response growth,
-    /// but downward. The window holds flat for a full timeout epoch, then lowers
-    /// faster as the consecutive timeout streak grows.
-    consecutive_timeouts: usize,
-    /// Window value at the last reduction — the floor the cubic ramp grows back
-    /// up from, so probing resumes from the post-backoff window rather than the
-    /// original slow-start point.
-    growth_base: usize,
-    /// Window value when the current timeout streak began.
-    reduction_base: usize,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -549,25 +547,10 @@ pub(super) enum LivenessOutcome {
 
 impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
-        let max_inflight_requests = config.advertised_max_inflight_requests();
-        // Slow-start: open at the configured initial window (clamped to the
-        // advertised hard cap) and grow toward the cap on success, rather than
-        // opening at the full `max_inflight`.
-        let initial_window = config
-            .initial_inflight_requests
-            .clamp(1, max_inflight_requests);
-        let initial_window = usize::try_from(initial_window)
-            .expect("u32 initial inflight requests fits in usize on supported targets");
         Self {
-            max_inflight_requests,
-            outbound_request_window: initial_window,
-            timeout_recovery_slots: 0,
+            max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
             bbr: BbrState::new(config),
-            consecutive_successes: 0,
-            consecutive_timeouts: 0,
-            growth_base: initial_window,
-            reduction_base: initial_window,
             block_liveness_deadline: None,
             last_block_at: None,
         }
@@ -578,9 +561,9 @@ impl DownloadWindow {
         self.bbr.record_delivery(now, elapsed, blocks);
     }
 
-    /// The BBR target cwnd in blocks, or `None` before the first delivery sample.
-    pub(super) fn bbr_cwnd_target(&self) -> Option<usize> {
-        self.bbr.cwnd_target()
+    /// The effective BBR cwnd in blocks currently applied.
+    pub(super) fn bbr_effective_cwnd(&self) -> usize {
+        self.bbr.effective_cwnd()
     }
 
     /// The current RTprop estimate in milliseconds, for tracing.
@@ -599,84 +582,18 @@ impl DownloadWindow {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        let hard_capacity = self.hard_outbound_capacity();
-        let adaptive_limit = hard_capacity.min(self.outbound_request_window);
-        let adaptive_slots = adaptive_limit.saturating_sub(self.outstanding.len());
-        if adaptive_slots > 0 {
-            return adaptive_slots;
-        }
-
-        if self.outbound_request_window == 1 {
-            return 0;
-        }
-
-        self.timeout_recovery_slots
-            .min(hard_capacity.saturating_sub(self.outstanding.len()))
+        // BBR-lite is the sole congestion controller: cap in-flight at the
+        // BDP-derived cwnd (clamped to the hard cap), so a peer's queue stays at
+        // ~one BDP and head-of-line latency tracks RTprop instead of growing with
+        // the byte budget.
+        let cwnd = self.bbr.effective_cwnd().min(self.hard_outbound_capacity());
+        cwnd.saturating_sub(self.outstanding.len())
     }
 
-    pub(super) fn reduce_outbound_window_after_timeout(&mut self) {
-        if self.consecutive_timeouts == 0 {
-            self.reduction_base = self.outbound_request_window;
-        }
-        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
-
-        let epoch = self.consecutive_timeouts / OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS;
-        if epoch > 0 {
-            let cubic_reduction = epoch
-                .saturating_mul(epoch)
-                .saturating_mul(epoch)
-                .saturating_mul(OUTBOUND_WINDOW_REDUCTION_CUBIC_COEFF);
-            let target = self.reduction_base.saturating_sub(cubic_reduction).max(1);
-            // Reduction only: never grow the window on a timeout.
-            self.outbound_request_window = self.outbound_request_window.min(target).max(1);
-        }
-
-        // A timeout ends the current success streak; the cubic ramp restarts from
-        // the reduced window, so growth probes back up from the post-backoff floor.
-        self.consecutive_successes = 0;
-        self.growth_base = self.outbound_request_window;
-        self.timeout_recovery_slots = self
-            .timeout_recovery_slots
-            .saturating_add(1)
-            .min(self.hard_outbound_capacity());
-    }
-
-    /// Grow the adaptive window on a successful response using a streak-gated
-    /// cubic ramp: hold the window flat until a full epoch of consecutive
-    /// successes, then raise it to `growth_base + COEFF * epoch^3` (capped at the
-    /// hard cap). The step grows cubically with the no-error streak, so the window
-    /// opens gently at first and accelerates the longer the peer serves without a
-    /// timeout. Any timeout resets the streak and the base (see
-    /// [`reduce_outbound_window_after_timeout`](Self::reduce_outbound_window_after_timeout)).
-    pub(super) fn increase_outbound_window_after_success(&mut self) {
-        self.consecutive_timeouts = 0;
-        self.reduction_base = self.outbound_request_window;
-        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
-        let max_window = self.hard_outbound_capacity();
-        if self.outbound_request_window >= max_window {
-            return;
-        }
-        let epoch = self.consecutive_successes / OUTBOUND_WINDOW_GROWTH_EPOCH_SUCCESSES;
-        if epoch == 0 {
-            // Still inside the first flat epoch: do not open the window yet.
-            return;
-        }
-        let cubic = epoch
-            .saturating_mul(epoch)
-            .saturating_mul(epoch)
-            .saturating_mul(OUTBOUND_WINDOW_GROWTH_CUBIC_COEFF);
-        let target = self.growth_base.saturating_add(cubic).min(max_window);
-        // Growth only: never shrink the window on a success.
-        self.outbound_request_window = self.outbound_request_window.max(target);
-    }
-
-    pub(super) fn record_outbound_request_scheduled(&mut self) {
-        let adaptive_limit = self
-            .hard_outbound_capacity()
-            .min(self.outbound_request_window);
-        if self.outstanding.len() >= adaptive_limit && self.timeout_recovery_slots > 0 {
-            self.timeout_recovery_slots = self.timeout_recovery_slots.saturating_sub(1);
-        }
+    /// Apply the BBR cwnd dip on a real request timeout (one multiplicative dip,
+    /// bounded by the minimum cwnd).
+    pub(super) fn record_timeout(&mut self) {
+        self.bbr.dip_on_timeout();
     }
 
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {

@@ -567,14 +567,9 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) {
-        // Reconcile the adaptive window's hard cap with the peer's currently
-        // advertised `max_inflight_requests` (it may have grown/shrunk via a
-        // `Status`; `handle_status` set `window.max_inflight_requests`). Mirrors
-        // the previous `handle_status` clamp of the window / recovery slots to the
-        // new hard capacity.
-        let hard = self.window.hard_outbound_capacity();
-        self.window.outbound_request_window = self.window.outbound_request_window.min(hard).max(1);
-        self.window.timeout_recovery_slots = self.window.timeout_recovery_slots.min(hard);
+        // The BBR cwnd is clamped to the peer's advertised hard cap inside
+        // `available_slots`, so there is no separate window to reconcile on a
+        // `Status` change.
         // GC this routine's own fully-committed outstanding requests: when the
         // committed floor passes the end of a request, its bodies are no longer
         // needed, so release its reservation and free its slot promptly rather
@@ -807,7 +802,6 @@ impl PeerRoutine {
 
             let deadline = queued_at + self.config.request_timeout;
             metrics::counter!("sync.block.request.sent").increment(1);
-            self.window.record_outbound_request_scheduled();
             let request_start_height = request.start_height;
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
@@ -922,7 +916,7 @@ impl PeerRoutine {
         if timed_out.is_empty() {
             return false;
         }
-        self.window.reduce_outbound_window_after_timeout();
+        self.window.record_timeout();
         for outstanding in &timed_out {
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
@@ -1143,7 +1137,6 @@ impl PeerRoutine {
             outstanding.mark_received(height);
             if outstanding.is_complete() {
                 completed = Some(self.window.outstanding.remove(index));
-                self.window.increase_outbound_window_after_success();
             }
         }
         if completed.is_some() {
@@ -1577,9 +1570,9 @@ impl PeerRoutine {
             self.generation,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
-                effective_window: hard_capacity.min(self.window.outbound_request_window),
+                effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
                 available_slots: self.window.available_slots(),
-                timeout_recovery_slots: self.window.timeout_recovery_slots,
+                timeout_recovery_slots: 0,
                 outstanding_requests: self.window.outstanding.len(),
             },
         );
@@ -1685,13 +1678,8 @@ impl PeerRoutine {
             );
             bs_insert_u64(
                 row,
-                "outbound_request_window",
-                u64::try_from(self.window.outbound_request_window).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                "timeout_recovery_slots",
-                u64::try_from(self.window.timeout_recovery_slots).unwrap_or(u64::MAX),
+                "bbr_cwnd",
+                u64::try_from(self.window.bbr_effective_cwnd()).unwrap_or(u64::MAX),
             );
             bs_insert_u64(
                 row,
@@ -1782,9 +1770,11 @@ impl PeerRoutine {
             if let Some(request_elapsed_ms) = request_elapsed_ms {
                 bs_insert_u64(row, "request_elapsed_ms", request_elapsed_ms);
             }
-            if let Some(cwnd) = self.window.bbr_cwnd_target() {
-                bs_insert_u64(row, "bbr_cwnd", u64::try_from(cwnd).unwrap_or(u64::MAX));
-            }
+            bs_insert_u64(
+                row,
+                "bbr_cwnd",
+                u64::try_from(self.window.bbr_effective_cwnd()).unwrap_or(u64::MAX),
+            );
             if let Some(rtprop_ms) = self.window.bbr_rtprop_ms() {
                 bs_insert_u64(row, "bbr_rtprop_ms", rtprop_ms);
             }
