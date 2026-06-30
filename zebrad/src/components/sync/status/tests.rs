@@ -174,3 +174,35 @@ fn high_sync_lengths() {
 
     assert!(!status.is_close_to_tip());
 }
+
+/// A network with proof-of-work disabled is always close to the tip, even with no recorded sync
+/// lengths, so a single node can mine without peers. Regtest already relied on this; this also
+/// covers custom PoW-disabled test networks (e.g. a mainnet shadow-fork upgrade test).
+#[test]
+fn disable_pow_network_is_close_to_tip() {
+    use zebra_chain::parameters::{testnet::Parameters, Network};
+
+    // Regtest has proof-of-work disabled by default.
+    let regtest = Network::new_regtest(Default::default());
+    let (status, _recent_sync_lengths) = SyncStatus::new_for_network(&regtest);
+    assert!(
+        status.is_close_to_tip(),
+        "regtest (PoW disabled) should be close to tip with no sync lengths",
+    );
+
+    // A custom, non-regtest testnet with proof-of-work disabled.
+    let custom = Parameters::build()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters with disabled PoW are valid");
+    assert!(!custom.is_regtest(), "custom testnet should not be regtest");
+    assert!(
+        custom.disable_pow(),
+        "custom testnet should have PoW disabled"
+    );
+    let (status, _recent_sync_lengths) = SyncStatus::new_for_network(&custom);
+    assert!(
+        status.is_close_to_tip(),
+        "a PoW-disabled network should be close to tip with no sync lengths",
+    );
+}
