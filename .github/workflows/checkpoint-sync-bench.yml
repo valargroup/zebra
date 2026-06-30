@@ -25,14 +25,19 @@ on:
       build_ref:
         description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
         required: false
-        default: "ironwood-main"
+        default: "feat/pre-release-main"
       force_rebuild:
         description: "Rebuild even if a binary for this commit SHA is already cached"
         type: boolean
         required: false
         default: false
+      skip_baseline:
+        description: "Skip baseline and run only the target/primary binary, even if a baseline ref/tag is set"
+        type: boolean
+        required: false
+        default: true
       baseline_ref:
-        description: "Optional second ref to build+run first, for a baseline -> primary speedup"
+        description: "Optional second ref to build+run first, for a baseline -> primary speedup. Ignored when skip_baseline is true."
         required: false
         default: ""
       release_tag:
@@ -44,9 +49,9 @@ on:
         required: true
         default: "1730000"
       wall_cap_seconds:
-        description: "Hard wall-clock cap for a single run"
+        description: "Hard wall-clock cap for a single run, in seconds"
         required: false
-        default: "2400"
+        default: "2000"
       feed_peer:
         description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
         required: false
@@ -61,8 +66,28 @@ on:
       download_concurrency_limit:
         required: false
         default: "150"
+      target_should_use_v2_p2p:
+        description: "Run the target/primary binary with Zakura P2P v2 and its block syncer"
+        type: boolean
+        required: false
+        default: true
+      target_should_use_legacy_p2p:
+        description: "Run the target/primary binary with legacy TCP P2P enabled"
+        type: boolean
+        required: false
+        default: false
+      baseline_should_use_v2_p2p:
+        description: "Run the baseline/base binary with Zakura P2P v2 and its block syncer"
+        type: boolean
+        required: false
+        default: false
+      baseline_should_use_legacy_p2p:
+        description: "Run the baseline/base binary with legacy TCP P2P enabled"
+        type: boolean
+        required: false
+        default: true
       baseline_tag:
-        description: "Optional (download mode): baseline release tag for a speedup comparison"
+        description: "Optional (download mode): baseline release tag for a speedup comparison. Ignored when skip_baseline is true."
         required: false
         default: ""
 
@@ -77,7 +102,7 @@ jobs:
   bench:
     name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
     runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
-    timeout-minutes: 300   # first-ever on-host build is cold; later builds are incremental
+    timeout-minutes: 360   # allow long self-hosted benchmark runs; WALL_CAP controls zebrad runtime
     steps:
       - name: Checkout (for the bench script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
@@ -90,6 +115,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           BUILD_REF: ${{ inputs.build_ref }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
+          SKIP_BASELINE: ${{ inputs.skip_baseline && '1' || '0' }}
           FORCE_REBUILD: ${{ inputs.force_rebuild && '1' || '0' }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           BASELINE_TAG: ${{ inputs.baseline_tag }}
@@ -99,6 +125,10 @@ jobs:
           PEERSET_SIZE: ${{ inputs.peerset_size }}
           CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
+          TARGET_SHOULD_USE_V2_P2P: ${{ inputs.target_should_use_v2_p2p && '1' || '0' }}
+          TARGET_SHOULD_USE_LEGACY_P2P: ${{ inputs.target_should_use_legacy_p2p && '1' || '0' }}
+          BASELINE_SHOULD_USE_V2_P2P: ${{ inputs.baseline_should_use_v2_p2p && '1' || '0' }}
+          BASELINE_SHOULD_USE_LEGACY_P2P: ${{ inputs.baseline_should_use_legacy_p2p && '1' || '0' }}
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
           SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
@@ -110,11 +140,20 @@ jobs:
           DASHBOARD_ARCHIVE: ${{ vars.BENCH_DASHBOARD_ARCHIVE || '/opt/zebra-bench/dashboard/runs' }}
         run: bash scripts/checkpoint-sync-bench.sh
 
+      - name: Build artifact name
+        id: artifact-name
+        if: always()
+        env:
+          ARTIFACT_REF: ${{ inputs.build_ref || inputs.release_tag }}
+        run: |
+          safe_ref="${ARTIFACT_REF//[^A-Za-z0-9_.-]/-}"
+          echo "name=checkpoint-sync-bench-${safe_ref}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
       - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
-          name: checkpoint-sync-bench-${{ inputs.build_ref || inputs.release_tag }}-${{ github.run_id }}
+          name: ${{ steps.artifact-name.outputs.name }}
           path: bench-out/
           if-no-files-found: ignore
           retention-days: 30
