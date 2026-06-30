@@ -43,7 +43,9 @@ use zebra_chain::{
 #[allow(unused_imports)]
 use zebra_chain::serialization::BytesInDisplayOrder;
 
-use zebra_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zebra_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zebra_node_services::mempool::{self, TransactionDependencies};
 use zebra_state::GetBlockTemplateChainInfo;
 
@@ -279,12 +281,13 @@ impl BlockTemplateResponse {
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
-        let height = chain_info
-            .tip_height
-            .next()
-            .expect("chain tip must be below Height::MAX");
+        let height = chain_info.tip_height.next().map_err(|_| {
+            TransactionError::CoinbaseConstruction(
+                "chain tip must be below Height::MAX".to_string(),
+            )
+        })?;
 
         // Convert transactions into TransactionTemplates.
         #[cfg(not(test))]
@@ -325,13 +328,12 @@ impl BlockTemplateResponse {
         let txs_fee = mempool_txs
             .iter()
             .map(|tx| tx.miner_fee)
-            .sum::<amount::Result<Amount<NonNegative>>>()
-            .expect("mempool tx fees must be non-negative");
+            .sum::<amount::Result<Amount<NonNegative>>>()?;
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
+            None => TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)?,
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -345,7 +347,11 @@ impl BlockTemplateResponse {
         let target = chain_info
             .expected_difficulty
             .to_expanded()
-            .expect("state always returns a valid difficulty value");
+            .ok_or_else(|| {
+                TransactionError::CoinbaseConstruction(
+                    "state returned an invalid difficulty value".to_string(),
+                )
+            })?;
 
         // Convert default values
         let capabilities: Vec<String> = Self::all_capabilities();
@@ -359,7 +365,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -397,7 +403,7 @@ impl BlockTemplateResponse {
             max_time: chain_info.max_time,
 
             submit_old,
-        }
+        })
     }
 }
 
@@ -539,7 +545,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Miner parameters, including the miner address, data, and memo.
-    miner_params: Option<MinerParams>,
+    miner_params: Result<MinerParams, Arc<MinerParamsError>>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -566,7 +572,7 @@ where
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
         Self {
-            miner_params: MinerParams::new(net, conf).ok(),
+            miner_params: MinerParams::new(net, conf).map_err(Arc::new),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -575,8 +581,8 @@ where
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
-    pub fn miner_params(&self) -> Option<&MinerParams> {
-        self.miner_params.as_ref()
+    pub fn miner_params(&self) -> Result<&MinerParams, &MinerParamsError> {
+        self.miner_params.as_ref().map_err(Arc::as_ref)
     }
 
     /// Returns the sync status.
@@ -600,7 +606,7 @@ where
 
     /// Randomizes the coinbase data, if miner parameters are set.
     pub fn randomize_coinbase_data(&mut self) {
-        if let Some(miner_params) = &mut self.miner_params {
+        if let Ok(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
         }

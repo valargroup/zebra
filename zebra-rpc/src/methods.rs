@@ -82,7 +82,8 @@ use zebra_chain::{
     },
 };
 use zebra_consensus::{
-    funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
+    error::TransactionError, funding_stream_address, router::service_trait::BlockVerifierService,
+    RouterError,
 };
 use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
@@ -2253,10 +2254,20 @@ where
 
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
-        let miner_params = self
-            .gbt
-            .miner_params()
-            .ok_or_error(0, "miner parameters are required for get_block_template")?;
+        let miner_params = self.gbt.miner_params().map_err(|error| {
+            let message = if matches!(
+                error,
+                types::get_block_template::MinerParamsError::MissingAddr
+            ) {
+                "miner parameters are required for get_block_template".to_string()
+            } else {
+                error.to_string()
+            };
+
+            ErrorObject::owned(0, message, None::<()>)
+        })?;
+        let gbt_transaction_error =
+            |error: TransactionError| ErrorObject::owned(0, error.to_string(), None::<()>);
 
         // - Checks and fetches that can change during long polling
         //
@@ -2378,7 +2389,6 @@ where
                 let precompute_coinbase = |network, height, params| {
                     tokio::task::spawn_blocking(move || {
                         TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
                     })
                 };
 
@@ -2386,13 +2396,13 @@ where
                     self.network.clone(),
                     precomputed_height,
                     miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
+                );
 
                 let _ = wait_for_new_tip.await;
 
                 precomputed_coinbase
+                    .await
+                    .expect("coinbase precomputation task should not panic")
             };
 
             // Wait for the maximum block time to elapse. This can change the block header
@@ -2457,7 +2467,9 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
+                        .then_some(precomputed_coinbase)
+                        .transpose()
+                        .map_err(gbt_transaction_error)?;
 
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
@@ -2471,6 +2483,7 @@ where
                         vec![],
                         submit_old,
                     )
+                    .map_err(gbt_transaction_error)?
                     .into())
                 }
 
@@ -2535,6 +2548,7 @@ where
             mempool_txs,
             submit_old,
         )
+        .map_err(gbt_transaction_error)?
         .into())
     }
 
