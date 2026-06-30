@@ -1,12 +1,17 @@
 //! Tests for the Zakura body-sync stall watchdog
 //! ([`ChainSync::bootstrap_genesis_then_pause`]).
 //!
-//! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
-//! so they are deterministic and need no clock, services, or live `ChainTip`.
+//! These exercise the pure decision function [`zakura_block_sync_stalled`] and the
+//! [`stop_zakura_sync`] hand-off helper directly, so they are deterministic and need
+//! no clock, services, or live `ChainTip`.
+
+use tokio_util::sync::CancellationToken;
 
 use zebra_chain::block::Height;
 
-use super::super::{zakura_block_sync_stalled, ZakuraLegacyProbe, ZakuraStallTracker};
+use super::super::{
+    stop_zakura_sync, zakura_block_sync_stalled, ZakuraLegacyProbe, ZakuraStallTracker,
+};
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
 /// hole: any increase in the verified tip — including a gossip-trickled block —
@@ -237,4 +242,36 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
             "a large header gap is the gap-based rule's domain; the legacy probe must stay off"
         );
     }
+}
+
+/// Before a dual-stack node hands body sync back to legacy ChainSync, the watchdog must stop the
+/// Zakura sync drivers so the legacy and Zakura commit pipelines never run at once (the deadlock
+/// this fix prevents). Stopping them is a cancel of the shared endpoint shutdown token, which the
+/// header- and block-sync drivers observe.
+#[test]
+fn fallback_cancels_the_zakura_shutdown_token() {
+    let token = CancellationToken::new();
+    assert!(
+        !token.is_cancelled(),
+        "precondition: a fresh token is not cancelled"
+    );
+
+    // A child token stands in for the drivers' observed shutdown: cancelling the shared token the
+    // watchdog holds must propagate to what the drivers actually await.
+    let driver_view = token.child_token();
+
+    stop_zakura_sync(&Some(token));
+
+    assert!(
+        driver_view.is_cancelled(),
+        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
+    );
+}
+
+/// On a Zakura-only node there is no endpoint shutdown token, so the hand-off helper must be a
+/// no-op rather than panic.
+#[test]
+fn stop_zakura_sync_is_a_noop_without_a_token() {
+    // Must not panic.
+    stop_zakura_sync(&None);
 }
