@@ -7,13 +7,26 @@
 
 use tokio_util::sync::CancellationToken;
 
-use zebra_chain::block::Height;
+use zebra_chain::block::{self, Height, HeightDiff};
 
 use super::super::{
     legacy_probe_supports_fallback, stop_zakura_sync, zakura_block_sync_stalled,
-    zakura_watchdog_action, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
-    ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    zakura_watchdog_action, LegacyProbeEvidence, ZakuraLegacyProbe, ZakuraStallTracker,
+    ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
+
+fn block_hash(index: HeightDiff) -> block::Hash {
+    let index = u64::try_from(index).expect("test block hash index is always non-negative");
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&index.to_le_bytes());
+    block::Hash(bytes)
+}
+
+fn threshold_hashes(offset: HeightDiff) -> Vec<block::Hash> {
+    (0..ZAKURA_LEGACY_BEHIND_THRESHOLD)
+        .map(|index| block_hash(offset + index))
+        .collect()
+}
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
 /// hole: any increase in the verified tip — including a gossip-trickled block —
@@ -370,6 +383,60 @@ fn legacy_probe_below_threshold_keeps_zakura_running() {
     assert!(
         !legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD - 1)),
         "legacy peers below the behind threshold must not force a fallback"
+    );
+}
+
+#[test]
+fn single_legacy_peer_with_arbitrary_unknown_hashes_does_not_force_fallback() {
+    let mut evidence = LegacyProbeEvidence::default();
+
+    assert_eq!(
+        evidence.add_peer_unknown_hashes(threshold_hashes(0)),
+        None,
+        "one peer advertising enough unknown hashes is not corroborated evidence"
+    );
+    assert!(
+        !legacy_probe_supports_fallback(evidence.best_ahead()),
+        "a single malicious legacy peer must not force Zakura fallback"
+    );
+}
+
+#[test]
+fn corroborated_legacy_hash_at_threshold_supports_fallback() {
+    let mut evidence = LegacyProbeEvidence::default();
+    let hashes = threshold_hashes(1_000);
+
+    assert_eq!(evidence.add_peer_unknown_hashes(hashes.clone()), None);
+    assert_eq!(
+        evidence.add_peer_unknown_hashes(hashes),
+        Some(ZAKURA_LEGACY_BEHIND_THRESHOLD),
+        "the same threshold-distance hash from two peers is trusted"
+    );
+    assert!(
+        legacy_probe_supports_fallback(evidence.best_ahead()),
+        "corroborated legacy peers at the threshold should still trigger fallback"
+    );
+}
+
+#[test]
+fn shallow_corroboration_does_not_amplify_one_deep_legacy_response() {
+    let shared_hash = block_hash(10_000);
+    let mut deep_response = threshold_hashes(20_000);
+    let last_hash = deep_response
+        .last_mut()
+        .expect("threshold response has at least one hash");
+    *last_hash = shared_hash;
+
+    let mut evidence = LegacyProbeEvidence::default();
+    assert_eq!(evidence.add_peer_unknown_hashes(deep_response), None);
+    assert_eq!(
+        evidence.add_peer_unknown_hashes([shared_hash]),
+        None,
+        "the shared hash is only shallow evidence in the second peer response"
+    );
+    assert!(
+        !legacy_probe_supports_fallback(evidence.best_ahead()),
+        "a single deep placement must not be amplified by shallow corroboration"
     );
 }
 

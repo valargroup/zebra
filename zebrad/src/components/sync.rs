@@ -341,6 +341,11 @@ const ZAKURA_LEGACY_PROBE_STALL_POLLS: u64 = 3;
 /// the real network tip.
 const ZAKURA_LEGACY_BEHIND_THRESHOLD: HeightDiff = 64;
 
+/// Minimum distinct peer responses that must advertise the same unknown block hash
+/// at or beyond [`ZAKURA_LEGACY_BEHIND_THRESHOLD`] before the watchdog trusts the
+/// legacy probe enough to fall back.
+const ZAKURA_LEGACY_PROBE_MIN_CORROBORATING_PEERS: usize = 2;
+
 /// Cross-poll bookkeeping for [`ChainSync::bootstrap_genesis_then_pause`]'s Zakura
 /// body-sync stall watchdog. See [`zakura_block_sync_stalled`].
 #[derive(Clone, Copy, Debug)]
@@ -478,6 +483,86 @@ fn zakura_watchdog_action(
 
 fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
     matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
+}
+
+/// Corroborates unknown legacy `FindBlocks` hashes across peer responses.
+///
+/// A single legacy peer can advertise arbitrary hashes, so the watchdog only treats
+/// a hash as evidence that the legacy network is ahead when at least
+/// [`ZAKURA_LEGACY_PROBE_MIN_CORROBORATING_PEERS`] distinct peer responses advertise
+/// the same unknown hash. The distance for a hash is the number of unknown hashes
+/// before and including that hash in one peer's response.
+#[derive(Debug, Default)]
+struct LegacyProbeEvidence {
+    distances_by_hash: HashMap<block::Hash, Vec<HeightDiff>>,
+    best_corroborated_ahead: Option<HeightDiff>,
+}
+
+impl LegacyProbeEvidence {
+    fn add_peer_unknown_hashes(
+        &mut self,
+        hashes: impl IntoIterator<Item = block::Hash>,
+    ) -> Option<HeightDiff> {
+        let mut peer_distances = HashMap::<block::Hash, HeightDiff>::new();
+        let mut distance: HeightDiff = 0;
+
+        for hash in hashes {
+            distance = distance.saturating_add(1);
+
+            peer_distances
+                .entry(hash)
+                .and_modify(|existing_distance| {
+                    *existing_distance = (*existing_distance).max(distance);
+                })
+                .or_insert(distance);
+        }
+
+        for (hash, distance) in peer_distances {
+            let distances = self.distances_by_hash.entry(hash).or_default();
+            distances.push(distance);
+
+            let corroborating_peers = distances
+                .iter()
+                .filter(|&&distance| distance >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
+                .count();
+
+            if corroborating_peers >= ZAKURA_LEGACY_PROBE_MIN_CORROBORATING_PEERS {
+                let ahead = distances
+                    .iter()
+                    .filter(|&&distance| distance >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
+                    .copied()
+                    .min()
+                    .expect(
+                        "corroborating peer count is non-zero because it reached the threshold",
+                    );
+
+                self.best_corroborated_ahead =
+                    Some(self.best_corroborated_ahead.unwrap_or(0).max(ahead));
+
+                return Some(ahead);
+            }
+
+            if distances.len() >= ZAKURA_LEGACY_PROBE_MIN_CORROBORATING_PEERS {
+                let corroborated_ahead = distances
+                    .iter()
+                    .copied()
+                    .min()
+                    .expect("distances is non-empty because we just pushed into it");
+
+                self.best_corroborated_ahead = Some(
+                    self.best_corroborated_ahead
+                        .unwrap_or(0)
+                        .max(corroborated_ahead),
+                );
+            }
+        }
+
+        None
+    }
+
+    fn best_ahead(&self) -> Option<HeightDiff> {
+        self.best_corroborated_ahead
+    }
 }
 
 /// Decides whether Zakura block sync should be considered stalled — so the legacy
@@ -1096,8 +1181,8 @@ where
     }
 
     /// Probes the legacy peer set for how far ahead the network is, returning the
-    /// greatest number of block hashes any peer offered beyond our tip (`None` if
-    /// no peer answered).
+    /// greatest corroborated number of block hashes peers offered beyond our tip
+    /// (`None` if no peer answered with corroborated unknown hashes).
     ///
     /// This is the watchdog's network-truth cross-check. It deliberately uses the
     /// legacy `FindBlocks` path rather than the Zakura header frontier: a fleet
@@ -1137,7 +1222,7 @@ where
             )));
         }
 
-        let mut best_ahead: Option<HeightDiff> = None;
+        let mut evidence = LegacyProbeEvidence::default();
         while let Some(res) = requests.next().await {
             let hashes = match res {
                 Ok(Ok(zn::Response::BlockHashes(hashes))) => hashes,
@@ -1146,25 +1231,24 @@ where
                 _ => continue,
             };
 
-            // Count the hashes this peer offered that we do not already have: that
-            // run is how many blocks beyond our tip the peer is advertising. Stop
-            // at the threshold so a far-behind node never pays for the whole
-            // (up to 500-hash) response.
-            let mut ahead: HeightDiff = 0;
+            // Keep the unknown hashes this peer offered in order: their positions
+            // are how far beyond our tip the peer is advertising. The evidence is
+            // trusted only after another peer advertises the same far-ahead hash.
+            let mut unknown_hashes = Vec::new();
             for hash in hashes {
                 // `state_contains` errs only if the state service is gone; treat
                 // an error as "known" so a failing probe never forces a fallback.
                 if !self.state_contains(hash).await.unwrap_or(true) {
-                    ahead += 1;
-                    if ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
-                        return Some(ahead);
-                    }
+                    unknown_hashes.push(hash);
                 }
             }
-            best_ahead = Some(best_ahead.unwrap_or(0).max(ahead));
+
+            if let Some(ahead) = evidence.add_peer_unknown_hashes(unknown_hashes) {
+                return Some(ahead);
+            }
         }
 
-        best_ahead
+        evidence.best_ahead()
     }
 
     /// Tries to synchronize the chain as far as it can.
