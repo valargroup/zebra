@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use zebra_chain::block::Height;
 
 use super::super::{
-    stop_zakura_sync, zakura_block_sync_stalled, ZakuraLegacyProbe, ZakuraStallTracker,
+    legacy_probe_supports_fallback, stop_zakura_sync, zakura_block_sync_stalled,
+    zakura_watchdog_action, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
+    ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
@@ -242,6 +244,133 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
             "a large header gap is the gap-based rule's domain; the legacy probe must stay off"
         );
     }
+}
+
+#[test]
+fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
+    let max_idle_polls = 3;
+    let token = CancellationToken::new();
+    let driver_view = token.child_token();
+    let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
+    let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
+
+    let mut action = ZakuraWatchdogAction::ContinueWaiting;
+    let mut verified = 0u32;
+    let mut header = 1_000u32;
+    for _ in 0..=max_idle_polls {
+        verified += 1;
+        header += 1;
+        action = zakura_watchdog_action(
+            &mut tracker,
+            &mut legacy_probe,
+            Some(Height(verified)),
+            Some(Height(header)),
+            max_idle_polls,
+            true,
+        );
+    }
+
+    assert_eq!(
+        action,
+        ZakuraWatchdogAction::FallbackToLegacy,
+        "a material gap that never closes must trigger legacy fallback when it is enabled"
+    );
+    stop_zakura_sync(&Some(token));
+    assert!(
+        driver_view.is_cancelled(),
+        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
+    );
+}
+
+#[test]
+fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
+    let max_idle_polls = 3;
+    let token = CancellationToken::new();
+    let driver_view = token.child_token();
+    let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
+    let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
+
+    let mut saw_warn_only = false;
+    let mut verified = 0u32;
+    let mut header = 1_000u32;
+    for _ in 0..(max_idle_polls * 2) {
+        verified += 1;
+        header += 1;
+        let action = zakura_watchdog_action(
+            &mut tracker,
+            &mut legacy_probe,
+            Some(Height(verified)),
+            Some(Height(header)),
+            max_idle_polls,
+            false,
+        );
+
+        assert_ne!(
+            action,
+            ZakuraWatchdogAction::FallbackToLegacy,
+            "Zakura-only nodes must not fall back to absent legacy peers"
+        );
+        saw_warn_only |= action == ZakuraWatchdogAction::WarnOnly;
+    }
+
+    assert!(
+        saw_warn_only,
+        "Zakura-only stalls should still produce the warn-only watchdog action"
+    );
+    assert!(
+        !driver_view.is_cancelled(),
+        "warn-only Zakura stalls must not cancel the Zakura shutdown token"
+    );
+}
+
+#[test]
+fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
+    let max_idle_polls = 5;
+    let frozen = Some(Height(1_000));
+    let token = CancellationToken::new();
+    let driver_view = token.child_token();
+    let mut tracker = ZakuraStallTracker::new(frozen);
+    let mut legacy_probe = ZakuraLegacyProbe::new(frozen);
+
+    let mut action = ZakuraWatchdogAction::ContinueWaiting;
+    for _ in 0..3 {
+        action = zakura_watchdog_action(
+            &mut tracker,
+            &mut legacy_probe,
+            frozen,
+            frozen,
+            max_idle_polls,
+            true,
+        );
+    }
+
+    assert_eq!(
+        action,
+        ZakuraWatchdogAction::ProbeLegacyPeers,
+        "a frozen tip that looks caught up must cross-check legacy peers"
+    );
+    assert!(
+        legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD)),
+        "legacy peers at or above the behind threshold must trigger fallback"
+    );
+
+    stop_zakura_sync(&Some(token));
+    assert!(
+        driver_view.is_cancelled(),
+        "legacy-informed fallback must cancel the Zakura sync drivers' shutdown token"
+    );
+}
+
+#[test]
+fn legacy_probe_below_threshold_keeps_zakura_running() {
+    assert!(
+        !legacy_probe_supports_fallback(None),
+        "no legacy peer answer must not force a fallback"
+    );
+    assert!(
+        !legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD - 1)),
+        "legacy peers below the behind threshold must not force a fallback"
+    );
 }
 
 /// The point of this test is to lock in the fallback behavior: when Zebra decides to stop using
