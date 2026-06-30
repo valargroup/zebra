@@ -560,14 +560,21 @@ where
     }
 }
 
-/// Cancels the Zakura sync drivers' shutdown token (the endpoint token shared by the header- and
-/// block-sync drivers) before the legacy [`ChainSync::sync`] loop resumes, so the legacy and
-/// Zakura commit pipelines never feed the state-commit pipeline at once (concurrent committers
-/// break its accounting and can deadlock the node). No-op when no token is available (e.g. Zakura
-/// networking is not running).
-fn stop_zakura_sync(zakura_shutdown: &Option<tokio_util::sync::CancellationToken>) {
+/// Cancels and drains the Zakura sync drivers before the legacy [`ChainSync::sync`] loop resumes.
+///
+/// The cancellation token stops new Zakura sync work. Awaiting the endpoint-owned tasks makes the
+/// hand-off a commit barrier: already-started Zakura block applies finish before legacy can submit
+/// commits through the same verifier and state pipeline. No-op when Zakura networking is absent.
+async fn stop_zakura_sync(
+    zakura_endpoint: Option<&zn::zakura::ZakuraEndpoint>,
+    zakura_shutdown: &Option<tokio_util::sync::CancellationToken>,
+) {
     if let Some(token) = zakura_shutdown {
         token.cancel();
+    }
+
+    if let Some(endpoint) = zakura_endpoint {
+        endpoint.shutdown_sync_tasks().await;
     }
 }
 
@@ -1003,11 +1010,12 @@ where
     /// so the watchdog can tell genuine Zakura block-sync progress (the verified tip
     /// closing a real gap to the network frontier) from a peer trickling next-height
     /// blocks over gossip (which bumps the verified tip without body sync running).
-    #[instrument(skip(self, read_state, zakura_shutdown))]
+    #[instrument(skip(self, read_state, zakura_endpoint, zakura_shutdown))]
     pub async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
         legacy_fallback: bool,
+        zakura_endpoint: Option<zn::zakura::ZakuraEndpoint>,
         zakura_shutdown: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(), Report>
     where
@@ -1065,7 +1073,7 @@ where
                          Zakura sync drivers and falling back to legacy ChainSync so legacy peers \
                          can drive body sync"
                     );
-                    stop_zakura_sync(&zakura_shutdown);
+                    stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
                     return self.sync().await;
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
@@ -1079,7 +1087,7 @@ where
                              higher tip; stopping Zakura sync drivers and falling back to legacy \
                              ChainSync so it can drive body sync"
                         );
-                        stop_zakura_sync(&zakura_shutdown);
+                        stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
                         return self.sync().await;
                     }
                 }

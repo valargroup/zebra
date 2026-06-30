@@ -977,6 +977,7 @@ impl StartCmd {
                     .bootstrap_genesis_then_pause(
                         read_only_state_service.clone(),
                         legacy_fallback,
+                        zakura_endpoint.clone(),
                         zakura_endpoint
                             .as_ref()
                             .and_then(|endpoint| endpoint.header_sync_shutdown()),
@@ -3510,6 +3511,115 @@ mod zakura_header_sync_driver_tests {
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_shutdown_drains_in_flight_apply_without_starting_queued_apply() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier = {
+            let release_first = release_first.clone();
+            let commit_count = commit_count.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                let commit_count = commit_count.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            commit_count.fetch_add(1, Ordering::SeqCst);
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(block.hash())
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let block1_hash = block1.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(1), block1_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(1),
+                    block1_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("queued block can be submitted before shutdown");
+        let _ = shutdown_tx.send(());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut driver)
+                .await
+                .is_err(),
+            "shutdown must wait for the already-started apply to finish"
+        );
+        release_first.notify_waiters();
+        driver.await.expect("driver task exits after apply drains");
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            1,
+            "shutdown must drop queued bodies instead of starting new commits"
+        );
         reactor_task.abort();
     }
 

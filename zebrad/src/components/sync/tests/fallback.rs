@@ -246,8 +246,8 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     }
 }
 
-#[test]
-fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
+#[tokio::test]
+async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
     let max_idle_polls = 3;
     let token = CancellationToken::new();
     let driver_view = token.child_token();
@@ -275,7 +275,7 @@ fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
         ZakuraWatchdogAction::FallbackToLegacy,
         "a material gap that never closes must trigger legacy fallback when it is enabled"
     );
-    stop_zakura_sync(&Some(token));
+    stop_zakura_sync(None, &Some(token)).await;
     assert!(
         driver_view.is_cancelled(),
         "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
@@ -323,8 +323,8 @@ fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
     );
 }
 
-#[test]
-fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
+#[tokio::test]
+async fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
     let max_idle_polls = 5;
     let frozen = Some(Height(1_000));
     let token = CancellationToken::new();
@@ -354,7 +354,7 @@ fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    stop_zakura_sync(&Some(token));
+    stop_zakura_sync(None, &Some(token)).await;
     assert!(
         driver_view.is_cancelled(),
         "legacy-informed fallback must cancel the Zakura sync drivers' shutdown token"
@@ -376,8 +376,8 @@ fn legacy_probe_below_threshold_keeps_zakura_running() {
 /// The point of this test is to lock in the fallback behavior: when Zebra decides to stop using
 /// Zakura sync and fall back to legacy sync, it must signal the running Zakura driver tasks to shut down.
 /// This asserts that the shutdown token is cancelled when the fallback occurs.
-#[test]
-fn fallback_cancels_the_zakura_shutdown_token() {
+#[tokio::test]
+async fn fallback_cancels_the_zakura_shutdown_token() {
     let token = CancellationToken::new();
     assert!(
         !token.is_cancelled(),
@@ -388,7 +388,7 @@ fn fallback_cancels_the_zakura_shutdown_token() {
     // watchdog holds must propagate to what the drivers actually await.
     let driver_view = token.child_token();
 
-    stop_zakura_sync(&Some(token));
+    stop_zakura_sync(None, &Some(token)).await;
 
     assert!(
         driver_view.is_cancelled(),
@@ -398,8 +398,8 @@ fn fallback_cancels_the_zakura_shutdown_token() {
 
 /// On a Zakura-only node there is no endpoint shutdown token, so the hand-off helper must be a
 /// no-op rather than panic.
-#[test]
-fn stop_zakura_sync_is_a_noop_without_a_token() {
+#[tokio::test]
+async fn stop_zakura_sync_is_a_noop_without_a_token() {
     // Must not panic.
-    stop_zakura_sync(&None);
+    stop_zakura_sync(None, &None).await;
 }
