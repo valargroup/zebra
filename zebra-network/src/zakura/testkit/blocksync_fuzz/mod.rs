@@ -104,6 +104,7 @@ pub(crate) async fn run_scenario(
         corpus.clone(),
         target,
         apply.clone(),
+        scenario.commit,
         committed_tx,
         shutdown.clone(),
     ));
@@ -188,10 +189,12 @@ fn spawn_action_driver(
     corpus: SyntheticBlockCorpus,
     target: block::Height,
     apply: MockApplyFrontier,
+    commit: CommitProfile,
     committed_tx: watch::Sender<block::Height>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut applied = 0u64;
         loop {
             let action = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -236,6 +239,15 @@ fn spawn_action_driver(
                     }
                 }
                 BlockSyncAction::SubmitBlock { token, block } => {
+                    // Model a slow/bursty commit drain: hold the submitted body before
+                    // applying so its reserved bytes stay held until
+                    // `BlockApplyFinished`, letting the apply backlog build against the
+                    // byte budget.
+                    if !commit.per_commit_delay.is_zero()
+                        && sleep_or_cancel(&shutdown, commit.per_commit_delay).await
+                    {
+                        break;
+                    }
                     let height = block
                         .coinbase_height()
                         .expect("synthetic submitted block has height");
@@ -255,6 +267,16 @@ fn spawn_action_driver(
                         .is_err()
                     {
                         break;
+                    }
+                    applied = applied.saturating_add(1);
+                    if let Some(burst) = commit.burst {
+                        if burst.every_commits > 0
+                            && applied.is_multiple_of(burst.every_commits)
+                            && !burst.duration.is_zero()
+                            && sleep_or_cancel(&shutdown, burst.duration).await
+                        {
+                            break;
+                        }
                     }
                 }
                 BlockSyncAction::Misbehavior { .. } => {}

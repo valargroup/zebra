@@ -3,7 +3,10 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -23,6 +26,8 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     capability: ZAKURA_CAP_BLOCK_SYNC,
     mode: StreamMode::Ordered,
 }];
+
+const CLOSE_BLOCK_SYNC_NO_PROGRESS_COOLDOWN: &str = "block_sync_no_progress_cooldown";
 
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
@@ -336,6 +341,13 @@ impl BlockSyncService {
         count < cap
     }
 
+    fn peer_is_parked(&self, peer_id: &ZakuraPeerId) -> bool {
+        self.inner
+            .routine_wiring
+            .as_ref()
+            .is_some_and(|wiring| wiring.registry.is_peer_parked(peer_id, Instant::now()))
+    }
+
     /// Whether `add_peer` may install a session for this peer. A peer that is
     /// already registered may always *replace* its session (the
     /// connection-symmetry collision where both sides opened a block-sync stream
@@ -373,14 +385,21 @@ impl Service for BlockSyncService {
 
     fn wants_peer(
         &self,
-        _peer: &ZakuraPeerId,
+        peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> bool {
-        self.peer_slots_free(direction)
+        !self.peer_is_parked(peer) && self.peer_slots_free(direction)
     }
 
     fn add_peer(&self, mut peer: Peer) {
+        if self.peer_is_parked(&peer.id) {
+            peer.close_handle()
+                .cancel(CLOSE_BLOCK_SYNC_NO_PROGRESS_COOLDOWN);
+            peer.service_cancel_token().cancel();
+            return;
+        }
+
         if !self.can_admit_peer(&peer.id, peer.direction) {
             return;
         }

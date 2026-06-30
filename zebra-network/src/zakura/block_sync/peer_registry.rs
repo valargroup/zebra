@@ -15,9 +15,10 @@
 //! `received_status` (when it decodes a `Status` frame in its own task),
 //! `outstanding` (on issue/finish/timeout/disconnect — per *request*, never per
 //! *body*), slot diagnostics, and download-side misbehavior. The **reactor** owns
-//! only entry insert/remove (admission/teardown) and reports serving-side
-//! misbehavior. Misbehavior is record-only: it is observed and traced but never
-//! drives a disconnect, so the registry keeps no per-peer misbehavior state.
+//! entry insert/remove (admission/teardown), serving-side misbehavior, and
+//! floor-watchdog hard excludes. Misbehavior is record-only: it is observed and
+//! traced but never drives a disconnect, so the registry keeps no per-peer
+//! misbehavior state.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -50,12 +51,13 @@ pub(super) struct Entry {
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
     pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
-    /// Routine-published slot diagnostics (trace only): the per-peer download
-    /// window state the reactor reads for the periodic `BLOCK_SYNC_STATE` row.
-    /// Updated whenever the routine issues/finishes/times out a request.
+    /// Routine-published slot and BBR diagnostics. The reactor summarizes this for
+    /// the periodic `BLOCK_SYNC_STATE` row, and peer routines read it for cross-peer
+    /// floor-bias decisions. Updated whenever the routine issues/finishes/times out
+    /// a request.
     pub(super) slots: SlotDiagnostics,
-    /// Heights this peer may not re-take until the given instant.
-    pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Heights this peer may not re-take after a floor-watchdog cancellation.
+    pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -79,21 +81,21 @@ impl Entry {
             max_response_bytes: config.advertised_max_response_bytes(),
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
-            retry_avoid: BTreeMap::new(),
+            floor_watchdog_avoid: BTreeMap::new(),
             generation,
         }
     }
 }
 
-/// Per-peer download window slot diagnostics published by the routine for the
-/// reactor's periodic `BLOCK_SYNC_STATE` trace row.
+/// Per-peer download window diagnostics published by the routine for trace
+/// summaries and cross-peer floor-bias decisions.
 #[derive(Copy, Clone, Debug, Default)]
 pub(super) struct SlotDiagnostics {
     pub(super) hard_capacity: usize,
     pub(super) effective_window: usize,
     pub(super) available_slots: usize,
-    pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding_requests: usize,
+    pub(super) bbr_rtprop_ms: Option<u64>,
 }
 
 /// Published metadata for one unreceived outstanding height.
@@ -118,6 +120,7 @@ pub(super) struct OutstandingClaim {
 #[derive(Debug)]
 pub(super) struct PeerRegistry {
     peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
+    parked_peers: StdMutex<HashMap<ZakuraPeerId, Instant>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
 }
@@ -132,6 +135,7 @@ impl PeerRegistry {
     pub(super) fn new() -> Self {
         Self {
             peers: StdMutex::new(HashMap::new()),
+            parked_peers: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -140,6 +144,24 @@ impl PeerRegistry {
         self.peers
             .lock()
             .expect("peer registry mutex is never poisoned")
+    }
+
+    fn lock_parked(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Instant>> {
+        self.parked_peers
+            .lock()
+            .expect("peer registry parked-peer mutex is never poisoned")
+    }
+
+    /// Refuse this peer at block-sync admission until `until`.
+    pub(super) fn park_peer_until(&self, peer: &ZakuraPeerId, until: Instant) {
+        self.lock_parked().insert(peer.clone(), until);
+    }
+
+    /// Whether the peer is still in its no-progress reconnect cooldown.
+    pub(super) fn is_peer_parked(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        let mut parked_peers = self.lock_parked();
+        parked_peers.retain(|_, until| *until > now);
+        parked_peers.get(peer).is_some_and(|until| *until > now)
     }
 
     /// Admit (or re-admit) a peer and allocate a fresh routine generation.
@@ -164,7 +186,7 @@ impl PeerRegistry {
             .and_modify(|entry| {
                 entry.direction = direction;
                 entry.outstanding.clear();
-                entry.retry_avoid.clear();
+                entry.floor_watchdog_avoid.clear();
                 entry.generation = generation;
             })
             .or_insert_with(|| Entry::new(direction, config, generation));
@@ -229,8 +251,8 @@ impl PeerRegistry {
         }
     }
 
-    /// Publish the routine's download-window slot diagnostics (trace only),
-    /// generation-gated like the outstanding writers.
+    /// Publish the routine's download-window diagnostics, generation-gated like the
+    /// outstanding writers. These feed both trace summaries and floor-bias decisions.
     pub(super) fn publish_slots(
         &self,
         peer: &ZakuraPeerId,
@@ -263,9 +285,6 @@ impl PeerRegistry {
             summary.available = summary
                 .available
                 .saturating_add(entry.slots.available_slots);
-            summary.timeout_recovery = summary
-                .timeout_recovery
-                .saturating_add(entry.slots.timeout_recovery_slots);
             if entry.slots.available_slots == 0 {
                 summary.saturated_peers = summary.saturated_peers.saturating_add(1);
             }
@@ -439,25 +458,45 @@ impl PeerRegistry {
             .min()
     }
 
-    /// Whether some peer other than `self_peer` is servable for `height` and has a
-    /// free normal (non-bypass) slot. Drives the floor→best-peer bias: a peer that is
-    /// saturated at its cwnd should not borrow a floor-bypass slot when another peer
-    /// can take the floor through its normal capacity. Deadlock-free — deferral only
-    /// happens when a peer with an actually-free slot exists, so the floor still
-    /// progresses; if every servable peer is saturated this returns false and the
-    /// caller bypasses. Uses the per-peer `available_slots` published by the routines.
-    pub(super) fn floor_has_unsaturated_other_server(
+    /// Whether some peer other than `self_peer` is a preferred floor server for
+    /// `height`: servable for it, holding a free normal (non-bypass) slot, and a
+    /// better floor server by RTprop. "Better" is strictly lower RTprop, or — when
+    /// `include_equal` — equal-or-lower.
+    ///
+    /// The floor rides the fastest servable carrier. The normal take path passes
+    /// `include_equal = false`, so this peer defers the floor only to a strictly
+    /// faster carrier; equal-RTprop carriers all stay eligible and the single-owner
+    /// work queue assigns one of them. The floor-bypass path passes
+    /// `include_equal = true`, so a peer whose cwnd is saturated yields its scarce
+    /// bypass slot to an equal-or-faster peer that can take the floor through normal
+    /// capacity. Deadlock-free either way: the unique fastest unsaturated server is
+    /// never preferred over (nothing beats it), and if every servable peer is
+    /// saturated this returns false and the floor still moves. Unknown RTprop is
+    /// treated as worst, so a measured peer is never deferred to an unmeasured one.
+    pub(super) fn floor_has_preferred_unsaturated_server(
         &self,
         height: block::Height,
         self_peer: &ZakuraPeerId,
+        self_rtprop_ms: Option<u64>,
+        include_equal: bool,
     ) -> bool {
+        let self_score = self_rtprop_ms.unwrap_or(u64::MAX);
         let peers = self.lock();
         peers.iter().any(|(peer, entry)| {
-            peer != self_peer
-                && entry.received_status
-                && entry.servable_low <= height
-                && height <= entry.servable_high
-                && entry.slots.available_slots > 0
+            if peer == self_peer
+                || !entry.received_status
+                || entry.servable_low > height
+                || height > entry.servable_high
+                || entry.slots.available_slots == 0
+            {
+                return false;
+            }
+            let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
+            if include_equal {
+                other_score <= self_score
+            } else {
+                other_score < self_score
+            }
         })
     }
 
@@ -484,8 +523,9 @@ impl PeerRegistry {
         }
     }
 
-    /// Hard-exclude this peer from re-taking `height` until `until`.
-    pub(super) fn avoid_height_until(
+    /// Hard-exclude this peer from re-taking `height` until `until` after the
+    /// floor watchdog force-cancels its stale claim.
+    pub(super) fn avoid_floor_height_until(
         &self,
         peer: &ZakuraPeerId,
         height: block::Height,
@@ -493,12 +533,12 @@ impl PeerRegistry {
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
-            entry.retry_avoid.insert(height, until);
+            entry.floor_watchdog_avoid.insert(height, until);
         }
     }
 
-    /// Whether this peer is still hard-excluded from `height`.
-    pub(super) fn is_avoiding_height(
+    /// Whether the floor watchdog still hard-excludes this peer from `height`.
+    pub(super) fn is_floor_height_avoided(
         &self,
         peer: &ZakuraPeerId,
         height: block::Height,
@@ -508,11 +548,24 @@ impl PeerRegistry {
         let Some(entry) = peers.get_mut(peer) else {
             return false;
         };
-        entry.retry_avoid.retain(|_, until| *until > now);
+        entry.floor_watchdog_avoid.retain(|_, until| *until > now);
         entry
-            .retry_avoid
+            .floor_watchdog_avoid
             .get(&height)
             .is_some_and(|until| *until > now)
+    }
+
+    /// The next floor-watchdog hard-exclude expiry for this peer, if any. The
+    /// routine uses this to wake itself when a registry-owned avoid expires.
+    pub(super) fn next_floor_avoid_deadline(
+        &self,
+        peer: &ZakuraPeerId,
+        now: Instant,
+    ) -> Option<Instant> {
+        let mut peers = self.lock();
+        let entry = peers.get_mut(peer)?;
+        entry.floor_watchdog_avoid.retain(|_, until| *until > now);
+        entry.floor_watchdog_avoid.values().min().copied()
     }
 }
 
@@ -522,7 +575,6 @@ pub(super) struct SlotSummary {
     pub(super) capacity: usize,
     pub(super) effective_window: usize,
     pub(super) available: usize,
-    pub(super) timeout_recovery: usize,
     pub(super) saturated_peers: usize,
     pub(super) outstanding_requests: usize,
 }
@@ -553,13 +605,14 @@ mod floor_bias_tests {
     }
 
     /// Register `peer` as servable for `[low, high]` with `available` free slots.
-    fn register(
+    fn register_with_rtprop(
         reg: &PeerRegistry,
         config: &super::super::ZakuraBlockSyncConfig,
         peer: &ZakuraPeerId,
         low: u32,
         high: u32,
         available: usize,
+        bbr_rtprop_ms: Option<u64>,
     ) {
         let generation = reg.admit(peer, ServicePeerDirection::Outbound, config);
         reg.upsert_status(
@@ -576,23 +629,104 @@ mod floor_bias_tests {
             generation,
             SlotDiagnostics {
                 available_slots: available,
+                bbr_rtprop_ms,
                 ..SlotDiagnostics::default()
             },
         );
     }
 
+    fn register(
+        reg: &PeerRegistry,
+        config: &super::super::ZakuraBlockSyncConfig,
+        peer: &ZakuraPeerId,
+        low: u32,
+        high: u32,
+        available: usize,
+    ) {
+        register_with_rtprop(reg, config, peer, low, high, available, None);
+    }
+
     #[test]
-    fn defers_to_an_unsaturated_other_server() {
+    fn bypass_defers_to_an_equal_or_faster_unsaturated_other_server() {
         let config = super::super::ZakuraBlockSyncConfig::default();
         let reg = PeerRegistry::new();
         let (a, b) = (peer(1), peer(2));
-        // A is saturated; B serves the floor and has a free slot.
-        register(&reg, &config, &a, 0, 1000, 0);
-        register(&reg, &config, &b, 0, 1000, 3);
-        // A should defer (B can take the floor through its normal capacity)…
-        assert!(reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+        // A is saturated; B serves the floor and has a free slot at an equal RTprop.
+        register_with_rtprop(&reg, &config, &a, 0, 1000, 0, Some(50));
+        register_with_rtprop(&reg, &config, &b, 0, 1000, 3, Some(50));
+        // In the bypass region (include_equal) A defers — B can take the floor through
+        // its normal capacity, so A keeps its scarce bypass slot…
+        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, Some(50), true));
         // …but B itself has no other unsaturated server (A is saturated), so B bypasses.
-        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &b));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &b,
+            Some(50),
+            true
+        ));
+    }
+
+    #[test]
+    fn normal_path_defers_only_to_a_strictly_faster_server() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (slow, fast) = (peer(1), peer(2));
+        // Both unsaturated; the normal take path (include_equal = false).
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        // The slow peer hands the floor up to the strictly-faster carrier…
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false
+        ));
+        // …and the fastest carrier never defers, so the floor always lands somewhere.
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &fast,
+            Some(40),
+            false
+        ));
+    }
+
+    #[test]
+    fn normal_path_keeps_equal_carriers_eligible() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (a, b) = (peer(1), peer(2));
+        // Two equal-RTprop unsaturated carriers: neither defers (strict <), so both stay
+        // eligible and the single-owner work queue assigns the floor to one of them —
+        // they never both defer and wedge the floor.
+        register_with_rtprop(&reg, &config, &a, 0, 1000, 3, Some(50));
+        register_with_rtprop(&reg, &config, &b, 0, 1000, 3, Some(50));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            Some(50),
+            false
+        ));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &b,
+            Some(50),
+            false
+        ));
+    }
+
+    #[test]
+    fn saturated_fast_peer_does_not_defer_to_slower_unsaturated_peer() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (fast, slow) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 0, Some(40));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &fast,
+            Some(40),
+            true
+        ));
     }
 
     #[test]
@@ -602,7 +736,7 @@ mod floor_bias_tests {
         let (a, b) = (peer(1), peer(2));
         register(&reg, &config, &a, 0, 1000, 0);
         register(&reg, &config, &b, 0, 1000, 0);
-        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
     }
 
     #[test]
@@ -614,6 +748,50 @@ mod floor_bias_tests {
         // B has a free slot but only serves heights 500..=1000 — it cannot take a floor
         // request at height 100, so A must still bypass.
         register(&reg, &config, &b, 500, 1000, 3);
-        assert!(!reg.floor_has_unsaturated_other_server(block::Height(100), &a));
+        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+    }
+
+    #[test]
+    fn floor_avoid_deadline_prunes_expired_entries_and_returns_next_wake() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        let now = Instant::now();
+
+        reg.avoid_floor_height_until(
+            &peer,
+            block::Height(1),
+            now - std::time::Duration::from_secs(1),
+        );
+        reg.avoid_floor_height_until(
+            &peer,
+            block::Height(2),
+            now + std::time::Duration::from_secs(2),
+        );
+        reg.avoid_floor_height_until(
+            &peer,
+            block::Height(3),
+            now + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            reg.next_floor_avoid_deadline(&peer, now),
+            Some(now + std::time::Duration::from_secs(1)),
+        );
+        assert!(!reg.is_floor_height_avoided(&peer, block::Height(1), now));
+        assert!(reg.is_floor_height_avoided(&peer, block::Height(2), now));
+    }
+
+    #[test]
+    fn parked_peer_expires_after_cooldown() {
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let now = Instant::now();
+
+        reg.park_peer_until(&peer, now + std::time::Duration::from_secs(1));
+
+        assert!(reg.is_peer_parked(&peer, now));
+        assert!(!reg.is_peer_parked(&peer, now + std::time::Duration::from_secs(2)));
     }
 }

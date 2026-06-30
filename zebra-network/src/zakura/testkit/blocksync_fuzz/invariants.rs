@@ -28,6 +28,17 @@ pub(crate) struct InvariantReport {
     /// `block_get_blocks_sent` requests issued via the floor bypass (a floor request
     /// sent while the peer was saturated at its BBR cwnd).
     pub(crate) floor_bypass_requests: usize,
+    /// Peak per-peer byte cwnd observed on a `block_body_received` row (`bbr_cwnd_bytes`,
+    /// emitted only under the byte unit). `0` means the field never appeared (blocks
+    /// unit, or no completed deliveries).
+    pub(crate) peak_cwnd_bytes: u64,
+    /// Peak per-peer in-flight reserved bytes observed (`bbr_inflight_bytes`).
+    pub(crate) peak_inflight_bytes: u64,
+    /// Peak per-peer derived byte→request capacity observed (`bbr_cwnd`, the byte cwnd
+    /// divided by a representative body). Under the byte unit this scales as
+    /// `cwnd_bytes / body_size`, so it is the clean signal that request depth tracks
+    /// the inverse of body size.
+    pub(crate) peak_cwnd_requests: u64,
 }
 
 /// Extract the report from a flushed trace reader.
@@ -57,6 +68,12 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
+    let body_rows: Vec<&Value> = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| event(row) == Some("block_body_received"))
+        .collect();
     let floor_bypass_requests = reader
         .table("block_sync")
         .rows()
@@ -64,6 +81,21 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter(|row| event(row) == Some("block_get_blocks_sent"))
         .filter(|row| u64_field(row, "floor_bypass") == Some(1))
         .count();
+    let peak_cwnd_bytes = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_cwnd_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_inflight_bytes = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_inflight_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_cwnd_requests = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_cwnd"))
+        .max()
+        .unwrap_or(0);
 
     InvariantReport {
         state_samples: state_rows.len(),
@@ -72,6 +104,9 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         final_budget_reserved,
         protocol_rejects,
         floor_bypass_requests,
+        peak_cwnd_bytes,
+        peak_inflight_bytes,
+        peak_cwnd_requests,
     }
 }
 

@@ -6,9 +6,10 @@ use super::*;
 use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
-        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_FLOOR_WATCHDOG_TICK,
+        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
+        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
     },
     reactor::node_id_from_block_peer_id,
@@ -423,8 +424,16 @@ fn download_window() -> DownloadWindow {
     DownloadWindow::new(&ZakuraBlockSyncConfig::default())
 }
 
+fn test_delivery_snapshot(now: Instant) -> DeliverySnapshot {
+    DeliverySnapshot {
+        delivered: 0,
+        delivered_at: now,
+    }
+}
+
 fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
+    let now = Instant::now();
     OutstandingBlockRange {
         request: BlockRangeRequest {
             start_height: block::Height(height),
@@ -437,14 +446,16 @@ fn window_request(height: u32) -> OutstandingBlockRange {
                 estimated_bytes: 1,
             }],
         },
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
         received: ReceivedBlockTracker::default(),
     }
 }
 
 fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
+    let now = Instant::now();
     OutstandingBlockRange {
         request: BlockRangeRequest {
             start_height: block::Height(start),
@@ -459,8 +470,9 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
                 })
                 .collect(),
         },
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
         received: ReceivedBlockTracker::default(),
     }
 }
@@ -707,6 +719,10 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
     );
     assert_eq!(
+        default.no_progress_peer_cooldown,
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
+    );
+    assert_eq!(
         default.effective_max_reorder_lookahead_bytes(),
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
@@ -717,6 +733,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(
         default.effective_floor_peer_avoid_cooldown(),
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
+    );
+    assert_eq!(
+        default.effective_no_progress_peer_cooldown(),
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
     );
     assert!(default.validate().is_ok());
     assert_eq!(
@@ -3000,10 +3020,12 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         ],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
+    let now = Instant::now();
     OutstandingBlockRange {
         request,
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
         received: ReceivedBlockTracker::default(),
     }
 }
@@ -3271,10 +3293,12 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
         }],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
+    let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         request,
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
         received: ReceivedBlockTracker::default(),
     };
     assert_eq!(budget.reserved(), hint);

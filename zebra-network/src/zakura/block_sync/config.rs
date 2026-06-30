@@ -74,17 +74,26 @@ pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Default short leash on a floor (lowest-missing-height) request.
+///
+/// A floor request that has not been served within this window is rescued to a
+/// faster carrier (returned to the queue + the peer retry-avoided), never letting
+/// the contiguous download floor wait on a slow peer. Far tighter than the base
+/// `request_timeout`, which governs patient above-floor speculation instead.
+pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness disconnects.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
+/// Default cooldown before a no-progress peer may be admitted again.
+pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default central floor-watchdog cadence.
 pub const DEFAULT_BS_FLOOR_WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
-/// Default block-sync status refresh interval reserved for later advertisement.
+/// Default block-sync status refresh interval after local frontier changes.
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-/// Default tolerated size-hint deviation percentage reserved for later soft scoring.
+/// Default tolerated size-hint deviation percentage before a peer is reported.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
-/// Default block-sync peer fanout for the same requested range.
+/// Default legacy range-fanout reservation multiplier.
 pub const DEFAULT_BS_FANOUT: usize = 1;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
 ///
@@ -110,6 +119,18 @@ pub const DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(10
 pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
 /// Default minimum cwnd in blocks — keeps the pipe primed and lets ProbeRTT send.
 pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
+/// Default minimum cwnd in **bytes** (the floor under [`CwndUnit::Bytes`]).
+///
+/// Under byte denomination the steady cwnd is `BtlBw_bytes × RTprop × gain`. For a
+/// low-latency peer that product is small (a fast link with ~1 ms base RTT needs
+/// little in flight to stay busy), so this floor — not the BDP — is the binding
+/// operating window most of the time. It is sized to keep enough concurrent
+/// single-block requests in flight to actually pipeline a server that has spare
+/// capacity (the trace showed peers 60–86% idle at a pinned cwnd of 4), while the
+/// size-aware delay-gradient still shrinks it back if a real standing queue forms.
+/// **This is the primary live-A/B tuning lever** (`byte-cwnd-1`): raise it to push
+/// more concurrency, lower it if floor head-of-line latency regresses.
+pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = 4 * 1024 * 1024;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
@@ -122,13 +143,15 @@ pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CwndUnit {
-    /// Count outstanding *requests* against the cwnd (one request ≈ one slot). The
-    /// shipped default — equal weight regardless of body size.
-    #[default]
+    /// Count outstanding *requests* against the cwnd (one request ≈ one slot), equal
+    /// weight regardless of body size. The A/B baseline — retained for comparison
+    /// against the byte controller and for tests.
     Blocks,
-    /// Count reserved body *bytes* against the cwnd (the cwnd's request budget scaled by
-    /// the advertised per-response byte cap), so a peer serving large bodies holds fewer
-    /// in flight. Experimental.
+    /// Count reserved body *bytes* against the cwnd, where the cwnd is itself a byte
+    /// bandwidth-delay product sourced from the header size hints (`BtlBw_bytes ×
+    /// RTprop × gain`), so a peer serving large bodies holds fewer in flight and one
+    /// serving small bodies holds many. The shipped default.
+    #[default]
     Bytes,
 }
 
@@ -218,18 +241,29 @@ pub struct ZakuraBlockSyncConfig {
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]
     pub floor_peer_avoid_cooldown: Duration,
-    /// Maximum block bodies submitted to the verifier before completed applies
-    /// release more submission slots.
+    /// Depth for block-sync action/body channels, clamped to at least one full
+    /// checkpoint range.
     pub max_submitted_block_applies: usize,
     /// Timeout for an outstanding block-body range request.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
+    /// Short leash on a floor request before its height is rescued to a faster
+    /// carrier. Clamped positive and never above `request_timeout`.
+    #[serde(with = "humantime_serde")]
+    pub floor_rescue_timeout: Duration,
+    /// How long to keep a peer disconnected after it makes no accepted block progress.
+    #[serde(with = "humantime_serde")]
+    pub no_progress_peer_cooldown: Duration,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
     pub size_deviation_tolerance: u32,
-    /// Number of peers later range scheduling may fan out to for the same body gap.
+    /// Legacy range-fanout reservation multiplier.
+    ///
+    /// No active scheduler currently sends the same range to multiple peers; this
+    /// only keeps old configs parsing and sizes the validation floor for one
+    /// worst-case floor request.
     pub fanout: usize,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,
@@ -253,12 +287,16 @@ pub struct ZakuraBlockSyncConfig {
     /// phase yet, so this knob is currently inert (cold start uses
     /// `initial_inflight_requests` and the BDP estimate takes over once samples arrive).
     pub bbr_startup_growth_percent: u32,
-    /// Minimum cwnd, in blocks.
+    /// Minimum cwnd, in blocks (the floor under [`CwndUnit::Blocks`]).
     pub bbr_min_cwnd: u32,
+    /// Minimum cwnd, in bytes (the floor under [`CwndUnit::Bytes`]). Doubles as the
+    /// cold-start byte window before the first delivery sample, and as the binding
+    /// operating window for low-latency peers whose byte-BDP is below it.
+    pub bbr_min_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
-    /// Unit the BBR cwnd budgets in-flight work against (`blocks` = request count,
-    /// default; `bytes` = reserved body bytes).
+    /// Unit the BBR cwnd budgets in-flight work against (`bytes` = header-hinted
+    /// reserved body bytes, default; `blocks` = request count, the A/B baseline).
     pub bbr_cwnd_unit: CwndUnit,
     /// Slots a floor (lowest-missing-height) request may borrow beyond the BBR cwnd, up
     /// to the peer's advertised hard cap. Lets the floor be fetched even when every
@@ -290,6 +328,8 @@ impl Default for ZakuraBlockSyncConfig {
             floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
+            floor_rescue_timeout: DEFAULT_BS_FLOOR_RESCUE_TIMEOUT,
+            no_progress_peer_cooldown: DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             fanout: DEFAULT_BS_FANOUT,
@@ -301,8 +341,9 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_delivery_rate_window: DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW,
             bbr_startup_growth_percent: DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT,
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
+            bbr_min_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
-            bbr_cwnd_unit: CwndUnit::Blocks,
+            bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
         }
@@ -325,7 +366,7 @@ impl ZakuraBlockSyncConfig {
         clamp_advertised_response_bytes(self.max_response_bytes)
     }
 
-    /// Return the non-zero verifier submission cap.
+    /// Return the non-zero block-sync action/body channel depth.
     pub fn submitted_apply_limit(&self) -> usize {
         self.max_submitted_block_applies
             .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
@@ -349,7 +390,22 @@ impl ZakuraBlockSyncConfig {
             .saturating_mul(BLOCK_PROGRESS_TIMEOUT_REQUESTS)
     }
 
+    /// Return the no-progress peer cooldown clamped to a positive duration.
+    pub(super) fn effective_no_progress_peer_cooldown(&self) -> Duration {
+        self.no_progress_peer_cooldown.max(Duration::from_millis(1))
+    }
+
+    /// Return the floor-rescue leash, clamped positive and no looser than the base
+    /// request timeout (a floor request is never more patient than a normal one).
+    pub(super) fn effective_floor_rescue_timeout(&self) -> Duration {
+        self.floor_rescue_timeout
+            .clamp(Duration::from_millis(1), self.request_timeout)
+    }
+
     /// Return the largest byte reservation a single floor request can need.
+    ///
+    /// `fanout` is only a compatibility reservation multiplier; it does not mean
+    /// current scheduling sends the same floor request to multiple peers.
     pub fn floor_request_byte_reservation(&self) -> u64 {
         let fanout = u64::try_from(self.fanout.max(1)).unwrap_or(u64::MAX);
         let worst_case_blocks = u64::from(self.advertised_max_blocks_per_response())
@@ -374,6 +430,9 @@ impl ZakuraBlockSyncConfig {
         }
         if self.bbr_min_cwnd == 0 {
             return Err("bbr_min_cwnd must be greater than zero");
+        }
+        if self.bbr_min_cwnd_bytes == 0 {
+            return Err("bbr_min_cwnd_bytes must be greater than zero");
         }
         if self.bbr_cwnd_gain_percent < 100
             || self.bbr_probe_bw_gain_percent < 100

@@ -347,7 +347,14 @@ impl WindowedSamples {
 /// Per-peer BBR-lite control parameters extracted from config (Copy, lock-free).
 #[derive(Copy, Clone, Debug)]
 struct BbrParams {
+    /// Unit the cwnd/BtlBw/`delivered` are denominated in. `Blocks` keeps the
+    /// request-counting controller (the A/B baseline); `Bytes` makes the controller
+    /// reason in header-hinted body bytes so the in-flight request count falls out as
+    /// `cwnd_bytes / advertised_block_size`.
+    unit: CwndUnit,
     cwnd_gain: f64,
+    /// Minimum / cold-start cwnd, in the active unit (`bbr_min_cwnd` blocks or
+    /// `bbr_min_cwnd_bytes` bytes).
     min_cwnd: usize,
     startup_cwnd: usize,
     rtprop_window: Duration,
@@ -365,12 +372,29 @@ struct BbrParams {
 
 impl BbrParams {
     fn from_config(config: &ZakuraBlockSyncConfig) -> Self {
-        let min_cwnd = usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1);
-        // Cold start opens at the configured initial window until the first BDP sample.
-        let startup_cwnd = usize::try_from(config.initial_inflight_requests)
-            .unwrap_or(min_cwnd)
-            .max(min_cwnd);
+        let (min_cwnd, startup_cwnd) = match config.bbr_cwnd_unit {
+            CwndUnit::Blocks => {
+                let min = usize::try_from(config.bbr_min_cwnd).unwrap_or(1).max(1);
+                // Cold start opens at the configured initial window until the first
+                // BDP sample.
+                let startup = usize::try_from(config.initial_inflight_requests)
+                    .unwrap_or(min)
+                    .max(min);
+                (min, startup)
+            }
+            CwndUnit::Bytes => {
+                // Byte denomination: the floor (and cold-start window) is the
+                // configured minimum byte cwnd. The BDP estimate takes over once the
+                // first delivery sample arrives; until then `bbr_min_cwnd_bytes`
+                // primes the pipe with a few bodies' worth of in-flight budget.
+                let min = usize::try_from(config.bbr_min_cwnd_bytes)
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+                (min, min)
+            }
+        };
         Self {
+            unit: config.bbr_cwnd_unit,
             cwnd_gain: f64::from(config.bbr_cwnd_gain_percent) / 100.0,
             min_cwnd,
             startup_cwnd,
@@ -411,9 +435,30 @@ impl BbrPhase {
 #[derive(Clone, Debug)]
 struct BbrState {
     params: BbrParams,
+    /// Windowed-min of the **raw request round-trip** (seconds) — the BDP's RTprop term
+    /// (`bdp = BtlBw × RTprop`) under both units: the genuine fastest observed round trip,
+    /// which never collapses to zero. (The earlier byte-unit model fed this the
+    /// *size-residual* `elapsed − bytes/BtlBw`; on a high-BtlBw carrier the fastest
+    /// delivery's residual is ≈0, which zeroed the BDP and pinned the cwnd at the floor.
+    /// The size-residual now lives in [`rtprop_residual_secs`](Self::rtprop_residual_secs),
+    /// used only by the size-aware delay gate.)
     rtprop_secs: WindowedSamples,
-    btlbw_blocks_per_sec: WindowedSamples,
+    /// Windowed-min of the **size-residual** round-trip (`elapsed − bytes/BtlBw` under
+    /// `Bytes`; the raw round-trip under `Blocks`) — the transmission-stripped propagation
+    /// latency. Used **only** as the delay gate's healthy-round-trip base, so a big block's
+    /// honest transfer time is not mistaken for a standing queue. It never feeds the BDP,
+    /// which must reflect real in-flight depth rather than a residual that collapses to ~0
+    /// on a fast carrier.
+    rtprop_residual_secs: WindowedSamples,
+    /// Max-filter over per-ack delivery rate, in **units per second** (blocks/s under
+    /// [`CwndUnit::Blocks`], bytes/s under [`CwndUnit::Bytes`]). The byte denomination
+    /// makes `BtlBw × RTprop` a true bandwidth-delay product over heterogeneous body
+    /// sizes; the block denomination is the A/B baseline.
+    btlbw_per_sec: WindowedSamples,
+    /// Cumulative delivered amount in the active unit (blocks or bytes), used as the
+    /// per-ack delivery-rate numerator via [`DeliverySnapshot`].
     delivered: u64,
+    delivered_at: Option<Instant>,
     /// Effective cwnd in blocks currently applied by `available_slots`: the
     /// BDP-derived target once measured, the startup window before that, dipped on
     /// timeouts. Never below `min_cwnd`. Ignored while in `ProbeRtt` (which forces
@@ -443,8 +488,10 @@ impl BbrState {
         let params = BbrParams::from_config(config);
         Self {
             rtprop_secs: WindowedSamples::new(params.rtprop_window),
-            btlbw_blocks_per_sec: WindowedSamples::new(params.delivery_rate_window),
+            rtprop_residual_secs: WindowedSamples::new(params.rtprop_window),
+            btlbw_per_sec: WindowedSamples::new(params.delivery_rate_window),
             delivered: 0,
+            delivered_at: None,
             cwnd_cap: params.startup_cwnd,
             phase: BbrPhase::ProbeBw,
             last_probe_rtt_at: None,
@@ -455,19 +502,69 @@ impl BbrState {
         }
     }
 
+    fn delivery_snapshot(&self, now: Instant) -> DeliverySnapshot {
+        DeliverySnapshot {
+            delivered: self.delivered,
+            delivered_at: self.delivered_at.unwrap_or(now),
+        }
+    }
+
     /// Record a completed request: `elapsed` from send to the final body, `blocks` in
-    /// it, `inflight` = requests still outstanding to this peer *after* this completion.
-    /// The RTprop sample is the round-trip; the BtlBw sample is the delivery rate, with
-    /// the interval floored at the current RTprop so a burst of buffered bodies arriving
-    /// within one tick cannot inflate the bandwidth estimate. Re-derives the applied cwnd
-    /// from the fresh BDP estimate, then advances the ProbeBw/ProbeRtt phase machine.
-    fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32, inflight: usize) {
+    /// it, and `inflight` = requests still outstanding to this peer *after* this
+    /// completion. The RTprop sample is the request round-trip. The BtlBw sample is
+    /// measured over the request's pipe interval (`delivered_delta / elapsed_since_snapshot`),
+    /// so one-block responses can still observe concurrent completions while the request
+    /// was in flight. The interval is floored at the previous RTprop so a burst of
+    /// buffered bodies arriving within one tick cannot inflate the bandwidth estimate.
+    /// Re-derives the applied cwnd from the fresh BDP estimate, then advances the
+    /// ProbeBw/ProbeRtt phase machine.
+    fn record_delivery(
+        &mut self,
+        now: Instant,
+        elapsed: Duration,
+        blocks: u32,
+        delivered_bytes: u64,
+        inflight: usize,
+        snapshot: DeliverySnapshot,
+    ) {
         let secs = elapsed.as_secs_f64();
+        // Floor the delivery-rate interval at the *previous* RTprop min (captured
+        // before this sample is observed) so a burst of buffered bodies arriving within
+        // one tick cannot inflate the bandwidth estimate.
+        let rate_floor = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
+
+        // Accumulate the delivered amount in the active unit and push a per-ack rate
+        // sample into the BtlBw max-filter (blocks/s under `Blocks`, bytes/s under
+        // `Bytes`).
+        let delivered_amount = match self.params.unit {
+            CwndUnit::Blocks => u64::from(blocks),
+            CwndUnit::Bytes => delivered_bytes,
+        };
+        let delivered_after = self.delivered.saturating_add(delivered_amount);
+        let delivered_delta = delivered_after.saturating_sub(snapshot.delivered).max(1);
+        let interval = now.saturating_duration_since(snapshot.delivered_at);
+        // `delivered_delta` is a count/byte total over a short sampling window;
+        // converting it to `f64` is exact for the operating ranges this controller sees.
+        let rate = delivered_delta as f64 / interval.as_secs_f64().max(rate_floor);
+        self.btlbw_per_sec.observe(now, rate);
+        self.delivered = delivered_after;
+        self.delivered_at = Some(now);
+
+        // Observe the BDP's RTprop sample: the **raw** round trip under both units. Its
+        // windowed min ≈ the base round trip of the fastest deliveries, which is the real
+        // in-flight depth the BDP needs. Feeding the BDP the size residual instead would
+        // collapse it to ~0 on a high-BtlBw carrier (the fastest delivery's residual
+        // `elapsed − bytes/BtlBw` ≈ 0), pinning the cwnd at the floor.
         self.rtprop_secs.observe(now, secs);
-        let floor = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
-        let rate = f64::from(blocks) / secs.max(floor);
-        self.btlbw_blocks_per_sec.observe(now, rate);
-        self.delivered = self.delivered.saturating_add(u64::from(blocks));
+        // Observe the size-residual separately, for the delay gate only: under `Bytes` it
+        // strips the body's transmission time so a big block's honest transfer is not read
+        // as a standing queue; under `Blocks` it is the raw round trip (A/B baseline).
+        let residual_sample = match self.params.unit {
+            CwndUnit::Blocks => secs,
+            CwndUnit::Bytes => self.size_residual_rtprop(secs, delivered_bytes),
+        };
+        self.rtprop_residual_secs.observe(now, residual_sample);
+
         if let Some(target) = self.cwnd_target() {
             self.cwnd_cap = target;
         }
@@ -476,23 +573,58 @@ impl BbrState {
         // still the pre-`advance_phase` value, so a tick that flips into ProbeRtt this
         // call last updated the ceiling under genuine ProbeBw conditions.
         if self.phase == BbrPhase::ProbeBw {
-            self.update_delay_cap(secs);
+            self.update_delay_cap(secs, delivered_bytes);
         }
         self.advance_phase(now, inflight);
+    }
+
+    /// Size-residual RTprop sample (`Bytes` unit): subtract the body's transmission
+    /// time at the bottleneck rate from the round trip, leaving the fixed-latency
+    /// component. Falls back to the raw round trip before any rate is known, and is
+    /// clamped to `[ε, elapsed]` (the residual can never exceed the time elapsed, and a
+    /// tiny positive floor keeps the byte-BDP well-defined).
+    fn size_residual_rtprop(&self, secs: f64, delivered_bytes: u64) -> f64 {
+        let btlbw = self.btlbw_per_sec.max().unwrap_or(0.0);
+        let residual = if btlbw > 0.0 {
+            // `delivered_bytes as f64` is exact for real body sizes.
+            secs - delivered_bytes as f64 / btlbw
+        } else {
+            secs
+        };
+        residual.clamp(1e-4, secs.max(1e-4))
     }
 
     /// Update the delay-gradient ceiling from this delivery's round-trip. When the
     /// smoothed round-trip rises above `RTprop × delay_gradient` the queue is building,
     /// so ratchet the ceiling down from the current operating cwnd; otherwise relax it
     /// back up so a cleared queue lets the cwnd re-probe for bandwidth.
-    fn update_delay_cap(&mut self, secs: f64) {
+    fn update_delay_cap(&mut self, secs: f64, delivered_bytes: u64) {
         let smoothed = match self.smoothed_elapsed_secs {
             Some(prev) => prev * (1.0 - BBR_DELAY_EWMA_ALPHA) + secs * BBR_DELAY_EWMA_ALPHA,
             None => secs,
         };
         self.smoothed_elapsed_secs = Some(smoothed);
-        let rtprop = self.rtprop_secs.min().unwrap_or(secs).max(1e-4);
-        if smoothed > rtprop * self.params.delay_gradient {
+        // The delay gate's base is the *residual* RTprop (transmission stripped), not the
+        // raw round trip the BDP uses: the size-aware `expected` below adds the body's
+        // transmission back, so basing it on the raw round trip would double-count it.
+        let rtprop = self.rtprop_residual_secs.min().unwrap_or(secs).max(1e-4);
+        // The expected round trip for a healthy (unqueued) delivery. Under `Bytes` it is
+        // size-aware — `RTprop + transmission time` — so a big block's honest transfer
+        // time is not mistaken for a standing queue; under `Blocks` it is just RTprop
+        // (the A/B baseline).
+        let expected = match self.params.unit {
+            CwndUnit::Blocks => rtprop,
+            CwndUnit::Bytes => {
+                let btlbw = self.btlbw_per_sec.max().unwrap_or(0.0);
+                let transmit = if btlbw > 0.0 {
+                    delivered_bytes as f64 / btlbw
+                } else {
+                    0.0
+                };
+                rtprop + transmit
+            }
+        };
+        if smoothed > expected * self.params.delay_gradient {
             // Queue building: shrink the ceiling relative to the current operating cwnd.
             let operating = self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd);
             let shrunk = (operating as f64 * BBR_DELAY_CAP_DOWN).round();
@@ -575,19 +707,20 @@ impl BbrState {
         self.delay_cap = self.delay_cap.min(self.cwnd_cap);
     }
 
-    /// Bandwidth-delay product in blocks: BtlBw (blocks/s) × RTprop (s). `None` until
-    /// at least one delivery sample exists (cold start).
-    fn bdp_blocks(&self) -> Option<f64> {
-        match (self.btlbw_blocks_per_sec.max(), self.rtprop_secs.min()) {
+    /// Bandwidth-delay product in the active unit: BtlBw (units/s) × RTprop (s) — blocks
+    /// under `Blocks`, bytes under `Bytes`. `None` until at least one delivery sample
+    /// exists (cold start).
+    fn bdp(&self) -> Option<f64> {
+        match (self.btlbw_per_sec.max(), self.rtprop_secs.min()) {
             (Some(rate), Some(rtprop)) => Some(rate * rtprop),
             _ => None,
         }
     }
 
-    /// Target cwnd in blocks = `max(min_cwnd, BDP × gain)`. `None` until the first
-    /// delivery sample exists, so the cwnd stays at the cold-start value until then.
+    /// Target cwnd in the active unit = `max(min_cwnd, BDP × gain)`. `None` until the
+    /// first delivery sample exists, so the cwnd stays at the cold-start value until then.
     fn cwnd_target(&self) -> Option<usize> {
-        let bdp = self.bdp_blocks()?;
+        let bdp = self.bdp()?;
         let scaled = (bdp * self.params.cwnd_gain).round();
         // BDP × gain is a non-negative, finite product of measured rates; clamp
         // defensively and the cast is safe.
@@ -606,9 +739,15 @@ impl BbrState {
             .map(|secs| (secs * 1000.0).round() as u64)
     }
 
+    /// Raw BtlBw max-filter value in the active unit per second (`None` cold-start).
+    fn btlbw_units_per_sec(&self) -> Option<f64> {
+        self.btlbw_per_sec.max()
+    }
+
     fn btlbw_milliblocks_per_sec(&self) -> Option<u64> {
-        // A rounded non-negative rate scaled by 1000 fits u64 for any real rate.
-        self.btlbw_blocks_per_sec
+        // A rounded non-negative rate scaled by 1000 fits u64 for any real rate. Only
+        // meaningful under `Blocks`; the byte trace path reports bytes/sec instead.
+        self.btlbw_per_sec
             .max()
             .map(|rate| (rate * 1000.0).round() as u64)
     }
@@ -639,13 +778,12 @@ impl BbrState {
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
-    /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller.
+    /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
+    /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
+    /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
     bbr: BbrState,
     /// Whether the cwnd budgets outstanding work in request slots or reserved bytes.
     cwnd_unit: CwndUnit,
-    /// Per-request byte weight used to scale the request-denominated cwnd into a byte
-    /// budget under [`CwndUnit::Bytes`] (the advertised per-response byte cap).
-    nominal_request_bytes: u64,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -666,24 +804,66 @@ impl DownloadWindow {
             outstanding: Vec::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
-            nominal_request_bytes: u64::from(config.max_response_bytes.max(1)),
             block_liveness_deadline: None,
             last_block_at: None,
         }
     }
 
-    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
-    /// and advance the ProbeRtt phase machine. Call after removing the completed request
-    /// from `outstanding`, so `outstanding.len()` is the inflight count the ProbeRtt
-    /// drain check needs.
-    pub(super) fn record_delivery(&mut self, now: Instant, elapsed: Duration, blocks: u32) {
-        let inflight = self.outstanding.len();
-        self.bbr.record_delivery(now, elapsed, blocks, inflight);
+    pub(super) fn delivery_snapshot(&self, now: Instant) -> DeliverySnapshot {
+        self.bbr.delivery_snapshot(now)
     }
 
-    /// The effective BBR cwnd in blocks currently applied.
+    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
+    /// and advance the ProbeRtt phase machine. `delivered_bytes` is the request's total
+    /// delivered body bytes — under the single-block-per-request invariant
+    /// (`DEFAULT_BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
+    /// `serialized_bytes`. Call after removing the completed request from `outstanding`,
+    /// so `outstanding.len()` is the inflight count the ProbeRtt drain check needs.
+    pub(super) fn record_delivery(
+        &mut self,
+        now: Instant,
+        elapsed: Duration,
+        blocks: u32,
+        delivered_bytes: u64,
+        snapshot: DeliverySnapshot,
+    ) {
+        let inflight = self.outstanding.len();
+        self.bbr
+            .record_delivery(now, elapsed, blocks, delivered_bytes, inflight, snapshot);
+    }
+
+    /// The effective BBR cwnd as a **request count**, for diagnostics that compare
+    /// against the request-count hard cap (the periodic slot trace, cross-peer floor
+    /// bias). Under `Blocks` this is the cwnd directly; under `Bytes` it is the byte
+    /// cwnd divided by a representative body size, so it reads as "requests this peer's
+    /// byte window admits". The byte cwnd itself is available via
+    /// [`bbr_effective_cwnd_bytes`](Self::bbr_effective_cwnd_bytes).
     pub(super) fn bbr_effective_cwnd(&self) -> usize {
-        self.bbr.effective_cwnd()
+        match self.cwnd_unit {
+            CwndUnit::Blocks => self.bbr.effective_cwnd(),
+            CwndUnit::Bytes => {
+                let cwnd_bytes = self.bbr.effective_cwnd() as u64;
+                let rep = self.representative_body_bytes();
+                usize::try_from((cwnd_bytes / rep.max(1)).max(1)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// The effective byte cwnd under `Bytes` (`None` under `Blocks`), for tracing.
+    pub(super) fn bbr_effective_cwnd_bytes(&self) -> Option<u64> {
+        matches!(self.cwnd_unit, CwndUnit::Bytes).then(|| self.bbr.effective_cwnd() as u64)
+    }
+
+    /// A representative body size in bytes for converting a byte cwnd into a request
+    /// count: the mean reserved bytes across in-flight requests, falling back to the
+    /// per-block worst case when nothing is outstanding. Used only for diagnostics and
+    /// the floor-bypass byte bonus, never for admission.
+    fn representative_body_bytes(&self) -> u64 {
+        let outstanding = self.outstanding.len() as u64;
+        if outstanding == 0 {
+            return block::MAX_BLOCK_BYTES;
+        }
+        (self.outstanding_reserved_bytes() / outstanding).max(1)
     }
 
     /// The current RTprop estimate in milliseconds, for tracing.
@@ -692,11 +872,33 @@ impl DownloadWindow {
     }
 
     /// The current BtlBw estimate in milli-blocks/sec (blocks/sec × 1000), for tracing.
+    /// `None` under `Bytes`, where [`bbr_btlbw_bytes_per_sec`](Self::bbr_btlbw_bytes_per_sec)
+    /// is the meaningful rate.
     pub(super) fn bbr_btlbw_milliblocks(&self) -> Option<u64> {
-        self.bbr.btlbw_milliblocks_per_sec()
+        matches!(self.cwnd_unit, CwndUnit::Blocks)
+            .then(|| self.bbr.btlbw_milliblocks_per_sec())
+            .flatten()
     }
 
-    /// Total blocks delivered through this peer's completed requests, for tracing.
+    /// The current BtlBw estimate in bytes/sec under `Bytes` (`None` under `Blocks`).
+    pub(super) fn bbr_btlbw_bytes_per_sec(&self) -> Option<u64> {
+        if !matches!(self.cwnd_unit, CwndUnit::Bytes) {
+            return None;
+        }
+        self.bbr
+            .btlbw_units_per_sec()
+            // A non-negative finite bytes/sec rate rounds into u64 for any real link.
+            .map(|rate| rate.round() as u64)
+    }
+
+    /// Bytes reserved across this peer's in-flight requests, for tracing the byte window
+    /// occupancy.
+    pub(super) fn bbr_inflight_bytes(&self) -> u64 {
+        self.outstanding_reserved_bytes()
+    }
+
+    /// Total delivered through this peer's completed requests, for tracing — blocks
+    /// under `Blocks`, bytes under `Bytes`.
     pub(super) fn bbr_delivered(&self) -> u64 {
         self.bbr.delivered
     }
@@ -730,35 +932,53 @@ impl DownloadWindow {
     ///
     /// The return value is non-zero exactly when there is room for at least one more
     /// request; callers use it as a gate, not an absolute count. Under
-    /// [`CwndUnit::Bytes`] the cwnd's request budget is scaled by the per-request byte
-    /// weight and compared against reserved body bytes, so a peer serving large bodies
-    /// holds fewer in flight. The controller itself is unit-agnostic — only this
-    /// comparison changes — which is the seam that makes switching units a small change.
+    /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget (`BtlBw_bytes × RTprop ×
+    /// gain`, from header size hints) compared against reserved body bytes, so a peer
+    /// serving large bodies holds fewer in flight and a peer serving small bodies holds
+    /// many — the in-flight *request* count falls out of `cwnd_bytes / body_size`. The
+    /// controller is unit-agnostic; only this comparison differs — the seam that makes
+    /// switching units a small change.
     pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
         // BBR-lite is the sole congestion controller: cap in-flight at the BDP-derived
-        // cwnd (clamped to the hard cap), so a peer's queue stays at ~one BDP and
-        // head-of-line latency tracks RTprop. The floor bypass adds `bonus` on top.
-        let cwnd_slots = self
-            .bbr
-            .effective_cwnd()
-            .saturating_add(bonus)
-            .min(self.hard_outbound_capacity());
+        // cwnd so a peer's queue stays at ~one BDP and head-of-line latency tracks
+        // RTprop. The floor bypass adds `bonus` on top.
+        let hard_cap = self.hard_outbound_capacity();
         match self.cwnd_unit {
-            CwndUnit::Blocks => cwnd_slots.saturating_sub(self.outstanding.len()),
+            CwndUnit::Blocks => {
+                let cwnd_slots = self
+                    .bbr
+                    .effective_cwnd()
+                    .saturating_add(bonus)
+                    .min(hard_cap);
+                cwnd_slots.saturating_sub(self.outstanding.len())
+            }
             CwndUnit::Bytes => {
                 // The peer's advertised request-count cap still binds in byte mode: a peer
                 // serving tiny bodies must never be issued more in-flight *requests* than it
                 // advertised it will service, however much byte headroom the cwnd still
                 // shows. Once the request count reaches the hard cap there is no slot,
-                // regardless of bytes — mirroring the blocks-unit ceiling.
-                if self.outstanding.len() >= self.hard_outbound_capacity() {
+                // regardless of bytes — mirroring the blocks-unit ceiling (review fix F2).
+                let outstanding = self.outstanding.len();
+                if outstanding >= hard_cap {
                     return 0;
                 }
-                // Otherwise scale the request-denominated cwnd into a byte budget and
-                // subtract the bytes already reserved for in-flight requests.
-                let cwnd_bytes = (cwnd_slots as u64).saturating_mul(self.nominal_request_bytes);
-                let remaining = cwnd_bytes.saturating_sub(self.outstanding_reserved_bytes());
-                usize::try_from(remaining).unwrap_or(usize::MAX)
+                // The cwnd is already a byte budget. The floor bypass grants `bonus`
+                // *representative* bodies of extra byte headroom — sized to the recent
+                // per-request reservation, NOT the 2 MB worst case — so a starved floor
+                // can still be fetched when the byte window is full without ballooning
+                // the in-flight bytes far past the cwnd (which would defeat the byte
+                // denomination's head-of-line bound). The take is still count-capped to
+                // one block and passes the real `ByteBudget` reservation.
+                let reserved = self.outstanding_reserved_bytes();
+                let representative = if outstanding == 0 {
+                    block::MAX_BLOCK_BYTES
+                } else {
+                    // A non-empty in-flight set: the mean reserved bytes per request.
+                    (reserved / outstanding as u64).max(1)
+                };
+                let bonus_bytes = (bonus as u64).saturating_mul(representative);
+                let cwnd_bytes = (self.bbr.effective_cwnd() as u64).saturating_add(bonus_bytes);
+                usize::try_from(cwnd_bytes.saturating_sub(reserved)).unwrap_or(usize::MAX)
             }
         }
     }
@@ -896,7 +1116,14 @@ pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
+    pub(super) delivery_snapshot: DeliverySnapshot,
     pub(super) received: ReceivedBlockTracker,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct DeliverySnapshot {
+    pub(super) delivered: u64,
+    pub(super) delivered_at: Instant,
 }
 
 impl OutstandingBlockRange {
@@ -1166,6 +1393,9 @@ mod bbr_tests {
     /// deliveries crosses a full ProbeBw → ProbeRtt → ProbeBw cycle.
     fn bbr_test_config() -> ZakuraBlockSyncConfig {
         ZakuraBlockSyncConfig {
+            // These tests assert blocks-slot semantics; pin the unit so the production
+            // default flip to `Bytes` does not change them.
+            bbr_cwnd_unit: CwndUnit::Blocks,
             bbr_min_cwnd: 4,
             bbr_cwnd_gain_percent: 200,
             bbr_probe_rtt_interval: Duration::from_secs(1),
@@ -1183,15 +1413,72 @@ mod bbr_tests {
     const CLEAN_BLOCKS: u32 = 40;
     const EXPECTED_CWND: usize = 80;
 
+    /// Blocks-mode delivery helper (the `delivered_bytes` arg is ignored under
+    /// `CwndUnit::Blocks`, so it passes 0).
+    fn record_delivery(
+        bbr: &mut BbrState,
+        now: Instant,
+        elapsed: Duration,
+        blocks: u32,
+        inflight: usize,
+    ) {
+        let snapshot = DeliverySnapshot {
+            delivered: bbr.delivered,
+            delivered_at: now - elapsed,
+        };
+        bbr.record_delivery(now, elapsed, blocks, 0, inflight, snapshot);
+    }
+
     #[test]
     fn cwnd_tracks_bdp_after_first_delivery() {
         let mut bbr = BbrState::new(&bbr_test_config());
         let t0 = Instant::now();
         // Cold start: the configured initial window until the first BDP sample.
         assert_eq!(bbr.effective_cwnd(), 16);
-        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
         assert_eq!(bbr.phase, BbrPhase::ProbeBw);
+    }
+
+    #[test]
+    fn one_block_responses_observe_pipe_delivery_rate() {
+        let mut bbr = BbrState::new(&bbr_test_config());
+        let t0 = Instant::now();
+        let rtprop = Duration::from_millis(100);
+        let sent_at = t0 - rtprop;
+        let snapshots: Vec<_> = (0..16).map(|_| bbr.delivery_snapshot(sent_at)).collect();
+
+        for snapshot in snapshots {
+            bbr.record_delivery(t0, rtprop, 1, 0, 16, snapshot);
+        }
+
+        // Sixteen one-block responses completed during the same request interval:
+        // BtlBw = 16 / 100 ms, BDP = 16, cwnd gain = 2.
+        assert_eq!(bbr.effective_cwnd(), 32);
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(160_000));
+    }
+
+    #[test]
+    fn delivery_rate_floor_uses_previous_rtprop_sample() {
+        let mut bbr = BbrState::new(&bbr_test_config());
+        let t0 = Instant::now();
+
+        // Establish a 100 ms RTprop and 100 blocks/s BtlBw sample.
+        record_delivery(&mut bbr, t0, Duration::from_millis(100), 10, 10);
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(100_000));
+
+        // A later 1 ms request is also the new RTprop, but it must not remove the
+        // floor for its own delivery-rate sample. With the old ordering this sample
+        // was 10 / 1 ms = 10_000 blocks/s and inflated BtlBw by 100x.
+        record_delivery(
+            &mut bbr,
+            t0 + Duration::from_millis(10),
+            Duration::from_millis(1),
+            10,
+            10,
+        );
+        assert_eq!(bbr.rtprop_ms(), Some(1));
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(100_000));
     }
 
     #[test]
@@ -1202,36 +1489,36 @@ mod bbr_tests {
         let t0 = Instant::now();
 
         // Establish a healthy cwnd; anchors the first probe at t0.
-        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
 
         // One interval later, a delivery trips ProbeRtt: cwnd pins to min_cwnd even
         // though the BDP estimate is unchanged.
         let t1 = t0 + Duration::from_millis(1_100);
-        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
         assert_eq!(bbr.effective_cwnd(), min_cwnd);
 
         // Queue not yet drained (inflight still above min): hold ProbeRtt, no timer.
         let t2 = t1 + Duration::from_millis(50);
-        bbr.record_delivery(t2, CLEAN_ELAPSED, 10, min_cwnd + 5);
+        record_delivery(&mut bbr, t2, CLEAN_ELAPSED, 10, min_cwnd + 5);
         assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
         assert!(bbr.probe_rtt_drained_at.is_none());
 
         // Queue drains to the floor: the hold timer starts here.
         let t3 = t2 + Duration::from_millis(20);
-        bbr.record_delivery(t3, CLEAN_ELAPSED, 10, min_cwnd - 1);
+        record_delivery(&mut bbr, t3, CLEAN_ELAPSED, 10, min_cwnd - 1);
         assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
         assert_eq!(bbr.probe_rtt_drained_at, Some(t3));
 
         // Before the hold elapses, still draining.
         let t4 = t3 + Duration::from_millis(100);
-        bbr.record_delivery(t4, CLEAN_ELAPSED, 10, 1);
+        record_delivery(&mut bbr, t4, CLEAN_ELAPSED, 10, 1);
         assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
 
         // After probe_rtt_duration past the drain, exit to ProbeBw and restore cwnd.
         let t5 = t3 + Duration::from_millis(200);
-        bbr.record_delivery(t5, CLEAN_ELAPSED, 10, 1);
+        record_delivery(&mut bbr, t5, CLEAN_ELAPSED, 10, 1);
         assert_eq!(bbr.phase, BbrPhase::ProbeBw);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
         assert_eq!(bbr.last_probe_rtt_at, Some(t5));
@@ -1246,9 +1533,9 @@ mod bbr_tests {
         let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
         let mut bbr = BbrState::new(&cfg);
         let t0 = Instant::now();
-        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         let t1 = t0 + Duration::from_millis(1_100);
-        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.effective_cwnd(), min_cwnd);
     }
 
@@ -1258,7 +1545,7 @@ mod bbr_tests {
         let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
         let mut bbr = BbrState::new(&cfg);
         let t0 = Instant::now();
-        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
 
         // In ProbeBw a timeout dips the cwnd by the multiplicative factor.
@@ -1269,7 +1556,7 @@ mod bbr_tests {
         // Enter ProbeRtt; a timeout there is an expected drain consequence, not
         // congestion signal, so cwnd_cap is left untouched.
         let t1 = t0 + Duration::from_millis(1_100);
-        bbr.record_delivery(t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t1, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.phase, BbrPhase::ProbeRtt);
         let cap_before = bbr.cwnd_cap;
         bbr.dip_on_timeout();
@@ -1291,6 +1578,7 @@ mod bbr_tests {
                 },
                 queued_at: now,
                 deadline: now,
+                delivery_snapshot: window.delivery_snapshot(now),
                 received: ReceivedBlockTracker::default(),
             });
         }
@@ -1330,7 +1618,7 @@ mod bbr_tests {
         let mut bbr = BbrState::new(&bbr_test_config());
         let mut now = Instant::now();
         for _ in 0..20 {
-            bbr.record_delivery(now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+            record_delivery(&mut bbr, now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
             now += Duration::from_millis(5);
         }
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
@@ -1347,7 +1635,7 @@ mod bbr_tests {
         let mut bbr = BbrState::new(&cfg);
         let t0 = Instant::now();
         // One clean delivery anchors RTprop at 10 ms and the BDP target at 80.
-        bbr.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
 
         // Now deliveries keep arriving at the same low RTprop sample for the min-filter
@@ -1359,7 +1647,7 @@ mod bbr_tests {
         let mut now = t0;
         for _ in 0..40 {
             now += Duration::from_millis(5);
-            bbr.record_delivery(now, inflated, CLEAN_BLOCKS, 50);
+            record_delivery(&mut bbr, now, inflated, CLEAN_BLOCKS, 50);
         }
         assert_eq!(
             bbr.phase,
@@ -1397,33 +1685,42 @@ mod bbr_tests {
                 },
                 queued_at: now,
                 deadline: now,
+                delivery_snapshot: window.delivery_snapshot(now),
                 received: ReceivedBlockTracker::default(),
             });
         }
     }
 
+    /// A byte-unit config whose cold-start byte cwnd is exactly `min_cwnd_bytes` (the
+    /// floor doubles as the cold-start window) with a request-count cap well above it.
+    fn byte_test_config(min_cwnd_bytes: u64, max_inflight: u32) -> ZakuraBlockSyncConfig {
+        ZakuraBlockSyncConfig {
+            bbr_cwnd_unit: CwndUnit::Bytes,
+            bbr_min_cwnd_bytes: min_cwnd_bytes,
+            max_inflight_requests: max_inflight,
+            ..bbr_test_config()
+        }
+    }
+
     #[test]
     fn cwnd_unit_bytes_budgets_in_flight_by_reserved_bytes() {
-        // cold-start cwnd 8 requests × 1000 B/request = an 8000 B in-flight budget.
-        let cfg = ZakuraBlockSyncConfig {
-            bbr_cwnd_unit: CwndUnit::Bytes,
-            initial_inflight_requests: 8,
-            max_inflight_requests: 256,
-            max_response_bytes: 1000,
-            ..bbr_test_config()
-        };
+        // The byte cwnd is the byte floor at cold start: an 8000 B in-flight budget,
+        // sourced from the controller's byte denomination — independent of how many
+        // *requests* that is.
+        let cfg = byte_test_config(8000, 256);
         let mut window = DownloadWindow::new(&cfg);
         assert_eq!(window.available_slots(), 8000);
 
-        // Six 1000 B requests leave 2000 B of headroom...
+        // Six 1000 B requests (their header-hinted `estimated_bytes`) leave 2000 B...
         push_outstanding_bytes(&mut window, 6, 1000);
         assert_eq!(window.available_slots(), 2000);
         // ...and two more exhaust the byte budget.
         push_outstanding_bytes(&mut window, 2, 1000);
         assert_eq!(window.available_slots(), 0);
 
-        // A peer serving 4 KB bodies fills the same cwnd with far fewer requests — the
-        // point of the byte unit. Two 4000 B requests already saturate the 8000 B budget.
+        // A peer serving 4 KB bodies fills the same byte cwnd with far fewer requests —
+        // the point of the byte unit. Two 4000 B requests already saturate the 8000 B
+        // budget, so the in-flight request count self-adjusts to the body size.
         let mut big = DownloadWindow::new(&cfg);
         push_outstanding_bytes(&mut big, 2, 4000);
         assert_eq!(big.available_slots(), 0);
@@ -1433,17 +1730,11 @@ mod bbr_tests {
     fn cwnd_unit_bytes_enforces_the_request_count_hard_cap() {
         // A peer advertising a small inflight cap but serving tiny bodies must not be
         // issued more *requests* than it will service, however much byte headroom the
-        // cwnd's byte budget still shows — the advertised request-count cap binds first.
-        let cfg = ZakuraBlockSyncConfig {
-            bbr_cwnd_unit: CwndUnit::Bytes,
-            initial_inflight_requests: 4,
-            max_inflight_requests: 4,    // advertised hard cap = 4 requests
-            max_response_bytes: 100_000, // large per-request byte weight
-            ..bbr_test_config()
-        };
+        // cwnd still shows — the advertised request-count cap binds first (review fix F2).
+        let cfg = byte_test_config(400_000, 4); // 400 KB byte cwnd, hard cap 4 requests
         let mut window = DownloadWindow::new(&cfg);
         assert_eq!(window.hard_outbound_capacity(), 4);
-        // cwnd 4 × 100_000 B = 400_000 B of byte headroom — room for many tiny bodies.
+        // 400_000 B of byte headroom — room for many tiny bodies.
         assert!(window.available_slots() > 0);
 
         // Four tiny (10 B) requests reach the request-count hard cap. The byte budget is
@@ -1457,6 +1748,100 @@ mod bbr_tests {
         );
         // The floor bypass must not breach the advertised cap either.
         assert_eq!(window.available_slots_with_bonus(2), 0);
+    }
+
+    #[test]
+    fn byte_mode_btlbw_is_bytes_per_sec_and_floor_binds_at_low_bdp() {
+        // A 20 KB body served in 10 ms: BtlBw = 2 MB/s, raw round trip 10 ms ⇒ a genuine
+        // byte-BDP of 20 KB, ×2 gain = 40 KB, below the 100 KB `min_cwnd_bytes` floor. So
+        // the floor is the binding operating window — the low-BDP regime the floor exists
+        // for. (Unlike the old size-residual model, this binds because the *real* BDP is
+        // small, not because the residual spuriously collapsed to ~0.)
+        let cfg = byte_test_config(100_000, 256);
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        let snapshot = DeliverySnapshot {
+            delivered: 0,
+            delivered_at: t0 - Duration::from_millis(10),
+        };
+        bbr.record_delivery(t0, Duration::from_millis(10), 1, 20_000, 50, snapshot);
+        // BtlBw is denominated in bytes/sec now, not blocks/sec.
+        assert_eq!(bbr.btlbw_units_per_sec(), Some(2_000_000.0));
+        // The byte floor binds because BDP×gain (40 KB) < floor (100 KB).
+        assert_eq!(bbr.effective_cwnd(), 100_000);
+    }
+
+    #[test]
+    fn byte_bdp_uses_raw_rtt_so_a_fast_carrier_lifts_off_the_floor() {
+        // The regression guard for the floor-pin fix. An 800 KB body served in 20 ms:
+        // BtlBw = 40 MB/s, raw round trip 20 ms ⇒ byte-BDP 800 KB, ×2 gain = 1.6 MB, well
+        // above the 256 KB floor. The cwnd lifts off the floor.
+        //
+        // The *size residual* of this same delivery collapses to the ε floor (its implied
+        // transmission 800 KB / 40 MB/s = 20 ms equals the whole round trip), so the old
+        // model would have computed BDP ≈ 0 and pinned the cwnd at 256 KB. Using the raw
+        // round trip for the BDP is what keeps a genuinely fast carrier from being
+        // under-pipelined.
+        let cfg = byte_test_config(256_000, 256);
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        let snapshot = DeliverySnapshot {
+            delivered: 0,
+            delivered_at: t0 - Duration::from_millis(20),
+        };
+        bbr.record_delivery(t0, Duration::from_millis(20), 1, 800_000, 50, snapshot);
+        assert_eq!(bbr.btlbw_units_per_sec(), Some(40_000_000.0));
+        // The residual would have zeroed the BDP; the raw round trip does not.
+        assert_eq!(bbr.size_residual_rtprop(0.02, 800_000), 1e-4);
+        assert_eq!(bbr.effective_cwnd(), 1_600_000);
+    }
+
+    #[test]
+    fn byte_residual_rtprop_subtracts_transmission_time() {
+        // With an established 1 MB/s BtlBw, a 100 ms round trip that carried 50 KB has a
+        // residual RTprop of 100 ms − 50 ms = 50 ms (the fixed-latency component), while a
+        // round trip whose implied transmission exceeds it clamps to the positive floor.
+        let cfg = byte_test_config(1, 256);
+        let mut bbr = BbrState::new(&cfg);
+        let now = Instant::now();
+        bbr.btlbw_per_sec.observe(now, 1_000_000.0);
+        let residual = bbr.size_residual_rtprop(0.1, 50_000);
+        assert!(
+            (residual - 0.05).abs() < 1e-9,
+            "residual should subtract 50 ms of transmission, got {residual}",
+        );
+        // 200 KB at 1 MB/s implies 200 ms of transmission > the 100 ms round trip: clamp.
+        assert_eq!(bbr.size_residual_rtprop(0.1, 200_000), 1e-4);
+    }
+
+    #[test]
+    fn byte_size_aware_delay_gate_does_not_ratchet_a_big_block() {
+        // A long smoothed round-trip that is fully explained by a big block's transmission
+        // time must NOT ratchet the delay ceiling under `Bytes` (size-aware expected RT),
+        // whereas the identical round trip WOULD ratchet under `Blocks` (RTprop-only).
+        let now = Instant::now();
+
+        let bytes_cfg = byte_test_config(1, 256);
+        let mut bytes = BbrState::new(&bytes_cfg);
+        bytes.btlbw_per_sec.observe(now, 1_000_000.0); // 1 MB/s
+                                                       // The delay gate's base is the *residual* RTprop estimator (10 ms base RTT here).
+        bytes.rtprop_residual_secs.observe(now, 0.01);
+        // 200 ms round trip carrying a 190 KB body: expected ≈ 10 ms + 190 ms = 200 ms.
+        bytes.update_delay_cap(0.2, 190_000);
+        assert!(
+            bytes.delay_cap().is_none(),
+            "a big block's honest transfer time must not look like a standing queue",
+        );
+
+        let blocks_cfg = bbr_test_config();
+        let mut blocks = BbrState::new(&blocks_cfg);
+        blocks.rtprop_residual_secs.observe(now, 0.01);
+        // Same 200 ms round trip, blocks mode: expected = RTprop (10 ms) → ratchets.
+        blocks.update_delay_cap(0.2, 190_000);
+        assert!(
+            blocks.delay_cap().is_some(),
+            "blocks mode treats the inflated round trip as a queue and ratchets down",
+        );
     }
 
     #[test]
