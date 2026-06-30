@@ -52,6 +52,13 @@ enum Cmd {
         #[arg(long)]
         src: PathBuf,
     },
+    /// Print a snapshot's finalized value pool and a stable digest of the
+    /// `utxo_by_out_loc` column family (read-only), for byte-match verification.
+    CfDump {
+        /// Snapshot root containing `state/vN/<network>`.
+        #[arg(long)]
+        src: PathBuf,
+    },
     /// Read blocks `start..=end` from a snapshot into a flat cache file.
     Index {
         /// Snapshot root to read from (opened read-only).
@@ -206,6 +213,41 @@ fn main() -> Result<()> {
                 tip.0 .0,
                 tip.1,
                 has_body
+            );
+        }
+        Cmd::CfDump { src } => {
+            // Open with the VCT fast path enabled (force_legacy = false): the
+            // benchmark forks are interrupted VCT snapshots below the handoff, which
+            // refuse to open read-only with vct_fast_sync off.
+            let config = state_config(src.clone(), false);
+            let state = FinalizedState::new_read_only(&config, &network);
+            let tip = state
+                .db
+                .tip()
+                .ok_or_else(|| eyre!("snapshot has no finalized tip"))?;
+            let value_pool = state.db.finalized_value_pool();
+            let (count, key_sum, key_xor, value_sum, value_xor) =
+                state.db.utxo_by_out_loc_verification_digest();
+            let lo = zebra_chain::block::Height(tip.0 .0.saturating_sub(14_500));
+            let (bi_count, bi_first_missing, bi_missing) = state.db.block_info_coverage(lo, tip.0);
+            let bi_digest = state.db.block_info_verification_digest();
+            println!(
+                "block_info[{}..={}]: count={} missing={} first_missing={:?}",
+                lo.0, tip.0 .0, bi_count, bi_missing, bi_first_missing
+            );
+            println!("block_info_digest={bi_digest:?}");
+            println!(
+                "src={}\ntip_height={}\ntip_hash={}\nvalue_pool={:?}\n\
+                 utxo_count={}\nutxo_key_sum={}\nutxo_key_xor={}\nutxo_value_sum={}\nutxo_value_xor={}",
+                src.display(),
+                tip.0 .0,
+                tip.1,
+                value_pool,
+                count,
+                key_sum,
+                key_xor,
+                value_sum,
+                value_xor,
             );
         }
         Cmd::Index {

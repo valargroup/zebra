@@ -17,7 +17,9 @@ use tokio::sync::{
 };
 
 use tracing::Span;
+use zebra_chain::amount::NonNegative;
 use zebra_chain::block::{self, Height};
+use zebra_chain::value_balance::ValueBalance;
 
 use zebra_chain::parallel::{
     commitment_aux::BlockCommitmentRoots,
@@ -30,8 +32,8 @@ use crate::{
     service::{
         check,
         finalized_state::{
-            spawn_note_precompute, DiskWriteBatch, FinalizedPipeline, FinalizedState,
-            PreparedCommitTrace, ZebraDb,
+            reconcile_window, spawn_note_precompute, DiskWriteBatch, FinalizedPipeline,
+            FinalizedState, PreparedCommitTrace, ReconcileBlock, ZebraDb,
         },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
@@ -124,6 +126,75 @@ fn run_finalized_writer(
     }
 }
 
+/// A window of deferred transparent spends handed to the reconcile worker thread.
+///
+/// The window blocks (height-ordered, all at or below the boundary) are resolved,
+/// deleted, and re-debited off the assembler thread. Empty jobs are never sent.
+struct ReconcileJob {
+    records: Vec<ReconcileBlock>,
+}
+
+/// The deferred-transparent reconcile worker thread loop (v2).
+///
+/// Owns the running chain value pool (seeded once from disk by the spawner) and is
+/// the **sole** writer of `chain_value_pools`, `block_info`, and the spent
+/// `utxo_by_out_loc` deletes in the deferred range — the assembler and disk writer
+/// write only the disjoint UTXO creates / headers / nullifiers / trees, and skip
+/// the value pool entirely when deferring. So this runs concurrently with assembly
+/// without shared-state races or key conflicts.
+///
+/// Jobs are processed FIFO, so the value-pool chaining stays ordered. A reconcile
+/// failure is fatal, as a rocksdb write failure is on the disk writer.
+fn run_reconcile_worker(
+    db: ZebraDb,
+    mut value_pool: ValueBalance<NonNegative>,
+    job_receiver: std::sync::mpsc::Receiver<ReconcileJob>,
+) {
+    let network = db.network();
+    while let Ok(ReconcileJob { records }) = job_receiver.recv() {
+        match reconcile_window(&db, &network, &records, value_pool) {
+            Ok(new_pool) => value_pool = new_pool,
+            Err(error) => panic!("deferred transparent reconcile worker failed: {error}"),
+        }
+    }
+}
+
+/// Handle to the reconcile worker thread and its bounded job channel.
+///
+/// The channel is capacity-1: handing off the next window blocks the assembler only
+/// while the worker is still busy with the previous one, bounding the in-flight
+/// `Arc<Block>` to ~two windows.
+struct ReconcileWorker {
+    sender: Option<std::sync::mpsc::SyncSender<ReconcileJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReconcileWorker {
+    /// Hand a window prefix to the worker, applying backpressure if it is still busy.
+    /// Empty windows are ignored.
+    fn send(&self, records: Vec<ReconcileBlock>) {
+        if records.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.sender.as_ref() {
+            // The worker only stops on channel close, so a send error means it
+            // panicked mid-reconcile; that is fatal (inconsistent value pool / UTXOs).
+            sender
+                .send(ReconcileJob { records })
+                .expect("reconcile worker thread has gone away");
+        }
+    }
+
+    /// Drop the job channel and wait for the worker to finish every queued window, so
+    /// all reconcile writes are durable. Idempotent.
+    fn flush_and_join(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("reconcile worker thread panicked");
+        }
+    }
+}
+
 /// Process the disk-writer thread's flush acknowledgements: for each acked height,
 /// advance the finalized chain tip, retire the now-durable overlay entries, and run
 /// the configured stop-height check (which exits the process if matched).
@@ -137,6 +208,7 @@ fn drain_finalized_acks(
     ack_receiver: &std::sync::mpsc::Receiver<Height>,
     in_flight: &mut VecDeque<(Height, block::Hash, ChainTipBlock)>,
     chain_tip_sender: &mut ChainTipSender,
+    mut reconcile_worker: Option<&mut ReconcileWorker>,
     block_until_empty: bool,
 ) {
     while !in_flight.is_empty() {
@@ -160,6 +232,46 @@ fn drain_finalized_acks(
 
         chain_tip_sender.set_finalized_tip(tip_block);
         pipeline.retire_through(height);
+
+        // Deferred transparent reconcile: when deferral is on, reconcile the window
+        // prefix at or below this now-durable height at each reconcile boundary and
+        // at the stop height (so the final partial window is reconciled before the
+        // process exits). The boundary is a fixed block interval when
+        // `defer_reconcile_interval > 0` (mainnet checkpoints are only ~30-40 blocks
+        // apart here, too frequent to amortize the reconcile cost), otherwise each
+        // checkpoint.
+        //
+        // v2: hand the window to the dedicated reconcile worker thread so its disk
+        // reads + value-pool recompute overlap continued assembly. v1 fallback (no
+        // worker): reconcile inline. Fatal on error either way: a failed reconcile
+        // would leave the value pool / UTXO set inconsistent.
+        if finalized_state.db.defers_transparent_spends() {
+            let interval = finalized_state.db.config().defer_reconcile_interval;
+            let is_boundary = if interval > 0 {
+                height.0 % (interval as u32) == 0
+            } else {
+                finalized_state
+                    .db
+                    .network()
+                    .checkpoint_list()
+                    .contains(height)
+            };
+            let at_stop = finalized_state.is_at_stop_height(height);
+            if is_boundary || at_stop {
+                if let Some(worker) = reconcile_worker.as_deref_mut() {
+                    worker.send(pipeline.take_reconcile_prefix(height));
+                    // The process is about to exit at the stop height; flush the
+                    // worker so every queued reconcile is durable first.
+                    if at_stop {
+                        worker.flush_and_join();
+                    }
+                } else {
+                    pipeline
+                        .reconcile_checkpoint(finalized_state, height)
+                        .expect("deferred transparent reconcile failed");
+                }
+            }
+        }
 
         // The block is now durable, so the stop-height check (which exits the
         // process) is safe to run here.
@@ -552,6 +664,36 @@ impl WriteBlockWorkerTask {
             pipeline_writer_handle = Some(handle);
         }
 
+        // Deferred-transparent reconcile worker (v2). When deferral is on (and not
+        // forced inline), spawn a dedicated thread that resolves/deletes/re-debits
+        // each window off the assembler thread. It owns the running value pool,
+        // seeded once here from disk (the worker is the sole writer of the value pool
+        // in the deferred range, so this stays exclusively owned with no races).
+        let mut reconcile_worker: Option<ReconcileWorker> = None;
+        if pipeline_active
+            && finalized_state.db.defers_transparent_spends()
+            && !finalized_state.db.config().defer_reconcile_inline
+        {
+            // Capacity 1: hand-off blocks the assembler only while the worker is
+            // still busy with the previous window (~two windows of blocks in flight).
+            let (job_sender, job_receiver) = std::sync::mpsc::sync_channel::<ReconcileJob>(1);
+            let worker_db = finalized_state.db.clone();
+            let start_value_pool = finalized_state.db.finalized_value_pool();
+            let worker_span = Span::current();
+            let handle = std::thread::Builder::new()
+                .name("zebra-reconcile-worker".to_string())
+                .spawn(move || {
+                    worker_span.in_scope(|| {
+                        run_reconcile_worker(worker_db, start_value_pool, job_receiver)
+                    })
+                })
+                .expect("failed to spawn the reconcile worker thread");
+            reconcile_worker = Some(ReconcileWorker {
+                sender: Some(job_sender),
+                handle: Some(handle),
+            });
+        }
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
@@ -834,6 +976,7 @@ impl WriteBlockWorkerTask {
                             ack_receiver,
                             &mut pipeline_in_flight,
                             chain_tip_sender,
+                            reconcile_worker.as_mut(),
                             false,
                         );
                         if finalized_state.is_at_stop_height(committed_height) {
@@ -843,6 +986,7 @@ impl WriteBlockWorkerTask {
                                 ack_receiver,
                                 &mut pipeline_in_flight,
                                 chain_tip_sender,
+                                reconcile_worker.as_mut(),
                                 true,
                             );
                         }
@@ -957,8 +1101,31 @@ impl WriteBlockWorkerTask {
                     ack_receiver,
                     &mut pipeline_in_flight,
                     chain_tip_sender,
+                    reconcile_worker.as_mut(),
                     true,
                 );
+
+                // Deferred reconcile: the trailing blocks committed past the last
+                // boundary form a partial window that nothing reconciled. Reconcile it
+                // now (through the durable tip) so the value pool and UTXO set are
+                // consistent before the handoff to the non-finalized state. (The
+                // production handoff drain barrier is a later stage; this keeps the
+                // prototype correct at the channel close.)
+                if finalized_state.db.defers_transparent_spends() {
+                    let tip_height = finalized_state.db.tip().map(|(height, _)| height);
+                    if let Some(tip_height) = tip_height {
+                        if let Some(worker) = reconcile_worker.as_mut() {
+                            // v2: send the final window, then wait for the worker to
+                            // make every queued reconcile durable.
+                            worker.send(pipeline.take_reconcile_prefix(tip_height));
+                            worker.flush_and_join();
+                        } else {
+                            pipeline
+                                .reconcile_checkpoint(finalized_state, tip_height)
+                                .expect("final deferred transparent reconcile failed");
+                        }
+                    }
+                }
             }
             if let Some(handle) = pipeline_writer_handle.take() {
                 let _ = handle.join();

@@ -30,5 +30,30 @@ pub fn state_config(cache_dir: PathBuf, force_legacy: bool) -> Config {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Per-checkpoint transparent reconcile prototype: defer the per-block spent-UTXO
+    // resolution off the commit path and reconcile it in a batch at each checkpoint.
+    // Requires the run-ahead pipeline (ZRB_PIPELINE_DEPTH > 0) for correctness.
+    config.defer_transparent_reconcile = std::env::var("ZRB_DEFER_TRANSPARENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    // Blocks between deferred reconciles (0 = per checkpoint). Mainnet checkpoints are
+    // ~30-40 blocks apart here, too frequent to amortize the reconcile; a larger fixed
+    // interval batches a bigger window.
+    config.defer_reconcile_interval = std::env::var("ZRB_RECONCILE_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // Force the v1 inline reconcile (on the assembler thread) instead of the default
+    // v2 worker thread; mainly to A/B the off-critical-path parallelism win.
+    config.defer_reconcile_inline = std::env::var("ZRB_RECONCILE_INLINE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    // Deterministic stop for byte-match verification: when set, the committer flushes
+    // and exits the process at exactly this height (and the per-checkpoint reconcile
+    // fires for the final window via the stop-height hook), so two runs land on an
+    // identical tip. Leave unset for throughput runs.
+    config.debug_stop_at_height = std::env::var("ZRB_STOP_AT_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok());
     config
 }

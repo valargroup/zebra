@@ -185,7 +185,7 @@ mod zebra_db;
 use vct::VctState;
 
 use pipeline::BlockPipelineContribution;
-pub(crate) use pipeline::FinalizedPipeline;
+pub(crate) use pipeline::{reconcile_window, FinalizedPipeline, ReconcileBlock};
 
 /// The verified-commitment-trees `tree_aux` serving read path (design §9): the per-block
 /// commitment roots for a height range, derived from the per-height trees.
@@ -1442,6 +1442,9 @@ impl FinalizedState {
                 wrote_vct_upgrade_marker: contribution.wrote_vct_upgrade_marker,
                 created_outputs: contribution.created_outputs,
                 updated_balances: contribution.updated_balances,
+                deferred_spent: contribution.deferred_spent,
+                deferred_block: contribution.deferred_block,
+                deferred_pool_change: contribution.deferred_pool_change,
             });
 
         Ok(AssembledCommit {

@@ -199,6 +199,13 @@ pub fn run(
         .build()
         .map_err(|e| eyre!("building tokio runtime: {e}"))?;
 
+    // When a deterministic stop height is configured, the state's committer thread
+    // exits the process itself (after flushing the deferred-reconcile worker). The
+    // bench's main task must not return first and exit out from under that flush, so
+    // it parks after reaching the gate and lets the committer be the authoritative
+    // terminator.
+    let debug_stop_at_height = config.debug_stop_at_height;
+
     let stats = runtime.block_on(async move {
         // Real buffered StateService + checkpoint verifier on the base fork.
         let (state, read_state, _latest, _change) = zebra_state::init(
@@ -448,6 +455,16 @@ pub fn run(
             committed as f64 / secs,
             total_bytes as f64 / secs / (1024.0 * 1024.0)
         );
+
+        // With a configured stop height, the state committer thread flushes the
+        // deferred-reconcile worker and exits the process once it commits the stop
+        // block. That flush can outlast this task's gate wait, so park here and let
+        // the committer's `process::exit` terminate the run, ensuring every reconcile
+        // is durable first. The bounded timeout is a safety net against a missed exit.
+        if debug_stop_at_height.is_some() {
+            tokio::time::sleep(Duration::from_secs(900)).await;
+        }
+
         Ok::<Stats, color_eyre::Report>(stats)
     })?;
 

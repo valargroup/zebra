@@ -36,17 +36,20 @@
 use std::{collections::HashMap, sync::Arc};
 
 use zebra_chain::{
-    amount::NonNegative,
-    block::{self, Height},
+    amount::{DeferredPoolBalanceChange, NonNegative},
+    block::{self, Block, Height},
     history_tree::HistoryTree,
     transparent,
     value_balance::ValueBalance,
 };
 
-use crate::service::finalized_state::{
-    disk_format::transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates},
-    disk_format::OutputLocation,
-    ZebraDb,
+use crate::{
+    service::finalized_state::{
+        disk_format::transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates},
+        disk_format::OutputLocation,
+        FinalizedState, ZebraDb,
+    },
+    BoxError,
 };
 
 use super::NoteCommitmentTrees;
@@ -80,6 +83,14 @@ pub(crate) struct PipelineBatchContribution {
     pub created_outputs: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
     /// The absolute address balances this block updated.
     pub updated_balances: Vec<(transparent::Address, AddressBalanceLocation)>,
+    /// Per-checkpoint reconcile: the spent outpoints this block deferred (empty
+    /// unless [`ZebraDb::defers_transparent_spends`] is on).
+    pub deferred_spent: Vec<transparent::OutPoint>,
+    /// The deferring block, held for the value-pool recompute at the checkpoint.
+    pub deferred_block: Option<Arc<Block>>,
+    /// The block's deferred-pool balance change, needed by the reconcile's
+    /// value-pool recompute (`Some` only after the deferred-pool activation).
+    pub deferred_pool_change: Option<DeferredPoolBalanceChange>,
 }
 
 /// A transparent output created by a not-yet-flushed block.
@@ -120,6 +131,37 @@ pub(crate) struct BlockPipelineContribution {
     pub created_outputs: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
     /// The absolute address balances this block updated.
     pub updated_balances: Vec<(transparent::Address, AddressBalanceLocation)>,
+    /// Per-checkpoint reconcile: the spent outpoints this block deferred (empty
+    /// unless [`ZebraDb::defers_transparent_spends`] is on).
+    pub deferred_spent: Vec<transparent::OutPoint>,
+    /// The deferring block, held for the value-pool recompute at the checkpoint.
+    pub deferred_block: Option<Arc<Block>>,
+    /// The block's deferred-pool balance change, needed by the reconcile's
+    /// value-pool recompute.
+    pub deferred_pool_change: Option<DeferredPoolBalanceChange>,
+}
+
+/// One block held in the [`DeferralWindow`] for the per-checkpoint transparent
+/// reconcile: its height, the block (for the value-pool recompute), the spent
+/// outpoints to resolve and delete, and its deferred-pool change.
+#[derive(Clone, Debug)]
+pub(crate) struct ReconcileBlock {
+    /// The deferring block's height.
+    pub height: Height,
+    /// The deferring block, for the value-pool recompute.
+    pub block: Arc<Block>,
+    /// The transparent outpoints this block spent, resolved + deleted at the reconcile.
+    pub spent: Vec<transparent::OutPoint>,
+    /// The block's deferred-pool balance change, passed to `chain_value_pool_change`.
+    pub deferred_pool_change: Option<DeferredPoolBalanceChange>,
+}
+
+/// The in-memory window of blocks whose transparent spend resolution has been
+/// deferred to the next checkpoint reconcile, in increasing height order.
+#[derive(Debug, Default)]
+struct DeferralWindow {
+    /// The deferred blocks, pushed in height order by [`FinalizedPipeline::record_block`].
+    blocks: Vec<ReconcileBlock>,
 }
 
 /// The in-memory tip state and read-through overlay for the run-ahead committer.
@@ -145,6 +187,9 @@ pub(crate) struct FinalizedPipeline {
     utxos: HashMap<transparent::OutPoint, OverlayUtxo>,
     /// Absolute address balances updated by not-yet-flushed blocks.
     address_balances: HashMap<transparent::Address, OverlayBalance>,
+    /// Blocks whose transparent spend resolution is deferred to the next
+    /// checkpoint reconcile (empty unless deferral is enabled).
+    deferral: DeferralWindow,
 }
 
 impl FinalizedPipeline {
@@ -160,6 +205,7 @@ impl FinalizedPipeline {
             vct_upgrade_marker_set: false,
             utxos: HashMap::new(),
             address_balances: HashMap::new(),
+            deferral: DeferralWindow::default(),
         }
     }
 
@@ -243,6 +289,9 @@ impl FinalizedPipeline {
             wrote_vct_upgrade_marker,
             created_outputs,
             updated_balances,
+            deferred_spent,
+            deferred_block,
+            deferred_pool_change,
         } = contribution;
 
         let (height, _hash) = tip;
@@ -252,6 +301,18 @@ impl FinalizedPipeline {
         self.note_commitment_trees = note_commitment_trees;
         self.value_pool = value_pool;
         self.vct_upgrade_marker_set |= wrote_vct_upgrade_marker;
+
+        // Per-checkpoint reconcile: record this block's deferred spends + block for
+        // the batched resolve/delete/value-pool pass at the next checkpoint. Only
+        // populated when deferral is on (`deferred_block` is `Some`).
+        if let Some(block) = deferred_block {
+            self.deferral.blocks.push(ReconcileBlock {
+                height,
+                block,
+                spent: deferred_spent,
+                deferred_pool_change,
+            });
+        }
 
         for (outpoint, out_loc, utxo) in created_outputs {
             self.utxos.insert(
@@ -281,4 +342,112 @@ impl FinalizedPipeline {
         self.address_balances
             .retain(|_, entry| entry.height > flushed_height);
     }
+
+    /// Removes and returns the deferral-window prefix at or below `boundary_height`,
+    /// in height order, leaving any later (next-interval) blocks in the window.
+    ///
+    /// Acks drain lazily, so by the time a boundary becomes durable the window may
+    /// already hold blocks past it; those belong to the next interval and are kept.
+    pub(crate) fn take_reconcile_prefix(&mut self, boundary_height: Height) -> Vec<ReconcileBlock> {
+        let split = self
+            .deferral
+            .blocks
+            .iter()
+            .position(|block| block.height > boundary_height)
+            .unwrap_or(self.deferral.blocks.len());
+        self.deferral.blocks.drain(..split).collect()
+    }
+
+    /// Reconcile the deferred transparent spends for the interval ending at
+    /// `height`, inline on the caller's thread (the v1 path).
+    ///
+    /// Resolves every window spend from disk, deletes the spent `utxo_by_out_loc`
+    /// entries, recomputes the value pool, and writes the deletes + value pool
+    /// (tip + per-height `BlockInfo`) in one atomic batch. Only the window prefix at
+    /// or below `height` is reconciled.
+    ///
+    /// v2 moves this work to a dedicated worker thread (see
+    /// [`reconcile_window`])); this method remains for the inline fallback and is
+    /// byte-identical to it.
+    pub(crate) fn reconcile_checkpoint(
+        &mut self,
+        finalized_state: &mut FinalizedState,
+        height: Height,
+    ) -> Result<(), BoxError> {
+        let records = self.take_reconcile_prefix(height);
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let db = &finalized_state.db;
+        let network = db.network();
+        let new_value_pool = reconcile_window(db, &network, &records, self.value_pool)?;
+        self.value_pool = new_value_pool;
+
+        Ok(())
+    }
+}
+
+/// Resolve, delete, and re-debit a window of deferred transparent spends, writing
+/// the result in one atomic batch, and return the value pool after the window.
+///
+/// This is the shared core of the per-interval reconcile, called either inline
+/// ([`FinalizedPipeline::reconcile_checkpoint`]) or off the assembler thread by the
+/// dedicated reconcile worker. `start_value_pool` is the running pool before the
+/// first block in `records`; the caller chains the returned pool into the next
+/// window so the value pool stays exactly the sum of the per-block deltas.
+///
+/// # Correctness
+///
+/// Every spent UTXO is durable here: each window block is flushed before its
+/// boundary becomes durable (pipeline depth is far below the interval), so even
+/// same-interval creates are on disk. The deletes (old spent outputs) are disjoint
+/// from the creates the assembler writes inline, and the assembler does not write
+/// the value pool when deferring, so this runs concurrently with assembly without
+/// key conflicts. The resulting value pool and UTXO set are byte-identical to the
+/// non-deferred per-block path.
+pub(crate) fn reconcile_window(
+    db: &ZebraDb,
+    network: &zebra_chain::parameters::Network,
+    records: &[ReconcileBlock],
+    start_value_pool: ValueBalance<NonNegative>,
+) -> Result<ValueBalance<NonNegative>, BoxError> {
+    if records.is_empty() {
+        return Ok(start_value_pool);
+    }
+
+    // Batch-resolve every spent outpoint from disk. Sort by txid (so repeated txids
+    // dedup and the `output_location`/`tx_loc_by_hash` reads are grouped), then sort
+    // the resolved locations so the `utxo_by_out_loc` value reads are sequential-ish
+    // rather than random per block.
+    let mut outpoints: Vec<transparent::OutPoint> = records
+        .iter()
+        .flat_map(|r| r.spent.iter().copied())
+        .collect();
+    outpoints.sort_unstable_by_key(|outpoint| (outpoint.hash.0, outpoint.index));
+    outpoints.dedup();
+
+    let mut located: Vec<(transparent::OutPoint, OutputLocation)> =
+        Vec::with_capacity(outpoints.len());
+    for outpoint in outpoints {
+        let out_loc = db.output_location(&outpoint).ok_or_else(|| {
+            format!("deferred spent outpoint missing from state at reconcile: {outpoint:?}")
+        })?;
+        located.push((outpoint, out_loc));
+    }
+    located.sort_unstable_by_key(|(_outpoint, out_loc)| *out_loc);
+
+    let mut resolved: HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)> =
+        HashMap::with_capacity(located.len());
+    for (outpoint, out_loc) in located {
+        let utxo = db
+            .utxo_by_location(out_loc)
+            .ok_or_else(|| {
+                format!("deferred spent UTXO missing from state at reconcile: {outpoint:?}")
+            })?
+            .utxo;
+        resolved.insert(outpoint, (out_loc, utxo));
+    }
+
+    db.commit_checkpoint_reconcile(network, start_value_pool, records, &resolved)
 }

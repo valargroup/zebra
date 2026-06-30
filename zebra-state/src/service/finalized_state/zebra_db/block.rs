@@ -1120,13 +1120,52 @@ impl ZebraDb {
             .collect();
 
         // Get a list of the spent UTXOs, before we delete any from the database.
-        let outpoints: Vec<transparent::OutPoint> = finalized
-            .block
-            .transactions
-            .iter()
-            .flat_map(|tx| tx.inputs().iter())
-            .flat_map(|input| input.outpoint())
-            .collect();
+        //
+        // Per-checkpoint transparent reconcile (`defer_transparent_reconcile`): in the
+        // deferred range, record this block's spent outpoints into the reconcile window
+        // and pass NO outpoints to the read loop, so the per-block spent-UTXO resolution,
+        // the `utxo_by_out_loc` deletes, and the transparent value-pool debit are all
+        // skipped here. Unlike the probe below, this is correct: the checkpoint reconcile
+        // resolves, deletes, and debits in one batched pass. The recorded outpoints (and
+        // the block) are threaded into the pipeline contribution below; deferral only
+        // takes effect on the run-ahead pipeline path, which the bench always uses.
+        //
+        // Benchmark-only ceiling probe (`ZEBRA_BENCH_SKIP_TRANSPARENT_READS=1`): drop the
+        // spent outpoints with NO reconcile, so the spend work is skipped entirely. This
+        // measures the throughput ceiling of deferring that work off the commit critical
+        // path. It produces an INCORRECT value pool and UTXO set, so it is never a shipped
+        // path — only a measurement of the upper bound.
+        let defer_spends = self.defers_transparent_spends();
+        // Deferral records into the run-ahead pipeline's reconcile window, so it is
+        // only correct when an overlay is present. Without one there is nowhere to
+        // record the spends and the checkpoint reconcile would never run, silently
+        // corrupting the value pool / UTXO set. The bench always runs pipelined.
+        assert!(
+            !defer_spends || overlay.is_some(),
+            "defer_transparent_reconcile requires the run-ahead pipeline \
+             (finalized_block_pipeline_depth > 0)"
+        );
+        let mut deferred_spent: Vec<transparent::OutPoint> = Vec::new();
+        let outpoints: Vec<transparent::OutPoint> = if defer_spends {
+            deferred_spent = finalized
+                .block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.inputs().iter())
+                .flat_map(|input| input.outpoint())
+                .collect();
+            Vec::new()
+        } else if super::bench_skip_transparent_reads() {
+            Vec::new()
+        } else {
+            finalized
+                .block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.inputs().iter())
+                .flat_map(|input| input.outpoint())
+                .collect()
+        };
 
         // Serialize the raw transaction bytes for `tx_by_loc` concurrently with the
         // spent-UTXO reads. Serialization is CPU-bound while the reads wait on disk,
@@ -1400,6 +1439,13 @@ impl ZebraDb {
                 wrote_vct_upgrade_marker: block_outputs.wrote_vct_upgrade_marker,
                 created_outputs,
                 updated_balances,
+                // Per-checkpoint reconcile: when deferring, hand the spent outpoints
+                // + block + deferred-pool change to the pipeline window so the
+                // checkpoint reconcile can resolve, delete, and re-debit them. Empty
+                // / `None` when not deferring (no behavior change).
+                deferred_spent,
+                deferred_block: defer_spends.then(|| finalized.block.clone()),
+                deferred_pool_change: finalized.deferred_pool_balance_change,
             }
         });
 

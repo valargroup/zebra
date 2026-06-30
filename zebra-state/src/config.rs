@@ -153,6 +153,43 @@ pub struct Config {
     /// overlay of not-yet-flushed blocks.
     pub finalized_block_pipeline_depth: usize,
 
+    /// Prototype: defer the transparent spend resolution (UTXO deletes + value-pool
+    /// debit) off the per-block commit path and reconcile it in a batched pass at
+    /// each checkpoint boundary, in the checkpoint-trusted range.
+    ///
+    /// The per-block committer records spent outpoints into an in-memory window
+    /// instead of resolving them; at each checkpoint the window is batch-resolved
+    /// (sorted/deduped disk reads), the value pool is recomputed, and the deletes +
+    /// pool are written in one atomic batch. The auxiliary address index must also be
+    /// off ([`skip_address_index`](Config::skip_address_index)).
+    ///
+    /// Not exposed in serde; set by the benchmark for measurement. Production wiring
+    /// (auto-enable under pruned + checkpoint sync, the handoff drain barrier, RPC
+    /// guards, crash recovery) is not yet implemented, so this defaults to `false`.
+    #[serde(skip)]
+    pub defer_transparent_reconcile: bool,
+
+    /// Prototype: how many blocks between deferred-transparent reconciles, when
+    /// [`defer_transparent_reconcile`](Config::defer_transparent_reconcile) is on.
+    ///
+    /// `0` (the default) reconciles at every checkpoint boundary — but mainnet
+    /// checkpoints are only ~30-40 blocks apart in dense regions, so the reconcile
+    /// fires far too often to amortize its fixed cost. A larger fixed interval
+    /// (e.g. ~2000) reconciles a bigger batched window. Correctness only requires a
+    /// bounded window with the window's spent UTXOs durable by reconcile time, not
+    /// checkpoint alignment.
+    #[serde(skip)]
+    pub defer_reconcile_interval: usize,
+
+    /// Prototype: run the deferred-transparent reconcile inline on the assembler
+    /// thread (the v1 path) instead of on the dedicated reconcile worker thread (v2).
+    ///
+    /// The default (`false`) hands each window to a worker thread so the reconcile's
+    /// disk reads and value-pool recompute overlap continued block assembly. Set to
+    /// `true` to force the inline path, mainly to A/B the parallelism win.
+    #[serde(skip)]
+    pub defer_reconcile_inline: bool,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -467,6 +504,10 @@ impl Default for Config {
             // Off by default: the committer is synchronous (assemble then flush)
             // until run-ahead is explicitly enabled and validated.
             finalized_block_pipeline_depth: 0,
+            // Off by default: prototype, benchmark-set only.
+            defer_transparent_reconcile: false,
+            defer_reconcile_interval: 0,
+            defer_reconcile_inline: false,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,

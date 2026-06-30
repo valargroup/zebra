@@ -63,6 +63,22 @@ pub mod transparent;
 // TODO: when the database is split out of zebra-state, always expose these methods.
 pub mod arbitrary;
 
+/// Benchmark-only throughput-ceiling probe (`ZEBRA_BENCH_SKIP_TRANSPARENT_READS=1`).
+///
+/// When set, the committer skips the per-block spent-UTXO resolution entirely, to
+/// measure the upper bound of deferring that work off the commit critical path (the
+/// per-checkpoint transparent reconcile). This deliberately produces an incorrect
+/// value pool and UTXO set, so it is a measurement tool only — never a shipped path.
+pub(crate) fn bench_skip_transparent_reads() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        matches!(
+            std::env::var("ZEBRA_BENCH_SKIP_TRANSPARENT_READS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 /// Wrapper struct to ensure high-level `zebra-state` database access goes through the correct API.
 ///
 /// `rocksdb` allows concurrent writes through a shared reference,
@@ -232,6 +248,22 @@ impl ZebraDb {
     /// Returns config for this database.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Whether the per-block committer defers transparent spend resolution (the
+    /// `utxo_by_out_loc` deletes and the transparent value-pool debit) off the
+    /// commit critical path, to a batched reconcile at each checkpoint boundary.
+    ///
+    /// The auxiliary address index must be off ([`Config::skip_address_index`]),
+    /// because the deferred path skips the per-block spent-UTXO reads that the
+    /// address-balance update depends on.
+    ///
+    /// v1 (prototype) omits the `height <= max_checkpoint_height` check: the
+    /// benchmark runs entirely inside the checkpoint range, and the handoff drain
+    /// barrier (so no semantic-verified block reads a mid-reconcile value pool or
+    /// UTXO set) is a later production stage.
+    pub(crate) fn defers_transparent_spends(&self) -> bool {
+        self.config().defer_transparent_reconcile && self.config().skip_address_index()
     }
 
     /// Returns the configured database kind for this database.

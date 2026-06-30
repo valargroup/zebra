@@ -37,7 +37,7 @@ use crate::{
                 AddressBalanceLocationUpdates, AddressLocation, AddressTransaction,
                 AddressUnspentOutput, OutputLocation,
             },
-            TransactionLocation,
+            RawBytes, TransactionLocation,
         },
         zebra_db::ZebraDb,
     },
@@ -82,6 +82,60 @@ pub type TransactionLocationBySpentOutputLocationCf<'cf> =
 
 impl ZebraDb {
     // Column family convenience methods
+
+    /// Verification helper (offline tools): a stable digest of the `utxo_by_out_loc`
+    /// column family — the entry count plus order-independent rolling hashes of the
+    /// raw key and value bytes — for comparing two databases' UTXO sets without
+    /// dumping every entry.
+    ///
+    /// Returns `(count, key_sum, key_xor, value_sum, value_xor)`. Two databases
+    /// have an identical UTXO set iff all five fields match. Used by the
+    /// per-checkpoint reconcile byte-match verification.
+    pub fn utxo_by_out_loc_verification_digest(&self) -> (u64, u64, u64, u64, u64) {
+        self.cf_verification_digest("utxo_by_out_loc")
+    }
+
+    /// Verification helper (offline tools): the same stable digest as
+    /// [`Self::utxo_by_out_loc_verification_digest`], over the `block_info` column
+    /// family — so two databases' per-height value pools can be compared.
+    pub fn block_info_verification_digest(&self) -> (u64, u64, u64, u64, u64) {
+        self.cf_verification_digest("block_info")
+    }
+
+    /// Order-independent rolling digest of a column family's raw key/value bytes:
+    /// `(count, key_sum, key_xor, value_sum, value_xor)`.
+    fn cf_verification_digest(&self, cf_name: &str) -> (u64, u64, u64, u64, u64) {
+        // FNV-1a over a byte slice.
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("column family was created when database was created");
+
+        let (mut count, mut key_sum, mut key_xor, mut value_sum, mut value_xor) = (0, 0, 0, 0, 0);
+        for (key, value) in self
+            .db
+            .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
+        {
+            let key_hash = fnv1a(key.raw_bytes());
+            let value_hash = fnv1a(value.raw_bytes());
+            count += 1;
+            key_sum = u64::wrapping_add(key_sum, key_hash);
+            key_xor ^= key_hash;
+            value_sum = u64::wrapping_add(value_sum, value_hash);
+            value_xor ^= value_hash;
+        }
+
+        (count, key_sum, key_xor, value_sum, value_xor)
+    }
 
     /// Returns a typed handle to the transaction location by spent output location column family.
     pub(crate) fn tx_loc_by_spent_output_loc_cf(
