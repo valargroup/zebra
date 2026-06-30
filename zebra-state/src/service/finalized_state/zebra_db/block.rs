@@ -1187,6 +1187,35 @@ impl ZebraDb {
         metrics::histogram!("zebra.state.write.spent_utxo_reads.duration_seconds")
             .record(reads_dur.as_secs_f64());
 
+        // Spend-distance instrumentation (trace-only): how many blocks back was each
+        // spent UTXO created? The cumulative buckets give the hit rate an in-memory
+        // UTXO cache of a given size would achieve, since the run-ahead overlay already
+        // serves only the pipeline-depth window. Built only when stage timing is on.
+        if zebra_chain::stage_timing::enabled() {
+            let spend_h = finalized.height.0;
+            let (mut le64, mut le256, mut le1024, mut le4096) = (0u64, 0u64, 0u64, 0u64);
+            for (_op, out_loc, _utxo) in &spent_utxos {
+                let d = spend_h.saturating_sub(out_loc.height().0);
+                if d <= 64 {
+                    le64 += 1;
+                }
+                if d <= 256 {
+                    le256 += 1;
+                }
+                if d <= 1024 {
+                    le1024 += 1;
+                }
+                if d <= 4096 {
+                    le4096 += 1;
+                }
+            }
+            zebra_chain::stage_timing::record_val(spend_h, "spent_total", spent_utxos.len() as u64);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le64", le64);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le256", le256);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le1024", le1024);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le4096", le4096);
+        }
+
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
                 .iter()
@@ -1794,6 +1823,12 @@ impl DiskWriteBatch {
         // absolute address balances for the run-ahead pipeline overlay.
         capture_pipeline_outputs: bool,
     ) -> Result<BlockBatchOutputs, CommitCheckpointVerifiedError> {
+        // Per-category key-count attribution (env-gated; no-op when stage timing
+        // is off). Each step's `batch.len()` delta is how many keys/deletes that
+        // category contributes to the commit batch (the compaction input).
+        let kh = finalized.height.0;
+        let mut kp = self.len();
+
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zebra_db,
@@ -1801,11 +1836,16 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
+        zebra_chain::stage_timing::record_val(kh, "keys_header_tx", (self.len() - kp) as u64);
+        kp = self.len();
+
         let zakura_header_commitment_roots_by_height = zebra_db
             .db
             .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
             .unwrap();
         self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
+        zebra_chain::stage_timing::record_val(kh, "keys_vct_evict", (self.len() - kp) as u64);
+        kp = self.len();
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1814,6 +1854,8 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zebra_db, finalized);
+        zebra_chain::stage_timing::record_val(kh, "keys_shielded", (self.len() - kp) as u64);
+        kp = self.len();
 
         // The `vct_upgrade_height` marker is written once, by the first block this
         // binary commits. In the run-ahead pipeline an earlier not-yet-flushed block
@@ -1830,6 +1872,8 @@ impl DiskWriteBatch {
             vct_sync_below,
             wrote_vct_upgrade_marker,
         );
+        zebra_chain::stage_timing::record_val(kh, "keys_trees", (self.len() - kp) as u64);
+        kp = self.len();
 
         // # Consensus
         //
@@ -1857,6 +1901,8 @@ impl DiskWriteBatch {
                 capture_pipeline_outputs,
             );
         }
+        zebra_chain::stage_timing::record_val(kh, "keys_transparent", (self.len() - kp) as u64);
+        kp = self.len();
 
         // Commit UTXOs and value pools. This runs for every height, including
         // genesis (which writes the initial pool and block info), matching the
@@ -1867,6 +1913,7 @@ impl DiskWriteBatch {
             spent_utxos_by_outpoint,
             value_pool,
         )?;
+        zebra_chain::stage_timing::record_val(kh, "keys_valuepool", (self.len() - kp) as u64);
 
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);

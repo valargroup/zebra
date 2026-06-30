@@ -17,6 +17,7 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use color_eyre::eyre::{eyre, Result};
@@ -129,6 +130,9 @@ pub fn spawn_raw(
     let mut height = reader.header().start_height;
 
     let handle = thread::spawn(move || loop {
+        // Split the single-threaded producer's per-block cost: disk read vs shielded
+        // deserialize (point decompression) vs send backpressure (consumer slow).
+        let read_start = Instant::now();
         let bytes = match reader.next_block() {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return,
@@ -137,7 +141,9 @@ pub fn spawn_raw(
                 return;
             }
         };
+        let read_us = read_start.elapsed().as_micros() as u64;
         let len = bytes.len();
+        let deser_start = Instant::now();
         let block = match Block::zcash_deserialize(&bytes[..]) {
             Ok(block) => Arc::new(block),
             Err(e) => {
@@ -145,8 +151,21 @@ pub fn spawn_raw(
                 return;
             }
         };
+        zebra_chain::stage_timing::record_val(height, "prefetch_read_us", read_us);
+        zebra_chain::stage_timing::record_val(
+            height,
+            "prefetch_deser_us",
+            deser_start.elapsed().as_micros() as u64,
+        );
 
-        if tx.send(Ok(RawBlock { block, len, height })).is_err() {
+        let send_start = Instant::now();
+        let sent = tx.send(Ok(RawBlock { block, len, height }));
+        zebra_chain::stage_timing::record_val(
+            height,
+            "prefetch_send_us",
+            send_start.elapsed().as_micros() as u64,
+        );
+        if sent.is_err() {
             // Consumer dropped the receiver: stop producing.
             return;
         }
@@ -154,4 +173,135 @@ pub fn spawn_raw(
     });
 
     (handle, rx)
+}
+
+/// Like [`spawn_raw`], but deserializes on `workers` threads in parallel.
+///
+/// Block deserialization (shielded point decompression) is the single-threaded
+/// producer's dominant cost, so this splits it: one reader thread streams raw bytes
+/// off the cache (cheap, mostly page-cached) into an MPMC work queue, and `workers`
+/// threads deserialize concurrently. Output arrives in *roughly* — not strictly —
+/// height order (workers finish out of order); the Zakura sequencer reorders, so the
+/// caller may feed bodies as received. `workers <= 1` falls back to [`spawn_raw`].
+pub fn spawn_raw_parallel(
+    reader: CacheReader,
+    capacity: usize,
+    workers: usize,
+) -> (Vec<JoinHandle<()>>, Receiver<Result<RawBlock>>) {
+    let workers = workers.max(1);
+    if workers == 1 {
+        let (handle, rx) = spawn_raw(reader, capacity);
+        return (vec![handle], rx);
+    }
+
+    let start_height = reader.header().start_height;
+    let (out_tx, out_rx) = sync_channel(capacity);
+    let (work_tx, work_rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(capacity);
+    // Workers emit (height, result) out of order; the reorder thread serializes them.
+    // The worker->reorder channel is intentionally unbounded so the reorder thread can
+    // always accept the (out-of-order) block it is waiting for. Read-ahead is instead
+    // bounded by `permit`: at most `capacity` blocks may be read but not yet emitted.
+    // Without this bound, a backpressured consumer (e.g. a slow sandblast region) lets
+    // the reader race ahead and deserialize the whole window into RAM (each block's
+    // Orchard Halo2 proof is large), exhausting memory.
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<(u32, Result<RawBlock>)>();
+    let (permit_tx, permit_rx) = crossbeam_channel::bounded::<()>(capacity);
+    for _ in 0..capacity {
+        let _ = permit_tx.send(());
+    }
+    let mut handles = Vec::with_capacity(workers + 2);
+
+    // Reader thread: sequential disk read -> work queue (errors go to the reorder).
+    let mut reader = reader;
+    let mut height = start_height;
+    let reader_result = result_tx.clone();
+    handles.push(thread::spawn(move || loop {
+        // Acquire a read-ahead permit (released by the reorder thread once a block is
+        // emitted downstream). Closed channel => consumer is gone, so stop reading.
+        if permit_rx.recv().is_err() {
+            return;
+        }
+        let read_start = Instant::now();
+        let bytes = match reader.next_block() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(e) => {
+                let _ = reader_result.send((height, Err(eyre!("reading block {height}: {e}"))));
+                return;
+            }
+        };
+        zebra_chain::stage_timing::record_val(
+            height,
+            "prefetch_read_us",
+            read_start.elapsed().as_micros() as u64,
+        );
+        if work_tx.send((height, bytes)).is_err() {
+            return;
+        }
+        height += 1;
+    }));
+
+    // Deserialize workers: pull bytes, deserialize (the expensive part), emit (height, result).
+    for _ in 0..workers {
+        let work_rx = work_rx.clone();
+        let result_tx = result_tx.clone();
+        handles.push(thread::spawn(move || {
+            while let Ok((height, bytes)) = work_rx.recv() {
+                let len = bytes.len();
+                let deser_start = Instant::now();
+                let item = match Block::zcash_deserialize(&bytes[..]) {
+                    Ok(block) => Ok(RawBlock {
+                        block: Arc::new(block),
+                        len,
+                        height,
+                    }),
+                    Err(e) => Err(eyre!("deserializing block {height}: {e}")),
+                };
+                let is_err = item.is_err();
+                zebra_chain::stage_timing::record_val(
+                    height,
+                    "prefetch_deser_us",
+                    deser_start.elapsed().as_micros() as u64,
+                );
+                if result_tx.send((height, item)).is_err() || is_err {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(result_tx); // result_rx closes once the reader + all workers finish
+
+    // Reorder thread: emit blocks in strict contiguous height order, so the consumer's
+    // committed-tip backpressure is deadlock-safe (the next block the committer needs is
+    // always produced before any block beyond it). Pending is bounded by the read-ahead
+    // permit capacity, so it can't grow unbounded.
+    handles.push(thread::spawn(move || {
+        let mut pending: std::collections::BTreeMap<u32, Result<RawBlock>> =
+            std::collections::BTreeMap::new();
+        let mut next = start_height;
+        while let Ok((height, item)) = result_rx.recv() {
+            pending.insert(height, item);
+            while let Some(item) = pending.remove(&next) {
+                let stop = item.is_err();
+                if out_tx.send(item).is_err() {
+                    return;
+                }
+                // Release one read-ahead permit now that this block has left the buffer.
+                let _ = permit_tx.send(());
+                next += 1;
+                if stop {
+                    return;
+                }
+            }
+        }
+        // Producers done (normal completion drains fully above; this only runs if a gap
+        // remains, e.g. after an error elsewhere — emit what's left so the consumer ends).
+        while let Some((_, item)) = pending.pop_first() {
+            if out_tx.send(item).is_err() {
+                return;
+            }
+        }
+    }));
+
+    (handles, out_rx)
 }

@@ -934,12 +934,17 @@ where
         expected_hash: AuthenticatedCheckpointHash,
     ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
     {
+        zebra_chain::stage_timing::record(
+            block.coinbase_height().map_or(0, |h| h.0),
+            "verifier_call_start",
+        );
         // Per-block validity checks (height, proof of work, Merkle root), the same checks the
         // accumulation path runs per block — defense in depth on top of the authenticated header.
         let block = match self.check_block(block) {
             Ok(block) => block,
             Err(e) => return async move { Err(e) }.boxed(),
         };
+        zebra_chain::stage_timing::record(block.height.0, "verifier_checked");
 
         // Bind the body to the authenticated header. A mismatch means the downloaded body and the
         // checkpoint-authenticated header disagree: a hard invariant violation, never recoverable.

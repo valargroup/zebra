@@ -227,6 +227,12 @@ impl BenchSequencerHandle {
             committer,
         } = self;
 
+        // Highest committed height the driver has reported, so the feed can backpressure
+        // on the *committed* tip (the submit window caps submission, but the sequencer's
+        // `applying` set drains all contiguous fed bodies unbounded — a fast feed would
+        // otherwise pile up the whole window in memory and OOM).
+        let committed_tip = Arc::new(AtomicU64::new(0));
+        let committed_tip_shim = committed_tip.clone();
         let control = committer.control.clone();
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel::<BlockSyncEvent>();
         tokio::spawn(async move {
@@ -239,6 +245,7 @@ impl BenchSequencerHandle {
                     local_frontier,
                 } = event
                 {
+                    committed_tip_shim.fetch_max(u64::from(height.0), Ordering::Relaxed);
                     if control
                         .send(SequencerControlInput::ApplyFinished {
                             token,
@@ -274,6 +281,7 @@ impl BenchSequencerHandle {
             actions: submissions.actions,
             block_sync,
             committer,
+            committed_tip,
         }
     }
 }
@@ -293,6 +301,9 @@ pub struct BenchDriverParts {
     pub block_sync: BlockSyncHandle,
     /// Progress/trace snapshots; retained to keep the sequencer task alive.
     pub committer: BenchCommitter,
+    /// Highest committed height reported by the driver. The feed reads this to cap how
+    /// far ahead of the committed tip it runs, bounding the in-flight body backlog.
+    pub committed_tip: Arc<AtomicU64>,
 }
 
 impl BenchBodyFeeder {

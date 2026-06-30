@@ -617,6 +617,7 @@ impl StateService {
             // If we've finished sending finalized blocks, ignore any repeated blocks.
             // (Blocks can be repeated after a syncer reset.)
             if let Some(finalized_block_write_sender) = &self.block_write_sender.finalized {
+                zebra_chain::stage_timing::record(queued_block.0.height.0, "state_to_worker");
                 let send_result = finalized_block_write_sender.send(queued_block);
 
                 // If the receiver is closed, we can't send any more blocks.

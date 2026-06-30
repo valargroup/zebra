@@ -94,6 +94,18 @@ pub(crate) struct PreparedCommitTrace {
 /// at least the configured threshold (or on the periodic baseline tick).
 ///
 /// A cheap no-op (one `OnceLock` load) when `ZEBRA_COMMIT_PRESSURE_TRACE` is unset.
+/// Resident set size of this process in MiB, read from `/proc/self/statm`
+/// (field 2 = resident pages × 4 KiB page). Returns 0 if unavailable. Used to
+/// distinguish RocksDB-internal growth from total-process growth in the trace.
+fn process_rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
+        .and_then(|pages| pages.parse::<u64>().ok())
+        .map(|pages| pages * 4096 / (1024 * 1024))
+        .unwrap_or(0)
+}
+
 pub(super) fn record_commit(db: &DiskDb, prepared: PreparedCommitTrace, batch_commit: Duration) {
     let Some(trace) = trace() else { return };
     let n = trace.count.fetch_add(1, Ordering::Relaxed);
@@ -122,7 +134,7 @@ pub(super) fn record_commit(db: &DiskDb, prepared: PreparedCommitTrace, batch_co
             r#""batch_assembly_ms":{:.3},"assemble_self_ms":{:.3},"queue_wait_ms":{:.3},"batch_commit_ms":{:.3},"commit_total_ms":{:.3},"#,
             r#""block_bytes":{},"tx_count":{},"output_count":{},"batch_keys":{},"batch_bytes":{},"#,
             r#""l0_files":{},"pending_compaction_bytes":{},"running_compactions":{},"#,
-            r#""running_flushes":{},"memtable_bytes":{},"total_sst_bytes":{},"live_data_bytes":{}}}"#
+            r#""running_flushes":{},"memtable_bytes":{},"total_sst_bytes":{},"live_data_bytes":{},"rss_mb":{}}}"#
         ),
         trace.start.elapsed().as_micros(),
         prepared.height,
@@ -147,6 +159,7 @@ pub(super) fn record_commit(db: &DiskDb, prepared: PreparedCommitTrace, batch_co
         p.memtable_bytes,
         p.total_sst_bytes,
         p.live_data_bytes,
+        process_rss_mb(),
     );
 
     if let Ok(mut file) = trace.file.lock() {

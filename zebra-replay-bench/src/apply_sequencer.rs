@@ -240,6 +240,7 @@ pub fn run(
             actions,
             block_sync,
             mut committer,
+            committed_tip,
         } = spawn_bench_sequencer(
             Height(expected_parent),
             Height(expected_parent),
@@ -276,19 +277,51 @@ pub fn run(
             },
         ));
 
-        let (_producer, rx) = prefetch::spawn_raw(reader, in_flight);
+        // Block deserialization is the single-threaded feed's dominant cost, which
+        // starves the apply pipeline. Deserialize on `ZRB_PREFETCH_WORKERS` threads
+        // (default 4) so the feed runs deep ahead and the real commit/verify ceiling
+        // shows. The sequencer reorders, so out-of-order producer output is fine.
+        let prefetch_workers = std::env::var("ZRB_PREFETCH_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let (_producers, rx) = prefetch::spawn_raw_parallel(reader, in_flight, prefetch_workers);
 
-        // Feed task: stream raw bodies into the sequencer's reorder queue in height
-        // order, up to the last checkpoint (`feed_target`). Accumulates fed bytes for
-        // the throughput report.
+        // Feed backpressure: cap how far ahead of the committed tip the feed runs, so a
+        // fast (parallel) feed can't pile the whole window into the sequencer's unbounded
+        // `applying` set and OOM. Count-based (not per-height) so it's deadlock-safe with
+        // the out-of-order parallel producer. Seed the committed tip to the base.
+        committed_tip.store(u64::from(expected_parent), Ordering::Relaxed);
+        let max_feed_ahead: u64 = std::env::var("ZRB_MAX_FEED_AHEAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
+
+        // Feed task: stream raw bodies into the sequencer's reorder queue, up to the last
+        // checkpoint (`feed_target`). Accumulates fed bytes for the throughput report.
         let fed_bytes = Arc::new(AtomicU64::new(0));
         let feed_bytes = fed_bytes.clone();
         let feed = tokio::spawn(async move {
             let mut fed = 0u32;
             while fed < feed_target {
+                // Backpressure: hold the feed once it is `max_feed_ahead` blocks past the
+                // committed tip, so the in-flight body backlog stays bounded. Count-based
+                // (`start + fed` vs committed), so a high out-of-order block never blocks a
+                // lower one the commit needs. Leaving blocks in the prefetch ring stalls
+                // the producers, propagating the bound upstream.
+                while (u64::from(start) + u64::from(fed))
+                    .saturating_sub(committed_tip.load(Ordering::Relaxed))
+                    > max_feed_ahead
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
                 // The prefetch producer is a std thread; do the blocking recv off the
-                // async executor.
+                // async executor. Time it: a long recv wait = the bench's deserialize
+                // supply is the gate; a long feed_body = the sequencer is backpressuring
+                // (the real apply pipeline downstream is the gate).
+                let recv_start = Instant::now();
                 let item = tokio::task::block_in_place(|| rx.recv());
+                let recv_us = recv_start.elapsed().as_micros() as u64;
                 let raw = match item {
                     Ok(Ok(p)) => p,
                     Ok(Err(e)) => return Err(e),
@@ -298,7 +331,16 @@ pub fn run(
                 let hash = raw.block.hash();
                 let len = raw.len as u64;
                 feed_bytes.fetch_add(len, Ordering::Relaxed);
-                if !feeder.feed_body(Height(height), hash, raw.block, len).await {
+                zebra_chain::stage_timing::record_val(height, "prefetch_recv_us", recv_us);
+                zebra_chain::stage_timing::record(height, "body_fed");
+                let feed_start = Instant::now();
+                let accepted = feeder.feed_body(Height(height), hash, raw.block, len).await;
+                zebra_chain::stage_timing::record_val(
+                    height,
+                    "feed_body_us",
+                    feed_start.elapsed().as_micros() as u64,
+                );
+                if !accepted {
                     break; // sequencer gone
                 }
                 fed += 1;
