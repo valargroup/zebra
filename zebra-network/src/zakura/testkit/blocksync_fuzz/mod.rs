@@ -104,6 +104,7 @@ pub(crate) async fn run_scenario(
         corpus.clone(),
         target,
         apply.clone(),
+        scenario.commit,
         committed_tx,
         shutdown.clone(),
     ));
@@ -135,7 +136,7 @@ pub(crate) async fn run_scenario(
         ));
     }
 
-    let _running = RunningHarness {
+    let running = RunningHarness {
         shutdown: shutdown.clone(),
         reactor_task,
         tasks,
@@ -154,6 +155,7 @@ pub(crate) async fn run_scenario(
     .and_then(|result| result.ok())
     .map(|height| *height);
     let committed_tip = reached.unwrap_or_else(|| *committed_rx.borrow());
+    running.stop().await;
 
     Ok(FuzzOutcome {
         committed_tip,
@@ -181,6 +183,26 @@ impl Drop for RunningHarness {
     }
 }
 
+impl RunningHarness {
+    async fn stop(mut self) {
+        self.shutdown.cancel();
+        stop_task(&mut self.reactor_task).await;
+        for task in &mut self.tasks {
+            stop_task(task).await;
+        }
+    }
+}
+
+async fn stop_task(task: &mut JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(2), &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 /// Answers the reactor's actions from the corpus and mock apply frontier.
 fn spawn_action_driver(
     handle: BlockSyncHandle,
@@ -188,10 +210,12 @@ fn spawn_action_driver(
     corpus: SyntheticBlockCorpus,
     target: block::Height,
     apply: MockApplyFrontier,
+    commit: CommitProfile,
     committed_tx: watch::Sender<block::Height>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut applied = 0u64;
         loop {
             let action = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -236,6 +260,15 @@ fn spawn_action_driver(
                     }
                 }
                 BlockSyncAction::SubmitBlock { token, block } => {
+                    // Model a slow/bursty commit drain: hold the submitted body before
+                    // applying so its reserved bytes stay held until
+                    // `BlockApplyFinished`, letting the apply backlog build against the
+                    // byte budget.
+                    if !commit.per_commit_delay.is_zero()
+                        && sleep_or_cancel(&shutdown, commit.per_commit_delay).await
+                    {
+                        break;
+                    }
                     let height = block
                         .coinbase_height()
                         .expect("synthetic submitted block has height");
@@ -255,6 +288,16 @@ fn spawn_action_driver(
                         .is_err()
                     {
                         break;
+                    }
+                    applied = applied.saturating_add(1);
+                    if let Some(burst) = commit.burst {
+                        if burst.every_commits > 0
+                            && applied.is_multiple_of(burst.every_commits)
+                            && !burst.duration.is_zero()
+                            && sleep_or_cancel(&shutdown, burst.duration).await
+                        {
+                            break;
+                        }
                     }
                 }
                 BlockSyncAction::Misbehavior { .. } => {}

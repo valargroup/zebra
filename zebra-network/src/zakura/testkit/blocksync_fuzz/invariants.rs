@@ -25,6 +25,20 @@ pub(crate) struct InvariantReport {
     pub(crate) final_budget_reserved: u64,
     /// Liveness-reaper / protocol-reject disconnects observed.
     pub(crate) protocol_rejects: usize,
+    /// `block_get_blocks_sent` requests issued via the floor bypass (a floor request
+    /// sent while the peer was saturated at its BBR cwnd).
+    pub(crate) floor_bypass_requests: usize,
+    /// Peak per-peer byte cwnd observed on a `block_body_received` row (`bbr_cwnd_bytes`,
+    /// emitted only under the byte unit). `0` means the field never appeared (blocks
+    /// unit, or no completed deliveries).
+    pub(crate) peak_cwnd_bytes: u64,
+    /// Peak per-peer in-flight reserved bytes observed (`bbr_inflight_bytes`).
+    pub(crate) peak_inflight_bytes: u64,
+    /// Peak per-peer derived byte→request capacity observed (`bbr_cwnd`, the byte cwnd
+    /// divided by a representative body). Under the byte unit this scales as
+    /// `cwnd_bytes / body_size`, so it is the clean signal that request depth tracks
+    /// the inverse of body size.
+    pub(crate) peak_cwnd_requests: u64,
 }
 
 /// Extract the report from a flushed trace reader.
@@ -54,6 +68,34 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
+    let body_rows: Vec<&Value> = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| event(row) == Some("block_body_received"))
+        .collect();
+    let floor_bypass_requests = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| event(row) == Some("block_get_blocks_sent"))
+        .filter(|row| u64_field(row, "floor_bypass") == Some(1))
+        .count();
+    let peak_cwnd_bytes = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_cwnd_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_inflight_bytes = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_inflight_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_cwnd_requests = body_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "bbr_cwnd"))
+        .max()
+        .unwrap_or(0);
 
     InvariantReport {
         state_samples: state_rows.len(),
@@ -61,6 +103,10 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         peak_budget_reserved,
         final_budget_reserved,
         protocol_rejects,
+        floor_bypass_requests,
+        peak_cwnd_bytes,
+        peak_inflight_bytes,
+        peak_cwnd_requests,
     }
 }
 
@@ -103,6 +149,19 @@ pub(crate) fn assert_core(
         "aggregate outstanding {} exceeded the advertised-inflight bound {}",
         report.max_outstanding,
         outstanding_bound,
+    );
+
+    // The global byte budget is never over-committed: peak reserved download bytes
+    // (in-flight + reorder + applying) must stay within the configured ceiling. Every
+    // per-peer routine reserves against the same CAS-guarded `ByteBudget`, so this must
+    // hold no matter how many peers race — the memory bound the spec requires. Vacuous
+    // only for scenarios that set an effectively unbounded budget (`u64::MAX`); the
+    // tight-ceiling scenarios make it bite.
+    assert!(
+        report.peak_budget_reserved <= scenario.config.max_inflight_block_bytes,
+        "peak reserved bytes {} exceeded the global in-flight byte budget {}",
+        report.peak_budget_reserved,
+        scenario.config.max_inflight_block_bytes,
     );
 }
 

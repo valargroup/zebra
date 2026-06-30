@@ -148,12 +148,18 @@ async fn serve_loop(
         }
 
         let mut returned = 0u32;
-        for (_, block, _) in &blocks {
-            if !spec.serve.per_block_is_zero() {
-                let delay = spec.serve.per_block_latency.sample(&mut rng);
-                if sleep_or_cancel(shutdown, delay).await {
-                    return;
+        for (_, block, block_bytes) in &blocks {
+            // Byte-accurate serve when a bandwidth is set: the block's transmission time
+            // is `bytes / bandwidth`. Otherwise fall back to the fixed per-block latency.
+            let per_block_delay = match spec.serve.bandwidth_bytes_per_sec {
+                Some(bandwidth) => Duration::from_secs_f64(*block_bytes as f64 / bandwidth as f64),
+                None if !spec.serve.per_block_is_zero() => {
+                    spec.serve.per_block_latency.sample(&mut rng)
                 }
+                None => Duration::ZERO,
+            };
+            if !per_block_delay.is_zero() && sleep_or_cancel(shutdown, per_block_delay).await {
+                return;
             }
             if peer
                 .send(BlockSyncMessage::Block(block.clone()))

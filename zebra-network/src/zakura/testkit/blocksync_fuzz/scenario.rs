@@ -66,8 +66,15 @@ pub(crate) struct ServeProfile {
     /// trace-proven head-of-line effect emerges from queue depth on top of this.
     pub(crate) first_block_latency: LatencyDist,
     /// Delay between blocks inside a response (models a rate-limited serve path;
-    /// effective serve rate ≈ `1 / per_block_latency`).
+    /// effective serve rate ≈ `1 / per_block_latency`). Ignored when
+    /// [`bandwidth_bytes_per_sec`](Self::bandwidth_bytes_per_sec) is set.
     pub(crate) per_block_latency: LatencyDist,
+    /// Optional **byte-accurate** serve bandwidth. When set, each block's serve delay is
+    /// `block_bytes / bandwidth` instead of the fixed `per_block_latency`, so a response
+    /// takes `first_block_latency + Σ bytes / bandwidth` — the realistic model where a
+    /// big block genuinely takes longer to transmit. This is what lets the byte-cwnd
+    /// controller observe a true bytes/sec BtlBw and size-dependent transfer time.
+    pub(crate) bandwidth_bytes_per_sec: Option<u64>,
     /// Optional periodic stall.
     pub(crate) idle_gap: Option<IdleGap>,
     /// Probability in `[0, 1]` that a request is silently dropped (no response),
@@ -86,6 +93,7 @@ impl ServeProfile {
         Self {
             first_block_latency: LatencyDist::zero(),
             per_block_latency: LatencyDist::zero(),
+            bandwidth_bytes_per_sec: None,
             idle_gap: None,
             drop_probability: 0.0,
             withhold: None,
@@ -102,6 +110,17 @@ impl ServeProfile {
         }
     }
 
+    /// A byte-accurate peer: a fixed base RTT plus a finite serve `bandwidth` (bytes/sec),
+    /// so each block takes `bytes / bandwidth` to transmit. This is the model the
+    /// byte-cwnd controller is meant to track — `elapsed ≈ base_rtt + bytes / bandwidth`.
+    pub(crate) fn byte_rate(base_rtt: Duration, bandwidth_bytes_per_sec: u64) -> Self {
+        Self {
+            first_block_latency: LatencyDist::Fixed(base_rtt),
+            bandwidth_bytes_per_sec: Some(bandwidth_bytes_per_sec.max(1)),
+            ..Self::fast()
+        }
+    }
+
     pub(crate) fn first_block_is_zero(&self) -> bool {
         self.first_block_latency.is_zero()
     }
@@ -109,6 +128,32 @@ impl ServeProfile {
     pub(crate) fn per_block_is_zero(&self) -> bool {
         self.per_block_latency.is_zero()
     }
+}
+
+/// How the harness's mock commit pipeline drains the applyQ.
+///
+/// The default applies each contiguous body instantly. A stall profile injects a steady
+/// per-commit delay and/or a periodic burst stall, modelling a slow/bursty commit drain
+/// (the trace-proven 27–53 s `commit_finish` tails). Because the commit driver only
+/// releases the byte budget once it reports the durable frontier *after* applying, a slow
+/// drain lets the apply backlog (and the reserved bytes that bound it) build — so a run
+/// can prove the queue is bounded by the memory ceiling, not by throttling download.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CommitProfile {
+    /// Fixed delay applied before each body is committed (steady slow commit).
+    pub(crate) per_commit_delay: Duration,
+    /// Optional periodic burst stall: every `every_commits` applied bodies, pause for
+    /// `duration` before continuing (the sawtooth the durable-watch must absorb).
+    pub(crate) burst: Option<CommitBurstStall>,
+}
+
+/// A periodic burst stall in the mock commit pipeline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommitBurstStall {
+    /// Pause after every this-many applied bodies.
+    pub(crate) every_commits: u64,
+    /// How long each pause lasts.
+    pub(crate) duration: Duration,
 }
 
 /// One synthetic peer the node downloads from.
@@ -218,6 +263,8 @@ pub(crate) struct Scenario {
     pub(crate) peers: Vec<PeerSpec>,
     /// Timed frontier changes (header growth, reanchor, verified reset).
     pub(crate) timeline: Vec<TipEvent>,
+    /// How the mock commit pipeline drains the applyQ (default: instant).
+    pub(crate) commit: CommitProfile,
     /// Wall-clock bound for the run.
     pub(crate) deadline: Duration,
 }
@@ -239,6 +286,7 @@ impl Scenario {
             config,
             peers,
             timeline: Vec::new(),
+            commit: CommitProfile::default(),
             deadline: Duration::from_secs(30),
         }
     }
@@ -261,12 +309,21 @@ impl FuzzOutcome {
 
 /// A default block-sync config for harness runs: generous byte budget (memory is not
 /// the constraint under test by default), moderate per-response/inflight caps.
+///
+/// The BBR ProbeRTT cadence is scaled down to sub-second so the mechanism is exercised
+/// within a fuzzer run's compressed wall-clock (production defaults are 10 s / 200 ms,
+/// which never fire in a ~1 s run). `rtprop_window` matches the probe interval so a
+/// stale (queue-inflated) RTprop sample ages out one interval after the probe that
+/// replaced it.
 pub(crate) fn fuzz_config() -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
         max_blocks_per_response: 16,
         max_inflight_requests: 256,
         max_inflight_block_bytes: u64::MAX,
         request_timeout: Duration::from_secs(30),
+        bbr_probe_rtt_interval: Duration::from_millis(150),
+        bbr_probe_rtt_duration: Duration::from_millis(30),
+        bbr_rtprop_window: Duration::from_millis(150),
         ..ZakuraBlockSyncConfig::default()
     }
 }

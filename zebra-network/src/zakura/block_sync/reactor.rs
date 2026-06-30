@@ -385,7 +385,7 @@ impl BlockSyncReactor {
             self.registry
                 .clear_outstanding_height(&claim.peer, claim.height);
             if servable_peers > 2 {
-                self.registry.avoid_height_until(
+                self.registry.avoid_floor_height_until(
                     &claim.peer,
                     claim.height,
                     now + self.startup.config.effective_floor_peer_avoid_cooldown(),
@@ -1465,7 +1465,6 @@ impl BlockSyncReactor {
         let slot_capacity = slots.capacity;
         let slot_effective_window = slots.effective_window;
         let slot_available = slots.available;
-        let slot_timeout_recovery = slots.timeout_recovery;
         let slot_saturated_peers = slots.saturated_peers;
         let counts = self.registry.direction_status_counts();
         let inbound_peers = counts.inbound;
@@ -1631,11 +1630,6 @@ impl BlockSyncReactor {
                 slot_effective_window as u64,
             );
             bs_insert_u64(row, "request_slot_available", slot_available as u64);
-            bs_insert_u64(
-                row,
-                "request_slot_timeout_recovery",
-                slot_timeout_recovery as u64,
-            );
             bs_insert_u64(
                 row,
                 "request_slot_saturated_peers",
@@ -2215,7 +2209,7 @@ fn block_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
     }
 }
 
-fn bs_insert_str(
+pub(super) fn bs_insert_str(
     row: &mut serde_json::Map<String, serde_json::Value>,
     key: &'static str,
     value: &str,

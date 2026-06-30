@@ -9,7 +9,8 @@ use super::{
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
         DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
+        MAX_BS_RESPONSE_BYTES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -18,9 +19,11 @@ use super::{
     state::*,
 };
 use crate::zakura::{
-    framed_channel, ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange,
-    FrontierUpdate, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
-    ZakuraBlockSyncCandidateState, ZakuraSyncExchange,
+    framed_channel,
+    testkit::{TraceCapture, TraceValue},
+    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
+    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
+    ZakuraSyncExchange,
 };
 use zebra_chain::{
     fmt::HexDebug,
@@ -423,8 +426,16 @@ fn download_window() -> DownloadWindow {
     DownloadWindow::new(&ZakuraBlockSyncConfig::default())
 }
 
+fn test_delivery_snapshot(now: Instant) -> DeliverySnapshot {
+    DeliverySnapshot {
+        delivered: 0,
+        delivered_at: now,
+    }
+}
+
 fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
+    let now = Instant::now();
     OutstandingBlockRange {
         request: BlockRangeRequest {
             start_height: block::Height(height),
@@ -437,143 +448,143 @@ fn window_request(height: u32) -> OutstandingBlockRange {
                 estimated_bytes: 1,
             }],
         },
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
+        received: ReceivedBlockTracker::default(),
+    }
+}
+
+fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
+    let byte = u8::try_from(start).expect("test heights fit in u8");
+    let now = Instant::now();
+    OutstandingBlockRange {
+        request: BlockRangeRequest {
+            start_height: block::Height(start),
+            count,
+            anchor_hash: block::Hash([byte; 32]),
+            estimated_bytes: u64::from(count),
+            expected_blocks: (start..start + count)
+                .map(|height| ExpectedBlock {
+                    height: block::Height(height),
+                    hash: block::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+                    estimated_bytes: 1,
+                })
+                .collect(),
+        },
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
 }
 
 #[test]
-fn peer_outbound_request_window_backs_off_and_grows_with_streaks() {
+fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
+    let config = ZakuraBlockSyncConfig::default();
+    let timeout = config.effective_liveness_timeout();
+    assert_eq!(timeout, Duration::from_secs(32));
+
+    let now = Instant::now();
     let mut window = download_window();
-    let max_inflight =
-        usize::try_from(MAX_BS_INFLIGHT_REQUESTS).expect("test max inflight fits usize");
-    window.max_inflight_requests = MAX_BS_INFLIGHT_REQUESTS;
-    window.outbound_request_window = max_inflight;
     window.outstanding.push(window_request(1));
-    assert_eq!(window.available_slots(), max_inflight - 1);
+    window.arm_liveness(now, timeout);
 
-    for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
     assert_eq!(
-        window.outbound_request_window, max_inflight,
-        "window holds flat within the first timeout epoch"
+        window.check_liveness(now + timeout - Duration::from_millis(1)),
+        LivenessOutcome::Ok
     );
     assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect
     );
-    assert_eq!(window.outbound_request_window, max_inflight - 8);
-
-    for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(window.outbound_request_window, max_inflight - 64);
-
-    for _ in 0..(16 * 16) {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-        if window.outbound_request_window == 1 {
-            break;
-        }
-    }
-    assert_eq!(window.outbound_request_window, 1);
-    assert_eq!(window.available_slots(), window.timeout_recovery_slots);
-    // Pinned at the floor, the peer is tolerated for two full reduction epochs
-    // (2 * 16 = 32 consecutive timeouts, ~256s at the 8s request timeout) before
-    // being disconnected.
-    for _ in 0..31 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::DisconnectPeer
-    );
-
-    // Streak-gated cubic ramp: the window holds flat for a full epoch of
-    // consecutive successes, then steps up. From the reduced base of 1, the first
-    // epoch (16 successes) raises it to base + COEFF * 1^3 = 1 + 8 = 9.
-    window.outstanding.clear();
-    window.timeout_recovery_slots = 0;
-    for _ in 0..15 {
-        window.increase_outbound_window_after_success();
-    }
-    assert_eq!(
-        window.outbound_request_window, 1,
-        "window holds flat within the first success epoch"
-    );
-    window.increase_outbound_window_after_success();
-    assert_eq!(
-        window.outbound_request_window, 9,
-        "the first full success epoch steps the window up by COEFF * 1^3"
-    );
-    // A second epoch accelerates cubically: base + COEFF * 2^3 = 1 + 64 = 65.
-    for _ in 0..16 {
-        window.increase_outbound_window_after_success();
-    }
-    assert_eq!(
-        window.outbound_request_window, 65,
-        "the second epoch grows cubically faster than the first"
-    );
-
-    window.outbound_request_window = max_inflight;
-    window.increase_outbound_window_after_success();
-    assert_eq!(window.outbound_request_window, max_inflight);
 }
 
 #[test]
-fn peer_timeout_recovery_slot_replaces_timed_out_request_above_reduced_window() {
+fn block_liveness_never_disconnects_idle_peer() {
+    let now = Instant::now();
     let mut window = download_window();
-    window.max_inflight_requests = 8;
-    window.outbound_request_window = 8;
 
-    for height in 1u32..=8 {
-        window.outstanding.push(window_request(height));
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+
+    window.block_liveness_deadline = Some(now);
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
+    window.disarm_liveness_if_idle();
+    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+}
+
+#[test]
+fn block_liveness_progress_before_deadline_keeps_peer_alive() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let mut now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    for _ in 0..4 {
+        now += timeout - Duration::from_millis(1);
+        assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+        window.note_block_progress(now, timeout);
+        assert_eq!(window.block_liveness_deadline, Some(now + timeout));
     }
+}
 
-    assert_eq!(window.available_slots(), 0);
+#[test]
+fn block_liveness_disarms_when_outstanding_drains() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
 
-    for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(window.outbound_request_window, 1);
-    assert_eq!(window.timeout_recovery_slots, 8);
-    assert_eq!(
-        window.available_slots(),
-        0,
-        "the advertised hard cap is still full until the timed-out request is removed"
-    );
+    window.outstanding.clear();
+    window.disarm_liveness_if_idle();
 
-    window.outstanding.remove(0);
-    assert_eq!(
-        window.available_slots(),
-        1,
-        "a timeout recovery slot lets the retry replace the timed-out request"
-    );
+    assert_eq!(window.block_liveness_deadline, None);
+    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
+}
 
-    window.record_outbound_request_scheduled();
-    assert_eq!(window.timeout_recovery_slots, 7);
-    window.outstanding.push(window_request(9));
-    assert_eq!(
-        window.available_slots(),
-        0,
-        "regular scheduling remains held below the reduced adaptive window"
-    );
+#[test]
+fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.outstanding.clear();
+    window.disarm_liveness_if_idle();
+
+    let resumed = now + Duration::from_secs(60);
+    window.outstanding.push(window_request(2));
+    window.arm_liveness(resumed, timeout);
+
+    assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
+}
+
+#[test]
+fn block_liveness_multi_block_range_progress_resets_each_body() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let start = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request_range(1, 3));
+    window.arm_liveness(start, timeout);
+
+    let first = start + Duration::from_secs(4);
+    window.note_block_progress(first, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(first + timeout));
+
+    let second = first + Duration::from_secs(4);
+    assert_eq!(window.check_liveness(second), LivenessOutcome::Ok);
+    window.note_block_progress(second, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(second + timeout));
+
+    let third = second + Duration::from_secs(4);
+    assert_eq!(window.check_liveness(third), LivenessOutcome::Ok);
+    window.note_block_progress(third, timeout);
+    assert_eq!(window.block_liveness_deadline, Some(third + timeout));
 }
 
 // The old `BlockRangeScheduler` single-pass timeout-retry bias
@@ -581,7 +592,7 @@ fn peer_timeout_recovery_slot_replaces_timed_out_request_above_reduced_window() 
 // per-peer assignment to bias, so a returned height is simply contestable by any
 // servable peer. The peer-local timeout bias is re-introduced in per-peer routines. The
 // reactor-level locality property is still covered by
-// `reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling`.
+// `reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling`.
 #[test]
 fn work_queue_returned_height_is_contestable_by_any_peer() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
@@ -712,6 +723,10 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
     );
     assert_eq!(
+        default.no_progress_peer_cooldown,
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
+    );
+    assert_eq!(
         default.effective_max_reorder_lookahead_bytes(),
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
@@ -722,6 +737,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(
         default.effective_floor_peer_avoid_cooldown(),
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
+    );
+    assert_eq!(
+        default.effective_no_progress_peer_cooldown(),
+        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
     );
     assert!(default.validate().is_ok());
     assert_eq!(
@@ -790,6 +809,12 @@ fn config_validate_rejects_degenerate_values() {
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
+
+    config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::ZERO,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -2049,15 +2074,15 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
     reactor_task.abort();
 }
 
-/// One peer whose request times out backs off (its outbound window halves) and
-/// must not block the other peers from being filled out of the same shared work.
+/// One peer whose request times out enters local recovery and must not block the
+/// other peers from being filled out of the same shared work.
 ///
 /// This is the timeout-locality invariant: a slow peer's recovery is local to
 /// that peer. The retry path re-queues the timed-out range to a *different*
 /// servable peer, so the healthy peer keeps making progress while the slow peer
 /// is in recovery rather than the whole download stalling behind one straggler.
 #[tokio::test]
-async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
+async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     let mut config = immediate_body_download_config();
     config.fanout = 1;
     // A request timeout long enough that the opening pass fans both heights out
@@ -2143,7 +2168,7 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     // Pick one peer to be the straggler (it never answers) and the other to be
     // healthy. The healthy peer answers `RangeUnavailable` for its own range so
     // it frees its slot without committing anything; the straggler's range then
-    // times out and re-queues. Because the timeout backoff is local to the
+    // times out and re-queues. Because timeout recovery is local to the
     // straggler, the healthy peer must keep being offered the re-queued shared
     // work rather than the whole download stalling behind the straggler.
     let healthy = peer_b.clone();
@@ -2183,7 +2208,101 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     );
     assert!(
         healthy_offers >= 2,
-        "the healthy peer was filled repeatedly despite the slow peer's timeout backoff"
+        "the healthy peer was filled repeatedly despite the slow peer's timeout recovery"
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
+    let mut capture =
+        TraceCapture::for_test("block_liveness_disconnects_silent_peer_and_traces_reason")
+            .expect("trace capture initializes");
+    let mut config = immediate_body_download_config();
+    config.fanout = 1;
+    config.request_timeout = Duration::from_millis(400);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x51);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), block::Hash([1; 32])))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: block::Hash([1; 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        }]))
+        .await
+        .expect("needed metadata queues");
+
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    tokio::time::timeout(Duration::from_secs(3), connection_cancel.cancelled())
+        .await
+        .expect("silent active peer is disconnected by block-progress liveness");
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        &[
+            (
+                bs_trace::REASON,
+                TraceValue::Str("block_sync_no_block_progress"),
+            ),
+            (bs_trace::OUTSTANDING, TraceValue::U64(1)),
+        ],
     );
 
     reactor_task.abort();
@@ -2563,51 +2682,6 @@ fn shed_top_until_available_self_funds_floor_reservation() {
     );
 }
 
-#[test]
-fn window_reduction_uses_consecutive_timeout_streak() {
-    let mut window = download_window();
-    window.max_inflight_requests = 256;
-    window.outbound_request_window = 256;
-
-    for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(window.outbound_request_window, 256);
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
-    assert_eq!(window.outbound_request_window, 248);
-
-    for _ in 0..16 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(window.outbound_request_window, 192);
-
-    // A successful response resets the timeout streak, so the next timeout starts
-    // a fresh cubic backoff from the current window instead of continuing the old
-    // streak.
-    window.increase_outbound_window_after_success();
-    for _ in 0..15 {
-        assert_eq!(
-            window.reduce_outbound_window_after_timeout(),
-            TimeoutBackoffOutcome::KeepPeer
-        );
-    }
-    assert_eq!(window.outbound_request_window, 192);
-    assert_eq!(
-        window.reduce_outbound_window_after_timeout(),
-        TimeoutBackoffOutcome::KeepPeer
-    );
-    assert_eq!(window.outbound_request_window, 184);
-}
-
 // ---- Sequencer commit pipeline ----
 
 fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
@@ -2956,12 +3030,33 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         ],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
+    let now = Instant::now();
     OutstandingBlockRange {
         request,
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
+}
+
+#[test]
+fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
+    let mut budget = ByteBudget::new(THREE_BLOCK_ESTIMATE * 3);
+    let mut outstanding = outstanding_three_block_range(&mut budget);
+
+    for (height, bytes) in [
+        (block::Height(1), 700),
+        (block::Height(2), 800),
+        (block::Height(3), 900),
+    ] {
+        outstanding.record_body_bytes(bytes);
+        outstanding.mark_received(height);
+    }
+
+    assert!(outstanding.is_complete());
+    assert_eq!(outstanding.delivered_bytes, 700 + 800 + 900);
 }
 
 #[test]
@@ -3204,6 +3299,44 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
     }
 }
 
+/// A request range at the maximum advertised block count (128) fills the
+/// `ReceivedBlockTracker`'s `u128` bitset exactly (offsets `0..=127`): every height —
+/// including the top-bit height 128 — must be markable, complete, and fully released,
+/// so no height silently falls off the end of the bitset. Guards the boundary that the
+/// `MAX_BS_BLOCKS_PER_REQUEST <= u128::BITS` const assertion in `state.rs` protects.
+#[test]
+fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
+    let count = MAX_BS_BLOCKS_PER_REQUEST;
+    assert_eq!(count, u128::BITS, "the cap is sized to the bitset width");
+    // Heights `1..=128`, offsets `0..=127`; the helper keeps heights within `u8`.
+    let mut outstanding = window_request_range(1, count);
+    assert_eq!(outstanding.reserved_bytes(), u64::from(count));
+
+    for height in 1..=count {
+        assert!(
+            !outstanding.has_received(block::Height(height)),
+            "height {height} should start unreceived",
+        );
+        outstanding.mark_received(block::Height(height));
+        assert!(
+            outstanding.has_received(block::Height(height)),
+            "height {height} (offset {}) must be markable — the bitset must cover the \
+             whole range",
+            height - 1,
+        );
+    }
+
+    assert!(
+        outstanding.is_complete(),
+        "a fully-received {count}-block range must report complete",
+    );
+    assert_eq!(
+        outstanding.reserved_bytes(),
+        0,
+        "every height received ⇒ no reserved bytes remain (no offset fell off the bitset)",
+    );
+}
+
 /// A body whose actual serialized size exceeds its advertised size hint is still
 /// accepted and buffered, and the byte budget charges the overshoot so it cannot
 /// issue more work while under-counting held bodies.
@@ -3227,10 +3360,13 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
         }],
     };
     assert!(budget.try_reserve(request.estimated_bytes));
+    let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         request,
-        queued_at: Instant::now(),
-        deadline: Instant::now(),
+        queued_at: now,
+        deadline: now,
+        delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     };
     assert_eq!(budget.reserved(), hint);
