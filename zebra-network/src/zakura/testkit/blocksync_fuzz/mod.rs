@@ -113,6 +113,7 @@ pub(crate) async fn run_scenario(
         handle.clone(),
         apply_rx,
         apply.clone(),
+        scenario.commit,
         committed_tx,
         shutdown.clone(),
     ));
@@ -242,6 +243,7 @@ fn spawn_commit_driver(
     handle: BlockSyncHandle,
     mut apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
     apply: MockApplyFrontier,
+    commit: CommitProfile,
     committed_tx: watch::Sender<block::Height>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
@@ -250,6 +252,7 @@ fn spawn_commit_driver(
         // bumps the epoch on a reset, so any item from a lower epoch is stale
         // (superseded by a rollback) and must be discarded rather than applied.
         let mut max_epoch = 0u64;
+        let mut applied = 0u64;
         loop {
             let item = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -262,11 +265,30 @@ fn spawn_commit_driver(
                 continue;
             }
             max_epoch = item.epoch;
+            // Model a slow/bursty commit drain: hold the body *before* applying so its
+            // reserved bytes stay held (the durable frontier is only reported after the
+            // apply), letting the apply backlog build against the byte budget rather than
+            // throttling download.
+            if !commit.per_commit_delay.is_zero()
+                && sleep_or_cancel(&shutdown, commit.per_commit_delay).await
+            {
+                break;
+            }
             let outcome = apply.apply(item.block.as_ref());
             if outcome.result == BlockApplyResult::Committed {
                 let _ = committed_tx.send(outcome.frontiers.verified_block_tip);
             }
             handle.report_durable_frontier(outcome.frontiers);
+            applied = applied.saturating_add(1);
+            if let Some(burst) = commit.burst {
+                if burst.every_commits > 0
+                    && applied.is_multiple_of(burst.every_commits)
+                    && !burst.duration.is_zero()
+                    && sleep_or_cancel(&shutdown, burst.duration).await
+                {
+                    break;
+                }
+            }
         }
     })
 }

@@ -10,9 +10,9 @@ use std::time::Duration;
 use zebra_chain::block;
 
 use super::{
-    assert_core_invariants, fuzz_config, invariant_report, run_scenario, run_trace, FuzzOutcome,
-    IdleGap, InvariantReport, LatencyDist, PeerSpec, Scenario, ServeProfile, TipEvent,
-    TipEventKind,
+    assert_core_invariants, fuzz_config, invariant_report, run_scenario, run_trace,
+    CommitBurstStall, CommitProfile, FuzzOutcome, IdleGap, InvariantReport, LatencyDist, PeerSpec,
+    Scenario, ServeProfile, TipEvent, TipEventKind,
 };
 use crate::zakura::ZakuraBlockSyncConfig;
 
@@ -103,29 +103,49 @@ async fn fuzz_steady_bytes_unit() {
     run_checked("fuzz_steady_bytes_unit", scenario, 32).await;
 }
 
-/// Head-of-line: one slow, high-latency peer alongside fast peers. The trace-proven
-/// regime the BBR work targets. For now we only require convergence; once BBR lands we
-/// compare the per-peer queue depth / HoL latency in the report across controllers.
+/// Head-of-line: one genuinely slow, high-RTprop peer alongside two fast byte-accurate
+/// carriers, in the single-block-per-request production regime. The floor must ride the
+/// carriers (the slow peer's higher RTprop defers it off the floor on the normal take
+/// path) while the slow peer is **kept, not reaped** — it serves a body roughly every
+/// 0.5 s, well inside the liveness window, so disconnecting it would throw away real
+/// bandwidth for no floor benefit. Asserts convergence and zero reaper disconnects; the
+/// floor-HoL p99 itself is the live-trace metric.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_one_slow_peer_hol() {
     let blocks = 300;
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        ..fuzz_config()
+    };
+    // 64 KiB/s with an 80 ms base RTT ⇒ ~0.5 s per 32 KiB body and a measured RTprop far
+    // above the carriers', so the normal-path floor preference defers the floor to them.
     let slow = PeerSpec::with_serve(
         1,
         target(blocks),
-        ServeProfile::slow(Duration::from_millis(20), Duration::from_millis(5)),
+        ServeProfile::byte_rate(Duration::from_millis(80), 64 * 1024),
     );
+    let carrier = |id| {
+        PeerSpec::with_serve(
+            id,
+            target(blocks),
+            ServeProfile::byte_rate(Duration::from_millis(2), 50 * 1024 * 1024),
+        )
+    };
     let mut scenario = Scenario::new(
         blocks,
         0x57ea_0002,
-        fuzz_config(),
-        vec![
-            slow,
-            PeerSpec::fast(2, target(blocks)),
-            PeerSpec::fast(3, target(blocks)),
-        ],
+        config,
+        vec![slow, carrier(2), carrier(3)],
     );
+    scenario.target_block_bytes = Some(32 * 1024);
     scenario.deadline = Duration::from_secs(60);
-    run_checked("fuzz_one_slow_peer_hol", scenario, 32).await;
+    let (_, report) = run_checked("fuzz_one_slow_peer_hol", scenario, 32).await;
+
+    // Directive #1: a peer delivering at a slow-but-steady cadence is never kicked.
+    assert_eq!(
+        report.protocol_rejects, 0,
+        "the slow-but-progressing peer must not be reaped (it serves ~every 0.5 s)",
+    );
 }
 
 /// Reorg: a mid-sync verified-tip reset, then sync resumes to the target. Stretched
@@ -257,4 +277,228 @@ async fn fuzz_large_to_small() {
     ];
     scenario.deadline = Duration::from_secs(60);
     run_checked("fuzz_large_to_small", scenario, 32).await;
+}
+
+/// A byte-cwnd config whose window binds on reserved body bytes rather than the
+/// request-count cap: a `min_cwnd_bytes` floor chosen below `max_inflight × body`, with
+/// the generous `fuzz_config` byte budget.
+///
+/// Forces **one block per request** (`max_blocks_per_response = 1`), the regime the byte
+/// controller is designed for and the production default — with multi-block ranges a
+/// single request can reserve many bodies at once, so the per-request byte cwnd would no
+/// longer bound the in-flight bytes (the request *count* is what the cwnd gates).
+fn byte_window_config(min_cwnd_bytes: u64) -> ZakuraBlockSyncConfig {
+    ZakuraBlockSyncConfig {
+        bbr_cwnd_unit: crate::zakura::CwndUnit::Bytes,
+        bbr_min_cwnd_bytes: min_cwnd_bytes,
+        max_blocks_per_response: 1,
+        ..fuzz_config()
+    }
+}
+
+/// Run one byte-unit scenario with a fixed body size and two byte-accurate peers,
+/// returning its invariant report.
+async fn run_byte_size_run(
+    name: &str,
+    seed: u64,
+    blocks: u32,
+    body_bytes: usize,
+    config: ZakuraBlockSyncConfig,
+    serve: ServeProfile,
+) -> InvariantReport {
+    let mut scenario = Scenario::new(
+        blocks,
+        seed,
+        config,
+        vec![
+            PeerSpec::with_serve(1, target(blocks), serve),
+            PeerSpec::with_serve(2, target(blocks), serve),
+        ],
+    );
+    scenario.target_block_bytes = Some(body_bytes);
+    scenario.deadline = Duration::from_secs(30);
+    let (_, report) = run_checked(name, scenario, 64).await;
+    report
+}
+
+/// Mixed block sizes: the byte cwnd holds ~the same reserved bytes in flight regardless
+/// of body size, so the in-flight *request* depth must scale inversely with the body
+/// size — small bodies pack many requests into the byte window, large bodies few. Two
+/// runs that differ only in body size make the headline byte-cwnd property a direct,
+/// deterministic comparison (the blocks unit, by contrast, would hold the same request
+/// count in both).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_mixed_block_sizes() {
+    let blocks = 400;
+    let config = byte_window_config(512 * 1024);
+    // Byte-accurate serve: each block takes `bytes / 20 MiB/s`, so a big block genuinely
+    // takes longer and the controller sees a real bytes/sec BtlBw.
+    let serve = ServeProfile::byte_rate(Duration::from_millis(2), 20 * 1024 * 1024);
+
+    let small = run_byte_size_run(
+        "fuzz_mixed_block_sizes_small",
+        0x57ea_0009,
+        blocks,
+        8 * 1024,
+        config.clone(),
+        serve,
+    )
+    .await;
+    let large = run_byte_size_run(
+        "fuzz_mixed_block_sizes_large",
+        0x57ea_000a,
+        blocks,
+        64 * 1024,
+        config,
+        serve,
+    )
+    .await;
+
+    // The byte cwnd (a similar order of magnitude in both runs — the budget is in bytes,
+    // not requests) maps to far more in-flight *requests* for small bodies than for large:
+    // request depth ∝ 1 / body_size, the headline byte-cwnd property the blocks unit
+    // cannot express. (Here ~8× the body size ⇒ a multiple-× request-depth gap.)
+    assert!(
+        small.peak_cwnd_requests > large.peak_cwnd_requests.saturating_mul(2),
+        "small bodies should admit many more single-block requests in a comparable byte \
+         window (small={} reqs @ {} B cwnd, large={} reqs @ {} B cwnd)",
+        small.peak_cwnd_requests,
+        small.peak_cwnd_bytes,
+        large.peak_cwnd_requests,
+        large.peak_cwnd_bytes,
+    );
+    // The byte window bounds in-flight memory: with one block per request the peak
+    // reserved bytes track the byte cwnd (plus a small floor-bypass margin), never
+    // ballooning to many multiples of it — the head-of-line bound byte denomination
+    // exists to provide. (A multi-block-range regression would push this well past 2×.)
+    for (label, run) in [("small", &small), ("large", &large)] {
+        let bound = run.peak_cwnd_bytes.saturating_mul(2);
+        assert!(
+            run.peak_inflight_bytes <= bound,
+            "{label}: in-flight reserved bytes {} must stay bounded by ~the byte cwnd \
+             (cwnd={} B, bound={} B)",
+            run.peak_inflight_bytes,
+            run.peak_cwnd_bytes,
+            bound,
+        );
+    }
+}
+
+/// Commit stall: the mock commit pipeline drains slowly and in bursts while fast peers
+/// keep serving. This is the `BLOCKSYNC_BYTE_CWND_PLAN` step-3 system check — the apply
+/// backlog must be bounded **only** by the byte budget (download parks on the memory
+/// ceiling, not on a commit-coupled throttle), and the verified tip must resume the
+/// instant each stall clears so the run still reaches the target.
+///
+/// `run_checked` already asserts the target is reached (vtip resumes; no commit-induced
+/// wedge). On top of that we assert the peak reserved bytes stayed within the configured
+/// ceiling (the queue did not grow toward the full chain) yet the ceiling was actually
+/// exercised (the stall created real backpressure — the bound is not vacuous).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_commit_stall() {
+    let blocks = 400;
+    let body_bytes = 32 * 1024usize;
+    // A small resident download budget so the commit stall makes it bind: the chain is
+    // ~12.8 MB (400 × 32 KiB) against a 2 MiB ceiling, so the budget must recycle ~6× and
+    // download genuinely waits on commit. Kept below the request-count cap's byte
+    // equivalent (2 peers × 64 reqs × 32 KiB = 4 MiB) so the *byte budget*, not the
+    // request count, is the binding constraint. (The fuzzer reactor path does not call
+    // `validate()`, which would otherwise require a full checkpoint range; the synthetic
+    // bodies are tiny and the mock committer needs no checkpoint batch, so a sub-floor
+    // ceiling is the right knob to exercise byte-budget backpressure here.)
+    let byte_ceiling: u64 = 2 * 1024 * 1024;
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: byte_ceiling,
+        max_blocks_per_response: 1,
+        ..fuzz_config()
+    };
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_000c,
+        config,
+        vec![
+            PeerSpec::fast(1, target(blocks)),
+            PeerSpec::fast(2, target(blocks)),
+        ],
+    );
+    scenario.target_block_bytes = Some(body_bytes);
+    // Steady 1 ms/commit plus a 120 ms burst every 40 commits — a slow, sawtoothing drain
+    // that holds the byte budget full between bursts without ever permanently wedging.
+    scenario.commit = CommitProfile {
+        per_commit_delay: Duration::from_millis(1),
+        burst: Some(CommitBurstStall {
+            every_commits: 40,
+            duration: Duration::from_millis(120),
+        }),
+    };
+    scenario.deadline = Duration::from_secs(60);
+    let (_, report) = run_checked("fuzz_commit_stall", scenario, 64).await;
+
+    // The byte budget is the only bound on the apply backlog: peak reserved bytes stay
+    // within the ceiling plus a small floor-bypass / request-boundary margin — i.e. the
+    // queue did not grow toward the 12.8 MB chain despite the commit stall.
+    let margin = (body_bytes as u64).saturating_mul(16);
+    let bound = byte_ceiling.saturating_add(margin);
+    assert!(
+        report.peak_budget_reserved <= bound,
+        "reserved bytes {} must stay within the {} B memory ceiling (+{} B margin); the \
+         apply backlog is bounded by the byte budget, not unbounded by the commit stall",
+        report.peak_budget_reserved,
+        byte_ceiling,
+        margin,
+    );
+    // Non-vacuous: the stall actually filled the budget (otherwise the bound proves
+    // nothing about backpressure).
+    assert!(
+        report.peak_budget_reserved >= byte_ceiling / 2,
+        "the commit stall should have created real byte-budget backpressure (reserved \
+         {} of the {} B ceiling)",
+        report.peak_budget_reserved,
+        byte_ceiling,
+    );
+    tracing::info!(
+        peak_budget_reserved = report.peak_budget_reserved,
+        final_budget_reserved = report.final_budget_reserved,
+        byte_ceiling,
+        "commit_stall byte-budget backpressure observation",
+    );
+}
+
+/// A single high-bandwidth peer with real headroom, served byte-accurately, under the
+/// byte unit. The controller must drive a clean sync to the tip while keeping the byte
+/// window the binding constraint — a per-peer byte cwnd is traced and the in-flight
+/// reserved bytes track it (the controller reasons in bytes, not request slots).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_high_bw_fast_peer() {
+    let blocks = 500;
+    let config = byte_window_config(256 * 1024);
+    let peer = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        // 100 MiB/s link with a 20 ms base RTT: enough headroom that the byte-BDP can
+        // exceed the floor once concurrency builds.
+        ServeProfile::byte_rate(Duration::from_millis(20), 100 * 1024 * 1024),
+    );
+    let mut scenario = Scenario::new(blocks, 0x57ea_000b, config, vec![peer]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(30);
+    let (_, report) = run_checked("fuzz_high_bw_fast_peer", scenario, 64).await;
+
+    // A per-peer byte cwnd was traced (byte denomination is live) and never dipped below
+    // its floor; the in-flight reserved bytes were tracked too.
+    assert!(
+        report.peak_cwnd_bytes >= 256 * 1024,
+        "byte cwnd should be traced at or above the floor, got {} B",
+        report.peak_cwnd_bytes,
+    );
+    assert!(
+        report.peak_inflight_bytes > 0,
+        "byte in-flight occupancy should be traced",
+    );
+    tracing::info!(
+        peak_cwnd_bytes = report.peak_cwnd_bytes,
+        peak_inflight_bytes = report.peak_inflight_bytes,
+        max_outstanding = report.max_outstanding,
+        "high_bw_fast_peer byte-window observation",
+    );
 }
