@@ -45,6 +45,53 @@ Stack:
 
 ### PR 2: blocksync before apply-queue/refactor
 
+- Split into a six-PR draft stack on top of #282:
+  - #284 `perf(network): pack block sync ranges by size hint`
+    (`review/blocksync-pre-apply` -> `review/headersync-roots`,
+    commit `9a57aadc6ebffe5fc1034d98df17ed7be89892fb`)
+  - #285 `perf(network): reduce block sync request bookkeeping`
+    (`review/blocksync-request-bookkeeping` -> `review/blocksync-pre-apply`,
+    commit `aa54be2c4f134ce6577d6c545c09ccaea6b68ffb`)
+  - #286 `perf(network): retain raw block bodies in reorder backlog`
+    (`review/blocksync-raw-reorder` -> `review/blocksync-request-bookkeeping`,
+    commit `0db01f48c1d3d38db1226607995ba341c4484297`)
+  - #287 `fix(network): prioritize block sync floor requests`
+    (`review/blocksync-floor-priority` -> `review/blocksync-raw-reorder`,
+    commit `96789ea7a5ca79575815b9e39842e8016fefa652`)
+  - #288 `fix(network): add block sync congestion control`
+    (`review/blocksync-congestion-control` -> `review/blocksync-floor-priority`,
+    commit `18eac76f1236793c7aac2d927a81a5b9e434b922`)
+  - #289 `fix(network): tune block sync throughput defaults`
+    (`review/blocksync-throughput-defaults` -> `review/blocksync-congestion-control`,
+    commit `46378b2ff328f4b0a90d1d01e38c79f1427b0448`)
+- The stack is rebased onto the current remote #282 head,
+  `valar/review/headersync-roots` commit
+  `c718280da877e85fa034a15af932aceab2c04b83`.
+- The final split stack intentionally no longer matches the backed-up original
+  all-in-one #284 branch exactly. Sequential review moved/fixed:
+  - #284 now returns persisted advertised body-size hints through
+    `BlockSizeHints` when no committed block size exists, so real scheduling uses
+    the data that PR persists.
+  - #286 keeps the decoded block on the immediate contiguous path and retains
+    raw bytes only for non-contiguous backlog, with a direct backlog-drain test.
+  - #287 is narrowed to floor-priority shedding only; slow-start/backoff tuning
+    now belongs to #288.
+  - #288 wires `ZakuraBlockSyncConfig::validate()` into top-level config
+    deserialization and tests degenerate config rejection.
+  - #289 refreshes the generated config fixture for the current block-sync
+    defaults.
+- The stack intentionally excludes the apply/committer ownership refactor,
+  `block_sync/apply_item.rs`, `zebrad` committer files, header-sync module/driver
+  changes, commit-bench/tooling, Docker/xtask/workspace packaging changes, and
+  generated `.snap.new` artifacts.
+- Validation for the split stack:
+  `git diff --check review/headersync-roots..HEAD`,
+  `cargo fmt --all -- --check`, and
+  `cargo test -p zebra-network zakura::block_sync --lib` passed (`146 passed`).
+  `cargo test -p zebra-network p2p_v2_block_sync_config_validation_rejects_degenerate_values --lib`
+  passed. `cargo test -p zebrad --test acceptance latest_config_is_stored -- --nocapture`
+  still failed before test execution in bundled `librocksdb-sys` C++ compilation
+  with the known local RocksDB `<cstdint>`/`uint64_t` header issue.
 - Build on top of PR #282 / `review/headersync-roots`, not directly on
   `origin/perf-note-commit-tree`. Suggested branch name:
   `review/blocksync-pre-apply`; target the PR at `review/headersync-roots` while

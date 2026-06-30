@@ -1,5 +1,69 @@
 # Zakura commit bench: offline apply-queue replay plan
 
+## 2026-06-27 sandblasting snapshot status
+
+The apply-queue path has been smoke-tested against the sandblasting mainnet archive snapshot:
+
+- snapshot archive: `/home/evan/src/valar/art/debug/benchmark/glue/snapshots/zebra-mainnet-20260616T032721Z-1707210.tar.zst`
+- sha256: `19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769`
+- clean state used for the final run: `/home/evan/src/valar/art/debug/benchmark/glue/snapshots/reruns/sandblasting-clean-1707210-applyq-final`
+- block/root cache: `/home/evan/src/valar/experiments/commit-bench/blocks`
+- final trace: `/home/evan/src/valar/experiments/commit-bench/traces/apply-queue-sandblasting-1707211-1707981-lookahead-1708054-final`
+
+The benchmark now treats these as reusable local artifacts. Run:
+
+```bash
+cargo xtask zakura-commit-bench -- status \
+  --state-dir /home/evan/src/valar/art/debug/benchmark/glue/snapshots/reruns/sandblasting-clean-1707210-applyq-final \
+  --cache-dir /home/evan/src/valar/experiments/commit-bench/blocks \
+  --blocks 800 \
+  --mode apply-queue \
+  --with-roots
+```
+
+`status` reports discovered snapshots, extracted states, zero-padded block
+caches, root sidecars, trace dirs, and exact `validate-cache` / `run` commands.
+Successful hydrated runs roll the state back to the startup finalized tip by
+default, so the same extracted snapshot can be reused for peer-count reruns.
+Use `--no-rollback` only when you intentionally want to keep the mutated DB for
+debugging.
+
+Two benchmark fixes were needed:
+
+- `z_gettreestate` Orchard roots are already in the byte order accepted by `orchard::tree::Root`,
+  unlike Sapling roots, so the benchmark must not reverse Orchard root bytes.
+- apply-queue + VCT fast-sync needs a successor checkpoint range as lookahead. The finalized writer
+  authenticates a fast-path block's supplied tree roots with the successor header, so stopping the
+  synthetic peer exactly at the measured checkpoint can stall the final measured block. The benchmark
+  now drives one extra checkpoint range but reports throughput only through the requested checkpoint.
+
+Final successful run:
+
+```bash
+target/release/zakura-commit-bench run \
+  --mode apply-queue \
+  --state-dir /home/evan/src/valar/art/debug/benchmark/glue/snapshots/reruns/sandblasting-clean-1707210-applyq-final \
+  --blocks 800 \
+  --cache-dir /home/evan/src/valar/experiments/commit-bench/blocks \
+  --with-roots \
+  --disk-peers 4 \
+  --trace-dir /home/evan/src/valar/experiments/commit-bench/traces/apply-queue-sandblasting-1707211-1707981-lookahead-1708054-final
+```
+
+Summary:
+
+```text
+mode:               apply-queue
+elapsed:            1.919s
+committed blocks:   771
+committed bytes:    216894781 (206.8 MiB)
+throughput:         401.7 blk/s   107.77 MiB/s
+measured tip:       1707981
+state tip:          1708045
+lookahead target:   1708054
+VCT fast path:      835 hit / 0 miss (100.0% hit), 0 retries
+```
+
 ## Goal
 
 Make `zakura-commit-bench` isolate only the P2P/download transport while keeping the rest of the

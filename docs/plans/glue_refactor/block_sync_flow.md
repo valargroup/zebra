@@ -413,6 +413,8 @@ pending or in-flight, then wakes routines waiting on `work.subscribe_available()
 `PeerRoutine::try_fill()` wakes on work availability, budget capacity, peer
 responses, view changes, and timeouts. For an eligible peer with `Status`, it:
 
+> TODO: refactor the shit out of try_fill, that is bonkers
+
 1. checks adaptive slots in `DownloadWindow`,
 2. takes a contiguous pending run in the peer's servable range,
 3. reserves the summed estimated bytes in `ByteBudget`,
@@ -691,6 +693,8 @@ peer-local.
   driver and durable-frontier watcher.
 - `zebrad/src/commands/start/zakura/committer.rs`: node-side commit pump.
 
+> Note: we should rename the blocksync driver to block sync state adapter perhaps. it not "driving" anything.
+
 ## Key Invariants To Preserve
 
 - Each height is in exactly one download state: below floor, `pending`, or
@@ -710,6 +714,8 @@ peer-local.
 - Commit rejection/reset is epoch-guarded; stale apply items and stale resets are
   discarded.
 - Misbehavior is record-only in the current code; it no longer drives disconnects.
+
+> TODO: clarify the difference between the committer and the block_sync_driver. Perhaps we could actually combine them? 
 
 ## Minimal Mental Model
 
