@@ -6,7 +6,7 @@ The controller runs **per peer** and is **byte-denominated**: it measures how fa
 peer delivers block bodies (bytes/second) and how quickly it answers (round-trip
 time), and from those it sizes a per-peer **in-flight window** — the amount of
 outstanding body bytes we allow that peer at any moment. One request fetches one
-block body, so the in-flight *request count* is simply `window ÷ body size`.
+block body, so the in-flight _request count_ is simply `window ÷ body size`.
 
 It pursues three goals:
 
@@ -41,10 +41,10 @@ BBR/code identifier follows in parentheses.
 - **In-flight window** (`cwnd`, "congestion window") — the maximum body bytes a single
   peer may have outstanding to us at once. A larger window means more parallel
   requests to that peer.
-- **Base round-trip** (`RTprop`) — the *minimum* recent round-trip time to a peer:
+- **Base round-trip** (`RTprop`) — the _minimum_ recent round-trip time to a peer:
   how long send-then-receive takes when nothing is queued. It is a latency, **not** a
   window size, but it sizes the window (see BDP). "RT" = round trip.
-- **BDR — byte delivery rate** (`BtlBw`, "bottleneck bandwidth") — the *maximum*
+- **BDR — byte delivery rate** (`BtlBw`, "bottleneck bandwidth") — the _maximum_
   recent rate, in bytes/second, at which a peer delivers bodies: the speed of the
   bottleneck link to that peer.
 - **BDP — bandwidth-delay product** = `BDR × base round-trip` — the amount of
@@ -60,14 +60,14 @@ BBR/code identifier follows in parentheses.
 - **Delay gradient** — the signal that a queue is forming: the recent round-trip has
   risen above the base round-trip by more than a set ratio. It trims the window down.
 - **Floor** — the lowest block height we still need; the chain cannot commit past it.
-  A "floor request" fetches it, and if its carrier is slow the height is *rescued* —
+  A "floor request" fetches it, and if its carrier is slow the height is _rescued_ —
   re-requested from a faster peer.
 
 ## Measured signals (per peer)
 
-- **Base round-trip** — windowed *min* of the raw request round-trip
+- **Base round-trip** — windowed _min_ of the raw request round-trip
   (`bbr_rtprop_window`, 10 s). The propagation floor; never collapses to zero.
-- **BDR** — windowed *max* of the per-response delivery rate in bytes/s
+- **BDR** — windowed _max_ of the per-response delivery rate in bytes/s
   (`bbr_delivery_rate_window`, 10 s).
 - **BDP** = `BDR × base round-trip` (bytes). Window target =
   `max(min window, BDP × gain)` (`gain = 200%`).
@@ -75,7 +75,7 @@ BBR/code identifier follows in parentheses.
   baseline (`base round-trip + bytes/BDR`), used to detect a building queue.
 
 In-flight admission compares a peer's **reserved body bytes** against its window; the
-in-flight *request count* falls out as `window ÷ body size`.
+in-flight _request count_ falls out as `window ÷ body size`.
 
 ## Control law — MUST
 
@@ -181,4 +181,3 @@ land fast.
 | `floor_bypass_slots` | 2 | floor borrow beyond the window |
 | `max_inflight_block_bytes` | 6 GiB | global in-flight byte ceiling |
 | timeout dip / delay-cap down / EWMA α | ×0.85 / ×0.9 / 0.25 | (constants) |
-
