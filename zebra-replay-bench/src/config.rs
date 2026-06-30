@@ -2,13 +2,15 @@
 
 use std::path::PathBuf;
 
-use zebra_state::{Config, StorageMode};
+use zebra_state::{Config, PruningConfig, StorageMode};
 
 /// Builds a [`zebra_state::Config`] pointing at `cache_dir`.
 ///
 /// `cache_dir` is the snapshot/fork root that contains `state/vN/<network>`. The
-/// benchmark only ever opens archive snapshots (full block bodies + per-height
-/// trees), so storage mode is fixed to [`StorageMode::Archive`].
+/// benchmark runs the production fast-sync configuration: [`StorageMode::Pruned`]
+/// with checkpoint sync, so it measures exactly what a real pruned validator does
+/// (including skipping the transparent address index). The per-run fork is a
+/// throwaway copy, so online pruning never touches the base snapshot.
 ///
 /// `force_legacy` clears `vct_fast_sync`, which forces the committer onto the full
 /// per-block note-commitment recompute path — the write-assembler + disk-writer
@@ -20,7 +22,7 @@ pub fn state_config(cache_dir: PathBuf, force_legacy: bool) -> Config {
         ephemeral: false,
         checkpoint_sync: true,
         vct_fast_sync: !force_legacy,
-        storage_mode: StorageMode::Archive,
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
         ..Config::default()
     };
     // Run-ahead finalized-commit pipeline depth (PR #309). 0 = synchronous (default).
