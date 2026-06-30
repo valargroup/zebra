@@ -236,21 +236,23 @@ impl BbrState {
     }
 
     /// Record a completed request: `elapsed` from send to the final body, `blocks` in
-    /// it, and `inflight` = requests still outstanding to this peer *after* this
-    /// completion. The RTprop sample is the request round-trip. The BtlBw sample is
-    /// measured over the request's pipe interval (`delivered_delta / elapsed_since_snapshot`),
-    /// so one-block responses can still observe concurrent completions while the request
-    /// was in flight. The interval is floored at the previous RTprop so a burst of
-    /// buffered bodies arriving within one tick cannot inflate the bandwidth estimate.
-    /// Re-derives the applied cwnd from the fresh BDP estimate, then advances the
-    /// ProbeBw/ProbeRtt phase machine.
+    /// it, and `inflight` = the work still outstanding to this peer *after* this
+    /// completion, **denominated in the cwnd's unit** (request count under `Blocks`,
+    /// reserved body bytes under `Bytes`) so the ProbeRtt drain check can compare it
+    /// against `min_cwnd` consistently. The RTprop sample is the request round-trip.
+    /// The BtlBw sample is measured over the request's pipe interval
+    /// (`delivered_delta / elapsed_since_snapshot`), so one-block responses can still
+    /// observe concurrent completions while the request was in flight. The interval is
+    /// floored at the previous RTprop so a burst of buffered bodies arriving within one
+    /// tick cannot inflate the bandwidth estimate. Re-derives the applied cwnd from the
+    /// fresh BDP estimate, then advances the ProbeBw/ProbeRtt phase machine.
     pub(super) fn record_delivery(
         &mut self,
         now: Instant,
         elapsed: Duration,
         blocks: u32,
         delivered_bytes: u64,
-        inflight: usize,
+        inflight: u64,
         snapshot: DeliverySnapshot,
     ) {
         let rtt_secs = elapsed.as_secs_f64();
@@ -370,10 +372,12 @@ impl BbrState {
     }
 
     /// Drive the ProbeBw/ProbeRtt cycle off completed deliveries (the only event that
-    /// carries both a fresh timestamp and the current inflight count). ProbeRtt forces
-    /// the cwnd to `min_cwnd`, which drains the queue; once drained, it holds for
-    /// `probe_rtt_duration` so an uncontended request completes and refreshes RTprop.
-    fn advance_phase(&mut self, now: Instant, inflight: usize) {
+    /// carries both a fresh timestamp and the current inflight measure). `inflight` is in
+    /// the cwnd's unit (request count under `Blocks`, reserved bytes under `Bytes`) so it
+    /// is comparable to `min_cwnd`. ProbeRtt forces the cwnd to `min_cwnd`, which drains
+    /// the queue; once drained, it holds for `probe_rtt_duration` so an uncontended
+    /// request completes and refreshes RTprop.
+    fn advance_phase(&mut self, now: Instant, inflight: u64) {
         // Anchor the first probe one interval after the first delivery.
         let anchor = *self.last_probe_rtt_at.get_or_insert(now);
         match self.phase {
@@ -385,7 +389,9 @@ impl BbrState {
             }
             BbrPhase::ProbeRtt => {
                 // Start the hold timer the moment the queue first reaches the floor.
-                if self.probe_rtt_drained_at.is_none() && inflight <= self.params.min_cwnd {
+                // `inflight` and `min_cwnd` are in the same unit; widen `min_cwnd`
+                // (`usize`) to `u64` for the comparison (lossless on supported targets).
+                if self.probe_rtt_drained_at.is_none() && inflight <= self.params.min_cwnd as u64 {
                     self.probe_rtt_drained_at = Some(now);
                 }
                 let Some(drained_at) = self.probe_rtt_drained_at else {
@@ -523,7 +529,8 @@ mod bbr_tests {
     const EXPECTED_CWND: usize = 80;
 
     /// Blocks-mode delivery helper (the `delivered_bytes` arg is ignored under
-    /// `CwndUnit::Blocks`, so it passes 0).
+    /// `CwndUnit::Blocks`, so it passes 0). `inflight` is the request count, which is the
+    /// Blocks-unit in-flight measure.
     fn record_delivery(
         bbr: &mut BbrState,
         now: Instant,
@@ -535,7 +542,8 @@ mod bbr_tests {
             delivered: bbr.delivered,
             delivered_at: now - elapsed,
         };
-        bbr.record_delivery(now, elapsed, blocks, 0, inflight, snapshot);
+        // Blocks unit: the in-flight measure is the request count.
+        bbr.record_delivery(now, elapsed, blocks, 0, inflight as u64, snapshot);
     }
 
     #[test]
@@ -859,6 +867,68 @@ mod bbr_tests {
         );
         // The floor bypass must not breach the advertised cap either.
         assert_eq!(window.available_slots_with_bonus(2), 0);
+    }
+
+    #[test]
+    fn probe_rtt_drain_respects_reserved_bytes_under_byte_unit() {
+        // Regression for the unit-inconsistent ProbeRtt drain gate under `CwndUnit::Bytes`.
+        // The drain check compares the in-flight measure against `min_cwnd`, which under
+        // `Bytes` is `min_cwnd_bytes`. The window must therefore feed the controller its
+        // reserved *bytes*, not a request count — otherwise a small count is always below
+        // the multi-KiB byte floor, the hold timer starts before the byte queue has
+        // drained, and ProbeRtt exits while still contended. Here a still-full byte queue
+        // must hold ProbeRtt open until the reserved bytes actually fall to the floor.
+        let cfg = byte_test_config(8_000, 256); // 8 KB byte floor
+        let mut window = DownloadWindow::new(&cfg);
+        let t0 = Instant::now();
+
+        // Five 4 KB reservations ⇒ 20 KB in flight, well above the 8 KB floor.
+        push_outstanding_bytes(&mut window, 5, 4_000);
+        let deliver = |window: &mut DownloadWindow, now: Instant| {
+            let snapshot = window.delivery_snapshot(now - Duration::from_millis(10));
+            window.record_delivery(now, Duration::from_millis(10), 1, 4_000, snapshot);
+        };
+
+        // First delivery anchors the probe at t0; stays in ProbeBw.
+        deliver(&mut window, t0);
+        assert_eq!(window.bbr_phase_code(), 0);
+
+        // One interval later ProbeRtt trips.
+        let t1 = t0 + Duration::from_millis(1_100);
+        deliver(&mut window, t1);
+        assert_eq!(window.bbr_phase_code(), 1, "ProbeRtt should have tripped");
+
+        // The byte queue is still 20 KB (above the floor), so even well past
+        // `probe_rtt_duration` the drain is NOT detected and ProbeRtt holds. The buggy
+        // count-vs-bytes gate would have stamped the drain immediately and exited here.
+        let t2 = t1 + Duration::from_millis(250);
+        deliver(&mut window, t2);
+        let t3 = t2 + Duration::from_millis(250);
+        deliver(&mut window, t3);
+        assert_eq!(
+            window.bbr_phase_code(),
+            1,
+            "the byte queue never drained, so ProbeRtt must stay pinned to the floor",
+        );
+
+        // Drain the byte queue to the floor (4 KB <= 8 KB): the hold timer starts now...
+        window.outstanding.truncate(1);
+        let t4 = t3 + Duration::from_millis(10);
+        deliver(&mut window, t4);
+        assert_eq!(
+            window.bbr_phase_code(),
+            1,
+            "draining, hold timer just started"
+        );
+
+        // ...and only after `probe_rtt_duration` past the drain does ProbeRtt exit.
+        let t5 = t4 + Duration::from_millis(250);
+        deliver(&mut window, t5);
+        assert_eq!(
+            window.bbr_phase_code(),
+            0,
+            "byte queue drained and held, ProbeRtt should exit to ProbeBw",
+        );
     }
 
     #[test]

@@ -342,7 +342,7 @@ impl DownloadWindow {
     /// delivered body bytes — under the single-block-per-request invariant
     /// (`DEFAULT_BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
     /// `serialized_bytes`. Call after removing the completed request from `outstanding`,
-    /// so `outstanding.len()` is the inflight count the ProbeRtt drain check needs.
+    /// so the in-flight measure reflects the post-completion queue depth.
     pub(super) fn record_delivery(
         &mut self,
         now: Instant,
@@ -351,7 +351,17 @@ impl DownloadWindow {
         delivered_bytes: u64,
         snapshot: DeliverySnapshot,
     ) {
-        let inflight = self.outstanding.len();
+        // The ProbeRtt drain check compares this against `min_cwnd`, so the in-flight
+        // measure MUST be in the cwnd's unit: request count under `Blocks`, reserved
+        // body bytes under `Bytes`. Passing the raw request count under `Bytes` made the
+        // drain check (`count <= min_cwnd_bytes`) trivially true, so the hold timer
+        // started before the byte queue had actually drained and the RTprop sample could
+        // still be contended.
+        let inflight = match self.cwnd_unit {
+            // `outstanding.len()` (a `usize` request count) widens to `u64` losslessly.
+            CwndUnit::Blocks => self.outstanding.len() as u64,
+            CwndUnit::Bytes => self.outstanding_reserved_bytes(),
+        };
         self.bbr
             .record_delivery(now, elapsed, blocks, delivered_bytes, inflight, snapshot);
     }
@@ -771,6 +781,18 @@ impl BlockBudgetLedger {
         charge
     }
 }
+
+/// Number of distinct request offsets the [`ReceivedBlockTracker`] bitset can hold —
+/// one per bit of its `u128`.
+const RECEIVED_TRACKER_OFFSET_CAPACITY: u32 = u128::BITS;
+
+// A request range carries one received-offset bit per requested height (offsets
+// `0..count`). If the advertised block-count cap ever exceeded the bitset width,
+// `bit_for_offset` would return `None` for the overflowing heights, so they could
+// never be marked received, `is_complete()` would be unreachable, and the range would
+// wedge (its reservation never released). Couple the two so a future cap bump that
+// outgrows the bitset fails to compile instead of silently wedging.
+const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPACITY);
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReceivedBlockTracker {
