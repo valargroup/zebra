@@ -136,7 +136,7 @@ pub(crate) async fn run_scenario(
         ));
     }
 
-    let _running = RunningHarness {
+    let running = RunningHarness {
         shutdown: shutdown.clone(),
         reactor_task,
         tasks,
@@ -155,6 +155,7 @@ pub(crate) async fn run_scenario(
     .and_then(|result| result.ok())
     .map(|height| *height);
     let committed_tip = reached.unwrap_or_else(|| *committed_rx.borrow());
+    running.stop().await;
 
     Ok(FuzzOutcome {
         committed_tip,
@@ -179,6 +180,26 @@ impl Drop for RunningHarness {
         for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+impl RunningHarness {
+    async fn stop(mut self) {
+        self.shutdown.cancel();
+        stop_task(&mut self.reactor_task).await;
+        for task in &mut self.tasks {
+            stop_task(task).await;
+        }
+    }
+}
+
+async fn stop_task(task: &mut JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(2), &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
     }
 }
 
