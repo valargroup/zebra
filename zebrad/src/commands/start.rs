@@ -93,8 +93,9 @@ use zebra_network::types::PeerServices;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use zakura::{
-    committer::Committer, drive_block_sync_actions, drive_block_sync_durable_frontier,
-    drive_zakura_header_sync_actions, mirror_zakura_full_block_commits, query_block_sync_frontiers,
+    checkpoint_trace, committer::Committer, drive_block_sync_actions,
+    drive_block_sync_durable_frontier, drive_zakura_header_sync_actions,
+    mirror_zakura_full_block_commits, query_block_sync_frontiers,
     zakura_header_sync_driver_startup, BlocksyncThroughputProbe, BlocksyncThroughputSummary,
     ZakuraHeaderSyncDriverHandles,
 };
@@ -647,17 +648,20 @@ impl StartCmd {
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
+        let zakura_trace = zakura_endpoint.as_ref().map(|endpoint| endpoint.trace());
+        let checkpoint_trace_hook = zakura_trace.clone().map(checkpoint_trace);
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zebra_consensus::router::init(
+            zebra_consensus::router::init_with_checkpoint_trace(
                 config.consensus.clone(),
                 &config.network.network,
                 state.clone(),
                 tx_verifier_setup_rx,
+                checkpoint_trace_hook,
             )
             .await;
 
         if let Some(endpoint) = zakura_endpoint.clone() {
-            let trace = endpoint.trace();
+            let trace = zakura_trace.unwrap_or_else(|| endpoint.trace());
             if let (Some(header_sync), Some(shutdown), Some(actions)) = (
                 endpoint.header_sync(),
                 endpoint.header_sync_shutdown(),

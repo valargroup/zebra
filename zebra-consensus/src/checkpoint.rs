@@ -19,6 +19,7 @@ use std::{
     pin::Pin,
     sync::{mpsc, Arc},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{Future, FutureExt, TryFutureExt};
@@ -82,6 +83,48 @@ struct RequestBlock {
 /// The CheckpointVerifier avoids creating zero-block lists.
 type QueuedBlockList = Vec<QueuedBlock>;
 
+pub const CHECKPOINT_BLOCK_QUEUED: &str = "checkpoint_block_queued";
+pub const CHECKPOINT_RANGE_READY: &str = "checkpoint_range_ready";
+pub const CHECKPOINT_RANGE_RELEASED: &str = "checkpoint_range_released";
+pub const CHECKPOINT_STATE_COMMIT_START: &str = "checkpoint_state_commit_start";
+pub const CHECKPOINT_STATE_COMMIT_FINISH: &str = "checkpoint_state_commit_finish";
+
+/// Checkpoint verifier trace fields exposed to node-specific trace emitters.
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointTraceEvent {
+    /// Event name.
+    pub event: &'static str,
+    /// Block height for single-block events.
+    pub height: Option<block::Height>,
+    /// Block hash for single-block events.
+    pub hash: Option<block::Hash>,
+    /// First height in a checkpoint range.
+    pub range_start: Option<block::Height>,
+    /// Target checkpoint height for range events.
+    pub target_checkpoint_height: Option<block::Height>,
+    /// Number of blocks in a checkpoint range.
+    pub range_count: Option<u64>,
+    /// Number of queued checkpoint block heights.
+    pub queued_slots: Option<u64>,
+    /// Previously verified checkpoint height, if known.
+    pub previous_checkpoint_height: Option<block::Height>,
+    /// Highest contiguous queued height observed for this event.
+    pub highest_contiguous_height: Option<block::Height>,
+    /// Event elapsed time in microseconds.
+    pub elapsed_us: Option<u64>,
+    /// Low-cardinality result label.
+    pub result: Option<&'static str>,
+}
+
+/// Optional checkpoint verifier trace sink.
+pub trait CheckpointTrace: Send + Sync + 'static {
+    /// Emit a checkpoint verifier trace event.
+    fn emit(&self, event: CheckpointTraceEvent);
+}
+
+/// Shared checkpoint verifier trace sink handle.
+pub type CheckpointTraceHandle = Arc<dyn CheckpointTrace>;
+
 /// The maximum number of queued blocks at any one height.
 ///
 /// This value is a tradeoff between:
@@ -112,6 +155,10 @@ fn progress_from_tip(
         // We start by verifying the genesis block, by itself
         None => (None, Progress::BeforeGenesis),
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// A checkpointing block verifier.
@@ -164,6 +211,9 @@ where
     /// Verified checkpoint progress transmitter.
     #[cfg(feature = "progress-bar")]
     verified_checkpoint_bar: howudoin::Tx,
+
+    /// Optional checkpoint pipeline trace sink.
+    trace: Option<CheckpointTraceHandle>,
 }
 
 impl<S> std::fmt::Debug for CheckpointVerifier<S>
@@ -263,6 +313,22 @@ where
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Self {
+        Self::from_checkpoint_list_with_trace(
+            checkpoint_list,
+            network,
+            initial_tip,
+            state_service,
+            None,
+        )
+    }
+
+    pub(crate) fn from_checkpoint_list_with_trace(
+        checkpoint_list: Arc<CheckpointList>,
+        network: &Network,
+        initial_tip: Option<(block::Height, block::Hash)>,
+        state_service: S,
+        trace: Option<CheckpointTraceHandle>,
+    ) -> Self {
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
         let (initial_tip_hash, verifier_progress) =
@@ -290,6 +356,7 @@ where
             queued_blocks_bar,
             #[cfg(feature = "progress-bar")]
             verified_checkpoint_bar,
+            trace,
         };
 
         if verifier_progress.is_final_checkpoint() {
@@ -362,6 +429,27 @@ where
         {
             self.queued_blocks_bar.close();
             self.verified_checkpoint_bar.close();
+        }
+    }
+
+    fn emit_trace(&self, event: CheckpointTraceEvent) {
+        if let Some(trace) = &self.trace {
+            trace.emit(event);
+        }
+    }
+
+    fn queued_slots(&self) -> u64 {
+        u64::try_from(self.queued.len()).unwrap_or(u64::MAX)
+    }
+
+    fn progress_height(progress: Progress<block::Height>) -> Option<block::Height> {
+        progress.height()
+    }
+
+    fn next_range_start(&self) -> Option<block::Height> {
+        match self.current_start_bound()? {
+            Unbounded => Some(block::Height(0)),
+            Excluded(height) | Included(height) => height.0.checked_add(1).map(block::Height),
         }
     }
 
@@ -751,6 +839,16 @@ where
 
                 let old = std::mem::replace(qb, new_qblock);
                 let _ = old.tx.send(Err(e));
+                self.emit_trace(CheckpointTraceEvent {
+                    event: CHECKPOINT_BLOCK_QUEUED,
+                    height: Some(height),
+                    hash: Some(hash),
+                    queued_slots: Some(self.queued_slots()),
+                    previous_checkpoint_height: Self::progress_height(
+                        self.previous_checkpoint_height(),
+                    ),
+                    ..Default::default()
+                });
                 return Ok(req_block);
             }
         }
@@ -768,6 +866,14 @@ where
         qblocks.push(new_qblock);
 
         self.queued_block_diagnostics(height, hash);
+        self.emit_trace(CheckpointTraceEvent {
+            event: CHECKPOINT_BLOCK_QUEUED,
+            height: Some(height),
+            hash: Some(hash),
+            queued_slots: Some(self.queued_slots()),
+            previous_checkpoint_height: Self::progress_height(self.previous_checkpoint_height()),
+            ..Default::default()
+        });
 
         Ok(req_block)
     }
@@ -840,26 +946,64 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        let trace = self.trace.clone();
+        let height = req_block.block.height;
+        let block_hash = req_block.block.hash;
         let commit_checkpoint_verified = tokio::spawn(async move {
-            let hash = req_block
+            let result_hash = req_block
                 .rx
                 .await
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
 
+            if let Some(trace) = &trace {
+                trace.emit(CheckpointTraceEvent {
+                    event: CHECKPOINT_STATE_COMMIT_START,
+                    height: Some(height),
+                    hash: Some(block_hash),
+                    ..Default::default()
+                });
+            }
+            let started = Instant::now();
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.
             match state_service
                 .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
+                .await
             {
-                zs::Response::Committed(committed_hash) => {
-                    assert_eq!(committed_hash, hash, "state must commit correct hash");
-                    Ok(hash)
+                Ok(zs::Response::Committed(committed_hash)) => {
+                    if let Some(trace) = &trace {
+                        trace.emit(CheckpointTraceEvent {
+                            event: CHECKPOINT_STATE_COMMIT_FINISH,
+                            height: Some(height),
+                            hash: Some(block_hash),
+                            elapsed_us: Some(elapsed_us(started)),
+                            result: Some("committed"),
+                            ..Default::default()
+                        });
+                    }
+                    assert_eq!(
+                        committed_hash, result_hash,
+                        "state must commit correct hash"
+                    );
+                    Ok(result_hash)
                 }
-                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
+                Ok(_) => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
+                Err(error) => {
+                    if let Some(trace) = &trace {
+                        trace.emit(CheckpointTraceEvent {
+                            event: CHECKPOINT_STATE_COMMIT_FINISH,
+                            height: Some(height),
+                            hash: Some(block_hash),
+                            elapsed_us: Some(elapsed_us(started)),
+                            result: Some("error"),
+                            ..Default::default()
+                        });
+                    }
+                    Err(error)
+                }
             }
         });
 
@@ -1000,6 +1144,9 @@ where
                 unreachable!("the FinalCheckpoint case should have returned earlier")
             }
         };
+        let started = Instant::now();
+        let range_start = self.next_range_start();
+        let highest_contiguous_height = Some(target_checkpoint_height);
 
         // Keep the old previous checkpoint height, to make sure we're making
         // progress
@@ -1080,6 +1227,17 @@ where
         );
 
         let block_count = rev_valid_blocks.len();
+        let range_count = u64::try_from(block_count).unwrap_or(u64::MAX);
+        self.emit_trace(CheckpointTraceEvent {
+            event: CHECKPOINT_RANGE_READY,
+            range_start,
+            target_checkpoint_height: Some(target_checkpoint_height),
+            range_count: Some(range_count),
+            queued_slots: Some(self.queued_slots()),
+            previous_checkpoint_height: Self::progress_height(old_prev_check_height),
+            highest_contiguous_height,
+            ..Default::default()
+        });
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
         metrics::counter!("checkpoint.verified.block.count").increment(block_count as u64);
 
@@ -1089,6 +1247,17 @@ where
             // Sending can fail, but there's nothing we can do about it.
             let _ = qblock.tx.send(Ok(qblock.block.hash));
         }
+        self.emit_trace(CheckpointTraceEvent {
+            event: CHECKPOINT_RANGE_RELEASED,
+            range_start,
+            target_checkpoint_height: Some(target_checkpoint_height),
+            range_count: Some(range_count),
+            queued_slots: Some(self.queued_slots()),
+            previous_checkpoint_height: Self::progress_height(old_prev_check_height),
+            highest_contiguous_height,
+            elapsed_us: Some(elapsed_us(started)),
+            ..Default::default()
+        });
 
         // Finally, update the checkpoint bounds
         self.update_progress(target_checkpoint_height);

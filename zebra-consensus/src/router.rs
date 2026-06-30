@@ -36,7 +36,7 @@ use zebra_state as zs;
 
 use crate::{
     block::{Request, SemanticBlockVerifier, VerifyBlockError},
-    checkpoint::{CheckpointVerifier, VerifyCheckpointError},
+    checkpoint::{CheckpointTraceHandle, CheckpointVerifier, VerifyCheckpointError},
     error::TransactionError,
     transaction, BoxError, Config,
 };
@@ -265,8 +265,37 @@ where
 pub async fn init<S, Mempool>(
     config: Config,
     network: &Network,
+    state_service: S,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::Request, transaction::Response, TransactionError>,
+        transaction::Request,
+    >,
+    BackgroundTaskHandles,
+    Height,
+)
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    init_with_checkpoint_trace(config, network, state_service, mempool, None).await
+}
+
+/// Like [`init`], with optional checkpoint verifier trace hooks.
+#[instrument(skip(state_service, mempool, checkpoint_trace))]
+pub async fn init_with_checkpoint_trace<S, Mempool>(
+    config: Config,
+    network: &Network,
     mut state_service: S,
     mempool: oneshot::Receiver<Mempool>,
+    checkpoint_trace: Option<CheckpointTraceHandle>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
@@ -394,7 +423,13 @@ where
     );
 
     let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
-    let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
+    let checkpoint = CheckpointVerifier::from_checkpoint_list_with_trace(
+        list,
+        network,
+        tip,
+        state_service,
+        checkpoint_trace,
+    );
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height,
