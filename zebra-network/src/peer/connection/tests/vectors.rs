@@ -24,7 +24,10 @@ use zebra_test::mock_service::{MockService, PanicAssertion};
 use crate::{
     constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
     peer::{
-        connection::{overload_drop_connection_probability, Connection, State},
+        connection::{
+            overload_drop_connection_probability, Connection, State,
+            MAX_CONSECUTIVE_RECEIVE_TIMEOUTS,
+        },
         ClientRequest, ErrorSlot,
     },
     protocol::external::Message,
@@ -679,7 +682,7 @@ async fn repeated_connection_receive_timeouts_close_connection() {
 
     let mut connection_join_handle = tokio::spawn(connection.run(peer_rx));
 
-    for _ in 0..2 {
+    for _ in 0..MAX_CONSECUTIVE_RECEIVE_TIMEOUTS {
         let (request_tx, mut request_rx) = oneshot::channel();
         client_tx
             .try_send(ClientRequest {

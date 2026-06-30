@@ -46,7 +46,7 @@ mod peer_tx;
 
 /// Consecutive non-ping outbound receive timeouts tolerated before the peer
 /// connection is closed. The first timeout still only fails the request.
-const MAX_CONSECUTIVE_RECEIVE_TIMEOUTS: usize = 2;
+const MAX_CONSECUTIVE_RECEIVE_TIMEOUTS: usize = 4;
 
 #[cfg(test)]
 mod tests;
