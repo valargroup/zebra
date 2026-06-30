@@ -404,6 +404,8 @@ where
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
+            check::has_enough_ironwood_flags(&tx)?;
+            check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
@@ -435,13 +437,7 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -450,6 +446,7 @@ where
 
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
+                check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
             } else if !tx.is_valid_non_coinbase() {
                 return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
             }
@@ -1221,13 +1218,18 @@ where
     /// Verifies a transaction's Orchard shielded data.
     ///
     /// `network_upgrade` is the network upgrade active at the verified transaction's block
-    /// height. It selects the Orchard verifier: the Orchard Action circuit (and its verifying
-    /// key) changed at NU6.2 to fix the variable-base scalar-multiplication bug
-    /// (GHSA-jfw5-j458-pfv6), so pre-NU6.2 bundles must be verified against the historical
-    /// (insecure) key and NU6.2+ bundles against the fixed key. A proof from one era does not
-    /// verify under the other era's key. [`primitives::halo2::verifier_for`] maps the upgrade to
-    /// the verifier holding the matching key; the two verifiers keep separate batches, so eras
-    /// are never mixed.
+    /// height. It selects the Orchard verifier by circuit era: the Orchard Action circuit (and
+    /// its verifying key) changed at NU6.2 to fix the variable-base scalar-multiplication bug
+    /// (GHSA-jfw5-j458-pfv6), and again at NU6.3 to add the
+    /// `disableCrossAddress` constraint. So pre-NU6.2 V5 bundles verify against
+    /// the historical key, NU6.2-until-NU6.3 bundles against the fixed key, and
+    /// NU6.3-onward bundles against the NU6.3 key. The Orchard cross-address
+    /// restriction applies from NU6.3 onward regardless of transaction version
+    /// (ZIP 229), so a V5 bundle at NU6.3 uses the NU6.3 circuit, not the fixed
+    /// one. A proof from one era does not verify under another era's key.
+    /// [`primitives::halo2::verifier_for`] maps the upgrade to
+    /// the verifier holding the matching key; the verifiers keep separate
+    /// batches, so eras are never mixed.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
@@ -1248,8 +1250,11 @@ where
             // Actions in one transaction. So we queue it for verification
             // only once instead of queuing it up for every Action description.
             //
-            // Route the bundle to the verifier for its circuit era: pre-NU6.2 bundles only
-            // verify under the insecure key, NU6.2+ bundles only under the fixed key.
+            // Route the bundle to the verifier for its circuit era: pre-NU6.2
+            // bundles verify only under the insecure key, NU6.2-until-NU6.3
+            // bundles only under the fixed key, and NU6.3-onward bundles only
+            // under the NU6.3 key (which enforces the Orchard cross-address
+            // restriction even in v5 transactions).
             async_checks.push(
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()

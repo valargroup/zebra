@@ -830,34 +830,44 @@ impl ZebraDb {
             })
             .collect();
 
-        // Get a list of the spent UTXOs, before we delete any from the database
+        // Get a list of the spent UTXOs, before we delete any from the database.
+        let outpoints: Vec<transparent::OutPoint> = finalized
+            .block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.inputs().iter())
+            .flat_map(|input| input.outpoint())
+            .collect();
+
         let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
-            finalized
-                .block
-                .transactions
-                .iter()
-                .flat_map(|tx| tx.inputs().iter())
-                .flat_map(|input| input.outpoint())
-                .map(|outpoint| {
-                    (
-                        outpoint,
-                        // Some utxos are spent in the same block, so they will be in
-                        // `tx_hash_indexes` and `new_outputs`
-                        self.output_location(&outpoint).unwrap_or_else(|| {
-                            lookup_out_loc(finalized.height, &outpoint, &tx_hash_indexes)
-                        }),
-                        self.utxo(&outpoint)
-                            .map(|ordered_utxo| ordered_utxo.utxo)
-                            .or_else(|| {
-                                finalized
-                                    .new_outputs
-                                    .get(&outpoint)
-                                    .map(|ordered_utxo| ordered_utxo.utxo.clone())
-                            })
-                            .expect("already checked UTXO was in state or block"),
-                    )
-                })
-                .collect();
+            if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                use rayon::prelude::*;
+                outpoints
+                    .into_par_iter()
+                    .map(|outpoint| {
+                        read_spent_utxo(
+                            self,
+                            finalized.height,
+                            outpoint,
+                            &tx_hash_indexes,
+                            &finalized.new_outputs,
+                        )
+                    })
+                    .collect()
+            } else {
+                outpoints
+                    .into_iter()
+                    .map(|outpoint| {
+                        read_spent_utxo(
+                            self,
+                            finalized.height,
+                            outpoint,
+                            &tx_hash_indexes,
+                            &finalized.new_outputs,
+                        )
+                    })
+                    .collect()
+            };
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -891,14 +901,27 @@ impl ZebraDb {
 
         // Get the current address balances, before the transactions in this block
 
-        fn read_addr_locs<T, F: Fn(&transparent::Address) -> Option<T>>(
+        // Like the spent-UTXO reads above, the per-address balance lookups are
+        // cache-served but serial. Fan them across the rayon pool once a block
+        // touches enough addresses to amortize the fork-join cost.
+        fn read_addr_locs<T: Send, F: Fn(&transparent::Address) -> Option<T> + Sync>(
             changed_addresses: HashSet<transparent::Address>,
             f: F,
         ) -> HashMap<transparent::Address, T> {
-            changed_addresses
-                .into_iter()
-                .filter_map(|address| Some((address, f(&address)?)))
-                .collect()
+            if changed_addresses.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                use rayon::prelude::*;
+                changed_addresses
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .filter_map(|address| Some((address, f(&address)?)))
+                    .collect()
+            } else {
+                changed_addresses
+                    .into_iter()
+                    .filter_map(|address| Some((address, f(&address)?)))
+                    .collect()
+            }
         }
 
         // # Performance
@@ -998,6 +1021,32 @@ impl ZebraDb {
                 error: error.to_string(),
             })
     }
+}
+
+/// Read a spent transparent UTXO and its output location before deleting it from the database.
+///
+/// Some UTXOs are created and spent in the same block, so they are in
+/// `tx_hash_indexes` and `new_outputs` rather than the database.
+fn read_spent_utxo(
+    db: &ZebraDb,
+    height: Height,
+    outpoint: transparent::OutPoint,
+    tx_hash_indexes: &HashMap<transaction::Hash, usize>,
+    new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
+    let db_out_loc = db.output_location(&outpoint);
+    let out_loc = db_out_loc.unwrap_or_else(|| lookup_out_loc(height, &outpoint, tx_hash_indexes));
+    let utxo = db_out_loc
+        .and_then(|loc| db.utxo_by_location(loc))
+        .map(|ordered_utxo| ordered_utxo.utxo)
+        .or_else(|| {
+            new_outputs
+                .get(&outpoint)
+                .map(|ordered_utxo| ordered_utxo.utxo.clone())
+        })
+        .expect("already checked UTXO was in state or block");
+
+    (outpoint, out_loc, utxo)
 }
 
 /// Lookup the output location for an outpoint.
@@ -1403,18 +1452,37 @@ impl DiskWriteBatch {
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
 
-        for (transaction_index, (transaction, transaction_hash)) in block
-            .transactions
-            .iter()
-            .zip(transaction_hashes.iter())
-            .enumerate()
-        {
+        // Serialize the raw transaction bytes up front: on heavy shielded blocks
+        // this serialization dominates the per-block write cost, and each
+        // transaction serializes independently.
+        //
+        // Only fan out to rayon once the block has enough transactions to amortize
+        // the multithreading overhead. Small blocks serialize sequentially (see
+        // PARALLEL_BLOCK_TX_THRESHOLD).
+        let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
+            Vec::new()
+        } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+            use rayon::prelude::*;
+            block
+                .transactions
+                .par_iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
+        } else {
+            block
+                .transactions
+                .iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
+        };
+
+        for (transaction_index, transaction_hash) in transaction_hashes.iter().enumerate() {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
             // keeps historical transaction data for this height.
-            if store_raw_transactions {
-                self.zs_insert(&tx_by_loc, transaction_location, transaction);
+            if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
+                self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
 
             // Index each transaction hash and location

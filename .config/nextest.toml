@@ -30,6 +30,13 @@ filter = "not test(=trusted_chain_sync_handles_forks_correctly) and not test(=de
 # TODO: We need a better test architecture to run all non-stateful
 [profile.all-tests]
 failure-output = "immediate"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(cluster_forms_native_two_node_mesh) and not test(=pruned_storage_mode_prunes_during_regtest_sync)"
+
+# --- Full Tests profile ---
+# Broader coverage for `ironwood-main`, scheduled, manual, and merge-queue runs.
+# This preserves the previous `all-tests` selection while the PR lane stays fast.
+[profile.full-tests]
+failure-output = "immediate"
 default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(cluster_forms_native_two_node_mesh)"
 
 # --- Individual Test Profiles ---
@@ -78,6 +85,22 @@ default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_mainn
 [profile.sync-past-mandatory-checkpoint-testnet]
 slow-timeout = { period = "60m", terminate-after = 2 }
 default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_testnet)'
+
+[profile.sync-range-pre-nu62]
+# A healthy 5k-window sync is ~3-5 min. Terminate a stalled (broken) sync at ~20 min so a
+# consensus regression fails fast and cleanly (a real test timeout) instead of waiting out the
+# job-level timeout. Generous margin over the healthy duration to avoid flakes on a slow droplet.
+slow-timeout = { period = "5m", terminate-after = 4 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=sync_range_pre_nu62)'
+
+[profile.sync-range-post-nu62]
+# A healthy 5k-window sync is ~3-5 min. Terminate a stalled (broken) sync at ~20 min so a
+# consensus regression fails fast and cleanly (a real test timeout) instead of waiting out the
+# job-level timeout. Generous margin over the healthy duration to avoid flakes on a slow droplet.
+slow-timeout = { period = "5m", terminate-after = 4 }
+success-output = "immediate"
+default-filter = 'package(zebrad) and test(=sync_range_post_nu62)'
 
 [profile.generate-checkpoints-mainnet]
 slow-timeout = { period = "90m", terminate-after = 1 }

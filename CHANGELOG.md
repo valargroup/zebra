@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Parallelize per-block serialization in the finalized block writer. On heavy
+  shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
+  computing the block size for `BlockInfo` dominate the per-block write cost. Both
+  are now done across the rayon pool — `par_iter` over the block's transactions —
+  inside the dedicated `COMMIT_COMPUTE_POOL` so the workers don't contend with the
+  download/verification pipeline. The raw-bytes path is byte-identical (`RawBytes`
+  is stored verbatim) and the size path is byte-count-identical (header +
+  CompactSize(tx_count) + sum of transaction sizes). Both fork-joins are gated on a
+  transaction-count threshold (`PARALLEL_BLOCK_TX_THRESHOLD = 16`) so small
+  early-chain blocks, where the fork-join overhead would outweigh the work, run
+  sequentially.
+- Parallelize the finalized writer's spent-UTXO and address-balance reads. In
+  transparent-heavy checkpoint ranges these cache-served point lookups were
+  issued serially on the writer thread; blocks with at least 16 reads now fan
+  them across the rayon pool and reuse each spent output location for the UTXO
+  lookup, reducing the serial read overhead without changing the committed batch.
+- Cache the `MerkleCRH^Orchard` Sinsemilla hash domain. The Orchard
+  note-commitment Merkle hash previously rebuilt the Sinsemilla `HashDomain` —
+  including a full `hash_to_curve` for its `Q` generator — on every node hash,
+  even though the domain (`z.cash:Orchard-MerkleCRH`) is constant for the whole
+  tree. The domain is now derived once and reused, speeding up every Orchard
+  note-commitment tree hash, including the irreducibly-serial per-block `root()`
+  chain (`orchard_combine` microbench ~−15%). The output is byte-identical.
 - Parallelize note-commitment tree updates during checkpoint-zone sync. Sapling
   and Orchard note commitments for each block are now appended to the incremental
   Merkle frontier using a parallel divide-and-conquer reduction across the rayon
@@ -23,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
+- Use V3 chain-history entries from NU6.3 onward, including Ironwood note
+  commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
@@ -120,6 +145,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Treat missing transaction inventory responses during mempool download as a
+  recoverable download failure, avoiding a panic when public peers no longer
+  have a gossiped transaction available.
+- Roll back the Zakura header store together with finalized block data, so
+  databases produced by `zebra-rollback-state` can resume Zakura body sync from
+  the new body tip instead of stalling behind stale headers and falling back to
+  legacy sync.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
   historical raw transaction data, matching the node's storage mode instead of
   always reporting archive behavior.

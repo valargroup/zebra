@@ -646,14 +646,13 @@ impl FinalizedState {
                     let history_tree_mut = Arc::make_mut(&mut history_tree);
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
-                    let ironwood_root = note_commitment_trees.ironwood.root();
                     history_tree_mut
                         .push(
                             &network,
                             block.clone(),
                             &sapling_root,
                             &orchard_root,
-                            &ironwood_root,
+                            &Default::default(),
                         )
                         .map_err(Arc::new)
                         .map_err(ValidateContextError::from)?;
@@ -731,13 +730,21 @@ impl FinalizedState {
         let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
-        let result = self.db.write_block(
-            finalized,
-            prev_note_commitment_trees,
-            &self.network(),
-            source,
-            retention,
-        );
+        // Build and write the block's RocksDB batch inside the dedicated
+        // commit-compute pool. The par-iter calls inside write_block end up scheduled
+        // on a separate pool from global (which is used by download/verify pipeline).
+        // This leads to less contention and more throughput, as benchmarked over the
+        // sand-blasting region.
+        let network = self.network();
+        let result = COMMIT_COMPUTE_POOL.install(|| {
+            self.db.write_block(
+                finalized,
+                prev_note_commitment_trees,
+                &network,
+                source,
+                retention,
+            )
+        });
 
         if result.is_ok() {
             if retention.clears_archive_backlog() {

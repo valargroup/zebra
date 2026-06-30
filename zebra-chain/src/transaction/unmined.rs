@@ -1,8 +1,8 @@
 //! Unmined Zcash transaction identifiers and transactions.
 //!
 //! Transaction versions 5 and 6 are uniquely identified by [`WtxId`] when
-//! unmined, and [`struct@Hash`] in the blockchain. The effects of a v5 or v6 transaction
-//! (spends and outputs) are uniquely identified by the same
+//! unmined, and [`struct@Hash`] in the blockchain. The effects of a v5 or
+//! v6 transaction (spends and outputs) are uniquely identified by the same
 //! [`struct@Hash`] in both cases.
 //!
 //! Transaction versions 1-4 are uniquely identified by legacy
