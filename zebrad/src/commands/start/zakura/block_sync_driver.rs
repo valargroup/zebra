@@ -3,7 +3,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -394,12 +397,99 @@ where
     }
 }
 
+/// Lock-free view of the commit pipeline that a fired-but-unresolved commit reads at
+/// its stall deadline to attribute *why* it is still pending.
+///
+/// Purely diagnostic: it never gates a commit (the commit is awaited regardless of what
+/// this says); it only classifies the `commit_stalled` trace row so a live trace can
+/// show which gating cause dominates the post-durable-watch commit tails. The
+/// [`Committer`](super::committer::Committer) owns one and maintains it as commits are
+/// fired and resolved; each in-flight commit holds a clone to read at its stall.
+#[derive(Clone, Default)]
+pub(crate) struct CommitPipelineProbe {
+    inner: Arc<CommitPipelineProbeInner>,
+}
+
+#[derive(Default)]
+struct CommitPipelineProbeInner {
+    /// Highest height committed so far (the contiguous head advances past it).
+    committed_marker: AtomicU64,
+    /// Highest height a commit has been fired for (submission high-water).
+    fired_high_water: AtomicU64,
+    /// Fired-but-unresolved commits.
+    in_flight: AtomicU64,
+}
+
+/// A `Copy` snapshot of [`CommitPipelineProbe`] read at the stall deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommitPipelineSnapshot {
+    pub(crate) committed_marker: u64,
+    pub(crate) fired_high_water: u64,
+    pub(crate) in_flight: u64,
+}
+
+impl CommitPipelineProbe {
+    /// Record that a commit was fired for `height`: raise the submission high-water and
+    /// the in-flight count. Pairs with exactly one [`note_resolved`](Self::note_resolved).
+    pub(crate) fn note_fired(&self, height: block::Height) {
+        self.inner
+            .fired_high_water
+            .fetch_max(u64::from(height.0), Ordering::Relaxed);
+        self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a fired commit resolved. `committed` carries the height on a
+    /// successful commit (raising the committed marker); `None` on a failure.
+    pub(crate) fn note_resolved(&self, committed: Option<block::Height>) {
+        if let Some(height) = committed {
+            self.inner
+                .committed_marker
+                .fetch_max(u64::from(height.0), Ordering::Relaxed);
+        }
+        // A fired commit always resolves exactly once; saturate at 0 defensively so a
+        // stray double-resolve can never wrap the unsigned counter.
+        let _ = self
+            .inner
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    fn snapshot(&self) -> CommitPipelineSnapshot {
+        CommitPipelineSnapshot {
+            committed_marker: self.inner.committed_marker.load(Ordering::Relaxed),
+            fired_high_water: self.inner.fired_high_water.load(Ordering::Relaxed),
+            in_flight: self.inner.in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Classify why a checkpoint commit was still pending at the stall deadline, from a
+/// lock-free pipeline snapshot. Diagnostic only — the value is a trace label, never a
+/// control input.
+fn commit_stall_reason(height: block::Height, snapshot: &CommitPipelineSnapshot) -> &'static str {
+    // The committed tip sits immediately below us ⇒ we are the contiguous head, so the
+    // gate is downstream of submission: the checkpoint batch above us is still filling in
+    // the verifier, or verify+persist on the head is slow (the "make commit faster"
+    // signal). Otherwise a lower contiguous block has not committed yet and we are blocked
+    // behind the un-committed prefix (floor / range head-of-line). `fired_high_water` and
+    // `commits_in_flight` ride alongside so analysis can sub-slice (e.g. head-pending with
+    // the whole range already submitted = genuine verify/persist bottleneck).
+    if u64::from(height.0) <= snapshot.committed_marker.saturating_add(1) {
+        cs_trace::COMMIT_STALL_CONTIGUOUS_HEAD
+    } else {
+        cs_trace::COMMIT_STALL_BEHIND_PREFIX
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block_verifier: BlockVerifier,
     block: Arc<block::Block>,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
+    probe: &CommitPipelineProbe,
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
@@ -420,6 +510,8 @@ where
             tokio::select! {
                 outcome = &mut commit => block_commit_result(Some(height), expected_hash, outcome),
                 _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
+                    let snapshot = probe.snapshot();
+                    let reason = commit_stall_reason(height, &snapshot);
                     emit_commit_state(
                         trace,
                         cs_trace::COMMIT_STALLED,
@@ -434,6 +526,10 @@ where
                                 cs_trace::ELAPSED_MS,
                                 ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT.as_millis().try_into().unwrap_or(u64::MAX),
                             );
+                            insert_cs_str(row, cs_trace::COMMIT_STALL_REASON, reason);
+                            insert_cs_u64(row, cs_trace::COMMITTED_MARKER, snapshot.committed_marker);
+                            insert_cs_u64(row, cs_trace::FIRED_HIGH_WATER, snapshot.fired_high_water);
+                            insert_cs_u64(row, cs_trace::COMMITS_IN_FLIGHT, snapshot.in_flight);
                         },
                     );
                     block_commit_result(Some(height), expected_hash, commit.await)
@@ -864,4 +960,96 @@ fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod commit_stall_tests {
+    use super::*;
+
+    fn height(h: u32) -> block::Height {
+        block::Height(h)
+    }
+
+    /// The probe mirrors the pipeline: firing raises the submission high-water and the
+    /// in-flight count; a successful resolution raises the committed marker and drops the
+    /// in-flight count; a failed resolution only drops the in-flight count.
+    #[test]
+    fn probe_tracks_fired_committed_and_in_flight() {
+        let probe = CommitPipelineProbe::default();
+        assert_eq!(
+            {
+                let s = probe.snapshot();
+                (s.committed_marker, s.fired_high_water, s.in_flight)
+            },
+            (0, 0, 0),
+        );
+
+        probe.note_fired(height(10));
+        probe.note_fired(height(11));
+        probe.note_fired(height(12));
+        let s = probe.snapshot();
+        assert_eq!(
+            (s.fired_high_water, s.in_flight, s.committed_marker),
+            (12, 3, 0)
+        );
+
+        // A success advances the marker and drops one in-flight; out-of-order successes
+        // keep the marker at the max (the committer commits a contiguous range, but the
+        // marker is defended against reordered completions).
+        probe.note_resolved(Some(height(10)));
+        probe.note_resolved(Some(height(12)));
+        let s = probe.snapshot();
+        assert_eq!((s.committed_marker, s.in_flight), (12, 1));
+
+        // A failure resolves without advancing the marker.
+        probe.note_resolved(None);
+        let s = probe.snapshot();
+        assert_eq!((s.committed_marker, s.in_flight), (12, 0));
+
+        // Defensive: an extra resolve cannot wrap the unsigned in-flight counter.
+        probe.note_resolved(None);
+        assert_eq!(probe.snapshot().in_flight, 0);
+    }
+
+    /// The reason is the contiguous head exactly when the stalled block sits at or
+    /// immediately above the committed marker; anything higher is behind the prefix.
+    #[test]
+    fn reason_classifies_contiguous_head_vs_behind_prefix() {
+        let snapshot = CommitPipelineSnapshot {
+            committed_marker: 100,
+            fired_high_water: 200,
+            in_flight: 50,
+        };
+
+        // At the marker, or the immediate next block, is the contiguous head.
+        for h in [100, 101] {
+            assert_eq!(
+                commit_stall_reason(height(h), &snapshot),
+                cs_trace::COMMIT_STALL_CONTIGUOUS_HEAD,
+            );
+        }
+        // Any gap above the marker is blocked behind the un-committed prefix.
+        for h in [102, 150, 200] {
+            assert_eq!(
+                commit_stall_reason(height(h), &snapshot),
+                cs_trace::COMMIT_STALL_BEHIND_PREFIX,
+            );
+        }
+
+        // From a fresh pipeline (marker 0), the genesis-adjacent block is the head and a
+        // deep checkpoint block is behind the prefix.
+        let fresh = CommitPipelineSnapshot {
+            committed_marker: 0,
+            fired_high_water: 0,
+            in_flight: 0,
+        };
+        assert_eq!(
+            commit_stall_reason(height(1), &fresh),
+            cs_trace::COMMIT_STALL_CONTIGUOUS_HEAD,
+        );
+        assert_eq!(
+            commit_stall_reason(height(400), &fresh),
+            cs_trace::COMMIT_STALL_BEHIND_PREFIX,
+        );
+    }
 }

@@ -72,20 +72,16 @@ impl BlocksyncThroughputProbe {
     }
 
     /// Pretend to apply `block` by advancing the synthetic frontier when it is
-    /// the next contiguous height. Returns the apply result and, on a synthetic
-    /// commit, the advanced frontier (the driver feeds it back into the reactor
-    /// exactly as a real commit's frontier would be).
-    pub(crate) fn apply_block(
-        &self,
-        block: &block::Block,
-    ) -> (BlockApplyResult, Option<BlockSyncFrontiers>) {
+    /// the next contiguous height. The committer reports the synthetic frontier
+    /// through the same Sequencer seam as the real durable-frontier watcher.
+    pub(crate) fn apply_block(&self, block: &block::Block) -> BlockApplyResult {
         let Some(height) = block.coinbase_height() else {
             let hash = block.hash();
             warn!(
                 ?hash,
                 "Zakura block-sync throughput probe rejected block without coinbase height"
             );
-            return (BlockApplyResult::Rejected, None);
+            return BlockApplyResult::Rejected;
         };
 
         let hash = block.hash();
@@ -102,17 +98,16 @@ impl BlocksyncThroughputProbe {
                 ?expected_height,
                 "Zakura block-sync throughput probe rejected non-contiguous block body"
             );
-            return (BlockApplyResult::Rejected, None);
+            return BlockApplyResult::Rejected;
         }
 
         inner.verified_block_tip = height;
         inner.verified_block_hash = hash;
         inner.completed_blocks = inner.completed_blocks.saturating_add(1);
         inner.completed_bytes = inner.completed_bytes.saturating_add(block_bytes);
-        let frontiers = inner.frontiers();
         inner.maybe_complete();
 
-        (BlockApplyResult::Committed, Some(frontiers))
+        BlockApplyResult::Committed
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BlocksyncThroughputProbeState> {
@@ -121,7 +116,6 @@ impl BlocksyncThroughputProbe {
             .expect("blocksync throughput probe mutex is not poisoned")
     }
 
-    #[cfg(test)]
     pub(crate) fn synthetic_frontier(&self) -> BlockSyncFrontiers {
         self.lock().frontiers()
     }
@@ -183,15 +177,14 @@ mod tests {
             BlocksyncThroughputProbe::new(initial_frontiers, block::Height(2));
 
         // A gap (height 2 before 1) is rejected and leaves the frontier put.
-        let (result, frontier) = probe.apply_block(block2.as_ref());
+        let result = probe.apply_block(block2.as_ref());
         assert_eq!(result, BlockApplyResult::Rejected);
-        assert_eq!(frontier, None);
         assert_eq!(probe.synthetic_frontier(), initial_frontiers);
 
-        let (result, frontier) = probe.apply_block(block1.as_ref());
+        let result = probe.apply_block(block1.as_ref());
         assert_eq!(result, BlockApplyResult::Committed);
         assert_eq!(
-            frontier.expect("committed body has a frontier"),
+            probe.synthetic_frontier(),
             BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(1),
@@ -200,10 +193,10 @@ mod tests {
         );
 
         // Re-applying an already-verified height is non-contiguous, so rejected.
-        let (result, _) = probe.apply_block(block1.as_ref());
+        let result = probe.apply_block(block1.as_ref());
         assert_eq!(result, BlockApplyResult::Rejected);
 
-        let (result, _) = probe.apply_block(block2.as_ref());
+        let result = probe.apply_block(block2.as_ref());
         assert_eq!(result, BlockApplyResult::Committed);
         assert_eq!(
             probe.synthetic_frontier(),

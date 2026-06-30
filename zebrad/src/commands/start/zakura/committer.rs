@@ -14,11 +14,13 @@
 //! submitted, so a serial "await each commit" loop would deadlock.
 //!
 //! The Committer never touches the byte budget — the Sequencer releases bytes on
-//! the durable-tip watch. On a commit failure (consensus-invalid body or local
-//! apply timeout) it raises a [`CommitterReset`] back to the Sequencer (via
-//! [`BlockSyncHandle::report_commit_rejected`]); within one contiguous range only
-//! the lowest failing height is raised (higher siblings are coalesced), and the
-//! Sequencer's per-height apply-epoch guard discards any remaining stale resets.
+//! durable frontier reports. Real commits use the durable-tip watch; throughput
+//! probe commits report their synthetic frontier directly. On a commit failure
+//! (consensus-invalid body or local apply timeout) it raises a [`CommitterReset`]
+//! back to the Sequencer (via [`BlockSyncHandle::report_commit_rejected`]); within
+//! one contiguous range only the lowest failing height is raised (higher siblings
+//! are coalesced), and the Sequencer's per-height apply-epoch guard discards any
+//! remaining stale resets.
 
 use std::{future::Future, sync::Arc, time::Instant};
 
@@ -30,29 +32,37 @@ use tracing::debug;
 use zebra_chain::block;
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, ApplyItem, BlockApplyClass, BlockApplyResult, BlockApplyToken,
-    BlockSyncHandle, CommitRejection, CommitterReset, ZakuraTrace,
+    BlockSyncFrontiers, BlockSyncHandle, CommitRejection, CommitterReset, ZakuraTrace,
 };
 
 use super::{
     block_apply_result_label,
     block_sync_driver::{
         block_apply_class, block_apply_class_label, commit_block_sync_body_with_stall_trace,
+        CommitPipelineProbe,
     },
     emit_commit_state, insert_cs_hash, insert_cs_height, insert_cs_str, insert_cs_u64,
     BlocksyncThroughputProbe,
 };
 
-/// Sink the Committer raises a [`CommitterReset`] through on a commit failure.
+/// Sink the Committer uses to report commit feedback to the Sequencer.
 ///
 /// Production wiring uses [`BlockSyncHandle`]; tests inject a recording double.
-pub trait CommitRejectSink: Send + Sync + 'static {
+pub trait CommitFeedbackSink: Send + Sync + 'static {
     /// Report a commit rejection back to the Sequencer.
     fn report_commit_rejected(&self, reset: CommitterReset);
+
+    /// Report a synthetic durable frontier in throughput-probe mode.
+    fn report_probe_frontier(&self, frontiers: BlockSyncFrontiers);
 }
 
-impl CommitRejectSink for BlockSyncHandle {
+impl CommitFeedbackSink for BlockSyncHandle {
     fn report_commit_rejected(&self, reset: CommitterReset) {
         BlockSyncHandle::report_commit_rejected(self, reset);
+    }
+
+    fn report_probe_frontier(&self, frontiers: BlockSyncFrontiers) {
+        BlockSyncHandle::report_durable_frontier(self, frontiers);
     }
 }
 
@@ -81,8 +91,8 @@ pub struct Committer<BlockVerifier> {
     apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
     /// The consensus verifier (`Request::Commit`).
     block_verifier: BlockVerifier,
-    /// Sink used to report a commit rejection back to the Sequencer.
-    reset_sink: Arc<dyn CommitRejectSink>,
+    /// Sink used to report commit feedback back to the Sequencer.
+    feedback_sink: Arc<dyn CommitFeedbackSink>,
     /// Boundary between the checkpoint and full verifier paths.
     max_checkpoint_height: block::Height,
     /// Fired-but-unresolved commits.
@@ -103,6 +113,10 @@ pub struct Committer<BlockVerifier> {
     /// Monotonic per-commit id used for trace correlation (replaces the deleted
     /// verifier apply token).
     commit_seq: BlockApplyToken,
+    /// Lock-free view of the pipeline (committed marker / submission high-water /
+    /// in-flight) that each fired commit reads at its stall deadline to attribute the
+    /// `commit_stalled` trace row. Diagnostic only — never gates a commit.
+    commit_probe: CommitPipelineProbe,
     trace: ZakuraTrace,
     /// Debug-only synthetic-commit probe; when set, commits are skipped.
     throughput_probe: Option<BlocksyncThroughputProbe>,
@@ -119,14 +133,14 @@ where
     pub fn new_without_probe(
         apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
         block_verifier: BlockVerifier,
-        reset_sink: Arc<dyn CommitRejectSink>,
+        feedback_sink: Arc<dyn CommitFeedbackSink>,
         max_checkpoint_height: block::Height,
         trace: ZakuraTrace,
     ) -> Self {
         Self::new(
             apply_rx,
             block_verifier,
-            reset_sink,
+            feedback_sink,
             max_checkpoint_height,
             trace,
             None,
@@ -136,7 +150,7 @@ where
     pub(crate) fn new(
         apply_rx: mpsc::UnboundedReceiver<ApplyItem>,
         block_verifier: BlockVerifier,
-        reset_sink: Arc<dyn CommitRejectSink>,
+        feedback_sink: Arc<dyn CommitFeedbackSink>,
         max_checkpoint_height: block::Height,
         trace: ZakuraTrace,
         throughput_probe: Option<BlocksyncThroughputProbe>,
@@ -144,13 +158,14 @@ where
         Self {
             apply_rx,
             block_verifier,
-            reset_sink,
+            feedback_sink,
             max_checkpoint_height,
             in_flight: FuturesUnordered::new(),
             committed_marker: block::Height::MIN,
             last_reset_epoch: 0,
             last_reset_height: block::Height::MAX,
             commit_seq: 0,
+            commit_probe: CommitPipelineProbe::default(),
             trace,
             throughput_probe,
         }
@@ -215,14 +230,24 @@ where
             source_peer,
             epoch,
         };
+        self.commit_probe.note_fired(height);
 
         let verifier = self.block_verifier.clone();
         let trace = self.trace.clone();
-        let probe = self.throughput_probe.clone();
+        let commit_probe = self.commit_probe.clone();
+        let throughput_probe = self.throughput_probe.clone();
         self.in_flight.push(
             async move {
                 let result = commit_one(
-                    verifier, block, class, &trace, commit_seq, height, hash, probe,
+                    verifier,
+                    block,
+                    class,
+                    &trace,
+                    &commit_probe,
+                    commit_seq,
+                    height,
+                    hash,
+                    throughput_probe,
                 )
                 .await;
                 CommitOutcome { meta, result }
@@ -231,16 +256,22 @@ where
         );
     }
 
-    /// Handle a resolved commit. Success advances the committed marker; a failure
-    /// raises a [`CommitterReset`] back to the Sequencer (the byte release stays the
-    /// Sequencer's job, driven by the durable-tip watch).
+    /// Handle a resolved commit. Success advances the committed marker; probe-mode
+    /// successes also report the synthetic frontier so the Sequencer can release
+    /// held bytes. Failures raise a [`CommitterReset`] back to the Sequencer.
     fn on_commit_done(&mut self, done: CommitOutcome) {
         let CommitOutcome { meta, result } = done;
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
                 self.committed_marker = self.committed_marker.max(meta.height);
+                self.commit_probe.note_resolved(Some(meta.height));
+                if let Some(probe) = self.throughput_probe.as_ref() {
+                    self.feedback_sink
+                        .report_probe_frontier(probe.synthetic_frontier());
+                }
             }
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {
+                self.commit_probe.note_resolved(None);
                 self.on_commit_error(meta, result);
             }
         }
@@ -284,7 +315,7 @@ where
         } else {
             CommitRejection::TimedOut
         };
-        self.reset_sink.report_commit_rejected(CommitterReset {
+        self.feedback_sink.report_commit_rejected(CommitterReset {
             height: meta.height,
             epoch: meta.epoch,
             source_peer: meta.source_peer,
@@ -308,6 +339,7 @@ async fn commit_one<BlockVerifier>(
     block: Arc<block::Block>,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
+    commit_probe: &CommitPipelineProbe,
     commit_seq: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
@@ -328,13 +360,14 @@ where
     let started = Instant::now();
     let result = match throughput_probe.as_ref() {
         // Throughput-probe mode (debug only): skip consensus verify+commit.
-        Some(probe) => probe.apply_block(block.as_ref()).0,
+        Some(probe) => probe.apply_block(block.as_ref()),
         None => {
             commit_block_sync_body_with_stall_trace(
                 verifier,
                 block,
                 class,
                 trace,
+                commit_probe,
                 commit_seq,
                 height,
                 expected_hash,
@@ -385,21 +418,30 @@ mod tests {
 
     type CommitLog = Arc<StdMutex<Vec<block::Height>>>;
 
-    /// Records the resets the committer raises, standing in for `BlockSyncHandle`.
+    /// Records commit feedback the committer raises, standing in for `BlockSyncHandle`.
     #[derive(Default)]
     struct RecordingSink {
         resets: StdMutex<Vec<CommitterReset>>,
+        probe_frontiers: StdMutex<Vec<BlockSyncFrontiers>>,
     }
 
-    impl CommitRejectSink for RecordingSink {
+    impl CommitFeedbackSink for RecordingSink {
         fn report_commit_rejected(&self, reset: CommitterReset) {
             self.resets.lock().unwrap().push(reset);
+        }
+
+        fn report_probe_frontier(&self, frontiers: BlockSyncFrontiers) {
+            self.probe_frontiers.lock().unwrap().push(frontiers);
         }
     }
 
     impl RecordingSink {
         fn resets(&self) -> Vec<CommitterReset> {
             self.resets.lock().unwrap().clone()
+        }
+
+        fn probe_frontiers(&self) -> Vec<BlockSyncFrontiers> {
+            self.probe_frontiers.lock().unwrap().clone()
         }
     }
 
@@ -581,6 +623,44 @@ mod tests {
             sorted(&log),
             vec![block::Height(1), block::Height(2), block::Height(3)]
         );
+        assert!(sink.resets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn throughput_probe_commit_reports_synthetic_frontier() {
+        let log: CommitLog = Default::default();
+        let sink = Arc::new(RecordingSink::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let initial_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: zebra_chain::parameters::Network::Mainnet.genesis_hash(),
+        };
+        let (probe, _completion_rx) =
+            BlocksyncThroughputProbe::new(initial_frontiers, block::Height(1));
+        let committer = Committer::new(
+            rx,
+            ok_verifier(log.clone()),
+            sink.clone(),
+            block::Height(100),
+            ZakuraTrace::noop(),
+            Some(probe),
+        );
+        let handle = tokio::spawn(committer.run(never()));
+        let block = block_from(&BLOCK_MAINNET_1_BYTES);
+        let expected = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block.hash(),
+        };
+
+        tx.send(apply_item(block, 1)).unwrap();
+        drop(tx);
+
+        let marker = handle.await.unwrap();
+        assert_eq!(marker, block::Height(1));
+        assert!(sorted(&log).is_empty(), "probe mode skips the verifier");
+        assert_eq!(sink.probe_frontiers(), vec![expected]);
         assert!(sink.resets().is_empty());
     }
 
