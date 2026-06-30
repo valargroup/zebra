@@ -244,10 +244,9 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     }
 }
 
-/// Before a dual-stack node hands body sync back to legacy ChainSync, the watchdog must stop the
-/// Zakura sync drivers so the legacy and Zakura commit pipelines never run at once (the deadlock
-/// this fix prevents). Stopping them is a cancel of the shared endpoint shutdown token, which the
-/// header- and block-sync drivers observe.
+/// The point of this test is to lock in the fallback behavior: when Zebra decides to stop using
+/// Zakura sync and fall back to legacy sync, it must signal the running Zakura driver tasks to shut down.
+/// This asserts that the shutdown token is cancelled when the fallback occurs.
 #[test]
 fn fallback_cancels_the_zakura_shutdown_token() {
     let token = CancellationToken::new();
