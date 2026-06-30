@@ -796,6 +796,7 @@ impl PeerRoutine {
                 queued_at,
                 deadline,
                 delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
             });
             self.window
@@ -1162,21 +1163,21 @@ impl PeerRoutine {
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let mut completed = None;
         if let Some(outstanding) = self.window.outstanding.get_mut(index) {
+            outstanding.record_body_bytes(serialized_bytes);
             outstanding.mark_received(height);
             if outstanding.is_complete() {
                 completed = Some(self.window.outstanding.remove(index));
             }
         }
-        if completed.is_some() {
+        if let Some(outstanding) = &completed {
             // Feed the BBR estimators on request completion: the round-trip (RTprop)
             // and the per-ack delivery rate (BtlBw) for this request's block count and
-            // delivered bytes. Under the single-block-per-request invariant the
-            // completing body's `serialized_bytes` is the request's delivered total.
+            // delivered bytes.
             self.window.record_delivery(
                 Instant::now(),
                 request_elapsed,
                 request_range_count,
-                serialized_bytes,
+                outstanding.delivered_bytes,
                 delivery_snapshot,
             );
         }

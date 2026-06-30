@@ -451,6 +451,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
 }
@@ -475,6 +476,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
 }
@@ -807,6 +809,12 @@ fn config_validate_rejects_degenerate_values() {
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
+
+    config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::ZERO,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
 }
 
 #[test]
@@ -3028,8 +3036,27 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
+}
+
+#[test]
+fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
+    let mut budget = ByteBudget::new(THREE_BLOCK_ESTIMATE * 3);
+    let mut outstanding = outstanding_three_block_range(&mut budget);
+
+    for (height, bytes) in [
+        (block::Height(1), 700),
+        (block::Height(2), 800),
+        (block::Height(3), 900),
+    ] {
+        outstanding.record_body_bytes(bytes);
+        outstanding.mark_received(height);
+    }
+
+    assert!(outstanding.is_complete());
+    assert_eq!(outstanding.delivered_bytes, 700 + 800 + 900);
 }
 
 #[test]
@@ -3301,6 +3328,7 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
+        delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     };
     assert_eq!(budget.reserved(), hint);

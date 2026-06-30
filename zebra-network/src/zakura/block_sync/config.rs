@@ -426,6 +426,9 @@ impl ZakuraBlockSyncConfig {
         if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
         }
+        if self.request_timeout < Duration::from_millis(1) {
+            return Err("request_timeout must be at least 1ms");
+        }
         if self.bbr_min_cwnd == 0 {
             return Err("bbr_min_cwnd must be greater than zero");
         }

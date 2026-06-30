@@ -636,6 +636,7 @@ pub(super) struct OutstandingBlockRange {
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
+    pub(super) delivered_bytes: u64,
     pub(super) received: ReceivedBlockTracker,
 }
 
@@ -675,6 +676,10 @@ impl OutstandingBlockRange {
         if let Some(offset) = self.request.offset_for_height(height) {
             self.received.insert_offset(offset);
         }
+    }
+
+    pub(super) fn record_body_bytes(&mut self, bytes: u64) {
+        self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
     }
 
     /// Mark every requested height at or below `tip` as received and return the
