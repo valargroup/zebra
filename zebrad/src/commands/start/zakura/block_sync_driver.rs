@@ -18,7 +18,7 @@ use zebra_chain::block;
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, BlockApplyClass, BlockApplyResult, BlockApplyToken,
     BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle,
-    BlockSyncMisbehavior, ZakuraTrace,
+    BlockSyncMisbehavior, ServingBlockReaderImpl, ZakuraTrace,
 };
 
 use super::{
@@ -30,9 +30,9 @@ use super::{
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
 
 /// Drive the node-side reads the block-sync reactor asks for: needed-blocks
-/// queries and inbound `GetBlocks` serving. The commit *tail* no longer runs here
-/// — bodies are committed by the [`Committer`](super::committer::Committer)
-/// draining the applyQ; this loop is purely the state-read seam.
+/// queries. The commit *tail* no longer runs here — bodies are committed by the
+/// [`Committer`](super::committer::Committer) draining the applyQ; this loop is
+/// purely the missing-body state-read seam.
 pub async fn drive_block_sync_actions<ReadState>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     // Retained so the disconnect capability stays wired into the driver, even
@@ -147,134 +147,125 @@ pub async fn drive_block_sync_actions<ReadState>(
                     }
                 }
             }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_START,
-                    "block_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-                        insert_cs_peer(row, cs_trace::PEER, &peer);
-                        insert_cs_height(row, cs_trace::RANGE_START, start);
-                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                    },
-                );
-                let started = Instant::now();
-                match tokio::time::timeout(
-                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-                    read_state
-                        .clone()
-                        .oneshot(zebra_state::ReadRequest::BlocksByHeightRange { start, count }),
-                )
-                .await
-                {
-                    Ok(Ok(zebra_state::ReadResponse::Blocks(blocks))) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_blocks_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, blocks.len() as u64);
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::REACTOR_EVENT_SENT,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "block_range_response_ready");
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                            },
-                        );
-                        let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        });
-                    }
-                    Ok(Ok(response)) => {
-                        trace_block_range_error(
-                            &trace,
-                            &peer,
-                            start,
-                            count,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected BlocksByHeightRange response");
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Ok(Err(error)) => {
-                        trace_block_range_error(
-                            &trace,
-                            &peer,
-                            start,
-                            count,
-                            &format!("{error}"),
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?error,
-                            "failed to read Zakura Blocks response from state"
-                        );
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Err(_elapsed) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_TIMEOUT,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_blocks_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
-                        warn!(?peer, "timed out reading Zakura block-sync serving range");
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
+        }
+    }
+}
+
+/// Committed-block reader used by per-peer serving routines.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadStateServingBlockReader<ReadState> {
+    read_state: ReadState,
+    trace: ZakuraTrace,
+}
+
+impl<ReadState> ReadStateServingBlockReader<ReadState> {
+    pub(crate) fn new(read_state: ReadState, trace: ZakuraTrace) -> Self {
+        Self { read_state, trace }
+    }
+}
+
+impl<ReadState> ServingBlockReaderImpl for ReadStateServingBlockReader<ReadState>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    fn read_committed_blocks(
+        &self,
+        start: block::Height,
+        count: u32,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<(block::Height, Arc<block::Block>, usize)>, zebra_chain::BoxError>,
+    > {
+        let read_state = self.read_state.clone();
+        let trace = self.trace.clone();
+        Box::pin(async move {
+            emit_commit_state(
+                &trace,
+                cs_trace::STATE_READ_START,
+                "block_sync_serving",
+                |row| {
+                    insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
+                    insert_cs_height(row, cs_trace::RANGE_START, start);
+                    insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                },
+            );
+            let started = Instant::now();
+            match tokio::time::timeout(
+                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                read_state.oneshot(zebra_state::ReadRequest::BlocksByHeightRange { start, count }),
+            )
+            .await
+            {
+                Ok(Ok(zebra_state::ReadResponse::Blocks(blocks))) => {
+                    emit_commit_state(
+                        &trace,
+                        cs_trace::STATE_READ_SUCCESS,
+                        "block_sync_serving",
+                        |row| {
+                            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
+                            insert_cs_height(row, cs_trace::RANGE_START, start);
+                            insert_cs_u64(row, cs_trace::RANGE_COUNT, blocks.len() as u64);
+                            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+                        },
+                    );
+                    Ok(blocks)
+                }
+                Ok(Ok(response)) => {
+                    emit_commit_state(
+                        &trace,
+                        cs_trace::STATE_READ_ERROR,
+                        "block_sync_serving",
+                        |row| {
+                            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
+                            insert_cs_height(row, cs_trace::RANGE_START, start);
+                            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                            insert_cs_str(row, cs_trace::RESULT, "unexpected_response");
+                            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+                        },
+                    );
+                    warn!(?response, "unexpected BlocksByHeightRange response");
+                    Ok(Vec::new())
+                }
+                Ok(Err(error)) => {
+                    emit_commit_state(
+                        &trace,
+                        cs_trace::STATE_READ_ERROR,
+                        "block_sync_serving",
+                        |row| {
+                            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
+                            insert_cs_height(row, cs_trace::RANGE_START, start);
+                            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                            insert_cs_str(row, cs_trace::RESULT, "error");
+                            insert_cs_str(row, cs_trace::REASON, &format!("{error}"));
+                            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+                        },
+                    );
+                    Err(error)
+                }
+                Err(_elapsed) => {
+                    emit_commit_state(
+                        &trace,
+                        cs_trace::STATE_READ_TIMEOUT,
+                        "block_sync_serving",
+                        |row| {
+                            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
+                            insert_cs_height(row, cs_trace::RANGE_START, start);
+                            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+                        },
+                    );
+                    Err("timed out reading Zakura block-sync serving range".into())
                 }
             }
-        }
+        })
     }
 }
 
@@ -881,57 +872,6 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
                 insert_cs_height(row, cs_trace::BEST_HEADER_TIP, *best_header_tip);
             }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_height(row, cs_trace::RANGE_START, *start);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
-            }
-        },
-    );
-}
-
-fn trace_block_range_error(
-    trace: &ZakuraTrace,
-    peer: &zebra_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    count: u32,
-    reason: &str,
-    started: Instant,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_ERROR,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-            insert_cs_str(row, cs_trace::RESULT, "error");
-            insert_cs_str(row, cs_trace::REASON, reason);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-}
-
-fn trace_block_range_finished(
-    trace: &ZakuraTrace,
-    peer: &zebra_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    requested_count: u32,
-    returned_count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "block_range_response_finished");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(returned_count));
-            insert_cs_u64(row, "requested_count", u64::from(requested_count));
         },
     );
 }

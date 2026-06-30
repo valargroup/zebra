@@ -1,7 +1,7 @@
 use super::{config::*, request::*, work_queue::WorkQueue, *};
 use crate::zakura::{
     chain_frontier_from_parts, Frontier, FrontierUpdate, ServicePeerDirection, ServicePeerSnapshot,
-    ZakuraBlockSyncCandidateState,
+    ServingBlockReader, ZakuraBlockSyncCandidateState,
 };
 
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
@@ -51,6 +51,8 @@ pub struct BlockSyncStartup {
     pub state_queries_enabled: bool,
     /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
+    /// Optional committed-block reader used by per-peer routines to serve inbound `GetBlocks`.
+    pub serving_reader: Option<ServingBlockReader>,
 }
 
 impl BlockSyncStartup {
@@ -70,6 +72,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            serving_reader: None,
         }
     }
 
@@ -89,7 +92,14 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            serving_reader: None,
         }
+    }
+
+    /// Attach the committed-block reader used for serving inbound `GetBlocks`.
+    pub fn with_serving_reader(mut self, serving_reader: ServingBlockReader) -> Self {
+        self.serving_reader = Some(serving_reader);
+        self
     }
 
     /// Build a latest-value frontier update stream from legacy startup pieces.
@@ -121,6 +131,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
+            serving_reader: None,
         }
     }
 }
@@ -167,6 +178,8 @@ pub(super) struct RoutineWiring {
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
+    pub(super) serving_reader: Arc<StdMutex<Option<ServingBlockReader>>>,
+    pub(super) serving_permits: Arc<tokio::sync::Semaphore>,
     pub(super) trace: ZakuraTrace,
 }
 
@@ -250,6 +263,16 @@ impl BlockSyncHandle {
             let _ = wiring
                 .sequencer_control
                 .send(super::sequencer_task::SequencerControlInput::CommitRejected(reset));
+        }
+    }
+
+    /// Install the committed-block reader used by future per-peer serving routines.
+    pub fn install_serving_reader(&self, reader: ServingBlockReader) {
+        if let Some(wiring) = self.routine_wiring.as_ref() {
+            *wiring
+                .serving_reader
+                .lock()
+                .expect("serving reader slot mutex is never poisoned") = Some(reader);
         }
     }
 
@@ -1119,8 +1142,6 @@ pub(super) struct PeerBlockState {
     /// *reply* half moved to the routine's `status_reply_meter`. This half stays
     /// reactor-side because the reactor owns serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    pub(super) served_blocks_inflight: u32,
-    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
 }
 
 impl PeerBlockState {
@@ -1129,41 +1150,7 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_blocks_inflight: 0,
-            served_block_requests: VecDeque::new(),
         }
-    }
-
-    pub(super) fn try_start_serving_blocks(
-        &mut self,
-        local_inflight_cap: u32,
-        start_height: block::Height,
-    ) -> bool {
-        if self.served_blocks_inflight >= local_inflight_cap {
-            return false;
-        }
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
-        self.served_block_requests
-            .push_back((start_height, Instant::now()));
-        true
-    }
-
-    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
-        self.served_block_requests
-            .iter()
-            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
-    }
-
-    pub(super) fn finish_serving_blocks(
-        &mut self,
-        start_height: block::Height,
-    ) -> Option<Duration> {
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
-        self.served_block_requests
-            .iter()
-            .position(|(start, _)| *start == start_height)
-            .and_then(|index| self.served_block_requests.remove(index))
-            .map(|(_, started)| started.elapsed())
     }
 }
 

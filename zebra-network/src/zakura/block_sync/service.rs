@@ -493,6 +493,8 @@ impl Service for BlockSyncService {
                             wiring.actions,
                             wiring.routine_to_reactor,
                             wiring.view,
+                            wiring.serving_reader,
+                            wiring.serving_permits,
                             run_cancel,
                             wiring.trace,
                         );

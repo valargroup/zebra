@@ -40,28 +40,6 @@ pub enum BlockSyncEvent {
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned the current body-missing, header-known heights with committed hashes.
     NeededBlocks(Vec<BlockSyncBlockMeta>),
-    /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
-    BlockRangeResponseFinished {
-        /// Peer whose served-response slot can be released.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Number of blocks read from state and sent in the response.
-        returned_count: u32,
-    },
-    /// State returned committed bodies requested by a peer and the reactor should send them.
-    BlockRangeResponseReady {
-        /// Peer whose inbound request is being served.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Bounded committed blocks returned by state.
-        blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
-    },
 }
 
 /// Result of applying a block-sync body through the verifier driver.
@@ -102,15 +80,6 @@ pub enum BlockSyncAction {
         /// Current best header target.
         best_header_tip: block::Height,
     },
-    /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
-    QueryBlocksByHeightRange {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First height.
-        start: block::Height,
-        /// Maximum count.
-        count: u32,
-    },
     /// Report peer misbehavior to the supervisor.
     Misbehavior {
         /// Misbehaving peer.
@@ -149,7 +118,7 @@ pub enum BlockSyncMisbehavior {
 ///
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its
 /// own frames and runs the download logic locally; it forwards only the concerns
-/// that need reactor-global state (serving, status advertisement, the producer,
+/// that need reactor-global state (status advertisement, the producer,
 /// misbehavior aggregation) over this channel. The sender is `try_send`/bounded
 /// so a busy reactor never backpressures a routine's decode loop into stalling
 /// its transport (the only blocking routine send is the Sequencer `AcceptBody`).
@@ -164,16 +133,6 @@ pub(super) enum RoutineToReactor {
         peer: ZakuraPeerId,
         /// Whether the rate meter allows sending a `Status` reply now.
         send_reply: bool,
-    },
-    /// A peer requested OUR committed blocks (serving). The reactor runs the
-    /// state query + driver path and sends via the peer's session clone.
-    ServeGetBlocks {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        count: u32,
     },
     /// A routine drained its pending work; the producer should re-query (it
     /// self-gates on low-water, so the ping is idempotent/cheap).

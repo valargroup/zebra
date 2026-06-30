@@ -89,7 +89,7 @@ use tracing_futures::Instrument;
 
 use zebra_chain::block::{self, genesis::regtest_genesis_block};
 use zebra_consensus::router::BackgroundTaskHandles;
-use zebra_network::types::PeerServices;
+use zebra_network::{types::PeerServices, zakura::ServingBlockReader};
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use zakura::{
@@ -97,7 +97,7 @@ use zakura::{
     drive_block_sync_durable_frontier, drive_zakura_header_sync_actions,
     mirror_zakura_full_block_commits, query_block_sync_frontiers,
     zakura_header_sync_driver_startup, BlocksyncThroughputProbe, BlocksyncThroughputSummary,
-    ZakuraHeaderSyncDriverHandles,
+    ReadStateServingBlockReader, ZakuraHeaderSyncDriverHandles,
 };
 
 use crate::{
@@ -688,7 +688,14 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
-                    // The state-read seam (needed-blocks queries + GetBlocks serving).
+                    block_sync.install_serving_reader(ServingBlockReader::new(Arc::new(
+                        ReadStateServingBlockReader::new(
+                            read_only_state_service.clone(),
+                            trace.clone(),
+                        ),
+                    )));
+
+                    // The state-read seam for needed-blocks queries.
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
                             block_actions,

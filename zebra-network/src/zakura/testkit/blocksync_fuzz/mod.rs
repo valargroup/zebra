@@ -229,8 +229,7 @@ fn spawn_action_driver(
                         break;
                     }
                 }
-                BlockSyncAction::QueryBlocksByHeightRange { .. }
-                | BlockSyncAction::Misbehavior { .. } => {}
+                BlockSyncAction::Misbehavior { .. } => {}
             }
         }
     })

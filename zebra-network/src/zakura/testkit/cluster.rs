@@ -1106,16 +1106,6 @@ mod tests {
                                     .collect();
                                 let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                             }
-                            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                                let _ = handle
-                                    .send(BlockSyncEvent::BlockRangeResponseFinished {
-                                        peer,
-                                        start_height: start,
-                                        requested_count: count,
-                                        returned_count: 0,
-                                    })
-                                    .await;
-                            }
                             BlockSyncAction::Misbehavior { .. } => {}
                         }
                     }

@@ -138,6 +138,10 @@ pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
+/// Default global concurrent committed-block reads allowed for serving inbound peers.
+pub const DEFAULT_BS_SERVING_READ_CONCURRENCY: usize = 16;
+/// Default per-peer pending `GetBlocks` requests kept by the serving sub-task.
+pub const DEFAULT_BS_SERVING_QUEUE_DEPTH: usize = 256;
 
 /// Unit the per-peer BBR cwnd budgets in-flight work against. The controller itself is
 /// unit-agnostic (it sizes a cwnd from measured delivery rate × RTprop); the unit only
@@ -307,6 +311,10 @@ pub struct ZakuraBlockSyncConfig {
     /// to the peer's advertised hard cap. Lets the floor be fetched even when every
     /// servable peer is saturated at its cwnd; `0` disables the bypass.
     pub floor_bypass_slots: u32,
+    /// Maximum committed-block serving reads running concurrently across all peers.
+    pub serving_read_concurrency: usize,
+    /// Per-peer pending inbound `GetBlocks` requests queued for local serving.
+    pub serving_queue_depth: usize,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
 }
@@ -351,6 +359,8 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
+            serving_read_concurrency: DEFAULT_BS_SERVING_READ_CONCURRENCY,
+            serving_queue_depth: DEFAULT_BS_SERVING_QUEUE_DEPTH,
             peer_limits: ServicePeerLimits::default(),
         }
     }
@@ -465,6 +475,12 @@ impl ZakuraBlockSyncConfig {
         }
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
+        }
+        if self.serving_read_concurrency == 0 {
+            return Err("serving_read_concurrency must be greater than zero");
+        }
+        if self.serving_queue_depth == 0 {
+            return Err("serving_queue_depth must be greater than zero");
         }
         Ok(())
     }

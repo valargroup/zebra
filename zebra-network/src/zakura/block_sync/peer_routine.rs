@@ -24,9 +24,13 @@
 //! [`PeerRegistry`]) and that inbound now arrives as a decoded frame from this
 //! task's own `FramedRecv` rather than a `PeerInput` channel.
 
-use std::collections::BTreeMap;
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BinaryHeap},
+    sync::Mutex as StdMutex,
+};
 
-use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
+use tokio::sync::{futures::Notified, mpsc, oneshot, watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
@@ -34,18 +38,19 @@ use super::{
     admission::{
         admission_decision, floor_rescue_high, request_deadline, AdmissionSnapshot, RequestPriority,
     },
+    config::inbound_get_blocks_count_limit,
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
-        block_sync_message_label, bs_insert_height, bs_insert_peer, bs_insert_str, bs_insert_u64,
-        tolerated_bytes,
+        block_sync_message_label, bs_insert_duration_ms, bs_insert_height, bs_insert_peer,
+        bs_insert_str, bs_insert_u64, tolerated_bytes, trace_block_sync_message_fields,
     },
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
     state::{
-        next_height, DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
-        ThroughputMeter,
+        height_after_count, next_height, DownloadWindow, LivenessOutcome, OutstandingBlockRange,
+        ReceivedBlockTracker, ThroughputMeter,
     },
     work_queue::{WorkItem, WorkQueue},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
@@ -53,7 +58,7 @@ use super::{
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
-    Admit, FramedRecv, OrderedSendError, SinkReject,
+    Admit, FramedRecv, OrderedSendError, ServingBlockReader, SinkReject,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
@@ -169,6 +174,13 @@ pub(super) struct PeerRoutine {
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
     /// cannot backpressure this decode loop into stalling the transport.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+    /// Bounded per-peer queue feeding this routine's serving sub-task.
+    serving_tx: Option<mpsc::Sender<ServingRequest>>,
+    serving_rx: Option<mpsc::Receiver<ServingRequest>>,
+    /// Shared committed-block reader slot used by this routine's serving sub-task.
+    serving_reader: Arc<StdMutex<Option<ServingBlockReader>>>,
+    /// Shared cap on concurrent committed-block reads across all serving sub-tasks.
+    serving_permits: Arc<Semaphore>,
     view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
@@ -202,6 +214,8 @@ impl PeerRoutine {
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         view: watch::Receiver<SequencerView>,
+        serving_reader: Arc<StdMutex<Option<ServingBlockReader>>>,
+        serving_permits: Arc<Semaphore>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
     ) -> Self {
@@ -219,6 +233,8 @@ impl PeerRoutine {
         status_reply_meter.mark_taken(Instant::now());
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
+        let depth = config.serving_queue_depth.max(1);
+        let (serving_tx, serving_rx) = mpsc::channel(depth);
         PeerRoutine {
             peer,
             session,
@@ -243,6 +259,10 @@ impl PeerRoutine {
             sequencer_control,
             actions,
             routine_to_reactor,
+            serving_tx: Some(serving_tx),
+            serving_rx: Some(serving_rx),
+            serving_reader,
+            serving_permits,
             view,
             last_reset_epoch,
             cancel,
@@ -254,6 +274,7 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down, matching the previous `run_peer`.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        let serving_task = self.spawn_serving_task();
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -289,7 +310,12 @@ impl PeerRoutine {
 
             tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return Ok(()),
+                _ = self.cancel.cancelled() => {
+                    if let Some(task) = serving_task {
+                        task.abort();
+                    }
+                    return Ok(());
+                }
                 frame = self.recv.recv(), if outbound_queue_has_capacity => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
@@ -300,14 +326,24 @@ impl PeerRoutine {
                         Some(frame) => self.handle_frame(&mut guard, frame).await?,
                         // Stream closed (peer gone): exit cleanly. `Drop` returns
                         // unreceived outstanding heights and releases their budget.
-                        None => return Ok(()),
+                        None => {
+                            if let Some(task) = serving_task {
+                                task.abort();
+                            }
+                            return Ok(());
+                        }
                     }
                 }
                 changed = self.view.changed() => {
                     match changed {
                         Ok(()) => self.on_view_changed(),
                         // The Sequencer task ended (shutdown); the routine follows.
-                        Err(_) => return Ok(()),
+                        Err(_) => {
+                            if let Some(task) = serving_task {
+                                task.abort();
+                            }
+                            return Ok(());
+                        }
                     }
                 }
                 _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
@@ -320,6 +356,22 @@ impl PeerRoutine {
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
         }
+    }
+
+    fn spawn_serving_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let rx = self.serving_rx.take()?;
+        let task = ServingTask {
+            peer: self.peer.clone(),
+            session: self.session.clone(),
+            config: self.config.clone(),
+            reader: self.serving_reader.clone(),
+            permits: self.serving_permits.clone(),
+            view: self.view.clone(),
+            rx,
+            cancel: self.cancel.clone(),
+            trace: self.trace.clone(),
+        };
+        Some(tokio::spawn(task.run()))
     }
 
     /// Admit, decode, and dispatch one inbound frame in this task. `Block` /
@@ -407,15 +459,38 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
-                // Serving is reactor-owned (state query + driver). Forward the
-                // request; the reactor serves via the session clone it holds.
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
+                if !self.received_status {
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::Misbehavior {
+                            peer: self.peer.clone(),
+                            reason: BlockSyncMisbehavior::GetBlocksSpam,
+                        });
+                    return Ok(());
+                }
+                if count == 0 {
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::Misbehavior {
+                            peer: self.peer.clone(),
+                            reason: BlockSyncMisbehavior::GetBlocksTooLong,
+                        });
+                    return Ok(());
+                }
+                let Some(serving_tx) = self.serving_tx.as_ref() else {
+                    return Ok(());
+                };
+                if serving_tx
+                    .try_send(ServingRequest {
                         start_height,
                         count,
-                    });
+                        queued_at: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    // The serving queue is a bounded per-peer admission control;
+                    // a full queue drops the request and relies on the peer retrying.
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -2007,6 +2082,395 @@ fn outstanding_unreceived_through(
         .map(|expected| expected.height)
 }
 
+#[derive(Clone, Debug)]
+struct ServingRequest {
+    start_height: block::Height,
+    count: u32,
+    queued_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedServingRequest {
+    sequence: u64,
+    request: ServingRequest,
+}
+
+impl PartialEq for QueuedServingRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.request.start_height == other.request.start_height && self.sequence == other.sequence
+    }
+}
+
+impl Eq for QueuedServingRequest {}
+
+impl PartialOrd for QueuedServingRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedServingRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.request
+            .start_height
+            .cmp(&other.request.start_height)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+struct ServingTask {
+    peer: ZakuraPeerId,
+    session: BlockSyncPeerSession,
+    config: ZakuraBlockSyncConfig,
+    reader: Arc<StdMutex<Option<ServingBlockReader>>>,
+    permits: Arc<Semaphore>,
+    view: watch::Receiver<SequencerView>,
+    rx: mpsc::Receiver<ServingRequest>,
+    cancel: CancellationToken,
+    trace: ZakuraTrace,
+}
+
+impl ServingTask {
+    async fn run(mut self) {
+        let mut pending = BinaryHeap::new();
+        let mut next_sequence = 0u64;
+
+        loop {
+            if pending.is_empty() {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => return,
+                    request = self.rx.recv() => {
+                        let Some(request) = request else {
+                            return;
+                        };
+                        push_serving_request(&mut pending, &mut next_sequence, request);
+                    }
+                }
+            }
+
+            while let Ok(request) = self.rx.try_recv() {
+                push_serving_request(&mut pending, &mut next_sequence, request);
+            }
+
+            let Some(Reverse(queued)) = pending.pop() else {
+                continue;
+            };
+            self.serve(queued.request).await;
+        }
+    }
+
+    async fn serve(&self, request: ServingRequest) {
+        let requested_count = clamp_serving_count(
+            &self.config,
+            self.view.borrow().verified_tip,
+            request.start_height,
+            request.count,
+        );
+        if requested_count == 0 {
+            self.send_range_unavailable(
+                request.start_height,
+                request
+                    .count
+                    .min(inbound_get_blocks_count_limit(&self.config)),
+            );
+            self.trace_range_response_sent(ServingRangeTrace {
+                start_height: request.start_height,
+                requested_count,
+                sent_count: 0,
+                sent_bytes: 0,
+                reason: "unavailable",
+                prepare_elapsed: Some(request.queued_at.elapsed()),
+                send_elapsed: Duration::ZERO,
+                total_elapsed: Some(request.queued_at.elapsed()),
+            });
+            return;
+        }
+
+        let Some(reader) = self
+            .reader
+            .lock()
+            .expect("serving reader slot mutex is never poisoned")
+            .clone()
+        else {
+            self.send_range_unavailable(request.start_height, requested_count);
+            self.trace_range_response_sent(ServingRangeTrace {
+                start_height: request.start_height,
+                requested_count,
+                sent_count: 0,
+                sent_bytes: 0,
+                reason: "reader_unavailable",
+                prepare_elapsed: Some(request.queued_at.elapsed()),
+                send_elapsed: Duration::ZERO,
+                total_elapsed: Some(request.queued_at.elapsed()),
+            });
+            return;
+        };
+
+        let permit = tokio::select! {
+            _ = self.cancel.cancelled() => return,
+            permit = self.permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+        };
+
+        let read_started = Instant::now();
+        let blocks = tokio::select! {
+            _ = self.cancel.cancelled() => return,
+            blocks = reader.read_committed_blocks(request.start_height, requested_count) => {
+                blocks
+            }
+        };
+        drop(permit);
+
+        let blocks = match blocks {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?error,
+                    "failed to read Zakura Blocks response from state"
+                );
+                self.send_range_unavailable(request.start_height, requested_count);
+                self.trace_range_response_sent(ServingRangeTrace {
+                    start_height: request.start_height,
+                    requested_count,
+                    sent_count: 0,
+                    sent_bytes: 0,
+                    reason: "read_error",
+                    prepare_elapsed: Some(read_started.elapsed()),
+                    send_elapsed: Duration::ZERO,
+                    total_elapsed: Some(request.queued_at.elapsed()),
+                });
+                return;
+            }
+        };
+
+        let prepare_elapsed = request.queued_at.elapsed();
+        let send_started = Instant::now();
+        let max_response_bytes = u64::from(self.config.advertised_max_response_bytes());
+        let mut sent_blocks = 0u32;
+        let mut sent_bytes = 0u64;
+        let mut reason = "complete";
+
+        for (height, block, size) in blocks {
+            let Ok(size) = u64::try_from(size) else {
+                reason = "size_overflow";
+                break;
+            };
+            let Some(next_bytes) = sent_bytes.checked_add(size) else {
+                reason = "byte_overflow";
+                break;
+            };
+            if next_bytes > max_response_bytes {
+                reason = "byte_cap";
+                break;
+            }
+            if height_after_count(request.start_height, sent_blocks) != Some(height) {
+                reason = "non_contiguous";
+                break;
+            }
+
+            if !self.send_block(block) {
+                reason = "send_failed";
+                break;
+            }
+            sent_blocks = sent_blocks.saturating_add(1);
+            sent_bytes = next_bytes;
+        }
+
+        if sent_blocks == 0 {
+            self.send_range_unavailable(request.start_height, requested_count);
+        } else {
+            self.send_blocks_done(request.start_height, sent_blocks);
+        }
+        self.trace_range_response_sent(ServingRangeTrace {
+            start_height: request.start_height,
+            requested_count,
+            sent_count: sent_blocks,
+            sent_bytes,
+            reason,
+            prepare_elapsed: Some(prepare_elapsed),
+            send_elapsed: send_started.elapsed(),
+            total_elapsed: Some(request.queued_at.elapsed()),
+        });
+    }
+
+    fn send_block(&self, block: Arc<block::Block>) -> bool {
+        let msg = BlockSyncMessage::Block(block.clone());
+        let started = Instant::now();
+        match self.session.try_send_block(block) {
+            Ok(()) => {
+                metrics::counter!("sync.block.body.served").increment(1);
+                self.trace_message_sent(&msg, "queued", started.elapsed());
+                true
+            }
+            Err(OrderedSendError::Full) => {
+                metrics::counter!("sync.block.body.serve_queue_full").increment(1);
+                tracing::debug!(peer = ?self.peer, "Zakura block-sync Block queue is full");
+                self.trace_message_sent(&msg, "full", started.elapsed());
+                false
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?error,
+                    "failed to queue Zakura block-sync Block"
+                );
+                self.trace_message_sent(&msg, "error", started.elapsed());
+                self.session.cancel_token().cancel();
+                false
+            }
+        }
+    }
+
+    fn send_blocks_done(&self, start_height: block::Height, returned: u32) {
+        if returned == 0 {
+            return;
+        }
+        let msg = BlockSyncMessage::BlocksDone {
+            start_height,
+            returned,
+        };
+        let started = Instant::now();
+        match self.session.try_send_blocks_done(start_height, returned) {
+            Ok(()) => self.trace_message_sent(&msg, "queued", started.elapsed()),
+            Err(OrderedSendError::Full) => {
+                metrics::counter!("sync.block.done.serve_queue_full").increment(1);
+                tracing::debug!(peer = ?self.peer, "Zakura block-sync BlocksDone queue is full");
+                self.trace_message_sent(&msg, "full", started.elapsed());
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?error,
+                    "failed to queue Zakura block-sync BlocksDone"
+                );
+                self.trace_message_sent(&msg, "error", started.elapsed());
+                self.session.cancel_token().cancel();
+            }
+        }
+    }
+
+    fn send_range_unavailable(&self, start_height: block::Height, count: u32) {
+        let count = count.max(1);
+        let msg = BlockSyncMessage::RangeUnavailable {
+            start_height,
+            count,
+        };
+        let started = Instant::now();
+        match self.session.try_send_range_unavailable(start_height, count) {
+            Ok(()) => self.trace_message_sent(&msg, "queued", started.elapsed()),
+            Err(OrderedSendError::Full) => {
+                metrics::counter!("sync.block.unavailable.serve_queue_full").increment(1);
+                tracing::debug!(peer = ?self.peer, "Zakura block-sync RangeUnavailable queue is full");
+                self.trace_message_sent(&msg, "full", started.elapsed());
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?error,
+                    "failed to queue Zakura block-sync RangeUnavailable"
+                );
+                self.trace_message_sent(&msg, "error", started.elapsed());
+                self.session.cancel_token().cancel();
+            }
+        }
+    }
+
+    fn emit(
+        &self,
+        event: &'static str,
+        build: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        if !self.trace.is_enabled() {
+            return;
+        }
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(event.to_string()),
+            );
+            build(row);
+        });
+    }
+
+    fn trace_message_sent(&self, msg: &BlockSyncMessage, result: &'static str, elapsed: Duration) {
+        self.emit(bs_trace::BLOCK_MESSAGE_SENT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            bs_insert_str(row, bs_trace::KIND, block_sync_message_label(msg));
+            bs_insert_str(row, bs_trace::RESULT, result);
+            bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, elapsed);
+            trace_block_sync_message_fields(row, msg);
+        });
+    }
+
+    fn trace_range_response_sent(&self, response: ServingRangeTrace) {
+        self.emit(bs_trace::BLOCK_RANGE_RESPONSE_SENT, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            bs_insert_height(row, bs_trace::RANGE_START, response.start_height);
+            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(response.sent_count));
+            bs_insert_u64(
+                row,
+                bs_trace::EXPECTED_COUNT,
+                u64::from(response.requested_count),
+            );
+            bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, response.sent_bytes);
+            bs_insert_str(row, bs_trace::REASON, response.reason);
+            if let Some(prepare_elapsed) = response.prepare_elapsed {
+                bs_insert_duration_ms(row, bs_trace::PREPARE_ELAPSED_MS, prepare_elapsed);
+            }
+            bs_insert_duration_ms(row, bs_trace::SEND_ELAPSED_MS, response.send_elapsed);
+            if let Some(total_elapsed) = response.total_elapsed {
+                bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, total_elapsed);
+            }
+        });
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ServingRangeTrace {
+    start_height: block::Height,
+    requested_count: u32,
+    sent_count: u32,
+    sent_bytes: u64,
+    reason: &'static str,
+    prepare_elapsed: Option<Duration>,
+    send_elapsed: Duration,
+    total_elapsed: Option<Duration>,
+}
+
+fn push_serving_request(
+    pending: &mut BinaryHeap<Reverse<QueuedServingRequest>>,
+    next_sequence: &mut u64,
+    request: ServingRequest,
+) {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.saturating_add(1);
+    pending.push(Reverse(QueuedServingRequest { sequence, request }));
+}
+
+fn clamp_serving_count(
+    config: &ZakuraBlockSyncConfig,
+    verified_tip: block::Height,
+    start_height: block::Height,
+    count: u32,
+) -> u32 {
+    if start_height > verified_tip {
+        return 0;
+    }
+
+    let available = verified_tip
+        .0
+        .checked_sub(start_height.0)
+        .and_then(|diff| diff.checked_add(1))
+        .unwrap_or(0);
+
+    count
+        .min(inbound_get_blocks_count_limit(config))
+        .min(available)
+}
+
 impl Drop for PeerRoutine {
     /// disconnect-mid-fetch correctness: on every exit path
     /// (cancel/panic/normal) return this routine's unreceived outstanding heights
@@ -2043,7 +2507,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, watch, Semaphore};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use zebra_chain::block;
@@ -2123,6 +2587,8 @@ mod tests {
             actions_tx,
             routine_to_reactor_tx,
             view_rx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Semaphore::new(1)),
             cancel,
             ZakuraTrace::noop(),
         );

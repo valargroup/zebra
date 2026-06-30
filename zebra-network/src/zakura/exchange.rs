@@ -244,6 +244,12 @@ pub trait BlockSyncStatePortImpl: Send + Sync + 'static {
         block: Arc<block::Block>,
     ) -> BoxFuture<'static, BlockBodySubmit>;
 
+    /// Publish body-sync progress that did not come from a direct submit path.
+    fn publish_body_progress(&self, update: FrontierUpdate) -> BoxFuture<'static, ()>;
+}
+
+/// State read seam used by per-peer block-sync routines to serve inbound `GetBlocks`.
+pub trait ServingBlockReaderImpl: Send + Sync + 'static {
     /// Read committed blocks for serving stream-6 peers.
     fn read_committed_blocks(
         &self,
@@ -253,9 +259,6 @@ pub trait BlockSyncStatePortImpl: Send + Sync + 'static {
         'static,
         Result<Vec<(block::Height, Arc<block::Block>, usize)>, zebra_chain::BoxError>,
     >;
-
-    /// Publish body-sync progress that did not come from a direct submit path.
-    fn publish_body_progress(&self, update: FrontierUpdate) -> BoxFuture<'static, ()>;
 }
 
 /// Cloneable header-sync state port.
@@ -351,6 +354,30 @@ impl BlockSyncStatePort {
         self.inner.submit_block_body(token, block)
     }
 
+    /// Publish body-sync progress that did not come from a direct submit path.
+    pub fn publish_body_progress(&self, update: FrontierUpdate) -> BoxFuture<'static, ()> {
+        self.inner.publish_body_progress(update)
+    }
+}
+
+impl std::fmt::Debug for BlockSyncStatePort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BlockSyncStatePort")
+    }
+}
+
+/// Cloneable committed-block reader for stream-6 serving.
+#[derive(Clone)]
+pub struct ServingBlockReader {
+    inner: Arc<dyn ServingBlockReaderImpl>,
+}
+
+impl ServingBlockReader {
+    /// Wrap an implementation in a cloneable serving reader.
+    pub fn new(inner: Arc<dyn ServingBlockReaderImpl>) -> Self {
+        Self { inner }
+    }
+
     /// Read committed blocks for serving stream-6 peers.
     pub fn read_committed_blocks(
         &self,
@@ -362,16 +389,11 @@ impl BlockSyncStatePort {
     > {
         self.inner.read_committed_blocks(start, count)
     }
-
-    /// Publish body-sync progress that did not come from a direct submit path.
-    pub fn publish_body_progress(&self, update: FrontierUpdate) -> BoxFuture<'static, ()> {
-        self.inner.publish_body_progress(update)
-    }
 }
 
-impl std::fmt::Debug for BlockSyncStatePort {
+impl std::fmt::Debug for ServingBlockReader {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BlockSyncStatePort")
+        formatter.write_str("ServingBlockReader")
     }
 }
 

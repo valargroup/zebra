@@ -23,8 +23,8 @@ use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
     ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
-    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraSyncExchange,
+    ServicePeerSnapshot, ServiceRegistry, ServingBlockReader, ServingBlockReaderImpl, StreamMode,
+    ZakuraBlockSyncCandidateState, ZakuraSyncExchange,
 };
 use zebra_chain::{
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -109,6 +109,57 @@ fn block_size(block: &block::Block) -> u32 {
             .len(),
     )
     .expect("test block size fits u32")
+}
+
+#[derive(Clone, Debug)]
+struct TestServingBlockReader {
+    blocks: Arc<HashMap<block::Height, (Arc<block::Block>, usize)>>,
+}
+
+impl TestServingBlockReader {
+    fn from_blocks(blocks: &[Arc<block::Block>]) -> ServingBlockReader {
+        let blocks = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.coinbase_height().expect("test block has height"),
+                    (
+                        block.clone(),
+                        usize::try_from(block_size(block)).expect("block size fits usize"),
+                    ),
+                )
+            })
+            .collect();
+        ServingBlockReader::new(Arc::new(Self {
+            blocks: Arc::new(blocks),
+        }))
+    }
+}
+
+impl ServingBlockReaderImpl for TestServingBlockReader {
+    fn read_committed_blocks(
+        &self,
+        start: block::Height,
+        count: u32,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<(block::Height, Arc<block::Block>, usize)>, zebra_chain::BoxError>,
+    > {
+        let blocks = self.blocks.clone();
+        Box::pin(async move {
+            let mut response = Vec::new();
+            for offset in 0..count {
+                let Some(height) = height_after_count(start, offset) else {
+                    break;
+                };
+                let Some((block, size)) = blocks.get(&height) else {
+                    break;
+                };
+                response.push((height, block.clone(), *size));
+            }
+            Ok(response)
+        })
+    }
 }
 
 fn status() -> BlockSyncStatus {
@@ -3546,7 +3597,6 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         match next_action(&mut actions).await {
             BlockSyncAction::Misbehavior { peer: got, reason } => break (got, reason),
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before malformed-message report: {action:?}"),
         }
     };
     assert_eq!(
@@ -6876,7 +6926,6 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
                             .expect("post-reset needed metadata queues");
                     }
                     BlockSyncAction::Misbehavior { .. } => {}
-                    action => panic!("unexpected action before fast-forward re-fetch: {action:?}"),
                 }
             }
         }
@@ -6975,7 +7024,6 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
                             .expect("new fork metadata queues");
                     }
                     BlockSyncAction::Misbehavior { .. } => {}
-                    action => panic!("unexpected action before new fork re-fetch: {action:?}"),
                 }
             }
         }
@@ -6998,7 +7046,6 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before stale body rejection: {action:?}"),
         }
     }
 
@@ -7414,7 +7461,6 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before invalid-block report: {action:?}"),
         }
     }
 
@@ -7551,8 +7597,9 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    handle.install_serving_reader(TestServingBlockReader::from_blocks(&blocks));
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         60,
@@ -7574,40 +7621,6 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
         )
         .await
         .expect("GetBlocks frame queues");
-
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 2);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before block range query: {action:?}"),
-        }
-    }
-
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 2,
-            blocks: vec![
-                (
-                    block::Height(1),
-                    blocks[0].clone(),
-                    usize::try_from(block1_size).expect("block size fits usize"),
-                ),
-                (
-                    block::Height(2),
-                    blocks[1].clone(),
-                    usize::try_from(block_size(&blocks[1])).expect("block size fits usize"),
-                ),
-            ],
-        })
-        .await
-        .expect("served block response queues");
 
     assert_eq!(
         wait_for_outbound_block(&mut outbound_rx).await.hash(),
@@ -8712,9 +8725,9 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
 }
 
 #[tokio::test]
-async fn reactor_backpressures_serving_slots_without_scoring_peer() {
+async fn routine_serving_queue_serves_repeated_requests_without_scoring_peer() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_requests: 1,
+        serving_queue_depth: 2,
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -8731,8 +8744,9 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    handle.install_serving_reader(TestServingBlockReader::from_blocks(&blocks));
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         63,
@@ -8757,27 +8771,24 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             .await
             .expect("GetBlocks frame queues");
     }
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryBlocksByHeightRange { .. }
-    ) {}
 
     assert_eq!(
-        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
+        wait_for_outbound_block(&mut outbound_rx).await.hash(),
+        blocks[0].hash(),
+    );
+    assert_eq!(
+        wait_for_outbound_blocks_done(&mut outbound_rx).await,
         (block::Height(1), 1),
-        "serving-slot saturation should backpressure the requester, not score it as spam",
+    );
+    assert_eq!(
+        wait_for_outbound_block(&mut outbound_rx).await.hash(),
+        blocks[0].hash(),
+    );
+    assert_eq!(
+        wait_for_outbound_blocks_done(&mut outbound_rx).await,
+        (block::Height(1), 1),
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 1,
-            returned_count: 1,
-        })
-        .await
-        .expect("serving slot release queues");
 
     reactor_task.abort();
 }
@@ -8813,7 +8824,8 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    handle.install_serving_reader(TestServingBlockReader::from_blocks(&blocks));
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // A two-slot outbound queue, wired by hand so we keep the peer's
@@ -8849,8 +8861,8 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .await
         .expect("status frame queues");
 
-    // The peer asks for the whole committed range; answer it so the reactor
-    // serves all three bodies into the saturated queue.
+    // The peer asks for the whole committed range; the routine serves all three
+    // bodies into the saturated queue.
     inbound_tx
         .send(
             BlockSyncMessage::GetBlocks {
@@ -8862,39 +8874,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("GetBlocks frame queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 3);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before block range query: {action:?}"),
-        }
-    }
-    let served: Vec<_> = blocks
-        .iter()
-        .map(|block| {
-            (
-                block.coinbase_height().expect("test block has height"),
-                block.clone(),
-                usize::try_from(block_size(block)).expect("block size fits usize"),
-            )
-        })
-        .collect();
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            blocks: served,
-        })
-        .await
-        .expect("served block response queues");
-
-    // Let the reactor finish the serve, including the sends that hit `Full`.
+    // Let the routine finish the serve, including the sends that hit `Full`.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !cancel.is_cancelled(),
@@ -8902,8 +8882,8 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
 
-    // Self-heal: drain the queue, release the serving slot, and re-request. The
-    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
+    // Self-heal: drain the queue and re-request. The earlier drop neither wedged
+    // nor scored the peer, so a fresh serve lands.
     while tokio::time::timeout(
         Duration::from_millis(100),
         next_outbound_message(&mut outbound_rx),
@@ -8911,15 +8891,6 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     .await
     .is_ok()
     {}
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            returned_count: 3,
-        })
-        .await
-        .expect("serving slot release queues");
     inbound_tx
         .send(
             BlockSyncMessage::GetBlocks {
@@ -8931,30 +8902,6 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("re-request GetBlocks frame queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 1);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before re-request query: {action:?}"),
-        }
-    }
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 1,
-            blocks: vec![(
-                block::Height(1),
-                blocks[0].clone(),
-                usize::try_from(block_size(&blocks[0])).expect("block size fits usize"),
-            )],
-        })
-        .await
-        .expect("re-served block response queues");
     assert_eq!(
         wait_for_outbound_block(&mut outbound_rx).await.hash(),
         blocks[0].hash(),
@@ -9191,7 +9138,6 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action during size mismatch test: {action:?}"),
         }
     }
 

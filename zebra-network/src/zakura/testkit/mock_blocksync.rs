@@ -325,15 +325,6 @@ impl ThroughputStats {
         state.final_frontier = state.final_frontier.max(height);
     }
 
-    fn record_request(&self, blocks: usize, bytes: usize) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("throughput stats mutex is not poisoned");
-        state.request_blocks.push(blocks);
-        state.request_bytes.push(bytes);
-    }
-
     fn final_frontier(&self) -> block::Height {
         self.inner
             .lock()
@@ -508,7 +499,7 @@ async fn drive_mock_block_sync_actions(
     node: &ZakuraTestNode,
     corpus: SyntheticBlockCorpus,
     apply: Option<MockApplyFrontier>,
-    servable_high: block::Height,
+    _servable_high: block::Height,
     stats: ThroughputStats,
     mut needed_blocks_gate: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
@@ -528,77 +519,62 @@ async fn drive_mock_block_sync_actions(
             .and_then(|handle| handle.take_apply_queue());
         loop {
             tokio::select! {
-                maybe_item = async {
-                    match apply_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    let Some(item) = maybe_item else {
-                        apply_rx = None;
-                        continue;
-                    };
-                    let Some(apply) = apply.as_ref() else {
-                        continue;
-                    };
-                    let outcome = apply.apply(item.block.as_ref());
-                    if outcome.result == BlockApplyResult::Committed {
-                        if let Some(size) = corpus.size_at(item.height) {
-                            stats.record_commit(item.height, size);
+                    maybe_item = async {
+                        match apply_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
                         }
-                    }
-                    if let Some(handle) = endpoint.block_sync() {
-                        handle.report_durable_frontier(outcome.frontiers);
-                    }
-                    continue;
-                }
-                maybe_action = actions.recv() => {
-                    let Some(action) = maybe_action else {
-                        break;
-                    };
-                    let Some(handle) = endpoint.block_sync() else {
+                    } => {
+                        let Some(item) = maybe_item else {
+                            apply_rx = None;
+                            continue;
+                        };
+                        let Some(apply) = apply.as_ref() else {
+                            continue;
+                        };
+                        let outcome = apply.apply(item.block.as_ref());
+                        if outcome.result == BlockApplyResult::Committed {
+                            if let Some(size) = corpus.size_at(item.height) {
+                                stats.record_commit(item.height, size);
+                            }
+                        }
+                        if let Some(handle) = endpoint.block_sync() {
+                            handle.report_durable_frontier(outcome.frontiers);
+                        }
                         continue;
-                    };
-                    match action {
-                        BlockSyncAction::QueryNeededBlocks {
-                            verified_block_tip,
-                            best_header_tip,
-                        } => {
-                            if let Some(gate) = needed_blocks_gate.as_mut() {
-                                while !*gate.borrow_and_update() {
-                                    if gate.changed().await.is_err() {
-                                        return;
+                    }
+                    maybe_action = actions.recv() => {
+                        let Some(action) = maybe_action else {
+                            break;
+                        };
+                        let Some(handle) = endpoint.block_sync() else {
+                            continue;
+                        };
+                        match action {
+                            BlockSyncAction::QueryNeededBlocks {
+                                verified_block_tip,
+                                best_header_tip,
+                            } => {
+                                if let Some(gate) = needed_blocks_gate.as_mut() {
+                                    while !*gate.borrow_and_update() {
+                                        if gate.changed().await.is_err() {
+                                            return;
+                                        }
                                     }
-                                }
+                        }
+                        let start = verified_block_tip.next().unwrap_or(verified_block_tip);
+                        let end = best_header_tip.min(corpus.target_height());
+                        let metas = if start <= end {
+                            corpus.metas_between(start, end)
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                     }
-                    let start = verified_block_tip.next().unwrap_or(verified_block_tip);
-                    let end = best_header_tip.min(corpus.target_height());
-                    let metas = if start <= end {
-                        corpus.metas_between(start, end)
-                    } else {
-                        Vec::new()
-                    };
-                    let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
-                }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    let blocks = corpus.blocks_in_range(start, count, servable_high);
-                    let response_bytes = blocks
-                        .iter()
-                        .fold(0usize, |sum, (_, _, size)| sum.saturating_add(*size));
-                    stats.record_request(blocks.len(), response_bytes);
-                    let _ = handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        })
-                        .await;
-                }
-                        BlockSyncAction::Misbehavior { .. } => {}
-                    }
+                    BlockSyncAction::Misbehavior { .. } => {}
                 }
             }
+                }
         }
     })
 }
