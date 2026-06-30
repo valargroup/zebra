@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   to inline hashing, so it affects only speed, never the resulting tree. This cuts
   the committer's tree-update cost by ~54% (12.5 → 5.7 ms/block) where the
   committer is the bottleneck.
+- Limit RocksDB write-ahead logs to 4 GiB in the finalized state database. Heavy
+  sync could otherwise accumulate tens of GiB of WAL files, making restarts spend
+  minutes replaying logs before Zebra could resume syncing.
 
 ### Changed
 
