@@ -564,27 +564,18 @@ impl PeerRoutine {
                 break "cwnd_saturated";
             }
             let in_bypass = normal_slots == 0;
-            // One contiguous chunk up to the peer's per-request count cap; the
-            // outer loop fills the rest of the peer's slots.
-            let local_peer_count_cap = usize::try_from(
-                self.max_blocks_per_response
-                    .min(self.config.advertised_max_blocks_per_response())
-                    .max(1),
-            )
-            .unwrap_or(usize::MAX);
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
             // Compute this chunk's count and byte ceiling before taking any work.
             // The count cap is the peer/request cap; the byte cap is enforced by
             // the budgeted work-queue take and then by the reservation below.
-            let max_count = local_peer_count_cap;
+            let max_count = self.request_count_cap();
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
             let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
             let mut request_priority = RequestPriority::Floor;
-            let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-                self.work.reserved_above(view.download_floor);
+            let reserved_above_floor = self.work.reserved_above(view.download_floor);
             // The floor rides the fastest servable carrier: defer it whenever a
             // preferred peer can take it. Outside the bypass region only a strictly
             // faster carrier makes this peer defer (equal carriers stay eligible, so a
@@ -620,19 +611,7 @@ impl PeerRoutine {
                 let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
                     admission_decision(
                         &self.config,
-                        AdmissionSnapshot {
-                            download_floor: view.download_floor,
-                            reorder_buffered_bytes: view.reorder_buffered_bytes,
-                            reorder_buffered_blocks: view.reorder_len,
-                            applying_buffered_bytes: view.applying_buffered_bytes,
-                            applying_buffered_blocks: view.applying_len,
-                            sequencer_input_queued_bytes: self
-                                .sequencer_input_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                            reserved_above_floor_bytes,
-                            reserved_above_floor_blocks,
-                            budget_available: self.budget.available(),
-                        },
+                        self.admission_snapshot(view, reserved_above_floor),
                         tail_start,
                         response_byte_cap,
                     )
@@ -664,19 +643,7 @@ impl PeerRoutine {
                 };
                 let Some(decision) = admission_decision(
                     &self.config,
-                    AdmissionSnapshot {
-                        download_floor: view.download_floor,
-                        reorder_buffered_bytes: view.reorder_buffered_bytes,
-                        reorder_buffered_blocks: view.reorder_len,
-                        applying_buffered_bytes: view.applying_buffered_bytes,
-                        applying_buffered_blocks: view.applying_len,
-                        sequencer_input_queued_bytes: self
-                            .sequencer_input_bytes
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        reserved_above_floor_bytes,
-                        reserved_above_floor_blocks,
-                        budget_available: self.budget.available(),
-                    },
+                    self.admission_snapshot(view, reserved_above_floor),
                     start_height,
                     response_byte_cap,
                 ) else {
@@ -858,6 +825,36 @@ impl PeerRoutine {
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);
         }
+    }
+
+    fn admission_snapshot(
+        &self,
+        view: SequencerView,
+        reserved_above_floor: (u64, u64),
+    ) -> AdmissionSnapshot {
+        let (reserved_above_floor_bytes, reserved_above_floor_blocks) = reserved_above_floor;
+        AdmissionSnapshot {
+            download_floor: view.download_floor,
+            reorder_buffered_bytes: view.reorder_buffered_bytes,
+            reorder_buffered_blocks: view.reorder_len,
+            applying_buffered_bytes: view.applying_buffered_bytes,
+            applying_buffered_blocks: view.applying_len,
+            sequencer_input_queued_bytes: self
+                .sequencer_input_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            reserved_above_floor_bytes,
+            reserved_above_floor_blocks,
+            budget_available: self.budget.available(),
+        }
+    }
+
+    fn request_count_cap(&self) -> usize {
+        usize::try_from(
+            self.max_blocks_per_response
+                .min(self.config.advertised_max_blocks_per_response())
+                .max(1),
+        )
+        .unwrap_or(usize::MAX)
     }
 
     async fn reserve_request_budget(

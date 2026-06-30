@@ -31,6 +31,7 @@ use super::{
 };
 
 mod admission;
+mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
 mod config;

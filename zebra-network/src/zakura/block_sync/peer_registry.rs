@@ -461,13 +461,13 @@ impl PeerRegistry {
     /// Whether some peer other than `self_peer` is a preferred floor server for
     /// `height`: servable for it, holding a free normal (non-bypass) slot, and a
     /// better floor server by RTprop. "Better" is strictly lower RTprop, or — when
-    /// `include_equal` — equal-or-lower.
+    /// `allow_equal_score` — equal-or-lower.
     ///
     /// The floor rides the fastest servable carrier. The normal take path passes
-    /// `include_equal = false`, so this peer defers the floor only to a strictly
+    /// `allow_equal_score = false`, so this peer defers the floor only to a strictly
     /// faster carrier; equal-RTprop carriers all stay eligible and the single-owner
     /// work queue assigns one of them. The floor-bypass path passes
-    /// `include_equal = true`, so a peer whose cwnd is saturated yields its scarce
+    /// `allow_equal_score = true`, so a peer whose cwnd is saturated yields its scarce
     /// bypass slot to an equal-or-faster peer that can take the floor through normal
     /// capacity. Deadlock-free either way: the unique fastest unsaturated server is
     /// never preferred over (nothing beats it), and if every servable peer is
@@ -478,21 +478,16 @@ impl PeerRegistry {
         height: block::Height,
         self_peer: &ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
-        include_equal: bool,
+        allow_equal_score: bool,
     ) -> bool {
         let self_score = self_rtprop_ms.unwrap_or(u64::MAX);
         let peers = self.lock();
         peers.iter().any(|(peer, entry)| {
-            if peer == self_peer
-                || !entry.received_status
-                || entry.servable_low > height
-                || height > entry.servable_high
-                || entry.slots.available_slots == 0
-            {
+            if peer == self_peer || !entry.can_serve_with_room(height) {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
-            if include_equal {
+            if allow_equal_score {
                 other_score <= self_score
             } else {
                 other_score < self_score
@@ -566,6 +561,15 @@ impl PeerRegistry {
         let entry = peers.get_mut(peer)?;
         entry.floor_watchdog_avoid.retain(|_, until| *until > now);
         entry.floor_watchdog_avoid.values().min().copied()
+    }
+}
+
+impl Entry {
+    fn can_serve_with_room(&self, height: block::Height) -> bool {
+        self.received_status
+            && self.servable_low <= height
+            && height <= self.servable_high
+            && self.slots.available_slots > 0
     }
 }
 
