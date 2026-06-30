@@ -79,7 +79,7 @@ async fn fuzz_steady() {
     run_checked("fuzz_steady", scenario, 32).await;
 }
 
-/// Steady state under the experimental byte cwnd unit: the controller budgets in-flight
+/// Steady state under the byte cwnd unit: the controller budgets in-flight
 /// work by reserved body bytes instead of request count. End-to-end seam check — the
 /// byte-denominated `available_slots` gate must still drive the real reactor to the tip
 /// without stalling.

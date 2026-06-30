@@ -11,8 +11,8 @@ use crate::zakura::{
 /// [`MAX_BS_INFLIGHT_REQUESTS`]).
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
-/// BBR-lite multiplicative cwnd dip applied on a real request timeout (one dip,
-/// not the cubic ladder), bounded below by `bbr_min_cwnd`.
+/// BBR-lite multiplicative cwnd dip applied on a real request timeout,
+/// bounded below by `bbr_min_cwnd`.
 const BBR_TIMEOUT_DIP: f64 = 0.85;
 /// EWMA weight for the smoothed request round-trip the delay-gradient compares against
 /// RTprop (higher = more responsive, noisier).
@@ -688,7 +688,7 @@ impl BbrState {
     }
 
     /// Apply one multiplicative dip on a real timeout (BBR-style), bounded by the
-    /// minimum cwnd. Does not run the cubic backoff ladder. Suppressed during ProbeRtt,
+    /// minimum cwnd. Suppressed during ProbeRtt,
     /// where the cwnd is already pinned to `min_cwnd` and timeouts are an expected
     /// consequence of the drain, not congestion signal. A timeout is strong congestion
     /// evidence, so it also ratchets the delay-gradient ceiling down to the dipped cwnd.
@@ -771,7 +771,7 @@ impl BbrState {
     }
 }
 
-/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
+/// Carved out of `PeerBlockState` so the window math stays unit-testable
 /// while the per-peer download state moves into the spawned
 /// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]

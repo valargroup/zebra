@@ -590,7 +590,7 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
 // per-peer assignment to bias, so a returned height is simply contestable by any
 // servable peer. The peer-local timeout bias is re-introduced in per-peer routines. The
 // reactor-level locality property is still covered by
-// `reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling`.
+// `reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling`.
 #[test]
 fn work_queue_returned_height_is_contestable_by_any_peer() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
@@ -2066,15 +2066,15 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
     reactor_task.abort();
 }
 
-/// One peer whose request times out backs off (its outbound window halves) and
-/// must not block the other peers from being filled out of the same shared work.
+/// One peer whose request times out enters local recovery and must not block the
+/// other peers from being filled out of the same shared work.
 ///
 /// This is the timeout-locality invariant: a slow peer's recovery is local to
 /// that peer. The retry path re-queues the timed-out range to a *different*
 /// servable peer, so the healthy peer keeps making progress while the slow peer
 /// is in recovery rather than the whole download stalling behind one straggler.
 #[tokio::test]
-async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
+async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     let mut config = immediate_body_download_config();
     config.fanout = 1;
     // A request timeout long enough that the opening pass fans both heights out
@@ -2160,7 +2160,7 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     // Pick one peer to be the straggler (it never answers) and the other to be
     // healthy. The healthy peer answers `RangeUnavailable` for its own range so
     // it frees its slot without committing anything; the straggler's range then
-    // times out and re-queues. Because the timeout backoff is local to the
+    // times out and re-queues. Because timeout recovery is local to the
     // straggler, the healthy peer must keep being offered the re-queued shared
     // work rather than the whole download stalling behind the straggler.
     let healthy = peer_b.clone();
@@ -2200,7 +2200,7 @@ async fn reactor_timeout_backoff_is_local_and_healthy_peer_keeps_filling() {
     );
     assert!(
         healthy_offers >= 2,
-        "the healthy peer was filled repeatedly despite the slow peer's timeout backoff"
+        "the healthy peer was filled repeatedly despite the slow peer's timeout recovery"
     );
 
     reactor_task.abort();
