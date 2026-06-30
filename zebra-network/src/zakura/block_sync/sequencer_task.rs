@@ -320,6 +320,10 @@ impl SequencerTask {
                         None => body_open = false,
                     }
                 }
+                // The drain pass above can close both inputs in one go, leaving every
+                // arm guard false. Stop instead of polling an all-disabled `select!`,
+                // which panics ("all branches are disabled and there is no else branch").
+                else => break,
             }
         }
     }
