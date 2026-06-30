@@ -355,6 +355,88 @@ mod tests {
         assert_eq!(budget.available(), 50);
     }
 
+    // A `ByteBudget` is cloned and shared across the block-sync Sequencer and every
+    // per-peer routine, all reserving concurrently against one counter. The reservation
+    // path must never over-commit the max — the property the CAS loop in `try_reserve`
+    // exists for. This drives many reservers at a tight budget and asserts the shared
+    // counter never exceeds the max; a regression to a non-atomic load-modify-store
+    // would over-commit under this contention.
+    #[test]
+    fn byte_budget_concurrent_reservations_never_over_commit() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const CHUNK: u64 = 4_096;
+        const CAP: u64 = 8;
+        const THREADS: usize = 16; // deliberately oversubscribed: 16 reservers, 8 slots
+        let max = CHUNK * CAP;
+        let budget = ByteBudget::new(max);
+
+        // Phase 1 — deterministic oversubscription. Every thread tries to reserve one
+        // CHUNK simultaneously and holds it across a barrier, so the counter sits at its
+        // peak with all reservations decided. Exactly CAP may be admitted; never more.
+        let start = Arc::new(Barrier::new(THREADS));
+        let all_reserved = Arc::new(Barrier::new(THREADS));
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let mut budget = budget.clone();
+            let start = start.clone();
+            let all_reserved = all_reserved.clone();
+            let successes = successes.clone();
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let ok = budget.try_reserve(CHUNK);
+                if ok {
+                    successes.fetch_add(1, AtomicOrdering::AcqRel);
+                }
+                // All reservations are decided and still held: the counter is at its peak.
+                all_reserved.wait();
+                assert!(
+                    budget.reserved() <= max,
+                    "reserved {} exceeded the budget max {max} (over-commit)",
+                    budget.reserved(),
+                );
+                if ok {
+                    budget.release(CHUNK);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("reserver thread panicked");
+        }
+        assert_eq!(
+            u64::try_from(successes.load(AtomicOrdering::Acquire)).unwrap(),
+            CAP,
+            "exactly CAP reservations may be admitted; the rest must be rejected",
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "every admitted reservation was released"
+        );
+
+        // Phase 2 — sustained churn. Many reserve/release rounds under contention, each
+        // asserting the counter is never over budget.
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let mut budget = budget.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..5_000 {
+                    if budget.try_reserve(CHUNK) {
+                        assert!(budget.reserved() <= max, "over-commit during churn");
+                        budget.release(CHUNK);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("churn thread panicked");
+        }
+        assert_eq!(budget.reserved(), 0);
+    }
+
     #[test]
     fn admit_rejects_disallowed_type() {
         let mut guard = SessionGuard::new(ALLOWED, 1_024, None);

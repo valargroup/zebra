@@ -150,6 +150,19 @@ pub(crate) fn assert_core(
         report.max_outstanding,
         outstanding_bound,
     );
+
+    // The global byte budget is never over-committed: peak reserved download bytes
+    // (in-flight + reorder + applying) must stay within the configured ceiling. Every
+    // per-peer routine reserves against the same CAS-guarded `ByteBudget`, so this must
+    // hold no matter how many peers race — the memory bound the spec requires. Vacuous
+    // only for scenarios that set an effectively unbounded budget (`u64::MAX`); the
+    // tight-ceiling scenarios make it bite.
+    assert!(
+        report.peak_budget_reserved <= scenario.config.max_inflight_block_bytes,
+        "peak reserved bytes {} exceeded the global in-flight byte budget {}",
+        report.peak_budget_reserved,
+        scenario.config.max_inflight_block_bytes,
+    );
 }
 
 fn event(row: &Value) -> Option<&str> {

@@ -502,3 +502,97 @@ async fn fuzz_high_bw_fast_peer() {
         "high_bw_fast_peer byte-window observation",
     );
 }
+
+/// Lossy peer: a peer silently drops ~30% of requests (no response at all), forcing the
+/// node's request-timeout / re-request path, while a covering fast peer can serve every
+/// height. The node must route around the drops and still commit a contiguous, correct
+/// prefix to the target. Drives the `drop_probability` serve knob no other scenario sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_lossy_peer() {
+    let blocks = 300;
+    let lossy = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 0.3,
+            ..ServeProfile::fast()
+        },
+    );
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_000d,
+        // Short request timeout so dropped requests are re-requested well within the run.
+        retry_config(),
+        vec![lossy, PeerSpec::fast(2, target(blocks))],
+    );
+    scenario.deadline = Duration::from_secs(60);
+    run_checked("fuzz_lossy_peer", scenario, 32).await;
+}
+
+/// Reverse-order serving: peers return the blocks of each multi-block response high→low,
+/// exercising out-of-order body arrival and the reorder buffer. `fuzz_config`'s
+/// `max_blocks_per_response = 16` lets the node issue multi-block ranges, so the reversal
+/// is non-trivial. The node must still commit a contiguous, hash-correct prefix to the
+/// target. Drives the `reorder` serve knob no other scenario sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_reorder() {
+    let blocks = 300;
+    let reorder_serve = ServeProfile {
+        reorder: true,
+        ..ServeProfile::fast()
+    };
+    let scenario = Scenario::new(
+        blocks,
+        0x57ea_000e,
+        fuzz_config(),
+        vec![
+            PeerSpec::with_serve(1, target(blocks), reorder_serve),
+            PeerSpec::with_serve(2, target(blocks), reorder_serve),
+        ],
+    );
+    run_checked("fuzz_reorder", scenario, 32).await;
+}
+
+/// Many peers racing against a tight global byte budget: every per-peer routine reserves
+/// against the one shared `ByteBudget`, so this stresses the concurrent reservation path
+/// end-to-end. A steady slow commit keeps the shared budget full so it actually binds
+/// while eight routines reserve concurrently. `assert_core` asserts
+/// `peak_budget_reserved` never exceeds the configured ceiling (the global memory bound
+/// under multi-peer contention — the spec's "concurrent reservations MUST NOT
+/// over-commit"); here we additionally assert the ceiling was genuinely approached, so
+/// that bound is not vacuous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_multi_peer_tight_budget() {
+    let blocks = 400;
+    let body_bytes = 32 * 1024usize;
+    // ~12.8 MB chain against a 3 MiB ceiling ⇒ the shared budget recycles ~4× and binds.
+    let byte_ceiling: u64 = 3 * 1024 * 1024;
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: byte_ceiling,
+        max_blocks_per_response: 1,
+        ..fuzz_config()
+    };
+    let peers: Vec<_> = (1u8..=8)
+        .map(|id| PeerSpec::fast(id, target(blocks)))
+        .collect();
+    let mut scenario = Scenario::new(blocks, 0x57ea_000f, config, peers);
+    scenario.target_block_bytes = Some(body_bytes);
+    // A steady slow commit so the budget stays full and binds; instant commit would keep
+    // it nearly empty and make the bound vacuous.
+    scenario.commit = CommitProfile {
+        per_commit_delay: Duration::from_millis(1),
+        burst: None,
+    };
+    scenario.deadline = Duration::from_secs(60);
+    let (_, report) = run_checked("fuzz_multi_peer_tight_budget", scenario, 128).await;
+
+    // Non-vacuous: the tight ceiling was genuinely approached under 8-peer contention, so
+    // `assert_core`'s `peak_budget_reserved <= max_inflight_block_bytes` proves a real
+    // bound rather than an idle budget.
+    assert!(
+        report.peak_budget_reserved >= byte_ceiling / 2,
+        "the tight budget should bind under 8-peer contention (reserved {} of {} B)",
+        report.peak_budget_reserved,
+        byte_ceiling,
+    );
+}

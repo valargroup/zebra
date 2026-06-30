@@ -3299,6 +3299,44 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
     }
 }
 
+/// A request range at the maximum advertised block count (128) fills the
+/// `ReceivedBlockTracker`'s `u128` bitset exactly (offsets `0..=127`): every height —
+/// including the top-bit height 128 — must be markable, complete, and fully released,
+/// so no height silently falls off the end of the bitset. Guards the boundary that the
+/// `MAX_BS_BLOCKS_PER_REQUEST <= u128::BITS` const assertion in `state.rs` protects.
+#[test]
+fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
+    let count = MAX_BS_BLOCKS_PER_REQUEST;
+    assert_eq!(count, u128::BITS, "the cap is sized to the bitset width");
+    // Heights `1..=128`, offsets `0..=127`; the helper keeps heights within `u8`.
+    let mut outstanding = window_request_range(1, count);
+    assert_eq!(outstanding.reserved_bytes(), u64::from(count));
+
+    for height in 1..=count {
+        assert!(
+            !outstanding.has_received(block::Height(height)),
+            "height {height} should start unreceived",
+        );
+        outstanding.mark_received(block::Height(height));
+        assert!(
+            outstanding.has_received(block::Height(height)),
+            "height {height} (offset {}) must be markable — the bitset must cover the \
+             whole range",
+            height - 1,
+        );
+    }
+
+    assert!(
+        outstanding.is_complete(),
+        "a fully-received {count}-block range must report complete",
+    );
+    assert_eq!(
+        outstanding.reserved_bytes(),
+        0,
+        "every height received ⇒ no reserved bytes remain (no offset fell off the bitset)",
+    );
+}
+
 /// A body whose actual serialized size exceeds its advertised size hint is still
 /// accepted and buffered, and the byte budget charges the overshoot so it cannot
 /// issue more work while under-counting held bodies.
