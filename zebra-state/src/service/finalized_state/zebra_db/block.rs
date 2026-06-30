@@ -1193,27 +1193,32 @@ impl ZebraDb {
         // serves only the pipeline-depth window. Built only when stage timing is on.
         if zebra_chain::stage_timing::enabled() {
             let spend_h = finalized.height.0;
-            let (mut le64, mut le256, mut le1024, mut le4096) = (0u64, 0u64, 0u64, 0u64);
+            let (mut le4k, mut le16k, mut le65k, mut le262k, mut le1m) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
             for (_op, out_loc, _utxo) in &spent_utxos {
                 let d = spend_h.saturating_sub(out_loc.height().0);
-                if d <= 64 {
-                    le64 += 1;
+                if d <= 4_096 {
+                    le4k += 1;
                 }
-                if d <= 256 {
-                    le256 += 1;
+                if d <= 16_384 {
+                    le16k += 1;
                 }
-                if d <= 1024 {
-                    le1024 += 1;
+                if d <= 65_536 {
+                    le65k += 1;
                 }
-                if d <= 4096 {
-                    le4096 += 1;
+                if d <= 262_144 {
+                    le262k += 1;
+                }
+                if d <= 1_048_576 {
+                    le1m += 1;
                 }
             }
             zebra_chain::stage_timing::record_val(spend_h, "spent_total", spent_utxos.len() as u64);
-            zebra_chain::stage_timing::record_val(spend_h, "spent_le64", le64);
-            zebra_chain::stage_timing::record_val(spend_h, "spent_le256", le256);
-            zebra_chain::stage_timing::record_val(spend_h, "spent_le1024", le1024);
-            zebra_chain::stage_timing::record_val(spend_h, "spent_le4096", le4096);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le4k", le4k);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le16k", le16k);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le65k", le65k);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le262k", le262k);
+            zebra_chain::stage_timing::record_val(spend_h, "spent_le1m", le1m);
         }
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
@@ -1232,21 +1237,6 @@ impl ZebraDb {
             .into_iter()
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
-
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
-
-        // Get the current address balances, before the transactions in this block
 
         // Like the spent-UTXO reads above, the per-address balance lookups are
         // cache-served but serial. Fan them across the rayon pool once a block
@@ -1281,26 +1271,46 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        // Resolve an address balance from the run-ahead overlay first (it may have
-        // been updated by a not-yet-flushed block), then from disk. With
-        // `overlay = None` this is exactly the disk read.
-        let lookup_balance = |addr: &transparent::Address| {
-            if let Some(overlay) = overlay {
-                if let Some(balance) = overlay.address_balance_override(addr) {
-                    return Some(balance);
-                }
-            }
-            self.address_balance_location(addr)
-        };
+        //
+        // When the address index is skipped (fast-sync), none of the per-address
+        // balance reads happen and `address_balances` is left empty; the gated
+        // transparent index passes below then write no address entries.
         let address_reads_start = std::time::Instant::now();
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                lookup_balance(addr)
-            }))
+        let address_balances: AddressBalanceLocationUpdates = if self.config().skip_address_index()
+        {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(lookup_balance(addr)?.into_new_change())
-            }))
+            // Transparent addresses with changed balances/UTXOs in this block.
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+            // Resolve an address balance from the run-ahead overlay first (it may
+            // have been updated by a not-yet-flushed block), then from disk.
+            let lookup_balance = |addr: &transparent::Address| {
+                if let Some(overlay) = overlay {
+                    if let Some(balance) = overlay.address_balance_override(addr) {
+                        return Some(balance);
+                    }
+                }
+                self.address_balance_location(addr)
+            };
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    lookup_balance(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(lookup_balance(addr)?.into_new_change())
+                }))
+            }
         };
         let address_reads_dur = address_reads_start.elapsed();
         #[cfg(feature = "commit-metrics")]
