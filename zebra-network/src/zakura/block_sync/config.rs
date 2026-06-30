@@ -85,8 +85,6 @@ pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
 /// Default cooldown before a no-progress peer may be admitted again.
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
-/// Default central floor-watchdog cadence.
-pub const DEFAULT_BS_FLOOR_WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
 /// Default block-sync status refresh interval after local frontier changes.

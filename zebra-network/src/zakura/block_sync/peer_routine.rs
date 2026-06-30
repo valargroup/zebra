@@ -67,11 +67,6 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLOSE_BLOCK_SYNC_GUARD_BAD_TYPE: &str = "block_sync_guard_bad_type";
-const CLOSE_BLOCK_SYNC_GUARD_DISALLOWED_TYPE: &str = "block_sync_guard_disallowed_type";
-const CLOSE_BLOCK_SYNC_GUARD_OVERSIZE: &str = "block_sync_guard_oversize";
-const CLOSE_BLOCK_SYNC_GUARD_REJECT: &str = "block_sync_guard_reject";
-const CLOSE_BLOCK_SYNC_MALFORMED_FRAME: &str = "block_sync_malformed_frame";
 const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
 fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
@@ -995,10 +990,7 @@ impl PeerRoutine {
                     outstanding = self.window.outstanding.len(),
                     "disconnecting Zakura block-sync peer after no accepted block progress"
                 );
-                Err(SinkReject::protocol_with_reason(
-                    error,
-                    CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS,
-                ))
+                Err(SinkReject::protocol(error))
             }
         }
     }
@@ -1668,34 +1660,6 @@ impl PeerRoutine {
                 "reason".to_string(),
                 serde_json::Value::String(reason.to_string()),
             );
-        });
-    }
-
-    fn trace_protocol_reject_frame(
-        &self,
-        reason: &'static str,
-        error: &str,
-        frame_message_type: u16,
-        frame_flags: u16,
-        payload_len: u64,
-    ) {
-        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
-            bs_insert_peer(row, bs_trace::PEER, &self.peer);
-            row.insert(
-                bs_trace::REASON.to_string(),
-                serde_json::Value::String(reason.to_string()),
-            );
-            row.insert(
-                bs_trace::ERROR.to_string(),
-                serde_json::Value::String(error.to_string()),
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::FRAME_MESSAGE_TYPE,
-                u64::from(frame_message_type),
-            );
-            bs_insert_u64(row, bs_trace::FRAME_FLAGS, u64::from(frame_flags));
-            bs_insert_u64(row, bs_trace::PAYLOAD_LEN, payload_len);
         });
     }
 

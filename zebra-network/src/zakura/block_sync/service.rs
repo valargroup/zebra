@@ -27,8 +27,6 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     mode: StreamMode::Ordered,
 }];
 
-const CLOSE_BLOCK_SYNC_NO_PROGRESS_COOLDOWN: &str = "block_sync_no_progress_cooldown";
-
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
@@ -394,8 +392,6 @@ impl Service for BlockSyncService {
 
     fn add_peer(&self, mut peer: Peer) {
         if self.peer_is_parked(&peer.id) {
-            peer.close_handle()
-                .cancel(CLOSE_BLOCK_SYNC_NO_PROGRESS_COOLDOWN);
             peer.service_cancel_token().cancel();
             return;
         }

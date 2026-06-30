@@ -684,6 +684,7 @@ impl BlockSyncReactor {
             },
             started.elapsed(),
             Some(tip),
+            None,
             capacity,
             max_capacity,
         );
@@ -753,6 +754,7 @@ impl BlockSyncReactor {
             },
             started.elapsed(),
             Some(tip),
+            None,
             capacity,
             max_capacity,
         );
@@ -1754,6 +1756,7 @@ impl BlockSyncReactor {
         result: &'static str,
         elapsed: Duration,
         height: Option<block::Height>,
+        token: Option<BlockApplyToken>,
         capacity: usize,
         max_capacity: usize,
     ) {
@@ -1763,6 +1766,9 @@ impl BlockSyncReactor {
             bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, elapsed);
             if let Some(height) = height {
                 bs_insert_height(row, bs_trace::HEIGHT, height);
+            }
+            if let Some(token) = token {
+                bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
             }
             bs_insert_u64(
                 row,
