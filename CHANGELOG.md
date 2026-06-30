@@ -174,6 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Remove the Zakura body-sync watchdog's fallback to the legacy ChainSync body
+  downloader. On a stall the watchdog used to call `ChainSync::sync()`, which ran
+  the legacy and Zakura commit pipelines at the same time — two committers feeding
+  the state-commit pipeline broke its accounting and could deadlock the node. The
+  watchdog now never switches to legacy: it parks after genesis and logs a warning
+  (once per stall window) if Zakura body sync stops closing the gap to the network
+  tip, so a stalled, eclipsed, or peerless node is still visible in the logs.
 - Stop the database format-validity check from panicking with "just checked for
   genesis block" while a verified-commitment-trees fast sync is in progress. The
   check runs on a background thread, concurrently with block commits, and could
