@@ -174,6 +174,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Stop the Zakura body-sync watchdog from running two commit pipelines at once.
+  When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
+  body downloader but left the Zakura block-sync driver running, so both fed the
+  state-commit pipeline concurrently — breaking its accounting and deadlocking
+  the node. The watchdog now stops the Zakura block-sync driver (via a dedicated
+  child cancellation token) before handing off to legacy ChainSync. A new
+  `network.zakura_legacy_body_sync_fallback` option now defaults to `false`,
+  hard-disabling the legacy fallback for Zakura deployments; set it to `true` to
+  restore eclipse-at-genesis recovery. The fallback is also only ever taken when
+  `network.legacy_p2p` is enabled.
 - Stop the database format-validity check from panicking with "just checked for
   genesis block" while a verified-commitment-trees fast sync is in progress. The
   check runs on a background thread, concurrently with block commits, and could

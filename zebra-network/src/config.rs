@@ -224,6 +224,19 @@ pub struct Config {
     /// only the native Zakura P2P v2 endpoint when [`v2_p2p`](Self::v2_p2p) is enabled.
     pub legacy_p2p: bool,
 
+    /// When running Zakura block sync (`v2_p2p = true`), resume the legacy ChainSync body
+    /// downloader as a fallback if Zakura block sync stalls.
+    ///
+    /// Defaults to `false`, hard-disabling the legacy syncer under Zakura. This prevents the
+    /// legacy and Zakura commit pipelines from ever running at once: concurrent committers break
+    /// the state-commit pipeline's accounting and can deadlock the node. The fallback is also
+    /// impossible without legacy peers, so even when enabled it is only ever taken when
+    /// [`legacy_p2p`](Self::legacy_p2p) is also enabled.
+    ///
+    /// Enable it to restore eclipse-at-genesis recovery: a node whose only reachable peers are
+    /// legacy-only can then make progress by handing body sync back to legacy.
+    pub zakura_legacy_body_sync_fallback: bool,
+
     /// Native Zakura endpoint, connection, and bootstrap settings.
     ///
     /// When `v2_p2p` is false, these settings are parsed but no iroh endpoint is started. The total
@@ -757,6 +770,7 @@ impl Default for Config {
             zakura_node_secret_key: None,
             v2_p2p: true,
             legacy_p2p: true,
+            zakura_legacy_body_sync_fallback: false,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -839,6 +853,7 @@ struct DConfig {
     #[serde(alias = "enable_p2p_v2")]
     v2_p2p: bool,
     legacy_p2p: bool,
+    zakura_legacy_body_sync_fallback: bool,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -860,6 +875,7 @@ impl Default for DConfig {
             zakura_node_secret_key: config.zakura_node_secret_key,
             v2_p2p: config.v2_p2p,
             legacy_p2p: config.legacy_p2p,
+            zakura_legacy_body_sync_fallback: config.zakura_legacy_body_sync_fallback,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -919,6 +935,7 @@ impl From<Config> for DConfig {
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
+            zakura_legacy_body_sync_fallback,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -957,6 +974,7 @@ impl From<Config> for DConfig {
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
+            zakura_legacy_body_sync_fallback,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -981,6 +999,7 @@ impl<'de> Deserialize<'de> for Config {
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
+            zakura_legacy_body_sync_fallback,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -1069,6 +1088,7 @@ impl<'de> Deserialize<'de> for Config {
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
+            zakura_legacy_body_sync_fallback,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,

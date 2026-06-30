@@ -655,6 +655,12 @@ impl StartCmd {
             )
             .await;
 
+        // Cancellation token for the Zakura block-sync driver alone. Derived as a child of the
+        // endpoint shutdown token below, so endpoint teardown still stops it, but the legacy
+        // fallback watchdog can stop *only* block sync without tearing down header sync. Kept
+        // `None` when Zakura block sync is not running.
+        let mut zakura_block_sync_shutdown: Option<tokio_util::sync::CancellationToken> = None;
+
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
             if let (Some(header_sync), Some(shutdown), Some(actions)) = (
@@ -683,6 +689,10 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
+                    // A child of the endpoint shutdown token: cancelled by endpoint teardown
+                    // (parent), or independently by the legacy fallback watchdog so it can stop
+                    // block sync without also stopping header sync or the full-block mirror.
+                    let block_sync_shutdown = shutdown.child_token();
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
                             block_actions,
@@ -698,11 +708,12 @@ impl StartCmd {
                             config.sync.zakura_block_apply_concurrency_limit,
                             trace.clone(),
                             blocksync_throughput_probe.clone(),
-                            shutdown.clone().cancelled_owned(),
+                            block_sync_shutdown.clone().cancelled_owned(),
                         )
                         .in_current_span(),
                     );
                     endpoint.push_block_sync_task(block_driver_task).await;
+                    zakura_block_sync_shutdown = Some(block_sync_shutdown);
                 }
 
                 let full_block_task = tokio::spawn(
@@ -971,9 +982,19 @@ impl StartCmd {
         }
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+            // Only resume legacy ChainSync as a fallback when it is both enabled and there is a
+            // legacy peer set to drive it. When it fires, the watchdog stops Zakura block sync
+            // (via the child token) before starting legacy, so the two commit pipelines never
+            // run at once.
+            let legacy_fallback_enabled =
+                config.network.zakura_legacy_body_sync_fallback && config.network.legacy_p2p;
             tokio::spawn(
                 syncer
-                    .bootstrap_genesis_then_pause(read_only_state_service.clone())
+                    .bootstrap_genesis_then_pause(
+                        read_only_state_service.clone(),
+                        legacy_fallback_enabled,
+                        zakura_block_sync_shutdown.clone(),
+                    )
                     .in_current_span(),
             )
         } else {

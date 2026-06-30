@@ -937,10 +937,12 @@ where
     /// so the watchdog can tell genuine Zakura block-sync progress (the verified tip
     /// closing a real gap to the network frontier) from a peer trickling next-height
     /// blocks over gossip (which bumps the verified tip without body sync running).
-    #[instrument(skip(self, read_state))]
+    #[instrument(skip(self, read_state, block_sync_shutdown))]
     pub async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
+        legacy_fallback_enabled: bool,
+        block_sync_shutdown: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -975,14 +977,35 @@ where
                 header_tip_height,
                 max_idle_polls,
             ) {
-                warn!(
-                    verified_tip = ?verified_height,
-                    header_tip = ?header_tip_height,
-                    stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
-                    "Zakura body sync is not closing the gap to the network tip; falling back \
-                     to legacy ChainSync so legacy peers can drive body sync"
-                );
-                return self.sync().await;
+                if legacy_fallback_enabled {
+                    warn!(
+                        verified_tip = ?verified_height,
+                        header_tip = ?header_tip_height,
+                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        "Zakura body sync is not closing the gap to the network tip; falling back \
+                         to legacy ChainSync so legacy peers can drive body sync"
+                    );
+                    Self::stop_zakura_block_sync(&block_sync_shutdown);
+                    return self.sync().await;
+                } else if tracker.idle_polls.is_multiple_of(max_idle_polls) {
+                    // Fallback hard-disabled: keep waiting for Zakura instead of switching
+                    // pipelines. Warn once per stall window (the tracker keeps counting idle
+                    // polls while stalled) rather than on every poll.
+                    warn!(
+                        verified_tip = ?verified_height,
+                        header_tip = ?header_tip_height,
+                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        "Zakura body sync is not closing the gap to the network tip; legacy \
+                         ChainSync fallback is disabled, continuing to wait for Zakura"
+                    );
+                }
+            }
+
+            // The remaining legacy-informed cross-check exists only to trigger the fallback, and
+            // it issues a `FindBlocks` fanout each time it probes. Skip it entirely when the
+            // fallback is disabled.
+            if !legacy_fallback_enabled {
+                continue;
             }
 
             // Second, legacy-informed trigger. The gap rule above is structurally
@@ -1012,10 +1035,22 @@ where
                              higher tip; falling back to legacy ChainSync so it can drive body \
                              sync"
                         );
+                        Self::stop_zakura_block_sync(&block_sync_shutdown);
                         return self.sync().await;
                     }
                 }
             }
+        }
+    }
+
+    /// Stops the Zakura block-sync driver before reactivating the legacy [`ChainSync::sync`]
+    /// loop, so the legacy and Zakura commit pipelines never feed the state-commit pipeline at
+    /// once (concurrent committers break its accounting and can deadlock the node). Cancelling
+    /// this child token leaves Zakura header sync and the full-block mirror running. No-op when
+    /// Zakura block sync is not active.
+    fn stop_zakura_block_sync(block_sync_shutdown: &Option<tokio_util::sync::CancellationToken>) {
+        if let Some(token) = block_sync_shutdown {
+            token.cancel();
         }
     }
 
