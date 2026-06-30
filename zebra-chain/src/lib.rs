@@ -38,6 +38,7 @@ pub mod sapling;
 pub mod serialization;
 pub mod shutdown;
 pub mod sprout;
+pub mod stage_timing;
 pub mod subtree;
 pub mod transaction;
 pub mod transparent;

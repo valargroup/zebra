@@ -584,7 +584,13 @@ impl WriteBlockWorkerTask {
             {
                 Some(block) => block,
                 None => match finalized_block_write_receiver.try_recv() {
-                    Ok(block) => block,
+                    Ok(block) => {
+                        zebra_chain::stage_timing::record(
+                            block.0.height.0,
+                            "write_worker_received",
+                        );
+                        block
+                    }
                     Err(TryRecvError::Empty) => {
                         // Starved: no finalized block available. Time the park so we can
                         // tell "assembler is upstream-starved (verify/driver/feed slow)"
@@ -656,6 +662,7 @@ impl WriteBlockWorkerTask {
             // sizes plus this block's note counts (the sizes after this block).
             if finalized_lookahead.is_empty() {
                 if let Ok(next) = finalized_block_write_receiver.try_recv() {
+                    zebra_chain::stage_timing::record(next.0.height.0, "write_worker_received");
                     finalized_lookahead.push_back(next);
                 }
             }
@@ -672,18 +679,19 @@ impl WriteBlockWorkerTask {
                     hash = ?ordered_block.0.hash,
                     "VCT: deferring fast checkpoint commit until successor is buffered"
                 );
+                // First time this iteration we discover N's successor isn't buffered:
+                // anchors "worker started waiting for N+1" so an offline join can compare
+                // it against when N+1 was actually sent to the worker (state_to_worker).
+                zebra_chain::stage_timing::record(ordered_block.0.height.0, "successor_wait_start");
                 retry_finalized_block = Some(ordered_block);
                 // VCT one-block look-ahead stall: this fast block can't commit until its
                 // successor is buffered (needed to authenticate its supplied roots). If
                 // this dominates, the 10ms poll granularity (not real work) is the gate.
                 let park = std::time::Instant::now();
                 std::thread::park_timeout(Duration::from_millis(10));
-                metrics::counter!("zebra.state.write.assembler_successor_defer.count")
-                    .increment(1);
-                metrics::histogram!(
-                    "zebra.state.write.assembler_successor_park.duration_seconds"
-                )
-                .record(park.elapsed().as_secs_f64());
+                metrics::counter!("zebra.state.write.assembler_successor_defer.count").increment(1);
+                metrics::histogram!("zebra.state.write.assembler_successor_park.duration_seconds")
+                    .record(park.elapsed().as_secs_f64());
                 continue;
             }
 

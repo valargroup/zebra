@@ -477,6 +477,14 @@ pub async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
+                // The pending-apply backlog when this SubmitBlock arrives: a large
+                // backlog means the sequencer is emitting well ahead and the driver's
+                // dispatch is the limiter; ~0 means the sequencer feeds just-in-time.
+                zebra_chain::stage_timing::record_val(
+                    height.map_or(0, |h| h.0),
+                    "submit_received",
+                    pending_applies.len() as u64,
+                );
                 emit_commit_state(
                     &trace,
                     cs_trace::BLOCK_SUBMIT_QUEUED,
@@ -762,6 +770,15 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             }
         }
 
+        // How many applies are concurrently in flight at the moment this one is
+        // dispatched: ~1-2 means the driver is paced one-at-a-time (verify can't run
+        // ahead); a large depth means the driver is sprinting and the gate is elsewhere.
+        zebra_chain::stage_timing::record_val(
+            pending.block.coinbase_height().map_or(0, |h| h.0),
+            "apply_dispatch",
+            (*checkpoint_in_flight + *full_in_flight) as u64,
+        );
+
         let class = pending.class;
         in_flight_applies.push(
             apply_block_sync_body(
@@ -942,6 +959,7 @@ where
         };
     };
 
+    zebra_chain::stage_timing::record(height.0, "driver_commit_start");
     emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
         insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
         insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
@@ -963,6 +981,7 @@ where
             } else {
                 None
             };
+            zebra_chain::stage_timing::record(height.0, "auth_hash_done");
 
             if class == BlockApplyClass::Checkpoint && checkpoint_auth_hash.is_none() {
                 // Hard sync-invariant violation: there is no fallback into range accumulation. We

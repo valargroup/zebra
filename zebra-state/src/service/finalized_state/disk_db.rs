@@ -1363,7 +1363,34 @@ impl DiskDb {
         // Tune level-style database file compaction.
         //
         // This improves Zebra's initial sync speed slightly, as of April 2022.
-        opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
+        //
+        // The memtable budget is env-tunable for empirical benchmarking; it defaults
+        // to the production constant. `optimize_level_style_compaction` derives
+        // write_buffer_size (budget/4), max_write_buffer_number (6), the L0 trigger,
+        // and the level sizes from this budget.
+        let memtable_mb = std::env::var("ZEBRA_ROCKSDB_MEMTABLE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(Self::MEMTABLE_RAM_CACHE_MEGABYTES);
+        opts.optimize_level_style_compaction(memtable_mb * ONE_MEGABYTE);
+
+        // Compaction/flush parallelism. RocksDB defaults to `max_background_jobs=2`
+        // (effectively one flush + one compaction) and `max_subcompactions=1`. With
+        // random-keyed nullifier/UTXO inserts a single compaction thread cannot keep
+        // up at high write rates, so L0 backs up. Env-gated for empirical sweeps;
+        // default behavior is unchanged when unset.
+        if let Some(jobs) = std::env::var("ZEBRA_ROCKSDB_BG_JOBS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            opts.set_max_background_jobs(jobs);
+        }
+        if let Some(subc) = std::env::var("ZEBRA_ROCKSDB_SUBCOMPACTIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            opts.set_max_subcompactions(subc);
+        }
 
         // Increase the process open file limit if needed,
         // then use it to set RocksDB's limit.
