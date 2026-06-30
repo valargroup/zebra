@@ -1010,7 +1010,7 @@ where
         }
     }
 
-    /// Passthrough to verify_v5_transaction, but for V6 transactions.
+    /// Verifies a V6 transaction.
     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
@@ -1018,7 +1018,39 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
     ) -> Result<AsyncChecks, TransactionError> {
-        Self::verify_v5_transaction(request, network, script_verifier, cached_ffi_transaction)
+        let transaction = request.transaction();
+        let nu = request.upgrade(network);
+
+        if nu < NetworkUpgrade::Nu6_3 {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                nu,
+            ));
+        }
+
+        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+
+        let sighash = cached_ffi_transaction
+            .sighasher()
+            .sighash(HashType::ALL, None);
+
+        let mut async_checks = Self::verify_transparent_inputs_and_outputs(
+            request,
+            script_verifier,
+            cached_ffi_transaction.clone(),
+        )?
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu));
+
+        #[cfg(zcash_unstable = "nu6.3")]
+        {
+            let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+            async_checks =
+                async_checks.and(Self::verify_ironwood_bundle(ironwood_bundle, &sighash, nu));
+        }
+
+        Ok(async_checks)
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided
@@ -1226,6 +1258,19 @@ where
         }
 
         async_checks
+    }
+
+    /// Verifies a transaction's Ironwood shielded data.
+    ///
+    /// Ironwood uses the same action proof system as Orchard, but its note
+    /// commitment and nullifier state are tracked separately.
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn verify_ironwood_bundle(
+        bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+        sighash: &SigHash,
+        network_upgrade: NetworkUpgrade,
+    ) -> AsyncChecks {
+        Self::verify_orchard_bundle(bundle, sighash, network_upgrade)
     }
 }
 
