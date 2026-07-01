@@ -17,10 +17,6 @@ mod tests;
 pub struct SyncStatus {
     latest_sync_length: watch::Receiver<Vec<usize>>,
     is_regtest: bool,
-    /// Whether the network has proof-of-work disabled. Such networks (regtest, and custom test
-    /// networks used for shadow-fork upgrade testing) are single-node and have no peers to sync
-    /// from, so the node is always considered at its chain tip.
-    disable_pow: bool,
 }
 
 impl SyncStatus {
@@ -34,9 +30,7 @@ impl SyncStatus {
     /// Create an instance of [`SyncStatus`] for a specific network.
     ///
     /// The status is determined based on the latest counts of synchronized blocks, observed
-    /// through `latest_sync_length`. On networks with proof-of-work disabled (regtest, and custom
-    /// test networks), [`ChainSyncStatus::is_close_to_tip`] always returns `true`, because such
-    /// networks are single-node and have no peers to sync from.
+    /// through `latest_sync_length`. In regtest, [`ChainSyncStatus::is_close_to_tip`] always returns `true`.
     pub fn new_for_network(
         network: &zebra_chain::parameters::Network,
     ) -> (Self, RecentSyncLengths) {
@@ -44,7 +38,6 @@ impl SyncStatus {
         let status = SyncStatus {
             latest_sync_length,
             is_regtest: network.is_regtest(),
-            disable_pow: network.disable_pow(),
         };
 
         (status, recent_sync_lengths)
@@ -59,7 +52,6 @@ impl SyncStatus {
         let status = SyncStatus {
             latest_sync_length,
             is_regtest: false,
-            disable_pow: false,
         };
 
         (status, recent_sync_lengths)
@@ -80,11 +72,7 @@ impl SyncStatus {
 impl ChainSyncStatus for SyncStatus {
     /// Check if the synchronization is likely close to the chain tip.
     fn is_close_to_tip(&self) -> bool {
-        // Networks with proof-of-work disabled are single-node (no peers to sync from), so the
-        // node is always at its tip. This preserves regtest behaviour and also lets a custom
-        // PoW-disabled test network (e.g. a mainnet shadow-fork) activate its mempool and mine
-        // via the `generate` RPC without waiting to sync to a non-existent network tip.
-        if self.is_regtest || self.disable_pow {
+        if self.is_regtest {
             return true;
         }
 

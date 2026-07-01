@@ -30,7 +30,7 @@ use zebra_consensus::MAX_BLOCK_SIGOPS;
 use zebra_network::{
     address_book_peers::MockAddressBookPeers, types::PeerServices, PeerSocketAddr,
 };
-use zebra_node_services::BoxError;
+use zebra_node_services::{mempool, BoxError};
 use zebra_state::{
     GetBlockTemplateChainInfo, IntoDisk, LatestChainTip, ReadRequest, ReadResponse,
     ReadStateService,
@@ -2200,6 +2200,115 @@ async fn getblocktemplate() {
     );
 
     gbt_with(net, addr).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn getblocktemplate_disable_pow_uses_empty_template_when_mempool_is_inactive() {
+    let _init_guard = zebra_test::init();
+
+    let net = Parameters::build()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom PoW-disabled testnet parameters are valid");
+    assert!(!net.is_regtest());
+    assert!(net.disable_pow());
+
+    let addr = ZcashAddress::from_transparent_p2pkh(
+        NetworkType::from(NetworkKind::from(&net)),
+        [0x7e; 20],
+    );
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let mut mock_sync_status = MockSyncStatus::default();
+    mock_sync_status.set_is_close_to_tip(false);
+
+    let mining_conf = crate::config::mining::Config {
+        miner_address: Some(addr),
+        extra_coinbase_data: None,
+        miner_memo: None,
+        internal_miner: true,
+    };
+
+    let fake_tip_height = NetworkUpgrade::Nu5
+        .activation_height(&net)
+        .expect("nu5 activation height");
+    let fake_tip_hash =
+        Hash::from_hex("0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8").unwrap();
+    let fake_min_time = DateTime32::from(1654008606);
+    let fake_cur_time = DateTime32::from(1654008617);
+    let fake_max_time = DateTime32::from(1654008728);
+    let fake_difficulty = CompactDifficulty::from(ExpandedDifficulty::from(U256::one()));
+
+    let (mock_tip, mock_tip_sender) = MockChainTip::new();
+    mock_tip_sender.send_best_tip_height(fake_tip_height);
+    mock_tip_sender.send_best_tip_hash(fake_tip_hash);
+    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(200));
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new(
+        net.clone(),
+        mining_conf,
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        state.clone(),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        mock_sync_status,
+        mock_tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let read_state_handler = {
+        let mut read_state = read_state.clone();
+        async move {
+            read_state
+                .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
+                .await
+                .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                    expected_difficulty: fake_difficulty,
+                    tip_height: fake_tip_height,
+                    tip_hash: fake_tip_hash,
+                    cur_time: fake_cur_time,
+                    min_time: fake_min_time,
+                    max_time: fake_max_time,
+                    chain_history_root: fake_history_tree(&net).hash(),
+                }));
+        }
+    };
+
+    let mempool_handler = async move {
+        mempool
+            .expect_request(mempool::Request::FullTransactions)
+            .await
+            .respond(Err(BoxError::from(mempool::MempoolDisabledError)));
+    };
+
+    let (get_block_template, ..) = tokio::join!(
+        rpc.get_block_template(None),
+        mempool_handler,
+        read_state_handler,
+    );
+
+    let GetBlockTemplateResponse::TemplateMode(get_block_template) =
+        get_block_template.expect("PoW-disabled testnets can mine with an inactive mempool")
+    else {
+        panic!(
+            "this getblocktemplate call without parameters should return the `TemplateMode` variant of the response"
+        )
+    };
+
+    assert!(get_block_template.transactions.is_empty());
+    assert_eq!(
+        get_block_template.coinbase_txn.fee,
+        Amount::<NonNegative>::zero()
+    );
 }
 
 async fn gbt_with(net: Network, addr: ZcashAddress) {

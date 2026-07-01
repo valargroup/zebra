@@ -19,6 +19,7 @@ use zebra_chain::{
     transparent::{self, OutPoint},
 };
 use zebra_consensus::transaction as tx;
+use zebra_node_services::mempool::MempoolDisabledError;
 use zebra_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
@@ -418,6 +419,22 @@ async fn mempool_service_disabled() -> Result<(), Report> {
         }
         _ => unreachable!("will never happen in this test"),
     };
+
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::FullTransactions)
+        .await;
+    let error = response.expect_err("disabled mempool should reject FullTransactions");
+    assert!(
+        error.downcast_ref::<MempoolDisabledError>().is_some(),
+        "disabled FullTransactions should return a typed MempoolDisabledError"
+    );
+    assert_eq!(
+        error.to_string(),
+        "mempool is not active: wait for Zebra to sync to the tip"
+    );
 
     // Test if the mempool returns to Queue requests correctly when disabled
     let response = service
