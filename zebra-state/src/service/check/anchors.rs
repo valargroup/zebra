@@ -176,20 +176,21 @@ fn is_default_ironwood_root_for_activation_mempool_check(
     height: Option<Height>,
     ironwood_anchor: &ironwood::tree::Root,
 ) -> bool {
+    // Only mempool checks can need this fallback. Block checks pass a parent
+    // chain and height, and the parent chain already has the activation root.
     if parent_chain.is_some() || height.is_some() {
         return false;
     }
 
-    if *ironwood_anchor != ironwood::tree::NoteCommitmentTree::default().root() {
-        return false;
-    }
-
+    // Without a finalized tip, there is no next height to compare to the
+    // configured NU6.3 activation height.
     let Some(finalized_tip_height) = finalized_state.finalized_tip_height() else {
         return false;
     };
 
     finalized_tip_height.next().ok()
         == NetworkUpgrade::Nu6_3.activation_height(&finalized_state.network())
+        && *ironwood_anchor == ironwood::tree::NoteCommitmentTree::default().root()
 }
 
 /// This function fetches and returns the Sprout final treestates from the state,
