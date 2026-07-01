@@ -33,16 +33,16 @@ edition = "2021"
 
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = "0.14"
+orchard = "0.15.0-pre.1"
 sapling-crypto = "0.7"
-zcash_address = "0.12"
+zcash_address = "0.13.0-pre.0"
 zcash_encoding = "0.4"
-zcash_history = "0.4"
-zcash_keys = "0.14"
-zcash_primitives = "0.28"
-zcash_proofs = "0.28"
-zcash_transparent = "0.8"
-zcash_protocol = "0.9"
+zcash_history = "0.5.0-pre.0"
+zcash_keys = "0.15.0-pre.0"
+zcash_primitives = "0.29.0-pre.0"
+zcash_proofs = "0.29.0-pre.0"
+zcash_transparent = "0.9.0-pre.0"
+zcash_protocol = "0.10.0-pre.0"
 zip32 = "0.2"
 abscissa_core = "0.7"
 base64 = "0.22.1"
@@ -180,16 +180,9 @@ config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
 
 [patch.crates-io]
-equihash = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-orchard = { git = "https://github.com/zcash/orchard", rev = "a0c1b83032ab7d75492c12f5ca28745c4e77eb1b" }
-zcash_address = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_encoding = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_history = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_keys = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_primitives = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_proofs = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_protocol = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
-zcash_transparent = { git = "https://github.com/valargroup/librustzcash.git", rev = "4a2ff926db6312969afb7865f4e697bb41e98cf0" }
+# TEMPORARY: Pin librustzcash crates to https://github.com/zcash/librustzcash/pull/2509
+equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
 
 [workspace.metadata.release]
 
@@ -355,7 +348,7 @@ debug = false
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
-    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu6.3", "nu7"))', # Used in Zebra and librustzcash
+    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zebra and librustzcash
 ] }
 
 # High-risk code

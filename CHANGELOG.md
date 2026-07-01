@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
+  previously routed through `Transaction::to_librustzcash`, which re-serializes
+  and reparses the whole transaction — decompressing every Jubjub and Pallas
+  curve point — purely to feed the same canonical bytes into the BLAKE2b digest
+  tree. A new `zebra-chain` `transaction::zip244` module builds the txid and
+  auth-commitment digests directly from Zebra's already-parsed transaction
+  fields, removing that reparse on the checkpoint path where no point is ever
+  needed. v6 transactions (the unstable `tx_v6` feature) still route through
+  `librustzcash`. The output is byte-identical: a differential property test
+  (`native_zip244_matches_librustzcash`) asserts the native txid and auth digest
+  match the `librustzcash` conversion across thousands of random v5 transactions.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both
@@ -50,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
+- Route post-NU6.3 coinbase rewards for Orchard receivers in unified miner
+  addresses to the Ironwood pool instead of rejecting them or falling back to a
+  lower-priority receiver.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
   the `zebrad` binary. The library crates previously declared 1.85.1, but the
   dependency tree (via `iroh`/`sentry` → `time 0.3.47`, plus the
@@ -59,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Ironwood value pool entries to `getblockchaininfo` and verbose
+  `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
   historical raw transaction data, matching the node's storage mode instead of
   always reporting archive behavior.
@@ -104,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   RPC listener without TLS for deployments where another boundary secures the
   listener, such as a private container network. Non-loopback listeners
   otherwise require TLS.
+- Added Ironwood RPC output for `getblock`, `getrawtransaction`,
+  `z_gettreestate`, and `z_getsubtreesbyindex`.
 
 ### Changed
 
@@ -145,8 +163,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Track Ironwood nullifiers in the mempool conflict cache so V6 transactions
-  with duplicate Ironwood spends are rejected or removed consistently.
+- Avoid panics in the block write task when RPC users invalidate a non-finalized
+  root block or reconsider the same invalidated block twice.
+- Stop the Zakura body-sync watchdog from running two commit pipelines at once.
+  When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
+  body downloader but left the Zakura block- and header-sync drivers running, so
+  both fed the state-commit pipeline concurrently — breaking its accounting and
+  deadlocking the node. The watchdog now cancels the Zakura sync drivers (via the
+  endpoint shutdown token) before handing off to legacy ChainSync. The fallback is
+  also limited to dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled); a
+  Zakura-only node, which has no legacy peers to fall back to, instead keeps
+  waiting for Zakura and logs a warning once per stall window.
 - Treat missing transaction inventory responses during mempool download as a
   recoverable download failure, avoiding a panic when public peers no longer
   have a gossiped transaction available.
@@ -203,6 +230,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Security
 
+- Reject invalid Sapling `cv` and `epk` point encodings during the fast semantic
+  precheck for V6 transactions, matching the existing V4/V5 behavior and keeping
+  small-order Sapling outputs out of the expensive batch verifier.
 - Write RPC authentication cookies through a freshly created private temporary
   file before replacing `.cookie`, so pre-existing permissive cookie files cannot
   expose the generated RPC authentication secret.

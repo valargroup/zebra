@@ -19,7 +19,7 @@ use zebra_chain::{
     transaction::{self, JoinSplitData, Transaction, UnminedTxId, VerifiedUnminedTx},
     transparent, LedgerState,
 };
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 use zebra_chain::{block, ironwood, parameters::NetworkUpgrade};
 
 use crate::components::mempool::tests::{
@@ -363,7 +363,7 @@ proptest! {
 
     /// Test if removing a V6 transaction clears its Ironwood nullifiers from the mempool's
     /// in-memory spend conflict cache.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn exact_removal_clears_ironwood_spend_conflicts(
         first in transaction_v6_strategy().prop_map(DisplayToDebug),
@@ -398,7 +398,7 @@ proptest! {
 
     /// Test if a mined V6 transaction's Ironwood nullifiers remove mempool transactions that
     /// duplicate the same spend, and clear the removed transaction's Ironwood conflict cache entry.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn same_effects_removal_clears_ironwood_spend_conflicts(
         first in transaction_v6_strategy().prop_map(DisplayToDebug),
@@ -534,7 +534,7 @@ enum SpendConflictTestInput {
     },
 
     /// Test V6 transactions to include Ironwood nullifier conflicts.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu7")]
     V6 {
         #[proptest(strategy = "transaction_v6_strategy().prop_map(DisplayToDebug)")]
         first: DisplayToDebug<Transaction>,
@@ -570,7 +570,7 @@ impl SpendConflictTestInput {
 
                 (first, second)
             }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            #[cfg(zcash_unstable = "nu7")]
             SpendConflictTestInput::V6 {
                 mut first,
                 mut second,
@@ -613,7 +613,7 @@ impl SpendConflictTestInput {
         let (mut first, mut second) = match self {
             SpendConflictTestInput::V4 { first, second, .. } => (first, second),
             SpendConflictTestInput::V5 { first, second, .. } => (first, second),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            #[cfg(zcash_unstable = "nu7")]
             SpendConflictTestInput::V6 { first, second, .. } => (first, second),
         };
 
@@ -694,7 +694,7 @@ impl SpendConflictTestInput {
 
                 // No JoinSplits
                 Transaction::V1 { .. } | Transaction::V5 { .. } => {}
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+                #[cfg(zcash_unstable = "nu7")]
                 Transaction::V6 { .. } => {}
             }
         }
@@ -766,7 +766,7 @@ impl SpendConflictTestInput {
                     Self::remove_sapling_transfers_with_conflicts(sapling_shielded_data, &conflicts)
                 }
 
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+                #[cfg(zcash_unstable = "nu7")]
                 Transaction::V6 {
                     sapling_shielded_data,
                     ..
@@ -845,7 +845,7 @@ impl SpendConflictTestInput {
                     ..
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),
 
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+                #[cfg(zcash_unstable = "nu7")]
                 Transaction::V6 {
                     orchard_shielded_data,
                     ..
@@ -887,7 +887,7 @@ impl SpendConflictTestInput {
 
     /// Find identical Ironwood nullifiers revealed by both transactions, then remove the actions
     /// that contain them from both transactions.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu7")]
     fn remove_ironwood_conflicts(first: &mut Transaction, second: &mut Transaction) {
         let first_nullifiers: HashSet<_> = first.ironwood_nullifiers().copied().collect();
         let second_nullifiers: HashSet<_> = second.ironwood_nullifiers().copied().collect();
@@ -916,12 +916,12 @@ impl SpendConflictTestInput {
         }
     }
 
-    #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+    #[cfg(not(zcash_unstable = "nu7"))]
     fn remove_ironwood_conflicts(_first: &mut Transaction, _second: &mut Transaction) {}
 
     /// Remove from a transaction's Ironwood shielded data the actions that contain nullifiers
     /// present in the `conflicts` set.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    #[cfg(zcash_unstable = "nu7")]
     fn remove_ironwood_actions_with_conflicts(
         maybe_shielded_data: &mut Option<ironwood::ShieldedData>,
         conflicts: &HashSet<ironwood::Nullifier>,
@@ -961,7 +961,7 @@ enum SpendConflictForTransactionV5 {
 }
 
 /// A spend conflict valid for V6 transactions.
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 #[derive(Arbitrary, Clone, Debug)]
 enum SpendConflictForTransactionV6 {
     Transparent(Box<TransparentSpendConflict>),
@@ -997,7 +997,7 @@ struct OrchardSpendConflict {
 }
 
 /// A conflict caused by revealing the same Ironwood nullifier.
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 #[derive(Arbitrary, Clone, Debug)]
 struct IronwoodSpendConflict {
     new_shielded_data: DisplayToDebug<ironwood::ShieldedData>,
@@ -1051,7 +1051,7 @@ impl SpendConflictForTransactionV5 {
     }
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 impl SpendConflictForTransactionV6 {
     /// Apply a spend conflict to a V6 transaction.
     ///
@@ -1199,7 +1199,7 @@ impl OrchardSpendConflict {
     }
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 impl IronwoodSpendConflict {
     /// Apply an Ironwood spend conflict.
     ///
@@ -1224,7 +1224,7 @@ impl IronwoodSpendConflict {
 }
 
 /// Generate a V6 transaction for mempool storage tests.
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 fn transaction_v6_strategy() -> BoxedStrategy<Transaction> {
     (
         Transaction::v5_strategy(LedgerState::default()),
@@ -1256,7 +1256,7 @@ fn transaction_v6_strategy() -> BoxedStrategy<Transaction> {
 }
 
 /// Create two verified V6 transactions that only conflict on an Ironwood nullifier.
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[cfg(zcash_unstable = "nu7")]
 fn verified_v6_transactions_with_ironwood_conflict(
     mut first: DisplayToDebug<Transaction>,
     mut second: DisplayToDebug<Transaction>,

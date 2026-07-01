@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use bincode::Options;
+use serde_big_array::BigArray;
 
 use zebra_chain::{
     amount::NonNegative,
@@ -87,10 +88,58 @@ impl IntoDisk for HistoryTreeParts {
     }
 }
 
+/// The width of a history-tree [`zcash_history::Entry`] as serialized by database formats written
+/// before NU6.3 widened `zcash_history::NodeData`.
+const LEGACY_MAX_ENTRY_SIZE: usize = 253;
+
+/// A mirror of [`HistoryTreeParts`] using the pre-NU6.3 [`zcash_history::Entry`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyHistoryTreeParts {
+    network_kind: NetworkKind,
+    size: u32,
+    peaks: BTreeMap<u32, LegacyEntry>,
+    current_height: Height,
+}
+
+/// A history-tree entry serialized at the pre-NU6.3 [`LEGACY_MAX_ENTRY_SIZE`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyEntry {
+    #[serde(with = "BigArray")]
+    inner: [u8; LEGACY_MAX_ENTRY_SIZE],
+}
+
+impl From<LegacyHistoryTreeParts> for HistoryTreeParts {
+    fn from(legacy: LegacyHistoryTreeParts) -> Self {
+        HistoryTreeParts {
+            network_kind: legacy.network_kind,
+            size: legacy.size,
+            peaks: legacy
+                .peaks
+                .into_iter()
+                .map(|(index, entry)| {
+                    (
+                        index,
+                        zcash_history::Entry::from_raw_bytes_padded(&entry.inner),
+                    )
+                })
+                .collect(),
+            current_height: legacy.current_height,
+        }
+    }
+}
+
 impl FromDisk for HistoryTreeParts {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        bincode::DefaultOptions::new()
-            .deserialize(bytes.as_ref())
+        let bytes = bytes.as_ref();
+        let options = bincode::DefaultOptions::new();
+
+        options
+            .deserialize::<HistoryTreeParts>(bytes)
+            .or_else(|_| {
+                options
+                    .deserialize::<LegacyHistoryTreeParts>(bytes)
+                    .map(HistoryTreeParts::from)
+            })
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }
@@ -110,34 +159,35 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        const LEGACY_VALUE_BALANCE_LEN: usize = 40;
-        const VALUE_BALANCE_LEN: usize = 48;
+        // We have two different DB formats, one from NU6_1 (Lockbox) one for Ironwood and onwards.
+        const NU6_1_VALUE_BALANCE_LEN: usize = 40;
+        const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
         const BLOCK_SIZE_LEN: usize = 4;
-        const LEGACY_BLOCK_INFO_LEN: usize = LEGACY_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
-        const BLOCK_INFO_LEN: usize = VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
         let bytes = bytes.as_ref();
 
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
         match bytes.len() {
-            BLOCK_INFO_LEN.. => {
+            IRONWOOD_BLOCK_INFO_LEN.. => {
                 let value_pools =
-                    ValueBalance::<NonNegative>::from_bytes(&bytes[..VALUE_BALANCE_LEN])
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..IRONWOOD_VALUE_BALANCE_LEN])
                         .expect("must work for 48 bytes");
                 let size = u32::from_le_bytes(
-                    bytes[VALUE_BALANCE_LEN..VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                    bytes[IRONWOOD_VALUE_BALANCE_LEN..IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
                         .try_into()
                         .expect("must be 4 bytes"),
                 );
                 BlockInfo::new(value_pools, size)
             }
-            LEGACY_BLOCK_INFO_LEN.. => {
+            NU6_1_BLOCK_INFO_LEN.. => {
                 let value_pools =
-                    ValueBalance::<NonNegative>::from_bytes(&bytes[..LEGACY_VALUE_BALANCE_LEN])
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..NU6_1_VALUE_BALANCE_LEN])
                         .expect("must work for 40 bytes");
                 let size = u32::from_le_bytes(
-                    bytes[LEGACY_VALUE_BALANCE_LEN..LEGACY_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                    bytes[NU6_1_VALUE_BALANCE_LEN..NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
                         .try_into()
                         .expect("must be 4 bytes"),
                 );
@@ -147,3 +197,6 @@ impl FromDisk for BlockInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

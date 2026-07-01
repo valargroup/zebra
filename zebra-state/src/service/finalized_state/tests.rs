@@ -5,7 +5,6 @@
 use zebra_chain::block::Height;
 
 mod prop;
-mod rebuild_history_tree;
 mod rollback;
 mod transparent;
 mod vectors;

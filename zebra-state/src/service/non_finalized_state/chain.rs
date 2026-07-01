@@ -1260,14 +1260,19 @@ impl Chain {
     fn remove_ironwood_tree_and_anchor(&mut self, position: RevertPosition, height: Height) {
         let (removed_heights, highest_removed_tree) = if position == RevertPosition::Root {
             (
+                // Remove all trees and anchors at or below the removed block.
+                // This makes sure the temporary trees from finalized tip forks are removed.
                 self.ironwood_anchors_by_height
                     .keys()
                     .cloned()
                     .filter(|index_height| *index_height <= height)
                     .collect(),
+                // Cache the highest (rightmost) tree before its removal.
                 self.ironwood_tree(height.into()),
             )
         } else {
+            // Just remove the reverted tip trees and anchors.
+            // We don't need to cache the highest (rightmost) tree.
             (vec![height], None)
         };
 
@@ -1289,6 +1294,14 @@ impl Chain {
             );
         }
 
+        // # Invariant
+        //
+        // The height following after the removed heights in a non-empty non-finalized state must
+        // always have its tree.
+        //
+        // The loop above can violate the invariant, and if `position` is [`RevertPosition::Root`],
+        // it will always violate the invariant. We restore the invariant by storing the highest
+        // (rightmost) removed tree just above `height` if there is no tree at that height.
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
@@ -1794,6 +1807,8 @@ impl Chain {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
@@ -1824,7 +1839,6 @@ impl Chain {
                     orchard_shielded_data,
                     &None::<ironwood::ShieldedData>,
                 ),
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
                     inputs,
                     outputs,
@@ -1868,13 +1882,7 @@ impl Chain {
                     &transaction_hash,
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
-                if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                    check::nullifier::add_ironwood_to_non_finalized_chain_unique(
-                        &mut self.ironwood_nullifiers,
-                        ironwood_shielded_data.nullifiers(),
-                        transaction_hash,
-                    )?;
-                }
+                self.update_chain_tip_with(&(ironwood_shielded_data.as_ref(), &transaction_hash))?;
             }
 
             // add key `transaction.hash` and value `(height, tx_index)` to `tx_loc_by_hash`
@@ -2008,6 +2016,8 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
@@ -2038,7 +2048,6 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     orchard_shielded_data,
                     &None::<ironwood::ShieldedData>,
                 ),
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
                     inputs,
                     outputs,
@@ -2088,12 +2097,10 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 position,
             );
             self.revert_chain_with(&(orchard_shielded_data, transaction_hash), position);
-            if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                check::nullifier::remove_from_non_finalized_chain(
-                    &mut self.ironwood_nullifiers,
-                    ironwood_shielded_data.nullifiers(),
-                );
-            }
+            self.revert_chain_with(
+                &(ironwood_shielded_data.as_ref(), transaction_hash),
+                position,
+            );
         }
 
         // TODO: move these to the shielded UpdateWith.revert...()?
@@ -2483,6 +2490,54 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
             check::nullifier::remove_from_non_finalized_chain(
                 &mut self.orchard_nullifiers,
                 orchard_shielded_data.nullifiers(),
+            );
+        }
+    }
+}
+
+impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for Chain {
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn update_chain_tip_with(
+        &mut self,
+        &(ironwood_shielded_data, revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+    ) -> Result<(), ValidateContextError> {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // We do note commitment tree updates in parallel rayon threads.
+
+            check::nullifier::add_ironwood_to_non_finalized_chain_unique(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
+                *revealing_tx_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if any nullifier is missing from the chain when we try to remove it.
+    ///
+    /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn revert_chain_with(
+        &mut self,
+        &(ironwood_shielded_data, _revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+        _position: RevertPosition,
+    ) {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // Note commitments are removed from the Chain during a fork,
+            // by removing trees above the fork height from the note commitment index.
+            // This happens when reverting the block itself.
+
+            check::nullifier::remove_from_non_finalized_chain(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
             );
         }
     }

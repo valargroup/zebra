@@ -38,6 +38,23 @@ use zebra_rpc::client::{
     ValidateAddressResponse, ZListUnifiedReceiversResponse, ZValidateAddressResponse,
 };
 
+fn remove_ironwood_value_pool(value: &mut serde_json::Value) {
+    let value_pools = value
+        .get_mut("valuePools")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("test response has valuePools");
+    let original_len = value_pools.len();
+
+    value_pools
+        .retain(|pool| pool.get("id").and_then(serde_json::Value::as_str) != Some("ironwood"));
+
+    assert_eq!(
+        value_pools.len(),
+        original_len - 1,
+        "test response has one Ironwood value pool"
+    );
+}
+
 #[test]
 fn test_get_info() -> Result<(), Box<dyn std::error::Error>> {
     let json = r#"
@@ -175,6 +192,24 @@ fn test_send_raw_transaction() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error::Error>> {
+    let mut json: serde_json::Value = serde_json::from_str(GET_BLOCKCHAIN_INFO_RESPONSE)?;
+    remove_ironwood_value_pool(&mut json);
+
+    let obj: GetBlockchainInfoResponse = serde_json::from_value(json)?;
+    let value_pools = obj.value_pools();
+
+    assert_eq!(value_pools.len(), 6);
+    assert_eq!(value_pools[4].id().as_str(), "deferred");
+    assert_eq!(value_pools[5].id().as_str(), "ironwood");
+    assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[5].value_delta().is_none());
+    assert!(value_pools[5].value_delta_zat().is_none());
+
+    Ok(())
+}
+
+#[test]
 fn test_get_block_0() -> Result<(), Box<dyn std::error::Error>> {
     let json = r#""00000000007bacdb373ca240dc6f044f0a816a407bc1924f82a2d84ebfa6103f""#;
     let obj: GetBlockResponse = serde_json::from_str(json)?;
@@ -240,6 +275,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
     let trees = block.trees();
     let trees_sapling = trees.sapling();
     let trees_orchard = trees.orchard();
+    let trees_ironwood = trees.ironwood();
     // We already tested that GetBlockHash is readable with `hash`, so we don't
     // bother unpacking it here
     let previous_block_hash = block.previous_block_hash();
@@ -269,12 +305,44 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
         difficulty,
         chain_supply,
         value_pools,
-        GetBlockTrees::new(trees_sapling, trees_orchard),
+        GetBlockTrees::new(trees_sapling, trees_orchard, trees_ironwood),
         previous_block_hash,
         next_block_hash,
     )));
 
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_block_trees_serializes_empty_ironwood() -> Result<(), Box<dyn std::error::Error>> {
+    let trees = GetBlockTrees::new(0, 2, None);
+    let json = serde_json::to_value(trees)?;
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "orchard": {
+                "size": 2,
+            },
+        })
+    );
+
+    let trees = GetBlockTrees::new(0, 2, Some(0));
+    let json = serde_json::to_value(trees)?;
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "orchard": {
+                "size": 2,
+            },
+            "ironwood": {
+                "size": 0,
+            },
+        })
+    );
 
     Ok(())
 }
@@ -351,6 +419,35 @@ fn test_get_block_2() -> Result<(), Box<dyn std::error::Error>> {
     )));
 
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error::Error>> {
+    let mut json: serde_json::Value = serde_json::from_str(GET_BLOCK_RESPONSE_2)?;
+    remove_ironwood_value_pool(&mut json);
+
+    let obj: GetBlockResponse = serde_json::from_value(json)?;
+    let GetBlockResponse::Object(block) = obj else {
+        panic!("test response is a verbose block object");
+    };
+    let value_pools = block
+        .value_pools()
+        .as_ref()
+        .expect("verbose block has valuePools");
+
+    assert_eq!(value_pools.len(), 6);
+    assert_eq!(value_pools[4].id().as_str(), "lockbox");
+    assert_eq!(value_pools[5].id().as_str(), "ironwood");
+    assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[5].value_delta().is_some());
+    assert_eq!(
+        value_pools[5]
+            .value_delta_zat()
+            .map(|amount| amount.zatoshis()),
+        Some(0)
+    );
 
     Ok(())
 }
@@ -589,6 +686,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_root = obj.sapling().commitments().final_root().clone();
     let orchard_final_root = obj.orchard().commitments().final_root().clone();
+    assert_eq!(obj.ironwood(), &Treestate::default());
 
     let new_obj = GetTreestateResponse::new(
         hash,
@@ -600,6 +698,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         ))),
         Treestate::new(Commitments::new(sapling_final_root, sapling_final_state)),
         Treestate::new(Commitments::new(orchard_final_root, orchard_final_state)),
+        Treestate::default(),
     );
 
     assert_eq!(obj, new_obj);
@@ -633,12 +732,30 @@ fn test_z_get_subtrees_by_index() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         NoteCommitmentSubtreeIndex(start_index),
         vec![SubtreeRpcData {
-            root: subtree_root,
+            root: subtree_root.clone(),
             end_height: zebra_chain::block::Height(subtree_end_height),
         }],
     );
 
     assert_eq!(obj, new_obj);
+
+    let ironwood_json = r#"
+{
+  "pool": "ironwood",
+  "start_index": 0,
+  "subtrees": [
+    {
+      "root": "d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b",
+      "end_height": 1707429
+    }
+  ]
+}
+"#;
+    let ironwood_obj: GetSubtreesByIndexResponse = serde_json::from_str(ironwood_json)?;
+
+    assert_eq!(ironwood_obj.pool(), "ironwood");
+    assert_eq!(ironwood_obj.subtrees()[0].root, subtree_root);
+    assert_eq!(ironwood_obj.subtrees()[0].end_height.0, subtree_end_height);
 
     Ok(())
 }

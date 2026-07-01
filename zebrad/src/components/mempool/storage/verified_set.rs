@@ -482,3 +482,21 @@ impl VerifiedSet {
         metrics::gauge!("zcash.mempool.cost.bytes").set(self.total_cost as f64);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_removes_ironwood_nullifiers() {
+        let mut verified = VerifiedSet::default();
+
+        verified.ironwood_nullifiers.insert(
+            ironwood::Nullifier::try_from([0; 32]).expect("zero is a valid Pallas base field"),
+        );
+
+        verified.clear();
+
+        assert!(verified.ironwood_nullifiers.is_empty());
+    }
+}

@@ -290,15 +290,7 @@ impl PrecomputedTxData {
     pub fn ironwood_bundle(
         &self,
     ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
-        #[cfg(zcash_unstable = "nu6.3")]
-        {
-            self.tx_data.ironwood_bundle().cloned()
-        }
-
-        #[cfg(not(zcash_unstable = "nu6.3"))]
-        {
-            None
-        }
+        self.tx_data.ironwood_bundle().cloned()
     }
 
     /// Returns the Sapling bundle in `tx_data`.
@@ -528,11 +520,18 @@ fn sighash_inner(
 ///
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
-    let nu = tx.network_upgrade().expect("V5 tx has a network upgrade");
+    // Compute the v5/v6 ZIP-244 authorizing-data digest natively, avoiding the
+    // `librustzcash` reparse (see `crate::transaction::zip244`). Unsupported
+    // versions fall back to `librustzcash`.
+    if let Some(auth_digest) = crate::transaction::zip244::auth_digest(tx) {
+        return auth_digest;
+    }
+
+    let nu = tx.network_upgrade().expect("v5+ tx has a network upgrade");
 
     AuthDigest(
         tx.to_librustzcash(nu)
-            .expect("V5 tx is convertible to its `zcash_params` equivalent")
+            .expect("v5+ tx is convertible to its `zcash_params` equivalent")
             .auth_commitment()
             .as_ref()
             .try_into()
@@ -541,17 +540,48 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
 }
 
 /// Compute both the transaction ID (txid) and the ZIP-244 authorizing-data
-/// commitment of a v5+ transaction from a single librustzcash conversion.
+/// commitment of a v5+ transaction from a single `librustzcash` conversion.
 ///
 /// # Panics
 ///
 /// If passed a pre-v5 transaction.
 pub(crate) fn txid_and_auth_digest(tx: &Transaction) -> (Hash, AuthDigest) {
-    let nu = tx.network_upgrade().expect("V5 tx has a network upgrade");
+    // Compute the v5/v6 ZIP-244 txid and authorizing-data digest natively,
+    // avoiding the `librustzcash` reparse (see `crate::transaction::zip244`).
+    // Unsupported versions fall back to `librustzcash`.
+    if let Some(result) = crate::transaction::zip244::txid_and_auth_digest(tx) {
+        return result;
+    }
+
+    let nu = tx.network_upgrade().expect("v5+ tx has a network upgrade");
 
     let tx = tx
         .to_librustzcash(nu)
-        .expect("V5 tx is convertible to its `zcash_params` equivalent");
+        .expect("v5+ tx is convertible to its `zcash_params` equivalent");
+
+    let txid = Hash(*tx.txid().as_ref());
+    let auth_digest = AuthDigest(
+        tx.auth_commitment()
+            .as_ref()
+            .try_into()
+            .expect("digest has the correct size"),
+    );
+
+    (txid, auth_digest)
+}
+
+/// Computes the txid and ZIP-244 authorizing-data digest of a v5/v6 transaction
+/// strictly via the `librustzcash` conversion, bypassing the native ZIP-244
+/// path. Used only as the differential oracle for the native implementation in
+/// `crate::transaction::zip244` (see the `native_zip244_matches_librustzcash`
+/// property test).
+#[cfg(test)]
+pub(crate) fn txid_and_auth_digest_via_librustzcash(tx: &Transaction) -> (Hash, AuthDigest) {
+    let nu = tx.network_upgrade().expect("v5+ tx has a network upgrade");
+
+    let tx = tx
+        .to_librustzcash(nu)
+        .expect("v5+ tx is convertible to its `zcash_params` equivalent");
 
     let txid = Hash(*tx.txid().as_ref());
     let auth_digest = AuthDigest(

@@ -244,9 +244,7 @@ impl NoteCommitmentTrees {
     }
 
     /// Update the Ironwood note commitment tree.
-    ///
-    /// This method modifies the tree inside the [`Arc`], if the [`Arc`] only
-    /// has one reference.
+    /// This method modifies the tree inside the `Arc`, if the `Arc` only has one reference.
     #[allow(clippy::unwrap_in_result)]
     pub fn update_ironwood_note_commitment_tree(
         mut ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
@@ -259,18 +257,19 @@ impl NoteCommitmentTrees {
         NoteCommitmentTreeError,
     > {
         let ironwood_nct = Arc::make_mut(&mut ironwood);
-        let mut subtree_root = None;
 
-        for ironwood_note_commitment in ironwood_note_commitments {
-            ironwood_nct
-                .append(ironwood_note_commitment)
-                .map_err(NoteCommitmentTreeError::Ironwood)?;
+        // It is impossible for blocks to contain more than one level 16 Ironwood root:
+        // > [NU6.3 onward] nActionsIronwood MUST be less than 2^16.
+        // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
+        //
+        // The note commitments are appended as a single parallel batch, which
+        // returns the (at most one) subtree completed within this block, matching
+        // the per-leaf append exactly (see `crate::parallel::batch_frontier`).
+        let subtree_root = ironwood_nct
+            .append_batch(&ironwood_note_commitments)
+            .map_err(NoteCommitmentTreeError::Ironwood)?;
 
-            if let Some(index_and_node) = ironwood_nct.completed_subtree_index_and_root() {
-                subtree_root = Some(index_and_node);
-            }
-        }
-
+        // Re-calculate and cache the tree root.
         let _ = ironwood_nct.root();
 
         Ok((ironwood, subtree_root))

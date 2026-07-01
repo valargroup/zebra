@@ -18,16 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Transaction::V6::ironwood_shielded_data` and Ironwood accessors on
   `Transaction`, including actions, nullifiers, note commitments, flags,
   shielded-data presence, flag sufficiency, and value balance.
+- `Block::ironwood_nullifiers` and `Block::ironwood_note_commitments`.
 - `SigHasher::ironwood_bundle`.
 
 ### Changed
 
-- V6 Orchard and Ironwood transaction parsing now accepts the NU6.3
-  `enableCrossAddress` flag while preserving V5 reserved-bit enforcement.
-- Use `zcash_history::V3` from NU6.3 onward so chain history leaves commit to
-  Ironwood note commitment tree roots and Ironwood transaction counts.
-- `HistoryTree`, `NonEmptyHistoryTree`, and `zcash_history::Tree` constructors
-  and mutators now require an Ironwood note commitment tree root.
+- V5/V6 transaction IDs and ZIP-244 authorizing-data digests are now computed
+  natively instead of via a `librustzcash` conversion. The output is unchanged.
+- V5/V6 deserialization no longer runs a `librustzcash` conversion. Transactions
+  that fail it (e.g. non-canonical Orchard proofs) now deserialize successfully
+  and are rejected during consensus verification instead of at parse time.
 
 ## [9.0.0] - 2026-06-02
 

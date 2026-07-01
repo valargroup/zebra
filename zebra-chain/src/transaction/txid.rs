@@ -6,7 +6,7 @@ use crate::serialization::{sha256d, ZcashSerialize};
 
 /// A Transaction ID builder. It computes the transaction ID by hashing
 /// different parts of the transaction, depending on the transaction version.
-/// For V5 transactions, it follows [ZIP-244] and [ZIP-225].
+/// For V5 and V6 transactions, it follows [ZIP-244] and [ZIP-225].
 ///
 /// [ZIP-244]: https://zips.z.cash/zip-0244
 /// [ZIP-225]: https://zips.z.cash/zip-0225
@@ -28,7 +28,6 @@ impl<'a> TxIdBuilder<'a> {
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => self.txid_v1_to_v4(),
             Transaction::V5 { .. } => self.txid_v5(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => self.txid_v6(),
         }
     }
@@ -41,18 +40,23 @@ impl<'a> TxIdBuilder<'a> {
         Some(Hash(hash_writer.finish()))
     }
 
-    /// Compute the Transaction ID for a V5 transaction in the given network upgrade.
+    /// Compute the Transaction ID for a V5 or V6 transaction.
     /// In this case it's the hash of a tree of hashes of specific parts of the
     /// transaction, as specified in ZIP-244 and ZIP-225.
     fn txid_v5(self) -> Option<Hash> {
+        // Compute the v5/v6 ZIP-244 txid natively, directly from the parsed
+        // transaction, avoiding the `librustzcash` reparse (see `super::zip244`).
+        // Unsupported versions fall back to `librustzcash` below.
+        if let Some(txid) = super::zip244::txid(self.trans) {
+            return Some(txid);
+        }
+
         let nu = self.trans.network_upgrade()?;
 
-        // We compute v5 txid (from ZIP-244) using librustzcash.
         Some(Hash(*self.trans.to_librustzcash(nu).ok()?.txid().as_ref()))
     }
 
-    /// Passthrough to txid_v5 for V6 transactions.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    /// Passthrough to the ZIP-244 txid path for V6 transactions.
     fn txid_v6(self) -> Option<Hash> {
         self.txid_v5()
     }

@@ -3430,7 +3430,8 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
             NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
-            | NetworkUpgrade::Nu7 => {
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3 => {
                 ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&hist_root, &auth_root)
                     .bytes_in_serialized_order()
             }
@@ -4007,7 +4008,8 @@ async fn has_spending_transaction_ids() -> Result<()> {
                 .map(Spend::from)
                 .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                 .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
+                .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
                 .map(|spend| (spend, tx_hash))
                 .collect::<Vec<_>>()
         });
