@@ -1807,6 +1807,8 @@ impl Chain {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
@@ -2021,6 +2023,8 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
