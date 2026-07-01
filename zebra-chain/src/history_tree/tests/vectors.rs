@@ -109,6 +109,95 @@ fn push_and_prune_for_network_upgrade(
     Ok(())
 }
 
+/// The parts-based leaf path (`from_block_parts` / `push_from_parts`) must build a
+/// byte-identical history tree to the block-based path — it's the *same* leaf, constructed
+/// from the header + roots + shielded tx-counts instead of the block body. This is what lets
+/// header-sync verification (design §6) fold supplied roots into the MMR and check them
+/// against header commitments without downloading any block body.
+#[test]
+fn parts_path_matches_block_path() -> Result<()> {
+    for network in Network::iter() {
+        parts_path_matches_block_path_for_upgrade(network.clone(), NetworkUpgrade::Heartwood)?;
+        parts_path_matches_block_path_for_upgrade(network, NetworkUpgrade::Canopy)?;
+    }
+    Ok(())
+}
+
+fn parts_path_matches_block_path_for_upgrade(
+    network: Network,
+    network_upgrade: NetworkUpgrade,
+) -> Result<()> {
+    let (blocks, sapling_roots) = network.block_sapling_roots_map();
+    let height = network_upgrade.activation_height(&network).unwrap().0;
+
+    let first_block = Arc::new(
+        blocks
+            .get(&height)
+            .expect("test vector exists")
+            .zcash_deserialize_into::<Block>()?,
+    );
+    let second_block = Arc::new(
+        blocks
+            .get(&(height + 1))
+            .expect("test vector exists")
+            .zcash_deserialize_into::<Block>()?,
+    );
+    let first_sapling =
+        sapling::tree::Root::try_from(**sapling_roots.get(&height).expect("test vector exists"))?;
+    let second_sapling = sapling::tree::Root::try_from(
+        **sapling_roots
+            .get(&(height + 1))
+            .expect("test vector exists"),
+    )?;
+
+    // Block-based path.
+    let mut block_tree = NonEmptyHistoryTree::from_block(
+        &network,
+        first_block.clone(),
+        &first_sapling,
+        &Default::default(),
+        &Default::default(),
+    )?;
+    block_tree.push(
+        second_block.clone(),
+        &second_sapling,
+        &Default::default(),
+        &Default::default(),
+    )?;
+
+    // Parts-based path: real per-pool tx-counts, header instead of body.
+    let mut parts_tree = NonEmptyHistoryTree::from_block_parts(
+        &network,
+        &first_block.header,
+        first_block.coinbase_height().unwrap(),
+        &first_sapling,
+        &Default::default(),
+        &Default::default(),
+        first_block.sapling_transactions_count(),
+        first_block.orchard_transactions_count(),
+        first_block.ironwood_transactions_count(),
+    )?;
+    parts_tree.push_from_parts(
+        &second_block.header,
+        second_block.coinbase_height().unwrap(),
+        &second_sapling,
+        &Default::default(),
+        &Default::default(),
+        second_block.sapling_transactions_count(),
+        second_block.orchard_transactions_count(),
+        second_block.ironwood_transactions_count(),
+    )?;
+
+    assert_eq!(
+        block_tree.hash(),
+        parts_tree.hash(),
+        "parts-based history root must match the block-based root on {network} at {network_upgrade:?}"
+    );
+    assert_eq!(block_tree.size(), parts_tree.size());
+
+    Ok(())
+}
+
 /// Test the history tree works during a network upgrade using the block
 /// of a network upgrade and the previous block from the previous upgrade.
 #[test]

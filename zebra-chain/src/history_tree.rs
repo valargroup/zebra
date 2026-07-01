@@ -13,7 +13,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    block::{Block, ChainHistoryMmrRootHash, Height},
+    block::{Block, ChainHistoryMmrRootHash, Header, Height},
     fmt::SummaryDebug,
     ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
@@ -237,6 +237,104 @@ impl NonEmptyHistoryTree {
         })
     }
 
+    /// Create a new history tree with a single block, from that block's *parts* — its
+    /// header, height, per-pool note-commitment roots, and per-pool shielded tx-counts —
+    /// without the block body. Mirrors [`from_block`](Self::from_block) but builds the leaf
+    /// via [`Tree::new_from_parts`], for header-sync verification (design §6).
+    #[allow(clippy::unwrap_in_result, clippy::too_many_arguments)]
+    pub fn from_block_parts(
+        network: &Network,
+        header: &Header,
+        height: Height,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+        sapling_tx: u64,
+        orchard_tx: u64,
+        ironwood_tx: u64,
+    ) -> Result<Self, HistoryTreeError> {
+        let network_upgrade = NetworkUpgrade::current(network, height);
+        let (tree, entry) = match network_upgrade {
+            NetworkUpgrade::Genesis
+            | NetworkUpgrade::BeforeOverwinter
+            | NetworkUpgrade::Overwinter
+            | NetworkUpgrade::Sapling
+            | NetworkUpgrade::Blossom => {
+                panic!("HistoryTree does not exist for pre-Heartwood upgrades")
+            }
+            NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => {
+                let (tree, entry) = Tree::<PreOrchard>::new_from_parts(
+                    network,
+                    header,
+                    height,
+                    sapling_root,
+                    &Default::default(),
+                    &Default::default(),
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )?;
+                (InnerHistoryTree::PreOrchard(tree), entry)
+            }
+            NetworkUpgrade::Nu5
+            | NetworkUpgrade::Nu6
+            | NetworkUpgrade::Nu6_1
+            | NetworkUpgrade::Nu6_2 => {
+                let (tree, entry) = Tree::<OrchardOnward>::new_from_parts(
+                    network,
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    &Default::default(),
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )?;
+                (InnerHistoryTree::OrchardOnward(tree), entry)
+            }
+            NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => {
+                let (tree, entry) = Tree::<IronwoodOnward>::new_from_parts(
+                    network,
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    ironwood_root,
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )?;
+                (InnerHistoryTree::IronwoodOnward(tree), entry)
+            }
+            #[cfg(zcash_unstable = "zfuture")]
+            NetworkUpgrade::ZFuture => {
+                let (tree, entry) = Tree::<IronwoodOnward>::new_from_parts(
+                    network,
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    ironwood_root,
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )?;
+                (InnerHistoryTree::IronwoodOnward(tree), entry)
+            }
+        };
+        let mut peaks = BTreeMap::new();
+        peaks.insert(0u32, entry);
+        Ok(NonEmptyHistoryTree {
+            network: network.clone(),
+            network_upgrade,
+            inner: tree,
+            size: 1,
+            peaks: peaks.into(),
+            current_height: height,
+        })
+    }
+
     /// Add block data to the tree.
     ///
     /// `sapling_root` is the root of the Sapling note commitment tree of the block.
@@ -300,6 +398,94 @@ impl NonEmptyHistoryTree {
         };
         for entry in new_entries {
             // Not every entry is a peak; those will be trimmed later
+            self.peaks.insert(self.size, entry);
+            self.size += 1;
+        }
+        self.prune()?;
+        self.current_height = height;
+        Ok(())
+    }
+
+    /// Add a block to the tree from its *parts* (header + height + roots + shielded
+    /// tx-counts), without the block body. Mirrors [`push`](Self::push) but folds the leaf
+    /// via [`Tree::append_leaf_parts`], for header-sync verification (design §6).
+    #[allow(clippy::unwrap_in_result, clippy::too_many_arguments)]
+    pub fn push_from_parts(
+        &mut self,
+        header: &Header,
+        height: Height,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+        sapling_tx: u64,
+        orchard_tx: u64,
+        ironwood_tx: u64,
+    ) -> Result<(), HistoryTreeError> {
+        assert!(
+            Some(height) == self.current_height + 1,
+            "added block with height {:?} but it must be {:?}+1",
+            height,
+            self.current_height
+        );
+
+        let network_upgrade = NetworkUpgrade::current(&self.network, height);
+        if network_upgrade != self.network_upgrade {
+            // This is the activation block of a network upgrade. Create a new tree.
+            let new_tree = Self::from_block_parts(
+                &self.network,
+                header,
+                height,
+                sapling_root,
+                orchard_root,
+                ironwood_root,
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
+            )?;
+            *self = new_tree;
+            assert_eq!(self.network_upgrade, network_upgrade);
+            return Ok(());
+        }
+
+        let new_entries = match &mut self.inner {
+            InnerHistoryTree::PreOrchard(tree) => tree
+                .append_leaf_parts(
+                    header,
+                    height,
+                    sapling_root,
+                    &Default::default(),
+                    &Default::default(),
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )
+                .map_err(|e| HistoryTreeError::InnerError { inner: e })?,
+            InnerHistoryTree::OrchardOnward(tree) => tree
+                .append_leaf_parts(
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    &Default::default(),
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )
+                .map_err(|e| HistoryTreeError::InnerError { inner: e })?,
+            InnerHistoryTree::IronwoodOnward(tree) => tree
+                .append_leaf_parts(
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    ironwood_root,
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )
+                .map_err(|e| HistoryTreeError::InnerError { inner: e })?,
+        };
+        for entry in new_entries {
             self.peaks.insert(self.size, entry);
             self.size += 1;
         }
@@ -598,6 +784,70 @@ impl HistoryTree {
                     .as_mut()
                     .expect("history tree must exist Heartwood-onward")
                     .push(block.clone(), sapling_root, orchard_root, ironwood_root)?;
+            }
+        };
+        Ok(())
+    }
+
+    /// Push a block to a maybe-existing `HistoryTree` from its *parts* (header + height +
+    /// roots + shielded tx-counts), without the block body. Mirrors [`push`](Self::push),
+    /// for header-sync verification (design §6).
+    #[allow(clippy::unwrap_in_result, clippy::too_many_arguments)]
+    pub fn push_from_parts(
+        &mut self,
+        network: &Network,
+        header: &Header,
+        height: Height,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+        sapling_tx: u64,
+        orchard_tx: u64,
+        ironwood_tx: u64,
+    ) -> Result<(), HistoryTreeError> {
+        let Some(heartwood_height) = NetworkUpgrade::Heartwood.activation_height(network) else {
+            assert!(
+                self.0.is_none(),
+                "history tree must not exist pre-Heartwood"
+            );
+            return Ok(());
+        };
+
+        match height.cmp(&heartwood_height) {
+            std::cmp::Ordering::Less => {
+                assert!(
+                    self.0.is_none(),
+                    "history tree must not exist pre-Heartwood"
+                );
+            }
+            std::cmp::Ordering::Equal => {
+                let tree = Some(NonEmptyHistoryTree::from_block_parts(
+                    network,
+                    header,
+                    height,
+                    sapling_root,
+                    orchard_root,
+                    ironwood_root,
+                    sapling_tx,
+                    orchard_tx,
+                    ironwood_tx,
+                )?);
+                *self = HistoryTree(tree);
+            }
+            std::cmp::Ordering::Greater => {
+                self.0
+                    .as_mut()
+                    .expect("history tree must exist Heartwood-onward")
+                    .push_from_parts(
+                        header,
+                        height,
+                        sapling_root,
+                        orchard_root,
+                        ironwood_root,
+                        sapling_tx,
+                        orchard_tx,
+                        ironwood_tx,
+                    )?;
             }
         };
         Ok(())
