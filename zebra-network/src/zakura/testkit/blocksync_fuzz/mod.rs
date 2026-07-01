@@ -204,6 +204,8 @@ async fn stop_task(task: &mut JoinHandle<()>) {
 }
 
 /// Answers the reactor's actions from the corpus and mock apply frontier.
+// A fuzz-harness driver that wires up many independent channels/knobs; grouping
+// them into a struct would not make the test setup clearer.
 #[allow(clippy::too_many_arguments)]
 fn spawn_action_driver(
     handle: BlockSyncHandle,
