@@ -822,17 +822,10 @@ where
         > + 'static,
     Mempool::Future: Send,
 {
-    let response = match mempool.oneshot(mempool::Request::FullTransactions).await {
-        Ok(response) => response,
-        Err(error)
-            if error
-                .downcast_ref::<mempool::MempoolDisabledError>()
-                .is_some() =>
-        {
-            return Ok(Some((Vec::new(), TransactionDependencies::default())));
-        }
-        Err(error) => return Err(ErrorObject::owned(0, error.to_string(), None::<()>)),
-    };
+    let response = mempool
+        .oneshot(mempool::Request::FullTransactions)
+        .await
+        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
 
     // TODO: Order transactions in block templates based on their dependencies
 
