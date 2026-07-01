@@ -182,6 +182,31 @@ pub(crate) fn tx_no_duplicates_in_chain(
     Ok(())
 }
 
+fn add_to_non_finalized_chain_unique_with<'block, NullifierT, DuplicateNullifierErrorFn>(
+    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
+    shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
+    revealing_tx_id: SpendingTransactionId,
+    duplicate_nullifier_error: DuplicateNullifierErrorFn,
+) -> Result<(), ValidateContextError>
+where
+    NullifierT: Copy + std::fmt::Debug + Eq + std::hash::Hash + 'block,
+    DuplicateNullifierErrorFn: Fn(&NullifierT, bool) -> ValidateContextError,
+{
+    for nullifier in shielded_data_nullifiers.into_iter() {
+        trace!(?nullifier, "adding nullifier");
+
+        // reject the nullifier if it is already present in this non-finalized chain
+        if chain_nullifiers
+            .insert(*nullifier, revealing_tx_id)
+            .is_some()
+        {
+            Err(duplicate_nullifier_error(nullifier, false))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Reject double-spends of nullifers:
 /// - both within the same `JoinSplit` (sprout only),
 /// - from different `JoinSplit`s, [`sapling::Spend`](zebra_chain::sapling::Spend)s,
@@ -208,31 +233,6 @@ pub(crate) fn tx_no_duplicates_in_chain(
 /// with same bit pattern, they won't be considered the same when determining
 /// uniqueness. This is enforced by the callers of this function.
 ///
-fn add_to_non_finalized_chain_unique_with<'block, NullifierT, DuplicateNullifierErrorFn>(
-    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
-    shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
-    revealing_tx_id: SpendingTransactionId,
-    duplicate_nullifier_error: DuplicateNullifierErrorFn,
-) -> Result<(), ValidateContextError>
-where
-    NullifierT: Copy + std::fmt::Debug + Eq + std::hash::Hash + 'block,
-    DuplicateNullifierErrorFn: Fn(&NullifierT, bool) -> ValidateContextError,
-{
-    for nullifier in shielded_data_nullifiers.into_iter() {
-        trace!(?nullifier, "adding nullifier");
-
-        // reject the nullifier if it is already present in this non-finalized chain
-        if chain_nullifiers
-            .insert(*nullifier, revealing_tx_id)
-            .is_some()
-        {
-            Err(duplicate_nullifier_error(nullifier, false))?;
-        }
-    }
-
-    Ok(())
-}
-
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
     chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
