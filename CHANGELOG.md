@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Explicitly flush consensus crypto batches at the semantic block verification
+  boundary, reducing near-tip block verification latency without changing the
+  global batch latency setting.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas

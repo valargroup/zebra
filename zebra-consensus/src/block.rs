@@ -31,7 +31,7 @@ use zebra_chain::{
 };
 use zebra_state as zs;
 
-use crate::{error::*, transaction as tx, BoxError};
+use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
 pub mod request;
@@ -276,6 +276,10 @@ where
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+            let _block_batch_flush = primitives::register_block_verifier_batch_flush(
+                &known_outpoint_hashes,
+                block.transactions.len(),
+            );
 
             for (&transaction_hash, transaction) in
                 transaction_hashes.iter().zip(block.transactions.iter())

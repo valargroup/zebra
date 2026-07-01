@@ -223,6 +223,19 @@ where
     fn get_worker_error(&self) -> crate::BoxError {
         self.error_handle.get_error_on_closed()
     }
+
+    /// Explicitly flushes the current pending batch.
+    ///
+    /// The flush is queued after item requests that have already been sent to
+    /// this batch worker. This method returns when the command has been queued,
+    /// not when the underlying batch has completed.
+    pub fn flush(&self) -> Result<(), crate::BoxError> {
+        self.tx
+            .send(Message::Flush {
+                span: tracing::Span::current(),
+            })
+            .map_err(|_| self.get_worker_error())
+    }
 }
 
 impl<T, Request: RequestWeight> Service<Request> for Batch<T, Request>
@@ -330,7 +343,7 @@ where
         // acquired, so we can freely allocate a oneshot.
         let (tx, rx) = oneshot::channel();
 
-        match self.tx.send(Message {
+        match self.tx.send(Message::Item {
             request,
             tx,
             span,
