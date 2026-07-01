@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   are now bounded: `reserved_bytes` is an O(1) incrementally-maintained counter
   (cross-checked against the independent byte budget by the existing audit), and
   `advance_floor`/`reset_above` pop only the committed prefix/suffix
-  (O(removed · log n)) instead of scanning the whole map.
+  (O(removed · log n)) instead of scanning the whole map. The `publish_view`
+  scans over the `applying` map (`applying_buffered_bytes`,
+  `submitted_applying_count`/`_bytes`, and the derived `unsubmitted_applying_count`)
+  are likewise now O(1) incrementally-maintained counters instead of a scan of the
+  apply backlog on every event.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas

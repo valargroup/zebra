@@ -2852,6 +2852,93 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
 }
 
 #[test]
+fn sequencer_applying_counters_match_scan_across_transitions() {
+    // Assert the O(1) applying counters (buffered bytes, submitted count/bytes)
+    // never drift from a full scan across insert / submit / unsubmit / remove /
+    // commit-release / reset.
+    let mut seq = test_sequencer(0, 8);
+    let blocks = mainnet_blocks_1_to_3();
+    let check = |seq: &Sequencer, label: &str| {
+        assert_eq!(
+            seq.applying_buffered_bytes(),
+            seq.applying_buffered_bytes_scanned(),
+            "applying_buffered_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.submitted_applying_count(),
+            seq.submitted_applying_count_scanned(),
+            "submitted_applying_count drifted after {label}"
+        );
+        assert_eq!(
+            seq.submitted_applying_bytes(),
+            seq.submitted_applying_bytes_scanned(),
+            "submitted_applying_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.unsubmitted_applying_count(),
+            seq.applying_len() - seq.submitted_applying_count(),
+            "unsubmitted derivation wrong after {label}"
+        );
+    };
+
+    // Buffer heights 1..=3 with distinct sizes and drain them into `applying`.
+    for (i, block) in blocks.iter().enumerate() {
+        let height = (i + 1) as u32;
+        seq.accept_body(
+            block::Height(height),
+            block.hash(),
+            block.clone(),
+            100 * u64::from(height),
+            peer(0),
+        );
+    }
+    assert_eq!(
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+    assert_eq!(seq.applying_buffered_bytes(), 600);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    check(&seq, "drain");
+
+    // Submit heights 1 and 2.
+    let item1 = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 applying");
+    let _ = seq
+        .prepare_submit(block::Height(2))
+        .expect("height 2 applying");
+    assert_eq!(seq.submitted_applying_count(), 2);
+    assert_eq!(seq.submitted_applying_bytes(), 300);
+    assert_eq!(seq.unsubmitted_applying_count(), 1);
+    check(&seq, "submit 1,2");
+
+    // Roll back the submit for height 1.
+    seq.unsubmit(block::Height(1), item1.token);
+    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.submitted_applying_bytes(), 200);
+    check(&seq, "unsubmit 1");
+
+    // Remove the still-submitted height 2 directly.
+    seq.remove_applying(block::Height(2));
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.applying_buffered_bytes(), 400);
+    check(&seq, "remove submitted 2");
+
+    // Commit through height 1: releases the applied body (height 1) from `applying`.
+    seq.advance_verified_tip(block::Height(1), true);
+    assert_eq!(seq.applying_buffered_bytes(), 300);
+    check(&seq, "advance_verified_tip");
+
+    // Reset drops all applying state and zeroes the counters.
+    seq.reset_to(block::Height(0), false);
+    assert_eq!(seq.applying_buffered_bytes(), 0);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    check(&seq, "reset");
+}
+
+#[test]
 fn sequencer_accept_body_rejects_at_or_below_floor() {
     let mut seq = test_sequencer(5, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
