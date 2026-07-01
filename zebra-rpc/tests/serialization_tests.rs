@@ -202,6 +202,8 @@ fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn s
     assert_eq!(value_pools.len(), 6);
     assert_eq!(value_pools[4].id().as_str(), "ironwood");
     assert_eq!(value_pools[4].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[4].value_delta().is_none());
+    assert!(value_pools[4].value_delta_zat().is_none());
 
     Ok(())
 }
@@ -404,6 +406,13 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
     assert_eq!(value_pools.len(), 6);
     assert_eq!(value_pools[4].id().as_str(), "ironwood");
     assert_eq!(value_pools[4].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[4].value_delta().is_some());
+    assert_eq!(
+        value_pools[4]
+            .value_delta_zat()
+            .map(|amount| amount.zatoshis()),
+        Some(0)
+    );
 
     Ok(())
 }

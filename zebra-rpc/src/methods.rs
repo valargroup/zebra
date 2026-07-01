@@ -3385,7 +3385,17 @@ where
     E: serde::de::Error,
 {
     match value_pools.len() {
-        5 => value_pools.insert(4, GetBlockchainInfoBalance::ironwood(Amount::zero(), None)),
+        5 => {
+            let ironwood_delta = value_pools
+                .iter()
+                .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
+                .then(Amount::zero);
+
+            value_pools.insert(
+                4,
+                GetBlockchainInfoBalance::ironwood(Amount::zero(), ironwood_delta),
+            );
+        }
         6 => {}
         len => return Err(E::invalid_length(len, &"five or six value pool balances")),
     }
