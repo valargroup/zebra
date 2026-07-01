@@ -2317,7 +2317,7 @@ where
             // Optional TODO:
             // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
             let Some((mempool_txs, mempool_tx_deps)) =
-                fetch_mempool_transactions(mempool.clone(), tip_hash, self.network.disable_pow())
+                fetch_mempool_transactions(mempool.clone(), tip_hash)
                     .await?
                     // If the mempool and state responses are out of sync:
                     // - if we are not long polling, omit mempool transactions from the template,
