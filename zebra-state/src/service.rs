@@ -1527,20 +1527,40 @@ where
                 chain.sapling_tree(height.into()),
                 chain.orchard_tree(height.into()),
             ) {
-                (Some(sapling), Some(orchard)) => Some(BlockCommitmentRoots {
-                    height,
-                    sapling_root: sapling.root(),
-                    orchard_root: orchard.root(),
-                    // The non-finalized chain holds the full block, so derive its
-                    // ZIP-244 auth-data root to serve as the predecessor-authentication
-                    // co-input (zero only if the block is unexpectedly absent).
-                    auth_data_root: chain
+                (Some(sapling), Some(orchard)) => {
+                    // The non-finalized chain holds the full block, so derive its shielded
+                    // tx-counts and ZIP-244 auth-data root — the ZIP-221 leaf inputs the
+                    // header and roots don't provide — to serve for header-sync verification
+                    // (zero only if the block is unexpectedly absent). The Ironwood tree does
+                    // not exist below Nu7, so its root is the empty-tree root here.
+                    let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
                         .block(height.into())
-                        .map(|block| block.block.auth_data_root())
-                        .unwrap_or_else(|| {
-                            zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32])
-                        }),
-                }),
+                        .map(|block| {
+                            (
+                                block.block.sapling_transactions_count(),
+                                block.block.orchard_transactions_count(),
+                                block.block.ironwood_transactions_count(),
+                                block.block.auth_data_root(),
+                            )
+                        })
+                        .unwrap_or((
+                            0,
+                            0,
+                            0,
+                            zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+                        ));
+                    Some(BlockCommitmentRoots {
+                        height,
+                        sapling_root: sapling.root(),
+                        orchard_root: orchard.root(),
+                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default()
+                            .root(),
+                        sapling_tx,
+                        orchard_tx,
+                        ironwood_tx,
+                        auth_data_root,
+                    })
+                }
                 _ => None,
             }
             // If the height is not in the chain, serve the roots from the zakura header commitment roots by height range

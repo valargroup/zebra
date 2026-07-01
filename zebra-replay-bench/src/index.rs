@@ -130,6 +130,10 @@ pub fn run_roots(
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
+            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
             auth_data_root: state
                 .db
                 .block(height.into())

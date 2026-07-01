@@ -535,6 +535,10 @@ impl ZebraDb {
                 height,
                 sapling_root: value.sapling,
                 orchard_root: value.orchard,
+                ironwood_root: value.ironwood,
+                sapling_tx: value.sapling_tx,
+                orchard_tx: value.orchard_tx,
+                ironwood_tx: value.ironwood_tx,
                 auth_data_root: value.auth_data_root,
             });
         }
@@ -558,6 +562,10 @@ impl ZebraDb {
                 CommitmentRootsByHeight {
                     sapling: roots.sapling_root,
                     orchard: roots.orchard_root,
+                    ironwood: roots.ironwood_root,
+                    sapling_tx: roots.sapling_tx,
+                    orchard_tx: roots.orchard_tx,
+                    ironwood_tx: roots.ironwood_tx,
                     auth_data_root: roots.auth_data_root,
                 },
             );
@@ -1446,8 +1454,12 @@ fn inferred_header_range_roots(
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
                 // Placeholder default roots: this fallback range carries no real roots
-                // (the recipient re-verifies and rejects them), so the auth-data root is
-                // an unused zero here too.
+                // (the recipient re-verifies and rejects them), so the Ironwood root, the
+                // counts, and the auth-data root are all unused zeros here too.
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
                 auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
             })
         })
@@ -2112,6 +2124,10 @@ impl DiskWriteBatch {
                     CommitmentRootsByHeight {
                         sapling: roots.sapling_root,
                         orchard: roots.orchard_root,
+                        ironwood: roots.ironwood_root,
+                        sapling_tx: roots.sapling_tx,
+                        orchard_tx: roots.orchard_tx,
+                        ironwood_tx: roots.ironwood_tx,
                         auth_data_root: roots.auth_data_root,
                     },
                 );

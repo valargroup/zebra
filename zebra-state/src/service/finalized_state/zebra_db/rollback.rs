@@ -1256,6 +1256,10 @@ mod tests {
             Height(1),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
             &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         batch.insert_commitment_roots_by_height(
@@ -1263,6 +1267,10 @@ mod tests {
             Height(2),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
             &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         batch.insert_commitment_roots_by_height(
@@ -1270,6 +1278,10 @@ mod tests {
             Height(3),
             &removed_sapling,
             &removed_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
             &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         batch.insert_commitment_roots_by_height(
@@ -1277,6 +1289,10 @@ mod tests {
             Height(4),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
             &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         db.write_batch(batch)
@@ -1385,6 +1401,10 @@ mod tests {
                 Height(height),
                 &sapling_root(height.into()),
                 &orchard_root(height.into()),
+                &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                0,
+                0,
+                0,
                 &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
             );
         }

@@ -1290,6 +1290,10 @@ fn root_at(height: Height) -> BlockCommitmentRoots {
         height,
         sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
         orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx: 0,
+        orchard_tx: 0,
+        ironwood_tx: 0,
         auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
     }
 }

@@ -21,7 +21,7 @@ use std::ops::RangeInclusive;
 
 use zebra_chain::{
     block::{merkle::AuthDataRoot, Height},
-    orchard,
+    ironwood, orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
@@ -146,6 +146,10 @@ impl ZebraDb {
                 height,
                 sapling_root: value.sapling,
                 orchard_root: value.orchard,
+                ironwood_root: value.ironwood,
+                sapling_tx: value.sapling_tx,
+                orchard_tx: value.orchard_tx,
+                ironwood_tx: value.ironwood_tx,
                 auth_data_root: value.auth_data_root,
             });
         }
@@ -672,6 +676,16 @@ impl DiskWriteBatch {
         // commitment check above already verified against the header.
         let auth_data_root = finalized.block.auth_data_root();
 
+        // The per-block shielded transaction counts — the only ZIP-221 history-leaf inputs the
+        // header and roots don't provide — plus the Ironwood note-commitment root, stored in the
+        // serving index so a fast-synced node can serve them for header-sync verification (design
+        // §6). The Ironwood tree does not exist below Nu7, so its root is the empty-tree root for
+        // every currently-committable height (there is no per-height Ironwood tree store yet).
+        let sapling_tx = finalized.block.sapling_transactions_count();
+        let orchard_tx = finalized.block.orchard_transactions_count();
+        let ironwood_tx = finalized.block.ironwood_transactions_count();
+        let ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
+
         // Record the upgrade height `U` once, on the first block this binary commits: the lowest
         // height in the serving index, and the boundary below which roots are served from the
         // pre-upgrade per-height trees instead. Written on both commit paths so it is set even for
@@ -708,6 +722,10 @@ impl DiskWriteBatch {
                 *height,
                 &sapling_root,
                 &orchard_root,
+                &ironwood_root,
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
                 &auth_data_root,
             );
             self.update_history_tree(zebra_db, history_tree);
@@ -759,6 +777,10 @@ impl DiskWriteBatch {
             *height,
             &note_commitment_trees.sapling.root(),
             &note_commitment_trees.orchard.root(),
+            &ironwood_root,
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
             &auth_data_root,
         );
 
@@ -843,12 +865,17 @@ impl DiskWriteBatch {
     /// fast-synced node that holds no per-height trees — can serve the `tree_aux`
     /// `BlockRoots` read from this compact 64-byte-per-height index. Idempotent
     /// (re-inserting the same height overwrites with the identical value).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_commitment_roots_by_height(
         &mut self,
         zebra_db: &ZebraDb,
         height: Height,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+        sapling_tx: u64,
+        orchard_tx: u64,
+        ironwood_tx: u64,
         auth_data_root: &AuthDataRoot,
     ) {
         let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
@@ -858,6 +885,10 @@ impl DiskWriteBatch {
             CommitmentRootsByHeight {
                 sapling: *sapling_root,
                 orchard: *orchard_root,
+                ironwood: *ironwood_root,
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
                 auth_data_root: *auth_data_root,
             },
         );
