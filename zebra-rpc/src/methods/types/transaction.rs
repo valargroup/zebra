@@ -601,7 +601,7 @@ pub struct JoinSplit {
 pub struct ShieldedSpend {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
     #[serde(with = "hex")]
@@ -625,20 +625,12 @@ pub struct ShieldedSpend {
     spend_auth_sig: [u8; 64],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedSpend {
-    /// The value commitment to the input note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
-}
-
 /// A Sapling output of a transaction.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct ShieldedOutput {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(rename = "cmu", with = "hex")]
@@ -657,13 +649,6 @@ pub struct ShieldedOutput {
     proof: [u8; 192],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedOutput {
-    /// The value commitment to the output note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
-}
 
 /// Object with Orchard-specific information.
 #[serde_with::serde_as]
@@ -899,7 +884,7 @@ impl TransactionObject {
                     let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();
 
                     ShieldedSpend {
-                        cv: spend.cv.clone(),
+                        cv: spend.cv,
                         anchor,
                         nullifier,
                         rk,
@@ -919,7 +904,7 @@ impl TransactionObject {
                     let out_ciphertext: [u8; 80] = output.out_ciphertext.into();
 
                     ShieldedOutput {
-                        cv: output.cv.clone(),
+                        cv: output.cv,
                         cm_u,
                         ephemeral_key,
                         enc_ciphertext,
