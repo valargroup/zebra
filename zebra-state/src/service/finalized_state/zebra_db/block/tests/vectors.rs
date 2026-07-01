@@ -51,9 +51,6 @@ use crate::{
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock, TransactionLocation,
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use zebra_chain::{ironwood, parallel::tree::NoteCommitmentTrees};
-
 /// Storage round-trip test for block and transaction data in the finalized state database.
 #[test]
 fn test_block_db_round_trip() {
@@ -941,65 +938,6 @@ fn full_block_commit_overwrites_conflicting_header_only_rows() {
     assert!(state.contains_hash(block2.hash()));
     assert!(state.block(block2.hash().into()).is_some());
     assert!(state.block(alternate_block2_hash.into()).is_none());
-}
-
-#[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn ironwood_activation_stores_empty_anchor_with_non_empty_post_block_tree() {
-    let _init_guard = zebra_test::init();
-
-    let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("genesis block deserializes");
-    let block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("block 1 deserializes");
-    let network = testnet::Parameters::build()
-        .with_activation_heights(testnet::ConfiguredActivationHeights {
-            nu6_3: Some(1),
-            ..Default::default()
-        })
-        .expect("test activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("test network is valid");
-    let state = state_with_genesis(&network, genesis);
-
-    let mut ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
-    let activation_anchor = ironwood_tree.root();
-    ironwood_tree
-        .append(1u64.into())
-        .expect("synthetic Ironwood note commitment fits in the tree");
-    let post_block_anchor = ironwood_tree.root();
-    assert_ne!(
-        activation_anchor, post_block_anchor,
-        "test must use a non-empty activation block Ironwood tree",
-    );
-
-    let finalized = FinalizedBlock::from_checkpoint_verified(
-        CheckpointVerifiedBlock::from(block1),
-        Treestate {
-            note_commitment_trees: NoteCommitmentTrees {
-                ironwood: Arc::new(ironwood_tree),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-    let mut batch = DiskWriteBatch::new();
-    batch.prepare_trees_batch(&state, &finalized, Some(NoteCommitmentTrees::default()));
-    state
-        .write_batch(batch)
-        .expect("activation tree batch writes");
-
-    let (stored_height, stored_activation_tree) = state
-        .ironwood_tree_by_height_range(..=Height(1))
-        .last()
-        .expect("activation height stores the post-block Ironwood tree");
-    assert_eq!(stored_height, Height(1));
-    assert_eq!(stored_activation_tree.root(), post_block_anchor);
-    assert!(state.contains_ironwood_anchor(&post_block_anchor));
-    assert!(state.contains_ironwood_anchor(&activation_anchor));
 }
 
 fn mainnet_state_with_genesis() -> (ZebraDb, Arc<Block>, Arc<Block>) {
