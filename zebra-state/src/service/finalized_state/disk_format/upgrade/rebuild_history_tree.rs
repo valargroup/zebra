@@ -26,19 +26,17 @@
 //! # When the rebuild runs
 //!
 //! The rebuild MUST complete before any reader deserializes the history-tree column family.
-//! [`run`](Upgrade::run) is invoked from the *background* format-upgrade thread, which races
-//! synchronous readers that run during state open (backup restore, the block-write task, the
+//! The 28.0.0 Ironwood upgrade is invoked from the *background* format-upgrade thread, which races
+//! synchronous readers that run during state open (backup restore, the block-write task, and the
 //! `z_gettreestate` RPC). So the rebuild is actually performed *synchronously* while the database is
 //! being opened, by [`rebuild_tip_history_tree_if_needed`], before the background thread is spawned
-//! and before any reader runs. By the time [`run`](Upgrade::run) executes in the background,
-//! [`needs_rebuild`] is already `false`, so [`run`](Upgrade::run) is a no-op that only participates
-//! in version-marking and validation in the normal upgrade loop.
+//! and before any reader runs. By the time the background upgrade executes,
+//! [`needs_rebuild`] is already `false`, so its rebuild call is a no-op that only participates in
+//! version-marking and validation in the normal upgrade loop.
 
 use std::sync::Arc;
 
 use bincode::Options as _;
-use crossbeam_channel::Receiver;
-use semver::Version;
 use thiserror::Error;
 
 use zebra_chain::{
@@ -50,10 +48,9 @@ use zebra_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::chain::HistoryTreeParts, DiskWriteBatch, ZebraDb,
+    disk_format::{chain::HistoryTreeParts, RawBytes},
+    DiskWriteBatch, ZebraDb,
 };
-
-use super::{CancelFormatChange, DiskFormatUpgrade};
 
 /// An error that prevents the tip history tree from being rebuilt.
 #[derive(Debug, Error)]
@@ -73,74 +70,6 @@ pub enum RebuildError {
         /// The height whose block or note commitment tree could not be found.
         height: Height,
     },
-}
-
-/// Implements [`DiskFormatUpgrade`] for rebuilding the tip history tree in the current `Entry`
-/// format.
-///
-/// This upgrade is the capstone of the bump to database format major version 28: the Ironwood tree,
-/// value pool, and index data are backfilled by earlier upgrades, and this upgrade rebuilds the
-/// stored history tree entry so it uses the Ironwood-capable entry size. Its [`version`] is
-/// therefore the in-code format version, so an upgraded database ends at the running version and the
-/// standalone rollback/prune tools (which require an exact version match) accept it.
-///
-/// [`version`]: Upgrade::version
-pub struct Upgrade;
-
-impl DiskFormatUpgrade for Upgrade {
-    fn version(&self) -> Version {
-        // The capstone of the bump to format major version 28: this is the in-code format version,
-        // so an upgraded database lands at the running version. See the type-level docs.
-        //
-        // We take only the major.minor.patch and drop any build metadata (the `indexer` build tag),
-        // matching every other `version()` here. Build metadata on the on-disk version is managed
-        // separately by `apply_format_upgrade` (it is added/removed depending on the `indexer`
-        // feature), and excluding it keeps this upgrade's declared version exactly equal to the
-        // value the version-ordering checks and the standalone tools compare against.
-        let in_code = crate::constants::state_database_format_version_in_code();
-        Version::new(in_code.major, in_code.minor, in_code.patch)
-    }
-
-    fn description(&self) -> &'static str {
-        "rebuild tip history tree in current entry format"
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn run(
-        &self,
-        initial_tip_height: Height,
-        db: &ZebraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
-        // Return early if the upgrade is cancelled.
-        if cancel_receiver.try_recv().is_ok() {
-            return Err(CancelFormatChange);
-        }
-
-        // The tip tree is rebuilt synchronously while the database is opened (see
-        // `rebuild_tip_history_tree_if_needed`), so by the time this runs in the background upgrade
-        // thread there is normally nothing to do. This call is kept for idempotency and to handle
-        // the (unreachable in production) case where the synchronous rebuild was skipped.
-        if let Err(err @ RebuildError::MissingData { .. }) =
-            rebuild_tip_history_tree_if_needed(db, initial_tip_height)
-        {
-            // A pruned old-format database can't be rebuilt. Surface it as a loud, explained panic
-            // rather than marking the database as upgraded with an unreadable entry. (The
-            // synchronous open path returns this same error before this point in production.)
-            panic!("{err}");
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn validate(
-        &self,
-        db: &ZebraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
-        Ok(quick_check(db))
-    }
 }
 
 /// Rebuilds the tip history tree in the current `Entry` format if the stored entry is in an older,
@@ -189,18 +118,27 @@ pub(crate) fn rebuild_tip_history_tree_if_needed(
     Ok(())
 }
 
-/// Returns `true` if the tip history tree entry exists but cannot be deserialized in the current
-/// format, and therefore needs to be rebuilt.
+/// Returns `true` if the tip history tree entry exists under either the current empty key or the
+/// legacy height key but cannot be deserialized in the current format, and therefore needs to be
+/// rebuilt.
 ///
 /// Reads the entry as raw bytes and attempts a non-panicking deserialization in the current format.
 /// An entry that fails this check was written with a smaller `Entry` buffer by an older Zebra
 /// version, which is exactly the case this upgrade repairs.
 pub(crate) fn needs_rebuild(db: &ZebraDb) -> bool {
-    let Some(raw_entry) = db.raw_history_tree_value_cf().zs_get(&()) else {
-        // No tip tree stored (empty/pre-Heartwood database), so there is nothing to rebuild.
-        return false;
-    };
+    if let Some(raw_entry) = db.raw_history_tree_value_cf().zs_get(&()) {
+        return history_tree_entry_needs_rebuild(&raw_entry);
+    }
 
+    // Some legacy databases still have the tip tree under a height key. Read both the key and value
+    // as raw bytes, so the synchronous repair can catch an old-format entry before the later key
+    // migration tries to deserialize it.
+    db.raw_history_tree_entries_cf()
+        .zs_last_key_value()
+        .is_some_and(|(_raw_key, raw_entry)| history_tree_entry_needs_rebuild(&raw_entry))
+}
+
+fn history_tree_entry_needs_rebuild(raw_entry: &RawBytes) -> bool {
     bincode::DefaultOptions::new()
         .deserialize::<HistoryTreeParts>(raw_entry.raw_bytes())
         .is_err()
@@ -295,13 +233,13 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RebuildError::MissingData { height })?
         .root();
-    // Ironwood trees are only stored from the Ironwood activation height onwards, and are
-    // de-duplicated, so search backwards for the most recent one. Before Ironwood activation the
-    // root is the empty-tree root, which the pre-Ironwood history tree versions ignore.
-    let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
-        Some((_height, tree)) => tree.root(),
-        None => Default::default(),
-    };
+    // `ironwood_tree_by_height()` searches backwards for the most recent stored tree and returns
+    // the empty note commitment tree when no Ironwood tree has been stored yet. That empty-tree
+    // root is distinct from `ironwood::tree::Root::default()`.
+    let ironwood_root = db
+        .ironwood_tree_by_height(&height)
+        .ok_or(RebuildError::MissingData { height })?
+        .root();
 
     Ok((block, sapling_root, orchard_root, ironwood_root))
 }

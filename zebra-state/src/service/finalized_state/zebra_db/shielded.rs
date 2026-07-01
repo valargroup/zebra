@@ -709,6 +709,11 @@ impl DiskWriteBatch {
         }
 
         // Store the Ironwood tree, anchor, and any new subtrees only if they have changed.
+        if is_ironwood_activation_height {
+            let activation_anchor = ironwood::tree::NoteCommitmentTree::default().root();
+            self.insert_ironwood_anchor(zebra_db, &activation_anchor);
+        }
+
         if is_ironwood_active
             && (is_ironwood_activation_height
                 || prev_ironwood_tree != note_commitment_trees.ironwood)
@@ -885,14 +890,19 @@ impl DiskWriteBatch {
         height: &Height,
         tree: &ironwood::tree::NoteCommitmentTree,
     ) {
-        let ironwood_anchors = zebra_db.db.cf_handle("ironwood_anchors").unwrap();
         let ironwood_tree_cf = zebra_db
             .db
             .cf_handle("ironwood_note_commitment_tree")
             .unwrap();
 
-        self.zs_insert(&ironwood_anchors, tree.root(), ());
+        self.insert_ironwood_anchor(zebra_db, &tree.root());
         self.zs_insert(&ironwood_tree_cf, height, tree);
+    }
+
+    /// Inserts the Ironwood note commitment tree `anchor`.
+    pub fn insert_ironwood_anchor(&mut self, zebra_db: &ZebraDb, anchor: &ironwood::tree::Root) {
+        let ironwood_anchors = zebra_db.db.cf_handle("ironwood_anchors").unwrap();
+        self.zs_insert(&ironwood_anchors, anchor, ());
     }
 
     /// Inserts the Ironwood note commitment subtree into the batch.
