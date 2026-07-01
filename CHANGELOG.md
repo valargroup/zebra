@@ -248,6 +248,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   manipulated timestamps past the last checkpoint) could replace a longer,
   higher-work header chain by height alone and steer body-gap discovery off the
   real chain.
+- A single required block that is unavailable from all ready peers can no longer
+  globally stall block-download dispatch. Previously any hash parked on its
+  registry-miss backoff set a head-of-line gate that paused *all* reserve
+  dispatch until the retry cleared, so a peer that advertised a required hash it
+  would not serve could delay unrelated block downloads for roughly the retry
+  budget (~2 minutes) — a targeted node-level sync/catch-up DoS. The syncer now
+  reserves only a single download slot for the pending retry and keeps
+  dispatching unrelated reserve hashes while spare lookahead capacity remains. A
+  new `sync.registry_miss.pending` gauge exposes how many required blocks are
+  parked on backoff.
 
 ## [Zebra 5.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v5.0.0) - 2026-06-02
 

@@ -103,6 +103,12 @@ const MISSING_BLOCK_REGISTRY_RETRY_LIMIT: usize = 60;
 /// resumes promptly once a peer that has the block appears.
 const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Download slots to keep free for scheduled registry-miss retries.
+///
+/// This gives a temporarily unavailable required block prompt retry capacity without letting one
+/// registry-missed hash globally stop unrelated reserve dispatch.
+const REGISTRY_MISS_RESERVED_DOWNLOAD_SLOTS: usize = 1;
+
 /// A lower bound on the user-specified checkpoint verification concurrency limit.
 ///
 /// Set to the maximum checkpoint interval, so the pipeline holds around a checkpoint's
@@ -1280,17 +1286,18 @@ where
                 || (self.downloads.in_flight() >= lookahead_limit / 2
                     && self.past_lookahead_limit_receiver.cloned_watch_data());
 
-            // Head-of-line priority: while a required block is missing from all current peers and
-            // waiting on its registry-miss backoff, pause *new* speculative dispatch so in-flight
-            // downloads drain and free up ready-peer slots. Otherwise lookahead work can keep every
-            // peer busy and starve the critical retry. This is inert in healthy sync.
-            let head_of_line_starved = !self.registry_miss_retry.is_empty();
+            // Head-of-line priority: while a required block is waiting on its registry-miss
+            // backoff, keep a small amount of download capacity free for its retry. Unrelated
+            // reserve hashes can still dispatch when there is spare capacity, so one unavailable
+            // hash can't globally stall useful downloads.
+            let reserve_dispatch_limit = self.reserve_dispatch_limit(lookahead_limit);
 
-            if !past_lookahead && !head_of_line_starved && !reserve.is_empty() {
+            if !past_lookahead && reserve_dispatch_limit > 0 && !reserve.is_empty() {
                 debug!(
                     tips.len = self.prospective_tips.len(),
                     in_flight = self.downloads.in_flight(),
                     reserve = reserve.len(),
+                    reserve_dispatch_limit,
                     lookahead_limit,
                     state_tip = ?self.latest_chain_tip.best_tip_height(),
                     "requesting more blocks",
@@ -1298,7 +1305,7 @@ where
 
                 let response = timeout(
                     BLOCK_VERIFY_TIMEOUT,
-                    self.request_blocks(std::mem::take(&mut reserve)),
+                    self.request_blocks(std::mem::take(&mut reserve), reserve_dispatch_limit),
                 )
                 .await
                 .map_err(Report::from)?;
@@ -1571,7 +1578,8 @@ where
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_obtain_tips_length(new_downloads);
 
-        let response = self.request_blocks(download_set).await;
+        let dispatch_limit = self.lookahead_limit(download_set.len());
+        let response = self.request_blocks(download_set, dispatch_limit).await;
 
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());
@@ -1822,17 +1830,16 @@ where
     async fn request_blocks(
         &mut self,
         mut hashes: IndexSet<block::Hash>,
+        dispatch_limit: usize,
     ) -> Result<IndexSet<block::Hash>, BlockDownloadVerifyError> {
-        let lookahead_limit = self.lookahead_limit(hashes.len());
-
         debug!(
             hashes.len = hashes.len(),
-            ?lookahead_limit,
+            ?dispatch_limit,
             "requesting blocks",
         );
 
-        let extra_hashes = if hashes.len() > lookahead_limit {
-            hashes.split_off(lookahead_limit)
+        let extra_hashes = if hashes.len() > dispatch_limit {
+            hashes.split_off(dispatch_limit)
         } else {
             IndexSet::new()
         };
@@ -1852,6 +1859,17 @@ where
         }
 
         Ok(extra_hashes)
+    }
+
+    /// Returns how many reserve hashes can be dispatched without consuming capacity reserved for
+    /// scheduled registry-miss retries.
+    fn reserve_dispatch_limit(&mut self, lookahead_limit: usize) -> usize {
+        let reserved_registry_retry_slots =
+            REGISTRY_MISS_RESERVED_DOWNLOAD_SLOTS.min(self.registry_miss_retry.len());
+
+        lookahead_limit
+            .saturating_sub(self.downloads.in_flight())
+            .saturating_sub(reserved_registry_retry_slots)
     }
 
     /// The configured lookahead limit, based on the currently verified height,
@@ -2111,6 +2129,10 @@ where
     fn update_metrics(&mut self) {
         metrics::gauge!("sync.prospective_tips.len",).set(self.prospective_tips.len() as f64);
         metrics::gauge!("sync.downloads.in_flight",).set(self.downloads.in_flight() as f64);
+        // Required blocks parked on a registry-miss backoff. A sustained non-zero value means one or
+        // more required hashes are unavailable from all ready peers and are holding a reserved
+        // download slot; a spike can indicate a peer feeding unavailable required hashes.
+        metrics::gauge!("sync.registry_miss.pending").set(self.registry_miss_retry.len() as f64);
     }
 
     /// Return if the sync should be restarted based on the given error
