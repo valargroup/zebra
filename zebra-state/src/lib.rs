@@ -63,8 +63,10 @@ pub use service::{
     finalized_state::FinalizedState,
     init, init_read_only,
     non_finalized_state::NonFinalizedState,
+    queued_blocks::QueuedCheckpointVerified,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
+    write::BlockWriteSender,
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
 
@@ -79,6 +81,10 @@ pub use service::finalized_state::{
 pub use service::finalized_state::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
+};
+pub use service::finalized_state::{
+    produce_final_frontiers_bytes, validate_final_frontiers_bytes, FinalFrontiersGenerationError,
+    FinalFrontiersValidationError,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZebraDb},

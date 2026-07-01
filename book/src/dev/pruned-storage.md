@@ -260,6 +260,10 @@ gracefully:
   - `getblock <hash|height> 0` (raw block) and `getblock <hash|height> 2` (full
     transaction objects) both require the raw transaction bytes, so they return
     the not-found error once those bytes have been pruned.
+- Transparent address-index RPCs (`getaddressbalance`, `getaddressutxos`, and
+  `getaddresstxids`) require archive storage mode. Pruned nodes return an error
+  for these calls because pruned storage does not guarantee complete address-index
+  data.
 
 No consensus path reads raw transactions below the retained window: reorgs are
 bounded to `MAX_BLOCK_REORG_HEIGHT` (1000) blocks, well within any valid retention

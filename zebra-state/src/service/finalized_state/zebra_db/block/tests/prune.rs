@@ -21,7 +21,11 @@ use crate::{
     constants::{MAX_BLOCK_REORG_HEIGHT, MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
     request::{CheckpointVerifiedBlock, FinalizableBlock, FinalizedBlock, Treestate},
     rollback_finalized_state,
-    service::finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
+    service::finalized_state::{
+        disk_db::DiskWriteBatch,
+        disk_format::upgrade::{block_info_and_address_received, DiskFormatUpgrade},
+        FinalizedState,
+    },
     Config, ContextuallyVerifiedBlock, PruningConfig, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock,
 };
@@ -49,11 +53,119 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, "prune tests")
+            .commit_finalized_direct(block.into(), None, None, None, "prune tests")
             .expect("test block is valid");
     }
 
     state
+}
+
+/// Returns the number of entries in the column family `cf_name`.
+fn cf_len(state: &FinalizedState, cf_name: &str) -> usize {
+    use crate::service::finalized_state::disk_format::RawBytes;
+    let cf = state
+        .db
+        .db
+        .cf_handle(cf_name)
+        .expect("column family exists");
+    state
+        .db
+        .db
+        .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
+        .count()
+}
+
+/// A pruned + checkpoint-syncing node commits the UTXO set but skips transparent
+/// archive-only index column families; an archive node populates all of them.
+#[test]
+fn pruned_checkpoint_commit_skips_the_transparent_address_index() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    const BALANCE_CF: &str = "balance_by_transparent_addr";
+    const UTXO_LOC_CF: &str = "utxo_loc_by_transparent_addr_loc";
+    const TX_LOC_CF: &str = "tx_loc_by_transparent_addr_loc";
+    const SPENT_TX_LOC_CF: &str = "tx_loc_by_spent_out_loc";
+    const UTXO_SET_CF: &str = "utxo_by_out_loc";
+
+    // Archive mode keeps the address index: the early coinbase outputs populate all
+    // three address column families.
+    let archive = new_state_with_blocks(&Config::ephemeral(), &network);
+    assert!(
+        !archive.db.config().skip_archive_indexes(),
+        "archive mode keeps transparent archive-only indexes"
+    );
+    assert!(
+        cf_len(&archive, BALANCE_CF) > 0
+            && cf_len(&archive, UTXO_LOC_CF) > 0
+            && cf_len(&archive, TX_LOC_CF) > 0,
+        "archive commit populates the address index: balance={}, utxo_loc={}, tx_loc={}",
+        cf_len(&archive, BALANCE_CF),
+        cf_len(&archive, UTXO_LOC_CF),
+        cf_len(&archive, TX_LOC_CF),
+    );
+
+    // Pruned + checkpoint-sync skips archive-only indexes entirely, but still writes
+    // the consensus-critical UTXO set.
+    let pruned = new_state_with_blocks(&pruned_config(), &network);
+    assert!(
+        pruned.db.config().skip_archive_indexes(),
+        "pruned + checkpoint-sync skips transparent archive-only indexes"
+    );
+    assert_eq!(
+        (
+            cf_len(&pruned, BALANCE_CF),
+            cf_len(&pruned, UTXO_LOC_CF),
+            cf_len(&pruned, TX_LOC_CF),
+            cf_len(&pruned, SPENT_TX_LOC_CF),
+        ),
+        (0, 0, 0, 0),
+        "pruned + checkpoint-sync writes no transparent archive-only index entries"
+    );
+    assert!(
+        cf_len(&pruned, UTXO_SET_CF) > 0,
+        "the UTXO set is still written when the address index is skipped"
+    );
+}
+
+#[test]
+fn pruned_checkpoint_block_info_migration_skips_address_received_index() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+    let state = new_state_with_blocks(&pruned_config(), &network);
+
+    assert!(
+        state.db.config().skip_archive_indexes(),
+        "pruned + checkpoint-sync skips transparent archive-only indexes"
+    );
+
+    for height in 0..=TEST_BLOCKS {
+        state
+            .db
+            .block_info_cf()
+            .new_batch_for_writing()
+            .zs_delete(&Height(height))
+            .write_batch()
+            .expect("block info test setup deletes existing row");
+    }
+
+    let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+    block_info_and_address_received::Upgrade
+        .run(Height(TEST_BLOCKS), &state.db, &cancel_receiver)
+        .expect("block info migration is not cancelled");
+
+    for height in 0..=TEST_BLOCKS {
+        assert!(
+            state.db.block_info_cf().zs_get(&Height(height)).is_some(),
+            "block info migration still backfills height {height}"
+        );
+    }
+
+    assert_eq!(
+        cf_len(&state, "balance_by_transparent_addr"),
+        0,
+        "block info migration does not backfill skipped address-received balances"
+    );
 }
 
 /// Opens a fresh finalized state with a checkpoint retention start and commits
@@ -80,7 +192,7 @@ fn new_state_with_checkpoint_retention(
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, "checkpoint retention tests")
+            .commit_finalized_direct(block.into(), None, None, None, "checkpoint retention tests")
             .expect("test block is valid");
     }
 
@@ -329,6 +441,185 @@ fn retention_plan_prepare_prune_writes_expected_pruning_batch() {
 }
 
 #[test]
+fn pruned_storage_marks_address_index_unavailable() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let archive_state = new_state_with_blocks(&Config::ephemeral(), &network);
+    assert!(
+        !archive_state.db.address_index_unavailable(),
+        "archive storage with no pruning marker keeps address-index RPC guarantees"
+    );
+
+    let pruned_state = new_state_with_blocks(&pruned_config(), &network);
+    assert!(
+        pruned_state.db.address_index_unavailable(),
+        "pruned config marks address-index RPCs as unavailable before the first marker"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&archive_state.db, Height(1), Height(2));
+    archive_state
+        .db
+        .write_batch(batch)
+        .expect("pruning marker batch writes");
+    assert!(
+        archive_state.db.address_index_unavailable(),
+        "the on-disk pruning marker keeps address-index RPCs unavailable after pruning"
+    );
+}
+
+#[test]
+fn pruned_checkpoint_restart_without_checkpoint_sync_keeps_address_index_unavailable() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let tx_retention = 5;
+    let checkpoint_lowest_retained = Height(3);
+    let max_checkpoint_height = Height(tx_retention + checkpoint_lowest_retained.0 - 1);
+    let checkpoint_config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),
+        checkpoint_sync: true,
+        ..Config::ephemeral()
+    };
+
+    let mut checkpoint_state = new_unvalidated_state_with_checkpoint_retention(
+        &checkpoint_config,
+        &network,
+        max_checkpoint_height,
+    );
+    let blocks = network.blockchain_map();
+    for height in 0..=max_checkpoint_height.0 {
+        let block: Arc<Block> = blocks
+            .get(&height)
+            .expect("block height has test data")
+            .zcash_deserialize_into()
+            .expect("test data deserializes");
+
+        checkpoint_state
+            .commit_finalized_direct(block.into(), None, None, None, "checkpoint restart tests")
+            .expect("test block is valid");
+    }
+
+    assert!(
+        checkpoint_state.db.config().skip_archive_indexes(),
+        "pruned checkpoint sync skips transparent archive-only indexes"
+    );
+    assert_eq!(
+        checkpoint_state.db.lowest_retained_height(),
+        Some(checkpoint_lowest_retained),
+        "skipped checkpoint raw transactions write the pruning marker"
+    );
+    std::mem::drop(checkpoint_state);
+
+    let semantic_config = Config {
+        checkpoint_sync: false,
+        ..checkpoint_config
+    };
+    let reopened = new_unvalidated_state_with_checkpoint_retention(
+        &semantic_config,
+        &network,
+        max_checkpoint_height,
+    );
+
+    assert!(
+        !reopened.db.config().skip_archive_indexes(),
+        "runtime config alone would resume transparent archive-only index writes"
+    );
+    assert!(
+        reopened.db.is_pruned(),
+        "the pruning marker is durable across the checkpoint-sync toggle"
+    );
+    assert!(
+        reopened.db.address_index_unavailable(),
+        "a database that skipped archive indexes keeps address RPCs disabled after restart"
+    );
+}
+
+/// A pruned checkpoint-sync database is durably marked as pruned from its first
+/// commit, before raw-transaction pruning advances the `is_pruned` cursor.
+///
+/// With `MIN_PRUNING_RETENTION` far above the handful of committed blocks, online
+/// pruning never runs, so `is_pruned` stays false — the initial-sync window. The
+/// address index is nonetheless already skipped, so `committed_in_pruned_mode`
+/// must be set to keep the database from masquerading as a full archive.
+#[test]
+fn pruned_mode_marker_is_written_before_raw_transaction_pruning() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let pruned = new_state_with_blocks(&pruned_config(), &network);
+
+    assert!(
+        !pruned.db.is_pruned(),
+        "few-block pruned sync has not advanced the raw-transaction pruning cursor yet"
+    );
+    assert!(
+        pruned.db.committed_in_pruned_mode(),
+        "the durable pruned-mode marker is written on the first pruned commit"
+    );
+    assert!(
+        pruned.db.address_index_unavailable(),
+        "address-index RPCs stay unavailable in the pre-cursor window"
+    );
+}
+
+/// Reopening a pruned checkpoint-sync database in archive mode must panic even in
+/// the initial-sync window, before raw-transaction pruning has written the
+/// `is_pruned` cursor. The durable pruned-mode marker written on the first pruned
+/// commit is what blocks this otherwise-silent reopen, which would serve an
+/// address index missing every block committed while it was skipped.
+#[test]
+#[should_panic(expected = "pruned")]
+fn reopening_pre_cursor_pruned_database_in_archive_mode_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let pruned = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }),
+        checkpoint_sync: true,
+        ..Config::default()
+    };
+
+    // Commit a handful of blocks in pruned checkpoint-sync mode, then drop the
+    // handle to release the database lock. Raw-transaction pruning never runs
+    // (retention is far above the block count), so `is_pruned` stays false while
+    // the address index has already been skipped.
+    {
+        let state = new_state_with_blocks(&pruned, &network);
+        assert!(
+            !state.db.is_pruned() && state.db.committed_in_pruned_mode(),
+            "pre-cursor pruned window: no raw-tx cursor yet, but pruned-mode marker set"
+        );
+    }
+
+    // Reopening in archive mode must refuse, because the skipped address index
+    // cannot be served. Skip format upgrades so the archive-reopen guard — the
+    // behavior under test — is what fires: with format checks enabled, the
+    // concurrent format-check thread also rejects the missing index, and on a tiny
+    // test database it can win the race and abort with a less specific message.
+    let archive = Config {
+        storage_mode: StorageMode::Archive,
+        ..pruned
+    };
+    let _state = FinalizedState::new_with_debug_without_storage_validation(
+        &archive,
+        &network,
+        true,
+        #[cfg(feature = "elasticsearch")]
+        false,
+        false,
+    );
+}
+
+#[test]
 fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
@@ -351,7 +642,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, "checkpoint handoff tests")
+            .commit_finalized_direct(block.into(), None, None, None, "checkpoint handoff tests")
             .expect("test block is valid");
     }
 
@@ -386,7 +677,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         .expect("test data deserializes");
 
     state
-        .commit_finalized_direct(block.into(), None, "checkpoint handoff tests")
+        .commit_finalized_direct(block.into(), None, None, None, "checkpoint handoff tests")
         .expect("handoff block is valid");
 
     let online_prune_until =
@@ -630,7 +921,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, "archive phase")
+            .commit_finalized_direct(block.into(), None, None, None, "archive phase")
             .expect("archive block is valid");
     }
 
@@ -670,7 +961,13 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         .expect("test data deserializes");
 
     pruned_state
-        .commit_finalized_direct(block.into(), None, "archive to pruned checkpoint")
+        .commit_finalized_direct(
+            block.into(),
+            None,
+            None,
+            None,
+            "archive to pruned checkpoint",
+        )
         .expect("checkpoint block is valid");
 
     assert_eq!(
@@ -728,7 +1025,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, "archive phase")
+            .commit_finalized_direct(block.into(), None, None, None, "archive phase")
             .expect("archive block is valid");
     }
     std::mem::drop(archive_state);
@@ -761,7 +1058,13 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
         .zcash_deserialize_into()
         .expect("test data deserializes");
     pruned_state
-        .commit_finalized_direct(block.into(), None, "archive to pruned checkpoint")
+        .commit_finalized_direct(
+            block.into(),
+            None,
+            None,
+            None,
+            "archive to pruned checkpoint",
+        )
         .expect("checkpoint block is valid");
     assert_eq!(
         pruned_state.db.lowest_retained_height(),
@@ -842,7 +1145,13 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         .zcash_deserialize_into()
         .expect("genesis test data deserializes");
     state
-        .commit_finalized_direct(genesis.into(), None, "contextual retention tests")
+        .commit_finalized_direct(
+            genesis.into(),
+            None,
+            None,
+            None,
+            "contextual retention tests",
+        )
         .expect("genesis block is valid");
 
     let block: Arc<Block> = blocks
@@ -858,7 +1167,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
     let finalizable = FinalizableBlock::new(contextually_verified, Treestate::default());
 
     state
-        .commit_finalized_direct(finalizable, None, "contextual retention tests")
+        .commit_finalized_direct(finalizable, None, None, None, "contextual retention tests")
         .expect("contextual block is valid");
 
     assert!(
@@ -876,7 +1185,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
 }
 
 #[test]
-fn rollback_reports_missing_block_when_checkpoint_raw_transactions_were_skipped() {
+fn rollback_rejects_pruned_storage_before_address_index_rollback() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
     let dir = tempfile::tempdir().expect("temp dir is created");
@@ -900,11 +1209,11 @@ fn rollback_reports_missing_block_when_checkpoint_raw_transactions_were_skipped(
             max_checkpoint_height: None,
         },
     )
-    .expect_err("rollback cannot remove blocks whose raw transactions were skipped");
+    .expect_err("rollback is unsupported for pruned storage");
 
     assert!(
-        matches!(error, RollbackFinalizedStateError::MissingBlock { height } if height < checkpoint_lowest_retained),
-        "rollback reports that skipped raw block data is unavailable: {error:?}"
+        matches!(error, RollbackFinalizedStateError::AddressIndexUnavailable),
+        "rollback rejects pruned storage before address-index rollback: {error:?}"
     );
 }
 
@@ -1102,6 +1411,162 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 
     // Reopening in archive mode (the default) must refuse, because pruned data
     // can't be served.
+    let _state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+}
+
+#[test]
+fn reopening_fast_synced_database_in_archive_mode_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    // Commit blocks, write the verified-commitment-trees fast-sync marker, then drop
+    // the handle to release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // A completed fast-synced database can reopen in archive mode even when the initial-rollout
+    // force-disable knob selects manual recomputation. Fast sync deletes nothing; the missing
+    // historical trees are surfaced at the RPC boundary, not by refusing to reopen.
+    let config = Config {
+        vct_fast_sync: false,
+        ..config
+    };
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the archive-mode reopen"
+    );
+}
+
+#[test]
+fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }),
+        ..Config::default()
+    };
+
+    // Commit blocks, write a completed fast-sync marker below the tip, then drop the handle to
+    // release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Pruning only removes historical raw transaction bytes; it does not make a completed
+    // fast-sync marker unsafe to reopen with VCT force-disabled.
+    let config = Config {
+        vct_fast_sync: false,
+        ..config
+    };
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the pruned-mode reopen"
+    );
+}
+
+#[test]
+#[should_panic(expected = "interrupted below the checkpoint handoff")]
+fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // `checkpoint_sync = false` selects the legacy committer (no VCT state), so nothing can
+    // supply the verified roots an interrupted fast sync needs to resume.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: false,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Reopening with the fast path disabled must refuse: the on-disk frontier is stale and no
+    // root source exists, so the committer would otherwise stall on every below-handoff block.
+    let _state = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+}
+
+#[test]
+#[should_panic(expected = "interrupted below the checkpoint handoff")]
+fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // Keep checkpoint sync enabled, but force-disable the VCT source. This should be just as
+    // unsafe as disabling checkpoint sync when the database is below a durable fast-sync marker.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        vct_fast_sync: false,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Reopening with the VCT force-disable knob must refuse: the on-disk frontier is stale and
+    // no root source exists, so the committer would otherwise stall on every below-handoff block.
     let _state = FinalizedState::new(
         &config,
         &network,

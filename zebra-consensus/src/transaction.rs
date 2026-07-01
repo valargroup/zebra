@@ -408,6 +408,27 @@ where
             check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
+            // # Consensus
+            //
+            // > Check that an Output description's cv and epk are not of small
+            // > order, [and] that a Spend description's cv and rk are not of
+            // > small order.
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#outputdesc
+            // https://zips.z.cash/protocol/protocol.pdf#spenddesc
+            //
+            // The not-small-order check for Sapling cv and epk is deferred from
+            // deserialization, which stores them as raw bytes to keep point
+            // decompression off the checkpoint-sync hot path (the checkpoint
+            // verifier does not need it, because it trusts block hashes). Enforce
+            // it here on the semantic verification path and the mempool, which
+            // process untrusted transactions, before any state lookup or the
+            // librustzcash conversion so an invalid point fails fast. (Spend rk
+            // is still validated at deserialization.)
+            if !tx.sapling_point_encodings_are_valid() {
+                return Err(TransactionError::SmallOrder);
+            }
+
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //
             // This soft fork was added while NU 6.1 was the active epoch on the Zcash

@@ -11,11 +11,13 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
+    ironwood, orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
         Network, NetworkUpgrade,
     },
+    sapling,
     subtree::NoteCommitmentSubtreeIndex,
     transaction,
     transparent::{self, Input},
@@ -29,6 +31,7 @@ use crate::{
         finalized_state::{
             disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
             disk_format::{
+                shielded::CommitmentRootsByHeight,
                 transparent::{
                     AddressBalanceLocation, AddressTransaction, AddressUnspentOutput,
                     OutputLocation,
@@ -40,7 +43,8 @@ use crate::{
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZebraDb,
             },
-            STATE_COLUMN_FAMILIES_IN_CODE,
+            COMMITMENT_ROOTS_BY_HEIGHT, STATE_COLUMN_FAMILIES_IN_CODE,
+            ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -110,6 +114,12 @@ pub enum RollbackFinalizedStateError {
     /// The state database has no finalized tip.
     #[error("state database is empty")]
     EmptyState,
+
+    /// Pruned storage does not guarantee complete transparent address indexes.
+    #[error(
+        "cannot roll back a pruned state database because transparent address indexes are unavailable"
+    )]
+    AddressIndexUnavailable,
 
     /// The requested target height is above the finalized tip.
     #[error("target height {target:?} is above finalized tip {tip:?}")]
@@ -381,6 +391,10 @@ fn validate_rollback(
     db: &ZebraDb,
     options: &RollbackFinalizedStateOptions,
 ) -> Result<RollbackBounds, RollbackFinalizedStateError> {
+    if db.address_index_unavailable() {
+        return Err(RollbackFinalizedStateError::AddressIndexUnavailable);
+    }
+
     let old_tip = db.tip().ok_or(RollbackFinalizedStateError::EmptyState)?;
     let (old_tip_height, _) = old_tip;
 
@@ -549,6 +563,61 @@ fn block_has_sprout_commitments(block: &Block) -> bool {
     block.sprout_note_commitments().next().is_some()
 }
 
+/// Blocking DB-open repair for an incompatible stored `history_tree`.
+///
+/// If the stored tip history tree cannot be decoded by the current code, rebuild it from the
+/// finalized blocks plus Sapling/Orchard roots using the same algorithm rollback uses, then write
+/// it back before the background format-validity check can read the old value.
+///
+/// The roots come from the compact per-height root index when present, so post-index VCT
+/// fast-synced databases can be repaired without historical tree rows. Pre-index archive
+/// databases fall back to deriving roots from per-height trees. Databases missing both sources
+/// fail closed with remediation instead of attempting a partial rebuild.
+pub(crate) fn repair_tip_history_tree_if_incompatible(db: &ZebraDb, network: &Network) {
+    let Some(tip_height) = db.finalized_tip_height() else {
+        return;
+    };
+    // Pre-Heartwood (no history tree) needs no repair.
+    if NetworkUpgrade::current(network, tip_height) < NetworkUpgrade::Heartwood {
+        return;
+    }
+    // Healthy DBs (the common case) decode fine: no-op, no rebuild.
+    if let Err(error) = db.check_tip_history_tree_decodes() {
+        tracing::warn!(
+            ?tip_height,
+            ?error,
+            "stored history tree is incompatible with this binary; rebuilding it from finalized \
+             blocks and commitment roots before startup"
+        );
+    } else {
+        return;
+    }
+
+    match rebuild_history_tree_from_upgrade_activation(db, network, tip_height) {
+        Ok(rebuilt) => {
+            let mut batch = DiskWriteBatch::new();
+            batch.update_history_tree(db, &rebuilt);
+            db.write_batch(batch)
+                .expect("history-tree repair batch write should succeed");
+            tracing::info!(
+                ?tip_height,
+                history_root = ?rebuilt.hash(),
+                "history-tree repair complete; rebuilt tip tree written in the current format"
+            );
+        }
+        Err(error) => {
+            panic!(
+                "cannot repair the incompatible history tree at tip {tip_height:?}: {error}. \
+                 The repair requires finalized block bodies plus Sapling/Orchard roots from the \
+                 current network-upgrade activation height through the tip. Roots can come from \
+                 `commitment_roots_by_height` or from per-height trees. If this database predates \
+                 the root index and is VCT fast-synced or pruned, re-sync from genesis or repair \
+                 from an archive-capable database."
+            );
+        }
+    }
+}
+
 fn rebuild_history_tree_from_upgrade_activation(
     db: &ZebraDb,
     network: &Network,
@@ -594,6 +663,20 @@ fn history_rebuild_inputs_at_height(
     let block = db
         .block(height.into())
         .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
+
+    if let Some(roots) = db
+        .commitment_roots_by_height_range(height..=height)
+        .into_iter()
+        .next()
+    {
+        return Ok((
+            block,
+            roots.sapling_root,
+            roots.orchard_root,
+            roots.ironwood_root,
+        ));
+    }
+
     let sapling_root = db
         .sapling_tree_by_height(&height)
         .ok_or(RollbackFinalizedStateError::MissingSaplingTree { height })?
@@ -679,6 +762,12 @@ fn reverse_transparent_block(
     // (see `prepare_transparent_transaction_batch`). Undoing the operations in the exact reverse
     // order retraces those same in-range intermediate balances, so the checked balance arithmetic
     // below cannot spuriously overflow or underflow.
+    // A pruned, checkpoint-syncing node never built the transparent archive-only indexes
+    // ([`Config::skip_archive_indexes`]), so there is nothing to un-credit / un-debit
+    // or remove from the finalized transparent spender index. The UTXO-set reversal
+    // (`utxo_by_out_loc`) below still runs.
+    let skip_index = db.config().skip_archive_indexes();
+
     for (tx_index, transaction) in block.transactions.iter().enumerate().rev() {
         let tx_location = TransactionLocation::from_usize(height, tx_index);
 
@@ -687,21 +776,23 @@ fn reverse_transparent_block(
             let created_output_location =
                 OutputLocation::from_usize(height, tx_index, output_index);
 
-            if let Some(address) = output.address(network) {
-                let address_location =
-                    cached_address_balance(db, address_balances, &address)?.address_location();
+            if !skip_index {
+                if let Some(address) = output.address(network) {
+                    let address_location =
+                        cached_address_balance(db, address_balances, &address)?.address_location();
 
-                batch.zs_delete(
-                    db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
-                    AddressTransaction::new(address_location, tx_location),
-                );
-                batch.zs_delete(
-                    db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
-                    AddressUnspentOutput::new(address_location, created_output_location),
-                );
+                    batch.zs_delete(
+                        db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
+                        AddressTransaction::new(address_location, tx_location),
+                    );
+                    batch.zs_delete(
+                        db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
+                        AddressUnspentOutput::new(address_location, created_output_location),
+                    );
 
-                sub_address_balance(db, address_balances, &address, output.value())?;
-                sub_address_received(db, address_balances, &address, output.value());
+                    sub_address_balance(db, address_balances, &address, output.value())?;
+                    sub_address_received(db, address_balances, &address, output.value());
+                }
             }
 
             batch.zs_delete(
@@ -714,21 +805,23 @@ fn reverse_transparent_block(
         for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
             let (spent_output_location, spent_utxo) = finalized_output(db, &spent_outpoint)?;
 
-            if let Some(address) = spent_utxo.output.address(network) {
-                let address_location =
-                    cached_address_balance(db, address_balances, &address)?.address_location();
+            if !skip_index {
+                if let Some(address) = spent_utxo.output.address(network) {
+                    let address_location =
+                        cached_address_balance(db, address_balances, &address)?.address_location();
 
-                batch.zs_delete(
-                    db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
-                    AddressTransaction::new(address_location, tx_location),
-                );
-                batch.zs_insert(
-                    db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
-                    AddressUnspentOutput::new(address_location, spent_output_location),
-                    (),
-                );
+                    batch.zs_delete(
+                        db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
+                        AddressTransaction::new(address_location, tx_location),
+                    );
+                    batch.zs_insert(
+                        db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
+                        AddressUnspentOutput::new(address_location, spent_output_location),
+                        (),
+                    );
 
-                add_address_balance(db, address_balances, &address, spent_utxo.output.value())?;
+                    add_address_balance(db, address_balances, &address, spent_utxo.output.value())?;
+                }
             }
 
             batch.zs_insert(
@@ -736,6 +829,8 @@ fn reverse_transparent_block(
                 spent_output_location,
                 &spent_utxo.output,
             );
+            // In `skip_index` mode the forward path never wrote this archive-only
+            // key, so this delete is a harmless no-op.
             batch.zs_delete(
                 db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
                 spent_output_location,
@@ -888,6 +983,10 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         .db
         .cf_handle("zakura_header_body_size_by_height")
         .unwrap();
+    let roots_by_height = db
+        .db
+        .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+        .unwrap();
 
     let Some((tip_height, _tip_hash)) = db
         .db
@@ -903,6 +1002,7 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         batch.zs_delete(&hash_by_height, height);
         batch.zs_delete(&header_by_height, height);
         batch.zs_delete(&body_size_by_height, height);
+        batch.zs_delete(&roots_by_height, height);
     }
 }
 
@@ -966,6 +1066,8 @@ fn prune_tree_indexes(
     target_height: Height,
     retained_sprout_roots: &Option<HashSet<zebra_chain::sprout::tree::Root>>,
 ) {
+    let retained_shielded_roots = retained_shielded_roots(db, target_height);
+
     let sapling_trees: BTreeMap<_, _> = db
         .sapling_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
@@ -973,8 +1075,11 @@ fn prune_tree_indexes(
         ))
         .collect();
     for (height, tree) in sapling_trees {
+        let root = tree.root();
         batch.delete_sapling_tree(db, &height);
-        batch.delete_sapling_anchor(db, &tree.root());
+        if !retained_shielded_roots.sapling.contains(&root) {
+            batch.delete_sapling_anchor(db, &root);
+        }
     }
 
     let orchard_trees: BTreeMap<_, _> = db
@@ -984,8 +1089,11 @@ fn prune_tree_indexes(
         ))
         .collect();
     for (height, tree) in orchard_trees {
+        let root = tree.root();
         batch.delete_orchard_tree(db, &height);
-        batch.delete_orchard_anchor(db, &tree.root());
+        if !retained_shielded_roots.orchard.contains(&root) {
+            batch.delete_orchard_anchor(db, &root);
+        }
     }
 
     let ironwood_trees: BTreeMap<_, _> = db
@@ -995,9 +1103,21 @@ fn prune_tree_indexes(
         ))
         .collect();
     for (height, tree) in ironwood_trees {
+        let root = tree.root();
         batch.delete_ironwood_tree(db, &height);
-        batch.delete_ironwood_anchor(db, &tree.root());
+        if !retained_shielded_roots.ironwood.contains(&root) {
+            batch.delete_ironwood_anchor(db, &root);
+        }
     }
+
+    // Fast-sync writes anchors and this root index without writing per-height trees. Use the
+    // index to remove anchors introduced only by rolled-back fast-path heights before truncating
+    // it, but retain any repeated root that is still valid at or below the target.
+    prune_fast_commitment_anchors_from_index(db, batch, target_height, &retained_shielded_roots);
+
+    // Truncate the per-height commitment-roots serving index above the target, so a rolled-back
+    // database does not serve roots for heights it no longer holds.
+    batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
 
     // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
@@ -1042,6 +1162,75 @@ fn prune_tree_indexes(
     batch.delete_range_sprout_tree(db, &next_height, &Height::MAX);
 }
 
+#[derive(Default)]
+struct RetainedShieldedRoots {
+    sapling: HashSet<sapling::tree::Root>,
+    orchard: HashSet<orchard::tree::Root>,
+    ironwood: HashSet<ironwood::tree::Root>,
+}
+
+fn retained_shielded_roots(db: &ZebraDb, target_height: Height) -> RetainedShieldedRoots {
+    let mut retained = RetainedShieldedRoots::default();
+
+    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+    for (_height, roots) in db
+        .db
+        .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(
+            &commitment_roots_by_height,
+            ..=target_height,
+        )
+    {
+        retained.sapling.insert(roots.sapling);
+        retained.orchard.insert(roots.orchard);
+        retained.ironwood.insert(roots.ironwood);
+    }
+
+    for (_height, tree) in db.sapling_tree_by_height_range(..=target_height) {
+        retained.sapling.insert(tree.root());
+    }
+
+    for (_height, tree) in db.orchard_tree_by_height_range(..=target_height) {
+        retained.orchard.insert(tree.root());
+    }
+
+    for (_height, tree) in db.ironwood_tree_by_height_range(..=target_height) {
+        retained.ironwood.insert(tree.root());
+    }
+
+    retained
+}
+
+fn prune_fast_commitment_anchors_from_index(
+    db: &ZebraDb,
+    batch: &mut DiskWriteBatch,
+    target_height: Height,
+    retained_roots: &RetainedShieldedRoots,
+) {
+    let commitment_roots_by_height = db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+    let rolled_back_roots: BTreeMap<_, CommitmentRootsByHeight> = db
+        .db
+        .zs_forward_range_iter(
+            &commitment_roots_by_height,
+            (
+                std::ops::Bound::Excluded(target_height),
+                std::ops::Bound::Unbounded,
+            ),
+        )
+        .collect();
+
+    for (_height, roots) in rolled_back_roots {
+        if !retained_roots.sapling.contains(&roots.sapling) {
+            batch.delete_sapling_anchor(db, &roots.sapling);
+        }
+        if !retained_roots.orchard.contains(&roots.orchard) {
+            batch.delete_orchard_anchor(db, &roots.orchard);
+        }
+        if !retained_roots.ironwood.contains(&roots.ironwood) {
+            batch.delete_ironwood_anchor(db, &roots.ironwood);
+        }
+    }
+}
+
 fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
@@ -1060,16 +1249,9 @@ mod tests {
 
     use super::*;
 
-    /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
-    /// including the hash→height index, while leaving rows at or below the target intact. This
-    /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip
-    /// instead of stalling on an un-requestable floor (see the function doc).
-    #[test]
-    fn delete_zakura_headers_above_truncates_the_header_store() {
-        let _init_guard = zebra_test::init();
-
+    fn ephemeral_mainnet_db() -> ZebraDb {
         let network = Network::Mainnet;
-        let db = ZebraDb::new(
+        ZebraDb::new(
             &Config::ephemeral(),
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -1079,7 +1261,236 @@ mod tests {
                 .iter()
                 .map(ToString::to_string),
             false,
+        )
+    }
+
+    fn sapling_note_commitment(value: u64) -> sapling::tree::NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<sapling::tree::NoteCommitmentUpdate>::from(
+            sapling::tree::NoteCommitmentUpdate::from_bytes(&bytes),
+        )
+        .expect("small little-endian integers are canonical Jubjub field elements")
+    }
+
+    fn sapling_root(value: u64) -> sapling::tree::Root {
+        let mut tree = sapling::tree::NoteCommitmentTree::default();
+        tree.append(sapling_note_commitment(value))
+            .expect("single-note Sapling tree is not full");
+        tree.root()
+    }
+
+    fn orchard_root(value: u64) -> orchard::tree::Root {
+        let mut tree = orchard::tree::NoteCommitmentTree::default();
+        tree.append(halo2::pasta::pallas::Base::from(value))
+            .expect("single-note Orchard tree is not full");
+        tree.root()
+    }
+
+    /// Fast-path VCT commits write Sapling/Orchard anchors and the compact
+    /// `commitment_roots_by_height` index, but skip per-height tree rows. Rollback must
+    /// therefore prune stale anchors from the index before truncating it; otherwise anchors
+    /// from rolled-back fast commits stay valid for contextual verification.
+    #[test]
+    fn prune_tree_indexes_drops_fast_index_anchors_above_target() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let retained_sapling = sapling_root(1);
+        let removed_sapling = sapling_root(2);
+        let retained_orchard = orchard_root(1);
+        let removed_orchard = orchard_root(2);
+
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_anchor(&db, &retained_sapling);
+        batch.insert_sapling_anchor(&db, &removed_sapling);
+        batch.insert_orchard_anchor(&db, &retained_orchard);
+        batch.insert_orchard_anchor(&db, &removed_orchard);
+
+        // Heights 1 and 2 are retained. Height 3 is rolled back and has a unique stale
+        // anchor. Height 4 is also rolled back, but repeats the retained root, so its anchor
+        // must remain valid after the index row is truncated.
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(1),
+            &retained_sapling,
+            &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(2),
+            &retained_sapling,
+            &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        );
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(3),
+            &removed_sapling,
+            &removed_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        );
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(4),
+            &retained_sapling,
+            &retained_orchard,
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            0,
+            0,
+            0,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        );
+        db.write_batch(batch)
+            .expect("seeding fast-path roots succeeds");
+
+        let mut batch = DiskWriteBatch::new();
+        prune_tree_indexes(&db, &mut batch, Height(2), &None);
+        db.write_batch(batch)
+            .expect("pruning fast-path roots succeeds");
+
+        assert!(
+            db.contains_sapling_anchor(&retained_sapling),
+            "rollback retains Sapling anchors still valid at or below the target"
+        );
+        assert!(
+            db.contains_orchard_anchor(&retained_orchard),
+            "rollback retains Orchard anchors still valid at or below the target"
+        );
+        assert!(
+            !db.contains_sapling_anchor(&removed_sapling),
+            "rollback removes Sapling anchors introduced only by rolled-back fast commits"
+        );
+        assert!(
+            !db.contains_orchard_anchor(&removed_orchard),
+            "rollback removes Orchard anchors introduced only by rolled-back fast commits"
+        );
+        assert_eq!(
+            db.commitment_roots_by_height_range(Height(1)..=Height(4))
+                .into_iter()
+                .map(|roots| roots.height)
+                .collect::<Vec<_>>(),
+            vec![Height(1), Height(2)],
+            "rollback truncates the serving index above the target"
+        );
+    }
+
+    /// `vct_tree_absent` marks exactly the half-open band `[U, H)`: heights below the upgrade
+    /// height `U` keep their pre-upgrade trees, and heights at or above the handoff `H` get trees
+    /// again from semantic sync. With no handoff marker the database is a normal archive and no
+    /// height is ever absent.
+    #[test]
+    fn vct_tree_absent_marks_only_the_upgrade_to_handoff_band() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // No markers: a normally-synced archive database, never absent.
+        assert!(!db.vct_tree_absent(Height(0)));
+        assert!(!db.vct_tree_absent(Height(100)));
+
+        // Upgrade U = 4, handoff H = 10: per-height trees absent exactly in [4, 10).
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        batch.update_vct_sync_marker(&db, Height(10));
+        db.write_batch(batch).expect("seeding vct markers succeeds");
+
+        assert!(
+            !db.vct_tree_absent(Height(3)),
+            "below U: the pre-upgrade tree is present"
+        );
+        assert!(db.vct_tree_absent(Height(4)), "at U: the tree is absent");
+        assert!(db.vct_tree_absent(Height(9)), "below H: the tree is absent");
+        assert!(
+            !db.vct_tree_absent(Height(10)),
+            "at H: the handoff tree is present"
+        );
+        assert!(
+            !db.vct_tree_absent(Height(11)),
+            "above H: the semantic-sync tree is present"
+        );
+    }
+
+    /// When the upgrade height is at or above the handoff — a node upgraded after the last
+    /// checkpoint, where semantic sync keeps writing trees — the band `[U, H)` is empty, so every
+    /// height is servable regardless of the upgrade height.
+    #[test]
+    fn vct_tree_absent_empty_band_when_upgraded_above_handoff() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(15));
+        batch.update_vct_sync_marker(&db, Height(10));
+        db.write_batch(batch).expect("seeding vct markers succeeds");
+
+        for height in [0, 9, 10, 12, 15, 20] {
+            assert!(
+                !db.vct_tree_absent(Height(height)),
+                "U >= H leaves an empty band, so height {height} is servable"
+            );
+        }
+    }
+
+    /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight
+    /// from the serving index, without touching the per-height trees.
+    #[test]
+    fn serve_block_roots_serves_at_or_above_upgrade_from_index() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // Index covers [4, 6]; the upgrade height is U = 4.
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        for height in 4u32..=6 {
+            batch.insert_commitment_roots_by_height(
+                &db,
+                Height(height),
+                &sapling_root(height.into()),
+                &orchard_root(height.into()),
+                &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                0,
+                0,
+                0,
+                &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            );
+        }
+        db.write_batch(batch)
+            .expect("seeding the serving index succeeds");
+
+        let served = crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6));
+        assert_eq!(
+            served
+                .into_iter()
+                .map(|root| root.height)
+                .collect::<Vec<_>>(),
+            vec![Height(4), Height(5), Height(6)],
+            "a request at or above U is served from the index"
+        );
+    }
+
+    /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
+    /// including the hash→height index, while leaving rows at or below the target intact. This
+    /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip
+    /// instead of stalling on an un-requestable floor (see the function doc).
+    #[test]
+    fn delete_zakura_headers_above_truncates_the_header_store() {
+        let _init_guard = zebra_test::init();
+
+        let db = ephemeral_mainnet_db();
 
         // A real header value for `zakura_header_by_height`; the height math is what matters, so
         // every seeded height can reuse the same header.
@@ -1184,18 +1595,7 @@ mod tests {
     fn delete_zakura_headers_above_is_a_noop_on_an_empty_store() {
         let _init_guard = zebra_test::init();
 
-        let network = Network::Mainnet;
-        let db = ZebraDb::new(
-            &Config::ephemeral(),
-            STATE_DATABASE_KIND,
-            &state_database_format_version_in_code(),
-            &network,
-            true,
-            STATE_COLUMN_FAMILIES_IN_CODE
-                .iter()
-                .map(ToString::to_string),
-            false,
-        );
+        let db = ephemeral_mainnet_db();
 
         let mut batch = DiskWriteBatch::new();
         delete_zakura_headers_above(&db, &mut batch, Height(3));

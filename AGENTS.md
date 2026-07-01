@@ -199,6 +199,7 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 - Update `CHANGELOG.md` under `[Unreleased]` for user-visible changes
 - Update crate `CHANGELOG.md` for library-consumer-visible changes
+- When changing a tunable parameter (a constant, `Config` default, timeout, window/limit, or backoff/growth coefficient), add a row to `CHANGELOG_PARAMS.md` in the same PR — record the parameter, location, old → new, PR link, and a one-line why
 - Apply the appropriate PR label (`C-feature`, `C-bug`, `C-security`, etc.)
 - See `CHANGELOG_GUIDELINES.md` for detailed formatting rules
 

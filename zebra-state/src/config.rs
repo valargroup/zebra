@@ -110,6 +110,32 @@ pub struct Config {
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
+    /// Mirror of `consensus.checkpoint_sync`, set by zebrad at startup.
+    ///
+    /// When `true` (the default), a node syncing under checkpoint trust uses the fast
+    /// verified-commitment-trees path below the last checkpoint: per-block Sapling/Orchard
+    /// roots are verified against the committed headers and folded into the anchor set and
+    /// history tree, skipping the per-block frontier recompute. The
+    /// `consensus.vct_fast_sync` setting is mirrored into state to keep checkpoint sync
+    /// enabled while forcing the legacy per-block recompute.
+    ///
+    /// Skipped in serde because it is not an independent state setting — it tracks the
+    /// consensus option, so the generic Zebra state config does not expose a duplicate.
+    #[serde(skip)]
+    pub checkpoint_sync: bool,
+
+    /// Mirror of `consensus.vct_fast_sync`, set by zebrad at startup.
+    ///
+    /// When `true` (the default), checkpoint sync uses the verified-commitment-trees fast path on
+    /// networks with embedded handoff frontiers. Set to `false` to keep `consensus.checkpoint_sync`
+    /// enabled while forcing the legacy per-block Sapling/Orchard tree recompute in both Archive
+    /// and Pruned storage modes.
+    ///
+    /// Skipped in serde because users configure this alongside `consensus.checkpoint_sync`, not
+    /// as an independent state setting.
+    #[serde(skip)]
+    pub vct_fast_sync: bool,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -246,6 +272,30 @@ impl Config {
             StorageMode::Archive => None,
             StorageMode::Pruned(pruning) => Some(pruning),
         }
+    }
+
+    /// Whether to omit archive/indexer-only data that is not required for consensus.
+    ///
+    /// These indexes are RPC-only state, not consensus. They are skipped only for
+    /// the minimal fast-validator configuration: a node that is both
+    /// [`StorageMode::Pruned`] **and** checkpoint-syncing
+    /// ([`checkpoint_sync`](Config::checkpoint_sync)). This drops historical
+    /// transparent address-index writes and transparent finalized-spender lookups,
+    /// just as pruned mode drops raw-transaction storage.
+    ///
+    /// An archive node keeps these indexes; so does a node with checkpoint sync
+    /// disabled (full semantic verification), even when pruned. RPCs backed by
+    /// skipped indexes return an error rather than wrong (empty) results.
+    ///
+    /// This is an RPC completeness rule, not a consensus-safety requirement.
+    /// Raw transaction bodies in `tx_by_loc` can use a rolling height window,
+    /// because each block body is independently present or absent. Transparent
+    /// address indexes are cumulative: starting them after skipped checkpoint
+    /// history would produce incomplete balances, UTXO lists, and transaction
+    /// histories that look authoritative. So pruned checkpoint-sync nodes skip
+    /// those indexes entirely and disable the RPCs that depend on them.
+    pub fn skip_archive_indexes(&self) -> bool {
+        matches!(self.storage_mode, StorageMode::Pruned(_)) && self.checkpoint_sync
     }
 
     /// Validates the configured [`StorageMode`].
@@ -402,6 +452,8 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             enable_zakura_header_seed_from_committed_blocks: false,
+            checkpoint_sync: true,
+            vct_fast_sync: true,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -422,7 +474,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skip_archive_indexes_only_when_pruned_and_checkpoint_syncing() {
+        let pruned_checkpoint = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            pruned_checkpoint.skip_archive_indexes(),
+            "pruned + checkpoint-sync skips archive-only indexes"
+        );
+
+        let archive = Config {
+            storage_mode: StorageMode::Archive,
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            !archive.skip_archive_indexes(),
+            "archive mode keeps archive-only indexes"
+        );
+
+        let pruned_legacy = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: false,
+            ..Default::default()
+        };
+        assert!(
+            !pruned_legacy.skip_archive_indexes(),
+            "pruned with checkpoint sync disabled keeps archive-only indexes"
+        );
+    }
+
+    #[test]
     fn storage_mode_deserializes_from_documented_toml() {
+        assert!(
+            Config::default().vct_fast_sync,
+            "VCT fast sync is enabled by default when checkpoint sync and embedded frontiers are available"
+        );
+
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
             .expect("archive storage mode deserializes from a string");
         assert_eq!(archive.storage_mode, StorageMode::Archive);
@@ -444,6 +534,12 @@ mod tests {
         assert_eq!(
             pruned_with_retention.storage_mode,
             StorageMode::Pruned(PruningConfig { tx_retention: 6000 })
+        );
+
+        let serialized = toml::to_string(&Config::default()).expect("state config serializes");
+        assert!(
+            !serialized.contains("vct_fast_sync"),
+            "vct_fast_sync is configured under [consensus], not [state]"
         );
     }
 }

@@ -17,9 +17,7 @@ use rand_core::{CryptoRng, RngCore};
 use crate::{
     error::{AddressError, RandError},
     primitives::redjubjub::SpendAuth,
-    serialization::{
-        serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
-    },
+    serialization::{ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
 #[cfg(test)]
@@ -248,64 +246,90 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 ///
 /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-#[derive(Copy, Clone, Deserialize, PartialEq, Serialize)]
-pub struct EphemeralPublicKey(
-    #[serde(with = "serde_helpers::AffinePoint")] pub(crate) jubjub::AffinePoint,
-);
+/// A Sapling ephemeral public key, stored as its canonical 32-byte encoding.
+///
+/// The key is a Jubjub curve point, but the validator only ever needs its bytes
+/// (for the txid digest and serialization); the point itself is needed only for
+/// wallet trial-decryption. So the point is not decompressed at deserialization,
+/// keeping the Jubjub point decompression (a field square root) off the
+/// checkpoint-sync hot path, where every Sapling output carries one.
+///
+/// # Consensus
+///
+/// The not-small-order check that this type used to perform at deserialization
+/// is deferred, but still enforced for every untrusted transaction. The
+/// checkpoint verifier trusts block hashes and does not need it. The semantic
+/// verifier and the mempool convert every transaction via `to_librustzcash`
+/// (`CachedFfiTransaction::new`) and verify the Sapling bundle, and
+/// librustzcash enforces the rule in `SaplingVerificationContext::check_output`
+/// (sapling-crypto `verifier.rs`, `epk.is_small_order()`). Validated by
+/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
+/// `transaction/tests/vectors.rs`.
+#[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
+
+impl EphemeralPublicKey {
+    /// Returns true if the stored encoding is a canonical, non-small-order
+    /// Jubjub point, i.e. a valid ephemeral public key per the consensus rules.
+    ///
+    /// This performs the point decompression that deserialization defers; it is
+    /// called by the semantic verifier (not the checkpoint verifier) to enforce
+    /// the not-small-order rule on untrusted transactions.
+    ///
+    /// # Consensus equivalence
+    ///
+    /// This MUST accept exactly the encodings that librustzcash accepts for an
+    /// `epk` on the verification path. If it diverged, Zebra and the rest of the
+    /// network would disagree on transaction validity — a chain split, not a
+    /// local bug. librustzcash decodes `epk` with `jubjub::ExtendedPoint::from_bytes`
+    /// (sapling-crypto `verifier/batch.rs`) and rejects it in
+    /// `SaplingVerificationContext::check_output` when `epk.is_small_order()`
+    /// (sapling-crypto `verifier.rs`). Decoding as an `AffinePoint` here is
+    /// equivalent — both reject the same non-canonical/off-curve encodings and
+    /// agree on `is_small_order` — and that equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates` in
+    /// `transaction/tests/vectors.rs`.
+    pub fn is_valid_not_small_order(&self) -> bool {
+        match jubjub::AffinePoint::from_bytes(self.0).into_option() {
+            Some(point) => !bool::from(point.is_small_order()),
+            None => false,
+        }
+    }
+}
 
 impl fmt::Debug for EphemeralPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("EphemeralPublicKey")
-            .field("u", &hex::encode(self.0.get_u().to_bytes()))
-            .field("v", &hex::encode(self.0.get_v().to_bytes()))
+            .field("epk", &hex::encode(self.0))
             .finish()
     }
 }
 
-impl Eq for EphemeralPublicKey {}
-
 impl From<EphemeralPublicKey> for [u8; 32] {
     fn from(nk: EphemeralPublicKey) -> [u8; 32] {
-        nk.0.to_bytes()
+        nk.0
     }
 }
 
 impl From<&EphemeralPublicKey> for [u8; 32] {
     fn from(nk: &EphemeralPublicKey) -> [u8; 32] {
-        nk.0.to_bytes()
+        nk.0
     }
 }
 
 impl PartialEq<[u8; 32]> for EphemeralPublicKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
-        &self.0.to_bytes() == other
+        &self.0 == other
     }
 }
 
 impl TryFrom<[u8; 32]> for EphemeralPublicKey {
     type Error = &'static str;
 
-    /// Read an EphemeralPublicKey from a byte array.
-    ///
-    /// Returns an error if the key is non-canonical, or [it is of small order][1].
-    ///
-    /// # Consensus
-    ///
-    /// > Check that a Output description's cv and epk are not of small order,
-    /// > i.e. \[h_J\]cv MUST NOT be 𝒪_J and \[h_J\]epk MUST NOT be 𝒪_J.
-    ///
-    /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+    /// Store an EphemeralPublicKey from a byte array, deferring point
+    /// decompression and the not-small-order check (see the type docs).
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
-        let possible_point = jubjub::AffinePoint::from_bytes(bytes);
-
-        if possible_point.is_none().into() {
-            return Err("Invalid jubjub::AffinePoint value for Sapling EphemeralPublicKey");
-        }
-        if possible_point.unwrap().is_small_order().into() {
-            Err("jubjub::AffinePoint value for Sapling EphemeralPublicKey point is of small order")
-        } else {
-            Ok(Self(possible_point.unwrap()))
-        }
+        Ok(Self(bytes))
     }
 }
 

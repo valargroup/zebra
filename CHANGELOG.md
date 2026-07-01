@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Remove O(n) scans from the Zakura block-sync sequencer's per-event hot path,
+  which stalled the checkpoint-sync commit pipeline for tens of seconds. During
+  checkpoint sync, headers race far ahead of the body tip, so the sequencer's
+  `WorkQueue` holds the entire lag (100k+ pending heights) in mutex-guarded
+  `BTreeMap`s and the `applying` map holds thousands of buffered bodies. Three
+  operations scanned these on every body/control event or floor advance, going
+  quadratic as the backlog grew and serializing the work-queue lock (freezing
+  both commit and download): (1) `WorkQueue::reserved_bytes()` re-summed reserved
+  request bytes across `pending` + `in_flight` on every `publish_view`;
+  (2) `advance_floor`/`reset_above` ran a full-map `retain` to drop committed
+  heights; and (3) `publish_view`'s `applying_buffered_bytes` /
+  `submitted_applying_count` / `submitted_applying_bytes` /
+  `unsubmitted_applying_count` each folded over the whole `applying` map. All are
+  now O(1) or O(removed·log n): `reserved_bytes` and the applying totals are
+  incrementally-maintained counters (cross-checked against the independent byte
+  budget by the existing `publish_view` audit, and asserted drift-free by new unit
+  tests), and `advance_floor`/`reset_above` pop only the committed prefix/suffix
+  instead of scanning the whole map.
+- Skip the transparent address index (balances, address→utxo, address→tx) on a
+  pruned, checkpoint-syncing node. The index is RPC-only state, not consensus, so
+  the minimal fast-validator configuration no longer does the per-block
+  address-balance reads or the index writes (like pruned mode already skips
+  raw-transaction storage). Address-lookup RPCs (`getaddressbalance`,
+  `getaddressutxos`, `getaddresstxids`) return an explicit "index disabled"
+  error in this mode instead of wrong (empty) results. Archive nodes, and pruned
+  nodes with checkpoint sync disabled (full semantic verification), are unchanged.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
@@ -52,9 +78,27 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
+- Precompute note-commitment tree hashing ahead of the finalized committer. The
+  per-leaf Merkle hashing for a block (the dominant committer cost on shielded
+  blocks) depends only on the starting note count, not the frontier's hashes, so
+  the finalized write loop now does a one-block look-ahead and runs the next
+  block's Sapling/Orchard hashing on idle cores while the current block commits;
+  the committer then only applies the precomputed subtree roots onto the frontier
+  (`update_trees_parallel_with` in `zebra-chain`). The precompute is applied only
+  if its starting tree size still matches at commit time and otherwise falls back
+  to inline hashing, so it affects only speed, never the resulting tree. This cuts
+  the committer's tree-update cost by ~54% (12.5 → 5.7 ms/block) where the
+  committer is the bottleneck.
 
 ### Changed
 
+- Transparent address-index RPCs (`getaddressbalance`, `getaddressutxos`, and
+  `getaddresstxids`) now require archive storage mode. Pruned nodes return an
+  error for these calls because pruned storage does not guarantee complete
+  address-index data. A pruned database is now durably marked from its first
+  commit (state database format minor version bump), so this holds even during the
+  initial-sync window before raw-transaction pruning starts, and the database can
+  no longer be reopened as an archive in that window.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note
@@ -102,6 +146,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   duplicate-peer handling scaffolding.
 - Added bounded Zakura header-sync stream-5 wire messages, stateless header
   validation, and the default `network.zakura.header_sync` config surface.
+- Verified-commitment-trees fast checkpoint sync. Below the last checkpoint Zebra
+  now fetches per-block Sapling/Orchard commitment roots from peers over a new
+  header-sync-aligned `tree_aux` stream, verifies each root against the node's own
+  checkpoint-committed block headers (the ZIP-221 ChainHistory MMR plus direct
+  below-Heartwood/below-NU5 checks), and folds the verified roots into the anchor
+  set and history tree — skipping the per-block note-commitment frontier recompute
+  that dominates checkpoint-sync CPU cost. At the checkpoint handoff an embedded
+  final frontier, verified against that block's proven root, is written as the tip
+  treestate and normal per-block recompute resumes. The resulting consensus state
+  is byte-identical to the legacy recompute; a root that cannot be obtained or
+  verified is rejected rather than recomputed against the stale frozen frontier, so
+  no untrusted data can influence consensus state. This is the default whenever
+  `consensus.checkpoint_sync = true` on a network with an embedded handoff frontier
+  (Mainnet), for both Archive and Pruned storage modes. The new
+  `consensus.vct_fast_sync` flag (default `true`) selects this fast path; set it to
+  `false` to keep checkpoint sync enabled while forcing the legacy per-block
+  recompute. Bumps the state database
+  format to 27.3.0 (new column families only; no data migration).
 - Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.
@@ -158,6 +220,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Stop the database format-validity check from panicking with "just checked for
+  genesis block" while a verified-commitment-trees fast sync is in progress. The
+  check runs on a background thread, concurrently with block commits, and could
+  read its `is_vct_synced()` guard as `false` and then read an absent genesis
+  note-commitment tree once a concurrent fast-sync commit set the marker in
+  between. It now treats an absent genesis tree as a (mid-flight) fast-synced
+  database — where the genesis-root-caching invariant does not apply — instead of
+  panicking.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so

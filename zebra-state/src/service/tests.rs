@@ -4,7 +4,7 @@
 
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use tokio::runtime::Runtime;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -13,7 +13,10 @@ use zebra_chain::{
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
+    orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
+    sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction, transparent,
     value_balance::ValueBalance,
@@ -25,18 +28,41 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, StateService,
+        arbitrary::populated_state, block_roots_by_height_range, chain_tip::TipAction,
+        headers_by_height_range, non_finalized_state::Chain, root_covered_best_header_tip,
+        StateService, ARCHIVE_INDEXES_DISABLED,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
         FakeChainHelper,
     },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock,
+    BoxError, CheckpointVerifiedBlock, Config, PruningConfig, ReadRequest, ReadResponse, Request,
+    Response, SemanticallyVerifiedBlock, StorageMode,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+fn root_at(height: Height) -> BlockCommitmentRoots {
+    BlockCommitmentRoots {
+        height,
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx: 0,
+        orchard_tx: 0,
+        ironwood_tx: 0,
+        auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+    }
+}
+
+fn roots_from_height(start_height: Height, count: usize) -> Vec<BlockCommitmentRoots> {
+    (0..count)
+        .map(|offset| {
+            let offset = u32::try_from(offset).expect("test root count fits in u32");
+            root_at(Height(start_height.0 + offset))
+        })
+        .collect()
+}
 
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
@@ -517,6 +543,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![999_999, 0],
+                tree_aux_roots: roots_from_height(Height(1), 2),
             })
             .await?,
         Response::Committed(block2_hash),
@@ -644,6 +671,131 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_header_range_rejects_missing_tree_aux_roots() -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let (state_service, _read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let genesis =
+        zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+    let block1 =
+        zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
+
+    let state = Buffer::new(BoxService::new(state_service), 1);
+    assert_eq!(
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(
+                CheckpointVerifiedBlock::from(genesis.clone()),
+            ))
+            .await?,
+        Response::Committed(genesis.hash()),
+    );
+
+    let error = state
+        .oneshot(Request::CommitHeaderRange {
+            anchor: genesis.hash(),
+            headers: vec![block1.header.clone()],
+            body_sizes: vec![0],
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .expect_err("missing roots must reject a non-empty header range");
+
+    assert!(matches!(
+        error.downcast_ref::<crate::CommitHeaderRangeError>(),
+        Some(crate::CommitHeaderRangeError::TreeAuxRootCountMismatch {
+            headers: 1,
+            roots: 0,
+        })
+    ));
+
+    Ok(())
+}
+
+#[cfg(feature = "indexer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_checkpoint_transparent_spender_lookup_returns_disabled_index_error(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let config = Config {
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
+        checkpoint_sync: true,
+        ..Config::ephemeral()
+    };
+    let (_, read_state, _, _) = StateService::new(config, &network, Height::MAX, 0).await;
+
+    let outpoint = transparent::OutPoint::from_usize(transaction::Hash([0; 32]), 0);
+    let error = read_state
+        .oneshot(ReadRequest::SpendingTransactionId(
+            crate::request::Spend::OutPoint(outpoint),
+        ))
+        .await
+        .expect_err("transparent spender lookup should require archive indexes");
+
+    assert!(
+        error.to_string().contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected error: {error}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_address_reads_error_in_pruned_storage_mode(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let config = Config {
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
+        ..Config::ephemeral()
+    };
+    let (_state_service, read_state, _, _) =
+        StateService::new(config, &network, Height::MAX, 0).await;
+
+    let address_balance_error = read_state
+        .clone()
+        .oneshot(ReadRequest::AddressBalance(HashSet::new()))
+        .await
+        .expect_err("address balances are unavailable in pruned mode");
+    assert!(
+        address_balance_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address balance error: {address_balance_error}"
+    );
+
+    let address_tx_ids_error = read_state
+        .clone()
+        .oneshot(ReadRequest::TransactionIdsByAddresses {
+            addresses: HashSet::new(),
+            height_range: Height(1)..=Height(1),
+        })
+        .await
+        .expect_err("address tx IDs are unavailable in pruned mode");
+    assert!(
+        address_tx_ids_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address tx IDs error: {address_tx_ids_error}"
+    );
+
+    let address_utxos_error = read_state
+        .oneshot(ReadRequest::UtxosByAddresses(HashSet::new()))
+        .await
+        .expect_err("address UTXOs are unavailable in pruned mode");
+    assert!(
+        address_utxos_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address UTXOs error: {address_utxos_error}"
+    );
+
+    Ok(())
+}
+
 /// A node still in the finalized (checkpoint) write phase must be able to commit
 /// a Zakura header range.
 ///
@@ -703,6 +855,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
             anchor: genesis.hash(),
             headers: vec![block1.header.clone(), block2.header.clone()],
             body_sizes: vec![999_999, 0],
+            tree_aux_roots: roots_from_height(Height(1), 2),
         }),
     )
     .await
@@ -756,9 +909,11 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
     chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
     chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;
 
+    let chain = Arc::new(chain);
+
     assert_eq!(
         headers_by_height_range(
-            Some(Arc::new(chain)),
+            Some(chain.clone()),
             &state_service.read_service.db,
             start,
             2,
@@ -767,6 +922,45 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
             (start, block1_hash, block1.header.clone()),
             (start.next().unwrap(), block2_hash, block2.header.clone()),
         ],
+    );
+    let roots = block_roots_by_height_range(Some(chain), &state_service.read_service.db, start, 2);
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].height, start);
+    assert_eq!(roots[1].height, start.next().unwrap());
+    let verified_tip = ((start - 1).unwrap(), block::Hash([0; 32]));
+    let best_header_tip = (start.next().unwrap(), block2_hash);
+    assert_eq!(
+        root_covered_best_header_tip(
+            None::<Arc<Chain>>,
+            &state_service.read_service.db,
+            Some(best_header_tip),
+            Some(verified_tip),
+        ),
+        Some(verified_tip),
+        "rootless durable header tips are capped to the verified block tip"
+    );
+    assert_eq!(
+        root_covered_best_header_tip(
+            Some(Arc::new(
+                Chain::new(
+                    &network,
+                    (start - 1).unwrap(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    ValueBalance::fake_populated_pool(),
+                )
+                .push(block1.prepare().test_with_zero_spent_utxos())?
+                .push(block2.prepare().test_with_zero_spent_utxos())?,
+            )),
+            &state_service.read_service.db,
+            Some(best_header_tip),
+            Some(verified_tip),
+        ),
+        Some(best_header_tip),
+        "verified non-finalized roots allow the header tip to stay ahead"
     );
     assert_eq!(
         headers_by_height_range(None::<Arc<Chain>>, &state_service.read_service.db, start, 2),

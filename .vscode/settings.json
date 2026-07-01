@@ -1,0 +1,17 @@
+{
+  // Rust build artifacts (~140G in target/, ~5G in unity-node/target/) saturate
+  // the file watcher and index, which hangs the extension host (agents + terminal).
+  // These dirs are gitignored, so hiding them from the editor is safe.
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.git/objects/**": true
+  },
+  "search.exclude": {
+    "**/target": true
+  },
+  "files.exclude": {
+    "**/target": true
+  },
+  // Let rust-analyzer manage the workspace without a redundant cargo check storm.
+  "rust-analyzer.files.excludeDirs": ["target"]
+}

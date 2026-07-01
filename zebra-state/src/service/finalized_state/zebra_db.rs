@@ -39,9 +39,10 @@ pub mod metrics;
 /// preparation work (raw-transaction serialization and block-size summation) is
 /// run on the rayon pool instead of sequentially.
 ///
-/// Below this, the rayon multi-threading overhead (waking workers, distributing the items,
-/// and joining) outweighs the work itself.
-/// The value was chosen by benchmarking over the sand-blasting region.
+/// Below this, the rayon fork-join cost (waking workers, distributing the items,
+/// and joining) outweighs the work itself. The parallel path is a clear win for
+/// the large blocks in the heavy shielded region; for the small blocks of the
+/// early chain it is pure overhead, so those run sequentially.
 pub(crate) const PARALLEL_BLOCK_TX_THRESHOLD: usize = 16;
 
 /// Minimum number of per-input/per-address database reads a block triggers before
@@ -174,9 +175,23 @@ impl ZebraDb {
             )
         }
 
+        db.run_blocking_format_repairs(network);
         db.spawn_format_change(format_change);
 
         db
+    }
+
+    /// Run synchronous compatibility repairs before background format checks can read the DB.
+    pub fn run_blocking_format_repairs(&self, network: &Network) {
+        if self.debug_skip_format_upgrades {
+            return;
+        }
+
+        // Repair incompatible stored history-tree bytes before the background
+        // format-validity check can read and panic on them. Healthy databases are
+        // a no-op, and read-only/offline-tool opens keep their existing
+        // skip-upgrade behavior.
+        rollback::repair_tip_history_tree_if_incompatible(self, network);
     }
 
     /// Launch any required format changes or format checks, and store their thread handle.
@@ -217,6 +232,23 @@ impl ZebraDb {
     /// Returns config for this database.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Returns true if transparent address index queries are unsupported for this database.
+    ///
+    /// Pruned storage does not guarantee complete transparent address indexes. This is true if
+    /// any of the following hold:
+    /// - the running config is pruned (catches newly configured pruned nodes on any restart,
+    ///   including before the first commit),
+    /// - the database committed at least one block in pruned mode (a durable marker written on
+    ///   the first pruned commit, which catches a later switch back to archive config even
+    ///   during the initial-sync window before raw-transaction pruning starts), or
+    /// - the raw-transaction pruning cursor has advanced (`is_pruned`), covering databases
+    ///   pruned by earlier code that predates the pruned-mode marker.
+    pub fn address_index_unavailable(&self) -> bool {
+        self.config().pruning_config().is_some()
+            || self.committed_in_pruned_mode()
+            || self.is_pruned()
     }
 
     /// Returns the configured database kind for this database.

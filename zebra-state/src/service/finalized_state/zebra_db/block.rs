@@ -22,7 +22,7 @@ use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
     ironwood, orchard,
-    parallel::tree::NoteCommitmentTrees,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize as _},
@@ -43,10 +43,12 @@ use crate::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
+            shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA,
+        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     },
     HashOrHeight,
 };
@@ -519,9 +521,84 @@ impl ZebraDb {
     }
 
     #[allow(clippy::unwrap_in_result)]
-    fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
+    pub(crate) fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
         let header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
         self.db.zs_get(&header_by_height, &height)
+    }
+
+    /// Returns provisional Zakura header-ahead roots for the contiguous prefix of `range`.
+    pub fn zakura_header_commitment_roots_by_height_range(
+        &self,
+        range: std::ops::RangeInclusive<Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut roots = Vec::new();
+        for height in (range.start().0..=range.end().0).map(Height) {
+            let Some(value) = self
+                .db
+                .zs_get::<_, _, CommitmentRootsByHeight>(&cf, &height)
+            else {
+                break;
+            };
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: value.sapling,
+                orchard_root: value.orchard,
+                ironwood_root: value.ironwood,
+                sapling_tx: value.sapling_tx,
+                orchard_tx: value.orchard_tx,
+                ironwood_tx: value.ironwood_tx,
+                auth_data_root: value.auth_data_root,
+            });
+        }
+        roots
+    }
+
+    /// Persist provisional header-ahead roots supplied by Zakura header sync.
+    pub fn insert_zakura_header_commitment_roots(
+        &self,
+        roots: impl IntoIterator<Item = BlockCommitmentRoots>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        for roots in roots {
+            batch.zs_insert(
+                &cf,
+                roots.height,
+                CommitmentRootsByHeight {
+                    sapling: roots.sapling_root,
+                    orchard: roots.orchard_root,
+                    ironwood: roots.ironwood_root,
+                    sapling_tx: roots.sapling_tx,
+                    orchard_tx: roots.orchard_tx,
+                    ironwood_tx: roots.ironwood_tx,
+                    auth_data_root: roots.auth_data_root,
+                },
+            );
+        }
+        self.write_batch(batch)
+    }
+
+    /// Delete provisional header-ahead roots by height.
+    pub fn delete_zakura_header_commitment_roots(
+        &self,
+        heights: impl IntoIterator<Item = Height>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        for height in heights {
+            batch.zs_delete(&cf, height);
+        }
+        self.write_batch(batch)
     }
 
     // The header readers below resolve from the consensus header column families
@@ -739,6 +816,95 @@ impl ZebraDb {
         self.lowest_retained_height().is_some()
     }
 
+    // Verified-commitment-trees fast-sync methods
+
+    /// Returns the checkpoint handoff height `H` of a verified-commitment-trees fast-synced
+    /// database: the upper (exclusive) bound of the band `[U, H)` in which per-height
+    /// note-commitment trees are absent. `U` is [`vct_upgrade_height`](Self::vct_upgrade_height).
+    ///
+    /// The fast path skips per-height trees only below the handoff; at and above `H`, semantic sync
+    /// writes them again. (Trees below the upgrade height `U` are also present — written before this
+    /// binary ran.) Returns `None` if the database was synced normally (per-height trees for every
+    /// height below the tip). Use [`vct_tree_absent`](Self::vct_tree_absent) to test a single
+    /// height rather than comparing against this bound directly.
+    pub fn vct_synced_below(&self) -> Option<Height> {
+        let vct_sync_metadata = self.db.cf_handle(VCT_SYNC_METADATA)?;
+        self.db.zs_get(&vct_sync_metadata, &())
+    }
+
+    /// Returns `true` if the database was built by the verified-commitment-trees
+    /// path, and therefore lacks per-height note-commitment trees below the
+    /// handoff height. The missing history is surfaced at the RPC boundary (§9);
+    /// it does not prevent reopening in any storage mode.
+    pub fn is_vct_synced(&self) -> bool {
+        self.vct_synced_below().is_some()
+    }
+
+    /// Returns the verified-commitment-trees upgrade height `U`: the lowest height this binary
+    /// committed, equal to the lowest height in the `commitment_roots_by_height` serving index.
+    ///
+    /// Written once on the first committed block and never moved (see
+    /// [`VCT_UPGRADE_METADATA`](crate::service::finalized_state::VCT_UPGRADE_METADATA)). Heights
+    /// below `U` predate this binary, so they hold per-height trees but no index entry; heights at
+    /// or above `U` hold an index entry. Returns `None` for a database written before this marker
+    /// existed (a pre-index archive database), where every height is served from the trees.
+    pub fn vct_upgrade_height(&self) -> Option<Height> {
+        let vct_upgrade_metadata = self.db.cf_handle(VCT_UPGRADE_METADATA)?;
+        self.db.zs_get(&vct_upgrade_metadata, &())
+    }
+
+    /// Returns `true` if the per-height note-commitment tree at `height` was never written because
+    /// this is a vct-synced database, i.e. `height` falls in the absent band `[U, H)`.
+    ///
+    /// `U` is the upgrade height ([`vct_upgrade_height`](Self::vct_upgrade_height)) and `H` is the
+    /// checkpoint handoff ([`vct_synced_below`](Self::vct_synced_below)). The fast path skips
+    /// per-height trees only at and after the upgrade and only below the checkpoint: heights below
+    /// `U` keep their pre-upgrade trees, and heights at or above `H` get trees again from semantic
+    /// sync. Returns `false` for a normally-synced database (`H` is `None`). When `H` is set, `U`
+    /// is too (both are written by the commit path), but `U` defaults to genesis if ever absent,
+    /// which preserves the original "absent below `H`" behaviour.
+    pub fn vct_tree_absent(&self, height: Height) -> bool {
+        let Some(handoff) = self.vct_synced_below() else {
+            return false;
+        };
+        let upgrade = self.vct_upgrade_height().unwrap_or(Height(0));
+        upgrade <= height && height < handoff
+    }
+
+    /// Returns `true` if `hash_or_height` resolves to a non-tip historical height
+    /// whose per-height note-commitment tree is unavailable because this is a
+    /// vct-synced database (the tree within the `[U, H)` absent band was never
+    /// written). Read-request handlers use this to return an archive-mode error
+    /// instead of a misleading "not found".
+    pub fn vct_historical_tree_unavailable(&self, hash_or_height: HashOrHeight) -> bool {
+        hash_or_height
+            .height_or_else(|hash| self.height(hash))
+            .is_some_and(|height| self.vct_tree_absent(height))
+    }
+
+    /// Returns `true` if this database has committed at least one block in pruned
+    /// storage mode.
+    ///
+    /// Unlike [`Self::is_pruned`] — which only becomes true once the raw-transaction
+    /// pruning cursor is first written (at the checkpoint retention start, near the
+    /// checkpoint tip) — this marker is written on the *first* commit in pruned mode,
+    /// before any archive-only data is dropped. A pruned checkpoint-sync node skips
+    /// the transparent address index from its very first block, so this is the durable
+    /// signal that address-index RPCs are unavailable and the database can never be
+    /// reopened as a full archive, even during the initial-sync window before
+    /// `is_pruned` flips.
+    ///
+    /// It is stored under a key in [`PRUNING_METADATA`] that is distinct from the
+    /// unit key used by [`Self::lowest_retained_height`], so it can be set early
+    /// without perturbing the raw-transaction pruning cursor.
+    pub fn committed_in_pruned_mode(&self) -> bool {
+        let Some(pruning_metadata) = self.db.cf_handle(PRUNING_METADATA) else {
+            return false;
+        };
+        let marker: Option<()> = self.db.zs_get(&pruning_metadata, &PrunedStorageModeKey);
+        marker.is_some()
+    }
+
     /// Returns the half-open range of block heights `[from, until)` whose raw
     /// transaction data should be pruned when committing a block at `new_tip`,
     /// given the configured `retention` window. Returns `None` if there is
@@ -812,6 +978,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
@@ -819,6 +986,11 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
+        // When `Some`, skip per-height tree writes and fold these roots into
+        // the anchor set.
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        // When `Some(height)`, mark the database as vct-synced.
+        vct_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -852,35 +1024,63 @@ impl ZebraDb {
             .flat_map(|input| input.outpoint())
             .collect();
 
-        let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
-            if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
-                use rayon::prelude::*;
-                outpoints
-                    .into_par_iter()
-                    .map(|outpoint| {
-                        read_spent_utxo(
-                            self,
-                            finalized.height,
-                            outpoint,
-                            &tx_hash_indexes,
-                            &finalized.new_outputs,
-                        )
-                    })
-                    .collect()
-            } else {
-                outpoints
-                    .into_iter()
-                    .map(|outpoint| {
-                        read_spent_utxo(
-                            self,
-                            finalized.height,
-                            outpoint,
-                            &tx_hash_indexes,
-                            &finalized.new_outputs,
-                        )
-                    })
-                    .collect()
-            };
+        // Serialize the raw transaction bytes for `tx_by_loc` concurrently with the
+        // spent-UTXO reads. Serialization is CPU-bound while the reads wait on disk,
+        // so overlapping them keeps the raw-tx serialization off the committer's
+        // serial critical path. The bytes are handed to `prepare_block_batch`; if
+        // `None` it serializes inline (e.g. the semantic path).
+        let store_raw_txs = retention.stores_raw_transactions();
+        let db: &ZebraDb = self;
+        let (spent_utxos, precomputed_raw_txs): (
+            Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
+            Option<Vec<RawBytes>>,
+        ) = rayon::join(
+            || {
+                if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                    use rayon::prelude::*;
+                    outpoints
+                        .into_par_iter()
+                        .map(|outpoint| {
+                            read_spent_utxo(
+                                db,
+                                finalized.height,
+                                outpoint,
+                                &tx_hash_indexes,
+                                &finalized.new_outputs,
+                            )
+                        })
+                        .collect()
+                } else {
+                    outpoints
+                        .into_iter()
+                        .map(|outpoint| {
+                            read_spent_utxo(
+                                db,
+                                finalized.height,
+                                outpoint,
+                                &tx_hash_indexes,
+                                &finalized.new_outputs,
+                            )
+                        })
+                        .collect()
+                }
+            },
+            || {
+                if store_raw_txs {
+                    use rayon::prelude::*;
+                    Some(
+                        finalized
+                            .block
+                            .transactions
+                            .par_iter()
+                            .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            },
+        );
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -898,21 +1098,6 @@ impl ZebraDb {
             .into_iter()
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
-
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
-
-        // Get the current address balances, before the transactions in this block
 
         // Like the spent-UTXO reads above, the per-address balance lookups are
         // cache-served but serial. Fan them across the rayon pool once a block
@@ -947,14 +1132,39 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+        //
+        // When archive-only indexes are skipped (pruned + checkpoint-sync fast-validator),
+        // none of the per-address balance reads happen and `address_balances` is left
+        // empty; the gated transparent index passes below then write no address entries.
+        let address_balances: AddressBalanceLocationUpdates = if self
+            .config()
+            .skip_archive_indexes()
+        {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            // Transparent addresses with changed balances/UTXOs in this block.
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+
+            // Get the current address balances, before the transactions in this block.
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    self.address_balance_location(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(self.address_balance_location(addr)?.into_new_change())
+                }))
+            }
         };
 
         let mut batch = DiskWriteBatch::new();
@@ -972,7 +1182,10 @@ impl ZebraDb {
             address_balances,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
-            retention.stores_raw_transactions(),
+            store_raw_txs,
+            precomputed_raw_txs,
+            vct_anchor_roots,
+            vct_sync_below,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -982,6 +1195,16 @@ impl ZebraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+
+        // The first commit in pruned storage mode durably marks the database as
+        // pruned, before the raw-transaction pruning cursor is written near the
+        // checkpoint tip. A pruned checkpoint-sync node already skips the transparent
+        // address index from this first block, so the marker keeps address-index RPCs
+        // disabled and blocks archive reopen throughout the initial-sync window where
+        // `is_pruned` is still false.
+        if self.config().pruning_config().is_some() && !self.committed_in_pruned_mode() {
+            batch.prepare_pruned_storage_mode_marker_batch(self);
+        }
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
@@ -1077,6 +1300,24 @@ fn lookup_out_loc(
     let tx_loc = TransactionLocation::from_usize(height, *tx_index);
 
     OutputLocation::from_outpoint(tx_loc, outpoint)
+}
+
+/// Key under which [`PRUNING_METADATA`] records that the database has committed
+/// at least one block in pruned storage mode.
+///
+/// Its byte encoding (`[1]`) is deliberately distinct from the unit key (`[]`) that
+/// [`ZebraDb::lowest_retained_height`] uses for the raw-transaction pruning cursor,
+/// so the two entries coexist in the column family without colliding. See
+/// [`ZebraDb::committed_in_pruned_mode`].
+#[derive(Debug)]
+struct PrunedStorageModeKey;
+
+impl IntoDisk for PrunedStorageModeKey {
+    type Bytes = [u8; 1];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        [1]
+    }
 }
 
 /// Computes the half-open range of block heights `[from, until)` to prune when a
@@ -1265,6 +1506,40 @@ impl RetentionPlan {
     }
 }
 
+#[cfg(test)]
+fn inferred_header_range_roots(
+    zebra_db: &ZebraDb,
+    anchor: block::Hash,
+    count: usize,
+) -> Result<Vec<BlockCommitmentRoots>, CommitHeaderRangeError> {
+    let anchor_height = zebra_db
+        .header_height(anchor)
+        .or_else(|| (anchor == zebra_db.network().genesis_hash()).then_some(block::Height(0)))
+        .unwrap_or(block::Height(0));
+
+    (0..count)
+        .map(|index| {
+            let offset =
+                u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
+            let height = (anchor_height + i64::from(offset))
+                .ok_or(CommitHeaderRangeError::HeightOverflow)?;
+            Ok(BlockCommitmentRoots {
+                height,
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                // Placeholder default roots: this fallback range carries no real roots
+                // (the recipient re-verifies and rejects them), so the Ironwood root, the
+                // counts, and the auth-data root are all unused zeros here too.
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            })
+        })
+        .collect()
+}
+
 impl DiskWriteBatch {
     // Write block methods
 
@@ -1295,13 +1570,22 @@ impl DiskWriteBatch {
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
+        precomputed_raw_txs: Option<Vec<RawBytes>>,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zebra_db,
             finalized,
             store_raw_transactions,
+            precomputed_raw_txs,
         )?;
+        let zakura_header_commitment_roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+        self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
         // because there aren't any in the mainnet or testnet genesis blocks.
@@ -1310,7 +1594,13 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zebra_db, finalized);
-        self.prepare_trees_batch(zebra_db, finalized, prev_note_commitment_trees);
+        self.prepare_trees_batch(
+            zebra_db,
+            finalized,
+            prev_note_commitment_trees,
+            vct_anchor_roots,
+            vct_sync_below,
+        );
 
         // # Consensus
         //
@@ -1411,6 +1701,17 @@ impl DiskWriteBatch {
         self.zs_insert(&pruning_metadata, (), lowest_retained_height);
     }
 
+    /// Adds a write for the durable pruned-storage-mode marker to this batch.
+    ///
+    /// See [`ZebraDb::committed_in_pruned_mode`]. This marks the database as a
+    /// one-way pruned database from its first pruned-mode commit, independently of
+    /// the raw-transaction pruning cursor. Idempotent: re-writing the marker just
+    /// overwrites the same key.
+    pub fn prepare_pruned_storage_mode_marker_batch(&mut self, zebra_db: &ZebraDb) {
+        let pruning_metadata = zebra_db.db.cf_handle(PRUNING_METADATA).unwrap();
+        self.zs_insert(&pruning_metadata, PrunedStorageModeKey, ());
+    }
+
     /// Prepare a database batch containing the block header and transaction data
     /// from `finalized.block`, and return it (without actually writing anything).
     #[allow(clippy::unwrap_in_result)]
@@ -1419,6 +1720,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         store_raw_transactions: bool,
+        precomputed_raw_txs: Option<Vec<RawBytes>>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         let db = &zebra_db.db;
 
@@ -1467,13 +1769,19 @@ impl DiskWriteBatch {
 
         // Serialize the raw transaction bytes up front: on heavy shielded blocks
         // this serialization dominates the per-block write cost, and each
-        // transaction serializes independently.
+        // transaction serializes independently. The result is byte-identical to
+        // inserting the transactions directly, because `RawBytes` is stored
+        // verbatim. The serialized bytes are inserted in height/index order below.
         //
         // Only fan out to rayon once the block has enough transactions to amortize
-        // the multithreading overhead. Small blocks serialize sequentially (see
+        // the fork-join cost; small blocks serialize sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
             Vec::new()
+        } else if let Some(precomputed) = precomputed_raw_txs {
+            // Serialized off the committer's critical path (overlapped with the
+            // spent-UTXO reads in `write_block`); use those bytes directly.
+            precomputed
         } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
             use rayon::prelude::*;
             block
@@ -1493,7 +1801,8 @@ impl DiskWriteBatch {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
-            // keeps historical transaction data for this height.
+            // keeps historical transaction data for this height (then
+            // `raw_transactions` holds the pre-serialized bytes in order).
             if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
                 self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
@@ -1658,6 +1967,7 @@ impl DiskWriteBatch {
     }
 
     /// Prepare a database batch containing a contextually validated header range.
+    #[cfg(test)]
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch(
         &mut self,
@@ -1665,6 +1975,20 @@ impl DiskWriteBatch {
         anchor: block::Hash,
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
+    ) -> Result<block::Hash, CommitHeaderRangeError> {
+        let roots = inferred_header_range_roots(zebra_db, anchor, headers.len())?;
+        self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &roots)
+    }
+
+    /// Prepare a database batch containing a contextually validated header range
+    /// and one provisional tree-aux root per header.
+    pub fn prepare_header_range_batch_with_roots(
+        &mut self,
+        zebra_db: &ZebraDb,
+        anchor: block::Hash,
+        headers: &[Arc<block::Header>],
+        body_sizes: &[u32],
+        tree_aux_roots: &[BlockCommitmentRoots],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
@@ -1674,6 +1998,13 @@ impl DiskWriteBatch {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
                 headers: headers.len(),
                 body_sizes: body_sizes.len(),
+            });
+        }
+
+        if headers.len() != tree_aux_roots.len() {
+            return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
+                headers: headers.len(),
+                roots: tree_aux_roots.len(),
             });
         }
 
@@ -1689,6 +2020,10 @@ impl DiskWriteBatch {
         let body_size_by_height = zebra_db
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+        let roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
             .unwrap();
 
         let anchor_height = zebra_db
@@ -1724,6 +2059,14 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if roots.height != height {
+                    return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                        expected_height: height,
+                        root_height: roots.height,
+                    });
+                }
+            }
 
             if let Some(expected) = checkpoints.hash(height) {
                 if expected != hash {
@@ -1834,17 +2177,46 @@ impl DiskWriteBatch {
                 self.zs_delete(&hash_by_height, height);
                 self.zs_delete(&header_by_height, height);
                 self.zs_delete(&body_size_by_height, height);
+                self.zs_delete(&roots_by_height, height);
             }
         }
 
-        for (height, hash, header, body_size) in validated_headers {
+        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
+        {
+            let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
+            let advertised_body_size = match (
+                same_header,
+                zebra_db.advertised_body_size(height),
+                AdvertisedBodySize::new(body_size).map(AdvertisedBodySize::get),
+            ) {
+                (true, existing, Some(new)) => Some(existing.unwrap_or(0).max(new)),
+                (true, existing, None) => existing,
+                (false, _existing, new) => new,
+            };
+
             self.zs_insert(&header_by_height, height, header);
             self.zs_insert(&hash_by_height, height, hash);
             self.zs_insert(&height_by_hash, hash, height);
-            if let Some(body_size) = AdvertisedBodySize::new(body_size) {
+            if let Some(body_size) = advertised_body_size.and_then(AdvertisedBodySize::new) {
                 self.zs_insert(&body_size_by_height, height, body_size);
             } else {
                 self.zs_delete(&body_size_by_height, height);
+            }
+
+            if let Some(roots) = tree_aux_roots.get(index) {
+                self.zs_insert(
+                    &roots_by_height,
+                    height,
+                    CommitmentRootsByHeight {
+                        sapling: roots.sapling_root,
+                        orchard: roots.orchard_root,
+                        ironwood: roots.ironwood_root,
+                        sapling_tx: roots.sapling_tx,
+                        orchard_tx: roots.orchard_tx,
+                        ironwood_tx: roots.ironwood_tx,
+                        auth_data_root: roots.auth_data_root,
+                    },
+                );
             }
         }
 

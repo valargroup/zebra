@@ -5,6 +5,19 @@
 fail-fast = true
 status-level = "pass"
 
+# --- Test groups ---
+
+# Zakura networking tests dial real iroh/QUIC endpoints and register peers within
+# a bounded deadline. Running many of them at once oversubscribes the CPU and
+# starves those handshakes/upgrades, which surfaced as flaky timeouts and upgrade
+# races in the PR lane (which has no retries). Cap their concurrency so they do
+# not starve each other. This complements the generous `TEST_NET_TIMEOUT` deadline
+# in the zebra-network testkit: the deadline absorbs slow connects, the group keeps
+# the contention that causes them from piling up. It does not exclude any tests, so
+# coverage is unchanged.
+[test-groups]
+zakura-network = { max-threads = 4 }
+
 # --- Platform-specific overrides ---
 
 # Skip Windows-incompatible tests
@@ -12,6 +25,14 @@ status-level = "pass"
 platform = 'cfg(target_os = "windows")'
 
 filter = "not test(=trusted_chain_sync_handles_forks_correctly) and not test(=delete_old_databases)"
+
+# Bound the Zakura networking tests (real iroh/QUIC connects) to the serial test
+# group defined above. This override lives on the `default` profile so it applies
+# to every profile (all-tests, full-tests, ...). It only assigns a test group; it
+# does not filter any tests out, so coverage is unchanged.
+[[profile.default.overrides]]
+filter = "package(zebra-network) and (test(~zakura::legacy_gossip::tests) or test(~zakura::testkit::cluster::tests) or test(~zakura::testkit::gossip::tests) or test(~zakura::testkit::mock_blocksync) or test(~mutual_p2p))"
+test-group = "zakura-network"
 
 # --- All Tests profile ---
 # CI-friendly test selection.

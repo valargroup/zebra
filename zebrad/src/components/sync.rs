@@ -806,6 +806,13 @@ where
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
 
+    /// Fanout for the head-of-line hedge: when a required block registry-misses, its
+    /// backoff retry is re-dispatched to this many random ready peers (ignoring inventory
+    /// markers) instead of a single peer, bypassing stale "missing" markers. `0` disables
+    /// hedging (plain single-peer retry). Read once at construction from the
+    /// `SYNC_HOL_HEDGE_FANOUT` env var; prototype-only A/B gate.
+    hol_hedge_fanout: usize,
+
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
     past_lookahead_limit_receiver: zs::WatchReceiver<bool>,
@@ -927,6 +934,7 @@ where
             verifier,
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
+            config.network.network.clone(),
             max(
                 checkpoint_verify_concurrency_limit,
                 full_verify_concurrency_limit,
@@ -949,6 +957,10 @@ where
             missing_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            hol_hedge_fanout: std::env::var("SYNC_HOL_HEDGE_FANOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             past_lookahead_limit_receiver,
             misbehavior_sender,
         };
@@ -1347,7 +1359,19 @@ where
                         for hash in due {
                             self.registry_miss_retry.remove(&hash);
 
-                            match self.downloads.download_and_verify(hash).await {
+                            // Re-dispatch the head-of-line block. When hedging is enabled, fan the
+                            // retry out to several random ready peers (ignoring stale inventory
+                            // markers) and take the first delivery; otherwise fall back to the
+                            // single-peer download.
+                            let dispatch = if self.hol_hedge_fanout > 0 {
+                                self.downloads
+                                    .download_and_verify_hedged(hash, self.hol_hedge_fanout)
+                                    .await
+                            } else {
+                                self.downloads.download_and_verify(hash).await
+                            };
+
+                            match dispatch {
                                 Ok(())
                                 | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload {
                                     ..
