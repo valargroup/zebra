@@ -22,9 +22,6 @@ use zebra_test::{
 };
 
 use super::super::*;
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use super::ironwood_v6_tx_hash;
-
 lazy_static! {
     pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
@@ -530,16 +527,6 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
             test.txid,
             test.auth_digest,
             "ZIP-244 V5",
-        )?;
-    }
-
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-    for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
-        assert_native_zip244_matches_test_vector(
-            test.tx,
-            test.txid,
-            test.auth_digest,
-            test.scenario,
         )?;
     }
 
@@ -1107,7 +1094,6 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
-                    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                     Transaction::V6 {
                         sapling_shielded_data,
                         ..
@@ -1165,7 +1151,6 @@ fn test_coinbase_script() -> Result<()> {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_transactions_reject_pre_nu6_3_branch_id() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
@@ -1210,7 +1195,6 @@ fn v6_transactions_reject_pre_nu6_3_branch_id() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_txid_commits_to_ironwood_digest() {
     use proptest::{
         prelude::any,
@@ -1274,7 +1258,6 @@ fn v6_txid_commits_to_ironwood_digest() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     use proptest::{
         prelude::any,
@@ -1349,7 +1332,6 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
     let _init_guard = zebra_test::init();
 
@@ -1405,7 +1387,6 @@ fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
 /// so malformed Ironwood proofs must still be caught by the conversion consensus
 /// relies on rather than slipping through.
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
     let _init_guard = zebra_test::init();
 
@@ -1540,7 +1521,6 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
 
     Transaction::zcash_deserialize(&v5_tx_bytes[..]).expect_err("V5 rk = identity should fail");
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     {
         let Transaction::V5 {
             orchard_shielded_data,
