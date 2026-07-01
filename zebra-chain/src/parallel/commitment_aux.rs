@@ -14,7 +14,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
     block::{self, merkle::AuthDataRoot},
-    orchard, sapling,
+    ironwood, orchard, sapling,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
@@ -34,8 +34,30 @@ pub struct BlockCommitmentRoots {
     pub sapling_root: sapling::tree::Root,
     /// The Orchard note-commitment tree root as of the end of this block (empty below NU5).
     pub orchard_root: orchard::tree::Root,
+    /// The Ironwood note-commitment tree root as of the end of this block (empty below Nu7).
+    ///
+    /// Carried alongside the Sapling/Orchard roots because the ZIP-221 V3 history leaf
+    /// (Nu7+) folds the Ironwood root into the chain-history MMR; a recipient rebuilding
+    /// the leaf to verify against header commitments (design §6) needs it, without the body.
+    pub ironwood_root: ironwood::tree::Root,
+    /// Number of this block's transactions carrying Sapling shielded data
+    /// (`Block::sapling_transactions_count`).
+    ///
+    /// The per-block shielded transaction counts are the *only* ZIP-221 history-leaf inputs
+    /// the header and roots don't already provide (everything else — hash, time,
+    /// difficulty/work, height — is header-derived). They are carried so a recipient can
+    /// rebuild the MMR leaf and verify each root against its checkpoint-committed header
+    /// commitment during header sync, without the block body. Like the roots they carry no
+    /// trust: a wrong count changes the leaf and fails the header commitment check.
+    pub sapling_tx: u64,
+    /// Number of this block's transactions carrying Orchard shielded data
+    /// (`Block::orchard_transactions_count`); the Orchard V2 leaf count input (NU5+).
+    pub orchard_tx: u64,
+    /// Number of this block's transactions carrying Ironwood shielded data; the Ironwood
+    /// V3 leaf count input (Nu7+).
+    pub ironwood_tx: u64,
     /// The authorizing-data root (ZIP-244 `hashAuthDataRoot`) of *this* block's own
-    /// transactions.
+    /// transactions. Serialized last.
     ///
     /// Carried so a recipient can authenticate the *predecessor's* note-commitment
     /// roots against this block's NU5+ header commitment
@@ -53,6 +75,10 @@ impl ZcashSerialize for BlockCommitmentRoots {
         writer.write_u32::<LittleEndian>(self.height.0)?;
         self.sapling_root.zcash_serialize(&mut writer)?;
         self.orchard_root.zcash_serialize(&mut writer)?;
+        self.ironwood_root.zcash_serialize(&mut writer)?;
+        writer.write_u64::<LittleEndian>(self.sapling_tx)?;
+        writer.write_u64::<LittleEndian>(self.orchard_tx)?;
+        writer.write_u64::<LittleEndian>(self.ironwood_tx)?;
         writer.write_all(&<[u8; 32]>::from(self.auth_data_root))?;
         Ok(())
     }
@@ -66,6 +92,10 @@ impl ZcashDeserialize for BlockCommitmentRoots {
         let height = block::Height(reader.read_u32::<LittleEndian>()?);
         let sapling_root = sapling::tree::Root::zcash_deserialize(&mut reader)?;
         let orchard_root = orchard::tree::Root::zcash_deserialize(&mut reader)?;
+        let ironwood_root = ironwood::tree::Root::zcash_deserialize(&mut reader)?;
+        let sapling_tx = reader.read_u64::<LittleEndian>()?;
+        let orchard_tx = reader.read_u64::<LittleEndian>()?;
+        let ironwood_tx = reader.read_u64::<LittleEndian>()?;
         let mut auth_data_root = [0u8; 32];
         reader.read_exact(&mut auth_data_root)?;
         let auth_data_root = AuthDataRoot::from(auth_data_root);
@@ -73,6 +103,10 @@ impl ZcashDeserialize for BlockCommitmentRoots {
             height,
             sapling_root,
             orchard_root,
+            ironwood_root,
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
             auth_data_root,
         })
     }
@@ -90,6 +124,10 @@ mod tests {
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
             auth_data_root: AuthDataRoot::from([7u8; 32]),
+            ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 3,
+            orchard_tx: 5,
+            ironwood_tx: 7,
         };
 
         let bytes = roots

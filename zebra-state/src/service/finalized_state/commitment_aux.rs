@@ -526,18 +526,33 @@ pub(crate) fn produce_block_roots(
         ) else {
             break;
         };
+        // Below the upgrade height the serving index does not exist, so derive the
+        // auth-data root and the shielded tx-counts from the locally stored block (this
+        // archival node holds the body for these heights). Zero only if the body is somehow
+        // absent, in which case the recipient simply re-fetches from a node that has it.
+        let block = db.block(height.into());
+        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = block
+            .as_ref()
+            .map(|block| {
+                (
+                    block.sapling_transactions_count(),
+                    block.orchard_transactions_count(),
+                    block.ironwood_transactions_count(),
+                    block.auth_data_root(),
+                )
+            })
+            .unwrap_or((0, 0, 0, AuthDataRoot::from([0u8; 32])));
         roots.push(BlockCommitmentRoots {
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
-            // Below the upgrade height the serving index does not exist, so derive the
-            // auth-data root from the locally stored block (this archival node holds the
-            // body for these heights). Zero only if the body is somehow absent, in which
-            // case the recipient simply re-fetches from a node that has it.
-            auth_data_root: db
-                .block(height.into())
-                .map(|block| block.auth_data_root())
-                .unwrap_or_else(|| AuthDataRoot::from([0u8; 32])),
+            // The Ironwood tree does not exist below Nu7, so its root is the empty-tree root
+            // for every currently-servable height (no per-height Ironwood tree store yet).
+            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
+            auth_data_root,
         });
     }
     roots
@@ -663,12 +678,20 @@ mod tests {
                 height: block::Height(10),
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
                 auth_data_root: AuthDataRoot::from([0u8; 32]),
             },
             BlockCommitmentRoots {
                 height: block::Height(11),
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
                 auth_data_root: AuthDataRoot::from([0u8; 32]),
             },
         ];
@@ -711,6 +734,10 @@ mod tests {
             height: block::Height(42),
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
             auth_data_root: AuthDataRoot::from([0u8; 32]),
         }]);
 

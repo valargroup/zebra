@@ -5,10 +5,12 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// Version of the native header-sync stream.
 ///
 /// Version 4 carries one tree-aux root for each non-empty range header.
-/// Version 5 extends each tree-aux root with the block's ZIP-244 `auth_data_root`
-/// (the co-input needed to authenticate the predecessor's note-commitment roots
-/// against this block's NU5+ header commitment). This is a breaking wire change:
-/// a v4 and a v5 node cannot exchange header-sync ranges.
+/// Version 5 extends each tree-aux root with the full set of per-block ZIP-221 history-leaf
+/// inputs a recipient needs to rebuild the leaf and verify the roots against its own header
+/// commitments during header sync, without the block body: the Ironwood note-commitment
+/// root, the three per-pool shielded transaction counts (Sapling/Orchard/Ironwood), and the
+/// block's ZIP-244 `auth_data_root` (the co-input to its NU5+ header commitment). This is a
+/// breaking wire change: a v4 and a v5 node cannot exchange header-sync ranges.
 pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 5;
 
 /// Peer status advertisement.
@@ -33,8 +35,10 @@ pub(super) const HEADER_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_COUNT_BYTES: usize = 4;
 pub(super) const HEADER_SYNC_HAS_ROOTS_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_BODY_SIZE_BYTES: usize = 4;
-/// Encoded [`BlockCommitmentRoots`]: height + Sapling root + Orchard root + auth-data root.
-pub(super) const HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES: usize = 4 + 32 + 32 + 32;
+/// Encoded [`BlockCommitmentRoots`]: height + Sapling root + Orchard root + Ironwood root
+/// + three `u64` shielded tx-counts (Sapling/Orchard/Ironwood) + auth-data root.
+pub(super) const HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES: usize =
+    4 + 32 + 32 + 32 + 8 + 8 + 8 + 32;
 pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
 pub(super) const REGTEST_HEADER_BYTES: usize = 177;
 pub(super) const HEADER_SYNC_FANOUT: usize = 3;

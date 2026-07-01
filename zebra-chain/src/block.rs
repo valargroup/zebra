@@ -209,6 +209,18 @@ impl Block {
             .expect("number of transactions must fit u64")
     }
 
+    /// Count how many Ironwood transactions exist in a block,
+    /// i.e. transactions where the Ironwood action set is non-empty
+    /// (the ZIP-221 V3 history-leaf `nIronwoodTxCount`).
+    pub fn ironwood_transactions_count(&self) -> u64 {
+        self.transactions
+            .iter()
+            .filter(|tx| tx.has_ironwood_shielded_data())
+            .count()
+            .try_into()
+            .expect("number of transactions must fit u64")
+    }
+
     /// Returns the overall chain value pool change in this block---the negative sum of the
     /// transaction value balances in this block.
     ///

@@ -94,20 +94,22 @@ const DATABASE_FORMAT_VERSION: u64 = 27;
 ///
 /// Version 3 adds the verified-commitment-trees state format:
 /// - the `fast_sync_metadata` column family, which records fast-sync handoff state,
-/// - the `commitment_roots_by_height` serving index (design §4), a compact per-height
-///   `(sapling_root, orchard_root, auth_data_root)` map every node writes so a fast-synced node
-///   can serve `tree_aux` roots without per-height trees. The per-height ZIP-244 `auth_data_root`
-///   is the co-input needed to authenticate a block's note-commitment roots against its
-///   successor's NU5+ header commitment without re-reading the successor body, and
+/// - the `commitment_roots_by_height` serving index (design §4), a compact per-height map every
+///   node writes so a fast-synced node can serve `tree_aux` roots without per-height trees. Each
+///   row holds `(sapling_root, orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx,
+///   auth_data_root)`: the Sapling/Orchard/Ironwood note-commitment roots and per-pool shielded
+///   transaction counts are the full set of ZIP-221 history-leaf inputs a recipient needs to
+///   rebuild each leaf and verify the roots against header commitments during header sync (design
+///   §6), and the ZIP-244 `auth_data_root` is the co-input to the block's NU5+ header commitment,
 /// - the on-open repair for incompatible stored history-tree bytes before background format
 ///   checks read the tip tree.
 ///
 /// New databases populate the serving index going forward; existing ones open with it empty and
 /// serve from per-height trees as before. Serving-index rows written by an earlier pre-release
-/// build of this version (without the `auth_data_root`, 64 instead of 96 bytes) decode with a
-/// zero auth-data root (compatibility code in
+/// build of this version — 64 bytes (pre-`auth_data_root`) or 96 bytes (pre-ironwood/counts) —
+/// decode with the missing fields empty/zero (compatibility code in
 /// [`disk_format::shielded::CommitmentRootsByHeight`]'s `FromDisk`), and heights with such a row
-/// fall back to the body-wait commit path until they are re-served with a real root — so this
+/// fall back to the body-wait commit path until they are re-served with full data — so this
 /// remains a single consolidated pre-release version-3 format.
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 3;
 
