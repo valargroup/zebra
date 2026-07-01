@@ -152,14 +152,14 @@ fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
     );
 }
 
-/// Tests that unified mining addresses with multiple shielded receivers still prefer Orchard
-/// before NU6.3.
+/// Tests that unified mining addresses with multiple shielded receivers still prefer the
+/// Orchard receiver before and at NU6.3.
 ///
 /// Like [`coinbase`], this builds real shielded outputs, so run it with the `--release` flag.
 #[cfg(zcash_unstable = "nu6.3")]
 #[test]
 #[ignore]
-fn coinbase_preserves_orchard_priority_before_nu6_3() {
+fn coinbase_preserves_orchard_priority_by_network_upgrade() {
     let net = nu6_3_testnet();
     let nu6_3_height = NetworkUpgrade::Nu6_3
         .activation_height(&net)
@@ -192,6 +192,27 @@ fn coinbase_preserves_orchard_priority_before_nu6_3() {
     assert!(
         pre_tx.ironwood_shielded_data().is_none(),
         "pre-NU6.3 coinbase should not have an Ironwood output"
+    );
+
+    let post_tx =
+        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
+            .expect("unified address is paid via Ironwood at NU6.3")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("coinbase transaction deserializes");
+
+    assert!(
+        post_tx.ironwood_shielded_data().is_some(),
+        "NU6.3 coinbase to a unified address should have an Ironwood output"
+    );
+    assert!(
+        post_tx.sapling_outputs().next().is_none(),
+        "NU6.3 coinbase should not prefer Sapling when Orchard is present"
+    );
+    assert!(
+        post_tx.orchard_shielded_data().is_none(),
+        "NU6.3 coinbase should not have an Orchard output"
     );
 }
 

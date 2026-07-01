@@ -207,6 +207,14 @@ impl TransactionTemplate<NegativeOrZero> {
                             return add_orchard_reward(&mut builder, addr);
                         }
 
+                        #[cfg(zcash_unstable = "nu6.3")]
+                        if upgrade == NetworkUpgrade::Nu6_3 {
+                            return add_ironwood_reward(&mut builder, addr);
+                        }
+
+                        #[cfg(not(zcash_unstable = "nu6.3"))]
+                        let _ = addr;
+
                         None
                     })
                     .or_else(|| {
@@ -216,19 +224,6 @@ impl TransactionTemplate<NegativeOrZero> {
                     .or_else(|| {
                         addr.transparent()
                             .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                    })
-                    .or_else(|| {
-                        addr.orchard().and_then(|addr| {
-                            #[cfg(zcash_unstable = "nu6.3")]
-                            if upgrade == NetworkUpgrade::Nu6_3 {
-                                return add_ironwood_reward(&mut builder, addr);
-                            }
-
-                            #[cfg(not(zcash_unstable = "nu6.3"))]
-                            let _ = addr;
-
-                            None
-                        })
                     })
             }
 
