@@ -43,9 +43,7 @@ use zebra_chain::{
 #[allow(unused_imports)]
 use zebra_chain::serialization::BytesInDisplayOrder;
 
-use zebra_consensus::{
-    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
-};
+use zebra_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
 use zebra_node_services::mempool::{self, TransactionDependencies};
 use zebra_state::GetBlockTemplateChainInfo;
 
@@ -281,13 +279,12 @@ impl BlockTemplateResponse {
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
-    ) -> Result<Self, TransactionError> {
+    ) -> Self {
         // Determine the next block height.
-        let height = chain_info.tip_height.next().map_err(|_| {
-            TransactionError::CoinbaseConstruction(
-                "chain tip must be below Height::MAX".to_string(),
-            )
-        })?;
+        let height = chain_info
+            .tip_height
+            .next()
+            .expect("chain tip must be below Height::MAX");
 
         // Convert transactions into TransactionTemplates.
         #[cfg(not(test))]
@@ -328,12 +325,13 @@ impl BlockTemplateResponse {
         let txs_fee = mempool_txs
             .iter()
             .map(|tx| tx.miner_fee)
-            .sum::<amount::Result<Amount<NonNegative>>>()?;
+            .sum::<amount::Result<Amount<NonNegative>>>()
+            .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = match precomputed_coinbase {
-            Some(coinbase_txn) => coinbase_txn,
-            None => TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)?,
-        };
+        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
+            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                .expect("valid coinbase tx")
+        });
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -347,11 +345,7 @@ impl BlockTemplateResponse {
         let target = chain_info
             .expected_difficulty
             .to_expanded()
-            .ok_or_else(|| {
-                TransactionError::CoinbaseConstruction(
-                    "state returned an invalid difficulty value".to_string(),
-                )
-            })?;
+            .expect("state always returns a valid difficulty value");
 
         // Convert default values
         let capabilities: Vec<String> = Self::all_capabilities();
@@ -365,7 +359,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        Ok(BlockTemplateResponse {
+        BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -403,7 +397,7 @@ impl BlockTemplateResponse {
             max_time: chain_info.max_time,
 
             submit_old,
-        })
+        }
     }
 }
 

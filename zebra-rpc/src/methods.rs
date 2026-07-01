@@ -83,8 +83,7 @@ use zebra_chain::{
     },
 };
 use zebra_consensus::{
-    error::TransactionError, funding_stream_address, router::service_trait::BlockVerifierService,
-    RouterError,
+    funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
 };
 use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
@@ -2270,8 +2269,6 @@ where
 
             ErrorObject::owned(0, message, None::<()>)
         })?;
-        let gbt_transaction_error =
-            |error: TransactionError| ErrorObject::owned(0, error.to_string(), None::<()>);
 
         // - Checks and fetches that can change during long polling
         //
@@ -2407,6 +2404,7 @@ where
                             &miner_params,
                             Amount::zero(),
                         )
+                        .expect("valid coinbase tx")
                     }),
                 ));
             }
@@ -2483,9 +2481,7 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase)
-                        .transpose()
-                        .map_err(gbt_transaction_error)?;
+                        .then_some(precomputed_coinbase);
 
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
@@ -2499,7 +2495,6 @@ where
                         vec![],
                         submit_old,
                     )
-                    .map_err(gbt_transaction_error)?
                     .into())
                 }
 
@@ -2564,7 +2559,6 @@ where
             mempool_txs,
             submit_old,
         )
-        .map_err(gbt_transaction_error)?
         .into())
     }
 
