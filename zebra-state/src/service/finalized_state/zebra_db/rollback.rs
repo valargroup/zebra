@@ -11,7 +11,7 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
-    orchard,
+    ironwood, orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
@@ -206,6 +206,13 @@ pub enum RollbackFinalizedStateError {
     /// An Orchard note commitment tree required for rollback could not be loaded.
     #[error("missing Orchard note commitment tree at height {height:?}")]
     MissingOrchardTree {
+        /// Missing tree height.
+        height: block::Height,
+    },
+
+    /// An Ironwood note commitment tree required for rollback could not be loaded.
+    #[error("missing Ironwood note commitment tree at height {height:?}")]
+    MissingIronwoodTree {
         /// Missing tree height.
         height: block::Height,
     },
@@ -616,25 +623,16 @@ fn rebuild_history_tree_from_upgrade_activation(
         .activation_height(network)
         .expect("current network upgrade must have an activation height");
 
-    let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree = HistoryTree::from_block(
-        network,
-        block,
-        &sapling_root,
-        &orchard_root,
-        &Default::default(),
-    )?;
+    let (block, sapling_root, orchard_root, ironwood_root) =
+        history_rebuild_inputs_at_height(db, start_height)?;
+    let mut history_tree =
+        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
-        let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, height)?;
+        let (block, sapling_root, orchard_root, ironwood_root) =
+            history_rebuild_inputs_at_height(db, height)?;
 
-        history_tree.push(
-            network,
-            block,
-            &sapling_root,
-            &orchard_root,
-            &Default::default(),
-        )?;
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(history_tree)
@@ -648,6 +646,7 @@ fn history_rebuild_inputs_at_height(
         Arc<Block>,
         zebra_chain::sapling::tree::Root,
         zebra_chain::orchard::tree::Root,
+        zebra_chain::ironwood::tree::Root,
     ),
     RollbackFinalizedStateError,
 > {
@@ -660,7 +659,12 @@ fn history_rebuild_inputs_at_height(
         .into_iter()
         .next()
     {
-        return Ok((block, roots.sapling_root, roots.orchard_root));
+        return Ok((
+            block,
+            roots.sapling_root,
+            roots.orchard_root,
+            roots.ironwood_root,
+        ));
     }
 
     let sapling_root = db
@@ -671,8 +675,12 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RollbackFinalizedStateError::MissingOrchardTree { height })?
         .root();
+    let ironwood_root = db
+        .ironwood_tree_by_height(&height)
+        .ok_or(RollbackFinalizedStateError::MissingIronwoodTree { height })?
+        .root();
 
-    Ok((block, sapling_root, orchard_root))
+    Ok((block, sapling_root, orchard_root, ironwood_root))
 }
 
 fn rebuild_treestate_to_height(
@@ -694,13 +702,8 @@ fn rebuild_treestate_to_height(
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
-        history_tree.push(
-            network,
-            block,
-            &sapling_root,
-            &orchard_root,
-            &Default::default(),
-        )?;
+        let ironwood_root = note_commitment_trees.ironwood.root();
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(RebuiltTreestate {
@@ -922,6 +925,7 @@ fn delete_shielded_block(db: &ZebraDb, batch: &mut DiskWriteBatch, block: &Block
     let sprout_nullifiers = db.db.cf_handle("sprout_nullifiers").unwrap();
     let sapling_nullifiers = db.db.cf_handle("sapling_nullifiers").unwrap();
     let orchard_nullifiers = db.db.cf_handle("orchard_nullifiers").unwrap();
+    let ironwood_nullifiers = db.db.cf_handle("ironwood_nullifiers").unwrap();
 
     for transaction in &block.transactions {
         for nullifier in transaction.sprout_nullifiers() {
@@ -932,6 +936,9 @@ fn delete_shielded_block(db: &ZebraDb, batch: &mut DiskWriteBatch, block: &Block
         }
         for nullifier in transaction.orchard_nullifiers() {
             batch.zs_delete(&orchard_nullifiers, nullifier);
+        }
+        for nullifier in transaction.ironwood_nullifiers() {
+            batch.zs_delete(&ironwood_nullifiers, nullifier);
         }
     }
 }
@@ -1012,7 +1019,7 @@ fn reset_tip_trees(db: &ZebraDb, batch: &mut DiskWriteBatch, treestate: &Rebuilt
     batch.update_sprout_tree(db, &treestate.sprout_tree);
     batch.update_history_tree(db, &treestate.history_tree);
 
-    // The sapling and orchard trees are height-keyed and de-duplicated: the forward write only
+    // The sapling, orchard, and ironwood trees are height-keyed and de-duplicated: the forward write only
     // stores a tree when its root changes, and reads find the tip tree by searching backwards.
     // Deleting the trees above the target height (see `prune_tree_indexes`) therefore already
     // leaves the correct de-duplicated trees for the new tip. Writing a tree at the target height
@@ -1067,6 +1074,20 @@ fn prune_tree_indexes(
         }
     }
 
+    let ironwood_trees: BTreeMap<_, _> = db
+        .ironwood_tree_by_height_range((
+            std::ops::Bound::Excluded(target_height),
+            std::ops::Bound::Unbounded,
+        ))
+        .collect();
+    for (height, tree) in ironwood_trees {
+        let root = tree.root();
+        batch.delete_ironwood_tree(db, &height);
+        if !retained_shielded_roots.ironwood.contains(&root) {
+            batch.delete_ironwood_anchor(db, &root);
+        }
+    }
+
     // Fast-sync writes anchors and this root index without writing per-height trees. Use the
     // index to remove anchors introduced only by rolled-back fast-path heights before truncating
     // it, but retain any repeated root that is still valid at or below the target.
@@ -1076,7 +1097,7 @@ fn prune_tree_indexes(
     // database does not serve roots for heights it no longer holds.
     batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
 
-    // Delete every sapling/orchard subtree whose notes extend past the target height. Subtree
+    // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
     // (the exclusive end of the single-index delete range) cannot overflow.
     for (index, _) in db
@@ -1093,6 +1114,14 @@ fn prune_tree_indexes(
         .filter(|(_, subtree)| subtree.end_height > target_height)
     {
         batch.delete_range_orchard_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
+    }
+
+    for (index, _) in db
+        .ironwood_subtree_list_by_index_range(..)
+        .into_iter()
+        .filter(|(_, subtree)| subtree.end_height > target_height)
+    {
+        batch.delete_range_ironwood_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
     }
 
     // Sprout has no by-height anchor index, so enumerate every anchor and drop the ones not seen
@@ -1115,6 +1144,7 @@ fn prune_tree_indexes(
 struct RetainedShieldedRoots {
     sapling: HashSet<sapling::tree::Root>,
     orchard: HashSet<orchard::tree::Root>,
+    ironwood: HashSet<ironwood::tree::Root>,
 }
 
 fn retained_shielded_roots(db: &ZebraDb, target_height: Height) -> RetainedShieldedRoots {
@@ -1130,6 +1160,7 @@ fn retained_shielded_roots(db: &ZebraDb, target_height: Height) -> RetainedShiel
     {
         retained.sapling.insert(roots.sapling);
         retained.orchard.insert(roots.orchard);
+        retained.ironwood.insert(roots.ironwood);
     }
 
     for (_height, tree) in db.sapling_tree_by_height_range(..=target_height) {
@@ -1138,6 +1169,10 @@ fn retained_shielded_roots(db: &ZebraDb, target_height: Height) -> RetainedShiel
 
     for (_height, tree) in db.orchard_tree_by_height_range(..=target_height) {
         retained.orchard.insert(tree.root());
+    }
+
+    for (_height, tree) in db.ironwood_tree_by_height_range(..=target_height) {
+        retained.ironwood.insert(tree.root());
     }
 
     retained
@@ -1167,6 +1202,9 @@ fn prune_fast_commitment_anchors_from_index(
         }
         if !retained_roots.orchard.contains(&roots.orchard) {
             batch.delete_orchard_anchor(db, &roots.orchard);
+        }
+        if !retained_roots.ironwood.contains(&roots.ironwood) {
+            batch.delete_ironwood_anchor(db, &roots.ironwood);
         }
     }
 }

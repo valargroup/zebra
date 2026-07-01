@@ -5,7 +5,8 @@ use proptest::prelude::*;
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Height},
-    orchard, sapling, sprout,
+    block_info::BlockInfo,
+    ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, Transaction},
     transparent,
@@ -20,7 +21,7 @@ use crate::service::finalized_state::{
             AddressBalanceLocation, AddressLocation, AddressTransaction, AddressUnspentOutput,
             OutputLocation,
         },
-        IntoDisk, TransactionLocation,
+        FromDisk, IntoDisk, TransactionLocation,
     },
 };
 
@@ -478,6 +479,91 @@ fn roundtrip_orchard_subtree_data() {
 
 // TODO: test note commitment tree round-trip, after implementing proptest::Arbitrary
 
+// Ironwood
+
+#[test]
+fn serialized_ironwood_nullifier_equal() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val1 in any::<ironwood::Nullifier>(), val2 in any::<ironwood::Nullifier>())| {
+        if val1 == val2 {
+            prop_assert_eq!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were equal, but serialized bytes were not.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        } else {
+            prop_assert_ne!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were not equal, but serialized bytes were equal.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        }
+    }
+    );
+}
+
+#[test]
+fn serialized_ironwood_tree_root_equal() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val1 in any::<ironwood::tree::Root>(), val2 in any::<ironwood::tree::Root>())| {
+        if val1 == val2 {
+            prop_assert_eq!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were equal, but serialized bytes were not.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        } else {
+            prop_assert_ne!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were not equal, but serialized bytes were equal.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        }
+    }
+    );
+}
+
+#[test]
+fn roundtrip_ironwood_tree_root() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val in any::<ironwood::tree::Root>())| assert_value_properties(val));
+}
+
+#[test]
+fn roundtrip_ironwood_subtree_data() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(mut val in any::<NoteCommitmentSubtreeData<ironwood::tree::Node>>())| {
+        val.end_height.0 %= MAX_ON_DISK_HEIGHT.0 + 1;
+        assert_value_properties(val)
+    });
+}
+
+// TODO: test note commitment tree round-trip, after implementing proptest::Arbitrary
+
 // Chain
 
 // TODO: test NonEmptyHistoryTree round-trip, after implementing proptest::Arbitrary
@@ -487,4 +573,40 @@ fn roundtrip_value_balance() {
     let _init_guard = zebra_test::init();
 
     proptest!(|(val in any::<ValueBalance::<NonNegative>>())| assert_value_properties(val));
+}
+
+#[test]
+fn roundtrip_block_info_with_ironwood_value_pool() {
+    let _init_guard = zebra_test::init();
+
+    let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
+    let block_info = BlockInfo::new(ValueBalance::from_ironwood_amount(ironwood_amount), 123);
+
+    assert_eq!(block_info.as_bytes().len(), 52);
+    assert_value_properties(block_info);
+}
+
+#[test]
+fn block_info_decodes_legacy_value_pools() {
+    let _init_guard = zebra_test::init();
+
+    let orchard_amount = Amount::<NonNegative>::try_from(5).expect("5 zatoshi is a valid amount");
+    let deferred_amount =
+        Amount::<NonNegative>::try_from(11).expect("11 zatoshi is a valid amount");
+
+    let mut legacy_value_pools = ValueBalance::from_orchard_amount(orchard_amount);
+    legacy_value_pools.set_deferred_amount(deferred_amount);
+
+    let mut legacy_bytes = legacy_value_pools.as_bytes()[..40].to_vec();
+    legacy_bytes.extend_from_slice(&123_u32.to_le_bytes());
+
+    let block_info = BlockInfo::from_bytes(legacy_bytes);
+
+    assert_eq!(block_info.value_pools().orchard_amount(), orchard_amount);
+    assert_eq!(block_info.value_pools().deferred_amount(), deferred_amount);
+    assert_eq!(
+        block_info.value_pools().ironwood_amount(),
+        Amount::<NonNegative>::zero()
+    );
+    assert_eq!(block_info.size(), 123);
 }

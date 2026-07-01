@@ -9,9 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Extended value-pool disk serialization with an Ironwood slot after the deferred pool, and
-  consolidated the current verified-commitment-trees state database format changes under
-  version `27.3.0`.
+- Bumped the state database format to 28 during upgrade, backfilling empty
+  Ironwood tree, value pool, and index data, then rebuilding stored history tree
+  entries so they use the Ironwood-capable entry size.
+- Extended value-pool disk serialization with an Ironwood slot after the deferred pool, with the
+  verified-commitment-trees state database format changes preserved as the intermediate
+  no-migration version `27.3.0`.
 - Extended the `commitment_roots_by_height` serving index (and the `tree_aux` header-sync
   payload it is served from) with each block's per-height ZIP-244 `auth_data_root`, so a node
   can serve the co-input a peer needs to authenticate a block's note-commitment roots against
