@@ -274,6 +274,30 @@ impl Config {
         }
     }
 
+    /// Whether to omit archive/indexer-only data that is not required for consensus.
+    ///
+    /// These indexes are RPC-only state, not consensus. They are skipped only for
+    /// the minimal fast-validator configuration: a node that is both
+    /// [`StorageMode::Pruned`] **and** checkpoint-syncing
+    /// ([`checkpoint_sync`](Config::checkpoint_sync)). This drops historical
+    /// transparent address-index writes and transparent finalized-spender lookups,
+    /// just as pruned mode drops raw-transaction storage.
+    ///
+    /// An archive node keeps these indexes; so does a node with checkpoint sync
+    /// disabled (full semantic verification), even when pruned. RPCs backed by
+    /// skipped indexes return an error rather than wrong (empty) results.
+    ///
+    /// This is an RPC completeness rule, not a consensus-safety requirement.
+    /// Raw transaction bodies in `tx_by_loc` can use a rolling height window,
+    /// because each block body is independently present or absent. Transparent
+    /// address indexes are cumulative: starting them after skipped checkpoint
+    /// history would produce incomplete balances, UTXO lists, and transaction
+    /// histories that look authoritative. So pruned checkpoint-sync nodes skip
+    /// those indexes entirely and disable the RPCs that depend on them.
+    pub fn skip_archive_indexes(&self) -> bool {
+        matches!(self.storage_mode, StorageMode::Pruned(_)) && self.checkpoint_sync
+    }
+
     /// Validates the configured [`StorageMode`].
     ///
     /// This must be called before opening the database, so that a misconfigured
@@ -448,6 +472,39 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_archive_indexes_only_when_pruned_and_checkpoint_syncing() {
+        let pruned_checkpoint = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            pruned_checkpoint.skip_archive_indexes(),
+            "pruned + checkpoint-sync skips archive-only indexes"
+        );
+
+        let archive = Config {
+            storage_mode: StorageMode::Archive,
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            !archive.skip_archive_indexes(),
+            "archive mode keeps archive-only indexes"
+        );
+
+        let pruned_legacy = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: false,
+            ..Default::default()
+        };
+        assert!(
+            !pruned_legacy.skip_archive_indexes(),
+            "pruned with checkpoint sync disabled keeps archive-only indexes"
+        );
+    }
 
     #[test]
     fn storage_mode_deserializes_from_documented_toml() {

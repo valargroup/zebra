@@ -961,6 +961,29 @@ impl ZebraDb {
             .is_some_and(|height| self.vct_tree_absent(height))
     }
 
+    /// Returns `true` if this database has committed at least one block in pruned
+    /// storage mode.
+    ///
+    /// Unlike [`Self::is_pruned`] — which only becomes true once the raw-transaction
+    /// pruning cursor is first written (at the checkpoint retention start, near the
+    /// checkpoint tip) — this marker is written on the *first* commit in pruned mode,
+    /// before any archive-only data is dropped. A pruned checkpoint-sync node skips
+    /// the transparent address index from its very first block, so this is the durable
+    /// signal that address-index RPCs are unavailable and the database can never be
+    /// reopened as a full archive, even during the initial-sync window before
+    /// `is_pruned` flips.
+    ///
+    /// It is stored under a key in [`PRUNING_METADATA`] that is distinct from the
+    /// unit key used by [`Self::lowest_retained_height`], so it can be set early
+    /// without perturbing the raw-transaction pruning cursor.
+    pub fn committed_in_pruned_mode(&self) -> bool {
+        let Some(pruning_metadata) = self.db.cf_handle(PRUNING_METADATA) else {
+            return false;
+        };
+        let marker: Option<()> = self.db.zs_get(&pruning_metadata, &PrunedStorageModeKey);
+        marker.is_some()
+    }
+
     /// Returns the half-open range of block heights `[from, until)` whose raw
     /// transaction data should be pruned when committing a block at `new_tip`,
     /// given the configured `retention` window. Returns `None` if there is
@@ -1150,21 +1173,6 @@ impl ZebraDb {
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
 
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
-
-        // Get the current address balances, before the transactions in this block
-
         // Like the spent-UTXO reads above, the per-address balance lookups are
         // cache-served but serial. Fan them across the rayon pool once a block
         // touches enough addresses to amortize the fork-join cost.
@@ -1198,14 +1206,39 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+        //
+        // When archive-only indexes are skipped (pruned + checkpoint-sync fast-validator),
+        // none of the per-address balance reads happen and `address_balances` is left
+        // empty; the gated transparent index passes below then write no address entries.
+        let address_balances: AddressBalanceLocationUpdates = if self
+            .config()
+            .skip_archive_indexes()
+        {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            // Transparent addresses with changed balances/UTXOs in this block.
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+
+            // Get the current address balances, before the transactions in this block.
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    self.address_balance_location(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(self.address_balance_location(addr)?.into_new_change())
+                }))
+            }
         };
 
         let mut batch = DiskWriteBatch::new();
@@ -1235,6 +1268,16 @@ impl ZebraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+
+        // The first commit in pruned storage mode durably marks the database as
+        // pruned, before the raw-transaction pruning cursor is written near the
+        // checkpoint tip. A pruned checkpoint-sync node already skips the transparent
+        // address index from this first block, so the marker keeps address-index RPCs
+        // disabled and blocks archive reopen throughout the initial-sync window where
+        // `is_pruned` is still false.
+        if self.config().pruning_config().is_some() && !self.committed_in_pruned_mode() {
+            batch.prepare_pruned_storage_mode_marker_batch(self);
+        }
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
@@ -1330,6 +1373,24 @@ fn lookup_out_loc(
     let tx_loc = TransactionLocation::from_usize(height, *tx_index);
 
     OutputLocation::from_outpoint(tx_loc, outpoint)
+}
+
+/// Key under which [`PRUNING_METADATA`] records that the database has committed
+/// at least one block in pruned storage mode.
+///
+/// Its byte encoding (`[1]`) is deliberately distinct from the unit key (`[]`) that
+/// [`ZebraDb::lowest_retained_height`] uses for the raw-transaction pruning cursor,
+/// so the two entries coexist in the column family without colliding. See
+/// [`ZebraDb::committed_in_pruned_mode`].
+#[derive(Debug)]
+struct PrunedStorageModeKey;
+
+impl IntoDisk for PrunedStorageModeKey {
+    type Bytes = [u8; 1];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        [1]
+    }
 }
 
 /// Computes the half-open range of block heights `[from, until)` to prune when a
@@ -1704,6 +1765,17 @@ impl DiskWriteBatch {
         // Writing this entry also marks the database as pruned, which is a
         // one-way state.
         self.zs_insert(&pruning_metadata, (), lowest_retained_height);
+    }
+
+    /// Adds a write for the durable pruned-storage-mode marker to this batch.
+    ///
+    /// See [`ZebraDb::committed_in_pruned_mode`]. This marks the database as a
+    /// one-way pruned database from its first pruned-mode commit, independently of
+    /// the raw-transaction pruning cursor. Idempotent: re-writing the marker just
+    /// overwrites the same key.
+    pub fn prepare_pruned_storage_mode_marker_batch(&mut self, zebra_db: &ZebraDb) {
+        let pruning_metadata = zebra_db.db.cf_handle(PRUNING_METADATA).unwrap();
+        self.zs_insert(&pruning_metadata, PrunedStorageModeKey, ());
     }
 
     /// Prepare a database batch containing the block header and transaction data

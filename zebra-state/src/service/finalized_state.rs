@@ -460,10 +460,16 @@ impl FinalizedState {
             db,
         };
 
-        // Pruning is a one-way storage mode. Refuse to open a database that has
-        // already pruned historical data in archive mode, because the data it
-        // would be expected to serve has been irreversibly deleted.
-        if config.pruning_config().is_none() && new_state.db.is_pruned() {
+        // Pruning is a one-way storage mode. Refuse to open in archive mode any
+        // database that has run in pruned mode, because the archive-only data it
+        // would be expected to serve has been irreversibly dropped. `is_pruned`
+        // covers databases whose raw-transaction cursor has advanced;
+        // `committed_in_pruned_mode` additionally covers a pruned database still in
+        // the initial-sync window, which has already skipped the transparent address
+        // index even though the raw-transaction cursor has not been written yet.
+        if config.pruning_config().is_none()
+            && (new_state.db.is_pruned() || new_state.db.committed_in_pruned_mode())
+        {
             panic!(
                 "this database has been pruned and cannot be opened in archive storage mode; \
                  configure pruned storage mode (`storage_mode.pruned`), or delete the cache \

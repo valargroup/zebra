@@ -115,6 +115,12 @@ pub enum RollbackFinalizedStateError {
     #[error("state database is empty")]
     EmptyState,
 
+    /// Pruned storage does not guarantee complete transparent address indexes.
+    #[error(
+        "cannot roll back a pruned state database because transparent address indexes are unavailable"
+    )]
+    AddressIndexUnavailable,
+
     /// The requested target height is above the finalized tip.
     #[error("target height {target:?} is above finalized tip {tip:?}")]
     TargetAboveTip {
@@ -385,6 +391,10 @@ fn validate_rollback(
     db: &ZebraDb,
     options: &RollbackFinalizedStateOptions,
 ) -> Result<RollbackBounds, RollbackFinalizedStateError> {
+    if db.address_index_unavailable() {
+        return Err(RollbackFinalizedStateError::AddressIndexUnavailable);
+    }
+
     let old_tip = db.tip().ok_or(RollbackFinalizedStateError::EmptyState)?;
     let (old_tip_height, _) = old_tip;
 
@@ -697,6 +707,12 @@ fn reverse_transparent_block(
     // (see `prepare_transparent_transaction_batch`). Undoing the operations in the exact reverse
     // order retraces those same in-range intermediate balances, so the checked balance arithmetic
     // below cannot spuriously overflow or underflow.
+    // A pruned, checkpoint-syncing node never built the transparent archive-only indexes
+    // ([`Config::skip_archive_indexes`]), so there is nothing to un-credit / un-debit
+    // or remove from the finalized transparent spender index. The UTXO-set reversal
+    // (`utxo_by_out_loc`) below still runs.
+    let skip_index = db.config().skip_archive_indexes();
+
     for (tx_index, transaction) in block.transactions.iter().enumerate().rev() {
         let tx_location = TransactionLocation::from_usize(height, tx_index);
 
@@ -705,21 +721,23 @@ fn reverse_transparent_block(
             let created_output_location =
                 OutputLocation::from_usize(height, tx_index, output_index);
 
-            if let Some(address) = output.address(network) {
-                let address_location =
-                    cached_address_balance(db, address_balances, &address)?.address_location();
+            if !skip_index {
+                if let Some(address) = output.address(network) {
+                    let address_location =
+                        cached_address_balance(db, address_balances, &address)?.address_location();
 
-                batch.zs_delete(
-                    db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
-                    AddressTransaction::new(address_location, tx_location),
-                );
-                batch.zs_delete(
-                    db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
-                    AddressUnspentOutput::new(address_location, created_output_location),
-                );
+                    batch.zs_delete(
+                        db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
+                        AddressTransaction::new(address_location, tx_location),
+                    );
+                    batch.zs_delete(
+                        db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
+                        AddressUnspentOutput::new(address_location, created_output_location),
+                    );
 
-                sub_address_balance(db, address_balances, &address, output.value())?;
-                sub_address_received(db, address_balances, &address, output.value());
+                    sub_address_balance(db, address_balances, &address, output.value())?;
+                    sub_address_received(db, address_balances, &address, output.value());
+                }
             }
 
             batch.zs_delete(
@@ -732,21 +750,23 @@ fn reverse_transparent_block(
         for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
             let (spent_output_location, spent_utxo) = finalized_output(db, &spent_outpoint)?;
 
-            if let Some(address) = spent_utxo.output.address(network) {
-                let address_location =
-                    cached_address_balance(db, address_balances, &address)?.address_location();
+            if !skip_index {
+                if let Some(address) = spent_utxo.output.address(network) {
+                    let address_location =
+                        cached_address_balance(db, address_balances, &address)?.address_location();
 
-                batch.zs_delete(
-                    db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
-                    AddressTransaction::new(address_location, tx_location),
-                );
-                batch.zs_insert(
-                    db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
-                    AddressUnspentOutput::new(address_location, spent_output_location),
-                    (),
-                );
+                    batch.zs_delete(
+                        db.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap(),
+                        AddressTransaction::new(address_location, tx_location),
+                    );
+                    batch.zs_insert(
+                        db.db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap(),
+                        AddressUnspentOutput::new(address_location, spent_output_location),
+                        (),
+                    );
 
-                add_address_balance(db, address_balances, &address, spent_utxo.output.value())?;
+                    add_address_balance(db, address_balances, &address, spent_utxo.output.value())?;
+                }
             }
 
             batch.zs_insert(
@@ -754,6 +774,8 @@ fn reverse_transparent_block(
                 spent_output_location,
                 &spent_utxo.output,
             );
+            // In `skip_index` mode the forward path never wrote this archive-only
+            // key, so this delete is a harmless no-op.
             batch.zs_delete(
                 db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
                 spent_output_location,

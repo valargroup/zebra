@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   data. This moves ZIP-244 authorizing-data commitment work off the finalized
   committer's critical path when available, while preserving the existing
   recompute fallback.
+- Skip the transparent address index (balances, address→utxo, address→tx) on a
+  pruned, checkpoint-syncing node. The index is RPC-only state, not consensus, so
+  the minimal fast-validator configuration no longer does the per-block
+  address-balance reads or the index writes (like pruned mode already skips
+  raw-transaction storage). Address-lookup RPCs (`getaddressbalance`,
+  `getaddressutxos`, `getaddresstxids`) return an explicit "index disabled"
+  error in this mode instead of wrong (empty) results. Archive nodes, and pruned
+  nodes with checkpoint sync disabled (full semantic verification), are unchanged.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
@@ -130,6 +138,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather
   than the earlier conservative test-network envelope.
+- Transparent address-index RPCs (`getaddressbalance`, `getaddressutxos`, and
+  `getaddresstxids`) now require archive storage mode. Pruned nodes return an
+  error for these calls because pruned storage does not guarantee complete
+  address-index data. A pruned database is now durably marked from its first
+  commit (state database format minor version bump), so this holds even during the
+  initial-sync window before raw-transaction pruning starts, and the database can
+  no longer be reopened as an archive in that window.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note

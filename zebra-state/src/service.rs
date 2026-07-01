@@ -89,6 +89,20 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
+/// Error returned for historical note-commitment tree/subtree read requests on a
+/// verified-commitment-trees fast-synced database, where the per-height trees
+/// below the checkpoint handoff height were never written.
+const FAST_SYNCED_TREE_UNAVAILABLE_ERROR: &str =
+    "note commitment treestate is unavailable below the checkpoint on a fast-synced node; \
+     historical treestate queries require an archive node";
+
+/// Returned for transparent archive/indexer lookups when the required indexes were
+/// not built. These indexes are RPC-only, not consensus.
+pub(crate) const ARCHIVE_INDEXES_DISABLED: &str =
+    "the transparent archive indexes are unavailable in pruned storage mode; \
+     getaddressbalance, getaddressutxos, getaddresstxids, and finalized transparent \
+     spender lookups require archive storage mode";
+
 /// A read-write service for Zebra's cached blockchain state.
 ///
 /// This service modifies and provides access to:
@@ -1750,9 +1764,18 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             #[cfg(feature = "indexer")]
-            ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
-            )),
+            ReadRequest::SpendingTransactionId(spend) => {
+                if matches!(spend, crate::request::Spend::OutPoint(_))
+                    && state.db.address_index_unavailable()
+                {
+                    return Err(ARCHIVE_INDEXES_DISABLED.into());
+                }
+
+                let spending_transaction_hash =
+                    read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend);
+
+                Ok(ReadResponse::TransactionId(spending_transaction_hash))
+            }
 
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),
@@ -1936,31 +1959,47 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_address_balance RPC.
             ReadRequest::AddressBalance(addresses) => {
-                let (balance, received) =
-                    read::transparent_balance(state.latest_best_chain(), &state.db, addresses)?;
-                Ok(ReadResponse::AddressBalance { balance, received })
+                if state.db.address_index_unavailable() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
+                } else {
+                    let (balance, received) =
+                        read::transparent_balance(state.latest_best_chain(), &state.db, addresses)?;
+                    Ok(ReadResponse::AddressBalance { balance, received })
+                }
             }
 
             // For the get_address_tx_ids RPC.
             ReadRequest::TransactionIdsByAddresses {
                 addresses,
                 height_range,
-            } => read::transparent_tx_ids(
-                state.latest_best_chain(),
-                &state.db,
-                addresses,
-                height_range,
-            )
-            .map(ReadResponse::AddressesTransactionIds),
+            } => {
+                if state.db.address_index_unavailable() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
+                } else {
+                    read::transparent_tx_ids(
+                        state.latest_best_chain(),
+                        &state.db,
+                        addresses,
+                        height_range,
+                    )
+                    .map(ReadResponse::AddressesTransactionIds)
+                }
+            }
 
             // For the get_address_utxos RPC.
-            ReadRequest::UtxosByAddresses(addresses) => read::address_utxos(
-                &state.network,
-                state.latest_best_chain(),
-                &state.db,
-                addresses,
-            )
-            .map(ReadResponse::AddressUtxos),
+            ReadRequest::UtxosByAddresses(addresses) => {
+                if state.db.address_index_unavailable() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
+                } else {
+                    read::address_utxos(
+                        &state.network,
+                        state.latest_best_chain(),
+                        &state.db,
+                        addresses,
+                    )
+                    .map(ReadResponse::AddressUtxos)
+                }
+            }
 
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(unmined_tx) => {
                 let latest_non_finalized_best_chain = state.latest_best_chain();

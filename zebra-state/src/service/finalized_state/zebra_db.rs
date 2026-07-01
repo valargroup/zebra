@@ -220,6 +220,23 @@ impl ZebraDb {
         &self.config
     }
 
+    /// Returns true if transparent address index queries are unsupported for this database.
+    ///
+    /// Pruned storage does not guarantee complete transparent address indexes. This is true if
+    /// any of the following hold:
+    /// - the running config is pruned (catches newly configured pruned nodes on any restart,
+    ///   including before the first commit),
+    /// - the database committed at least one block in pruned mode (a durable marker written on
+    ///   the first pruned commit, which catches a later switch back to archive config even
+    ///   during the initial-sync window before raw-transaction pruning starts), or
+    /// - the raw-transaction pruning cursor has advanced (`is_pruned`), covering databases
+    ///   pruned by earlier code that predates the pruned-mode marker.
+    pub fn address_index_unavailable(&self) -> bool {
+        self.config().pruning_config().is_some()
+            || self.committed_in_pruned_mode()
+            || self.is_pruned()
+    }
+
     /// Returns the configured database kind for this database.
     pub fn db_kind(&self) -> String {
         self.db.db_kind()
