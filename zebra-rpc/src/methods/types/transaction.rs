@@ -1118,7 +1118,7 @@ impl TransactionObject {
     }
 }
 
-#[cfg(all(test, zcash_unstable = "nu6.3"))]
+#[cfg(test)]
 mod tests {
     use proptest::{
         prelude::any,

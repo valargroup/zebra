@@ -725,7 +725,6 @@ async fn rpc_getblock() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
     let _init_guard = zebra_test::init();
