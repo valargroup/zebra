@@ -42,6 +42,10 @@ async fn run_checked(
         final_budget_reserved = report.final_budget_reserved,
         protocol_rejects = report.protocol_rejects,
         floor_bypass_requests = report.floor_bypass_requests,
+        total_requests = report.total_requests,
+        max_requests_without_block_progress = report.max_requests_without_block_progress,
+        max_unproven_requests_without_block_progress =
+            report.max_unproven_requests_without_block_progress,
         "blocksync fuzz scenario complete",
     );
     assert_core_invariants(&scenario, &outcome, &report, outstanding_slack);
@@ -206,6 +210,95 @@ async fn fuzz_idle_peers() {
         vec![withholder, PeerSpec::fast(2, target(blocks))],
     );
     run_checked("fuzz_idle_peers", scenario, 32).await;
+}
+
+/// Silent-dropping carrier: one peer answers normally half the time and **silently
+/// drops** the rest (no response at all), alongside one fast full-range peer. This is
+/// the bbr-committer-6 floor-stall shape — a peer takes a floor-critical request and
+/// never serves it, so the lowest missing height waits on the node's request-timeout /
+/// re-request path before a healthy peer covers it. The contiguous-commit invariant
+/// (`reached_target`) proves a silently-dropping peer never wedges sync, and the
+/// re-request count proves the timeout path was actually exercised (non-vacuous).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_silent_dropping_peer() {
+    let blocks = 300;
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        ..retry_config()
+    };
+    // A flaky carrier: full-range and otherwise fast, but drops half its requests on the
+    // floor — exactly the silent-on-the-floor peer that stalls the contiguous head.
+    let flaky = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 0.5,
+            ..ServeProfile::fast()
+        },
+    );
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_000d,
+        config,
+        vec![flaky, PeerSpec::fast(2, target(blocks))],
+    );
+    scenario.deadline = Duration::from_secs(60);
+    let (_, report) = run_checked("fuzz_silent_dropping_peer", scenario, 32).await;
+
+    // Non-vacuous: the silent drops forced re-requests, so more requests were issued than
+    // there are blocks (otherwise the dropping peer never held a height we needed).
+    assert!(
+        report.total_requests > usize::try_from(blocks).expect("block count fits usize"),
+        "silent drops must force re-requests: issued {} requests for {} blocks",
+        report.total_requests,
+        blocks,
+    );
+}
+
+/// Fully silent carrier: one peer accepts status and `GetBlocks` but never sends any
+/// block-sync response. The node must cap requests to that peer, disconnect it via
+/// no-progress liveness, then finish through a healthy peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_silent_peer_request_cap() {
+    let blocks = 96;
+    let probe_requests = 1;
+    let request_cap = 8;
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        request_timeout: Duration::from_millis(100),
+        floor_rescue_timeout: Duration::from_millis(25),
+        initial_block_probe_requests: probe_requests,
+        max_requests_without_block_progress: request_cap,
+        ..fuzz_config()
+    };
+
+    let mut silent = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 1.0,
+            ..ServeProfile::fast()
+        },
+    );
+    silent.max_inflight_requests = 64;
+
+    let mut healthy = PeerSpec::fast(2, target(blocks));
+    healthy.connect_at = Duration::from_millis(700);
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_000e, config, vec![silent, healthy]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(10);
+    let (_, report) = run_checked("fuzz_silent_peer_request_cap", scenario, 32).await;
+
+    assert!(
+        report.protocol_rejects >= 1,
+        "the fully silent peer must be disconnected by no-progress liveness",
+    );
+    assert_eq!(
+        report.max_unproven_requests_without_block_progress,
+        u64::from(probe_requests),
+        "the silent peer should receive exactly the configured initial probe budget",
+    );
 }
 
 /// Churn storm: a stable peer plus several peers connecting and disconnecting on a

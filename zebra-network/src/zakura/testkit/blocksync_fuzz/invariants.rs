@@ -8,6 +8,7 @@
 //! corpus hash. The trace-derived bounds catch download-side regressions.
 
 use serde_json::Value;
+use std::collections::HashMap;
 
 use super::scenario::{FuzzOutcome, Scenario};
 use crate::zakura::testkit::TraceReader;
@@ -25,6 +26,15 @@ pub(crate) struct InvariantReport {
     pub(crate) final_budget_reserved: u64,
     /// Liveness-reaper / protocol-reject disconnects observed.
     pub(crate) protocol_rejects: usize,
+    /// Total `block_get_blocks_sent` requests issued over the run. Exceeds the chain
+    /// length when blocks are re-requested (a peer dropped/withheld a height), so it is
+    /// the non-vacuous signal that a timeout/re-request scenario actually re-requested.
+    pub(crate) total_requests: usize,
+    /// Worst per-peer streak of `GetBlocks` requests without an accepted block body.
+    pub(crate) max_requests_without_block_progress: u64,
+    /// Worst per-peer no-progress streak observed before a peer has delivered its
+    /// first accepted block body.
+    pub(crate) max_unproven_requests_without_block_progress: u64,
     /// `block_get_blocks_sent` requests issued via the floor bypass (a floor request
     /// sent while the peer was saturated at its BBR cwnd).
     pub(crate) floor_bypass_requests: usize,
@@ -68,6 +78,10 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
+    let total_requests = reader.table("block_sync").count("block_get_blocks_sent");
+    let max_requests_without_block_progress = max_requests_without_block_progress(reader);
+    let max_unproven_requests_without_block_progress =
+        max_unproven_requests_without_block_progress(reader);
     let body_rows: Vec<&Value> = reader
         .table("block_sync")
         .rows()
@@ -103,11 +117,58 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         peak_budget_reserved,
         final_budget_reserved,
         protocol_rejects,
+        total_requests,
+        max_requests_without_block_progress,
+        max_unproven_requests_without_block_progress,
         floor_bypass_requests,
         peak_cwnd_bytes,
         peak_inflight_bytes,
         peak_cwnd_requests,
     }
+}
+
+fn max_unproven_requests_without_block_progress(reader: &TraceReader) -> u64 {
+    reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| event(row) == Some("block_get_blocks_sent"))
+        .filter(|row| u64_field(row, "block_progress_proven") == Some(0))
+        .filter_map(|row| u64_field(row, "requests_without_block_progress"))
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_requests_without_block_progress(reader: &TraceReader) -> u64 {
+    let mut streaks: HashMap<String, u64> = HashMap::new();
+    let mut max_streak = 0u64;
+
+    for row in reader.table("block_sync").rows() {
+        let Some(peer) = str_field(row, "peer") else {
+            continue;
+        };
+
+        match event(row) {
+            Some("block_peer_connected") => {
+                streaks.insert(peer.to_string(), 0);
+            }
+            Some("block_get_blocks_sent") => {
+                let streak = streaks
+                    .entry(peer.to_string())
+                    .and_modify(|streak| *streak = streak.saturating_add(1))
+                    .or_insert(1);
+                max_streak = max_streak.max(*streak);
+            }
+            Some("block_body_received")
+            | Some("block_peer_disconnected")
+            | Some("block_peer_protocol_reject") => {
+                streaks.insert(peer.to_string(), 0);
+            }
+            _ => {}
+        }
+    }
+
+    max_streak
 }
 
 /// Assert the run's core invariants. `outstanding_slack` is added to the per-peer
@@ -171,4 +232,8 @@ fn event(row: &Value) -> Option<&str> {
 
 fn u64_field(row: &Value, field: &str) -> Option<u64> {
     row.get(field).and_then(Value::as_u64)
+}
+
+fn str_field<'a>(row: &'a Value, field: &str) -> Option<&'a str> {
+    row.get(field).and_then(Value::as_str)
 }

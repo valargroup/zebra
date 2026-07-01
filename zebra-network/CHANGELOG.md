@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Raised `DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT` from 30s to 150s. The 30s
   application-idle reaper tore down healthy gossip connections between blocks
   (which can be minutes apart) and forced constant re-dials.
+- Zakura block sync now uses a probe-first no-progress policy for peers that
+  are not delivering accepted block bodies. A peer receives only
+  `initial_block_probe_requests` before its first accepted body; after that,
+  `max_requests_without_block_progress` is the hard cap before the no-progress
+  liveness deadline disconnects it.
 
 ### Fixed
 

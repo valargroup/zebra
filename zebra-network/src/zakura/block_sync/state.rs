@@ -310,8 +310,16 @@ pub(super) struct DownloadWindow {
     cwnd_unit: CwndUnit,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
+    /// Last time this peer was sent a block-body request.
+    pub(super) last_request_at: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
     pub(super) last_block_at: Option<Instant>,
+    /// Consecutive `GetBlocks` requests sent since the last accepted full block body.
+    pub(super) requests_without_block_progress: u32,
+    /// Maximum no-progress requests this peer may receive in its current proof state.
+    max_requests_without_block_progress: u32,
+    /// Maximum no-progress requests this peer may receive before its first accepted body.
+    initial_block_probe_requests: u32,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -329,7 +337,11 @@ impl DownloadWindow {
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             block_liveness_deadline: None,
+            last_request_at: None,
             last_block_at: None,
+            requests_without_block_progress: 0,
+            max_requests_without_block_progress: config.max_requests_without_block_progress,
+            initial_block_probe_requests: config.initial_block_probe_requests,
         }
     }
 
@@ -527,7 +539,22 @@ impl DownloadWindow {
         self.bbr.dip_on_timeout();
     }
 
+    pub(super) fn has_block_progress(&self) -> bool {
+        self.last_block_at.is_some()
+    }
+
+    pub(super) fn no_progress_request_cap(&self) -> u32 {
+        if self.has_block_progress() {
+            self.max_requests_without_block_progress
+        } else {
+            self.initial_block_probe_requests
+        }
+    }
+
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+        self.last_request_at = Some(now);
+        self.requests_without_block_progress =
+            self.requests_without_block_progress.saturating_add(1);
         if self.block_liveness_deadline.is_none() {
             self.block_liveness_deadline = Some(now + timeout);
         }
@@ -535,6 +562,7 @@ impl DownloadWindow {
 
     pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
         self.last_block_at = Some(now);
+        self.requests_without_block_progress = 0;
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -542,7 +570,18 @@ impl DownloadWindow {
         };
     }
 
-    pub(super) fn disarm_liveness_if_idle(&mut self) {
+    pub(super) fn disarm_liveness_after_progress_if_idle(&mut self) {
+        if self.outstanding.is_empty()
+            && matches!(
+                (self.last_request_at, self.last_block_at),
+                (Some(request_at), Some(block_at)) if block_at >= request_at
+            )
+        {
+            self.block_liveness_deadline = None;
+        }
+    }
+
+    pub(super) fn clear_liveness_if_idle(&mut self) {
         if self.outstanding.is_empty() {
             self.block_liveness_deadline = None;
         }
@@ -551,8 +590,10 @@ impl DownloadWindow {
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
         match self.block_liveness_deadline {
             None => LivenessOutcome::Ok,
+            Some(deadline) if self.last_request_at.is_none() && now >= deadline => {
+                LivenessOutcome::Disarm
+            }
             Some(deadline) if now < deadline => LivenessOutcome::Ok,
-            Some(_) if self.outstanding.is_empty() => LivenessOutcome::Disarm,
             Some(_) => LivenessOutcome::Disconnect,
         }
     }

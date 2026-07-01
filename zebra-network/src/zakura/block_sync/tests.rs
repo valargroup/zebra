@@ -6,8 +6,9 @@ use super::*;
 use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
-        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
         DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
         MAX_BS_RESPONSE_BYTES,
@@ -510,7 +511,7 @@ fn block_liveness_never_disconnects_idle_peer() {
 
     window.block_liveness_deadline = Some(now);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
-    window.disarm_liveness_if_idle();
+    window.clear_liveness_if_idle();
     assert_eq!(window.block_liveness_deadline, None);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
 }
@@ -532,7 +533,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
 }
 
 #[test]
-fn block_liveness_disarms_when_outstanding_drains() {
+fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
@@ -540,10 +541,55 @@ fn block_liveness_disarms_when_outstanding_drains() {
     window.arm_liveness(now, timeout);
 
     window.outstanding.clear();
-    window.disarm_liveness_if_idle();
+    window.disarm_liveness_after_progress_if_idle();
+
+    assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect
+    );
+}
+
+#[test]
+fn block_liveness_disarms_when_satisfied_request_drains() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+    window.outstanding.clear();
+    window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, None);
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
+}
+
+#[test]
+fn block_liveness_uses_probe_cap_until_first_accepted_body() {
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    assert!(!window.has_block_progress());
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    assert_eq!(window.requests_without_block_progress, 1);
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+
+    assert!(window.has_block_progress());
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert_eq!(window.no_progress_request_cap(), 8);
 }
 
 #[test]
@@ -553,8 +599,9 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let mut window = download_window();
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
-    window.disarm_liveness_if_idle();
+    window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
     window.outstanding.push(window_request(2));
@@ -726,6 +773,14 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
     );
     assert_eq!(
+        default.initial_block_probe_requests,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+    );
+    assert_eq!(
+        default.max_requests_without_block_progress,
+        DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+    );
+    assert_eq!(
         default.effective_max_reorder_lookahead_bytes(),
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
@@ -811,6 +866,18 @@ fn config_validate_rejects_degenerate_values() {
 
     config = ZakuraBlockSyncConfig {
         request_timeout: Duration::ZERO,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        max_requests_without_block_progress: 0,
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -2390,14 +2457,19 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
     capture.flush().await;
     let reader = capture.reader().expect("trace rows load");
     reader.table("block_sync").assert_row(
-        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        bs_trace::BLOCK_GET_BLOCKS_SENT,
         &[
-            (
-                bs_trace::REASON,
-                TraceValue::Str("block_sync_no_block_progress"),
-            ),
-            (bs_trace::OUTSTANDING, TraceValue::U64(1)),
+            ("requests_without_block_progress", TraceValue::U64(1)),
+            ("no_progress_request_cap", TraceValue::U64(1)),
+            ("block_progress_proven", TraceValue::U64(0)),
         ],
+    );
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        &[(
+            bs_trace::REASON,
+            TraceValue::Str("block_sync_no_block_progress"),
+        )],
     );
 
     reactor_task.abort();

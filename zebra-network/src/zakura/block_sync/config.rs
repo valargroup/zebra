@@ -83,6 +83,10 @@ pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness disconnects.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
+/// Default `GetBlocks` probes sent to a new peer before it proves block-body progress.
+pub const DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS: u32 = 1;
+/// Maximum `GetBlocks` requests sent to one peer without an accepted block body.
+pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 /// Default cooldown before a no-progress peer may be admitted again.
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
@@ -252,6 +256,15 @@ pub struct ZakuraBlockSyncConfig {
     /// How long to keep a peer disconnected after it makes no accepted block progress.
     #[serde(with = "humantime_serde")]
     pub no_progress_peer_cooldown: Duration,
+    /// Maximum `GetBlocks` requests to queue to a peer before it has delivered its
+    /// first accepted block body. This discovery phase keeps peers that accept
+    /// requests but never serve bodies from receiving a normal BBR cold-start burst.
+    pub initial_block_probe_requests: u32,
+    /// Maximum `GetBlocks` requests to queue to one peer without receiving an accepted
+    /// block body after it has proven block-body progress. Once this cap is reached,
+    /// the peer receives no more block requests until it either makes block progress or
+    /// the liveness deadline disconnects it.
+    pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
@@ -328,6 +341,8 @@ impl Default for ZakuraBlockSyncConfig {
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             floor_rescue_timeout: DEFAULT_BS_FLOOR_RESCUE_TIMEOUT,
             no_progress_peer_cooldown: DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
+            initial_block_probe_requests: DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+            max_requests_without_block_progress: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             fanout: DEFAULT_BS_FANOUT,
@@ -434,6 +449,12 @@ impl ZakuraBlockSyncConfig {
         }
         if self.bbr_min_cwnd_bytes == 0 {
             return Err("bbr_min_cwnd_bytes must be greater than zero");
+        }
+        if self.max_requests_without_block_progress == 0 {
+            return Err("max_requests_without_block_progress must be greater than zero");
+        }
+        if self.initial_block_probe_requests == 0 {
+            return Err("initial_block_probe_requests must be greater than zero");
         }
         if self.bbr_cwnd_gain_percent < 100
             || self.bbr_probe_bw_gain_percent < 100

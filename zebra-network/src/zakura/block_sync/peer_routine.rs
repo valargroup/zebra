@@ -482,7 +482,7 @@ impl PeerRoutine {
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
-        self.window.disarm_liveness_if_idle();
+        self.window.clear_liveness_if_idle();
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
     }
@@ -559,6 +559,14 @@ impl PeerRoutine {
             // `floor_bonus` slots so the lowest missing height keeps moving.
             if !self.received_status {
                 break "no_status";
+            }
+            if self.window.requests_without_block_progress >= self.window.no_progress_request_cap()
+            {
+                break if self.window.has_block_progress() {
+                    "no_block_progress_request_cap"
+                } else {
+                    "initial_block_probe_request_cap"
+                };
             }
             if floor_slots == 0 {
                 break "cwnd_saturated";
@@ -963,16 +971,7 @@ impl PeerRoutine {
         match self.window.check_liveness(now) {
             LivenessOutcome::Ok => Ok(()),
             LivenessOutcome::Disarm => {
-                self.window.disarm_liveness_if_idle();
-                Ok(())
-            }
-            LivenessOutcome::Disconnect if self.session.outbound_capacity() == 0 => {
-                // This is local ordered-stream backpressure, not the peer's request
-                // window. While the outbound queue is full, the select loop above
-                // does not drain inbound frames, so a useful block may already be
-                // waiting behind our own write-side congestion.
-                self.window.block_liveness_deadline =
-                    Some(now + self.config.effective_liveness_timeout());
+                self.window.clear_liveness_if_idle();
                 Ok(())
             }
             LivenessOutcome::Disconnect => {
@@ -1021,7 +1020,7 @@ impl PeerRoutine {
         }
         if removed {
             self.publish_outstanding();
-            self.window.disarm_liveness_if_idle();
+            self.window.disarm_liveness_after_progress_if_idle();
         }
     }
 
@@ -1542,7 +1541,9 @@ impl PeerRoutine {
             }
         }
         self.publish_outstanding();
-        self.window.disarm_liveness_if_idle();
+        if disposition == Disposition::Satisfied {
+            self.window.disarm_liveness_after_progress_if_idle();
+        }
     }
 
     fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
@@ -1764,6 +1765,25 @@ impl PeerRoutine {
                 row,
                 "peer_outstanding",
                 self.window.outstanding.len() as u64,
+            );
+            bs_insert_u64(
+                row,
+                "requests_without_block_progress",
+                u64::from(self.window.requests_without_block_progress),
+            );
+            bs_insert_u64(
+                row,
+                "no_progress_request_cap",
+                u64::from(self.window.no_progress_request_cap()),
+            );
+            bs_insert_u64(
+                row,
+                "block_progress_proven",
+                if self.window.has_block_progress() {
+                    1
+                } else {
+                    0
+                },
             );
             // A floor request issued while the peer was saturated at its cwnd — borrowed
             // a floor-bypass slot. Lets the analysis confirm the bypass actually fired.
