@@ -139,7 +139,7 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
             })
             .unwrap_or(false)
             && !finalized_state.contains_ironwood_anchor(&ironwood_shielded_data.shared_anchor)
-            && !is_empty_ironwood_anchor_for_activation_mempool_check(
+            && !is_default_ironwood_root_for_activation_mempool_check(
                 finalized_state,
                 parent_chain,
                 height,
@@ -165,12 +165,12 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
     Ok(())
 }
 
-/// Returns true for an activation-height mempool transaction anchored to the empty Ironwood tree.
+/// Returns true for an activation-height mempool transaction anchored to the default Ironwood root.
 ///
 /// Before the NU6.3 activation block is committed, finalized state has not stored an Ironwood tree
 /// or anchor yet. But mempool transactions for the next block are checked while the finalized tip is
-/// still one block before activation, so they must be allowed to anchor to the empty Ironwood tree.
-fn is_empty_ironwood_anchor_for_activation_mempool_check(
+/// still one block before activation, so they must be allowed to anchor to the default Ironwood root.
+fn is_default_ironwood_root_for_activation_mempool_check(
     finalized_state: &ZebraDb,
     parent_chain: Option<&Arc<Chain>>,
     height: Option<Height>,

@@ -365,7 +365,7 @@ fn check_sapling_anchors() {
 
 #[test]
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn mempool_allows_empty_ironwood_anchor_at_activation() {
+fn mempool_allows_default_ironwood_root_at_activation() {
     let _init_guard = zebra_test::init();
 
     let network = TestnetParameters::build()
@@ -394,15 +394,15 @@ fn mempool_allows_empty_ironwood_anchor_at_activation() {
         .commit_finalized_direct(
             CheckpointVerifiedBlock::from(genesis).into(),
             None,
-            "empty Ironwood anchor activation test",
+            "default Ironwood root activation test",
         )
         .expect("testnet genesis block commits");
 
-    let empty_ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
+    let default_ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
     assert!(
         !finalized_state
             .db
-            .contains_ironwood_anchor(&empty_ironwood_root),
+            .contains_ironwood_anchor(&default_ironwood_root),
         "the special case should not depend on a stored finalized Ironwood anchor"
     );
 
@@ -414,7 +414,7 @@ fn mempool_allows_empty_ironwood_anchor_at_activation() {
     let ironwood_shielded_data = ironwood::ShieldedData {
         flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
         value_balance: Amount::try_from(0).expect("zero is a valid amount"),
-        shared_anchor: empty_ironwood_root,
+        shared_anchor: default_ironwood_root,
         proof: Halo2Proof(vec![]),
         actions: at_least_one![action],
         binding_sig: [0u8; 64].into(),
@@ -437,5 +437,5 @@ fn mempool_allows_empty_ironwood_anchor_at_activation() {
     };
 
     tx_anchors_refer_to_final_treestates(&finalized_state.db, None, &unmined_tx)
-        .expect("activation-height mempool transactions can use the empty Ironwood anchor");
+        .expect("activation-height mempool transactions can use the default Ironwood root");
 }
