@@ -350,6 +350,42 @@ fn mempool_removes_ironwood_duplicate_spends() {
 }
 
 #[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn mempool_rejects_ironwood_conflict_on_insert() {
+    let _init_guard = zebra_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let action = ironwood_action();
+    let first_mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
+    let second_mempool_tx = verified_ironwood_v6_tx(Height(2), action);
+
+    let first_mempool_id = first_mempool_tx.transaction.id;
+    let second_mempool_id = second_mempool_tx.transaction.id;
+
+    assert_eq!(
+        storage.insert(first_mempool_tx, Vec::new(), None),
+        Ok(first_mempool_id)
+    );
+
+    assert_eq!(
+        storage.insert(second_mempool_tx, Vec::new(), None),
+        Err(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+
+    assert!(storage.contains_transaction_exact(&first_mempool_id.mined_id()));
+    assert!(!storage.contains_transaction_exact(&second_mempool_id.mined_id()));
+    assert_eq!(
+        storage.rejection_error(&second_mempool_id),
+        Some(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+}
+
+#[test]
 fn mempool_expired_basic() -> Result<()> {
     let _init_guard = zebra_test::init();
     for network in Network::iter() {
