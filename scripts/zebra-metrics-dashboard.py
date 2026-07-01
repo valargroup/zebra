@@ -103,6 +103,15 @@ PANELS = [
     ("Zakura",     "zk_peers",       "Cohort peers (active)",       "",      "gauge"),
     ("Zakura",     "zk_qdepth",      "Zakura queue depth",          "",      "gauge"),
     ("Zakura",     "zk_block_sync",  "block_sync streams accepted", "",      "gauge"),
+    # Download supply: received-body rate + whether a peer can serve the floor.
+    ("Download",   "recv_s",         "Blocks received / s",         "blk/s", "rate"),
+    ("Download",   "floor_avail_peers",   "Floor-gap available peers",  "",   "gauge"),
+    ("Download",   "floor_servable_peers","Floor-gap servable peers",   "",   "gauge"),
+    # Peer churn / connectivity: high accepted+closed with flat active = churn;
+    # dial failures = discovery/connectivity trouble.
+    ("Peers",      "conn_new_s",     "Connections accepted / s",    "/s",    "rate"),
+    ("Peers",      "conn_closed_s",  "Connections closed / s",      "/s",    "rate"),
+    ("Peers",      "dial_fail_s",    "Dial failures / s",           "/s",    "rate"),
     # Apply-queue depth + floor-gap attribution: separates HOL download stalls
     # from the sequencer→committer handoff ("glue") from peer-supply starvation.
     ("Apply queue","applied_s",      "Submitted blocks / s",        "/s",    "rate"),
@@ -360,6 +369,12 @@ class Collector:
         _reorder_bytes      = bare(m, "sync_block_reorder_buffered_bytes")
         d["reorder_mb"]     = (_reorder_bytes / 1e6) if _reorder_bytes is not None else None
         d["outstanding"]    = bare(m, "sync_block_outstanding")
+        # Download-supply health at the sync floor: whether any peer can currently
+        # serve the next-needed block. `available` dropping to 0 while `servable`
+        # is non-zero is the head-of-line-on-the-floor signature (peers exist but
+        # none is dispatchable — the stall we saw at ~9 blk/s).
+        d["floor_avail_peers"]    = bare(m, "sync_block_floor_gap_available_peers")
+        d["floor_servable_peers"] = bare(m, "sync_block_floor_gap_servable_peers")
 
         cur = {
             "h":    bare(m, "state_finalized_block_height"),
@@ -371,6 +386,12 @@ class Collector:
             "txid_s": bare(m, "zebra_state_prepare_txid_auth_digest_duration_seconds_sum"),
             "bc_s": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_sum"),
             "bc_c": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_count"),
+            # Download supply + peer-churn counters (rates computed below). `total`
+            # so a labeled series still aggregates.
+            "recv":        total(m, "sync_block_body_received"),
+            "conn_acc":    total(m, "zakura_p2p_conn_accepted"),
+            "conn_closed": total(m, "zakura_p2p_conn_closed_neutral"),
+            "dial_fail":   total(m, "zakura_p2p_discovery_dial_failed"),
         }
         # Maintain the trailing height window for smoothed throughput.
         if cur["h"] is not None:
@@ -413,6 +434,12 @@ class Collector:
             d["vct_fast_s"]     = rate(p["vf"], cur["vf"], dt)
             d["vct_prevalid_s"] = rate(p["vp"], cur["vp"], dt)
             d["applied_s"]      = rate(p["sub"], cur["sub"], dt)
+            # Download supply rate + peer churn (connections opened/closed per sec,
+            # dial failures per sec) — to tell "slow/few peers" from a commit stall.
+            d["recv_s"]         = rate(p["recv"], cur["recv"], dt)
+            d["conn_new_s"]     = rate(p["conn_acc"], cur["conn_acc"], dt)
+            d["conn_closed_s"]  = rate(p["conn_closed"], cur["conn_closed"], dt)
+            d["dial_fail_s"]    = rate(p["dial_fail"], cur["dial_fail"], dt)
             d["p_auth_root"]    = ms_per_block(p["aroot_s"], cur["aroot_s"], p["h"], cur["h"])
             d["p_ordered_out"]  = ms_per_block(p["ordered_s"], cur["ordered_s"], p["h"], cur["h"])
             d["p_txid_digest"]  = ms_per_block(p["txid_s"], cur["txid_s"], p["h"], cur["h"])
