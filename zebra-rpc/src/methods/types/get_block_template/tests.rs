@@ -103,7 +103,8 @@ fn coinbase() -> anyhow::Result<()> {
 /// Ironwood reuses the Orchard receiver, and net-new value into Orchard is forbidden after
 /// NU6.3, so the Orchard receiver is paid via Ironwood once NU6.3 is active.
 ///
-/// Like [`coinbase`], this builds real shielded outputs, so run it with the `--release` flag.
+/// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
+/// debug test runs fast. Run it with `--release` when intentionally checking this path.
 #[cfg(zcash_unstable = "nu6.3")]
 #[test]
 #[ignore]
@@ -175,7 +176,8 @@ fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
 /// Tests that unified mining addresses with multiple shielded receivers still prefer the
 /// Orchard receiver before and from NU6.3 onward.
 ///
-/// Like [`coinbase`], this builds real shielded outputs, so run it with the `--release` flag.
+/// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
+/// debug test runs fast. Run it with `--release` when intentionally checking this path.
 #[cfg(zcash_unstable = "nu6.3")]
 #[test]
 #[ignore]
