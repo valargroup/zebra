@@ -21,6 +21,7 @@
 
 use std::env;
 
+use crossbeam_channel::unbounded;
 use zebra_chain::{
     block::Height,
     ironwood,
@@ -37,7 +38,10 @@ use crate::{
     service::{
         arbitrary::PreparedChain,
         finalized_state::{
-            disk_format::{upgrade::rebuild_history_tree, RawBytes},
+            disk_format::{
+                upgrade::{fix_tree_key_type, rebuild_history_tree},
+                IntoDisk, RawBytes,
+            },
             CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
         },
     },
@@ -143,6 +147,49 @@ fn corrupt_tip_history_tree_to_old_format(db: &crate::service::finalized_state::
     );
 }
 
+/// Moves the stored tip history-tree entry back to the legacy height key and corrupts the value into
+/// an unreadable old-format-style blob.
+fn corrupt_legacy_tip_history_tree_to_old_format(
+    db: &crate::service::finalized_state::ZebraDb,
+    tip_height: Height,
+) {
+    let raw_entry = db
+        .raw_history_tree_value_cf()
+        .zs_get(&())
+        .expect("a synced post-Heartwood database has a stored tip history tree entry");
+
+    let mut truncated = raw_entry.raw_bytes().clone();
+    assert!(
+        !truncated.is_empty(),
+        "the stored history tree entry should have a non-empty serialization to truncate",
+    );
+    // Drop the final byte so the reader runs out of input mid-entry.
+    truncated.pop();
+
+    let legacy_key = RawBytes::new_raw_bytes(tip_height.as_bytes().to_vec());
+
+    let mut batch = DiskWriteBatch::new();
+    let _ = db
+        .raw_history_tree_value_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_delete(&());
+    let _ = db
+        .raw_history_tree_entries_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_insert(&legacy_key, &RawBytes::new_raw_bytes(truncated));
+    db.write_batch(batch)
+        .expect("writing a synthetic legacy old-format history tree entry succeeds");
+
+    assert!(
+        db.raw_history_tree_value_cf().zs_get(&()).is_none(),
+        "the current empty-key history tree entry should be absent",
+    );
+    assert!(
+        rebuild_history_tree::needs_rebuild(db),
+        "the corrupted legacy entry must be detected as needing a rebuild",
+    );
+}
+
 #[test]
 fn rebuild_reproduces_stored_history_root() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -217,6 +264,67 @@ fn rebuild_reproduces_stored_history_root() -> Result<()> {
                 db.history_tree().hash(),
                 stored_root,
                 "the repaired history tree root must match the originally stored root",
+            );
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn rebuild_repairs_legacy_height_keyed_old_format_history_tree() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = rebuild_test_network();
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, Some(2), true);
+
+    proptest!(
+        ProptestConfig::with_cases(proptest_cases()),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())| {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            prop_assume!(synced.len() > 8);
+
+            let state = sync_to(&network, &synced);
+            let db = &state.db;
+
+            let tip_height = db
+                .finalized_tip_height()
+                .expect("synced database has a finalized tip");
+            let stored_root = db.history_tree().hash();
+            prop_assert!(
+                stored_root.is_some(),
+                "a Heartwood-onward chain should store a non-empty history tree",
+            );
+
+            corrupt_legacy_tip_history_tree_to_old_format(db, tip_height);
+
+            rebuild_history_tree::rebuild_tip_history_tree_if_needed(db, tip_height)
+                .expect("repairing a fully synced database should not be missing any data");
+
+            prop_assert!(
+                db.raw_history_tree_value_cf().zs_get(&()).is_some(),
+                "the repair should write the rebuilt tree under the current empty key",
+            );
+            prop_assert!(
+                !rebuild_history_tree::needs_rebuild(db),
+                "the current entry must be readable after the repair",
+            );
+            prop_assert_eq!(
+                db.history_tree().hash(),
+                stored_root,
+                "the repaired history tree root must match the originally stored root",
+            );
+
+            let (_cancel_sender, cancel_receiver) = unbounded();
+            fix_tree_key_type::run(tip_height, db, &cancel_receiver)
+                .expect("the key-format upgrade should run after the synchronous repair");
+            prop_assert!(
+                fix_tree_key_type::quick_check(db).is_ok(),
+                "the key-format upgrade should delete the legacy height-keyed entry",
             );
         }
     );

@@ -48,7 +48,8 @@ use zebra_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::chain::HistoryTreeParts, DiskWriteBatch, ZebraDb,
+    disk_format::{chain::HistoryTreeParts, RawBytes},
+    DiskWriteBatch, ZebraDb,
 };
 
 /// An error that prevents the tip history tree from being rebuilt.
@@ -117,18 +118,27 @@ pub(crate) fn rebuild_tip_history_tree_if_needed(
     Ok(())
 }
 
-/// Returns `true` if the tip history tree entry exists but cannot be deserialized in the current
-/// format, and therefore needs to be rebuilt.
+/// Returns `true` if the tip history tree entry exists under either the current empty key or the
+/// legacy height key but cannot be deserialized in the current format, and therefore needs to be
+/// rebuilt.
 ///
 /// Reads the entry as raw bytes and attempts a non-panicking deserialization in the current format.
 /// An entry that fails this check was written with a smaller `Entry` buffer by an older Zebra
 /// version, which is exactly the case this upgrade repairs.
 pub(crate) fn needs_rebuild(db: &ZebraDb) -> bool {
-    let Some(raw_entry) = db.raw_history_tree_value_cf().zs_get(&()) else {
-        // No tip tree stored (empty/pre-Heartwood database), so there is nothing to rebuild.
-        return false;
-    };
+    if let Some(raw_entry) = db.raw_history_tree_value_cf().zs_get(&()) {
+        return history_tree_entry_needs_rebuild(&raw_entry);
+    }
 
+    // Some legacy databases still have the tip tree under a height key. Read both the key and value
+    // as raw bytes, so the synchronous repair can catch an old-format entry before the later key
+    // migration tries to deserialize it.
+    db.raw_history_tree_entries_cf()
+        .zs_last_key_value()
+        .is_some_and(|(_raw_key, raw_entry)| history_tree_entry_needs_rebuild(&raw_entry))
+}
+
+fn history_tree_entry_needs_rebuild(raw_entry: &RawBytes) -> bool {
     bincode::DefaultOptions::new()
         .deserialize::<HistoryTreeParts>(raw_entry.raw_bytes())
         .is_err()
