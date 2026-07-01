@@ -1122,11 +1122,10 @@ impl Transaction {
     /// this transaction is a canonical, non-small-order Jubjub point (or the
     /// transaction has no Sapling data).
     ///
-    /// Those points are stored as raw bytes and their not-small-order check is
-    /// deferred from deserialization to keep point decompression off the
-    /// checkpoint-sync hot path. The semantic verifier calls this to enforce the
-    /// consensus rule on untrusted transactions; the checkpoint verifier does not
-    /// need it because it trusts block hashes.
+    /// These points are stored as raw bytes with their not-small-order check
+    /// deferred from deserialization, to keep point decompression off the
+    /// checkpoint-sync hot path. The semantic verifier calls this on untrusted
+    /// transactions; the checkpoint verifier trusts block hashes and skips it.
     pub fn sapling_point_encodings_are_valid(&self) -> bool {
         match self {
             Transaction::V4 {

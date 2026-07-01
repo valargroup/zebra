@@ -417,14 +417,12 @@ where
             // https://zips.z.cash/protocol/protocol.pdf#outputdesc
             // https://zips.z.cash/protocol/protocol.pdf#spenddesc
             //
-            // The not-small-order check for Sapling cv and epk is deferred from
-            // deserialization, which stores them as raw bytes to keep point
-            // decompression off the checkpoint-sync hot path (the checkpoint
-            // verifier does not need it, because it trusts block hashes). Enforce
-            // it here on the semantic verification path and the mempool, which
-            // process untrusted transactions, before any state lookup or the
-            // librustzcash conversion so an invalid point fails fast. (Spend rk
-            // is still validated at deserialization.)
+            // Deserialization stores Sapling cv and epk as raw bytes and defers
+            // their not-small-order check to keep point decompression off the
+            // checkpoint-sync hot path. We enforce it here, on the semantic and
+            // mempool paths that process untrusted transactions, before any state
+            // lookup or librustzcash conversion so an invalid point fails fast.
+            // (Spend rk is still validated at deserialization.)
             if !tx.sapling_point_encodings_are_valid() {
                 return Err(TransactionError::SmallOrder);
             }

@@ -146,15 +146,13 @@ impl ZcashDeserialize for OutputInTransactionV4 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
         //
-        // See comments below for each specific type. Sapling `cv` and `epk`
-        // store their bytes during deserialization and defer the point validity
-        // check to `Transaction::sapling_point_encodings_are_valid`.
+        // Sapling `cv` and `epk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(OutputInTransactionV4(Output {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`commitment::ValueCommitment::zcash_deserialize`].
-            // This preserves the encoding bytes; it does not validate that `cv`
-            // is a canonical, non-small-order Jubjub point.
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
             cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
@@ -162,9 +160,8 @@ impl ZcashDeserialize for OutputInTransactionV4 {
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-            // See [`keys::EphemeralPublicKey::zcash_deserialize`].
-            // This preserves the encoding bytes; it does not validate that
-            // `ephemeral_key` is a canonical, non-small-order Jubjub point.
+            // Stores the bytes without validating the point; see
+            // [`keys::EphemeralPublicKey::zcash_deserialize`].
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
@@ -215,15 +212,13 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
         //
-        // See comments below for each specific type. Sapling `cv` and `epk`
-        // store their bytes during deserialization and defer the point validity
-        // check to `Transaction::sapling_point_encodings_are_valid`.
+        // Sapling `cv` and `epk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(OutputPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`commitment::ValueCommitment::zcash_deserialize`].
-            // This preserves the encoding bytes; it does not validate that `cv`
-            // is a canonical, non-small-order Jubjub point.
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
             cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
@@ -231,9 +226,8 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-            // See [`keys::EphemeralPublicKey::zcash_deserialize`].
-            // This preserves the encoding bytes; it does not validate that
-            // `ephemeral_key` is a canonical, non-small-order Jubjub point.
+            // Stores the bytes without validating the point; see
+            // [`keys::EphemeralPublicKey::zcash_deserialize`].
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to

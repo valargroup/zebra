@@ -236,47 +236,32 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
     }
 }
 
-/// An [ephemeral public key][1] for Sapling key agreement.
+/// An [ephemeral public key][1] (`epk`) for Sapling key agreement, stored as its
+/// 32-byte encoding.
 ///
-/// Consensus validation rejects public keys containing points of small order.
-/// This type stores the transaction encoding first and performs that point check
-/// only when [`EphemeralPublicKey::is_valid_not_small_order`] or transaction
-/// semantic verification asks for it.
-///
-/// It is denoted by `epk` in the specification. Its serialized form is
-/// [KA^{Sapling}.Public][2], but a constructed or deserialized
-/// `EphemeralPublicKey` is not guaranteed to be consensus-valid until the
-/// deferred check has run.
-///
-/// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
-/// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-/// A Sapling ephemeral public key, stored as the 32-byte encoding from the
-/// transaction.
-///
-/// The key is a Jubjub curve point, but the validator only ever needs its bytes
-/// (for the txid digest and serialization); the point itself is needed only for
-/// wallet trial-decryption. So the point is not decompressed at deserialization,
-/// keeping the Jubjub point decompression (a field square root) off the
-/// checkpoint-sync hot path, where every Sapling output carries one.
+/// The key is a Jubjub point, but the validator only needs its bytes (for the
+/// txid digest and serialization); the point itself is only needed for wallet
+/// trial-decryption. So we keep the raw bytes and skip decompression at
+/// deserialization, keeping the field square root off the checkpoint-sync hot
+/// path, where every Sapling output carries an `epk`.
 ///
 /// # Consensus
 ///
-/// `TryFrom<[u8; 32]>` and `ZcashDeserialize` preserve the encoding exactly;
-/// they do not prove that the bytes are a canonical, non-small-order Jubjub
-/// point. Call [`EphemeralPublicKey::is_valid_not_small_order`] when the caller
-/// needs a consensus-valid point.
+/// Deserialization only checks the byte length; it does not prove the bytes are
+/// a canonical, non-small-order point. The not-small-order check is deferred to
+/// the semantic verifier and mempool, which call
+/// [`EphemeralPublicKey::is_valid_not_small_order`] (via
+/// [`Transaction::sapling_point_encodings_are_valid`]) and also verify the
+/// Sapling bundle through librustzcash, whose `check_output` rejects a
+/// small-order `epk`. The checkpoint verifier trusts block hashes and skips the
+/// check. Covered by
+/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash`.
 ///
-/// The not-small-order check that this type used to perform at deserialization
-/// is deferred, but still enforced for every untrusted transaction. The
-/// checkpoint verifier trusts block hashes and does not need it. The semantic
-/// verifier and the mempool call
-/// [`crate::transaction::Transaction::sapling_point_encodings_are_valid`],
-/// convert every transaction via `to_librustzcash` (`CachedFfiTransaction::new`)
-/// and verify the Sapling bundle, and librustzcash enforces the rule in
-/// `SaplingVerificationContext::check_output` (sapling-crypto `verifier.rs`,
-/// `epk.is_small_order()`). Validated by
-/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
-/// `transaction/tests/vectors.rs`.
+/// Its serialized form is [KA^{Sapling}.Public][2].
+///
+/// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+/// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
+/// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
@@ -284,23 +269,17 @@ impl EphemeralPublicKey {
     /// Returns true if the stored encoding is a canonical, non-small-order
     /// Jubjub point, i.e. a valid ephemeral public key per the consensus rules.
     ///
-    /// This performs the point decompression that deserialization defers; it is
-    /// called by the semantic verifier (not the checkpoint verifier) to enforce
-    /// the not-small-order rule on untrusted transactions.
+    /// This is the not-small-order check deferred from deserialization, run by
+    /// the semantic verifier (not the checkpoint verifier) on untrusted
+    /// transactions.
     ///
-    /// # Consensus equivalence
-    ///
-    /// This MUST accept exactly the encodings that librustzcash accepts for an
-    /// `epk` on the verification path. If it diverged, Zebra and the rest of the
-    /// network would disagree on transaction validity — a chain split, not a
-    /// local bug. librustzcash decodes `epk` with `jubjub::ExtendedPoint::from_bytes`
-    /// (sapling-crypto `verifier/batch.rs`) and rejects it in
-    /// `SaplingVerificationContext::check_output` when `epk.is_small_order()`
-    /// (sapling-crypto `verifier.rs`). Decoding as an `AffinePoint` here is
-    /// equivalent — both reject the same non-canonical/off-curve encodings and
-    /// agree on `is_small_order` — and that equivalence is pinned by
-    /// `sapling_point_checks_match_librustzcash_predicates` in
-    /// `transaction/tests/vectors.rs`.
+    /// To stay in consensus with the rest of the network, this must accept
+    /// exactly the `epk` encodings librustzcash accepts. librustzcash decodes as
+    /// an `ExtendedPoint` and rejects small-order points in `check_output`;
+    /// decoding as an `AffinePoint` here is equivalent — both reject the same
+    /// off-curve/non-canonical encodings and agree on `is_small_order`.
+    /// Equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates`.
     pub fn is_valid_not_small_order(&self) -> bool {
         match jubjub::AffinePoint::from_bytes(self.0).into_option() {
             Some(point) => !bool::from(point.is_small_order()),
