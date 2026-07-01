@@ -28,6 +28,8 @@ pub fn run(
         return Err(CancelFormatChange);
     }
 
+    let skip_archive_indexes = zebra_db.config().skip_archive_indexes();
+
     (0..=initial_tip_height.0)
         .into_par_iter()
         .try_for_each(|height| {
@@ -46,16 +48,30 @@ pub fn run(
                 }
 
                 if !should_index_at_height {
-                    if let Some(spend) = tx
-                        .inputs()
-                        .iter()
-                        .filter_map(|input| Some(input.outpoint()?.into()))
-                        .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
-                        .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
-                        .next()
-                    {
+                    // Pruned checkpoint-sync databases intentionally leave the
+                    // finalized transparent spender index empty, but still keep
+                    // shielded nullifier transaction locations (including Ironwood)
+                    // for indexer builds.
+                    let first_spend = if skip_archive_indexes {
+                        tx.sprout_nullifiers()
+                            .cloned()
+                            .map(Spend::from)
+                            .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
+                            .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
+                            .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
+                            .next()
+                    } else {
+                        tx.inputs()
+                            .iter()
+                            .filter_map(|input| Some(input.outpoint()?.into()))
+                            .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
+                            .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
+                            .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
+                            .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
+                            .next()
+                    };
+
+                    if let Some(spend) = first_spend {
                         if read::spending_transaction_hash::<Arc<Chain>>(None, zebra_db, spend)
                             .is_some()
                         {
@@ -69,23 +85,25 @@ pub fn run(
                     };
                 }
 
-                for input in tx.inputs() {
-                    if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                        return Err(CancelFormatChange);
+                if !skip_archive_indexes {
+                    for input in tx.inputs() {
+                        if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
+                            return Err(CancelFormatChange);
+                        }
+
+                        let spent_outpoint = input
+                            .outpoint()
+                            .expect("should filter out coinbase transactions");
+
+                        let spent_output_location = zebra_db
+                            .output_location(&spent_outpoint)
+                            .expect("should have location for spent outpoint");
+
+                        let _ = zebra_db
+                            .tx_loc_by_spent_output_loc_cf()
+                            .with_batch_for_writing(&mut batch)
+                            .zs_insert(&spent_output_location, &tx_loc);
                     }
-
-                    let spent_outpoint = input
-                        .outpoint()
-                        .expect("should filter out coinbase transactions");
-
-                    let spent_output_location = zebra_db
-                        .output_location(&spent_outpoint)
-                        .expect("should have location for spent outpoint");
-
-                    let _ = zebra_db
-                        .tx_loc_by_spent_output_loc_cf()
-                        .with_batch_for_writing(&mut batch)
-                        .zs_insert(&spent_output_location, &tx_loc);
                 }
 
                 batch.prepare_nullifier_batch(zebra_db, &tx, tx_loc);

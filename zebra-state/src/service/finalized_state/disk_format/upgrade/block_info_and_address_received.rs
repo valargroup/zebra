@@ -60,6 +60,7 @@ impl DiskFormatUpgrade for Upgrade {
     ) -> Result<(), super::CancelFormatChange> {
         let network = db.network();
         let balance_by_transparent_addr = db.address_balance_cf();
+        let skip_archive_indexes = db.config().skip_archive_indexes();
         let chunk_size = rayon::current_num_threads();
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
@@ -117,19 +118,21 @@ impl DiskFormatUpgrade for Upgrade {
                             }
                         }
 
-                        for output in tx.outputs() {
-                            if let Some(address) = output.address(&network) {
-                                // Note: using `empty()` will set the location
-                                // to a dummy value. This only works because the
-                                // addition operator for
-                                // `AddressBalanceLocationChange` (which reuses
-                                // the `AddressBalanceLocationInner` addition
-                                // operator) will ignore these dummy values when
-                                // adding balances during the merge operator.
-                                *address_balance_changes
-                                    .entry(address)
-                                    .or_insert_with(AddressBalanceLocationChange::empty)
-                                    .received_mut() += u64::from(output.value());
+                        if !skip_archive_indexes {
+                            for output in tx.outputs() {
+                                if let Some(address) = output.address(&network) {
+                                    // Note: using `empty()` will set the location
+                                    // to a dummy value. This only works because the
+                                    // addition operator for
+                                    // `AddressBalanceLocationChange` (which reuses
+                                    // the `AddressBalanceLocationInner` addition
+                                    // operator) will ignore these dummy values when
+                                    // adding balances during the merge operator.
+                                    *address_balance_changes
+                                        .entry(address)
+                                        .or_insert_with(AddressBalanceLocationChange::empty)
+                                        .received_mut() += u64::from(output.value());
+                                }
                             }
                         }
                     }
@@ -218,11 +221,13 @@ impl DiskFormatUpgrade for Upgrade {
                 .with_batch_for_writing(&mut batch)
                 .zs_insert(&height, &block_info);
 
-            // Update transparent addresses that received funds in this block.
-            for (address, change) in address_balance_changes {
-                // Note that the logic of the merge operator is set up by
-                // calling `set_merge_operator_associative()` in `DiskDb`.
-                batch.zs_merge(balance_by_transparent_addr, address, change);
+            if !skip_archive_indexes {
+                // Update transparent addresses that received funds in this block.
+                for (address, change) in address_balance_changes {
+                    // Note that the logic of the merge operator is set up by
+                    // calling `set_merge_operator_associative()` in `DiskDb`.
+                    batch.zs_merge(balance_by_transparent_addr, address, change);
+                }
             }
 
             db.write_batch(batch)
@@ -271,6 +276,14 @@ impl DiskFormatUpgrade for Upgrade {
 
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
             return Err(CancelFormatChange);
+        }
+
+        // A pruned, checkpoint-syncing node does not build transparent archive-only
+        // indexes ([`Config::skip_archive_indexes`]), so the received-balance check below
+        // does not apply — the balances are intentionally absent. The BlockInfo check
+        // above still runs, since block info is written regardless of the address index.
+        if db.config().skip_archive_indexes() {
+            return Ok(Ok(()));
         }
 
         // Check that all recipient addresses of transparent transfers in the range have a non-zero received balance.

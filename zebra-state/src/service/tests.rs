@@ -4,7 +4,7 @@
 
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use tokio::runtime::Runtime;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -30,14 +30,14 @@ use crate::{
     service::{
         arbitrary::populated_state, block_roots_by_height_range, chain_tip::TipAction,
         headers_by_height_range, non_finalized_state::Chain, root_covered_best_header_tip,
-        StateService,
+        StateService, ARCHIVE_INDEXES_DISABLED,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
         FakeChainHelper,
     },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock,
+    BoxError, CheckpointVerifiedBlock, Config, PruningConfig, ReadRequest, ReadResponse, Request,
+    Response, SemanticallyVerifiedBlock, StorageMode,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -714,6 +714,88 @@ async fn commit_header_range_rejects_missing_tree_aux_roots() -> std::result::Re
     Ok(())
 }
 
+#[cfg(feature = "indexer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_checkpoint_transparent_spender_lookup_returns_disabled_index_error(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let config = Config {
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
+        checkpoint_sync: true,
+        ..Config::ephemeral()
+    };
+    let (_, read_state, _, _) = StateService::new(config, &network, Height::MAX, 0).await;
+
+    let outpoint = transparent::OutPoint::from_usize(transaction::Hash([0; 32]), 0);
+    let error = read_state
+        .oneshot(ReadRequest::SpendingTransactionId(
+            crate::request::Spend::OutPoint(outpoint),
+        ))
+        .await
+        .expect_err("transparent spender lookup should require archive indexes");
+
+    assert!(
+        error.to_string().contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected error: {error}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_address_reads_error_in_pruned_storage_mode(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let config = Config {
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
+        ..Config::ephemeral()
+    };
+    let (_state_service, read_state, _, _) =
+        StateService::new(config, &network, Height::MAX, 0).await;
+
+    let address_balance_error = read_state
+        .clone()
+        .oneshot(ReadRequest::AddressBalance(HashSet::new()))
+        .await
+        .expect_err("address balances are unavailable in pruned mode");
+    assert!(
+        address_balance_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address balance error: {address_balance_error}"
+    );
+
+    let address_tx_ids_error = read_state
+        .clone()
+        .oneshot(ReadRequest::TransactionIdsByAddresses {
+            addresses: HashSet::new(),
+            height_range: Height(1)..=Height(1),
+        })
+        .await
+        .expect_err("address tx IDs are unavailable in pruned mode");
+    assert!(
+        address_tx_ids_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address tx IDs error: {address_tx_ids_error}"
+    );
+
+    let address_utxos_error = read_state
+        .oneshot(ReadRequest::UtxosByAddresses(HashSet::new()))
+        .await
+        .expect_err("address UTXOs are unavailable in pruned mode");
+    assert!(
+        address_utxos_error
+            .to_string()
+            .contains(ARCHIVE_INDEXES_DISABLED),
+        "unexpected address UTXOs error: {address_utxos_error}"
+    );
+
+    Ok(())
+}
+
 /// A node still in the finalized (checkpoint) write phase must be able to commit
 /// a Zakura header range.
 ///
@@ -863,6 +945,7 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
                 Chain::new(
                     &network,
                     (start - 1).unwrap(),
+                    Default::default(),
                     Default::default(),
                     Default::default(),
                     Default::default(),
