@@ -894,7 +894,8 @@ impl Service<Request> for Mempool {
                     async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 
-                // Queue inv-advertised candidates from a specific peer.
+                // Queue transaction candidates received from a specific peer,
+                // whether inv-advertised ids or directly pushed transactions.
                 // Per-peer accounting is enforced inside the downloader.
                 Request::QueueFromPeer {
                     transactions,
@@ -902,28 +903,20 @@ impl Service<Request> for Mempool {
                 } => {
                     trace!(req_count = ?transactions.len(), ?source, "got mempool QueueFromPeer request");
 
-                    let rsp: Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>> =
-                        transactions
-                            .into_iter()
-                            .filter_map(|gossiped_tx| {
-                                if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
-                                    return None;
-                                }
-
-                                match tx_downloads.download_if_needed_and_verify(
-                                    gossiped_tx,
-                                    Some(source.clone()),
-                                    None,
-                                ) {
-                                    Ok(()) => None,
-                                    Err(error) => Some(Err(BoxError::from(error))),
-                                }
-                            })
-                            .collect();
+                    for gossiped_tx in transactions {
+                        if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
+                            continue;
+                        }
+                        let _ = tx_downloads.download_if_needed_and_verify(
+                            gossiped_tx,
+                            Some(source.clone()),
+                            None,
+                        );
+                    }
 
                     self.update_metrics();
 
-                    async move { Ok(Response::Queued(rsp)) }.boxed()
+                    async move { Ok(Response::Queued(Vec::new())) }.boxed()
                 }
 
                 // Store successfully downloaded and verified transactions in the mempool

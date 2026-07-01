@@ -424,7 +424,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_mempool_full_queue_is_reported_as_overload() -> Result<(), crate::BoxError> {
+async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), crate::BoxError> {
     let (
         inbound_service,
         _mempool_guard,
@@ -443,6 +443,9 @@ async fn peer_mempool_full_queue_is_reported_as_overload() -> Result<(), crate::
     let source = zebra_network::PeerSource::Zakura(peer_id);
     let txid = |index: u8| UnminedTxId::from_legacy_id(zebra_chain::transaction::Hash([index; 32]));
 
+    // Fill the peer's per-peer admission slots. Each advertised id starts one
+    // in-flight download, so all `MAX_INBOUND_CONCURRENCY_PER_PEER` slots stay
+    // occupied while we push the over-cap advertisement below.
     for index in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
         let response = inbound_service
             .clone()
@@ -454,21 +457,22 @@ async fn peer_mempool_full_queue_is_reported_as_overload() -> Result<(), crate::
         assert_eq!(response, Response::Nil);
     }
 
-    let error = inbound_service
+    // The over-cap advertisement is silently refused: the per-peer cap drops the
+    // excess candidate without starting a download, and without reporting an
+    // overload error that would risk disconnecting an otherwise-honest peer.
+    let response = inbound_service
         .clone()
         .oneshot(Request::AdvertiseTransactionIds(
             HashSet::from([txid(99)]),
             Some(source.clone()),
         ))
         .await
-        .expect_err("peer-caused full queue should be surfaced as overload");
-    assert!(
-        error
-            .downcast_ref::<tower::load_shed::error::Overloaded>()
-            .is_some(),
-        "expected overload error, got {error:?}",
-    );
+        .expect("over-cap advertisement is refused silently, not surfaced as an error");
+    assert_eq!(response, Response::Nil);
 
+    // Only the admitted candidates reach the network; the refused one never does.
+    // Draining exactly `MAX_INBOUND_CONCURRENCY_PER_PEER` requests confirms the
+    // over-cap advertisement did not start an extra download.
     for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
         peer_set
             .expect_request_that(|request| {
@@ -483,6 +487,7 @@ async fn peer_mempool_full_queue_is_reported_as_overload() -> Result<(), crate::
             .await
             .respond(Response::Transactions(Vec::new()));
     }
+    peer_set.expect_no_requests().await;
 
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(

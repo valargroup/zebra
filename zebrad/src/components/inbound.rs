@@ -19,10 +19,7 @@ use futures::{
     stream::Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{
-    buffer::Buffer, load_shed::error::Overloaded, timeout::Timeout, util::BoxService, Service,
-    ServiceExt,
-};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
 
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_state::{self as zs};
@@ -96,24 +93,6 @@ fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
             mempool::QueueSource::Zakura(peer_id.as_bytes().to_vec())
         }
     }
-}
-
-fn mempool_queue_response(resp: mempool::Response) -> Result<zn::Response, BoxError> {
-    let mempool::Response::Queued(results) = resp else {
-        return Ok(zn::Response::Nil);
-    };
-
-    if results.iter().any(|result| {
-        result
-            .as_ref()
-            .err()
-            .and_then(|err| err.downcast_ref::<crate::components::mempool::MempoolError>())
-            == Some(&crate::components::mempool::MempoolError::FullQueue)
-    }) {
-        return Err(Overloaded::new().into());
-    }
-
-    Ok(zn::Response::Nil)
 }
 
 /// The services used by the [`Inbound`] service.
@@ -569,8 +548,8 @@ impl Service<zn::Request> for Inbound {
                 mempool
                     .clone()
                     .oneshot(request)
-                    .map_ok(mempool_queue_response)
-                    .and_then(futures::future::ready)
+                    // The response just indicates if processing was queued or not; ignore it
+                    .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
             zn::Request::AdvertiseTransactionIds(transactions, advertiser) => {
@@ -589,8 +568,8 @@ impl Service<zn::Request> for Inbound {
                 mempool
                     .clone()
                     .oneshot(request)
-                    .map_ok(mempool_queue_response)
-                    .and_then(futures::future::ready)
+                    // The response just indicates if processing was queued or not; ignore it
+                    .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
             zn::Request::AdvertiseBlock(hash, advertiser) => {
