@@ -1356,7 +1356,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 
 #[test]
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn v6_padded_orchard_proof_is_rejected_on_deserialize() {
+fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
     let _init_guard = zebra_test::init();
 
     let orchard_shielded_data = Network::iter()
@@ -1375,19 +1375,88 @@ fn v6_padded_orchard_proof_is_rejected_on_deserialize() {
         ironwood_shielded_data: None,
     };
 
-    // Control: the same tx with a canonical proof must round-trip, so any
-    // rejection below is attributable to the padding, not the test vector.
+    // Control: the same tx with a canonical proof round-trips and converts
+    // cleanly, so any conversion failure below is attributable to the padding,
+    // not the test vector.
     let canonical_bytes = make_tx(orchard_shielded_data.clone())
         .zcash_serialize_to_vec()
         .expect("serialize");
-    Transaction::zcash_deserialize(&canonical_bytes[..])
+    let canonical_tx = Transaction::zcash_deserialize(&canonical_bytes[..])
         .expect("v6 tx with a canonical Orchard proof round-trips");
+    canonical_tx
+        .to_librustzcash(NetworkUpgrade::Nu6_3)
+        .expect("v6 tx with a canonical Orchard proof converts to librustzcash");
 
+    // The `librustzcash` conversion is deferred out of deserialization to
+    // consensus verification, so a padded (non-canonical) Orchard proof now
+    // deserializes successfully instead of being rejected at parse time.
     let mut padded = orchard_shielded_data;
     padded.proof.0.push(0);
     let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
-    Transaction::zcash_deserialize(&padded_bytes[..]).expect_err(
-        "v6 transaction with a padded Orchard proof must be rejected on deserialization",
+    let padded_tx = Transaction::zcash_deserialize(&padded_bytes[..])
+        .expect("padded Orchard proof deserializes once librustzcash validation is deferred");
+
+    // The deferred conversion that consensus verification relies on still
+    // rejects the padded proof, so the malformed transaction cannot be verified.
+    padded_tx
+        .to_librustzcash(NetworkUpgrade::Nu6_3)
+        .expect_err("v6 transaction with a padded Orchard proof must fail librustzcash conversion");
+}
+
+/// Companion to `v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion`
+/// covering the Ironwood bundle, the other net-new V6 shielded pool. Ironwood
+/// reuses Orchard's variable-length Halo2 proof encoding, so the same
+/// non-canonical padding must be rejected. This guards the deferred-validation
+/// boundary for Ironwood: Zebra's parser is more permissive than `librustzcash`,
+/// so malformed Ironwood proofs must still be caught by the conversion consensus
+/// relies on rather than slipping through.
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
+    let _init_guard = zebra_test::init();
+
+    // Ironwood shielded data has the same shape as Orchard, so a real Orchard
+    // bundle is a valid Ironwood bundle for encoding/conversion purposes.
+    let ironwood_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard-shaped bundle");
+
+    let make_tx = |ironwood_shielded_data| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+    };
+
+    // Control: the same tx with a canonical proof round-trips and converts
+    // cleanly, so any conversion failure below is attributable to the padding,
+    // not the bundle.
+    let canonical_bytes = make_tx(ironwood_shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("serialize");
+    let canonical_tx = Transaction::zcash_deserialize(&canonical_bytes[..])
+        .expect("v6 tx with a canonical Ironwood proof round-trips");
+    canonical_tx
+        .to_librustzcash(NetworkUpgrade::Nu6_3)
+        .expect("v6 tx with a canonical Ironwood proof converts to librustzcash");
+
+    // The padded (non-canonical) Ironwood proof deserializes successfully once
+    // librustzcash validation is deferred to consensus verification.
+    let mut padded = ironwood_shielded_data;
+    padded.proof.0.push(0);
+    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
+    let padded_tx = Transaction::zcash_deserialize(&padded_bytes[..])
+        .expect("padded Ironwood proof deserializes once librustzcash validation is deferred");
+
+    // The deferred conversion that consensus verification relies on still
+    // rejects the padded proof, so the malformed transaction cannot be verified.
+    padded_tx.to_librustzcash(NetworkUpgrade::Nu6_3).expect_err(
+        "v6 transaction with a padded Ironwood proof must fail librustzcash conversion",
     );
 }
 
