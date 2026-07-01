@@ -3689,6 +3689,84 @@ async fn v5_consensus_branch_ids() {
     }
 }
 
+/// Block-context transaction verification must still validate transactions
+/// through librustzcash, even when deserialization intentionally avoids extra
+/// librustzcash parsing for checkpoint-sync performance.
+#[tokio::test]
+async fn block_verification_rejects_librustzcash_invalid_orchard_action() {
+    let _init_guard = zebra_test::init();
+
+    let nu5_height = Height(10);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu5: Some(nu5_height.0),
+            ..Default::default()
+        })
+        .expect("failed to set NU5 activation height")
+        .disable_temporary_orchard_disabling_soft_fork()
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    let mut orchard_shielded_data = v5_transactions(Network::new_default_testnet().block_iter())
+        .find_map(|transaction| {
+            transaction
+                .orchard_shielded_data()
+                .cloned()
+                .filter(|shielded_data| shielded_data.proof_size_is_canonical())
+        })
+        .expect("test vectors include an Orchard transaction with a canonical proof");
+
+    orchard_shielded_data.flags = Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS;
+    orchard_shielded_data.value_balance = Amount::<NegativeAllowed>::zero();
+    orchard_shielded_data
+        .actions
+        .iter_mut()
+        .next()
+        .expect("Orchard shielded data has at least one action")
+        .action
+        .rk = [0u8; 32].into();
+
+    let tx = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height::MAX_EXPIRY_HEIGHT,
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+    };
+
+    assert_eq!(
+        check::shielded_proof_size_is_canonical(&tx, nu5_height, &network),
+        Ok(()),
+        "the test transaction must reach librustzcash conversion, not proof-size checks"
+    );
+
+    let response = Verifier::new_for_tests(
+        &network,
+        service_fn(|_| async { unreachable!("state service should not be called") }),
+    )
+    .oneshot(Request::Block {
+        transaction_hash: tx.hash(),
+        transaction: Arc::new(tx),
+        known_utxos: Arc::new(HashMap::new()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        height: nu5_height,
+        time: DateTime::<Utc>::MAX_UTC,
+    })
+    .await;
+
+    assert_eq!(
+        response,
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            5,
+            NetworkUpgrade::Nu5
+        )),
+        "block transaction verification must reject transactions that librustzcash cannot parse"
+    );
+}
+
 // Utility functions
 
 /// Create a mock transparent transfer to be included in a transaction.
