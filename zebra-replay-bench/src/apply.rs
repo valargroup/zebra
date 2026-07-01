@@ -135,7 +135,13 @@ pub fn run(
                     (successor, auth)
                 }
             };
-            Some((successor, Some(auth)))
+            Some((
+                successor.header.clone(),
+                successor
+                    .coinbase_height()
+                    .expect("replay blocks have a coinbase height"),
+                auth,
+            ))
         } else {
             None
         };

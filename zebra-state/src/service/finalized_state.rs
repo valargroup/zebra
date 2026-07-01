@@ -23,7 +23,7 @@ use std::{
 };
 
 use zebra_chain::{
-    block::{self, merkle::AuthDataRoot, Block},
+    block::{self, merkle::AuthDataRoot},
     ironwood, orchard,
     parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
     parameters::Network,
@@ -780,6 +780,30 @@ impl FinalizedState {
         self.db.network()
     }
 
+    /// Source the successor of `height` — its header, height, and ZIP-244 auth-data root —
+    /// from the already-committed header chain, so the committer can authenticate
+    /// `height`'s supplied verified-commitment-trees roots without the successor *body*.
+    ///
+    /// Header sync commits headers (and their per-height roots, including the auth-data
+    /// root) far ahead of the body frontier, so the successor header is normally already
+    /// present. Returns `None` when it is not (e.g. at the header tip, or before a v2
+    /// header-sync peer has served the auth-data root for that height), in which case the
+    /// caller waits for the successor body instead.
+    pub(crate) fn successor_header_auth_for(
+        &self,
+        height: block::Height,
+    ) -> Option<(Arc<block::Header>, block::Height, AuthDataRoot)> {
+        let successor = (height + 1)?;
+        let header = self.db.zakura_header(successor)?;
+        let auth_data_root = self
+            .db
+            .zakura_header_commitment_roots_by_height_range(successor..=successor)
+            .first()
+            .filter(|root| root.height == successor)
+            .map(|root| root.auth_data_root)?;
+        Some((header, successor, auth_data_root))
+    }
+
     /// Commit a checkpoint-verified block to the state.
     ///
     /// It's the caller's responsibility to ensure that blocks are committed in
@@ -789,7 +813,7 @@ impl FinalizedState {
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
-        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
+        next_checkpoint: Option<(Arc<block::Header>, block::Height, AuthDataRoot)>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
@@ -848,12 +872,14 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
-        // The next checkpoint block (and its precomputed
-        // auth data root), used to verify this block's fixture roots before the fast
-        // path trusts them. `None` is only valid for fast blocks at the checkpoint
-        // handoff, where the embedded final frontiers independently authenticate
-        // this height's roots, or outside the checkpoint commit path.
-        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
+        // The successor block's header, height, and ZIP-244 auth-data root, used to
+        // verify this block's fixture roots before the fast path trusts them. Only the
+        // successor *header* and auth-data root are needed (not its body), so this can be
+        // sourced from the committed header chain when the successor body has not been
+        // downloaded yet. `None` is only valid for fast blocks at the checkpoint handoff,
+        // where the embedded final frontiers independently authenticate this height's
+        // roots, or outside the checkpoint commit path.
+        next_checkpoint: Option<(Arc<block::Header>, block::Height, AuthDataRoot)>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (
@@ -948,10 +974,11 @@ impl FinalizedState {
                             is_prevalidated,
                         ),
                     ];
-                    if let Some((next_block, next_auth)) = &next_checkpoint {
+                    if let Some((next_header, next_height, next_auth)) = &next_checkpoint {
                         verification_items.push(
                             commitment_aux_verify::CommitmentRootVerification::header_only(
-                                next_block.clone(),
+                                next_header.clone(),
+                                *next_height,
                                 *next_auth,
                             ),
                         );
@@ -973,10 +1000,10 @@ impl FinalizedState {
                             self.vct_reject_supplied_root(height, error)
                         })?;
 
-                    if let Some((next_block, _next_auth)) = &next_checkpoint {
+                    if let Some((next_header, _next_height, _next_auth)) = &next_checkpoint {
                         self.vct_prevalidated_next = Some((
                             (height + 1).expect("checkpoint block heights are valid"),
-                            next_block.hash(),
+                            next_header.hash(),
                         ));
                     } else if self
                         .vct
