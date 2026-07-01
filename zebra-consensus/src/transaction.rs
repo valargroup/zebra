@@ -407,6 +407,7 @@ where
             check::has_enough_ironwood_flags(&tx)?;
             check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
+            check::sapling_point_encodings_are_valid(&tx)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //
@@ -900,7 +901,8 @@ where
             | NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
-            | NetworkUpgrade::Nu6_2 => Ok(()),
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -909,7 +911,6 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,

@@ -5,8 +5,7 @@ use std::iter;
 use zebra_chain::amount::Amount;
 
 use strum::IntoEnumIterator;
-use zcash_keys::address::Address;
-use zcash_keys::address::UnifiedAddress;
+use zcash_keys::address::{Address, UnifiedAddress};
 
 use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
