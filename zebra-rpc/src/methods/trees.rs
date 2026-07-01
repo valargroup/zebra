@@ -96,6 +96,7 @@ pub struct GetTreestateResponse {
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
     /// Omitted from the response unless Ironwood tree state is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
     ironwood: Option<Treestate>,
 }
 
@@ -103,6 +104,21 @@ impl GetTreestateResponse {
     /// Returns the Ironwood treestate if it was present in the RPC response.
     pub fn optional_ironwood(&self) -> Option<&Treestate> {
         self.ironwood.as_ref()
+    }
+
+    /// Constructs a treestate response with optional Ironwood data.
+    pub(crate) fn new_with_ironwood(
+        hash: Hash,
+        height: Height,
+        time: u32,
+        sprout: Option<Treestate>,
+        sapling: Treestate,
+        orchard: Treestate,
+        ironwood: Option<Treestate>,
+    ) -> Self {
+        let mut response = Self::new(hash, height, time, sprout, sapling, orchard);
+        response.ironwood = ironwood;
+        response
     }
 
     /// Constructs [`Treestate`] from its constituent parts.
