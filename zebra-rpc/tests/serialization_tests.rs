@@ -305,10 +305,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
         difficulty,
         chain_supply,
         value_pools,
-        trees_ironwood.map_or_else(
-            || GetBlockTrees::new(trees_sapling, trees_orchard),
-            |ironwood| GetBlockTrees::new_with_ironwood(trees_sapling, trees_orchard, ironwood),
-        ),
+        GetBlockTrees::new(trees_sapling, trees_orchard, trees_ironwood),
         previous_block_hash,
         next_block_hash,
     )));
@@ -320,7 +317,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_get_block_trees_serializes_empty_ironwood() -> Result<(), Box<dyn std::error::Error>> {
-    let trees = GetBlockTrees::new(0, 2);
+    let trees = GetBlockTrees::new(0, 2, None);
     let json = serde_json::to_value(trees)?;
 
     assert_eq!(
@@ -332,7 +329,7 @@ fn test_get_block_trees_serializes_empty_ironwood() -> Result<(), Box<dyn std::e
         })
     );
 
-    let trees = GetBlockTrees::new_with_ironwood(0, 2, 0);
+    let trees = GetBlockTrees::new(0, 2, Some(0));
     let json = serde_json::to_value(trees)?;
 
     assert_eq!(
@@ -701,6 +698,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         ))),
         Treestate::new(Commitments::new(sapling_final_root, sapling_final_state)),
         Treestate::new(Commitments::new(orchard_final_root, orchard_final_state)),
+        Treestate::default(),
     );
 
     assert_eq!(obj, new_obj);

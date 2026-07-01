@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed `GetBlockTrees::new()` and `GetTreestateResponse::new()` to take
+  Ironwood tree data.
+
 ### Added
 
 - Added Ironwood RPC output for `getblock`, `getrawtransaction`,

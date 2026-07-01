@@ -97,26 +97,10 @@ pub struct GetTreestateResponse {
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
     /// Contains empty commitments unless Ironwood tree state is available.
     #[serde(default)]
-    #[new(default)]
     ironwood: Treestate,
 }
 
 impl GetTreestateResponse {
-    /// Constructs a treestate response with Ironwood data.
-    pub(crate) fn new_with_ironwood(
-        hash: Hash,
-        height: Height,
-        time: u32,
-        sprout: Option<Treestate>,
-        sapling: Treestate,
-        orchard: Treestate,
-        ironwood: Treestate,
-    ) -> Self {
-        let mut response = Self::new(hash, height, time, sprout, sapling, orchard);
-        response.ironwood = ironwood;
-        response
-    }
-
     /// Constructs [`Treestate`] from its constituent parts.
     #[deprecated(note = "Use `new` instead.")]
     pub fn from_parts(

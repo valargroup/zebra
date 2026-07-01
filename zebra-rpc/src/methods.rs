@@ -2062,7 +2062,7 @@ where
             Treestate::new(trees::Commitments::new(Some(root), Some(tree)))
         });
 
-        Ok(GetTreestateResponse::new_with_ironwood(
+        Ok(GetTreestateResponse::new(
             hash,
             height,
             time,
@@ -4533,20 +4533,11 @@ impl Default for GetBlockTrees {
 
 impl GetBlockTrees {
     /// Constructs a new instance of ['GetBlockTrees'].
-    pub fn new(sapling: u64, orchard: u64) -> Self {
+    pub fn new(sapling: u64, orchard: u64, ironwood: Option<u64>) -> Self {
         GetBlockTrees {
             sapling: SaplingTrees { size: sapling },
             orchard: OrchardTrees { size: orchard },
-            ironwood: None,
-        }
-    }
-
-    /// Constructs a new instance of ['GetBlockTrees'] with Ironwood data.
-    pub fn new_with_ironwood(sapling: u64, orchard: u64, ironwood: u64) -> Self {
-        GetBlockTrees {
-            sapling: SaplingTrees { size: sapling },
-            orchard: OrchardTrees { size: orchard },
-            ironwood: Some(IronwoodTrees { size: ironwood }),
+            ironwood: ironwood.map(|size| IronwoodTrees { size }),
         }
     }
 
