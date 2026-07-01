@@ -886,21 +886,6 @@ impl ZebraDb {
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
 
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
-
-        // Get the current address balances, before the transactions in this block
-
         // Like the spent-UTXO reads above, the per-address balance lookups are
         // cache-served but serial. Fan them across the rayon pool once a block
         // touches enough addresses to amortize the fork-join cost.
@@ -934,14 +919,37 @@ impl ZebraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+        //
+        // When the address index is skipped (pruned + checkpoint-sync fast-validator),
+        // none of the per-address balance reads happen and `address_balances` is left
+        // empty; the gated transparent index passes below then write no address entries.
+        let address_balances: AddressBalanceLocationUpdates = if self.config().skip_address_index()
+        {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            // Transparent addresses with changed balances/UTXOs in this block.
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+
+            // Get the current address balances, before the transactions in this block.
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    self.address_balance_location(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(self.address_balance_location(addr)?.into_new_change())
+                }))
+            }
         };
 
         let mut batch = DiskWriteBatch::new();

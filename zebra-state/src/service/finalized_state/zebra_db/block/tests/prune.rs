@@ -56,6 +56,72 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
     state
 }
 
+/// Returns the number of entries in the column family `cf_name`.
+fn cf_len(state: &FinalizedState, cf_name: &str) -> usize {
+    use crate::service::finalized_state::disk_format::RawBytes;
+    let cf = state
+        .db
+        .db
+        .cf_handle(cf_name)
+        .expect("column family exists");
+    state
+        .db
+        .db
+        .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
+        .count()
+}
+
+/// A pruned + checkpoint-syncing node commits the UTXO set but skips the three
+/// transparent address-index column families; an archive node populates all of them.
+#[test]
+fn pruned_checkpoint_commit_skips_the_transparent_address_index() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    const BALANCE_CF: &str = "balance_by_transparent_addr";
+    const UTXO_LOC_CF: &str = "utxo_loc_by_transparent_addr_loc";
+    const TX_LOC_CF: &str = "tx_loc_by_transparent_addr_loc";
+    const UTXO_SET_CF: &str = "utxo_by_out_loc";
+
+    // Archive mode keeps the address index: the early coinbase outputs populate all
+    // three address column families.
+    let archive = new_state_with_blocks(&Config::ephemeral(), &network);
+    assert!(
+        !archive.db.config().skip_address_index(),
+        "archive mode keeps the transparent address index"
+    );
+    assert!(
+        cf_len(&archive, BALANCE_CF) > 0
+            && cf_len(&archive, UTXO_LOC_CF) > 0
+            && cf_len(&archive, TX_LOC_CF) > 0,
+        "archive commit populates the address index: balance={}, utxo_loc={}, tx_loc={}",
+        cf_len(&archive, BALANCE_CF),
+        cf_len(&archive, UTXO_LOC_CF),
+        cf_len(&archive, TX_LOC_CF),
+    );
+
+    // Pruned + checkpoint-sync skips the address index entirely, but still writes the
+    // consensus-critical UTXO set.
+    let pruned = new_state_with_blocks(&pruned_config(), &network);
+    assert!(
+        pruned.db.config().skip_address_index(),
+        "pruned + checkpoint-sync skips the transparent address index"
+    );
+    assert_eq!(
+        (
+            cf_len(&pruned, BALANCE_CF),
+            cf_len(&pruned, UTXO_LOC_CF),
+            cf_len(&pruned, TX_LOC_CF),
+        ),
+        (0, 0, 0),
+        "pruned + checkpoint-sync writes no transparent address index entries"
+    );
+    assert!(
+        cf_len(&pruned, UTXO_SET_CF) > 0,
+        "the UTXO set is still written when the address index is skipped"
+    );
+}
+
 /// Opens a fresh finalized state with a checkpoint retention start and commits
 /// blocks `0..=TEST_BLOCKS` for `network`.
 fn new_state_with_checkpoint_retention(

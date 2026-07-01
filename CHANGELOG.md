@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Skip the transparent address index (balances, address→utxo, address→tx) on a
+  pruned, checkpoint-syncing node. The index is RPC-only state, not consensus, so
+  the minimal fast-validator configuration no longer does the per-block
+  address-balance reads or the index writes (like pruned mode already skips
+  raw-transaction storage). Address-lookup RPCs (`getaddressbalance`,
+  `getaddressutxos`, `getaddresstxids`) return an explicit "index disabled"
+  error in this mode instead of wrong (empty) results. Archive nodes, and pruned
+  nodes with checkpoint sync disabled (full semantic verification), are unchanged.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas

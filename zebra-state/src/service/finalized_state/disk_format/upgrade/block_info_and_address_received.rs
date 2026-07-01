@@ -273,6 +273,14 @@ impl DiskFormatUpgrade for Upgrade {
             return Err(CancelFormatChange);
         }
 
+        // A pruned, checkpoint-syncing node does not build the transparent address
+        // index ([`Config::skip_address_index`]), so the received-balance check below
+        // does not apply — the balances are intentionally absent. The BlockInfo check
+        // above still runs, since block info is written regardless of the address index.
+        if db.config().skip_address_index() {
+            return Ok(Ok(()));
+        }
+
         // Check that all recipient addresses of transparent transfers in the range have a non-zero received balance.
 
         // Collect the set of addresses that received transparent funds in the last query range (last 1000 blocks).

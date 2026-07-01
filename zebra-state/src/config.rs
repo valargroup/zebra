@@ -258,6 +258,23 @@ impl Config {
         }
     }
 
+    /// Whether to omit the auxiliary transparent **address index** (balances,
+    /// address→utxo, address→tx).
+    ///
+    /// The address index is RPC-only state, not consensus. It is skipped only for the
+    /// minimal fast-validator configuration: a node that is both [`StorageMode::Pruned`]
+    /// **and** checkpoint-syncing ([`checkpoint_sync`](Config::checkpoint_sync)). That
+    /// drops the per-block address-balance reads and index writes, just as pruned mode
+    /// drops raw-transaction storage.
+    ///
+    /// An archive node keeps the index; so does a node with checkpoint sync disabled
+    /// (full semantic verification), even when pruned. Address-lookup RPCs
+    /// (`getaddressbalance`/`getaddressutxos`/`getaddresstxids`) return an error when
+    /// the index is skipped, rather than wrong (empty) results.
+    pub fn skip_address_index(&self) -> bool {
+        matches!(self.storage_mode, StorageMode::Pruned(_)) && self.checkpoint_sync
+    }
+
     /// Validates the configured [`StorageMode`].
     ///
     /// This must be called before opening the database, so that a misconfigured
@@ -432,6 +449,39 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_address_index_only_when_pruned_and_checkpoint_syncing() {
+        let pruned_checkpoint = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            pruned_checkpoint.skip_address_index(),
+            "pruned + checkpoint-sync skips the transparent address index"
+        );
+
+        let archive = Config {
+            storage_mode: StorageMode::Archive,
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            !archive.skip_address_index(),
+            "archive mode keeps the address index"
+        );
+
+        let pruned_legacy = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: false,
+            ..Default::default()
+        };
+        assert!(
+            !pruned_legacy.skip_address_index(),
+            "pruned with checkpoint sync disabled keeps the address index"
+        );
+    }
 
     #[test]
     fn storage_mode_deserializes_from_documented_toml() {
