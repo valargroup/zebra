@@ -649,7 +649,6 @@ pub struct ShieldedOutput {
     proof: [u8; 192],
 }
 
-
 /// Object with Orchard-specific information.
 #[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
