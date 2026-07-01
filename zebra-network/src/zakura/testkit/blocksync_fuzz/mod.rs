@@ -204,6 +204,7 @@ async fn stop_task(task: &mut JoinHandle<()>) {
 }
 
 /// Answers the reactor's actions from the corpus and mock apply frontier.
+#[allow(clippy::too_many_arguments)]
 fn spawn_action_driver(
     handle: BlockSyncHandle,
     mut actions: mpsc::Receiver<BlockSyncAction>,
