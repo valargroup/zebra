@@ -239,7 +239,7 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 /// An [ephemeral public key][1] (`epk`) for Sapling key agreement, stored as its
 /// 32-byte encoding.
 ///
-/// The key is a Jubjub point, but the validator only needs its bytes (for the
+/// The key is a Jubjub point, but nodes only need its bytes (for the
 /// txid digest and serialization); the point itself is only needed for wallet
 /// trial-decryption. So we keep the raw bytes and skip decompression at
 /// deserialization, keeping the field square root off the checkpoint-sync hot
