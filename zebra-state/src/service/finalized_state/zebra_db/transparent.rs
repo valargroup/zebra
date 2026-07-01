@@ -37,7 +37,7 @@ use crate::{
                 AddressBalanceLocationUpdates, AddressLocation, AddressTransaction,
                 AddressUnspentOutput, OutputLocation,
             },
-            TransactionLocation,
+            RawBytes, TransactionLocation,
         },
         zebra_db::ZebraDb,
     },
@@ -82,6 +82,60 @@ pub type TransactionLocationBySpentOutputLocationCf<'cf> =
 
 impl ZebraDb {
     // Column family convenience methods
+
+    /// Verification helper (offline tools): a stable digest of the `utxo_by_out_loc`
+    /// column family — the entry count plus order-independent rolling hashes of the
+    /// raw key and value bytes — for comparing two databases' UTXO sets without
+    /// dumping every entry.
+    ///
+    /// Returns `(count, key_sum, key_xor, value_sum, value_xor)`. Two databases
+    /// have an identical UTXO set iff all five fields match. Used by the
+    /// per-checkpoint reconcile byte-match verification.
+    pub fn utxo_by_out_loc_verification_digest(&self) -> (u64, u64, u64, u64, u64) {
+        self.cf_verification_digest("utxo_by_out_loc")
+    }
+
+    /// Verification helper (offline tools): the same stable digest as
+    /// [`Self::utxo_by_out_loc_verification_digest`], over the `block_info` column
+    /// family — so two databases' per-height value pools can be compared.
+    pub fn block_info_verification_digest(&self) -> (u64, u64, u64, u64, u64) {
+        self.cf_verification_digest("block_info")
+    }
+
+    /// Order-independent rolling digest of a column family's raw key/value bytes:
+    /// `(count, key_sum, key_xor, value_sum, value_xor)`.
+    fn cf_verification_digest(&self, cf_name: &str) -> (u64, u64, u64, u64, u64) {
+        // FNV-1a over a byte slice.
+        fn fnv1a(bytes: &[u8]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        }
+
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("column family was created when database was created");
+
+        let (mut count, mut key_sum, mut key_xor, mut value_sum, mut value_xor) = (0, 0, 0, 0, 0);
+        for (key, value) in self
+            .db
+            .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
+        {
+            let key_hash = fnv1a(key.raw_bytes());
+            let value_hash = fnv1a(value.raw_bytes());
+            count += 1;
+            key_sum = u64::wrapping_add(key_sum, key_hash);
+            key_xor ^= key_hash;
+            value_sum = u64::wrapping_add(value_sum, value_hash);
+            value_xor ^= value_hash;
+        }
+
+        (count, key_sum, key_xor, value_sum, value_xor)
+    }
 
     /// Returns a typed handle to the transaction location by spent output location column family.
     pub(crate) fn tx_loc_by_spent_output_loc_cf(
@@ -417,6 +471,10 @@ impl DiskWriteBatch {
     /// If this method returns an error, it will be propagated,
     /// and the batch should not be written to the database.
     #[allow(clippy::too_many_arguments)]
+    /// When `capture_balances` is true, returns the absolute address balances
+    /// after applying this block, so the run-ahead committer can serve the
+    /// next block's address reads from memory before the write is durable.
+    /// Returns `None` otherwise, avoiding a clone on the synchronous path.
     pub fn prepare_transparent_transaction_batch(
         &mut self,
         zebra_db: &ZebraDb,
@@ -430,22 +488,32 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
-    ) {
+        capture_balances: bool,
+    ) -> Option<AddressBalanceLocationUpdates> {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
+
+        // A pruned, checkpoint-syncing node skips the auxiliary transparent address
+        // index entirely. The UTXO-set passes still run (they write/delete
+        // `utxo_by_out_loc`), but the address-balance update, the per-tx address
+        // indexing, and the address balance CF are all elided. The UTXO/value-pool/
+        // nullifier state is unchanged.
+        let skip_index = zebra_db.config().skip_address_index();
 
         // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
         // before crediting outputs within each transaction. This ordering keeps every
         // intermediate per-address balance within the consensus range, even when the block
         // contains a same-address transparent self-spend chain whose batch credit-first
         // intermediate balance would otherwise exceed MAX_MONEY.
-        Self::prepare_transparent_address_balance_updates(
-            network,
-            *height,
-            &block.transactions,
-            spent_utxos_by_outpoint,
-            &mut address_balances,
-        );
+        if !skip_index {
+            Self::prepare_transparent_address_balance_updates(
+                network,
+                *height,
+                &block.transactions,
+                spent_utxos_by_outpoint,
+                &mut address_balances,
+            );
+        }
 
         // Write the new and spent transparent output index entries. These passes no longer
         // touch `address_balances`; they only read each entry's `address_location()`.
@@ -454,31 +522,43 @@ impl DiskWriteBatch {
             network,
             new_outputs_by_out_loc,
             &address_balances,
+            skip_index,
         );
         self.prepare_spent_transparent_outputs_batch(
             db,
             network,
             spent_utxos_by_out_loc,
             &address_balances,
+            skip_index,
         );
 
         // Index the transparent addresses that spent in each transaction
-        for (tx_index, transaction) in block.transactions.iter().enumerate() {
-            let spending_tx_location = TransactionLocation::from_usize(*height, tx_index);
+        if !skip_index {
+            for (tx_index, transaction) in block.transactions.iter().enumerate() {
+                let spending_tx_location = TransactionLocation::from_usize(*height, tx_index);
 
-            self.prepare_spending_transparent_tx_ids_batch(
-                zebra_db,
-                network,
-                spending_tx_location,
-                transaction,
-                spent_utxos_by_outpoint,
-                #[cfg(feature = "indexer")]
-                out_loc_by_outpoint,
-                &address_balances,
-            );
+                self.prepare_spending_transparent_tx_ids_batch(
+                    zebra_db,
+                    network,
+                    spending_tx_location,
+                    transaction,
+                    spent_utxos_by_outpoint,
+                    #[cfg(feature = "indexer")]
+                    out_loc_by_outpoint,
+                    &address_balances,
+                );
+            }
         }
 
-        self.prepare_transparent_balances_batch(db, address_balances);
+        // Capture the post-block absolute balances for the pipeline overlay before
+        // they are moved into the write batch (cheap clone, only when running ahead).
+        let captured = capture_balances.then(|| address_balances.clone());
+
+        if !skip_index {
+            self.prepare_transparent_balances_batch(db, address_balances);
+        }
+
+        captured
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,
@@ -591,6 +671,7 @@ impl DiskWriteBatch {
         network: &Network,
         new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
         address_balances: &AddressBalanceLocationUpdates,
+        skip_index: bool,
     ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
         let utxo_loc_by_transparent_addr_loc =
@@ -601,7 +682,9 @@ impl DiskWriteBatch {
         // Index all new transparent outputs
         for (new_output_location, utxo) in new_outputs_by_out_loc {
             let unspent_output = &utxo.output;
-            let receiving_address = unspent_output.address(network);
+            let receiving_address = (!skip_index)
+                .then(|| unspent_output.address(network))
+                .flatten();
 
             if let Some(receiving_address) = receiving_address {
                 let receiving_address_location = match address_balances {
@@ -663,6 +746,7 @@ impl DiskWriteBatch {
         network: &Network,
         spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
         address_balances: &AddressBalanceLocationUpdates,
+        skip_index: bool,
     ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
         let utxo_loc_by_transparent_addr_loc =
@@ -673,7 +757,9 @@ impl DiskWriteBatch {
         // Coinbase inputs represent new coins, so there are no UTXOs to mark as spent.
         for (spent_output_location, utxo) in spent_utxos_by_out_loc {
             let spent_output = &utxo.output;
-            let sending_address = spent_output.address(network);
+            let sending_address = (!skip_index)
+                .then(|| spent_output.address(network))
+                .flatten();
 
             // Fetch the link from the address to the AddressLocation, from memory.
             if let Some(sending_address) = sending_address {

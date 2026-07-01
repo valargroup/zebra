@@ -73,7 +73,9 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-mod zakura;
+// `pub(crate)` (not private) so the crate root can re-export the block-sync apply
+// driver under the `internal-bench` feature for `zebra-replay-bench`.
+pub(crate) mod zakura;
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
 

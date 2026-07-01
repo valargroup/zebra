@@ -22,6 +22,7 @@ mod index;
 mod prefetch;
 mod rollback;
 mod roots_cache;
+mod seed_headers;
 mod stats;
 
 use std::path::PathBuf;
@@ -47,6 +48,13 @@ struct Cli {
 enum Cmd {
     /// Print a snapshot's finalized tip height and hash (read-only).
     Info {
+        /// Snapshot root containing `state/vN/<network>`.
+        #[arg(long)]
+        src: PathBuf,
+    },
+    /// Print a snapshot's finalized value pool and a stable digest of the
+    /// `utxo_by_out_loc` column family (read-only), for byte-match verification.
+    CfDump {
         /// Snapshot root containing `state/vN/<network>`.
         #[arg(long)]
         src: PathBuf,
@@ -136,10 +144,28 @@ enum Cmd {
         /// Pruned (the base must already be a pruned snapshot; pruning is one-way).
         #[arg(long)]
         archive: bool,
+        /// Stop after committing up to this height, clamping the cache window (to bench
+        /// a sub-range of a larger cache). Defaults to the full cache end.
+        #[arg(long)]
+        stop_height: Option<u32>,
         /// Write structured Zakura JSONL trace tables to this directory (the same
         /// tables `perf-run-mainnet` produces via `[network.zakura] trace_dir`).
         #[arg(long)]
         trace_dir: Option<PathBuf>,
+    },
+    /// Seed the Zakura header store on a base snapshot for every cached block height,
+    /// so the production block-sync driver's header-authenticated checkpoint fast path
+    /// can run offline. Run once on the base (tip must be `start-1`); forks inherit it.
+    SeedHeaders {
+        /// Base fork root (opened writable, mutated in place; must be at start-1).
+        #[arg(long)]
+        base: PathBuf,
+        /// Cache file produced by `index`.
+        #[arg(long)]
+        cache: PathBuf,
+        /// Seed against an Archive-mode base. Default mirrors the run (Pruned).
+        #[arg(long)]
+        archive: bool,
     },
     /// Replay a cache through the real `zebra-consensus` checkpoint verifier, which
     /// commits to a real `StateService` (tip must be `start-1`). One altitude above
@@ -189,6 +215,41 @@ fn main() -> Result<()> {
                 has_body
             );
         }
+        Cmd::CfDump { src } => {
+            // Open with the VCT fast path enabled (force_legacy = false): the
+            // benchmark forks are interrupted VCT snapshots below the handoff, which
+            // refuse to open read-only with vct_fast_sync off.
+            let config = state_config(src.clone(), false);
+            let state = FinalizedState::new_read_only(&config, &network);
+            let tip = state
+                .db
+                .tip()
+                .ok_or_else(|| eyre!("snapshot has no finalized tip"))?;
+            let value_pool = state.db.finalized_value_pool();
+            let (count, key_sum, key_xor, value_sum, value_xor) =
+                state.db.utxo_by_out_loc_verification_digest();
+            let lo = zebra_chain::block::Height(tip.0 .0.saturating_sub(14_500));
+            let (bi_count, bi_first_missing, bi_missing) = state.db.block_info_coverage(lo, tip.0);
+            let bi_digest = state.db.block_info_verification_digest();
+            println!(
+                "block_info[{}..={}]: count={} missing={} first_missing={:?}",
+                lo.0, tip.0 .0, bi_count, bi_missing, bi_first_missing
+            );
+            println!("block_info_digest={bi_digest:?}");
+            println!(
+                "src={}\ntip_height={}\ntip_hash={}\nvalue_pool={:?}\n\
+                 utxo_count={}\nutxo_key_sum={}\nutxo_key_xor={}\nutxo_value_sum={}\nutxo_value_xor={}",
+                src.display(),
+                tip.0 .0,
+                tip.1,
+                value_pool,
+                count,
+                key_sum,
+                key_xor,
+                value_sum,
+                value_xor,
+            );
+        }
         Cmd::Index {
             src,
             cache,
@@ -207,6 +268,13 @@ fn main() -> Result<()> {
         }
         Cmd::Rollback { base, target } => {
             rollback::run(&base, target, network)?;
+        }
+        Cmd::SeedHeaders {
+            base,
+            cache,
+            archive,
+        } => {
+            seed_headers::run(&base, &cache, network, archive)?;
         }
         Cmd::Apply {
             base,
@@ -252,6 +320,7 @@ fn main() -> Result<()> {
             cache,
             vct_sidecar,
             archive,
+            stop_height,
             trace_dir,
         } => {
             #[cfg(feature = "commit-metrics")]
@@ -263,6 +332,7 @@ fn main() -> Result<()> {
                 vct_sidecar.as_deref(),
                 network,
                 archive,
+                stop_height,
                 trace_dir.as_deref(),
             )?;
 
@@ -289,7 +359,10 @@ fn render_metrics(handle: metrics_exporter_prometheus::PrometheusHandle) {
         if line.starts_with('#') {
             continue;
         }
-        if line.starts_with("zebra_state_") || line.starts_with("state_vct_") {
+        if line.starts_with("zebra_state_")
+            || line.starts_with("state_vct_")
+            || line.starts_with("zebra_consensus_")
+        {
             println!("{line}");
         }
     }

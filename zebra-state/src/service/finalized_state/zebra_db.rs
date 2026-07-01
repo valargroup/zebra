@@ -63,6 +63,22 @@ pub mod transparent;
 // TODO: when the database is split out of zebra-state, always expose these methods.
 pub mod arbitrary;
 
+/// Benchmark-only throughput-ceiling probe (`ZEBRA_BENCH_SKIP_TRANSPARENT_READS=1`).
+///
+/// When set, the committer skips the per-block spent-UTXO resolution entirely, to
+/// measure the upper bound of deferring that work off the commit critical path (the
+/// per-checkpoint transparent reconcile). This deliberately produces an incorrect
+/// value pool and UTXO set, so it is a measurement tool only — never a shipped path.
+pub(crate) fn bench_skip_transparent_reads() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        matches!(
+            std::env::var("ZEBRA_BENCH_SKIP_TRANSPARENT_READS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 /// Wrapper struct to ensure high-level `zebra-state` database access goes through the correct API.
 ///
 /// `rocksdb` allows concurrent writes through a shared reference,
@@ -232,6 +248,30 @@ impl ZebraDb {
     /// Returns config for this database.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Whether the per-block committer defers transparent spend resolution (the
+    /// `utxo_by_out_loc` deletes and the transparent value-pool debit) off the commit
+    /// critical path, to a batched reconcile on the worker thread, for the block at
+    /// `height`.
+    ///
+    /// Only defers in the checkpoint-trusted range (`height <= max_checkpoint_height`):
+    /// above the last checkpoint the semantic verifier validates spends against the
+    /// live UTXO set and value pool, so those must stay current (non-deferred). The
+    /// auxiliary address index must also be off ([`Config::skip_address_index`]),
+    /// because the deferred path skips the per-block spent-UTXO reads the
+    /// address-balance update depends on.
+    pub(crate) fn defers_transparent_spends(&self, height: Height) -> bool {
+        self.config()
+            .defers_transparent_spends_at(&self.network(), height)
+    }
+
+    /// Whether the deferred-transparent reconcile is configured for this node (the
+    /// height-independent lifecycle predicate: worker spawn, drain triggers, the
+    /// handoff barrier). The per-block decision is the height-bound
+    /// [`defers_transparent_spends`](Self::defers_transparent_spends).
+    pub(crate) fn defer_reconcile_configured(&self) -> bool {
+        self.config().defer_reconcile_configured()
     }
 
     /// Returns the configured database kind for this database.

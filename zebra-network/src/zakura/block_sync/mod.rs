@@ -54,8 +54,8 @@ mod work_queue;
 
 #[cfg(feature = "internal-bench")]
 pub use bench::{
-    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
-    BenchSubmit, SequencerProgress,
+    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchDriverParts, BenchSequencerHandle,
+    BenchSubmissions, BenchSubmit, SequencerProgress,
 };
 pub use config::{
     BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,

@@ -16,7 +16,7 @@ use serde::{
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::Span;
 
-use zebra_chain::{common::default_cache_dir, parameters::Network};
+use zebra_chain::{block, common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{
@@ -135,6 +135,61 @@ pub struct Config {
     /// as an independent state setting.
     #[serde(skip)]
     pub vct_fast_sync: bool,
+
+    /// Maximum number of checkpoint-verified blocks the finalized committer may
+    /// assemble ahead of the durable disk write (the run-ahead pipeline depth).
+    ///
+    /// When `0` (the default), the committer is fully synchronous: each block is
+    /// assembled and flushed to disk before the next is assembled — the original
+    /// behavior. When greater than `0`, the committer assembles up to this many
+    /// blocks ahead on the assembler thread while a dedicated disk-writer thread
+    /// flushes earlier blocks, so per-block wall time approaches `max(assemble,
+    /// flush)` instead of their sum. The externally-visible finalized tip and the
+    /// download budget still trail the durable flush (ack-after-flush), so crash
+    /// recovery is unchanged.
+    ///
+    /// Only applies below the last checkpoint (the reorg-free region); near the
+    /// tip the committer is always synchronous. The bound caps the in-memory
+    /// overlay of not-yet-flushed blocks.
+    pub finalized_block_pipeline_depth: usize,
+
+    /// **Experimental.** Defer the transparent spend resolution (UTXO deletes +
+    /// value-pool debit) off the per-block commit path and reconcile it in a batched
+    /// pass on a dedicated worker thread, in the checkpoint-trusted range.
+    ///
+    /// The per-block committer records spent outpoints into an in-memory window
+    /// instead of resolving them; every [`defer_reconcile_interval`] blocks the window
+    /// is batch-resolved (sorted/deduped disk reads), the value pool is recomputed, and
+    /// the deletes + pool are written in one atomic batch. Only takes effect when the
+    /// auxiliary address index is off ([`skip_address_index`](Config::skip_address_index),
+    /// i.e. pruned + checkpoint sync) and only below the last checkpoint; at the
+    /// checkpoint→semantic handoff the window is drained so the value pool / UTXO set
+    /// are current before semantic verification reads them.
+    ///
+    /// Default `false`. Opt-in for performance benchmarking on a disposable
+    /// below-checkpoint node; crash recovery and RPC mid-reconcile guards are not yet
+    /// implemented, so a node enabling this should be treated as re-snapshottable.
+    pub defer_transparent_reconcile: bool,
+
+    /// **Experimental.** How many blocks between deferred-transparent reconciles, when
+    /// [`defer_transparent_reconcile`](Config::defer_transparent_reconcile) is on.
+    ///
+    /// `0` (the default) reconciles at every checkpoint boundary — but mainnet
+    /// checkpoints are only ~30-40 blocks apart in dense regions, so the reconcile
+    /// fires far too often to amortize its fixed cost. A larger fixed interval
+    /// (e.g. ~2000) reconciles a bigger batched window. Correctness only requires a
+    /// bounded window with the window's spent UTXOs durable by reconcile time, not
+    /// checkpoint alignment.
+    pub defer_reconcile_interval: usize,
+
+    /// Prototype: run the deferred-transparent reconcile inline on the assembler
+    /// thread (the v1 path) instead of on the dedicated reconcile worker thread (v2).
+    ///
+    /// The default (`false`) hands each window to a worker thread so the reconcile's
+    /// disk reads and value-pool recompute overlap continued block assembly. Set to
+    /// `true` to force the inline path, mainly to A/B the parallelism win.
+    #[serde(skip)]
+    pub defer_reconcile_inline: bool,
 
     /// Whether to delete the old database directories when present.
     ///
@@ -272,6 +327,46 @@ impl Config {
             StorageMode::Archive => None,
             StorageMode::Pruned(pruning) => Some(pruning),
         }
+    }
+
+    /// Whether to omit the auxiliary transparent **address index** (balances,
+    /// address→utxo, address→tx).
+    ///
+    /// The address index is RPC-only state, not consensus. It is skipped only for the
+    /// minimal fast-validator configuration: a node that is both [`StorageMode::Pruned`]
+    /// **and** checkpoint-syncing ([`checkpoint_sync`](Config::checkpoint_sync)). That
+    /// drops the per-block address-balance reads and index writes, just as pruned mode
+    /// drops raw-transaction storage.
+    ///
+    /// An archive node keeps the index; so does a node with checkpoint sync disabled
+    /// (full semantic verification), even when pruned. Address-lookup RPCs
+    /// (`getaddressbalance`/`getaddressutxos`/`getaddresstxids`) return an error when
+    /// the index is skipped, rather than wrong (empty) results.
+    pub fn skip_address_index(&self) -> bool {
+        matches!(self.storage_mode, StorageMode::Pruned(_)) && self.checkpoint_sync
+    }
+
+    /// Whether the deferred-transparent reconcile is configured for this node: the
+    /// experimental [`defer_transparent_reconcile`](Config::defer_transparent_reconcile)
+    /// opt-in is on **and** the auxiliary address index is off (the deferred path skips
+    /// the per-block spent-UTXO reads the address index depends on).
+    ///
+    /// This is the lifecycle predicate (worker spawn, drain triggers); the per-block
+    /// decision is the height-bound [`defers_transparent_spends_at`](Config::defers_transparent_spends_at).
+    pub fn defer_reconcile_configured(&self) -> bool {
+        self.defer_transparent_reconcile && self.skip_address_index()
+    }
+
+    /// Whether the per-block committer defers transparent spend resolution for a block
+    /// at `height` on `network`.
+    ///
+    /// Deferral is only valid in the checkpoint-trusted range: above the last
+    /// checkpoint the semantic verifier validates each block's spends against the UTXO
+    /// set and value pool, so those must be current (non-deferred). The handoff drain
+    /// barrier flushes any pending window before the first above-checkpoint block, and
+    /// this gate keeps every above-checkpoint block on the inline (non-deferred) path.
+    pub fn defers_transparent_spends_at(&self, network: &Network, height: block::Height) -> bool {
+        self.defer_reconcile_configured() && height <= network.checkpoint_list().max_height()
     }
 
     /// Validates the configured [`StorageMode`].
@@ -430,6 +525,13 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            // Off by default: the committer is synchronous (assemble then flush)
+            // until run-ahead is explicitly enabled and validated.
+            finalized_block_pipeline_depth: 0,
+            // Off by default: prototype, benchmark-set only.
+            defer_transparent_reconcile: false,
+            defer_reconcile_interval: 0,
+            defer_reconcile_inline: false,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -448,6 +550,85 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_address_index_only_when_pruned_and_checkpoint_syncing() {
+        let pruned_checkpoint = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            pruned_checkpoint.skip_address_index(),
+            "pruned + checkpoint-sync skips the transparent address index"
+        );
+
+        let archive = Config {
+            storage_mode: StorageMode::Archive,
+            checkpoint_sync: true,
+            ..Default::default()
+        };
+        assert!(
+            !archive.skip_address_index(),
+            "archive mode keeps the address index"
+        );
+
+        let pruned_legacy = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: false,
+            ..Default::default()
+        };
+        assert!(
+            !pruned_legacy.skip_address_index(),
+            "pruned with checkpoint sync disabled keeps the address index"
+        );
+    }
+
+    #[test]
+    fn defers_transparent_spends_only_in_checkpoint_range() {
+        let network = Network::Mainnet;
+        let max_checkpoint = network.checkpoint_list().max_height();
+        let below = block::Height(max_checkpoint.0 - 1);
+        let above = block::Height(max_checkpoint.0 + 1);
+
+        // Configured: pruned + checkpoint sync (so the address index is off) + opt-in.
+        let deferring = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            defer_transparent_reconcile: true,
+            ..Default::default()
+        };
+        assert!(
+            deferring.defers_transparent_spends_at(&network, below),
+            "defers below the last checkpoint"
+        );
+        assert!(
+            deferring.defers_transparent_spends_at(&network, max_checkpoint),
+            "defers at the last checkpoint height"
+        );
+        assert!(
+            !deferring.defers_transparent_spends_at(&network, above),
+            "must NOT defer above the last checkpoint (the semantic verifier reads the live UTXO set / value pool there)"
+        );
+
+        // Opt-in off: never defers, at any height.
+        let off = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            checkpoint_sync: true,
+            defer_transparent_reconcile: false,
+            ..Default::default()
+        };
+        assert!(!off.defers_transparent_spends_at(&network, below));
+
+        // Address index on (archive): the deferred path is unsafe, never defers.
+        let archive = Config {
+            storage_mode: StorageMode::Archive,
+            checkpoint_sync: true,
+            defer_transparent_reconcile: true,
+            ..Default::default()
+        };
+        assert!(!archive.defers_transparent_spends_at(&network, below));
+    }
 
     #[test]
     fn storage_mode_deserializes_from_documented_toml() {

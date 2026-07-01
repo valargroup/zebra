@@ -91,8 +91,16 @@ impl CheckpointFrontierRefresh {
     }
 }
 
+/// Drives the Zakura block-sync apply pipeline: consumes `BlockSyncAction`s from the
+/// sequencer, applies submitted bodies through the consensus router into state
+/// (checkpoint-class blocks take the header-authenticated fast path), drains applies
+/// concurrently under the checkpoint/full/combined limits, and reports completions
+/// back to the sequencer via `block_sync`. Runs until `shutdown` resolves.
+///
+/// This is the production sync driver; it is also reused by the offline
+/// `zebra-replay-bench` (via `zebrad::bench_api`) to benchmark the real apply path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
+pub async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
     // Retained so the disconnect capability stays wired into the driver, even
     // though peer scoring no longer drives disconnects (misbehavior is record-only).
@@ -469,6 +477,14 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
+                // The pending-apply backlog when this SubmitBlock arrives: a large
+                // backlog means the sequencer is emitting well ahead and the driver's
+                // dispatch is the limiter; ~0 means the sequencer feeds just-in-time.
+                zebra_chain::stage_timing::record_val(
+                    height.map_or(0, |h| h.0),
+                    "submit_received",
+                    pending_applies.len() as u64,
+                );
                 emit_commit_state(
                     &trace,
                     cs_trace::BLOCK_SUBMIT_QUEUED,
@@ -754,6 +770,15 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             }
         }
 
+        // How many applies are concurrently in flight at the moment this one is
+        // dispatched: ~1-2 means the driver is paced one-at-a-time (verify can't run
+        // ahead); a large depth means the driver is sprinting and the gate is elsewhere.
+        zebra_chain::stage_timing::record_val(
+            pending.block.coinbase_height().map_or(0, |h| h.0),
+            "apply_dispatch",
+            (*checkpoint_in_flight + *full_in_flight) as u64,
+        );
+
         let class = pending.class;
         in_flight_applies.push(
             apply_block_sync_body(
@@ -934,6 +959,7 @@ where
         };
     };
 
+    zebra_chain::stage_timing::record(height.0, "driver_commit_start");
     emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
         insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
         insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
@@ -946,19 +972,53 @@ where
     // normal mode the frontier comes from re-reading committed state below.
     let (result, probe_frontier) = match throughput_probe.as_ref() {
         Some(probe) => probe.apply_block(block.as_ref()),
-        None => (
-            commit_block_sync_body_with_stall_trace(
-                block_verifier.clone(),
-                block,
-                class,
-                &trace,
-                token,
-                height,
-                expected_hash,
-            )
-            .await,
-            None,
-        ),
+        None => {
+            // For a checkpoint-class body, obtain the checkpoint-authenticated expected hash. This
+            // also enforces the airtight-ordering invariant: the body must not reach the verifier
+            // before header sync has authenticated its height (the needed-bodies gate ensures it).
+            let checkpoint_auth_hash = if class == BlockApplyClass::Checkpoint {
+                query_authenticated_checkpoint_hash(read_state.clone(), height).await
+            } else {
+                None
+            };
+            zebra_chain::stage_timing::record(height.0, "auth_hash_done");
+
+            if class == BlockApplyClass::Checkpoint && checkpoint_auth_hash.is_none() {
+                // Hard sync-invariant violation: there is no fallback into range accumulation. We
+                // refuse the commit and surface it; airtight ordering means this should not happen.
+                warn!(
+                    ?height,
+                    ?expected_hash,
+                    "Zakura checkpoint body is not header-authenticated; refusing fast commit"
+                );
+                emit_commit_state(
+                    &trace,
+                    "checkpoint_auth_invariant",
+                    "block_sync_driver",
+                    |row| {
+                        insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+                        insert_cs_height(row, cs_trace::HEIGHT, height);
+                        insert_cs_hash(row, cs_trace::HASH, expected_hash);
+                    },
+                );
+                (BlockApplyResult::Rejected, None)
+            } else {
+                (
+                    commit_block_sync_body_with_stall_trace(
+                        block_verifier.clone(),
+                        block,
+                        class,
+                        &trace,
+                        token,
+                        height,
+                        expected_hash,
+                        checkpoint_auth_hash,
+                    )
+                    .await,
+                    None,
+                )
+            }
+        }
     };
     emit_commit_state(
         &trace,
@@ -971,6 +1031,9 @@ where
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
             insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
             insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+            if class == BlockApplyClass::Checkpoint && result == BlockApplyResult::Committed {
+                insert_cs_str(row, "checkpoint_commit_path", "zakura_authenticated");
+            }
         },
     );
     emit_commit_state(
@@ -1083,6 +1146,7 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
+    checkpoint_auth_hash: Option<zebra_state::AuthenticatedCheckpointHash>,
 ) -> BlockApplyResult
 where
     BlockVerifier:
@@ -1090,9 +1154,16 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    let commit = block_verifier
-        .clone()
-        .oneshot(zebra_consensus::Request::Commit(block));
+    // Checkpoint-class bodies use the header-authenticated fast path (per-block validate + release,
+    // no range accumulation). Full-class bodies take the normal semantic commit.
+    let request = match checkpoint_auth_hash {
+        Some(expected_hash) => zebra_consensus::Request::CommitCheckpointAuthenticated {
+            block,
+            expected_hash,
+        },
+        None => zebra_consensus::Request::Commit(block),
+    };
+    let commit = block_verifier.clone().oneshot(request);
 
     match class {
         BlockApplyClass::Checkpoint => {
@@ -1187,6 +1258,41 @@ fn block_commit_timed_out(
         "timed out committing Zakura block-sync body"
     );
     BlockApplyResult::TimedOut
+}
+
+/// Reads the checkpoint-authenticated hash for `height`, if header sync has authenticated it.
+///
+/// Returns the provenance token required by the Zakura checkpoint fast-commit path, or `None` if
+/// the height is not (yet) checkpoint-authenticated or the read fails.
+async fn query_authenticated_checkpoint_hash<ReadState>(
+    read_state: ReadState,
+    height: block::Height,
+) -> Option<zebra_state::AuthenticatedCheckpointHash>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match read_state
+        .oneshot(zebra_state::ReadRequest::AuthenticatedCheckpointHash { height })
+        .await
+    {
+        Ok(zebra_state::ReadResponse::AuthenticatedCheckpointHash(token)) => token,
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                ?height,
+                ?error,
+                "failed to read authenticated checkpoint hash"
+            );
+            None
+        }
+    }
 }
 
 async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(

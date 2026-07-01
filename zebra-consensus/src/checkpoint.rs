@@ -37,7 +37,7 @@ use zebra_chain::{
     },
     work::equihash,
 };
-use zebra_state::{self as zs, CheckpointVerifiedBlock};
+use zebra_state::{self as zs, AuthenticatedCheckpointHash, CheckpointVerifiedBlock};
 
 use crate::{
     block::VerifyBlockError,
@@ -603,14 +603,24 @@ where
 
         // Cheap proof-of-work checks run *before* the expensive precomputation,
         // so a flood of invalid-PoW blocks can't make us do per-transaction work.
+        let pow_start = std::time::Instant::now();
         self.check_proof_of_work(&block.header, height, hash)?;
+        let pow = pow_start.elapsed();
 
         // Precompute the per-transaction hashes and auth data root, which scale
         // with block weight. (The precomputed path does this concurrently in the
         // caller and skips it here.)
+        let precompute_start = std::time::Instant::now();
         let block = CheckpointVerifiedBlock::with_hash(block, hash);
+        let precompute = precompute_start.elapsed();
+        metrics::histogram!("zebra.consensus.checkpoint.precompute.duration_seconds")
+            .record(precompute.as_secs_f64());
 
-        self.finish_validation(block)
+        let merkle_start = std::time::Instant::now();
+        let block = self.finish_validation(block)?;
+        crate::verify_timing::record(height.0, pow, precompute, merkle_start.elapsed());
+
+        Ok(block)
     }
 
     /// Check a [`CheckpointVerifiedBlock`] whose precomputation (txids, auth data
@@ -636,6 +646,7 @@ where
         height: block::Height,
         hash: block::Hash,
     ) -> Result<(), VerifyCheckpointError> {
+        let pow_start = std::time::Instant::now();
         if self.network.disable_pow() {
             crate::block::check::difficulty_threshold_is_valid(
                 header,
@@ -647,6 +658,8 @@ where
             crate::block::check::difficulty_is_valid(header, &self.network, &height, &hash)?;
             crate::block::check::equihash_solution_is_valid(header)?;
         }
+        metrics::histogram!("zebra.consensus.checkpoint.pow.duration_seconds")
+            .record(pow_start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -671,11 +684,14 @@ where
                 .map(DeferredPoolBalanceChange::new),
         );
 
+        let merkle_start = std::time::Instant::now();
         crate::block::check::merkle_root_validity(
             &self.network,
             &block.block,
             &block.transaction_hashes,
         )?;
+        metrics::histogram!("zebra.consensus.checkpoint.merkle.duration_seconds")
+            .record(merkle_start.elapsed().as_secs_f64());
 
         Ok(block)
     }
@@ -893,6 +909,108 @@ where
                 };
                 // Ignore errors since send() can fail only when the verifier
                 // is being dropped, and then it doesn't matter anymore.
+                let _ = reset_sender.send(tip);
+            }
+            result
+        }
+        .boxed()
+    }
+
+    /// Verify and release a Zakura header-authenticated checkpoint block.
+    ///
+    /// This is the narrow fast path: it validates the block in isolation (height, proof of work,
+    /// Merkle root) and asserts the body matches the checkpoint-authenticated header hash, then
+    /// releases it straight to the state commit pipeline. It does **not** enqueue the block, walk
+    /// the checkpoint range, or touch `verifier_progress`.
+    ///
+    /// Zakura checkpoint heights always take this path (there is no fallback into range
+    /// accumulation), so the verifier's range/progress state is never consulted for them; the
+    /// `check_height` bound stays correct because progress only ever lags the committed tip, which
+    /// is lenient (no false `AlreadyVerified`). The router enforces that `block` is at or below the
+    /// checkpoint height before calling this.
+    pub(crate) fn call_authenticated(
+        &mut self,
+        block: Arc<Block>,
+        expected_hash: AuthenticatedCheckpointHash,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        zebra_chain::stage_timing::record(
+            block.coinbase_height().map_or(0, |h| h.0),
+            "verifier_call_start",
+        );
+        // Per-block validity checks (height, proof of work, Merkle root), the same checks the
+        // accumulation path runs per block — defense in depth on top of the authenticated header.
+        let block = match self.check_block(block) {
+            Ok(block) => block,
+            Err(e) => return async move { Err(e) }.boxed(),
+        };
+        zebra_chain::stage_timing::record(block.height.0, "verifier_checked");
+
+        // Bind the body to the authenticated header. A mismatch means the downloaded body and the
+        // checkpoint-authenticated header disagree: a hard invariant violation, never recoverable.
+        let expected = expected_hash.hash();
+        if block.hash != expected {
+            let (height, found) = (block.height, block.hash);
+            return async move {
+                Err(VerifyCheckpointError::AuthenticatedHashMismatch {
+                    height,
+                    expected,
+                    found,
+                })
+            }
+            .boxed();
+        }
+
+        self.commit_authenticated_block(block)
+    }
+
+    /// Release an already-validated, authenticated checkpoint block straight to the state commit
+    /// pipeline.
+    ///
+    /// Mirrors the commit/reset behavior of [`Self::verify_and_commit`] but without the range
+    /// release channel: the block is committed directly (DB mutation stays parent-ordered in the
+    /// state write task), and on a commit error the verifier is reset to the state tip.
+    fn commit_authenticated_block(
+        &mut self,
+        block: CheckpointVerifiedBlock,
+    ) -> Pin<Box<dyn Future<Output = Result<block::Hash, VerifyCheckpointError>> + Send + 'static>>
+    {
+        let hash = block.hash;
+
+        let state_service = self.state_service.clone();
+        let commit_checkpoint_verified = tokio::spawn(async move {
+            match state_service
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(block))
+                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                .await?
+            {
+                zs::Response::Committed(committed_hash) => {
+                    assert_eq!(committed_hash, hash, "state must commit correct hash");
+                    Ok(hash)
+                }
+                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
+            }
+        });
+
+        let state_service = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
+        async move {
+            let result = commit_checkpoint_verified.await;
+            let result = if zebra_chain::shutdown::is_shutting_down() {
+                Err(VerifyCheckpointError::ShuttingDown)
+            } else {
+                result.expect("commit_checkpoint_verified should not panic")
+            };
+            if result.is_err() {
+                // Keep the verifier consistent with the state for any later legacy caller.
+                let tip = match state_service
+                    .oneshot(zs::Request::Tip)
+                    .await
+                    .map_err(VerifyCheckpointError::Tip)?
+                {
+                    zs::Response::Tip(tip) => tip,
+                    _ => unreachable!("wrong response for Tip"),
+                };
                 let _ = reset_sender.send(tip);
             }
             result
@@ -1203,6 +1321,15 @@ pub enum VerifyCheckpointError {
     },
     #[error("zebra is shutting down")]
     ShuttingDown,
+    #[error(
+        "authenticated checkpoint body at {height:?} has hash {found:?}, \
+         but the authenticated header hash is {expected:?}"
+    )]
+    AuthenticatedHashMismatch {
+        height: block::Height,
+        expected: block::Hash,
+        found: block::Hash,
+    },
 }
 
 impl From<VerifyBlockError> for VerifyCheckpointError {

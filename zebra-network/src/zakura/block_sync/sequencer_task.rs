@@ -738,6 +738,9 @@ impl SequencerTask {
         let body_input_bytes = self
             .body_input_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+        // Cross-layer drift check: the independently-maintained `ByteBudget` total
+        // must equal the sum of the component counters. `work.reserved_bytes()` is
+        // now an O(1) counter, so this runs on every event without a work-queue scan.
         let expected_budget = self
             .work
             .reserved_bytes()

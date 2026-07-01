@@ -17,7 +17,9 @@ use tokio::sync::{
 };
 
 use tracing::Span;
+use zebra_chain::amount::NonNegative;
 use zebra_chain::block::{self, Height};
+use zebra_chain::value_balance::ValueBalance;
 
 use zebra_chain::parallel::{
     commitment_aux::BlockCommitmentRoots,
@@ -29,12 +31,15 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
+        finalized_state::{
+            reconcile_window, spawn_note_precompute, DiskWriteBatch, FinalizedPipeline,
+            FinalizedState, PreparedCommitTrace, ReconcileBlock, ZebraDb,
+        },
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    CommitCheckpointVerifiedError, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -52,6 +57,276 @@ type PendingPrecompute = (
     crossbeam_channel::Receiver<BlockNotePrecompute>,
     Arc<AtomicBool>,
 );
+
+/// A finalized block batch handed to the disk-writer thread for flushing, in the
+/// run-ahead committer.
+///
+/// The assembler thread builds these against the in-memory overlay and sends them
+/// over a bounded channel; the disk-writer thread flushes each one to disk in
+/// height order, sends the per-block commit response only once durable, then acks
+/// the flushed height back so the assembler can advance the chain tip and retire
+/// the overlay.
+struct PipelineFlush {
+    batch: DiskWriteBatch,
+    commit_trace: PreparedCommitTrace,
+    hash: block::Hash,
+    height: Height,
+    rsp_tx: oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+}
+
+/// The disk-writer thread loop for the run-ahead finalized committer.
+///
+/// Flushes each assembled batch to disk in arrival (height) order, sends the
+/// per-block commit response only once the write is durable (ack-after-flush),
+/// then acks the flushed height back to the assembler. A rocksdb write failure is
+/// fatal, as on the synchronous path.
+fn run_finalized_writer(
+    db: ZebraDb,
+    batch_receiver: std::sync::mpsc::Receiver<PipelineFlush>,
+    ack_sender: std::sync::mpsc::Sender<Height>,
+) {
+    loop {
+        // Time blocked waiting for the next batch: ~0 means the disk-writer is the
+        // bottleneck (a full queue feeding it), high means it is starved (the
+        // assembler upstream is the bottleneck).
+        let recv_start = std::time::Instant::now();
+        let Ok(PipelineFlush {
+            batch,
+            commit_trace,
+            hash,
+            height,
+            rsp_tx,
+        }) = batch_receiver.recv()
+        else {
+            break;
+        };
+        metrics::histogram!("zebra.state.write.disk_writer_recv_wait.duration_seconds")
+            .record(recv_start.elapsed().as_secs_f64());
+
+        // Full per-block service time on the disk-writer (flush + acks): the inverse
+        // of this is the disk-writer's max throughput.
+        let service_start = std::time::Instant::now();
+        db.flush_block_batch(
+            batch,
+            commit_trace,
+            "commit checkpoint-verified request (pipelined)",
+        );
+
+        // Ack-after-flush: the commit response only resolves once the block is
+        // durable on disk.
+        let _ = rsp_tx.send(Ok(hash));
+
+        // If the assembler has gone away (shutdown), stop.
+        let stop = ack_sender.send(height).is_err();
+        metrics::histogram!("zebra.state.write.disk_writer_service.duration_seconds")
+            .record(service_start.elapsed().as_secs_f64());
+        if stop {
+            break;
+        }
+    }
+}
+
+/// A window of deferred transparent spends handed to the reconcile worker thread.
+///
+/// The window blocks (height-ordered, all at or below the boundary) are resolved,
+/// deleted, and re-debited off the assembler thread. Empty jobs are never sent.
+struct ReconcileJob {
+    records: Vec<ReconcileBlock>,
+}
+
+/// The deferred-transparent reconcile worker thread loop (v2).
+///
+/// Owns the running chain value pool (seeded once from disk by the spawner) and is
+/// the **sole** writer of `chain_value_pools`, `block_info`, and the spent
+/// `utxo_by_out_loc` deletes in the deferred range — the assembler and disk writer
+/// write only the disjoint UTXO creates / headers / nullifiers / trees, and skip
+/// the value pool entirely when deferring. So this runs concurrently with assembly
+/// without shared-state races or key conflicts.
+///
+/// Jobs are processed FIFO, so the value-pool chaining stays ordered. A reconcile
+/// failure is fatal, as a rocksdb write failure is on the disk writer.
+fn run_reconcile_worker(
+    db: ZebraDb,
+    mut value_pool: ValueBalance<NonNegative>,
+    job_receiver: std::sync::mpsc::Receiver<ReconcileJob>,
+) {
+    let network = db.network();
+    let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+    loop {
+        // Env-gated: time how long the worker sits idle waiting for the next window. A
+        // large wait means the worker is faster than the assembler produces intervals.
+        let recv_start = std::time::Instant::now();
+        let Ok(ReconcileJob { records }) = job_receiver.recv() else {
+            break;
+        };
+        if debug {
+            let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+            eprintln!(
+                "[recon-recv] last_h={last_h} recv_wait_ms={:.1}",
+                recv_start.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        // Run the interval's parallel passes on the dedicated reconcile pool so they
+        // do not share the global pool's queue with the assembler's `par_iter`s.
+        let result = crate::service::finalized_state::RECONCILE_POOL
+            .install(|| reconcile_window(&db, &network, &records, value_pool));
+        match result {
+            Ok(new_pool) => value_pool = new_pool,
+            Err(error) => panic!("deferred transparent reconcile worker failed: {error}"),
+        }
+    }
+}
+
+/// Handle to the reconcile worker thread and its bounded job channel.
+///
+/// The channel is capacity-1: handing off the next window blocks the assembler only
+/// while the worker is still busy with the previous one, bounding the in-flight
+/// `Arc<Block>` to ~two windows.
+struct ReconcileWorker {
+    sender: Option<std::sync::mpsc::SyncSender<ReconcileJob>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReconcileWorker {
+    /// Hand a window prefix to the worker, applying backpressure if it is still busy.
+    /// Empty windows are ignored.
+    fn send(&self, records: Vec<ReconcileBlock>) {
+        if records.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.sender.as_ref() {
+            // Env-gated: time how long the bounded send blocks. A large wait means the
+            // worker is behind (the capacity-1 channel is full), i.e. the reconcile
+            // gates the assembler.
+            let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+            let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+            let send_start = std::time::Instant::now();
+            // The worker only stops on channel close, so a send error means it
+            // panicked mid-reconcile; that is fatal (inconsistent value pool / UTXOs).
+            sender
+                .send(ReconcileJob { records })
+                .expect("reconcile worker thread has gone away");
+            if debug {
+                eprintln!(
+                    "[recon-send] last_h={last_h} backpressure_ms={:.1}",
+                    send_start.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+        }
+    }
+
+    /// Drop the job channel and wait for the worker to finish every queued window, so
+    /// all reconcile writes are durable. Idempotent.
+    fn flush_and_join(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("reconcile worker thread panicked");
+        }
+    }
+}
+
+impl Drop for ReconcileWorker {
+    /// Clean-shutdown safety net: if the worker was not already drained at the
+    /// checkpoint handoff (the common path), close the job channel and join the
+    /// thread so a clean stop finishes any queued reconcile before the state service
+    /// is torn down. Idempotent — a no-op once `flush_and_join` has run. Join errors
+    /// are swallowed here to avoid panicking during unwinding; crash recovery from a
+    /// mid-window stop is out of scope (the node is treated as re-snapshottable).
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Process the disk-writer thread's flush acknowledgements: for each acked height,
+/// advance the finalized chain tip, retire the now-durable overlay entries, and run
+/// the configured stop-height check (which exits the process if matched).
+///
+/// With `block_until_empty`, waits for every in-flight block to be acked (used at
+/// the checkpoint→non-finalized handoff and after a stop-height block); otherwise
+/// drains only the acks already available.
+fn drain_finalized_acks(
+    finalized_state: &mut FinalizedState,
+    pipeline: &mut FinalizedPipeline,
+    ack_receiver: &std::sync::mpsc::Receiver<Height>,
+    in_flight: &mut VecDeque<(Height, block::Hash, ChainTipBlock)>,
+    chain_tip_sender: &mut ChainTipSender,
+    mut reconcile_worker: Option<&mut ReconcileWorker>,
+    block_until_empty: bool,
+) {
+    while !in_flight.is_empty() {
+        let acked = if block_until_empty {
+            match ack_receiver.recv() {
+                Ok(height) => height,
+                // The writer thread is gone; stop draining.
+                Err(_) => break,
+            }
+        } else {
+            match ack_receiver.try_recv() {
+                Ok(height) => height,
+                Err(_) => break,
+            }
+        };
+
+        let (height, hash, tip_block) = in_flight
+            .pop_front()
+            .expect("each ack corresponds to an in-flight block");
+        debug_assert_eq!(height, acked, "the writer acks blocks in height order");
+
+        chain_tip_sender.set_finalized_tip(tip_block);
+        pipeline.retire_through(height);
+
+        // Deferred transparent reconcile: when deferral is on, reconcile the window
+        // prefix at or below this now-durable height at each reconcile boundary and
+        // at the stop height (so the final partial window is reconciled before the
+        // process exits). The boundary is a fixed block interval when
+        // `defer_reconcile_interval > 0` (mainnet checkpoints are only ~30-40 blocks
+        // apart here, too frequent to amortize the reconcile cost), otherwise each
+        // checkpoint.
+        //
+        // v2: hand the window to the dedicated reconcile worker thread so its disk
+        // reads + value-pool recompute overlap continued assembly. v1 fallback (no
+        // worker): reconcile inline. Fatal on error either way: a failed reconcile
+        // would leave the value pool / UTXO set inconsistent.
+        if finalized_state.db.defer_reconcile_configured() {
+            let interval = finalized_state.db.config().defer_reconcile_interval;
+            let is_boundary = if interval > 0 {
+                height.0 % (interval as u32) == 0
+            } else {
+                finalized_state
+                    .db
+                    .network()
+                    .checkpoint_list()
+                    .contains(height)
+            };
+            let at_stop = finalized_state.is_at_stop_height(height);
+            if is_boundary || at_stop {
+                if let Some(worker) = reconcile_worker.as_deref_mut() {
+                    worker.send(pipeline.take_reconcile_prefix(height));
+                    // The process is about to exit at the stop height; flush the
+                    // worker so every queued reconcile is durable first.
+                    if at_stop {
+                        worker.flush_and_join();
+                    }
+                } else {
+                    pipeline
+                        .reconcile_checkpoint(finalized_state, height)
+                        .expect("deferred transparent reconcile failed");
+                }
+            }
+        }
+
+        // The block is now durable, so the stop-height check (which exits the
+        // process) is safe to run here.
+        finalized_state.finalized_stop_at_height_if_configured(
+            height,
+            hash,
+            "commit checkpoint-verified request",
+        );
+    }
+}
 
 /// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
 const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
@@ -395,6 +670,75 @@ impl WriteBlockWorkerTask {
         let mut vct_root_stall: Option<(Height, Instant)> = None;
         let mut vct_root_stall_logged = false;
 
+        // Run-ahead finalized-commit pipeline. Enabled only below the last
+        // checkpoint (the reorg-free region, where the committer is processing the
+        // finalized block channel) and once format upgrades are finished (so the
+        // overlay serves absolute `Insert` address balances, not merge deltas). When
+        // active, the committer assembles each block's batch against the in-memory
+        // overlay and hands it to a dedicated disk-writer thread; the chain tip and
+        // overlay retirement trail the writer's flush acks (ack-after-flush).
+        let pipeline_depth = finalized_state.db.config().finalized_block_pipeline_depth;
+        let pipeline_active = pipeline_depth > 0 && finalized_state.db.finished_format_upgrades();
+
+        let mut pipeline_state: Option<FinalizedPipeline> = None;
+        let mut pipeline_flush_sender: Option<std::sync::mpsc::SyncSender<PipelineFlush>> = None;
+        let mut pipeline_ack_receiver: Option<std::sync::mpsc::Receiver<Height>> = None;
+        let mut pipeline_writer_handle: Option<std::thread::JoinHandle<()>> = None;
+        let mut pipeline_in_flight: VecDeque<(Height, block::Hash, ChainTipBlock)> =
+            VecDeque::new();
+
+        if pipeline_active {
+            // The bounded batch channel is the backpressure: at most `pipeline_depth`
+            // assembled-but-not-yet-flushed blocks are in flight, bounding the overlay.
+            let (flush_sender, flush_receiver) =
+                std::sync::mpsc::sync_channel::<PipelineFlush>(pipeline_depth);
+            let (ack_sender, ack_receiver) = std::sync::mpsc::channel::<Height>();
+            let writer_db = finalized_state.db.clone();
+            let writer_span = Span::current();
+            let handle = std::thread::Builder::new()
+                .name("zebra-finalized-writer".to_string())
+                .spawn(move || {
+                    writer_span
+                        .in_scope(|| run_finalized_writer(writer_db, flush_receiver, ack_sender))
+                })
+                .expect("failed to spawn the finalized disk-writer thread");
+
+            pipeline_state = Some(FinalizedPipeline::new());
+            pipeline_flush_sender = Some(flush_sender);
+            pipeline_ack_receiver = Some(ack_receiver);
+            pipeline_writer_handle = Some(handle);
+        }
+
+        // Deferred-transparent reconcile worker (v2). When deferral is on (and not
+        // forced inline), spawn a dedicated thread that resolves/deletes/re-debits
+        // each window off the assembler thread. It owns the running value pool,
+        // seeded once here from disk (the worker is the sole writer of the value pool
+        // in the deferred range, so this stays exclusively owned with no races).
+        let mut reconcile_worker: Option<ReconcileWorker> = None;
+        if pipeline_active
+            && finalized_state.db.defer_reconcile_configured()
+            && !finalized_state.db.config().defer_reconcile_inline
+        {
+            // Capacity 1: hand-off blocks the assembler only while the worker is
+            // still busy with the previous window (~two windows of blocks in flight).
+            let (job_sender, job_receiver) = std::sync::mpsc::sync_channel::<ReconcileJob>(1);
+            let worker_db = finalized_state.db.clone();
+            let start_value_pool = finalized_state.db.finalized_value_pool();
+            let worker_span = Span::current();
+            let handle = std::thread::Builder::new()
+                .name("zebra-reconcile-worker".to_string())
+                .spawn(move || {
+                    worker_span.in_scope(|| {
+                        run_reconcile_worker(worker_db, start_value_pool, job_receiver)
+                    })
+                })
+                .expect("failed to spawn the reconcile worker thread");
+            reconcile_worker = Some(ReconcileWorker {
+                sender: Some(job_sender),
+                handle: Some(handle),
+            });
+        }
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
@@ -427,9 +771,23 @@ impl WriteBlockWorkerTask {
             {
                 Some(block) => block,
                 None => match finalized_block_write_receiver.try_recv() {
-                    Ok(block) => block,
+                    Ok(block) => {
+                        zebra_chain::stage_timing::record(
+                            block.0.height.0,
+                            "write_worker_received",
+                        );
+                        block
+                    }
                     Err(TryRecvError::Empty) => {
+                        // Starved: no finalized block available. Time the park so we can
+                        // tell "assembler is upstream-starved (verify/driver/feed slow)"
+                        // apart from "assembler is the bottleneck".
+                        let park = std::time::Instant::now();
                         std::thread::park_timeout(Duration::from_millis(10));
+                        metrics::histogram!(
+                            "zebra.state.write.assembler_empty_park.duration_seconds"
+                        )
+                        .record(park.elapsed().as_secs_f64());
                         continue;
                     }
                     Err(TryRecvError::Disconnected) => break,
@@ -449,9 +807,19 @@ impl WriteBlockWorkerTask {
             // So if there has been a block commit error,
             // we need to drop all the descendants of that block,
             // until we receive a block at the required next height.
-            let next_valid_height = finalized_state
-                .db
-                .finalized_tip_height()
+            //
+            // The next block must be the child of the current tip. In the run-ahead
+            // pipeline the assembler runs *ahead* of the durable disk tip (ack-after-
+            // flush), so the next valid height follows the in-memory assembled tip
+            // (`pipeline.tip()`), not the on-disk tip — otherwise a block whose parent
+            // is assembled-but-not-yet-flushed is wrongly dropped as "wrong height".
+            // `pipeline.tip()` is `None` until the first block is assembled (seeded),
+            // so the first block correctly falls back to the durable tip.
+            let next_valid_height = pipeline_state
+                .as_ref()
+                .and_then(|pipeline| pipeline.tip())
+                .map(|(height, _hash)| height)
+                .or_else(|| finalized_state.db.finalized_tip_height())
                 .map(|height| (height + 1).expect("committed heights are valid"))
                 .unwrap_or(Height(0));
 
@@ -481,6 +849,7 @@ impl WriteBlockWorkerTask {
             // sizes plus this block's note counts (the sizes after this block).
             if finalized_lookahead.is_empty() {
                 if let Ok(next) = finalized_block_write_receiver.try_recv() {
+                    zebra_chain::stage_timing::record(next.0.height.0, "write_worker_received");
                     finalized_lookahead.push_back(next);
                 }
             }
@@ -497,8 +866,19 @@ impl WriteBlockWorkerTask {
                     hash = ?ordered_block.0.hash,
                     "VCT: deferring fast checkpoint commit until successor is buffered"
                 );
+                // First time this iteration we discover N's successor isn't buffered:
+                // anchors "worker started waiting for N+1" so an offline join can compare
+                // it against when N+1 was actually sent to the worker (state_to_worker).
+                zebra_chain::stage_timing::record(ordered_block.0.height.0, "successor_wait_start");
                 retry_finalized_block = Some(ordered_block);
+                // VCT one-block look-ahead stall: this fast block can't commit until its
+                // successor is buffered (needed to authenticate its supplied roots). If
+                // this dominates, the 10ms poll granularity (not real work) is the gate.
+                let park = std::time::Instant::now();
                 std::thread::park_timeout(Duration::from_millis(10));
+                metrics::counter!("zebra.state.write.assembler_successor_defer.count").increment(1);
+                metrics::histogram!("zebra.state.write.assembler_successor_park.duration_seconds")
+                    .record(park.elapsed().as_secs_f64());
                 continue;
             }
 
@@ -548,17 +928,95 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
-            let next_block_took_vct_path =
-                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+            let committed_height = ordered_block.0.height;
 
-            // Try committing the block
-            match finalized_state.commit_finalized(
-                ordered_block,
-                prev_note_commitment_trees,
-                note_precompute,
-                next_checkpoint,
-            ) {
-                Ok((finalized, note_commitment_trees)) => {
+            // Handoff drain barrier (consensus-critical). Deferral is only valid below
+            // the last checkpoint (guard 2); above it the semantic verifier validates
+            // each block's spends against the live UTXO set and value pool, so those
+            // must be current. Before the first above-checkpoint block commits, flush
+            // every in-flight block to disk (so the window's spent UTXOs are durable),
+            // drain the pending reconcile window, and refresh the pipeline's threaded
+            // value pool from the now-current disk pool for the inline commits that
+            // follow. The finalized committer normally only sees checkpoint-verified
+            // blocks, so this rarely fires here — the common handoff is the
+            // channel-close drain below — but it guards the boundary itself.
+            if reconcile_worker.is_some()
+                && committed_height > finalized_state.db.network().checkpoint_list().max_height()
+            {
+                if let (Some(pipeline), Some(ack_receiver)) =
+                    (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+                {
+                    drain_finalized_acks(
+                        finalized_state,
+                        pipeline,
+                        ack_receiver,
+                        &mut pipeline_in_flight,
+                        chain_tip_sender,
+                        reconcile_worker.as_mut(),
+                        true,
+                    );
+                    if let Some(mut worker) = reconcile_worker.take() {
+                        worker.send(pipeline.take_reconcile_prefix(committed_height));
+                        worker.flush_and_join();
+                    }
+                    pipeline.reseed_value_pool(&finalized_state.db);
+                }
+            }
+
+            let next_block_took_vct_path = finalized_state.vct_fast_will_apply(committed_height);
+
+            // Commit the block. When the run-ahead pipeline is active, assemble the
+            // block against the overlay and hand its batch to the disk-writer thread
+            // (the chain tip advances later, on the writer's flush ack); otherwise
+            // assemble and flush it synchronously here, advancing the tip inline.
+            let commit_result: Result<
+                NoteCommitmentTrees,
+                (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+            > = if let Some(pipeline) = pipeline_state.as_mut() {
+                let (checkpoint_verified, rsp_tx) = ordered_block;
+                let tip_block = ChainTipBlock::from(checkpoint_verified.clone());
+                match finalized_state.commit_finalized_pipelined(
+                    checkpoint_verified.clone().into(),
+                    prev_note_commitment_trees,
+                    note_precompute,
+                    next_checkpoint,
+                    pipeline,
+                ) {
+                    Ok(assembled) => {
+                        pipeline_in_flight.push_back((assembled.height, assembled.hash, tip_block));
+                        // Bounded send: applies backpressure once `pipeline_depth`
+                        // blocks are already in flight to the disk-writer thread.
+                        let _ = pipeline_flush_sender
+                            .as_ref()
+                            .expect("flush sender is present while the pipeline is active")
+                            .send(PipelineFlush {
+                                batch: assembled.batch,
+                                commit_trace: assembled.commit_trace,
+                                hash: assembled.hash,
+                                height: assembled.height,
+                                rsp_tx,
+                            });
+                        Ok(assembled.note_commitment_trees)
+                    }
+                    Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+                }
+            } else {
+                finalized_state
+                    .commit_finalized(
+                        ordered_block,
+                        prev_note_commitment_trees,
+                        note_precompute,
+                        next_checkpoint,
+                    )
+                    .map(|(finalized, note_commitment_trees)| {
+                        let tip_block = ChainTipBlock::from(finalized);
+                        chain_tip_sender.set_finalized_tip(tip_block);
+                        note_commitment_trees
+                    })
+            };
+
+            match commit_result {
+                Ok(note_commitment_trees) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -581,9 +1039,37 @@ impl WriteBlockWorkerTask {
                         vct_root_stall_logged = false;
                     }
 
-                    let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-                    chain_tip_sender.set_finalized_tip(tip_block);
+
+                    // In the pipeline, advance the chain tip and retire the overlay
+                    // for any blocks the writer has already flushed. If this block is
+                    // the configured stop height, then wait for it to become durable,
+                    // so the stop check fires after the flush and no later block is
+                    // assembled past it.
+                    if let (Some(pipeline), Some(ack_receiver)) =
+                        (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+                    {
+                        drain_finalized_acks(
+                            finalized_state,
+                            pipeline,
+                            ack_receiver,
+                            &mut pipeline_in_flight,
+                            chain_tip_sender,
+                            reconcile_worker.as_mut(),
+                            false,
+                        );
+                        if finalized_state.is_at_stop_height(committed_height) {
+                            drain_finalized_acks(
+                                finalized_state,
+                                pipeline,
+                                ack_receiver,
+                                &mut pipeline_in_flight,
+                                chain_tip_sender,
+                                reconcile_worker.as_mut(),
+                                true,
+                            );
+                        }
+                    }
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
@@ -675,6 +1161,53 @@ impl WriteBlockWorkerTask {
                         return;
                     }
                 }
+            }
+        }
+
+        // The finalized block channel has closed (the checkpoint→non-finalized
+        // handoff). Drain the run-ahead pipeline to durability before switching to
+        // the non-finalized loop: drop the batch sender so the writer finishes its
+        // queue and exits, advance the chain tip and retire the overlay for every
+        // remaining in-flight block, then join the writer thread.
+        if pipeline_active {
+            drop(pipeline_flush_sender.take());
+            if let (Some(pipeline), Some(ack_receiver)) =
+                (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+            {
+                drain_finalized_acks(
+                    finalized_state,
+                    pipeline,
+                    ack_receiver,
+                    &mut pipeline_in_flight,
+                    chain_tip_sender,
+                    reconcile_worker.as_mut(),
+                    true,
+                );
+
+                // Deferred reconcile: the trailing blocks committed past the last
+                // boundary form a partial window that nothing reconciled. This is the
+                // common checkpoint→non-finalized handoff: drain the window (through the
+                // durable tip) so the value pool and UTXO set are current before the
+                // semantic verifier reads them. (The in-loop barrier above guards the
+                // rarer case of an above-checkpoint block arriving on this channel.)
+                if finalized_state.db.defer_reconcile_configured() {
+                    let tip_height = finalized_state.db.tip().map(|(height, _)| height);
+                    if let Some(tip_height) = tip_height {
+                        if let Some(worker) = reconcile_worker.as_mut() {
+                            // v2: send the final window, then wait for the worker to
+                            // make every queued reconcile durable.
+                            worker.send(pipeline.take_reconcile_prefix(tip_height));
+                            worker.flush_and_join();
+                        } else {
+                            pipeline
+                                .reconcile_checkpoint(finalized_state, tip_height)
+                                .expect("final deferred transparent reconcile failed");
+                        }
+                    }
+                }
+            }
+            if let Some(handle) = pipeline_writer_handle.take() {
+                let _ = handle.join();
             }
         }
 

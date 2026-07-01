@@ -239,6 +239,59 @@ fn out_of_order_committing_strategy() -> BoxedStrategy<Vec<Arc<Block>>> {
     Just(blocks).prop_shuffle().boxed()
 }
 
+/// Committing checkpoint-verified blocks through the real `StateService` with the
+/// run-ahead pipeline enabled (`finalized_block_pipeline_depth > 0`) must succeed,
+/// exactly like the synchronous committer. This drives the full write-worker path
+/// (which the `FinalizedState`-only equivalence test bypasses), where the pipeline
+/// actually activates.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipelined_state_service_commits_chain() -> Result<()> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::MAINNET_BLOCKS
+        .range(0..=20)
+        .map(|(_, b)| b.zcash_deserialize_into::<Arc<Block>>().unwrap())
+        .collect();
+    let expected = blocks.len();
+
+    let mut config = Config::ephemeral();
+    config.finalized_block_pipeline_depth = 2;
+
+    let (state, _read, _latest, _change) =
+        StateService::new(config, &network, Height::MAX, 0).await;
+    let mut state = Buffer::new(BoxService::new(state), 10);
+
+    // Queue all the commits (so several are in flight, exercising the pipeline depth),
+    // then await each response in order.
+    let mut rsps = Vec::new();
+    for block in blocks {
+        let rsp = state
+            .ready()
+            .await
+            .expect("state service ready")
+            .call(Request::CommitCheckpointVerifiedBlock(block.into()));
+        rsps.push(rsp);
+    }
+    let mut committed = 0;
+    for (i, rsp) in rsps.into_iter().enumerate() {
+        rsp.await
+            .unwrap_or_else(|e| panic!("pipelined commit of block {i} failed: {e:?}"));
+        committed += 1;
+    }
+
+    assert_eq!(
+        committed, expected,
+        "every queued block should commit through the pipeline"
+    );
+    assert!(
+        expected >= 2,
+        "the test chain must have at least two blocks"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_state_still_responds_to_requests() -> Result<()> {
     let _init_guard = zebra_test::init();

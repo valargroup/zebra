@@ -26,22 +26,25 @@ window warm in page cache first.
 # What height is a snapshot at?
 zebra-replay-bench info --src /path/to/snapshot
 
-# Phase 1: extract a 30k window into a cache (source opened read-only)
+# Phase 1: extract a 50k window into a cache (source opened read-only)
 zebra-replay-bench index \
   --src /path/to/high-snapshot \
-  --cache /tmp/win.zrb --start 1800001 --end 1830000
+  --cache /tmp/win.zrb --start 1849958 --end 1899957
 
-# Phase 2: replay onto a fork whose tip == 1800000
-zebra-replay-bench apply --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+# Phase 2: replay onto a fork whose tip == 1849957
+# The base must be a cleanly-pruned snapshot at START-1 (1849957) — one produced by
+# replaying forward past the checkpoint raw-tx archive backlog, so a run does not
+# re-trigger a DrainBacklog delete storm at startup.
+zebra-replay-bench apply --base /path/to/fork-at-1849957 --cache /tmp/win.zrb
 
 # One altitude up: replay through the real zebra-state write worker
-zebra-replay-bench apply-worker --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+zebra-replay-bench apply-worker --base /path/to/fork-at-1849957 --cache /tmp/win.zrb
 
 # Two altitudes up: replay through the real zebra-consensus checkpoint verifier
-zebra-replay-bench apply-verifier --base /path/to/fork-at-1800000 --cache /tmp/win.zrb
+zebra-replay-bench apply-verifier --base /path/to/fork-at-1849957 --cache /tmp/win.zrb
 
 # Three altitudes up: replay through the real Zakura block-sync Sequencer (VCT-only)
-zebra-replay-bench apply-sequencer --base /path/to/fork-at-1800000 --cache /tmp/win.zrb --vct-sidecar /tmp/win.vct
+zebra-replay-bench apply-sequencer --base /path/to/fork-at-1849957 --cache /tmp/win.zrb --vct-sidecar /tmp/win.vct
 ```
 
 ## Third altitude: `apply-verifier`
@@ -96,6 +99,9 @@ Two optional flags:
   writer is flushed at end-of-run. Without it the tracer is `noop()` (zero overhead).
   Via the harness: `REPLAY_TRACE_DIR=<dir> make perf-replay-sequencer` (add
   `REPLAY_ARCHIVE=1` for archive mode).
+- `--stop-height <h>` clamps the committed window to a sub-range of the cache (stops at
+  the last checkpoint `<= h`), so a larger cache can be reused for a shorter run.
+  Harness: `REPLAY_STOP_HEIGHT=<h>`.
 
 ## Two altitudes: `apply` vs `apply-worker`
 

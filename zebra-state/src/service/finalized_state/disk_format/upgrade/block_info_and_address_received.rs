@@ -250,6 +250,17 @@ impl DiskFormatUpgrade for Upgrade {
             return Ok(Ok(()));
         };
 
+        // Deferred-transparent reconcile: in the checkpoint-trusted range the per-height
+        // `BlockInfo` (and the value pool) are written by the reconcile worker a window
+        // behind the committed tip, so a transient gap below the tip is expected and not
+        // corruption. The auxiliary address index is also off in this mode, so the
+        // received-balance check below does not apply either. Skip the new-blocks check
+        // while deferral is active and the tip is still inside the deferred range; above
+        // the last checkpoint blocks commit inline and the check resumes normally.
+        if db.defer_reconcile_configured() && tip_height <= network.checkpoint_list().max_height() {
+            return Ok(Ok(()));
+        }
+
         // Check any outputs in the last 1000 blocks.
         let start_height = (tip_height - 1_000).unwrap_or(Height::MIN);
 

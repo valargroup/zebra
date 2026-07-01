@@ -17,10 +17,11 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::NonNegative,
+    amount::{NegativeAllowed, NonNegative},
     block::Height,
     block_info::BlockInfo,
     history_tree::HistoryTree,
+    parameters::Network,
     serialization::{CompactSizeMessage, ZcashSerialize as _},
     transparent,
     value_balance::ValueBalance,
@@ -30,11 +31,13 @@ use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk},
-        disk_format::{chain::HistoryTreeParts, RawBytes},
+        disk_format::transparent::AddressBalanceLocationUpdates,
+        disk_format::{chain::HistoryTreeParts, OutputLocation, RawBytes},
+        pipeline::ReconcileBlock,
         zebra_db::{metrics::value_pool_metrics, ZebraDb},
         TypedColumnFamily,
     },
-    HashOrHeight, ValidateContextError,
+    BoxError, HashOrHeight, ValidateContextError,
 };
 
 /// The name of the History Tree column family.
@@ -219,6 +222,26 @@ impl ZebraDb {
             .unwrap_or_else(ValueBalance::zero)
     }
 
+    /// Verification helper (offline tools): the count of `block_info` entries and
+    /// the lowest/highest heights missing a `BlockInfo` in `[lo, hi]`.
+    pub fn block_info_coverage(&self, lo: Height, hi: Height) -> (u64, Option<Height>, u64) {
+        let cf = self.block_info_cf();
+        let mut count = 0u64;
+        let mut first_missing = None;
+        let mut missing = 0u64;
+        for height in lo.0..=hi.0 {
+            if cf.zs_get(&Height(height)).is_some() {
+                count += 1;
+            } else {
+                if first_missing.is_none() {
+                    first_missing = Some(Height(height));
+                }
+                missing += 1;
+            }
+        }
+        (count, first_missing, missing)
+    }
+
     /// Returns the stored `BlockInfo` for the given block.
     pub fn block_info(&self, hash_or_height: HashOrHeight) -> Option<BlockInfo> {
         let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
@@ -226,6 +249,141 @@ impl ZebraDb {
         let block_info_cf = self.block_info_cf();
 
         block_info_cf.zs_get(&height)
+    }
+
+    /// Per-checkpoint transparent reconcile: write, in one atomic batch, the
+    /// `utxo_by_out_loc` deletes for every deferred spend in `records` and the
+    /// recomputed chain value pool (the tip pool plus per-height `BlockInfo`).
+    /// Returns the value pool after the last block in `records`.
+    ///
+    /// `start_value_pool` is the pool before the first block in `records`,
+    /// `resolved` maps each spent outpoint to its on-disk location and UTXO.
+    ///
+    /// This reproduces, in a batched pass, exactly what the per-block
+    /// [`prepare_spent_transparent_outputs_batch`](DiskWriteBatch::prepare_spent_transparent_outputs_batch)
+    /// (with the address index off) and
+    /// [`prepare_chain_value_pools_batch`](DiskWriteBatch::prepare_chain_value_pools_batch)
+    /// would have written inline, so the resulting state is byte-identical.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn commit_checkpoint_reconcile(
+        &self,
+        network: &Network,
+        start_value_pool: ValueBalance<NonNegative>,
+        records: &[ReconcileBlock],
+        resolved: &HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)>,
+    ) -> Result<ValueBalance<NonNegative>, BoxError> {
+        // Env-gated per-phase timing for the A2 bottleneck study.
+        let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+        let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+
+        let mut batch = DiskWriteBatch::new();
+
+        // The deletes: every resolved spend, keyed by output location. The address
+        // index is off in the deferred range, so `skip_index = true` makes this
+        // delete only the `utxo_by_out_loc` entries (no address-link deletes), and
+        // the empty `address_balances` is never consulted.
+        let deletes_start = std::time::Instant::now();
+        let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = resolved
+            .values()
+            .map(|(out_loc, utxo)| (*out_loc, utxo.clone()))
+            .collect();
+        batch.prepare_spent_transparent_outputs_batch(
+            &self.db,
+            network,
+            &spent_utxos_by_out_loc,
+            &AddressBalanceLocationUpdates::Insert(HashMap::new()),
+            true,
+        );
+        let deletes_dur = deletes_start.elapsed();
+        let n_deletes = spent_utxos_by_out_loc.len();
+
+        // Compute each block's independent value-pool delta and serialized size in
+        // parallel — `chain_value_pool_change` re-folds every transaction's value
+        // balance and the size sums every transaction's serialized length, so this is
+        // the CPU-heavy pass, and it is independent across the window's blocks. Then
+        // apply the deltas in block order sequentially (cheap integer adds) to get the
+        // per-height running pool for `BlockInfo`. Splitting the parallel per-block
+        // work from the ordered running-sum keeps the result byte-identical to the
+        // inline per-block path (same deltas, same application order).
+        let vp_start = std::time::Instant::now();
+        use rayon::prelude::*;
+        let per_block: Vec<(ValueBalance<NegativeAllowed>, usize)> = records
+            .par_iter()
+            .map(
+                |record| -> Result<(ValueBalance<NegativeAllowed>, usize), BoxError> {
+                    let spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo> = record
+                        .spent
+                        .iter()
+                        .map(|outpoint| {
+                            let (_out_loc, utxo) = resolved
+                                .get(outpoint)
+                                .expect("every deferred spend was resolved above");
+                            (*outpoint, utxo.clone())
+                        })
+                        .collect();
+
+                    let delta = record
+                        .block
+                        .chain_value_pool_change(&spent_by_block, record.deferred_pool_change)?;
+
+                    // Block size, summed per-transaction (byte-identical to serializing the
+                    // whole block), as in `prepare_chain_value_pools_batch`.
+                    let transactions = &record.block.transactions;
+                    let transactions_size: usize = transactions
+                        .iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum();
+                    let tx_count_size = CompactSizeMessage::try_from(transactions.len())
+                        .expect("block must have a valid transaction count")
+                        .zcash_serialized_size();
+                    let block_size = record.block.header.zcash_serialized_size()
+                        + tx_count_size
+                        + transactions_size;
+
+                    Ok((delta, block_size))
+                },
+            )
+            .collect::<Result<Vec<_>, BoxError>>()?;
+        let vp_dur = vp_start.elapsed();
+
+        let bi_start = std::time::Instant::now();
+        let mut value_pool = start_value_pool;
+        for (record, (delta, block_size)) in records.iter().zip(per_block) {
+            value_pool = value_pool.add_chain_value_pool_change(delta)?;
+            value_pool_metrics(&value_pool);
+
+            let _ = self
+                .block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(
+                    &record.height,
+                    &BlockInfo::new(value_pool, block_size as u32),
+                );
+        }
+
+        let _ = self
+            .chain_value_pools_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&(), &value_pool);
+        let bi_dur = bi_start.elapsed();
+
+        let write_start = std::time::Instant::now();
+        self.write_batch(batch)?;
+        let write_dur = write_start.elapsed();
+
+        if debug {
+            eprintln!(
+                "[recon-commit] last_h={last_h} n_blocks={} n_deletes={n_deletes} \
+                 deletes_ms={:.1} vp_ms={:.1} blockinfo_ms={:.1} write_ms={:.1}",
+                records.len(),
+                deletes_dur.as_secs_f64() * 1e3,
+                vp_dur.as_secs_f64() * 1e3,
+                bi_dur.as_secs_f64() * 1e3,
+                write_dur.as_secs_f64() * 1e3,
+            );
+        }
+
+        Ok(value_pool)
     }
 }
 
@@ -286,13 +444,25 @@ impl DiskWriteBatch {
     /// [`chain_value_pool_change`]: zebra_chain::block::Block::chain_value_pool_change
     /// [`add_chain_value_pool_change`]: ValueBalance::add_chain_value_pool_change
     #[allow(clippy::unwrap_in_result)]
+    /// Returns the chain value pool after applying this block, so the run-ahead
+    /// committer can thread it forward in memory to the next block's assembly.
     pub fn prepare_chain_value_pools_batch(
         &mut self,
         db: &ZebraDb,
         finalized: &FinalizedBlock,
         utxos_spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo>,
         value_pool: ValueBalance<NonNegative>,
-    ) -> Result<(), ValidateContextError> {
+    ) -> Result<ValueBalance<NonNegative>, ValidateContextError> {
+        // Per-checkpoint reconcile / ceiling probe: the value-pool change needs the spent
+        // values. When deferring (`defers_transparent_spends`), the spent reads are skipped
+        // here and recomputed in the batched checkpoint reconcile, so leave the pool
+        // unchanged (it is threaded forward and corrected at the next checkpoint). The
+        // benchmark probe (`bench_skip_transparent_reads`) skips it with no reconcile,
+        // leaving the pool permanently stale (measurement only, never shipped).
+        if db.defers_transparent_spends(finalized.height) || super::bench_skip_transparent_reads() {
+            return Ok(value_pool);
+        }
+
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
@@ -364,6 +534,6 @@ impl DiskWriteBatch {
             &BlockInfo::new(new_value_pool, block_size as u32),
         );
 
-        Ok(())
+        Ok(new_value_pool)
     }
 }

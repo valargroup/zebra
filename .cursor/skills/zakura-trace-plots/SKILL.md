@@ -29,6 +29,20 @@ Default outputs:
 
 Use the time plot for stall diagnosis. Height plots collapse zero-progress stalls onto one x-position.
 
+When the user is analyzing the verify -> commit pipeline and provides per-block
+timing traces such as `seq50k-commit-timing.jsonl` and
+`seq50k-verify-timing.jsonl`, also generate the by-height timing plot:
+
+```bash
+python3 .cursor/skills/zakura-trace-plots/scripts/plot_commit_verify_timing.py \
+  COMMIT_TIMING.jsonl VERIFY_TIMING.jsonl --out-dir perf-artifacts
+```
+
+This graph is useful for separating verifier cost from committer cost. It plots
+commit phases (`spent_utxo_reads`, `address_reads`, `batch_assembly`,
+`batch_commit`), commit total latency, verifier phases (`pow`, `precompute`,
+`merkle`), and rolling implied throughput from each timing stream.
+
 ## Metrics Awareness
 
 Use `block_sync.jsonl` as the source of truth for:

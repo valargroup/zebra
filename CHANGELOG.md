@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Fix work-queue scans that stalled the Zakura block-sync commit pipeline for
+  tens of seconds during checkpoint sync. When headers race far ahead of the body
+  tip, the sequencer's `WorkQueue` holds the entire lag (100k+ pending heights) in
+  mutex-guarded `BTreeMap`s, and two O(n) operations ran under that lock on the
+  hot path: `reserved_bytes()` (a full scan re-summing reserved request bytes on
+  every `publish_view`, i.e. every body/control event) and `advance_floor()` (a
+  full-map `retain` garbage-collecting committed heights on every floor advance).
+  As the backlog grew these became quadratic, saturating the single sequencer task
+  and serializing the work-queue lock so both commit *and* download stalled
+  (observed as ~12–30s body-commit freezes with peers blocked on the lock). Both
+  are now bounded: `reserved_bytes` is an O(1) incrementally-maintained counter
+  (cross-checked against the independent byte budget by the existing audit), and
+  `advance_floor`/`reset_above` pop only the committed prefix/suffix
+  (O(removed · log n)) instead of scanning the whole map. The `publish_view`
+  scans over the `applying` map (`applying_buffered_bytes`,
+  `submitted_applying_count`/`_bytes`, and the derived `unsubmitted_applying_count`)
+  are likewise now O(1) incrementally-maintained counters instead of a scan of the
+  apply backlog on every event.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
@@ -20,6 +38,26 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `librustzcash`. The output is byte-identical: a differential property test
   (`native_zip244_matches_librustzcash`) asserts the native txid and auth digest
   match the `librustzcash` conversion across thousands of random v5 transactions.
+- Add a run-ahead finalized-commit pipeline that overlaps the next block's batch
+  assembly with the current block's disk write, raising checkpoint-sync commit
+  throughput from `assemble + flush` per block toward `max(assemble, flush)`. The
+  committer is split into an assemble half (`assemble_finalized_direct` /
+  `assemble_block_batch` — treestate compute + batch build, no writes) and a flush
+  half (`flush_finalized_direct` / `flush_block_batch` — the rocksdb write and
+  post-commit bookkeeping). When enabled, the committer assembles each block's
+  batch on its thread and hands it to a dedicated disk-writer thread over a bounded
+  channel (the channel depth is the backpressure). A new `FinalizedPipeline` (in
+  `zebra-state/src/service/finalized_state/pipeline.rs`) carries the in-memory tip
+  state — history tree, note-commitment trees, value pool, `vct_upgrade_height`
+  marker, tip cursor — and a read-through overlay for not-yet-flushed spent UTXOs
+  and address balances, so a block assembled ahead of the durable write reads its
+  parent's effects from memory. The externally-visible finalized tip, the per-block
+  commit response, and the download budget all trail the durable flush
+  (ack-after-flush), so crash recovery is unchanged. Only the checkpoint
+  (reorg-free) region uses the pipeline; near the tip the committer stays
+  synchronous. The new `Config::finalized_block_pipeline_depth` defaults to `0`
+  (synchronous), so behavior is byte-identical to the previous committer until the
+  depth is raised. See `CHANGELOG_PARAMS.md`.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both
