@@ -59,7 +59,7 @@ expression: block
       "valueDeltaZat": 0
     },
     {
-      "id": "ironwood",
+      "id": "lockbox",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false,
@@ -67,7 +67,7 @@ expression: block
       "valueDeltaZat": 0
     },
     {
-      "id": "lockbox",
+      "id": "ironwood",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false,

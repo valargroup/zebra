@@ -200,10 +200,11 @@ fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn s
     let value_pools = obj.value_pools();
 
     assert_eq!(value_pools.len(), 6);
-    assert_eq!(value_pools[4].id().as_str(), "ironwood");
-    assert_eq!(value_pools[4].chain_value_zat().zatoshis(), 0);
-    assert!(value_pools[4].value_delta().is_none());
-    assert!(value_pools[4].value_delta_zat().is_none());
+    assert_eq!(value_pools[4].id().as_str(), "deferred");
+    assert_eq!(value_pools[5].id().as_str(), "ironwood");
+    assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[5].value_delta().is_none());
+    assert!(value_pools[5].value_delta_zat().is_none());
 
     Ok(())
 }
@@ -404,11 +405,12 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
         .expect("verbose block has valuePools");
 
     assert_eq!(value_pools.len(), 6);
-    assert_eq!(value_pools[4].id().as_str(), "ironwood");
-    assert_eq!(value_pools[4].chain_value_zat().zatoshis(), 0);
-    assert!(value_pools[4].value_delta().is_some());
+    assert_eq!(value_pools[4].id().as_str(), "lockbox");
+    assert_eq!(value_pools[5].id().as_str(), "ironwood");
+    assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
+    assert!(value_pools[5].value_delta().is_some());
     assert_eq!(
-        value_pools[4]
+        value_pools[5]
             .value_delta_zat()
             .map(|amount| amount.zatoshis()),
         Some(0)

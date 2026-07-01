@@ -916,7 +916,7 @@
             "valueDeltaZat": 0
         },
         {
-            "id": "ironwood",
+            "id": "lockbox",
             "monitored": true,
             "chainValue": 0.00000000,
             "chainValueZat": 0,
@@ -924,7 +924,7 @@
             "valueDeltaZat": 0
         },
         {
-            "id": "lockbox",
+            "id": "ironwood",
             "monitored": true,
             "chainValue": 0.00000000,
             "chainValueZat": 0,

@@ -3391,10 +3391,10 @@ where
                 .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
                 .then(Amount::zero);
 
-            value_pools.insert(
-                4,
-                GetBlockchainInfoBalance::ironwood(Amount::zero(), ironwood_delta),
-            );
+            value_pools.push(GetBlockchainInfoBalance::ironwood(
+                Amount::zero(),
+                ironwood_delta,
+            ));
         }
         6 => {}
         len => return Err(E::invalid_length(len, &"five or six value pool balances")),
