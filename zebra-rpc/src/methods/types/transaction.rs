@@ -209,14 +209,11 @@ impl TransactionTemplate<NegativeOrZero> {
                         }
 
                         // From NU6.3 on, the Orchard pool is frozen
-                        // (disabled_add_to_orchard_pool). At NU6.3 the Orchard receiver is
-                        // paid via Ironwood, which reuses the Orchard address, when
-                        // Ironwood is compiled in; the verifier only accepts V6/Ironwood
-                        // coinbase outputs while NU6.3 is the current upgrade. After NU6.3
-                        // neither pool is accepted, so an Orchard-only address cannot
-                        // receive a coinbase reward.
+                        // (disabled_add_to_orchard_pool), so pay the Orchard receiver
+                        // via Ironwood, which reuses the Orchard address, when Ironwood
+                        // is compiled in.
                         #[cfg(zcash_unstable = "nu6.3")]
-                        if upgrade == NetworkUpgrade::Nu6_3 {
+                        if upgrade >= NetworkUpgrade::Nu6_3 {
                             return add_ironwood_reward(&mut builder, addr);
                         }
 
