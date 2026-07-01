@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use zebra_chain::{
-    block::{merkle::AuthDataRoot, Block, Height},
+    block::{merkle::AuthDataRoot, Block, Header, Height},
     history_tree::HistoryTree,
-    orchard,
+    ironwood, orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     sapling,
 };
@@ -142,6 +143,136 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
     }
 
     Ok(())
+}
+
+/// Header-only variant of [`verify_supplied_sapling_root_below_heartwood`] (design §6.1): the
+/// same direct pre-Heartwood Sapling check, driven by the header + height instead of the block
+/// body, for the header-sync verification path.
+pub(crate) fn verify_supplied_sapling_root_below_heartwood_from_header(
+    network: &Network,
+    header: &Header,
+    height: Height,
+    sapling_root: &sapling::tree::Root,
+) -> Result<(), ValidateContextError> {
+    let expected = match header.commitment(network, height)? {
+        Commitment::FinalSaplingRoot(header_root) => header_root,
+        Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
+        // Heartwood activation and later are authenticated by the MMR path.
+        _ => return Ok(()),
+    };
+
+    if sapling_root != &expected {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidFinalSaplingRoot {
+                expected: <[u8; 32]>::from(expected),
+                actual: <[u8; 32]>::from(*sapling_root),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
+/// Verifies a supplied Ironwood root for a *pre-Nu7* block (design §6.1, Ironwood analogue of
+/// [`verify_supplied_orchard_root_below_nu5`]).
+///
+/// The Ironwood tree does not activate until Nu7, and no leaf below Nu7 commits to an Ironwood
+/// root (the V1/V2 history leaf ignores it). Below Nu7 the tree is provably the empty default,
+/// so the supplied root is pinned to the empty-tree root — an untrusted source cannot inject a
+/// non-empty Ironwood anchor there. At and above Nu7 the V3 MMR leaf authenticates it.
+pub(crate) fn verify_supplied_ironwood_root_below_nu7(
+    network: &Network,
+    height: Height,
+    ironwood_root: &ironwood::tree::Root,
+) -> Result<(), ValidateContextError> {
+    if let Some(nu7_height) = NetworkUpgrade::Nu7.activation_height(network) {
+        if height >= nu7_height {
+            return Ok(());
+        }
+    }
+
+    let expected = ironwood::tree::NoteCommitmentTree::default().root();
+    if ironwood_root != &expected {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidPreNu5OrchardRoot {
+                expected: <[u8; 32]>::from(expected),
+                actual: <[u8; 32]>::from(*ironwood_root),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
+/// Verify supplied per-block roots against the checkpoint-committed header chain, folding them
+/// into the ZIP-221 MMR **from parts** (no block bodies) — the header-sync verification path
+/// (design §6). This is the authoritative check: a range that passes is safe to persist and
+/// serve; a range that fails identifies the offending peer at ingestion.
+///
+/// `items` are `(header, roots)` in ascending, contiguous height order, each one height above
+/// `tree`'s current tip (`tree` is the running header-frontier history tree). Returns the
+/// advanced tree, or `(height, error)` for the first block whose header commitment rejects the
+/// roots folded so far.
+///
+/// # Lag
+///
+/// A block's commitment binds the history tree as of its *parent*, so the root supplied for
+/// height `H` is confirmed when `H + 1` is processed. Over a contiguous range `[start..=end]`
+/// this confirms `[start..=end - 1]`; the next range's first header confirms `end`.
+pub(crate) fn verify_supplied_roots_from_parts<'a, I>(
+    network: &Network,
+    mut tree: HistoryTree,
+    items: I,
+) -> Result<HistoryTree, (Height, ValidateContextError)>
+where
+    I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
+{
+    for (header, roots) in items {
+        let height = roots.height;
+
+        // Confirm this block's header commitment against the running tree (every root folded
+        // so far), driven by the header + this block's own auth-data root.
+        check::header_commitment_is_valid_for_chain_history(
+            header,
+            height,
+            network,
+            &tree,
+            roots.auth_data_root,
+        )
+        .map_err(|error| (height, error))?;
+
+        // Direct checks the MMR path can't vouch for below the pools' activations.
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            network,
+            header,
+            height,
+            &roots.sapling_root,
+        )
+        .map_err(|error| (height, error))?;
+        verify_supplied_orchard_root_below_nu5(network, height, &roots.orchard_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_root_below_nu7(network, height, &roots.ironwood_root)
+            .map_err(|error| (height, error))?;
+
+        // Fold this block's supplied roots into the running MMR, building the leaf from the
+        // header + carried tx-counts (no block body).
+        tree.push_from_parts(
+            network,
+            header,
+            height,
+            &roots.sapling_root,
+            &roots.orchard_root,
+            &roots.ironwood_root,
+            roots.sapling_tx,
+            roots.orchard_tx,
+            roots.ironwood_tx,
+        )
+        .map_err(Arc::new)
+        .map_err(ValidateContextError::from)
+        .map_err(|error| (height, error))?;
+    }
+
+    Ok(tree)
 }
 
 /// Verifies that `items` (blocks in ascending height order, with supplied

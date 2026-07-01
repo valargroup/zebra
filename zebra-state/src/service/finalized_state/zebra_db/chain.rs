@@ -157,6 +157,26 @@ impl ZebraDb {
         Arc::new(HistoryTree::from(history_tree))
     }
 
+    /// Returns the running ZIP-221 history tree at the Zakura header-sync frontier.
+    ///
+    /// This is the authoritative header-sync verifier's running state (design §6): the tree
+    /// into which each committed header range's verified roots are folded, ahead of the
+    /// finalized body tip. Returns an empty tree if no range has been folded yet (a fresh
+    /// database, or one that has not yet reached Heartwood).
+    pub(crate) fn zakura_header_frontier_tree(&self) -> HistoryTree {
+        let cf = self
+            .db
+            .cf_handle(crate::service::finalized_state::ZAKURA_HEADER_FRONTIER_TREE)
+            .expect("ZAKURA_HEADER_FRONTIER_TREE column family exists");
+        let parts: Option<HistoryTreeParts> = self.db.zs_get(&cf, &());
+        let inner = parts.map(|parts| {
+            parts
+                .with_network(&self.db.network())
+                .expect("header-frontier tree decodes with the current HistoryTreeParts format")
+        });
+        HistoryTree::from(inner)
+    }
+
     /// Returns `Ok(())` if the stored tip history tree decodes with the current
     /// `HistoryTreeParts` format.
     ///

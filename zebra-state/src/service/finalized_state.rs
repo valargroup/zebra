@@ -178,6 +178,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
     ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
+    ZAKURA_HEADER_FRONTIER_TREE,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",
@@ -285,6 +286,17 @@ pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
 /// header commitments.
 pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
     "zakura_header_commitment_roots_by_height";
+
+/// Column family: the running ZIP-221 history tree at the Zakura header-sync frontier.
+///
+/// Keyed by the unit key `()` (a single value, atomically updated per header-range commit,
+/// like the finalized `history_tree`). As each committed header range's supplied roots are
+/// verified against the header commitments (design §6), they are folded into this tree, which
+/// runs ahead of the finalized body tip. It is the authoritative verifier's running state: a
+/// range that fails to fold consistently is rejected and its peer scored, so no unverified
+/// root is ever persisted or served. Stored so verification resumes across restarts without an
+/// O(frontier) rebuild.
+pub const ZAKURA_HEADER_FRONTIER_TREE: &str = "zakura_header_frontier_tree";
 
 /// The finalized part of the chain state, stored in the db.
 ///

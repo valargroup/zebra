@@ -21,9 +21,10 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
+    history_tree::HistoryTree,
     ironwood, orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
-    parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
+    parameters::{Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize as _},
     transaction::{self, Transaction},
@@ -43,6 +44,7 @@ use crate::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
+            chain::HistoryTreeParts,
             shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
@@ -58,6 +60,25 @@ use crate::request::Spend;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the running header-frontier history `tree` is folded exactly up to `anchor_height`.
+///
+/// A non-empty tree matches when its tip equals the anchor. An empty tree matches exactly while
+/// the anchor is below the first MMR height (Heartwood) — nothing has been folded yet and the
+/// activation block folds into it next.
+fn header_frontier_is_at_anchor(
+    tree: &HistoryTree,
+    anchor_height: block::Height,
+    network: &Network,
+) -> bool {
+    match tree.as_ref().map(|tree| tree.current_height()) {
+        Some(height) => height == anchor_height,
+        None => match NetworkUpgrade::Heartwood.activation_height(network) {
+            Some(heartwood) => anchor_height < heartwood,
+            None => true,
+        },
+    }
+}
 
 const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
@@ -2109,6 +2130,38 @@ impl DiskWriteBatch {
             }
         }
 
+        // Authoritative header-sync verification (design §6): fold this range's supplied roots
+        // into the running header-frontier ZIP-221 MMR and confirm each against its
+        // checkpoint-committed header commitment. A range that fails is rejected here — nothing
+        // is stored — and its peer is scored via `InvalidCommitmentRoots`, catching a lying peer
+        // early and attributably. Only ranges carrying roots (the checkpoint window) are
+        // verified; above the last checkpoint no roots are requested.
+        if !tree_aux_roots.is_empty() {
+            let network = zebra_db.network();
+            let frontier = self.position_header_frontier_tree(zebra_db, &network, anchor_height)?;
+
+            let items = validated_headers
+                .iter()
+                .zip(tree_aux_roots.iter())
+                .map(|((_height, _hash, header, _body_size), roots)| (header.as_ref(), roots));
+
+            let advanced = crate::service::finalized_state::commitment_aux_verify::verify_supplied_roots_from_parts(
+                &network, frontier, items,
+            )
+            .map_err(|(height, source)| CommitHeaderRangeError::InvalidCommitmentRoots {
+                height,
+                source: Box::new(source),
+            })?;
+
+            let frontier_cf = zebra_db
+                .db
+                .cf_handle(crate::service::finalized_state::ZAKURA_HEADER_FRONTIER_TREE)
+                .expect("ZAKURA_HEADER_FRONTIER_TREE column family exists");
+            if let Some(tree) = advanced.as_ref() {
+                self.zs_insert(&frontier_cf, (), HistoryTreeParts::from(tree));
+            }
+        }
+
         for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
         {
             let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
@@ -2151,6 +2204,63 @@ impl DiskWriteBatch {
         Ok(block::Hash::from(
             &**headers.last().expect("headers is non-empty"),
         ))
+    }
+
+    /// Position the running header-frontier history tree at `anchor_height` for verification
+    /// (design §6).
+    ///
+    /// In the checkpoint window, headers are checkpoint-pinned and committed contiguously, so the
+    /// persisted frontier tree is normally already folded up to the anchor and returned directly.
+    /// Otherwise (a fresh adoption of the format, or a rare re-anchor) it folds the stored roots
+    /// forward from the frontier tip to the anchor, re-verifying them, and errors if the frontier
+    /// cannot be positioned exactly at the anchor.
+    fn position_header_frontier_tree(
+        &self,
+        zebra_db: &ZebraDb,
+        network: &Network,
+        anchor_height: block::Height,
+    ) -> Result<HistoryTree, CommitHeaderRangeError> {
+        let frontier = zebra_db.zakura_header_frontier_tree();
+        if header_frontier_is_at_anchor(&frontier, anchor_height, network) {
+            return Ok(frontier);
+        }
+
+        // Fold the stored roots forward from the frontier tip to the anchor, re-verifying them.
+        let start = frontier
+            .as_ref()
+            .map(|tree| (tree.current_height() + 1).expect("stored header heights are valid"))
+            .unwrap_or(block::Height(0));
+        let stored_roots =
+            zebra_db.zakura_header_commitment_roots_by_height_range(start..=anchor_height);
+        let mut items = Vec::with_capacity(stored_roots.len());
+        for roots in &stored_roots {
+            let header = zebra_db.zakura_header(roots.height).ok_or(
+                CommitHeaderRangeError::HeaderFrontierUnavailable {
+                    anchor_height,
+                    missing_height: roots.height,
+                },
+            )?;
+            items.push((header, roots));
+        }
+        let rebuilt = crate::service::finalized_state::commitment_aux_verify::verify_supplied_roots_from_parts(
+            network,
+            frontier,
+            items.iter().map(|(header, roots)| (header.as_ref(), *roots)),
+        )
+        .map_err(|(height, source)| CommitHeaderRangeError::InvalidCommitmentRoots {
+            height,
+            source: Box::new(source),
+        })?;
+
+        // The fold must reach the anchor, or the range would verify against the wrong tree.
+        if !header_frontier_is_at_anchor(&rebuilt, anchor_height, network) {
+            return Err(CommitHeaderRangeError::HeaderFrontierUnavailable {
+                anchor_height,
+                missing_height: start,
+            });
+        }
+
+        Ok(rebuilt)
     }
 
     /// Deletes the block header at `height`.
