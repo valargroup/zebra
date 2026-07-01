@@ -208,7 +208,7 @@ impl TransactionTemplate<NegativeOrZero> {
                         }
 
                         #[cfg(zcash_unstable = "nu6.3")]
-                        if upgrade == NetworkUpgrade::Nu6_3 {
+                        if upgrade >= NetworkUpgrade::Nu6_3 {
                             return add_ironwood_reward(&mut builder, addr);
                         }
 
