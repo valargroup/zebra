@@ -14,6 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   data. This moves ZIP-244 authorizing-data commitment work off the finalized
   committer's critical path when available, while preserving the existing
   recompute fallback.
+- Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
+  previously routed through `Transaction::to_librustzcash`, which re-serializes
+  and reparses the whole transaction — decompressing every Jubjub and Pallas
+  curve point — purely to feed the same canonical bytes into the BLAKE2b digest
+  tree. A new `zebra-chain` `transaction::zip244` module builds the txid and
+  auth-commitment digests directly from Zebra's already-parsed transaction
+  fields, removing that reparse on the checkpoint path where no point is ever
+  needed. v6 transactions (the unstable `tx_v6` feature) still route through
+  `librustzcash`. The output is byte-identical: a differential property test
+  (`native_zip244_matches_librustzcash`) asserts the native txid and auth digest
+  match the `librustzcash` conversion across thousands of random v5 transactions.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both
@@ -51,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
+- Use V3 chain-history entries from NU6.3 onward, including Ironwood note
+  commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
@@ -62,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Ironwood value pool entries to `getblockchaininfo` and verbose
+  `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
   historical raw transaction data, matching the node's storage mode instead of
   always reporting archive behavior.
@@ -148,6 +163,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Stop the Zakura body-sync watchdog from running two commit pipelines at once.
+  When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
+  body downloader but left the Zakura block- and header-sync drivers running, so
+  both fed the state-commit pipeline concurrently — breaking its accounting and
+  deadlocking the node. The watchdog now cancels the Zakura sync drivers (via the
+  endpoint shutdown token) before handing off to legacy ChainSync. The fallback is
+  also limited to dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled); a
+  Zakura-only node, which has no legacy peers to fall back to, instead keeps
+  waiting for Zakura and logs a warning once per stall window.
+- Treat missing transaction inventory responses during mempool download as a
+  recoverable download failure, avoiding a panic when public peers no longer
+  have a gossiped transaction available.
 - Roll back the Zakura header store together with finalized block data, so
   databases produced by `zebra-rollback-state` can resume Zakura body sync from
   the new body tip instead of stalling behind stale headers and falling back to

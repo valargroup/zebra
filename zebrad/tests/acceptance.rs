@@ -222,6 +222,20 @@ use crate::common::regtest::MiningRpcMethods;
 /// This limit only applies to some tests.
 pub const MAX_ASYNC_BLOCKING_TIME: Duration = zebra_test::mock_service::DEFAULT_MAX_REQUEST_DELAY;
 
+/// Stop height for the `pre-nu62` sync-confidence window.
+///
+/// 5,000 blocks above the top mainnet checkpoint (3,358,006) and 1,594 blocks
+/// below the NU6.2 mainnet activation height (3,364,600), so the window exercises
+/// NU6.1-era consensus rules under full validation without crossing the soft fork.
+const SYNC_RANGE_PRE_NU62_STOP_HEIGHT: block::Height = block::Height(3_363_006);
+
+/// Stop height for the `post-nu62` sync-confidence window.
+///
+/// 5,000 blocks above the window start (3,375,000), which is ~10k blocks above the
+/// NU6.2 mainnet activation height (3,364,600), so the window exercises current
+/// post-NU6.2 consensus rules under full validation.
+const SYNC_RANGE_POST_NU62_STOP_HEIGHT: block::Height = block::Height(3_380_000);
+
 #[test]
 fn generate_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -1237,6 +1251,8 @@ fn create_cached_database(network: Network) -> Result<()> {
         height,
         // Use checkpoints to increase sync performance while caching the database
         true,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're still using checkpoints when we finish the cached sync
         &checkpoint_stop_regex,
     )
@@ -1253,6 +1269,8 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
         height.unwrap(),
         // Test full validation by turning checkpoints off
         false,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're doing full validation when we finish the cached sync
         &full_validation_stop_regex,
     )
@@ -1282,6 +1300,8 @@ fn full_sync_test(network: Network, timeout_argument_name: &str) -> Result<()> {
             block::Height::MAX,
             // Use the checkpoints to sync quickly, then do full validation until the chain tip
             true,
+            // Archive storage: keep all transaction data in the cached database.
+            zebra_state::StorageMode::Archive,
             // Finish when we reach the chain tip
             SYNC_FINISHED_REGEX,
         )
@@ -1367,6 +1387,71 @@ fn sync_past_mandatory_checkpoint_testnet() -> Result<()> {
     let _init_guard = zebra_test::init();
     let network = Network::new_default_testnet();
     sync_past_mandatory_checkpoint(network)
+}
+
+/// Sync a fixed window of mainnet blocks from a cached state with full (semantic)
+/// validation, stopping at `stop_height`.
+///
+/// The cached state must already be synced to the window's start height — in CI it
+/// is restored from a pruned snapshot in Spaces (produced out-of-band by
+/// `make-sync-confidence-snapshots.sh`). Because
+/// both sync-confidence windows lie above the top compiled checkpoint (3,358,006),
+/// every block in the window is contextually verified, so this asserts the run
+/// finishes with a `contextually-verified` commit at `stop_height`.
+#[tracing::instrument]
+fn sync_confidence_range(stop_height: block::Height) -> Result<()> {
+    let network = Mainnet;
+    let full_validation_stop_regex =
+        format!("{STOP_AT_HEIGHT_REGEX}.*commit contextually-verified request");
+
+    create_cached_database_height(
+        &network,
+        stop_height,
+        // Full validation: do not use the optional checkpoints.
+        false,
+        // The sync-confidence snapshots are pruned, so the consumer must open the
+        // database in pruned storage mode (archive mode refuses a pruned database).
+        zebra_state::StorageMode::Pruned(zebra_state::PruningConfig {
+            tx_retention: zebra_state::constants::min_pruning_retention(&network),
+        }),
+        &full_validation_stop_regex,
+    )
+}
+
+/// Full-validation sync of ~5k mainnet blocks ending just below NU6.2, from a
+/// cached state at the top mainnet checkpoint.
+///
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// via the `sync-range-pre-nu62` nextest profile.
+#[allow(dead_code)]
+#[test]
+fn sync_range_pre_nu62() -> Result<()> {
+    if std::env::var("TEST_SYNC_RANGE").is_err() {
+        tracing::warn!(
+            "Skipped sync_range_pre_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    sync_confidence_range(SYNC_RANGE_PRE_NU62_STOP_HEIGHT)
+}
+
+/// Full-validation sync of ~5k mainnet blocks above NU6.2, from a cached state at
+/// height 3,375,000.
+///
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// via the `sync-range-post-nu62` nextest profile.
+#[allow(dead_code)]
+#[test]
+fn sync_range_post_nu62() -> Result<()> {
+    if std::env::var("TEST_SYNC_RANGE").is_err() {
+        tracing::warn!(
+            "Skipped sync_range_post_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    sync_confidence_range(SYNC_RANGE_POST_NU62_STOP_HEIGHT)
 }
 
 /// Test if `zebrad` can fully sync the chain on mainnet.
@@ -2995,17 +3080,50 @@ async fn regtest_block_templates_are_valid_block_submissions() -> Result<()> {
 /// (including non-finalized blocks), not just the finalized-database tip.
 #[tokio::test]
 async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Result<()> {
-    use zebra_state::constants::MAX_BLOCK_REORG_HEIGHT;
-
     let _init_guard = zebra_test::init();
 
-    let network = Network::new_regtest(
+    let network_without_checkpoints = Network::new_regtest(
         ConfiguredActivationHeights {
             nu5: Some(100),
             ..Default::default()
         }
         .into(),
     );
+    let mut config = os_assigned_rpc_port_config(false, &network_without_checkpoints)?;
+    config.mempool.debug_enable_at_height = Some(0);
+
+    let mut zebrad = testdir()?
+        .with_config(&mut config)?
+        .spawn_child(args!["start"])?;
+    let rpc_address = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
+
+    zebrad.expect_stdout_line_matches("activating mempool")?;
+
+    let client = RpcRequestClient::new(rpc_address);
+    client.generate(1).await?;
+
+    let block1 = client
+        .get_block(1)
+        .await
+        .map_err(|err| eyre::eyre!(err))?
+        .expect("block at height 1 should exist");
+
+    zebrad.kill(false)?;
+    let output = zebrad.wait_with_output()?;
+    output.assert_failure()?.assert_was_killed()?;
+
+    let checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
+        (Height(0), network_without_checkpoints.genesis_hash()),
+        (Height(1), block1.hash()),
+    ]);
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(100),
+            ..Default::default()
+        },
+        checkpoints: Some(checkpoints),
+        ..Default::default()
+    });
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.mempool.debug_enable_at_height = Some(0);
 
@@ -3014,27 +3132,23 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    zebrad.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
+    client
+        .submit_block(Arc::unwrap_or_clone(block1.clone()))
+        .await?;
+    client.generate(1).await?;
 
-    // Mine enough blocks to push the first few blocks into the finalized state.
-    // Block at height 2 is finalized once tip > 2 + MAX_BLOCK_REORG_HEIGHT = 101.
-    let blocks_to_mine = MAX_BLOCK_REORG_HEIGHT + 10;
-    client.generate(blocks_to_mine).await?;
-
-    // Get the coinbase txid from block 2 (it will be in the finalized DB).
-    let block2 = client
-        .get_block(2)
-        .await
-        .map_err(|err| eyre::eyre!(err))?
-        .expect("block at height 2 should exist");
-    let txid = block2.transactions[0].hash();
+    // Get the coinbase txid from block 1, which is finalized by the
+    // configured checkpoint. The current tip is block 2, which is
+    // non-finalized.
+    let txid = block1.transactions[0].hash();
 
     // Confirm the tip height and compute expected confirmations.
     let info = client.blockchain_info().await?;
     let tip_height = info.blocks().0;
-    let expected_confirmations = 1 + tip_height - 2;
+    let expected_confirmations = tip_height;
 
     // getrawtransaction verbose=1 returns a JSON object that includes `confirmations`.
     let response: Value = client
@@ -3406,7 +3520,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         );
     }
 
-    tracing::info!("restarting Zebra on Mainnet");
+    tracing::info!("restarting Zebra on Regtest");
 
     child.kill(false)?;
     let output = child.wait_with_output()?;
@@ -3416,16 +3530,14 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
 
     output.assert_failure()?;
 
-    let mut config = random_known_rpc_port_config(false, &Network::Mainnet)?;
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
     config.state.ephemeral = false;
-    config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from((
-        [127, 0, 0, 1],
-        random_known_port(),
-    )));
-    let indexer_listen_addr = config.rpc.indexer_listen_addr.unwrap();
+    config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     let test_dir = testdir()?.with_config(&mut config)?;
 
-    let _child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir.spawn_child(args!["start"])?;
+    let _rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
+    let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
 
     tracing::info!("waiting for Zebra state cache to be opened");
 
@@ -3442,12 +3554,12 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         .await?
         .map_err(|err| eyre!(err))?;
 
-    tracing::info!("waiting for initial mainnet chain tip reset");
+    tracing::info!("waiting for initial regtest chain tip reset");
 
     let tip_action = timeout(LAUNCH_DELAY, chain_tip_change.wait_for_tip_change()).await??;
     assert!(
         tip_action.is_reset(),
-        "first mainnet tip action should be a reset"
+        "first regtest tip action should be a reset"
     );
 
     Ok(())
@@ -3895,7 +4007,8 @@ async fn has_spending_transaction_ids() -> Result<()> {
                 .map(Spend::from)
                 .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                 .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
+                .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
                 .map(|spend| (spend, tx_hash))
                 .collect::<Vec<_>>()
         });
@@ -4056,10 +4169,13 @@ fn check_no_git_dependencies() {
 
 #[tokio::test]
 async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
+    const INITIAL_NON_FINALIZED_BLOCKS: u32 = 3;
+
     let network = Network::new_regtest(Default::default());
 
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
+    config.state.debug_skip_non_finalized_state_backup_task = true;
     let test_dir = testdir()?.with_config(&mut config)?;
 
     // Start Zebra and generate some blocks.
@@ -4072,23 +4188,20 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Wait for Zebra to load its state cache
     tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
-    let generated_block_hashes = rpc_client.generate(50).await?;
-    // Wait for non-finalized backup task to make a second write to the backup cache
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
     // Wait for zebrad to fully terminate to ensure database lock is released.
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad to fully terminate")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     // Prepare checkpoint heights/hashes
     let last_hash = *generated_block_hashes
         .last()
         .expect("should have at least one block hash");
     let configured_checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
         (Height(0), network.genesis_hash()),
-        (Height(50), last_hash),
+        (Height(INITIAL_NON_FINALIZED_BLOCKS), last_hash),
     ]);
 
     // Check that Zebra will restore its non-finalized state from backup when the finalized tip is past the
@@ -4116,14 +4229,14 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zebra can commit blocks after restoring non-finalized state");
     rpc_client
-        .generate(10)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
     tracing::info!("retrieving blocks to be used with configured checkpoints");
     let checkpointed_blocks = {
         let mut blocks = Vec::new();
-        for height in 1..=50 {
+        for height in 1..=INITIAL_NON_FINALIZED_BLOCKS.try_into()? {
             blocks.push(
                 rpc_client
                     .get_block(height)
@@ -4144,7 +4257,6 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad to fully terminate")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Check that the non-finalized state is not restored from backup when the finalized tip height is below the
     // max checkpoint height and that it can still commit more blocks to its state
@@ -4182,11 +4294,11 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
         result?
     }
 
-    // Commit some blocks to check that Zebra's state will still commit blocks, and generate enough blocks
-    // for Zebra's finalized tip to pass the max checkpoint height.
+    // Commit a block to check that Zebra's state will still commit blocks
+    // after checkpoint verification.
 
     rpc_client
-        .generate(200)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
@@ -4195,7 +4307,6 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad process to exit after kill")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Check that Zebra will can commit blocks to its state when its finalized tip is past the max checkpoint height
     // and the non-finalized backup cache is disabled or empty.
@@ -4216,7 +4327,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zebra commits blocks with empty non-finalized state");
     rpc_client
-        .generate(10)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
