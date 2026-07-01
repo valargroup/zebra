@@ -90,6 +90,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnect, and self-healing as the peer recovers. Tunable via
   `bbr_reliability_weight_percent` (`0` = plain BBR, the A/B baseline; `100` = full
   goodput discount, the default).
+- Retuned the Zakura block-sync BBR cold start for a conservative start and a faster
+  ramp, now that the reliability discount and delay-gradient ceiling backstop an
+  over-eager window: lowered `bbr_min_cwnd_bytes` from 4 MiB to ≈2.5 MB (one max block
+  plus headroom), so a just-proven peer rides its own measured BDP up instead of
+  jumping to a multi-megabyte burst, and raised `bbr_cwnd_gain_percent` from 200% to
+  300% so it ramps `1 → 3 → 9 …` per round from that smaller base.
+- Added a periodic per-peer `block_peer_bbr` trace heartbeat (every 10s) carrying the
+  full controller state even while a peer is idle, so oscillation (window ramping up
+  then the reliability discount pulling it back) is visible between deliveries.
 
 ### Fixed
 

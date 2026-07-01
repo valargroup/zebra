@@ -2711,6 +2711,78 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
+    // The per-peer `block_peer_bbr` heartbeat fires on a fixed cadence even while the
+    // peer is idle (its interval's first tick is immediate), so the controller state is
+    // observable between deliveries. A freshly-connected, unproven, idle peer must emit
+    // at least one heartbeat carrying the BBR fields, with reliability at the optimistic
+    // full value and no proven progress yet.
+    let mut capture = TraceCapture::for_test("peer_emits_periodic_bbr_heartbeat_while_idle")
+        .expect("trace capture initializes");
+    let config = immediate_body_download_config();
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (_handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, _handle.clone());
+
+    let peer = peer(0x5b);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    // Let the routine reach its idle select loop and fire the immediate heartbeat tick.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_BBR,
+        &[
+            ("bbr_reliability_permille", TraceValue::U64(1000)),
+            ("block_progress_proven", TraceValue::U64(0)),
+            ("bbr_phase", TraceValue::U64(0)),
+        ],
+    );
+
+    reactor_task.abort();
+}
+
 // The old covered-prefix / assigned-key / queued-retry-ordering scheduler tests
 // (`scheduler_partial_*`, `scheduler_drops_*`, `scheduler_splits_*`,
 // `scheduler_retries_only_uncovered_suffix`, `scheduler_keeps_queued_*`,

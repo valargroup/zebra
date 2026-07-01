@@ -272,6 +272,12 @@ pub mod block_sync_trace {
     pub const BLOCK_CHAIN_TIP_RESET: &str = "block_chain_tip_reset";
     /// Periodic reactor state snapshot (the key stall-diagnosis row).
     pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
+    /// Periodic per-peer BBR controller heartbeat, emitted on a fixed cadence even
+    /// while the peer is idle (unlike the per-delivery `block_body_received` row). Lets
+    /// a trace see whether the controller stays balanced (cwnd settled, reliability
+    /// near 1.0) or oscillates — ramping the cwnd up only for the reliability discount
+    /// to pull it back.
+    pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
 }
 
 /// Shared discovery trace event names and field keys.

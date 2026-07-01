@@ -105,7 +105,14 @@ pub const DEFAULT_BS_FANOUT: usize = 1;
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
 /// Default steady-state cwnd gain, as a percent of the bandwidth-delay product.
-pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 200;
+///
+/// Raised to 300% to ramp a proven peer up more aggressively from the smaller
+/// cold-start floor (see [`DEFAULT_BS_BBR_MIN_CWND_BYTES`]): each round the cwnd is
+/// `3× BDP`, so it grows `1 → 3 → 9 …` rather than `1 → 2 → 4 …`. The faster ramp is
+/// safe because the reliability discount and delay-gradient ceiling pull the cwnd back
+/// if the extra concurrency starts costing drops or standing queue, so an over-eager
+/// ramp self-corrects instead of running away.
+pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 300;
 /// Default ProbeBW up-probe pacing gain, percent.
 pub const DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT: u32 = 125;
 /// Default ProbeRTT cadence: how often to drain to re-measure the min-RTT.
@@ -121,18 +128,19 @@ pub const DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(10
 pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
 /// Default minimum cwnd in blocks — keeps the pipe primed and lets ProbeRTT send.
 pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
-/// Default minimum cwnd in **bytes** (the floor under [`CwndUnit::Bytes`]).
+/// Default minimum cwnd in **bytes** (the floor under [`CwndUnit::Bytes`], and the
+/// cold-start window before the first delivery sample).
 ///
-/// Under byte denomination the steady cwnd is `BtlBw_bytes × RTprop × gain`. For a
-/// low-latency peer that product is small (a fast link with ~1 ms base RTT needs
-/// little in flight to stay busy), so this floor — not the BDP — is the binding
-/// operating window most of the time. It is sized to keep enough concurrent
-/// single-block requests in flight to actually pipeline a server that has spare
-/// capacity (the trace showed peers 60–86% idle at a pinned cwnd of 4), while the
-/// size-aware delay-gradient still shrinks it back if a real standing queue forms.
-/// **This is the primary live-A/B tuning lever** (`byte-cwnd-1`): raise it to push
-/// more concurrency, lower it if floor head-of-line latency regresses.
-pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = 4 * 1024 * 1024;
+/// Under byte denomination the steady cwnd is `BtlBw_bytes × RTprop × gain`. This floor
+/// binds when that product is small; more importantly it is the window a *just-proven*
+/// peer jumps to on its second round, so it sets how conservative the start is. Sized to
+/// **one max block plus a little headroom** (≈2.5 MB) so a single worst-case body always
+/// fits, but a freshly-proven peer then rides its own measured BDP up (via the 300% gain)
+/// rather than teleporting straight to a multi-megabyte burst — a conservative start that
+/// pairs with the faster ramp. Lowered from 4 MB for exactly that reason. **This is the
+/// primary live-A/B concurrency lever**: raise it to push more in flight, lower it if
+/// floor head-of-line latency regresses.
+pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = block::MAX_BLOCK_BYTES + 512 * 1024;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
 /// Default weight (percent, `0..=100`) with which a peer's measured reliability — the

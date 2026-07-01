@@ -67,6 +67,10 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`). Pure observability —
+/// it emits the controller state on a fixed interval so a trace can spot oscillation
+/// even while the peer is idle between deliveries; it has no control effect.
+const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
 fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
@@ -243,6 +247,10 @@ impl PeerRoutine {
         let work = self.work.clone();
         // The per-connection oversize guard applied to inbound frames at ingress.
         let mut guard = block_sync_guard();
+        // Per-peer BBR heartbeat cadence. `Skip` so a routine that was busy past a tick
+        // emits one fresh sample rather than a catch-up burst. Observability only.
+        let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
+        bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             // missed-wake safety: register both `Notify`s via
             // `Notified::enable()` BEFORE the fill attempt. The budget/work
@@ -296,6 +304,7 @@ impl PeerRoutine {
                 _ = &mut available => {
                     self.trace_wake("work_added");
                 }
+                _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
         }
@@ -1858,41 +1867,81 @@ impl PeerRoutine {
             if let Some(request_elapsed_ms) = request_elapsed_ms {
                 bs_insert_u64(row, "request_elapsed_ms", request_elapsed_ms);
             }
+            self.insert_bbr_fields(row);
+        });
+    }
+
+    /// Insert the per-peer BBR controller fields (effective cwnd, RTprop, BtlBw, phase,
+    /// delay-gradient ceiling, reliability) into a trace row. Shared by the per-delivery
+    /// `block_body_received` row and the periodic `block_peer_bbr` heartbeat so both
+    /// report the controller from an identical field set.
+    fn insert_bbr_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
+        bs_insert_u64(
+            row,
+            "bbr_cwnd",
+            u64::try_from(self.window.bbr_effective_cwnd()).unwrap_or(u64::MAX),
+        );
+        if let Some(rtprop_ms) = self.window.bbr_rtprop_ms() {
+            bs_insert_u64(row, "bbr_rtprop_ms", rtprop_ms);
+        }
+        if let Some(btlbw) = self.window.bbr_btlbw_milliblocks() {
+            bs_insert_u64(row, "bbr_btlbw_milliblocks_per_sec", btlbw);
+        }
+        // Byte-denomination fields (emitted only under `CwndUnit::Bytes`): the byte
+        // cwnd, the bytes/sec BtlBw, and the in-flight reserved bytes. `bbr_cwnd` above
+        // stays the derived in-flight *request* count so existing analysis scripts keep
+        // working in either unit.
+        if let Some(cwnd_bytes) = self.window.bbr_effective_cwnd_bytes() {
+            bs_insert_u64(row, "bbr_cwnd_bytes", cwnd_bytes);
+            bs_insert_u64(row, "bbr_inflight_bytes", self.window.bbr_inflight_bytes());
+        }
+        if let Some(btlbw_bytes) = self.window.bbr_btlbw_bytes_per_sec() {
+            bs_insert_u64(row, "bbr_btlbw_bytes_per_sec", btlbw_bytes);
+        }
+        bs_insert_u64(row, "bbr_delivered", self.window.bbr_delivered());
+        bs_insert_u64(row, "bbr_phase", self.window.bbr_phase_code());
+        if let Some(smoothed_ms) = self.window.bbr_smoothed_elapsed_ms() {
+            bs_insert_u64(row, "bbr_smoothed_elapsed_ms", smoothed_ms);
+        }
+        if let Some(delay_cap) = self.window.bbr_delay_cap() {
+            bs_insert_u64(row, "bbr_delay_cap", delay_cap);
+        }
+        bs_insert_u64(
+            row,
+            "bbr_reliability_permille",
+            self.window.bbr_reliability_permille(),
+        );
+    }
+
+    /// Emit the periodic per-peer BBR heartbeat (`block_peer_bbr`). Fires on a fixed
+    /// cadence even while the peer is idle, so the controller's balance is observable
+    /// between deliveries — e.g. spotting a peer whose cwnd keeps ramping up only to be
+    /// pulled back by the reliability discount instead of settling near `r = 1.0`.
+    fn trace_bbr_sample(&self) {
+        self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_u64(
                 row,
-                "bbr_cwnd",
-                u64::try_from(self.window.bbr_effective_cwnd()).unwrap_or(u64::MAX),
+                "peer_outstanding",
+                self.window.outstanding.len() as u64,
             );
-            if let Some(rtprop_ms) = self.window.bbr_rtprop_ms() {
-                bs_insert_u64(row, "bbr_rtprop_ms", rtprop_ms);
-            }
-            if let Some(btlbw) = self.window.bbr_btlbw_milliblocks() {
-                bs_insert_u64(row, "bbr_btlbw_milliblocks_per_sec", btlbw);
-            }
-            // Byte-denomination fields (emitted only under `CwndUnit::Bytes`): the byte
-            // cwnd, the bytes/sec BtlBw, and the in-flight reserved bytes. `bbr_cwnd`
-            // above stays the derived in-flight *request* count so existing analysis
-            // scripts keep working in either unit.
-            if let Some(cwnd_bytes) = self.window.bbr_effective_cwnd_bytes() {
-                bs_insert_u64(row, "bbr_cwnd_bytes", cwnd_bytes);
-                bs_insert_u64(row, "bbr_inflight_bytes", self.window.bbr_inflight_bytes());
-            }
-            if let Some(btlbw_bytes) = self.window.bbr_btlbw_bytes_per_sec() {
-                bs_insert_u64(row, "bbr_btlbw_bytes_per_sec", btlbw_bytes);
-            }
-            bs_insert_u64(row, "bbr_delivered", self.window.bbr_delivered());
-            bs_insert_u64(row, "bbr_phase", self.window.bbr_phase_code());
-            if let Some(smoothed_ms) = self.window.bbr_smoothed_elapsed_ms() {
-                bs_insert_u64(row, "bbr_smoothed_elapsed_ms", smoothed_ms);
-            }
-            if let Some(delay_cap) = self.window.bbr_delay_cap() {
-                bs_insert_u64(row, "bbr_delay_cap", delay_cap);
-            }
+            bs_insert_u64(row, "budget_reserved", self.budget.reserved());
             bs_insert_u64(
                 row,
-                "bbr_reliability_permille",
-                self.window.bbr_reliability_permille(),
+                "requests_without_block_progress",
+                u64::from(self.window.requests_without_block_progress),
             );
+            bs_insert_u64(
+                row,
+                "no_progress_request_cap",
+                u64::from(self.window.no_progress_request_cap()),
+            );
+            bs_insert_u64(
+                row,
+                "block_progress_proven",
+                u64::from(self.window.has_block_progress()),
+            );
+            self.insert_bbr_fields(row);
         });
     }
 
