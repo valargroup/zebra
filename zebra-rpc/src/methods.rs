@@ -367,8 +367,8 @@ pub trait Rpc {
     /// `lightwalletd` only uses positive heights, so Zebra does not support
     /// negative heights.
     ///
-    /// The `ironwood` field is serialized only when Ironwood tree state is
-    /// available for the requested block.
+    /// The `ironwood` field contains empty commitments unless Ironwood tree
+    /// state is available for the requested block.
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
 
@@ -2058,8 +2058,9 @@ where
         #[cfg(not(zcash_unstable = "nu6.3"))]
         let ironwood = None;
 
-        let ironwood = ironwood
-            .map(|(tree, root)| Treestate::new(trees::Commitments::new(Some(root), Some(tree))));
+        let ironwood = ironwood.map_or_else(Treestate::default, |(tree, root)| {
+            Treestate::new(trees::Commitments::new(Some(root), Some(tree)))
+        });
 
         Ok(GetTreestateResponse::new_with_ironwood(
             hash,

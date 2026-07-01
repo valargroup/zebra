@@ -62,8 +62,9 @@ impl Default for GetSubtreesByIndexResponse {
 ///
 /// The dense format might be used in future RPCs.
 ///
-/// The serialized response omits `ironwood` unless Ironwood tree state is
-/// available for the requested block.
+/// When Ironwood tree state is not available for the requested block, the
+/// `ironwood` field contains empty commitments, matching the Sapling and
+/// Orchard fields before their activation heights.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetTreestateResponse {
     /// The block hash corresponding to the treestate, hex-encoded.
@@ -94,19 +95,14 @@ pub struct GetTreestateResponse {
     orchard: Treestate,
 
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
-    /// Omitted from the response unless Ironwood tree state is available.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Contains empty commitments unless Ironwood tree state is available.
+    #[serde(default)]
     #[new(default)]
-    ironwood: Option<Treestate>,
+    ironwood: Treestate,
 }
 
 impl GetTreestateResponse {
-    /// Returns the Ironwood treestate if it was present in the RPC response.
-    pub fn optional_ironwood(&self) -> Option<&Treestate> {
-        self.ironwood.as_ref()
-    }
-
-    /// Constructs a treestate response with optional Ironwood data.
+    /// Constructs a treestate response with Ironwood data.
     pub(crate) fn new_with_ironwood(
         hash: Hash,
         height: Height,
@@ -114,7 +110,7 @@ impl GetTreestateResponse {
         sprout: Option<Treestate>,
         sapling: Treestate,
         orchard: Treestate,
-        ironwood: Option<Treestate>,
+        ironwood: Treestate,
     ) -> Self {
         let mut response = Self::new(hash, height, time, sprout, sapling, orchard);
         response.ironwood = ironwood;
@@ -151,7 +147,7 @@ impl GetTreestateResponse {
             orchard,
             // This deprecated compatibility helper only accepts Sapling and
             // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
-            ironwood: None,
+            ironwood: Default::default(),
         }
     }
 

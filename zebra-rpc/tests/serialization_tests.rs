@@ -689,7 +689,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_root = obj.sapling().commitments().final_root().clone();
     let orchard_final_root = obj.orchard().commitments().final_root().clone();
-    assert!(obj.optional_ironwood().is_none());
+    assert_eq!(obj.ironwood(), &Treestate::default());
 
     let new_obj = GetTreestateResponse::new(
         hash,
