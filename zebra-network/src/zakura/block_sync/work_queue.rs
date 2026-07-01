@@ -58,9 +58,7 @@ struct WorkQueueInner {
     floor_estimate_bytes: u64,
     /// Running sum of `reserved_charge()` across every `pending` + `in_flight`
     /// item, maintained incrementally at each ledger transition so
-    /// [`WorkQueue::reserved_bytes`] is O(1) instead of an O(pending + in_flight)
-    /// scan on the sequencer's hot path. `debug_assert`s and the throttled budget
-    /// audit cross-check it against the map contents.
+    /// [`WorkQueue::reserved_bytes`]
     reserved_bytes: u64,
 }
 
