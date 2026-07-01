@@ -1,7 +1,9 @@
 # Deferred transparent reconcile (prototype)
 
-Status: **prototype, benchmark-gated, default-off. NOT safe to enable on a real node yet**
-(see "Production-readiness gaps").
+Status: **prototype, default-off, opt-in.** Byte-match-verified with lifecycle guards
+(height gate, handoff drain barrier, format-check + clean-shutdown). Benchmark-only: safe on
+a **disposable** below-checkpoint node; crash recovery + RPC guards are still missing (see
+"Production-readiness gaps (remaining)").
 
 ## Problem
 
@@ -74,35 +76,61 @@ Benchmarked offline via `zebra-replay-bench` on a mainnet 1.85M–1.9M pruned sn
 
 ## Gating
 
-Env-gated for benchmarking, default off; no production code path is enabled:
+Default off. Opt-in, reachable by a real node for benchmarking:
 
-- `zebra-state` `Config`: `defer_transparent_reconcile` (off), `defer_reconcile_interval`
-  (0 = per checkpoint), `defer_reconcile_inline` (force v1). All `#[serde(skip)]`.
-- `Config::defers_transparent_spends()` currently requires `defer_transparent_reconcile &&
-  skip_address_index()` (pruned + checkpoint-sync). It does **not** yet bound the height to
-  `max_checkpoint_height`.
+- `zebra-state` `Config` (settable under `[state]` in `zebrad.toml`):
+  `defer_transparent_reconcile` (off), `defer_reconcile_interval` (0 = per checkpoint).
+  `defer_reconcile_inline` (force the v1 inline path) stays `#[serde(skip)]` (bench A/B only).
+- `Config::defers_transparent_spends_at(network, height)` requires
+  `defer_transparent_reconcile && skip_address_index()` (pruned + checkpoint-sync) **and**
+  `height <= max_checkpoint_height`. `Config::defer_reconcile_configured()` is the
+  height-independent lifecycle predicate (worker spawn / drain triggers).
 - `zebra-replay-bench`: `ZRB_DEFER_TRANSPARENT`, `ZRB_RECONCILE_INTERVAL`,
   `ZRB_RECONCILE_INLINE`, `ZRB_STOP_AT_HEIGHT`.
 
-## Production-readiness gaps (why it is not safe to enable yet)
+## Lifecycle guards (implemented)
 
-The reconcile *logic* is byte-match-verified, but the surrounding lifecycle is not:
+The reconcile *logic* is byte-match-verified; these lifecycle guards make it safe to
+benchmark on a real below-checkpoint node:
 
-1. **No handoff drain barrier.** The deferral is only valid below `max_checkpoint_height`.
-   At the handoff to semantic verification the value pool + UTXO set must be fully
-   reconciled first (the semantic verifier reads them to validate spends). The prototype
-   omits the height bound and the drain, so enabling it on a node that reaches the handoff
-   would feed the semantic verifier a stale/superset UTXO set + lagging value pool — a
-   consensus failure.
-2. **No crash recovery.** The reconciled (durable transparent) tip trails the committed
-   tip. A crash mid-window leaves `utxo_by_out_loc` a superset and `BlockInfo`/value pool
-   lagging; restart must re-derive the pending window. Not implemented.
-3. **No RPC guards.** Mid-window the UTXO set is a superset and the value pool lags, so
-   address/utxo/value RPCs would return wrong results. Not guarded.
-4. **Background format check.** `check_new_blocks` trips on the transient `BlockInfo` lag;
-   the prototype sidesteps it only via the deterministic-stop bench harness. A production
-   path must skip/relax it in the deferred range.
-5. **Shutdown + error handling.** The worker is fatal-on-error (panic), and clean shutdown
-   requires draining the worker before exit (the bench parks its main task to do this).
+1. **Reachability.** `defer_transparent_reconcile` + `defer_reconcile_interval` are serde
+   fields on the state config, so a node can opt in from `[state]`. Default off.
+2. **Height-bound gate.** `defers_transparent_spends_at` returns false above
+   `max_checkpoint_height`, so every above-checkpoint block commits inline (non-deferred).
+   Unit-tested (`defers_transparent_spends_only_in_checkpoint_range`).
+3. **Handoff drain barrier (consensus-critical).** Before the first block above
+   `max_checkpoint_height` commits, the finalized committer flushes every in-flight block to
+   disk, drains the pending reconcile window (`flush_and_join` the worker), and refreshes the
+   pipeline's threaded value pool from the now-current disk pool — so the semantic verifier
+   never reads a stale/superset UTXO set or lagging value pool. The common handoff (the
+   checkpoint→non-finalized channel close) drains the same way.
+4. **Format check + clean shutdown.** The background `check_new_blocks` skips the new-blocks
+   validation while deferral is configured and the tip is in the deferred range (the
+   `BlockInfo`/value-pool lag there is expected, and the address index is off). The reconcile
+   worker is `flush_and_join`'d at the handoff and again via a `Drop` safety net, so a clean
+   stop finishes any queued reconcile before teardown.
 
-Until 1–5 are implemented and tested, this is a measurement prototype only.
+## Production-readiness gaps (remaining)
+
+1. **No crash recovery.** The reconciled (durable transparent) tip trails the committed tip.
+   A crash mid-window leaves `utxo_by_out_loc` a superset and `BlockInfo`/value pool lagging;
+   restart would need to re-derive the pending window. Not implemented — a node enabling this
+   must be treated as **disposable / re-snapshottable**.
+2. **No RPC guards.** Mid-window the UTXO set is a superset and the value pool lags, so
+   address/utxo/value RPCs would return wrong results in the deferred range. Not guarded.
+
+Until crash recovery + RPC guards are implemented, this remains a benchmarking feature for a
+disposable below-checkpoint node, not a general-purpose production mode.
+
+## Benchmarking on a real below-checkpoint node
+
+1. Snapshot a pruned + checkpoint-sync node whose tip is well below `max_checkpoint_height`
+   (mainnet ~3.36M) — the node must be **disposable** (re-snapshot per run; no crash
+   recovery).
+2. In `zebrad.toml` `[state]`: set `defer_transparent_reconcile = true` and
+   `defer_reconcile_interval = 2000` (pruned storage + checkpoint sync are required for the
+   address index to be off, which the gate needs).
+3. Set `debug_stop_at_height` to a height still below `max_checkpoint_height` so the run
+   stops inside the deferred range (the handoff barrier is exercised by code/tests, not by
+   the bench range).
+4. Avoid address/utxo/value RPCs against the node while it is in the deferred range.

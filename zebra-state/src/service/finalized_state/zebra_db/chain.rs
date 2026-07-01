@@ -418,7 +418,7 @@ impl DiskWriteBatch {
         // unchanged (it is threaded forward and corrected at the next checkpoint). The
         // benchmark probe (`bench_skip_transparent_reads`) skips it with no reconcile,
         // leaving the pool permanently stale (measurement only, never shipped).
-        if db.defers_transparent_spends() || super::bench_skip_transparent_reads() {
+        if db.defers_transparent_spends(finalized.height) || super::bench_skip_transparent_reads() {
             return Ok(value_pool);
         }
 

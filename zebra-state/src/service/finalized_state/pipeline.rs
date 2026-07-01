@@ -250,6 +250,17 @@ impl FinalizedPipeline {
         self.value_pool
     }
 
+    /// Refresh the threaded value pool from the durable database.
+    ///
+    /// In the deferred range the reconcile worker is the sole writer of the value
+    /// pool, so the pipeline's threaded copy stays at its seed (deferred blocks pass
+    /// it through unchanged). After the handoff drain barrier the worker has written
+    /// the current pool to disk; this adopts it so the inline (non-deferred) commits
+    /// above the last checkpoint start from the correct pool.
+    pub(crate) fn reseed_value_pool(&mut self, db: &ZebraDb) {
+        self.value_pool = db.finalized_value_pool();
+    }
+
     /// Whether a not-yet-flushed block has already written the set-once
     /// `vct_upgrade_height` marker, so the next block must not write it again.
     pub(crate) fn vct_upgrade_marker_set(&self) -> bool {

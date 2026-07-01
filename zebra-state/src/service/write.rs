@@ -195,6 +195,21 @@ impl ReconcileWorker {
     }
 }
 
+impl Drop for ReconcileWorker {
+    /// Clean-shutdown safety net: if the worker was not already drained at the
+    /// checkpoint handoff (the common path), close the job channel and join the
+    /// thread so a clean stop finishes any queued reconcile before the state service
+    /// is torn down. Idempotent — a no-op once `flush_and_join` has run. Join errors
+    /// are swallowed here to avoid panicking during unwinding; crash recovery from a
+    /// mid-window stop is out of scope (the node is treated as re-snapshottable).
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Process the disk-writer thread's flush acknowledgements: for each acked height,
 /// advance the finalized chain tip, retire the now-durable overlay entries, and run
 /// the configured stop-height check (which exits the process if matched).
@@ -245,7 +260,7 @@ fn drain_finalized_acks(
         // reads + value-pool recompute overlap continued assembly. v1 fallback (no
         // worker): reconcile inline. Fatal on error either way: a failed reconcile
         // would leave the value pool / UTXO set inconsistent.
-        if finalized_state.db.defers_transparent_spends() {
+        if finalized_state.db.defer_reconcile_configured() {
             let interval = finalized_state.db.config().defer_reconcile_interval;
             let is_boundary = if interval > 0 {
                 height.0 % (interval as u32) == 0
@@ -671,7 +686,7 @@ impl WriteBlockWorkerTask {
         // in the deferred range, so this stays exclusively owned with no races).
         let mut reconcile_worker: Option<ReconcileWorker> = None;
         if pipeline_active
-            && finalized_state.db.defers_transparent_spends()
+            && finalized_state.db.defer_reconcile_configured()
             && !finalized_state.db.config().defer_reconcile_inline
         {
             // Capacity 1: hand-off blocks the assembler only while the worker is
@@ -884,6 +899,40 @@ impl WriteBlockWorkerTask {
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
             let committed_height = ordered_block.0.height;
+
+            // Handoff drain barrier (consensus-critical). Deferral is only valid below
+            // the last checkpoint (guard 2); above it the semantic verifier validates
+            // each block's spends against the live UTXO set and value pool, so those
+            // must be current. Before the first above-checkpoint block commits, flush
+            // every in-flight block to disk (so the window's spent UTXOs are durable),
+            // drain the pending reconcile window, and refresh the pipeline's threaded
+            // value pool from the now-current disk pool for the inline commits that
+            // follow. The finalized committer normally only sees checkpoint-verified
+            // blocks, so this rarely fires here — the common handoff is the
+            // channel-close drain below — but it guards the boundary itself.
+            if reconcile_worker.is_some()
+                && committed_height > finalized_state.db.network().checkpoint_list().max_height()
+            {
+                if let (Some(pipeline), Some(ack_receiver)) =
+                    (pipeline_state.as_mut(), pipeline_ack_receiver.as_ref())
+                {
+                    drain_finalized_acks(
+                        finalized_state,
+                        pipeline,
+                        ack_receiver,
+                        &mut pipeline_in_flight,
+                        chain_tip_sender,
+                        reconcile_worker.as_mut(),
+                        true,
+                    );
+                    if let Some(mut worker) = reconcile_worker.take() {
+                        worker.send(pipeline.take_reconcile_prefix(committed_height));
+                        worker.flush_and_join();
+                    }
+                    pipeline.reseed_value_pool(&finalized_state.db);
+                }
+            }
+
             let next_block_took_vct_path = finalized_state.vct_fast_will_apply(committed_height);
 
             // Commit the block. When the run-ahead pipeline is active, assemble the
@@ -1106,12 +1155,12 @@ impl WriteBlockWorkerTask {
                 );
 
                 // Deferred reconcile: the trailing blocks committed past the last
-                // boundary form a partial window that nothing reconciled. Reconcile it
-                // now (through the durable tip) so the value pool and UTXO set are
-                // consistent before the handoff to the non-finalized state. (The
-                // production handoff drain barrier is a later stage; this keeps the
-                // prototype correct at the channel close.)
-                if finalized_state.db.defers_transparent_spends() {
+                // boundary form a partial window that nothing reconciled. This is the
+                // common checkpoint→non-finalized handoff: drain the window (through the
+                // durable tip) so the value pool and UTXO set are current before the
+                // semantic verifier reads them. (The in-loop barrier above guards the
+                // rarer case of an above-checkpoint block arriving on this channel.)
+                if finalized_state.db.defer_reconcile_configured() {
                     let tip_height = finalized_state.db.tip().map(|(height, _)| height);
                     if let Some(tip_height) = tip_height {
                         if let Some(worker) = reconcile_worker.as_mut() {

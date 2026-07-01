@@ -251,19 +251,27 @@ impl ZebraDb {
     }
 
     /// Whether the per-block committer defers transparent spend resolution (the
-    /// `utxo_by_out_loc` deletes and the transparent value-pool debit) off the
-    /// commit critical path, to a batched reconcile at each checkpoint boundary.
+    /// `utxo_by_out_loc` deletes and the transparent value-pool debit) off the commit
+    /// critical path, to a batched reconcile on the worker thread, for the block at
+    /// `height`.
     ///
-    /// The auxiliary address index must be off ([`Config::skip_address_index`]),
-    /// because the deferred path skips the per-block spent-UTXO reads that the
+    /// Only defers in the checkpoint-trusted range (`height <= max_checkpoint_height`):
+    /// above the last checkpoint the semantic verifier validates spends against the
+    /// live UTXO set and value pool, so those must stay current (non-deferred). The
+    /// auxiliary address index must also be off ([`Config::skip_address_index`]),
+    /// because the deferred path skips the per-block spent-UTXO reads the
     /// address-balance update depends on.
-    ///
-    /// v1 (prototype) omits the `height <= max_checkpoint_height` check: the
-    /// benchmark runs entirely inside the checkpoint range, and the handoff drain
-    /// barrier (so no semantic-verified block reads a mid-reconcile value pool or
-    /// UTXO set) is a later production stage.
-    pub(crate) fn defers_transparent_spends(&self) -> bool {
-        self.config().defer_transparent_reconcile && self.config().skip_address_index()
+    pub(crate) fn defers_transparent_spends(&self, height: Height) -> bool {
+        self.config()
+            .defers_transparent_spends_at(&self.network(), height)
+    }
+
+    /// Whether the deferred-transparent reconcile is configured for this node (the
+    /// height-independent lifecycle predicate: worker spawn, drain triggers, the
+    /// handoff barrier). The per-block decision is the height-bound
+    /// [`defers_transparent_spends`](Self::defers_transparent_spends).
+    pub(crate) fn defer_reconcile_configured(&self) -> bool {
+        self.config().defer_reconcile_configured()
     }
 
     /// Returns the configured database kind for this database.

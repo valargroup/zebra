@@ -1135,7 +1135,7 @@ impl ZebraDb {
         // measures the throughput ceiling of deferring that work off the commit critical
         // path. It produces an INCORRECT value pool and UTXO set, so it is never a shipped
         // path — only a measurement of the upper bound.
-        let defer_spends = self.defers_transparent_spends();
+        let defer_spends = self.defers_transparent_spends(finalized.height);
         // Deferral records into the run-ahead pipeline's reconcile window, so it is
         // only correct when an overlay is present. Without one there is nowhere to
         // record the spends and the checkpoint reconcile would never run, silently
