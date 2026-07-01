@@ -259,7 +259,7 @@ impl NoteCommitmentTrees {
         let ironwood_nct = Arc::make_mut(&mut ironwood);
 
         // It is impossible for blocks to contain more than one level 16 Ironwood root:
-        // > [NU5 onward] nSpendsSapling, nOutputsSapling, and nActionsOrchard MUST all be less than 2^16.
+        // > [NU6.3 onward] nActionsIronwood MUST be less than 2^16.
         // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
         //
         // The note commitments are appended as a single parallel batch, which
