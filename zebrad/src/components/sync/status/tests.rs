@@ -174,3 +174,31 @@ fn high_sync_lengths() {
 
     assert!(!status.is_close_to_tip());
 }
+
+/// Regtest is always close to tip because it has no remote network tip.
+#[test]
+fn regtest_is_close_to_tip_without_sync_lengths() {
+    let regtest = zebra_chain::parameters::Network::new_regtest(Default::default());
+    let (status, _recent_sync_lengths) = SyncStatus::new_for_network(&regtest);
+
+    assert!(status.is_close_to_tip());
+}
+
+/// A custom PoW-disabled testnet still uses sync progress for close-to-tip status.
+#[test]
+fn disable_pow_testnet_is_not_close_to_tip_without_sync_lengths() {
+    use zebra_chain::parameters::{testnet::Parameters, Network};
+
+    let custom = Parameters::build()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters with disabled PoW are valid");
+
+    assert!(matches!(custom, Network::Testnet(_)));
+    assert!(!custom.is_regtest());
+    assert!(custom.disable_pow());
+
+    let (status, _recent_sync_lengths) = SyncStatus::new_for_network(&custom);
+
+    assert!(!status.is_close_to_tip());
+}

@@ -815,10 +815,12 @@ where
 /// `last_seen_tip_hash` from the mempool response doesn't match the tip hash from the state.
 ///
 /// You should call `check_synced_to_tip()` before calling this function.
-/// If the mempool is inactive because Zebra is not synced to the tip, returns no transactions.
+/// If `allow_inactive_mempool` is true and the mempool is inactive because Zebra is not synced to
+/// the tip, returns no transactions.
 pub async fn fetch_mempool_transactions<Mempool>(
     mempool: Mempool,
     chain_tip_hash: block::Hash,
+    allow_inactive_mempool: bool,
 ) -> RpcResult<Option<(Vec<VerifiedUnminedTx>, TransactionDependencies)>>
 where
     Mempool: Service<
@@ -828,10 +830,18 @@ where
         > + 'static,
     Mempool::Future: Send,
 {
-    let response = mempool
-        .oneshot(mempool::Request::FullTransactions)
-        .await
-        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+    let response = match mempool.oneshot(mempool::Request::FullTransactions).await {
+        Ok(response) => response,
+        Err(error)
+            if allow_inactive_mempool
+                && error
+                    .downcast_ref::<mempool::MempoolDisabledError>()
+                    .is_some() =>
+        {
+            return Ok(Some((Vec::new(), TransactionDependencies::default())));
+        }
+        Err(error) => return Err(ErrorObject::owned(0, error.to_string(), None::<()>)),
+    };
 
     // TODO: Order transactions in block templates based on their dependencies
 

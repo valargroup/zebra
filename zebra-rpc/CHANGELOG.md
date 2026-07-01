@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `getblocktemplate` routes post-NU6.3 Orchard-only unified miner addresses to
   Ironwood when the unstable NU6.3 code is compiled in.
+- `getblocktemplate` builds empty templates on PoW-disabled networks when the
+  mempool is inactive.
 - `GetBlockTemplateHandler::miner_params()` now returns the stored
   configuration error when miner parameters are invalid.
 - `getblocktemplate` returns coinbase construction errors instead of panicking
