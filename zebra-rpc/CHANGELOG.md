@@ -7,25 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed `GetBlockTrees::new()` and `GetTreestateResponse::new()` to take
+  Ironwood tree data.
+
 ### Added
 
-- Added Ironwood RPC output for `getrawtransaction`, `z_gettreestate`, and
-  `z_getsubtreesbyindex`.
+- Added Ironwood RPC output for `getblock`, `getrawtransaction`,
+  `z_gettreestate`, and `z_getsubtreesbyindex`.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 
 ### Changed
 
-- Verbose transaction output omits the `ironwood` bundle unless the transaction
-  contains Ironwood shielded data.
 - `getblocktemplate` routes post-NU6.3 Orchard receivers in unified miner
-  addresses to Ironwood.
+  addresses to Ironwood when the unstable NU6.3 code is compiled in.
 - `getblocktemplate` builds empty templates on PoW-disabled networks when the
   mempool is inactive.
-- `GetBlockTemplateHandler::miner_params()` now returns the stored
-  configuration error when miner parameters are invalid.
-- `getblocktemplate` returns coinbase construction errors instead of panicking
-  when building a template fails.
+- Verbose transaction output omits the `ironwood` bundle unless the transaction
+  contains Ironwood shielded data.
 
 ## [9.0.0] - 2026-06-02
 
@@ -235,7 +236,7 @@ process and third-party integration improvements.
 ### Breaking Changes
 
 - Removed the `GetAddressBalanceRequest::valid_address_strings` method.
-- Changed `GetTreestateResponse::new()` to take `sprout` and `ironwood` as optional treestate parameters.
+- Changed `GetTreestateResponse::new()` to take six parameters instead of five.
 - Changed `Commitments::new()` to take the new `final_root` parameter.
 - Changed `TransactionObject::new()` to take 26 parameters instead of 25.
 - Changed `Orchard::new()` to take seven parameters instead of three.

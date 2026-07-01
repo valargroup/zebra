@@ -62,8 +62,9 @@ impl Default for GetSubtreesByIndexResponse {
 ///
 /// The dense format might be used in future RPCs.
 ///
-/// The serialized response omits `ironwood` unless Ironwood tree state is
-/// available for the requested block.
+/// When Ironwood tree state is not available for the requested block, the
+/// `ironwood` field contains empty commitments, matching the Sapling and
+/// Orchard fields before their activation heights.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetTreestateResponse {
     /// The block hash corresponding to the treestate, hex-encoded.
@@ -84,7 +85,7 @@ pub struct GetTreestateResponse {
     /// A treestate containing a Sprout note commitment tree, hex-encoded. Zebra
     /// does not support returning it; but the field is here to enable parsing
     /// responses from other implementations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     sprout: Option<Treestate>,
 
     /// A treestate containing a Sapling note commitment tree, hex-encoded.
@@ -94,17 +95,12 @@ pub struct GetTreestateResponse {
     orchard: Treestate,
 
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
-    /// Omitted from the response unless Ironwood tree state is available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ironwood: Option<Treestate>,
+    /// Contains empty commitments unless Ironwood tree state is available.
+    #[serde(default)]
+    ironwood: Treestate,
 }
 
 impl GetTreestateResponse {
-    /// Returns the Ironwood treestate if it was present in the RPC response.
-    pub fn optional_ironwood(&self) -> Option<&Treestate> {
-        self.ironwood.as_ref()
-    }
-
     /// Constructs [`Treestate`] from its constituent parts.
     #[deprecated(note = "Use `new` instead.")]
     pub fn from_parts(
@@ -135,7 +131,7 @@ impl GetTreestateResponse {
             orchard,
             // This deprecated compatibility helper only accepts Sapling and
             // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
-            ironwood: None,
+            ironwood: Default::default(),
         }
     }
 

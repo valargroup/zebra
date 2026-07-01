@@ -22,14 +22,13 @@ use DbFormatChange::*;
 
 use crate::service::finalized_state::ZebraDb;
 
-pub(crate) mod add_ironwood_activation_tree;
+pub(crate) mod add_ironwood_tree;
 pub(crate) mod add_subtrees;
 pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
-pub(crate) mod rebuild_history_tree;
 pub(crate) mod tree_keys_and_caches_upgrade;
 
 #[cfg(not(feature = "indexer"))]
@@ -112,7 +111,7 @@ fn format_upgrades(
             "add Zakura header body size hints",
             Version::new(27, 2, 0),
         )),
-        Box::new(add_ironwood_activation_tree::Upgrade),
+        Box::new(add_ironwood_tree::Upgrade),
     ] as [Box<dyn DiskFormatUpgrade>; 8])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())

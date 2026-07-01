@@ -33,7 +33,7 @@
 
 use std::{
     cmp,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt,
     ops::RangeInclusive,
     sync::Arc,
@@ -73,7 +73,7 @@ use zebra_chain::{
         ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
-    subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
+    subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
     value_balance::ValueBalance,
@@ -83,8 +83,7 @@ use zebra_chain::{
     },
 };
 use zebra_consensus::{
-    error::TransactionError, funding_stream_address, router::service_trait::BlockVerifierService,
-    RouterError,
+    funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
 };
 use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
@@ -368,8 +367,8 @@ pub trait Rpc {
     /// `lightwalletd` only uses positive heights, so Zebra does not support
     /// negative heights.
     ///
-    /// The `ironwood` field is serialized only when Ironwood tree state is
-    /// available for the requested block.
+    /// The `ironwood` field contains empty commitments unless Ironwood tree
+    /// state is available for the requested block.
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
 
@@ -949,27 +948,6 @@ where
     pub fn network(&self) -> &Network {
         &self.network
     }
-}
-
-fn subtrees_by_index_response<Root>(
-    pool: String,
-    start_index: NoteCommitmentSubtreeIndex,
-    subtrees: BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Root>>,
-    encode_root: impl Fn(&Root) -> String,
-) -> Result<GetSubtreesByIndexResponse> {
-    let subtrees = subtrees
-        .values()
-        .map(|subtree| SubtreeRpcData {
-            root: encode_root(&subtree.root),
-            end_height: subtree.end_height,
-        })
-        .collect();
-
-    Ok(GetSubtreesByIndexResponse {
-        pool,
-        start_index,
-        subtrees,
-    })
 }
 
 #[async_trait]
@@ -2049,8 +2027,10 @@ where
         } else {
             None
         };
-        let ironwood = ironwood
-            .map(|(tree, root)| Treestate::new(trees::Commitments::new(Some(root), Some(tree))));
+
+        let ironwood = ironwood.map_or_else(Treestate::default, |(tree, root)| {
+            Treestate::new(trees::Commitments::new(Some(root), Some(tree)))
+        });
 
         Ok(GetTreestateResponse::new(
             hash,
@@ -2088,8 +2068,18 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            subtrees_by_index_response(pool, start_index, subtrees, |root| {
-                root.to_bytes().encode_hex()
+            let subtrees = subtrees
+                .values()
+                .map(|subtree| SubtreeRpcData {
+                    root: subtree.root.to_bytes().encode_hex(),
+                    end_height: subtree.end_height,
+                })
+                .collect();
+
+            Ok(GetSubtreesByIndexResponse {
+                pool,
+                start_index,
+                subtrees,
             })
         } else if pool == "orchard" {
             let request = zebra_state::ReadRequest::OrchardSubtrees { start_index, limit };
@@ -2104,7 +2094,19 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            subtrees_by_index_response(pool, start_index, subtrees, |root| root.encode_hex())
+            let subtrees = subtrees
+                .values()
+                .map(|subtree| SubtreeRpcData {
+                    root: subtree.root.encode_hex(),
+                    end_height: subtree.end_height,
+                })
+                .collect();
+
+            Ok(GetSubtreesByIndexResponse {
+                pool,
+                start_index,
+                subtrees,
+            })
         } else if pool == "ironwood" {
             let request = zebra_state::ReadRequest::IronwoodSubtrees { start_index, limit };
             let response = read_state
@@ -2118,7 +2120,19 @@ where
                 _ => unreachable!("unmatched response to a subtrees request"),
             };
 
-            subtrees_by_index_response(pool, start_index, subtrees, |root| root.encode_hex())
+            let subtrees = subtrees
+                .values()
+                .map(|subtree| SubtreeRpcData {
+                    root: subtree.root.encode_hex(),
+                    end_height: subtree.end_height,
+                })
+                .collect();
+
+            Ok(GetSubtreesByIndexResponse {
+                pool,
+                start_index,
+                subtrees,
+            })
         } else {
             Err(ErrorObject::owned(
                 server::error::LegacyCode::Misc.into(),
@@ -2338,26 +2352,15 @@ where
 
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
-        let miner_params = self.gbt.miner_params().map_err(|error| {
-            let message = if matches!(
-                error,
-                types::get_block_template::MinerParamsError::MissingAddr
-            ) {
-                "miner parameters are required for get_block_template".to_string()
-            } else {
-                error.to_string()
-            };
-
-            ErrorObject::owned(0, message, None::<()>)
-        })?;
-        let gbt_transaction_error =
-            |error: TransactionError| ErrorObject::owned(0, error.to_string(), None::<()>);
+        let miner_params = self
+            .gbt
+            .miner_params()
+            .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
         // - Checks and fetches that can change during long polling
         //
         // Set up the loop.
         let mut max_time_reached = false;
-        let mut precomputed_coinbase = None;
 
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
@@ -2401,7 +2404,7 @@ where
             // Optional TODO:
             // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
             let Some((mempool_txs, mempool_tx_deps)) =
-                fetch_mempool_transactions(mempool.clone(), tip_hash, self.network.disable_pow())
+                fetch_mempool_transactions(mempool.clone(), tip_hash)
                     .await?
                     // If the mempool and state responses are out of sync:
                     // - if we are not long polling, omit mempool transactions from the template,
@@ -2463,11 +2466,7 @@ where
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
             // `+2`: we expect the tip to advance by one block before waking us up.
             let precomputed_height = Height(chain_info.tip_height.0 + 2);
-
-            if precomputed_coinbase
-                .as_ref()
-                .is_none_or(|(height, _)| *height != precomputed_height)
-            {
+            let wait_for_new_tip = async {
                 // Precompute the coinbase tx for an empty block that will sit on the new tip. We
                 // will return this provisional block upon a chain tip change so that miners can
                 // mine on the newest tip, and don't waste their effort on a shorter chain while we
@@ -2475,21 +2474,25 @@ where
                 // before we start waiting for a new tip since computing the coinbase tx takes a few
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
-                let network = self.network.clone();
-                let miner_params = miner_params.clone();
-
-                precomputed_coinbase = Some((
-                    precomputed_height,
+                let precompute_coinbase = |network, height, params| {
                     tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(
-                            &network,
-                            precomputed_height,
-                            &miner_params,
-                            Amount::zero(),
-                        )
-                    }),
-                ));
-            }
+                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
+                            .expect("valid coinbase tx")
+                    })
+                };
+
+                let precomputed_coinbase = precompute_coinbase(
+                    self.network.clone(),
+                    precomputed_height,
+                    miner_params.clone(),
+                )
+                .await
+                .expect("valid coinbase tx");
+
+                let _ = wait_for_new_tip.await;
+
+                precomputed_coinbase
+            };
 
             // Wait for the maximum block time to elapse. This can change the block header
             // on testnet. (On mainnet it can happen due to a network disconnection, or a
@@ -2533,17 +2536,7 @@ where
                     );
                 }
 
-                _ = wait_for_new_tip => {
-                    let (precomputed_height, precomputed_coinbase) = precomputed_coinbase
-                        .take()
-                        .expect("coinbase precomputation starts before waiting for a new tip");
-
-                    // Await before fetching chain info, so any extra tip change during slow
-                    // coinbase construction is reflected in the response below.
-                    let precomputed_coinbase = precomputed_coinbase
-                        .await
-                        .expect("coinbase precomputation task should not panic");
-
+                precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
                     let server_long_poll_id = LongPollInput::new(
@@ -2563,9 +2556,7 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase)
-                        .transpose()
-                        .map_err(gbt_transaction_error)?;
+                        .then_some(precomputed_coinbase);
 
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
@@ -2579,7 +2570,6 @@ where
                         vec![],
                         submit_old,
                     )
-                    .map_err(gbt_transaction_error)?
                     .into())
                 }
 
@@ -2644,7 +2634,6 @@ where
             mempool_txs,
             submit_old,
         )
-        .map_err(gbt_transaction_error)?
         .into())
     }
 
@@ -4548,20 +4537,11 @@ impl Default for GetBlockTrees {
 
 impl GetBlockTrees {
     /// Constructs a new instance of ['GetBlockTrees'].
-    pub fn new(sapling: u64, orchard: u64) -> Self {
+    pub fn new(sapling: u64, orchard: u64, ironwood: Option<u64>) -> Self {
         GetBlockTrees {
             sapling: SaplingTrees { size: sapling },
             orchard: OrchardTrees { size: orchard },
-            ironwood: None,
-        }
-    }
-
-    /// Constructs a new instance of ['GetBlockTrees'] with Ironwood data.
-    pub fn new_with_ironwood(sapling: u64, orchard: u64, ironwood: u64) -> Self {
-        GetBlockTrees {
-            sapling: SaplingTrees { size: sapling },
-            orchard: OrchardTrees { size: orchard },
-            ironwood: Some(IronwoodTrees { size: ironwood }),
+            ironwood: ironwood.map(|size| IronwoodTrees { size }),
         }
     }
 
