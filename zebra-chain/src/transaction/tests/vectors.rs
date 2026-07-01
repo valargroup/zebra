@@ -1604,9 +1604,9 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
         },
         sapling::{
             self,
-            keys::EphemeralPublicKey,
+            keys::EphemeralPublicKeyBytes,
             shielded_data::{ShieldedData, TransferData},
-            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+            EncryptedNote, Output, ValueCommitmentBytes, WrappedNoteKey,
         },
         serialization::{ZcashDeserializeInto, ZcashSerialize},
         transaction::{LockTime, Transaction},
@@ -1652,9 +1652,9 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
     // return whether `to_librustzcash` accepts it.
     let build_and_convert = |cv_bytes: [u8; 32], epk_bytes: [u8; 32]| -> bool {
         let output = Output {
-            cv: ValueCommitment(cv_bytes),
+            cv: ValueCommitmentBytes(cv_bytes),
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
-            ephemeral_key: EphemeralPublicKey(epk_bytes),
+            ephemeral_key: EphemeralPublicKeyBytes(epk_bytes),
             enc_ciphertext: EncryptedNote([0u8; 580]),
             out_ciphertext: WrappedNoteKey([0u8; 80]),
             zkproof: Groth16Proof([0u8; 192]),
@@ -1735,9 +1735,9 @@ fn sapling_lazy_cv_epk_edge_cases() {
         },
         sapling::{
             self,
-            keys::{EphemeralPublicKey, ValidatingKey},
+            keys::{EphemeralPublicKeyBytes, ValidatingKey},
             shielded_data::{ShieldedData, TransferData},
-            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+            EncryptedNote, Output, ValueCommitment, ValueCommitmentBytes, WrappedNoteKey,
         },
         serialization::{ZcashDeserializeInto, ZcashSerialize},
         transaction::{LockTime, Transaction},
@@ -1756,9 +1756,9 @@ fn sapling_lazy_cv_epk_edge_cases() {
 
     let make_v5 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
         let output = Output {
-            cv: ValueCommitment(cv),
+            cv: ValueCommitmentBytes(cv),
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
-            ephemeral_key: EphemeralPublicKey(epk),
+            ephemeral_key: EphemeralPublicKeyBytes(epk),
             enc_ciphertext: EncryptedNote([0u8; 580]),
             out_ciphertext: WrappedNoteKey([0u8; 80]),
             zkproof: Groth16Proof([0u8; 192]),
@@ -1826,9 +1826,9 @@ fn sapling_lazy_cv_epk_edge_cases() {
 
     // `commitment()` decompresses a valid encoding to the same point.
     assert_eq!(
-        ValueCommitment(valid_cv)
-            .commitment()
+        ValueCommitment::try_from(ValueCommitmentBytes(valid_cv))
             .expect("the generator is a valid value commitment")
+            .commitment()
             .to_bytes(),
         valid_cv,
         "commitment() must round-trip a valid value commitment",
@@ -1865,9 +1865,9 @@ fn sapling_point_encodings_check_rejects_bad_points() {
         },
         sapling::{
             self,
-            keys::EphemeralPublicKey,
+            keys::EphemeralPublicKeyBytes,
             shielded_data::{ShieldedData, TransferData},
-            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+            EncryptedNote, Output, ValueCommitmentBytes, WrappedNoteKey,
         },
         transaction::{LockTime, Transaction},
     };
@@ -1880,9 +1880,9 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 
     let make_shielded_data = |cv: [u8; 32], epk: [u8; 32]| {
         let output = Output {
-            cv: ValueCommitment(cv),
+            cv: ValueCommitmentBytes(cv),
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
-            ephemeral_key: EphemeralPublicKey(epk),
+            ephemeral_key: EphemeralPublicKeyBytes(epk),
             enc_ciphertext: EncryptedNote([0u8; 580]),
             out_ciphertext: WrappedNoteKey([0u8; 80]),
             zkproof: Groth16Proof([0u8; 192]),
@@ -1964,8 +1964,8 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
 /// same encodings as the librustzcash functions they mirror.
 ///
-/// If `ValueCommitment::is_valid_not_small_order` or
-/// `EphemeralPublicKey::is_valid_not_small_order` ever diverged from librustzcash,
+/// If `ValueCommitmentBytes::is_valid_not_small_order` or
+/// `EphemeralPublicKeyBytes::is_valid_not_small_order` ever diverged from librustzcash,
 /// Zebra would accept or reject transactions the rest of the network doesn't — a
 /// chain split. This pins each Zebra predicate against the library predicate over
 /// a corpus covering both verdicts:
@@ -1979,7 +1979,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 fn sapling_point_checks_match_librustzcash_predicates() {
     use group::{Group, GroupEncoding};
 
-    use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
+    use crate::sapling::{keys::EphemeralPublicKeyBytes, ValueCommitmentBytes};
 
     let _init_guard = zebra_test::init();
 
@@ -2035,15 +2035,15 @@ fn sapling_point_checks_match_librustzcash_predicates() {
 
     for bytes in inputs {
         assert_eq!(
-            ValueCommitment(bytes).is_valid_not_small_order(),
+            ValueCommitmentBytes(bytes).is_valid_not_small_order(),
             librustzcash_cv_valid(bytes),
-            "ValueCommitment::is_valid_not_small_order must match librustzcash \
+            "ValueCommitmentBytes::is_valid_not_small_order must match librustzcash \
              read_value_commitment for {bytes:02x?}",
         );
         assert_eq!(
-            EphemeralPublicKey(bytes).is_valid_not_small_order(),
+            EphemeralPublicKeyBytes(bytes).is_valid_not_small_order(),
             librustzcash_epk_valid(bytes),
-            "EphemeralPublicKey::is_valid_not_small_order must match librustzcash \
+            "EphemeralPublicKeyBytes::is_valid_not_small_order must match librustzcash \
              check_output for {bytes:02x?}",
         );
     }

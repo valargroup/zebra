@@ -85,7 +85,7 @@ impl Arbitrary for Output {
                 cv: ExtendedPoint::generator().into(),
                 cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32])
                     .unwrap(),
-                ephemeral_key: keys::EphemeralPublicKey(
+                ephemeral_key: keys::EphemeralPublicKeyBytes(
                     jubjub::AffinePoint::from(ExtendedPoint::generator()).to_bytes(),
                 ),
                 enc_ciphertext,

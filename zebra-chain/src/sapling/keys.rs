@@ -236,19 +236,18 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
     }
 }
 
-/// An [ephemeral public key][1] (`epk`) for Sapling key agreement, stored as its
-/// 32-byte encoding.
+/// A raw [ephemeral public key][1] (`epk`) encoding for Sapling key agreement.
 ///
-/// The key is a Jubjub point, but nodes only need its bytes for the txid digest
-/// and serialization. The point itself is only used for wallet trial decryption,
-/// so Zebra keeps the raw bytes and skips decompression during deserialization.
+/// This type stores the 32 bytes from the transaction without proving they are a
+/// canonical, non-small-order Jubjub point. Nodes only need these bytes for the
+/// txid digest and serialization, so Zebra skips decompression during
+/// deserialization.
 ///
 /// # Consensus
 ///
 /// Deserialization only checks the byte length; the semantic verifier and
 /// mempool must check that it is a canonical, non-small-order point. They do so
-/// by calling
-/// [`EphemeralPublicKey::is_valid_not_small_order`] (via
+/// by converting it to [`EphemeralPublicKey`] (via
 /// [`Transaction::sapling_point_encodings_are_valid`]). They also verify the
 /// Sapling bundle through librustzcash, whose `check_output` rejects a
 /// small-order `epk`.
@@ -259,15 +258,89 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
 /// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EphemeralPublicKeyBytes(pub(crate) [u8; 32]);
+
+impl EphemeralPublicKeyBytes {
+    /// Returns true if this raw encoding can be converted into a consensus-valid
+    /// Sapling ephemeral public key.
+    pub fn is_valid_not_small_order(&self) -> bool {
+        EphemeralPublicKey::try_from(*self).is_ok()
+    }
+}
+
+impl fmt::Debug for EphemeralPublicKeyBytes {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("EphemeralPublicKeyBytes")
+            .field("epk", &hex::encode(self.0))
+            .finish()
+    }
+}
+
+impl From<EphemeralPublicKeyBytes> for [u8; 32] {
+    fn from(nk: EphemeralPublicKeyBytes) -> [u8; 32] {
+        nk.0
+    }
+}
+
+impl From<&EphemeralPublicKeyBytes> for [u8; 32] {
+    fn from(nk: &EphemeralPublicKeyBytes) -> [u8; 32] {
+        nk.0
+    }
+}
+
+impl PartialEq<[u8; 32]> for EphemeralPublicKeyBytes {
+    fn eq(&self, other: &[u8; 32]) -> bool {
+        &self.0 == other
+    }
+}
+
+impl TryFrom<[u8; 32]> for EphemeralPublicKeyBytes {
+    type Error = &'static str;
+
+    /// Store raw `epk` bytes, deferring point decompression and the
+    /// not-small-order check (see the type docs).
+    ///
+    /// This constructor is fallible only to match older call sites and trait
+    /// bounds; any 32-byte array is stored successfully.
+    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
+        Ok(Self(bytes))
+    }
+}
+
+impl ZcashSerialize for EphemeralPublicKeyBytes {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_all(&<[u8; 32]>::from(self)[..])?;
+        Ok(())
+    }
+}
+
+impl ZcashDeserialize for EphemeralPublicKeyBytes {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        Self::try_from(reader.read_32_bytes()?).map_err(SerializationError::Parse)
+    }
+}
+
+/// A validated [ephemeral public key][1] (`epk`) for Sapling key agreement.
+///
+/// Values of this type are canonical, non-small-order Jubjub points, so they
+/// satisfy the Sapling output consensus rule.
+///
+/// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+#[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
 impl EphemeralPublicKey {
-    /// Returns true if the stored encoding is a canonical, non-small-order
-    /// Jubjub point, i.e. a valid ephemeral public key per the consensus rules.
-    ///
-    /// This is the not-small-order check deferred from deserialization, run by
-    /// the semantic verifier (not the checkpoint verifier) on untrusted
-    /// transactions.
+    /// Returns the canonical serialized bytes for this public key.
+    pub fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl TryFrom<EphemeralPublicKeyBytes> for EphemeralPublicKey {
+    type Error = &'static str;
+
+    /// Validate a raw `epk` encoding as a canonical, non-small-order Jubjub
+    /// point, i.e. a valid ephemeral public key per the consensus rules.
     ///
     /// To stay in consensus with the rest of the network, this must accept
     /// exactly the `epk` encodings librustzcash accepts. librustzcash decodes as
@@ -276,11 +349,20 @@ impl EphemeralPublicKey {
     /// off-curve/non-canonical encodings and agree on `is_small_order`.
     /// Equivalence is pinned by
     /// `sapling_point_checks_match_librustzcash_predicates`.
-    pub fn is_valid_not_small_order(&self) -> bool {
-        match jubjub::AffinePoint::from_bytes(self.0).into_option() {
-            Some(point) => !bool::from(point.is_small_order()),
-            None => false,
+    fn try_from(raw: EphemeralPublicKeyBytes) -> Result<Self, Self::Error> {
+        match jubjub::AffinePoint::from_bytes(raw.0).into_option() {
+            Some(point) if !bool::from(point.is_small_order()) => Ok(Self(raw.0)),
+            Some(_) => Err("ephemeral public key is small order"),
+            None => Err("ephemeral public key is not a canonical Jubjub point"),
         }
+    }
+}
+
+impl TryFrom<[u8; 32]> for EphemeralPublicKey {
+    type Error = &'static str;
+
+    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
+        EphemeralPublicKeyBytes::try_from(bytes).and_then(Self::try_from)
     }
 }
 
@@ -307,19 +389,6 @@ impl From<&EphemeralPublicKey> for [u8; 32] {
 impl PartialEq<[u8; 32]> for EphemeralPublicKey {
     fn eq(&self, other: &[u8; 32]) -> bool {
         &self.0 == other
-    }
-}
-
-impl TryFrom<[u8; 32]> for EphemeralPublicKey {
-    type Error = &'static str;
-
-    /// Store an `EphemeralPublicKey` from a byte array, deferring point
-    /// decompression and the not-small-order check (see the type docs).
-    ///
-    /// This constructor is fallible only to match older call sites and trait
-    /// bounds; any 32-byte array is stored successfully.
-    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
-        Ok(Self(bytes))
     }
 }
 

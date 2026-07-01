@@ -26,13 +26,13 @@ use super::{commitment, keys, note};
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#outputencoding
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Getters)]
 pub struct Output {
-    /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    /// A raw value commitment encoding for the value of the input note.
+    pub cv: commitment::ValueCommitmentBytes,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(with = "serde_helpers::SaplingExtractedNoteCommitment")]
     pub cm_u: sapling_crypto::note::ExtractedNoteCommitment,
-    /// An encoding of an ephemeral Jubjub public key.
-    pub ephemeral_key: keys::EphemeralPublicKey,
+    /// A raw encoding of an ephemeral Jubjub public key.
+    pub ephemeral_key: keys::EphemeralPublicKeyBytes,
     /// A ciphertext component for the encrypted output note.
     pub enc_ciphertext: note::EncryptedNote,
     /// A ciphertext component for the encrypted output note.
@@ -57,13 +57,13 @@ pub struct OutputInTransactionV4(pub Output);
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#outputencoding
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputPrefixInTransactionV5 {
-    /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    /// A raw value commitment encoding for the value of the input note.
+    pub cv: commitment::ValueCommitmentBytes,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(with = "serde_helpers::SaplingExtractedNoteCommitment")]
     pub cm_u: sapling_crypto::note::ExtractedNoteCommitment,
-    /// An encoding of an ephemeral Jubjub public key.
-    pub ephemeral_key: keys::EphemeralPublicKey,
+    /// A raw encoding of an ephemeral Jubjub public key.
+    pub ephemeral_key: keys::EphemeralPublicKeyBytes,
     /// A ciphertext component for the encrypted output note.
     pub enc_ciphertext: note::EncryptedNote,
     /// A ciphertext component for the encrypted output note.
@@ -152,8 +152,8 @@ impl ZcashDeserialize for OutputInTransactionV4 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
-            // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            // [`commitment::ValueCommitmentBytes::zcash_deserialize`].
+            cv: commitment::ValueCommitmentBytes::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
@@ -161,8 +161,8 @@ impl ZcashDeserialize for OutputInTransactionV4 {
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
             // Stores the bytes without validating the point; see
-            // [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
+            // [`keys::EphemeralPublicKeyBytes::zcash_deserialize`].
+            ephemeral_key: keys::EphemeralPublicKeyBytes::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
@@ -218,8 +218,8 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
-            // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            // [`commitment::ValueCommitmentBytes::zcash_deserialize`].
+            cv: commitment::ValueCommitmentBytes::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
@@ -227,8 +227,8 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
             // Stores the bytes without validating the point; see
-            // [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
+            // [`keys::EphemeralPublicKeyBytes::zcash_deserialize`].
+            ephemeral_key: keys::EphemeralPublicKeyBytes::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus

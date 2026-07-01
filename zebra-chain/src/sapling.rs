@@ -5,10 +5,10 @@
 //!
 //! **Consensus rule**:
 //!
-//! These data structures ensure that [ZIP-216](https://zips.z.cash/zip-0216),
-//! canonical Jubjub point encodings, are enforced everywhere where Jubjub
-//! points occur, and non-canonical point encodings are rejected. This is
-//! enforced by the jubjub crate, which is also used by the redjubjub crate.
+//! Validated Sapling point types enforce
+//! [ZIP-216](https://zips.z.cash/zip-0216) canonical Jubjub point encodings.
+//! Some transaction fields store raw bytes and defer point validation to the
+//! semantic verifier so checkpoint sync can avoid unnecessary decompression.
 
 mod commitment;
 mod note;
@@ -24,7 +24,7 @@ pub mod shielded_data;
 pub mod spend;
 pub mod tree;
 
-pub use commitment::{CommitmentRandomness, ValueCommitment};
+pub use commitment::{CommitmentRandomness, ValueCommitment, ValueCommitmentBytes};
 pub use keys::Diversifier;
 pub use note::{EncryptedNote, Note, Nullifier, WrappedNoteKey};
 pub use output::{Output, OutputInTransactionV4, OutputPrefixInTransactionV5};

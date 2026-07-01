@@ -22,8 +22,8 @@ use crate::{
         Groth16Proof,
     },
     sapling::{
-        output::OutputPrefixInTransactionV5, spend::SpendPrefixInTransactionV5, tree, Nullifier,
-        Output, Spend,
+        commitment::ValueCommitment, keys::EphemeralPublicKey, output::OutputPrefixInTransactionV5,
+        spend::SpendPrefixInTransactionV5, tree, Nullifier, Output, Spend,
     },
     serialization::{AtLeastOne, TrustedPreallocate},
 };
@@ -244,10 +244,10 @@ where
     /// validated separately at deserialization.
     pub fn point_encodings_are_valid(&self) -> bool {
         self.spends()
-            .all(|spend| spend.cv.is_valid_not_small_order())
+            .all(|spend| ValueCommitment::try_from(spend.cv).is_ok())
             && self.outputs().all(|output| {
-                output.cv.is_valid_not_small_order()
-                    && output.ephemeral_key.is_valid_not_small_order()
+                ValueCommitment::try_from(output.cv).is_ok()
+                    && EphemeralPublicKey::try_from(output.ephemeral_key).is_ok()
             })
     }
 
@@ -303,13 +303,21 @@ where
     pub fn binding_verification_key(&self) -> Option<redjubjub::VerificationKeyBytes<Binding>> {
         let cv_old: sapling_crypto::value::CommitmentSum = self
             .spends()
-            .map(|spend| spend.cv.commitment())
+            .map(|spend| {
+                ValueCommitment::try_from(spend.cv)
+                    .ok()
+                    .map(|cv| cv.commitment())
+            })
             .collect::<Option<Vec<_>>>()?
             .into_iter()
             .sum();
         let cv_new: sapling_crypto::value::CommitmentSum = self
             .outputs()
-            .map(|output| output.cv.commitment())
+            .map(|output| {
+                ValueCommitment::try_from(output.cv)
+                    .ok()
+                    .map(|cv| cv.commitment())
+            })
             .collect::<Option<Vec<_>>>()?
             .into_iter()
             .sum();

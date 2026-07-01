@@ -3107,7 +3107,7 @@ fn sapling_output_with_invalid_ephemeral_key_is_rejected() {
 /// Replaces the first Sapling output's ephemeral key with an off-curve point,
 /// for `sapling_output_with_invalid_ephemeral_key_is_rejected`.
 fn corrupt_first_sapling_output_ephemeral_key(transaction: &mut Transaction) {
-    let bad_epk = sapling::keys::EphemeralPublicKey::try_from([0xffu8; 32])
+    let bad_epk = sapling::keys::EphemeralPublicKeyBytes::try_from([0xffu8; 32])
         .expect("deserialization defers point validation, so try_from stores the bytes");
 
     match transaction {
@@ -3125,7 +3125,7 @@ fn corrupt_first_sapling_output_ephemeral_key(transaction: &mut Transaction) {
 
 fn set_first_sapling_output_ephemeral_key<A: sapling::AnchorVariant + Clone>(
     transfers: &mut sapling::TransferData<A>,
-    ephemeral_key: sapling::keys::EphemeralPublicKey,
+    ephemeral_key: sapling::keys::EphemeralPublicKeyBytes,
 ) {
     match transfers {
         sapling::TransferData::JustOutputs { outputs } => {

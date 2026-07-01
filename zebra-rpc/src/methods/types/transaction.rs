@@ -26,7 +26,7 @@ use zebra_chain::{
         Network,
     },
     primitives::ed25519,
-    sapling::ValueCommitment,
+    sapling::ValueCommitmentBytes as ValueCommitment,
     serialization::ZcashSerialize,
     transaction::{self, SerializedTransaction, Transaction, VerifiedUnminedTx},
     transparent::Script,

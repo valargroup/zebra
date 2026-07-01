@@ -35,8 +35,8 @@ use super::{
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Getters)]
 pub struct Spend<AnchorV: AnchorVariant> {
-    /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    /// A raw value commitment encoding for the value of the input note.
+    pub cv: commitment::ValueCommitmentBytes,
     /// An anchor for this spend.
     ///
     /// The anchor is the root of the Sapling note commitment tree in a previous
@@ -67,8 +67,8 @@ pub struct Spend<AnchorV: AnchorVariant> {
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpendPrefixInTransactionV5 {
-    /// A value commitment to the value of the input note.
-    pub cv: commitment::ValueCommitment,
+    /// A raw value commitment encoding for the value of the input note.
+    pub cv: commitment::ValueCommitmentBytes,
     /// The nullifier of the input note.
     pub nullifier: note::Nullifier,
     /// The randomized public key for `spend_auth_sig`.
@@ -204,8 +204,8 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
-            // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            // [`commitment::ValueCommitmentBytes::zcash_deserialize`].
+            cv: commitment::ValueCommitmentBytes::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // But as mentioned above, we validate it further as an integer.
             per_spend_anchor: (&mut reader).zcash_deserialize_into()?,
@@ -261,8 +261,8 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
-            // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            // [`commitment::ValueCommitmentBytes::zcash_deserialize`].
+            cv: commitment::ValueCommitmentBytes::zcash_deserialize(&mut reader)?,
             // Type is `B^Y^{[ℓ_{PRFnfSapling}/8]}`, i.e. 32 bytes
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),
             // Type is `SpendAuthSig^{Sapling}.Public`, i.e. J
