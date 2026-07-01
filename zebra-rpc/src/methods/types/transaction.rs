@@ -750,6 +750,25 @@ pub struct OrchardFlags {
     /// Whether Orchard or Ironwood spends are enabled.
     #[serde(rename = "enableSpends")]
     enable_spends: bool,
+    /// Whether Ironwood cross-address transfers are enabled.
+    ///
+    /// This field is only serialized for Ironwood bundles.
+    #[serde(
+        rename = "enableCrossAddress",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    #[new(default)]
+    enable_cross_address: Option<bool>,
+}
+
+impl OrchardFlags {
+    /// Returns a copy of these flags with the Ironwood cross-address flag set.
+    pub fn with_cross_address(mut self, enable_cross_address: bool) -> Self {
+        self.enable_cross_address = Some(enable_cross_address);
+        self
+    }
 }
 
 /// The Orchard or Ironwood action of a transaction.
@@ -783,9 +802,24 @@ pub struct OrchardAction {
 }
 
 impl Orchard {
+    fn from_orchard_shielded_data(
+        shielded_data: Option<&orchard::ShieldedData>,
+        value_balance: Amount<NegativeAllowed>,
+    ) -> Self {
+        Self::from_shielded_data(shielded_data, value_balance, false)
+    }
+
+    fn from_ironwood_shielded_data(
+        shielded_data: &orchard::ShieldedData,
+        value_balance: Amount<NegativeAllowed>,
+    ) -> Self {
+        Self::from_shielded_data(Some(shielded_data), value_balance, true)
+    }
+
     fn from_shielded_data(
         shielded_data: Option<&orchard::ShieldedData>,
         value_balance: Amount<NegativeAllowed>,
+        include_cross_address_flag: bool,
     ) -> Self {
         Self {
             actions: shielded_data.map_or_else(Vec::new, |data| {
@@ -802,10 +836,18 @@ impl Orchard {
             value_balance: Zec::from(value_balance).lossy_zec(),
             value_balance_zat: value_balance.zatoshis(),
             flags: shielded_data.map(|data| {
-                OrchardFlags::new(
+                let flags = OrchardFlags::new(
                     data.flags.contains(orchard::Flags::ENABLE_OUTPUTS),
                     data.flags.contains(orchard::Flags::ENABLE_SPENDS),
-                )
+                );
+
+                if include_cross_address_flag {
+                    flags.with_cross_address(
+                        data.flags.contains(orchard::Flags::ENABLE_CROSS_ADDRESS),
+                    )
+                } else {
+                    flags
+                }
             }),
             anchor: shielded_data.map(|data| data.shared_anchor.bytes_in_display_order()),
             proof: shielded_data.map(|data| data.proof.bytes_in_display_order()),
@@ -1068,13 +1110,13 @@ impl TransactionObject {
                 .collect(),
             value_balance: Some(Zec::from(tx.sapling_value_balance().sapling_amount()).lossy_zec()),
             value_balance_zat: Some(tx.sapling_value_balance().sapling_amount().zatoshis()),
-            orchard: Some(Orchard::from_shielded_data(
+            orchard: Some(Orchard::from_orchard_shielded_data(
                 tx.orchard_shielded_data(),
                 tx.orchard_value_balance().orchard_amount(),
             )),
             ironwood: tx.ironwood_shielded_data().map(|ironwood_shielded_data| {
-                Orchard::from_shielded_data(
-                    Some(ironwood_shielded_data),
+                Orchard::from_ironwood_shielded_data(
+                    ironwood_shielded_data,
                     tx.ironwood_value_balance().ironwood_amount(),
                 )
             }),
@@ -1127,6 +1169,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn orchard_flags_only_serialize_cross_address_when_set() {
+        let orchard_flags = OrchardFlags::new(true, false);
+        let orchard_flags_json =
+            serde_json::to_value(orchard_flags).expect("Orchard flags should serialize to JSON");
+
+        assert_eq!(orchard_flags_json["enableOutputs"], true);
+        assert_eq!(orchard_flags_json["enableSpends"], false);
+        assert!(
+            orchard_flags_json.get("enableCrossAddress").is_none(),
+            "Orchard flags should not include the Ironwood cross-address flag"
+        );
+
+        let ironwood_flags = OrchardFlags::new(false, true).with_cross_address(false);
+        let ironwood_flags_json =
+            serde_json::to_value(ironwood_flags).expect("Ironwood flags should serialize to JSON");
+
+        assert_eq!(ironwood_flags_json["enableOutputs"], false);
+        assert_eq!(ironwood_flags_json["enableSpends"], true);
+        assert_eq!(ironwood_flags_json["enableCrossAddress"], false);
+    }
+
+    #[test]
     fn transaction_object_exposes_ironwood_actions_like_orchard() {
         let _init_guard = zebra_test::init();
 
@@ -1139,7 +1203,9 @@ mod tests {
         let value_balance: Amount = 123i64.try_into().expect("test amount is valid");
         let proof = Halo2Proof(vec![1; ::orchard::Proof::expected_proof_size(1)]);
         let ironwood_shielded_data = ironwood::ShieldedData {
-            flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+            flags: ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
             value_balance,
             shared_anchor: tree::Root::default(),
             proof: proof.clone(),
@@ -1178,11 +1244,16 @@ mod tests {
         assert_eq!(ironwood.actions.len(), 1);
         assert_eq!(ironwood.value_balance_zat, value_balance.zatoshis());
         assert_eq!(ironwood.value_balance, Zec::from(value_balance).lossy_zec());
+        let expected_flags = OrchardFlags::new(true, true).with_cross_address(true);
         assert_eq!(
-            ironwood.flags,
-            Some(OrchardFlags::new(true, true)),
-            "Ironwood should use the same flag shape as Orchard"
+            ironwood.flags.as_ref(),
+            Some(&expected_flags),
+            "Ironwood should include its cross-address flag"
         );
+        assert_eq!(expected_flags.enable_cross_address(), Some(true));
+        let flags_json = serde_json::to_value(ironwood.flags.as_ref().expect("Ironwood flags"))
+            .expect("Ironwood flags should serialize to JSON");
+        assert_eq!(flags_json["enableCrossAddress"], true);
         assert_eq!(
             ironwood.anchor,
             Some(
