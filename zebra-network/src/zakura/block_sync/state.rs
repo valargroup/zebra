@@ -555,6 +555,24 @@ impl DownloadWindow {
         }
     }
 
+    /// Scale a base floor-bypass slot count by the peer's reliability discount so the
+    /// bypass shrinks with the same signal that shrinks the window. The floor bypass
+    /// grants slots *beyond* the congestion window so the lowest missing height keeps
+    /// moving through a healthy-but-saturated carrier; it must **not** keep handing
+    /// above-window slots to a peer whose goodput has collapsed just because a block is
+    /// near the floor. A healthy peer (factor ≈ 1) keeps the full bypass; a sealed peer
+    /// (factor → 0) gets none, so a wedged peer receives no requests of any kind.
+    pub(super) fn scaled_floor_bonus(&self, base: usize) -> usize {
+        let scaled = (base as f64 * self.bbr.reliability_factor()).round();
+        // Finite, non-negative by construction (base ≥ 0, factor ∈ [0, 1]); the guard is
+        // defensive against a non-finite factor, sealing the bypass rather than opening it.
+        if scaled.is_finite() && scaled >= 0.0 {
+            scaled as usize
+        } else {
+            0
+        }
+    }
+
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.

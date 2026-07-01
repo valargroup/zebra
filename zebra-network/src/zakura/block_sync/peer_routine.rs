@@ -73,6 +73,26 @@ const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
+/// Whether a due block-liveness deadline should be granted one bounded grace instead of
+/// disconnecting the peer. The grace exists only to avoid punishing a peer for *our own*
+/// transient outbound write congestion: it is allowed exactly when our outbound queue is
+/// full **and** has been continuously full for less than `request_timeout`. A peer that
+/// has simply stopped reading its stream holds our outbound full indefinitely, so once the
+/// full stretch reaches `request_timeout` the grace is denied and the peer is disconnected
+/// at the liveness deadline — it can no longer dodge the timer by refusing to read (the bug
+/// the previous unbounded `outbound_capacity() == 0 → extend` escape allowed, which let a
+/// wedged peer survive to the ~180 s transport idle timeout).
+fn liveness_grace_allowed(
+    outbound_full: bool,
+    outbound_full_since: Option<Instant>,
+    now: Instant,
+    request_timeout: Duration,
+) -> bool {
+    outbound_full
+        && outbound_full_since
+            .is_some_and(|since| now.saturating_duration_since(since) < request_timeout)
+}
+
 fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
     frame.payload.first().copied() == Some(MSG_BS_BLOCK)
 }
@@ -158,6 +178,14 @@ pub(super) struct PeerRoutine {
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
+    /// When our outbound queue to this peer *first* filled in the current
+    /// continuous full stretch (`None` while it has capacity). A peer that stops
+    /// reading its stream backs our outbound up and holds it full; this timestamp
+    /// lets the liveness check tell genuinely-transient local write congestion
+    /// (outbound only just filled) from a peer that has stopped reading for
+    /// `request_timeout` — the latter is disconnected at the liveness deadline
+    /// rather than excused indefinitely.
+    outbound_full_since: Option<Instant>,
 
     /// Cancellation: the peer's service session token. Fires on disconnect, park,
     /// or local shutdown; the routine exits and its `Drop` guard returns work.
@@ -229,6 +257,7 @@ impl PeerRoutine {
             routine_to_reactor,
             sequencer_view,
             last_reset_epoch,
+            outbound_full_since: None,
             cancel,
             trace,
         }
@@ -268,6 +297,15 @@ impl PeerRoutine {
                 self.try_fill().await;
             }
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
+            // Track the start of the current continuous outbound-full stretch so the
+            // liveness check can bound the write-congestion grace: a peer that has
+            // stopped reading holds this full and its `outbound_full_since` ages past
+            // `request_timeout`, at which point it is disconnected rather than excused.
+            if outbound_queue_has_capacity {
+                self.outbound_full_since = None;
+            } else if self.outbound_full_since.is_none() {
+                self.outbound_full_since = Some(Instant::now());
+            }
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep();
@@ -564,12 +602,18 @@ impl PeerRoutine {
         // is a candidate bubble.
         let mut fill_sent = 0u32;
         let fill_stop: &'static str = loop {
-            let floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
+            // The floor bypass is scaled by the peer's reliability: a healthy saturated
+            // carrier keeps the full bypass so the floor keeps moving, but a
+            // failing/sealed peer earns *no* above-window slots — its limit is never
+            // bypassed just because a block is near the floor.
+            let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
+            let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
             let normal_slots = self.window.available_slots();
             let floor_slots = self.window.available_slots_with_bonus(floor_bonus);
             // Break only when even a bypassed floor request has no slot. A cwnd that is
             // saturated for above-floor work (`normal_slots == 0`) still leaves up to
-            // `floor_bonus` slots so the lowest missing height keeps moving.
+            // `floor_bonus` slots so the lowest missing height keeps moving — unless the
+            // peer is sealed, in which case `floor_bonus` is 0 and it gets no work.
             if !self.received_status {
                 break "no_status";
             }
@@ -1009,16 +1053,28 @@ impl PeerRoutine {
                 self.window.clear_liveness_if_idle();
                 Ok(())
             }
-            LivenessOutcome::Disconnect if self.session.outbound_capacity() == 0 => {
-                // This is local ordered-stream backpressure, not the peer's request
-                // window. While the outbound queue is full the select loop above does
-                // not drain inbound frames (`if outbound_queue_has_capacity`), so a
-                // useful block may already be waiting behind our own write-side
-                // congestion. Extend the deadline instead of punishing the peer for
-                // our congestion; the no-progress cap still disconnects a genuinely
-                // silent peer once the outbound clears.
+            LivenessOutcome::Disconnect
+                if liveness_grace_allowed(
+                    self.session.outbound_capacity() == 0,
+                    self.outbound_full_since,
+                    now,
+                    self.config.request_timeout,
+                ) =>
+            {
+                // Our outbound queue is full but has *only just* filled (< one
+                // `request_timeout` of continuous backpressure): this is plausibly
+                // transient local write congestion, not a dead peer. While the outbound
+                // queue is full the select loop above does not drain inbound frames
+                // (`if outbound_queue_has_capacity`), so a useful block the peer already
+                // sent may be waiting behind our own write side. Grant one short,
+                // BOUNDED grace and re-check rather than punish the peer for our
+                // congestion. This is the *only* liveness extension: unlike the previous
+                // unbounded escape, a peer that has simply stopped reading holds our
+                // outbound full past `request_timeout`, falls through to the disconnect
+                // arm below, and is disconnected at the liveness deadline — a wedged peer
+                // can no longer avoid the timer by refusing to read.
                 self.window
-                    .extend_liveness_deadline(now, self.config.effective_liveness_timeout());
+                    .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
             }
             LivenessOutcome::Disconnect => {
@@ -1822,7 +1878,10 @@ impl PeerRoutine {
     /// idle (`no_work` with an empty queue, `cwnd_saturated`) from a recoverable one
     /// (slots + budget + work all free yet stopped — a wakeup gap to fix).
     fn trace_fill_stop(&self, reason: &'static str) {
-        let floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
+        // Mirror the effective (reliability-scaled) bypass the fill loop used, so the
+        // slot snapshot reflects a sealed peer's collapsed floor bonus.
+        let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
+        let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_str(row, bs_trace::FILL_STOP_REASON, reason);
@@ -2244,5 +2303,56 @@ mod tests {
 
         fill.await
             .expect("try_fill completes after the funding decision");
+    }
+
+    /// The liveness grace is granted only for genuinely-transient local write congestion:
+    /// outbound full but full for *less* than `request_timeout`.
+    #[test]
+    fn liveness_grace_only_for_fresh_outbound_backpressure() {
+        let now = Instant::now();
+        let request_timeout = Duration::from_secs(8);
+
+        // Outbound just filled (1 s ago): plausibly our own write congestion — grace.
+        let fresh = now - Duration::from_secs(1);
+        assert!(super::liveness_grace_allowed(
+            true,
+            Some(fresh),
+            now,
+            request_timeout
+        ));
+
+        // Outbound has been full for a full `request_timeout` (the peer has stopped
+        // reading): NO grace — the peer is disconnected at the liveness deadline.
+        let sustained = now - request_timeout;
+        assert!(!super::liveness_grace_allowed(
+            true,
+            Some(sustained),
+            now,
+            request_timeout
+        ));
+        let long = now - Duration::from_secs(30);
+        assert!(!super::liveness_grace_allowed(
+            true,
+            Some(long),
+            now,
+            request_timeout
+        ));
+
+        // Outbound has capacity (not full): the outbound-full escape does not apply at all,
+        // so the deadline disconnects normally.
+        assert!(!super::liveness_grace_allowed(
+            false,
+            Some(fresh),
+            now,
+            request_timeout
+        ));
+        // Full but no recorded start (should not happen while full, but be defensive):
+        // no grace.
+        assert!(!super::liveness_grace_allowed(
+            true,
+            None,
+            now,
+            request_timeout
+        ));
     }
 }

@@ -72,9 +72,16 @@ pub(crate) struct Degrade {
 /// What a [`Degrade`] switches a peer to.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DegradeMode {
-    /// Silently drop every subsequent request (the peer wedges / dies). The node must
-    /// seal it off and disconnect it via the liveness timer.
+    /// Silently drop every subsequent request (the peer keeps *reading* our requests but
+    /// never answers). The node must seal it off and disconnect it via the liveness timer.
     GoSilent,
+    /// Stop reading our stream entirely and answer nothing — a truly wedged connection.
+    /// Because the peer no longer drains our bounded outbound queue, the node's
+    /// `outbound_capacity()` falls to zero and stays there. This is the case the old
+    /// liveness escape excused indefinitely (extend-while-outbound-full), letting a
+    /// non-reading peer avoid disconnect until the transport idle timeout (~180 s). The
+    /// node must now disconnect it at the liveness deadline regardless of outbound state.
+    Wedge,
     /// Switch to a finite serve bandwidth (bytes/sec) behind a fixed base RTT: the peer
     /// keeps delivering but far more slowly. The node must keep it (its cwnd/params just
     /// shrink), not disconnect it.
@@ -296,6 +303,12 @@ pub(crate) struct Scenario {
     pub(crate) timeline: Vec<TipEvent>,
     /// How the mock commit pipeline drains the applyQ (default: instant).
     pub(crate) commit: CommitProfile,
+    /// Depth of each synthetic peer's bounded transport queue (both directions). `None`
+    /// uses the default (1024). A *small* depth lets a peer that stops reading fill the
+    /// node's outbound queue quickly, exercising the liveness path when
+    /// `outbound_capacity()` is zero — the wedge case the default depth is too large to
+    /// reproduce.
+    pub(crate) transport_queue_depth: Option<usize>,
     /// Wall-clock bound for the run.
     pub(crate) deadline: Duration,
 }
@@ -318,6 +331,7 @@ impl Scenario {
             peers,
             timeline: Vec::new(),
             commit: CommitProfile::default(),
+            transport_queue_depth: None,
             deadline: Duration::from_secs(30),
         }
     }

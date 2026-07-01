@@ -78,8 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (so a slow peer whose probe timed out but that then delivered is kept), a
   destructive view reset clears the probe streak (so an unproven peer whose only
   probe was in flight at the reset can probe again rather than wedging), and a
-  would-be liveness disconnect caused by *local* outbound backpressure extends
-  the deadline instead of parking the peer.
+  would-be liveness disconnect caused by *transient* local outbound backpressure
+  is briefly deferred (see the bounded grace below).
 - Zakura block-sync BBR now folds per-peer reliability into the cwnd. Vanilla BBR
   ignores request failures, but a dropped block-sync request is expensive (it can
   stall the contiguous floor for a whole request-timeout), so the controller tracks
@@ -111,6 +111,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remaining window bytes (window − reserved, plus the bounded floor bypass), so a peer
   whose window is nearly full can no longer issue a large multi-body request that
   overshoots it — the byte cwnd is a real admission limit, not just a non-empty gate.
+- The block-sync liveness disconnect is now **bounded**: a peer that stops reading our
+  stream backs our outbound queue up and holds it full, and the previous escape
+  (`outbound_capacity() == 0` → extend the deadline) treated that as our own write
+  congestion and extended *indefinitely*, so a wedged, non-reading peer was never
+  disconnected by the application (it survived until the ~150 s transport idle timeout)
+  while we kept queuing requests it never read. The grace is now granted only while the
+  outbound queue has been continuously full for less than `request_timeout` (genuinely
+  transient local congestion); once it has been full that long — the peer has stopped
+  reading — the peer is disconnected at the liveness deadline regardless of outbound
+  state. A peer that stops responding is now cut off at the timeout, full stop.
+- The block-sync floor bypass (the extra above-window slots that let the lowest missing
+  height keep moving through a saturated carrier) is now scaled by the peer's reliability,
+  so a failing/sealed peer earns **no** bypass. A peer's window limit is no longer
+  bypassed just because a block is near the floor: only a healthy, saturated carrier gets
+  the bypass; once a peer is sealed its floor bonus ramps to zero, so a wedged peer
+  receives no requests of any kind (the seal, the no-progress cap, and the bounded
+  liveness timer then compose to stop and disconnect it).
 - Retuned the Zakura block-sync BBR cold start for a conservative start and a faster
   ramp, now that the reliability discount and delay-gradient ceiling backstop an
   over-eager window: lowered `bbr_min_cwnd_bytes` from 4 MiB to ≈2.5 MB (one max block

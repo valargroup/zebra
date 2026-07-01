@@ -80,6 +80,21 @@ async fn serve_loop(
     tokio::pin!(disconnect);
 
     loop {
+        // A `Wedge` degradation stops the peer reading our stream entirely once it has
+        // been connected for `degrade.at`: it neither drains the node's outbound queue nor
+        // answers. The node's `outbound_capacity()` then falls to zero and stays there —
+        // the truly-wedged connection the liveness timer must still disconnect. Park on
+        // shutdown/disconnect only; never read again.
+        let wedged = spec.serve.degrade.is_some_and(|degrade| {
+            matches!(degrade.mode, DegradeMode::Wedge) && started.elapsed() >= degrade.at
+        });
+        if wedged {
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = &mut disconnect => {}
+            }
+            return;
+        }
         let message = tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = &mut disconnect => return,
@@ -107,7 +122,10 @@ async fn serve_loop(
             .degrade
             .filter(|degrade| started.elapsed() >= degrade.at)
             .map(|degrade| degrade.mode);
-        if matches!(degraded_mode, Some(DegradeMode::GoSilent)) {
+        if matches!(
+            degraded_mode,
+            Some(DegradeMode::GoSilent | DegradeMode::Wedge)
+        ) {
             continue;
         }
         let (effective_first_block_latency, effective_bandwidth) = match degraded_mode {

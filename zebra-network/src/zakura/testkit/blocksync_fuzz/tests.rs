@@ -424,6 +424,86 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
     );
 }
 
+/// Requirement — a peer that WEDGES by *no longer reading our stream* (not merely going
+/// silent) must still be disconnected at the liveness deadline. When a peer stops draining
+/// our bounded outbound queue, `outbound_capacity()` falls to zero and stays there. The old
+/// liveness escape (`Disconnect if outbound_capacity() == 0 → extend`) treated that as our
+/// own write congestion and extended the deadline *every* time, indefinitely — so a wedged
+/// peer survived until the ~180 s transport idle timeout while we kept queuing requests it
+/// never read. The bounded grace fixes this: once our outbound has been continuously full
+/// for `request_timeout`, the peer is disconnected at the liveness deadline regardless.
+///
+/// This is the distinct counterpart to `fuzz_peer_wedges_after_progress_is_disconnected`
+/// (which uses `GoSilent`: the peer keeps *reading* and so never fills our outbound, taking
+/// the normal disconnect arm). Here the peer stops reading, so the run exercises the escape
+/// arm specifically. A small transport queue depth makes the outbound fill quickly (the
+/// default 1024 is too large for the node to ever fill given the no-progress cap — which is
+/// exactly why this bug was invisible to the earlier tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_peer_that_stops_reading_is_disconnected() {
+    let blocks = 400;
+    // A proven carrier that serves at a finite rate, then stops reading our stream entirely
+    // 250 ms in — a truly stuck connection. By then it has delivered a run of bodies, so it
+    // is *proven* (its no-progress cap is the larger proven budget), the harder case. It is
+    // the only peer: the chain cannot complete once it wedges, and it is not meant to — the
+    // property under test is the disconnect. `fuzz_peer_wedges_after_progress_is_disconnected`
+    // (a `GoSilent` peer that keeps reading) already covers a healthy peer finishing the
+    // chain after a wedge.
+    let wedger = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            bandwidth_bytes_per_sec: Some(4 * 1024 * 1024),
+            degrade: Some(Degrade {
+                at: Duration::from_millis(250),
+                mode: DegradeMode::Wedge,
+            }),
+            ..ServeProfile::fast()
+        },
+    );
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_dead, degrade_config(), vec![wedger]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    // A small per-peer transport queue so the node's outbound to the non-reading peer fills
+    // (and stays full) quickly — the condition that drives `outbound_capacity()` to zero and
+    // exercises the (now-bounded) liveness escape. The default 1024 is far too large for the
+    // node to ever fill given the no-progress cap, which is exactly why this bug was
+    // invisible to the earlier tests.
+    scenario.transport_queue_depth = Some(4);
+    scenario.deadline = Duration::from_secs(5);
+
+    // Run WITHOUT the reach-the-target assertion (a lone wedged peer cannot finish the chain);
+    // assert the disconnect directly from the report.
+    let (mut capture, trace) =
+        run_trace("fuzz_peer_that_stops_reading_is_disconnected").expect("trace capture opens");
+    let _outcome = run_scenario(&scenario, trace)
+        .await
+        .expect("scenario runs without harness error");
+    capture.flush().await;
+    let reader = capture
+        .reader()
+        .expect("trace reader loads the flushed run");
+    let report = invariant_report(&reader);
+    capture.finish().await.expect("capture discards cleanly");
+
+    // The wedged, non-reading peer must be disconnected — even though our outbound to it is
+    // full (its stream unread). With the old unbounded escape this is 0 (extend forever until
+    // the ~180 s transport idle timeout): the teeth of the fix.
+    assert!(
+        report.protocol_rejects >= 1,
+        "a peer that stops reading our stream must still be disconnected at the liveness \
+         deadline, got {} rejects",
+        report.protocol_rejects,
+    );
+    // It was proven when it wedged (streak past the single initial probe), so this is the
+    // harder proven-peer case, not the never-proved one.
+    assert!(
+        report.max_requests_without_block_progress >= 2,
+        "the disconnected peer should have been proven, got {}",
+        report.max_requests_without_block_progress,
+    );
+}
+
 /// Requirement — a peer that becomes RADICALLY SLOWER (but keeps delivering) is kept,
 /// not kicked; its params just adapt. A single full-range carrier serves fast, then
 /// drops to a low finite bandwidth behind a high base RTT partway through. Because it is

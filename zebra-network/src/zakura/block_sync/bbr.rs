@@ -494,6 +494,17 @@ impl BbrState {
     /// bodies. During ProbeRtt the base is `min_cwnd` (drain to re-measure RTprop); in
     /// ProbeBw it is the BDP-derived cwnd capped by the delay-gradient ceiling, floored at
     /// `min_cwnd`.
+    /// The reliability discount factor in `[0, 1]` applied to the BDP/floor base:
+    /// `1 - weight × (1 - reliability)`. `1.0` for a healthy peer (or `weight = 0`),
+    /// ramping toward `0` as a peer's goodput collapses — the seal. Exposed so the
+    /// floor-bypass sizing can shrink with the same signal that shrinks the window: a
+    /// failing peer must not be handed extra above-window slots just because a block is
+    /// near the floor. `factor` is already in `[0, 1]` (weight and `r` are both
+    /// clamped); `max(0.0)` is defensive.
+    pub(super) fn reliability_factor(&self) -> f64 {
+        (1.0 - self.params.reliability_weight * (1.0 - self.reliability)).max(0.0)
+    }
+
     pub(super) fn effective_cwnd(&self) -> usize {
         // Reliability discount, shared by both phases: a peer that turns only `r` of its
         // requests into bodies holds `1 - weight × (1 - r)` of the window. `weight = 0`
@@ -503,9 +514,8 @@ impl BbrState {
         // (generous) liveness timer decides whether it is actually dead. A *slow but
         // delivering* peer keeps `r ≈ 1` (every completion is a success), so this never
         // seals it — only its BDP shrinks; a *dropping/wedged* peer's `r` collapses and
-        // the window follows it to zero. `factor` is already in `[0, 1]` (weight and `r`
-        // are both clamped); `max(0.0)` is defensive.
-        let factor = (1.0 - self.params.reliability_weight * (1.0 - self.reliability)).max(0.0);
+        // the window follows it to zero.
+        let factor = self.reliability_factor();
         let base = match self.phase {
             // ProbeRtt drains to the floor to take a clean, uncontended RTprop sample.
             BbrPhase::ProbeRtt => self.params.min_cwnd,
@@ -822,6 +832,58 @@ mod bbr_tests {
         assert!(
             window.bbr_effective_cwnd() < healthy,
             "a batch of timed-out requests must shrink the peer's cwnd",
+        );
+    }
+
+    #[test]
+    fn reliability_factor_tracks_the_seal() {
+        // The floor-bypass sizing rides the same discount as the cwnd: 1.0 for a healthy
+        // peer, ramping toward 0 as reliability collapses, so a failing peer earns no
+        // above-window floor slots.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert!(
+            (bbr.reliability_factor() - 1.0).abs() < 1e-9,
+            "a healthy peer keeps the full factor, got {}",
+            bbr.reliability_factor(),
+        );
+
+        bbr.penalize_reliability(20);
+        let discounted = bbr.reliability_factor();
+        assert!(
+            discounted < 1.0 && discounted > 0.0,
+            "drops discount the factor below 1 (but not yet to zero), got {discounted}",
+        );
+
+        bbr.penalize_reliability(200);
+        assert!(
+            bbr.reliability_factor() < 0.05,
+            "a wedged peer's factor collapses toward zero, got {}",
+            bbr.reliability_factor(),
+        );
+    }
+
+    #[test]
+    fn scaled_floor_bonus_collapses_when_the_peer_is_sealed() {
+        // The floor bypass must not hand above-window slots to a failing peer just because
+        // a block is near the floor: the bonus scales with reliability and reaches zero
+        // once the peer is sealed.
+        let cfg = bbr_test_config();
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(
+            window.scaled_floor_bonus(2),
+            2,
+            "a healthy peer keeps the full floor bypass",
+        );
+
+        // A wedged peer (reliability collapses): no above-window floor slots at all.
+        window.record_timeout(200);
+        assert_eq!(
+            window.scaled_floor_bonus(2),
+            0,
+            "a sealed peer's floor bypass must be zero",
         );
     }
 

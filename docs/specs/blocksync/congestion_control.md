@@ -171,7 +171,13 @@ land fast.
   rescued to a faster carrier, **not** disconnected (record-only).
 - The floor MAY borrow up to `floor_bypass_slots` (2) representative bodies beyond a
   saturated window so it is fetched even when every peer is at its window; the borrow
-  MUST stay within the advertised request-count cap and reserve real budget.
+  MUST stay within the advertised request-count cap and reserve real budget. The borrow
+  MUST be scaled by the peer's reliability (the same factor that scales the window), so a
+  failing/sealed peer earns **no** bypass: only a healthy, saturated carrier may exceed
+  its window for the floor. A peer's window is never bypassed merely because a block is
+  near the floor — that would keep handing above-window work to a peer that has stopped
+  delivering. If every servable carrier is sealed the floor waits for a fresh carrier (or
+  the watchdog re-fan) rather than hammering a dead peer.
 - **Above-floor** speculation SHOULD use a patient, size-aware deadline
   (`request_timeout + estimated_bytes ÷ BDR`) and MUST NOT gate the floor.
 
@@ -219,8 +225,16 @@ probe-first no-progress policy:
     probe was in flight at the reset can probe again rather than wedging at its cap
     with a cleared deadline;
   - a would-be liveness disconnect attributable to **local** outbound backpressure
-    (our outbound queue is full, so we stopped draining inbound) MUST extend the
-    deadline instead of disconnecting the peer for our own write-side congestion.
+    (our outbound queue is full, so we stopped draining inbound) MAY extend the
+    deadline instead of disconnecting the peer for our own write-side congestion —
+    but this grace MUST be **bounded**: it applies only while the outbound queue has
+    been continuously full for less than `request_timeout`. A peer that has simply
+    stopped reading our stream holds the outbound full indefinitely, so once the full
+    stretch reaches `request_timeout` the peer MUST be disconnected at the liveness
+    deadline regardless of outbound state. An unbounded escape (extend whenever the
+    outbound is full) MUST NOT be used: it lets a wedged, non-reading peer avoid the
+    timer until the far slower transport idle timeout while we keep queuing requests
+    it never reads.
 
 ### Problem: distinguishing a wedged peer from a merely-slow one
 
@@ -228,10 +242,13 @@ Both a wedged peer and a suddenly-slower peer miss deadlines; only the wedged on
 be disconnected. The design keeps these apart without a slowness-based disconnect:
 
 - **Wedged** (stops delivering): its completions cease, so reliability collapses and the
-  window ramps to zero (the seal) — it receives no new work. It also makes no accepted
-  block progress, so the generous liveness deadline (`request_timeout ×
-  BLOCK_PROGRESS_TIMEOUT_REQUESTS`) elapses and disconnects it. The reliability seal is
-  the _fast_ reaction; the liveness timer is the _authority_ on death.
+  window ramps to zero (the seal) — and because the floor bypass is scaled by the same
+  reliability, its bypass ramps to zero too, so a sealed peer receives **no** work of any
+  kind, not even the floor (its limit is never bypassed just because a block is near the
+  floor). It also makes no accepted block progress, so the generous liveness deadline
+  (`request_timeout × BLOCK_PROGRESS_TIMEOUT_REQUESTS`) elapses and disconnects it — even
+  if it has stopped reading and holds our outbound full (the bounded escape above). The
+  reliability seal is the _fast_ reaction; the liveness timer is the _authority_ on death.
 - **Slow but delivering** (a sudden bandwidth drop): every body still arrives, just late.
   Each completion is a reliability success, and a body accepted through the late/unmatched
   path credits reliability back to offset the timeout its own request was charged — so a
