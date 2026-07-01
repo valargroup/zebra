@@ -509,7 +509,7 @@ impl ZebraDb {
     }
 
     #[allow(clippy::unwrap_in_result)]
-    fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
+    pub(crate) fn zakura_header(&self, height: block::Height) -> Option<Arc<block::Header>> {
         let header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
         self.db.zs_get(&header_by_height, &height)
     }
@@ -535,6 +535,7 @@ impl ZebraDb {
                 height,
                 sapling_root: value.sapling,
                 orchard_root: value.orchard,
+                auth_data_root: value.auth_data_root,
             });
         }
         roots
@@ -557,6 +558,7 @@ impl ZebraDb {
                 CommitmentRootsByHeight {
                     sapling: roots.sapling_root,
                     orchard: roots.orchard_root,
+                    auth_data_root: roots.auth_data_root,
                 },
             );
         }
@@ -1443,6 +1445,10 @@ fn inferred_header_range_roots(
                 height,
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                // Placeholder default roots: this fallback range carries no real roots
+                // (the recipient re-verifies and rejects them), so the auth-data root is
+                // an unused zero here too.
+                auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
             })
         })
         .collect()
@@ -2106,6 +2112,7 @@ impl DiskWriteBatch {
                     CommitmentRootsByHeight {
                         sapling: roots.sapling_root,
                         orchard: roots.orchard_root,
+                        auth_data_root: roots.auth_data_root,
                     },
                 );
             }

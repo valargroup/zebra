@@ -210,6 +210,7 @@ fn root_at(height: block::Height) -> BlockCommitmentRoots {
         height,
         sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
         orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        auth_data_root: block::merkle::AuthDataRoot::from([0u8; 32]),
     }
 }
 

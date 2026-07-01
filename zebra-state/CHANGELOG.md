@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extended value-pool disk serialization with an Ironwood slot after the deferred pool, and
   consolidated the current verified-commitment-trees state database format changes under
   version `27.3.0`.
+- Extended the `commitment_roots_by_height` serving index (and the `tree_aux` header-sync
+  payload it is served from) with each block's per-height ZIP-244 `auth_data_root`, so a node
+  can serve the co-input a peer needs to authenticate a block's note-commitment roots against
+  its successor's NU5+ header commitment. Consolidated under database format version `27.3.0`
+  (no version bump); serving-index rows from an earlier pre-release build (64 bytes, no
+  auth-data root) remain readable. Carrying the auth-data root bumps the Zakura header-sync
+  stream format to version 5, a breaking wire change (all peers must run the new format).
 - Added the `vct_upgrade_metadata` column family, recording the upgrade height `U` (the lowest
   height this binary committed). `tree_aux` root serving now stitches the per-height trees below
   `U` with the serving index at and above `U`, so a node that upgraded mid-chain serves a range

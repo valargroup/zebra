@@ -1531,6 +1531,15 @@ where
                     height,
                     sapling_root: sapling.root(),
                     orchard_root: orchard.root(),
+                    // The non-finalized chain holds the full block, so derive its
+                    // ZIP-244 auth-data root to serve as the predecessor-authentication
+                    // co-input (zero only if the block is unexpectedly absent).
+                    auth_data_root: chain
+                        .block(height.into())
+                        .map(|block| block.block.auth_data_root())
+                        .unwrap_or_else(|| {
+                            zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32])
+                        }),
                 }),
                 _ => None,
             }

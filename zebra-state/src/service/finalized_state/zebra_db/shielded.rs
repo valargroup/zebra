@@ -20,7 +20,7 @@ use std::{
 use std::ops::RangeInclusive;
 
 use zebra_chain::{
-    block::Height,
+    block::{merkle::AuthDataRoot, Height},
     orchard,
     parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
@@ -146,6 +146,7 @@ impl ZebraDb {
                 height,
                 sapling_root: value.sapling,
                 orchard_root: value.orchard,
+                auth_data_root: value.auth_data_root,
             });
         }
         roots
@@ -664,6 +665,13 @@ impl DiskWriteBatch {
             ..
         } = finalized;
 
+        // The ZIP-244 auth-data root of this block, stored in the serving index so this
+        // node can hand it to a peer as the co-input needed to authenticate the
+        // *predecessor's* note-commitment roots against this block's NU5+ header
+        // commitment (without the peer re-reading this block's body). Same value the
+        // commitment check above already verified against the header.
+        let auth_data_root = finalized.block.auth_data_root();
+
         // Record the upgrade height `U` once, on the first block this binary commits: the lowest
         // height in the serving index, and the boundary below which roots are served from the
         // pre-upgrade per-height trees instead. Written on both commit paths so it is set even for
@@ -695,7 +703,13 @@ impl DiskWriteBatch {
             // Persist the per-height roots into the serving index even though no per-height
             // tree is written, so this fast-synced node can still serve `tree_aux` roots
             // (design §4); otherwise the root-serving fleet collapses as nodes fast-sync.
-            self.insert_commitment_roots_by_height(zebra_db, *height, &sapling_root, &orchard_root);
+            self.insert_commitment_roots_by_height(
+                zebra_db,
+                *height,
+                &sapling_root,
+                &orchard_root,
+                &auth_data_root,
+            );
             self.update_history_tree(zebra_db, history_tree);
             return;
         }
@@ -745,6 +759,7 @@ impl DiskWriteBatch {
             *height,
             &note_commitment_trees.sapling.root(),
             &note_commitment_trees.orchard.root(),
+            &auth_data_root,
         );
 
         self.update_history_tree(zebra_db, history_tree);
@@ -834,6 +849,7 @@ impl DiskWriteBatch {
         height: Height,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        auth_data_root: &AuthDataRoot,
     ) {
         let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         self.zs_insert(
@@ -842,6 +858,7 @@ impl DiskWriteBatch {
             CommitmentRootsByHeight {
                 sapling: *sapling_root,
                 orchard: *orchard_root,
+                auth_data_root: *auth_data_root,
             },
         );
     }

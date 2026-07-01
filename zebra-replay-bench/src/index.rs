@@ -130,6 +130,11 @@ pub fn run_roots(
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
+            auth_data_root: state
+                .db
+                .block(height.into())
+                .map(|block| block.auth_data_root())
+                .unwrap_or_else(|| zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32])),
         });
         let done = h - start + 1;
         if done.is_multiple_of(5000) || done == total {

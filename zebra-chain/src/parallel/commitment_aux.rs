@@ -13,7 +13,8 @@ use std::io;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
-    block, orchard, sapling,
+    block::{self, merkle::AuthDataRoot},
+    orchard, sapling,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
@@ -33,6 +34,18 @@ pub struct BlockCommitmentRoots {
     pub sapling_root: sapling::tree::Root,
     /// The Orchard note-commitment tree root as of the end of this block (empty below NU5).
     pub orchard_root: orchard::tree::Root,
+    /// The authorizing-data root (ZIP-244 `hashAuthDataRoot`) of *this* block's own
+    /// transactions.
+    ///
+    /// Carried so a recipient can authenticate the *predecessor's* note-commitment
+    /// roots against this block's NU5+ header commitment
+    /// (`hashBlockCommitments = BLAKE2b(chainHistoryRoot ‖ authDataRoot ‖ 0)`) without
+    /// downloading this block's body. Like the other roots it carries no trust: it is
+    /// only the co-input to a hash check against a checkpoint-committed header, so a
+    /// wrong value fails verification rather than being accepted. Default/zero below
+    /// NU5, where the header commits the chain-history root directly and this field is
+    /// unused.
+    pub auth_data_root: AuthDataRoot,
 }
 
 impl ZcashSerialize for BlockCommitmentRoots {
@@ -40,6 +53,7 @@ impl ZcashSerialize for BlockCommitmentRoots {
         writer.write_u32::<LittleEndian>(self.height.0)?;
         self.sapling_root.zcash_serialize(&mut writer)?;
         self.orchard_root.zcash_serialize(&mut writer)?;
+        writer.write_all(&<[u8; 32]>::from(self.auth_data_root))?;
         Ok(())
     }
 }
@@ -52,10 +66,14 @@ impl ZcashDeserialize for BlockCommitmentRoots {
         let height = block::Height(reader.read_u32::<LittleEndian>()?);
         let sapling_root = sapling::tree::Root::zcash_deserialize(&mut reader)?;
         let orchard_root = orchard::tree::Root::zcash_deserialize(&mut reader)?;
+        let mut auth_data_root = [0u8; 32];
+        reader.read_exact(&mut auth_data_root)?;
+        let auth_data_root = AuthDataRoot::from(auth_data_root);
         Ok(BlockCommitmentRoots {
             height,
             sapling_root,
             orchard_root,
+            auth_data_root,
         })
     }
 }
@@ -71,6 +89,7 @@ mod tests {
             height: block::Height(1_687_200),
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            auth_data_root: AuthDataRoot::from([7u8; 32]),
         };
 
         let bytes = roots

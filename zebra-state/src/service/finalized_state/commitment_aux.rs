@@ -20,7 +20,10 @@ use std::{
 };
 
 use thiserror::Error;
-use zebra_chain::{block, orchard, sapling, sprout};
+use zebra_chain::{
+    block::{self, merkle::AuthDataRoot},
+    orchard, sapling, sprout,
+};
 
 use super::{FromDisk, IntoDisk, ZebraDb};
 
@@ -527,6 +530,14 @@ pub(crate) fn produce_block_roots(
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
+            // Below the upgrade height the serving index does not exist, so derive the
+            // auth-data root from the locally stored block (this archival node holds the
+            // body for these heights). Zero only if the body is somehow absent, in which
+            // case the recipient simply re-fetches from a node that has it.
+            auth_data_root: db
+                .block(height.into())
+                .map(|block| block.auth_data_root())
+                .unwrap_or_else(|| AuthDataRoot::from([0u8; 32])),
         });
     }
     roots
@@ -652,11 +663,13 @@ mod tests {
                 height: block::Height(10),
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                auth_data_root: AuthDataRoot::from([0u8; 32]),
             },
             BlockCommitmentRoots {
                 height: block::Height(11),
                 sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
                 orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                auth_data_root: AuthDataRoot::from([0u8; 32]),
             },
         ];
         let roots = roots
@@ -698,6 +711,7 @@ mod tests {
             height: block::Height(42),
             sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
             orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            auth_data_root: AuthDataRoot::from([0u8; 32]),
         }]);
 
         assert!(
