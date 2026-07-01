@@ -198,20 +198,16 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         match miner_params.addr() {
-            Address::Unified(addr) => addr
-                .sapling()
-                .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                .or_else(|| {
-                    addr.transparent()
-                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                })
-                .or_else(|| {
-                    addr.orchard().and_then(|addr| {
-                        let upgrade = NetworkUpgrade::current(net, height);
+            Address::Unified(addr) => {
+                let upgrade = NetworkUpgrade::current(net, height);
+
+                addr.orchard()
+                    .and_then(|addr| {
                         // Before NU6.3, pay the Orchard receiver via Orchard.
                         if upgrade < NetworkUpgrade::Nu6_3 {
                             return add_orchard_reward(&mut builder, addr);
                         }
+
                         // From NU6.3 on, the Orchard pool is frozen
                         // (disabled_add_to_orchard_pool). At NU6.3 the Orchard receiver is
                         // paid via Ironwood — which reuses the Orchard address — when
@@ -223,9 +219,21 @@ impl TransactionTemplate<NegativeOrZero> {
                         if upgrade == NetworkUpgrade::Nu6_3 {
                             return add_ironwood_reward(&mut builder, addr);
                         }
+
+                        #[cfg(not(zcash_unstable = "nu6.3"))]
+                        let _ = addr;
+
                         None
                     })
-                }),
+                    .or_else(|| {
+                        addr.sapling()
+                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                    })
+                    .or_else(|| {
+                        addr.transparent()
+                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                    })
+            }
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 
