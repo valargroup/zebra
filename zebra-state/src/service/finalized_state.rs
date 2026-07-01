@@ -23,8 +23,7 @@ use std::{
 };
 
 use zebra_chain::{
-    block::{self, merkle::AuthDataRoot, Block},
-    ironwood, orchard,
+    block, ironwood, orchard,
     parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
     parameters::Network,
     sapling,
@@ -1256,19 +1255,6 @@ impl FinalizedState {
         self.vct_prevalidated_next = None;
     }
 
-    /// `true` when committing `height` on the fast path needs a buffered successor before
-    /// it can safely persist this block's supplied roots.
-    ///
-    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
-    /// checkpoint handoff is exempt because its embedded final frontiers are verified
-    /// against this block's roots before the real tip treestate is written; trusted
-    /// local fixtures can commit their tip root on the in-arrears check.
-    pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
-        self.vct
-            .as_ref()
-            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
     fn vct_verify_handoff_frontier_roots(
         &mut self,
@@ -1318,19 +1304,13 @@ impl FinalizedState {
     /// Test-only: enable fast mode reading roots/frontiers from an arbitrary
     /// [`commitment_aux::CommitmentRootSource`] (e.g. a payload produced from a
     /// database via [`commitment_aux::produce_block_roots`]), so the producer→consumer
-    /// round-trip can be exercised in-process. `requires_verified_successor` marks
-    /// whether the installed source is untrusted and must defer tip roots until their
-    /// successor is buffered.
+    /// round-trip can be exercised in-process.
     #[cfg(test)]
     pub(in crate::service::finalized_state) fn enable_vct_fast_source(
         &mut self,
         source: Box<dyn commitment_aux::CommitmentRootSource>,
-        requires_verified_successor: bool,
     ) {
-        self.vct = Some(VctState::test_with_source(
-            source,
-            requires_verified_successor,
-        ));
+        self.vct = Some(VctState::test_with_source(source));
     }
 
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.
@@ -1343,16 +1323,6 @@ impl FinalizedState {
     #[cfg(test)]
     pub(crate) fn vct_fast_count(&self) -> u64 {
         self.vct.as_ref().map(|v| v.fast_count()).unwrap_or(0)
-    }
-
-    /// Test-only: number of fast blocks whose own commitment check was skipped by
-    /// the dedup (the previous block's look-ahead already validated them).
-    #[cfg(test)]
-    pub(crate) fn vct_prevalidated_count(&self) -> u64 {
-        self.vct
-            .as_ref()
-            .map(|v| v.prevalidated_count())
-            .unwrap_or(0)
     }
 
     /// POC: log the consensus-equivalence digest (anchor sets + history root) and

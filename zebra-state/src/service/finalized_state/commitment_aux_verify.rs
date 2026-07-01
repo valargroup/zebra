@@ -51,18 +51,6 @@ impl CommitmentRootVerification {
             skip_parent_check,
         }
     }
-
-    pub(crate) fn header_only(
-        block: Arc<Block>,
-        precomputed_auth_data_root: Option<AuthDataRoot>,
-    ) -> Self {
-        CommitmentRootVerification {
-            block,
-            roots: None,
-            precomputed_auth_data_root,
-            skip_parent_check: false,
-        }
-    }
 }
 
 /// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the

@@ -2225,13 +2225,13 @@ impl DiskWriteBatch {
             return Ok(frontier);
         }
 
-        // Fold the stored roots forward from the frontier tip to the anchor, re-verifying them.
-        let start = frontier
-            .as_ref()
-            .map(|tree| (tree.current_height() + 1).expect("stored header heights are valid"))
-            .unwrap_or(block::Height(0));
-        let stored_roots =
-            zebra_db.zakura_header_commitment_roots_by_height_range(start..=anchor_height);
+        // Rebuild the frontier from an empty tree by folding the stored roots `[1..=anchor]`,
+        // re-verifying them. This handles both a lagging persisted frontier (first adoption of
+        // the format) and a re-anchor *below* the current frontier (a header re-org overwrote
+        // higher heights). Rare: in the checkpoint window headers are pinned and contiguous, so
+        // the fast path above normally returns immediately.
+        let stored_roots = zebra_db
+            .zakura_header_commitment_roots_by_height_range(block::Height(1)..=anchor_height);
         let mut items = Vec::with_capacity(stored_roots.len());
         for roots in &stored_roots {
             let header = zebra_db.zakura_header(roots.height).ok_or(
@@ -2244,7 +2244,7 @@ impl DiskWriteBatch {
         }
         let rebuilt = crate::service::finalized_state::commitment_aux_verify::verify_supplied_roots_from_parts(
             network,
-            frontier,
+            HistoryTree::default(),
             items.iter().map(|(header, roots)| (header.as_ref(), *roots)),
         )
         .map_err(|(height, source)| CommitHeaderRangeError::InvalidCommitmentRoots {
@@ -2256,7 +2256,7 @@ impl DiskWriteBatch {
         if !header_frontier_is_at_anchor(&rebuilt, anchor_height, network) {
             return Err(CommitHeaderRangeError::HeaderFrontierUnavailable {
                 anchor_height,
-                missing_height: start,
+                missing_height: block::Height(1),
             });
         }
 

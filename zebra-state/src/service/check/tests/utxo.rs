@@ -877,13 +877,8 @@ fn new_state_with_mainnet_transparent_data(
 
     if use_finalized_state {
         let block1 = CheckpointVerifiedBlock::from(block1.clone());
-        let commit_result = finalized_state.commit_finalized_direct(
-            block1.clone().into(),
-            None,
-            None,
-            None,
-            "test",
-        );
+        let commit_result =
+            finalized_state.commit_finalized_direct(block1.clone().into(), None, None, "test");
 
         // the block was committed
         assert_eq!(

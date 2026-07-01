@@ -670,13 +670,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         .expect("test data deserializes");
 
     pruned_state
-        .commit_finalized_direct(
-            block.into(),
-            None,
-            None,
-            None,
-            "archive to pruned checkpoint",
-        )
+        .commit_finalized_direct(block.into(), None, None, "archive to pruned checkpoint")
         .expect("checkpoint block is valid");
 
     assert_eq!(
@@ -767,13 +761,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
         .zcash_deserialize_into()
         .expect("test data deserializes");
     pruned_state
-        .commit_finalized_direct(
-            block.into(),
-            None,
-            None,
-            None,
-            "archive to pruned checkpoint",
-        )
+        .commit_finalized_direct(block.into(), None, None, "archive to pruned checkpoint")
         .expect("checkpoint block is valid");
     assert_eq!(
         pruned_state.db.lowest_retained_height(),
@@ -854,13 +842,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         .zcash_deserialize_into()
         .expect("genesis test data deserializes");
     state
-        .commit_finalized_direct(
-            genesis.into(),
-            None,
-            None,
-            None,
-            "contextual retention tests",
-        )
+        .commit_finalized_direct(genesis.into(), None, None, "contextual retention tests")
         .expect("genesis block is valid");
 
     let block: Arc<Block> = blocks

@@ -867,6 +867,7 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
                     Default::default(),
                     Default::default(),
                     Default::default(),
+                    Default::default(),
                     ValueBalance::fake_populated_pool(),
                 )
                 .push(block1.prepare().test_with_zero_spent_utxos())?
