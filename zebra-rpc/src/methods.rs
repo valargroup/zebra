@@ -2273,6 +2273,7 @@ where
         //
         // Set up the loop.
         let mut max_time_reached = false;
+        let mut precomputed_coinbase = None;
 
         // The loop returns the server long poll ID, which should be different to the client one.
         let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
@@ -2378,7 +2379,11 @@ where
             let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
             // `+2`: we expect the tip to advance by one block before waking us up.
             let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            let wait_for_new_tip = async {
+
+            if precomputed_coinbase
+                .as_ref()
+                .map_or(true, |(height, _)| *height != precomputed_height)
+            {
                 // Precompute the coinbase tx for an empty block that will sit on the new tip. We
                 // will return this provisional block upon a chain tip change so that miners can
                 // mine on the newest tip, and don't waste their effort on a shorter chain while we
@@ -2386,24 +2391,21 @@ where
                 // before we start waiting for a new tip since computing the coinbase tx takes a few
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                    })
-                };
+                let network = self.network.clone();
+                let miner_params = miner_params.clone();
 
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
+                precomputed_coinbase = Some((
                     precomputed_height,
-                    miner_params.clone(),
-                );
-
-                let _ = wait_for_new_tip.await;
-
-                precomputed_coinbase
-                    .await
-                    .expect("coinbase precomputation task should not panic")
-            };
+                    tokio::task::spawn_blocking(move || {
+                        TransactionTemplate::new_coinbase(
+                            &network,
+                            precomputed_height,
+                            &miner_params,
+                            Amount::zero(),
+                        )
+                    }),
+                ));
+            }
 
             // Wait for the maximum block time to elapse. This can change the block header
             // on testnet. (On mainnet it can happen due to a network disconnection, or a
@@ -2447,7 +2449,11 @@ where
                     );
                 }
 
-                precomputed_coinbase = wait_for_new_tip => {
+                _ = wait_for_new_tip => {
+                    let (precomputed_height, precomputed_coinbase) = precomputed_coinbase
+                        .take()
+                        .expect("coinbase precomputation starts before waiting for a new tip");
+
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
                     let server_long_poll_id = LongPollInput::new(
@@ -2466,6 +2472,9 @@ where
                     // (multi-block advance, reorg, or spurious notification) — its
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
+                    let precomputed_coinbase = precomputed_coinbase
+                        .await
+                        .expect("coinbase precomputation task should not panic");
                     let precomputed_coinbase = (next_height == precomputed_height)
                         .then_some(precomputed_coinbase)
                         .transpose()
