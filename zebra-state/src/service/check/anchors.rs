@@ -7,8 +7,6 @@ use rayon::prelude::*;
 
 use zebra_chain::{
     block::{Block, Height},
-    ironwood,
-    parameters::NetworkUpgrade,
     sprout,
     transaction::{Hash as TransactionHash, Transaction, UnminedTx},
 };
@@ -139,12 +137,6 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
             })
             .unwrap_or(false)
             && !finalized_state.contains_ironwood_anchor(&ironwood_shielded_data.shared_anchor)
-            && !is_default_ironwood_root_for_activation_mempool_check(
-                finalized_state,
-                parent_chain,
-                height,
-                &ironwood_shielded_data.shared_anchor,
-            )
         {
             return Err(ValidateContextError::UnknownIronwoodAnchor {
                 anchor: ironwood_shielded_data.shared_anchor,
@@ -163,34 +155,6 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
     }
 
     Ok(())
-}
-
-/// Returns true for an activation-height mempool transaction anchored to the default Ironwood root.
-///
-/// Before the NU6.3 activation block is committed, finalized state has not stored an Ironwood tree
-/// or anchor yet. But mempool transactions for the next block are checked while the finalized tip is
-/// still one block before activation, so they must be allowed to anchor to the default Ironwood root.
-fn is_default_ironwood_root_for_activation_mempool_check(
-    finalized_state: &ZebraDb,
-    parent_chain: Option<&Arc<Chain>>,
-    height: Option<Height>,
-    ironwood_anchor: &ironwood::tree::Root,
-) -> bool {
-    // Only mempool checks can need this fallback. Block checks pass a parent
-    // chain and height, and the parent chain already has the activation root.
-    if parent_chain.is_some() || height.is_some() {
-        return false;
-    }
-
-    // Without a finalized tip, there is no next height to compare to the
-    // configured NU6.3 activation height.
-    let Some(finalized_tip_height) = finalized_state.finalized_tip_height() else {
-        return false;
-    };
-
-    finalized_tip_height.next().ok()
-        == NetworkUpgrade::Nu6_3.activation_height(&finalized_state.network())
-        && *ironwood_anchor == ironwood::tree::NoteCommitmentTree::default().root()
 }
 
 /// This function fetches and returns the Sprout final treestates from the state,

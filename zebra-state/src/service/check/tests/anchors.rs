@@ -2,12 +2,6 @@
 
 use std::{ops::Deref, sync::Arc};
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use proptest::{
-    arbitrary::any,
-    strategy::{Strategy, ValueTree},
-    test_runner::TestRunner,
-};
 use zebra_chain::{
     amount::Amount,
     block::{Block, Height},
@@ -16,18 +10,6 @@ use zebra_chain::{
     serialization::ZcashDeserializeInto,
     sprout::{self, JoinSplit},
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
-};
-
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use zebra_chain::{
-    amount::NonNegative,
-    at_least_one, ironwood,
-    parameters::{
-        testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
-        NetworkUpgrade,
-    },
-    primitives::Halo2Proof,
-    transaction::{Hash as TransactionHash, UnminedTxId},
 };
 
 use crate::{
@@ -39,9 +21,6 @@ use crate::{
     tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
     DiskWriteBatch, SemanticallyVerifiedBlock, ValidateContextError,
 };
-
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use crate::{service::finalized_state::FinalizedState, CheckpointVerifiedBlock, Config};
 
 // Sprout
 
@@ -361,81 +340,4 @@ fn check_sapling_anchors() {
     );
 }
 
-// TODO: create a test for orchard anchors
-
-#[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn mempool_allows_default_ironwood_root_at_activation() {
-    let _init_guard = zebra_test::init();
-
-    let network = TestnetParameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            nu6_3: Some(1),
-            ..Default::default()
-        })
-        .expect("configured activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured network is valid");
-
-    let genesis = zebra_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("testnet genesis block deserializes");
-
-    let mut finalized_state = FinalizedState::new_with_debug(
-        &Config::ephemeral(),
-        &network,
-        true,
-        #[cfg(feature = "elasticsearch")]
-        false,
-        false,
-    );
-    finalized_state
-        .commit_finalized_direct(
-            CheckpointVerifiedBlock::from(genesis).into(),
-            None,
-            "default Ironwood root activation test",
-        )
-        .expect("testnet genesis block commits");
-
-    let default_ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
-    assert!(
-        !finalized_state
-            .db
-            .contains_ironwood_anchor(&default_ironwood_root),
-        "the special case should not depend on a stored finalized Ironwood anchor"
-    );
-
-    let mut runner = TestRunner::default();
-    let action = any::<ironwood::AuthorizedAction>()
-        .new_tree(&mut runner)
-        .expect("test action strategy creates a value")
-        .current();
-    let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
-        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
-        shared_anchor: default_ironwood_root,
-        proof: Halo2Proof(vec![]),
-        actions: at_least_one![action],
-        binding_sig: [0u8; 64].into(),
-    };
-    let transaction = Transaction::V6 {
-        network_upgrade: NetworkUpgrade::Nu6_3,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        lock_time: LockTime::unlocked(),
-        expiry_height: Height(1),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood_shielded_data),
-    };
-    let unmined_tx = UnminedTx {
-        transaction: Arc::new(transaction),
-        id: UnminedTxId::from_legacy_id(TransactionHash::from([0; 32])),
-        size: 0,
-        conventional_fee: Amount::<NonNegative>::zero(),
-    };
-
-    tx_anchors_refer_to_final_treestates(&finalized_state.db, None, &unmined_tx)
-        .expect("activation-height mempool transactions can use the default Ironwood root");
-}
+// TODO: create tests for orchard and ironwood anchors
