@@ -196,17 +196,6 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     }
 }
 
-/// How often [`SequencerTask::publish_view`] re-audits the byte budget against a
-/// full work-queue scan.
-///
-/// The audit only feeds the `sync.block.budget.audit_drift` metric — the budget
-/// already keeps an O(1) running counter that the published view uses directly.
-/// `publish_view` runs on every body and control event, and the audit's scan is
-/// O(pending + in_flight), so scanning on each call is quadratic in the backlog
-/// and stalls the commit pipeline once it grows. Sampling on an interval keeps
-/// the drift check while bounding its cost to one scan per interval.
-const BUDGET_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
-
 /// The serial commit-pipeline task. Owns the `Sequencer` (moved out of state), a
 /// `ByteBudget` clone, an `Arc<WorkQueue>` clone, an action sender clone, and the
 /// committed throughput meter. Releases bytes directly and emits `SubmitBlock` /
@@ -217,9 +206,6 @@ pub(super) struct SequencerTask {
     work: Arc<WorkQueue>,
     actions: mpsc::Sender<BlockSyncAction>,
     committed_throughput: ThroughputMeter,
-    /// Next time [`Self::publish_view`] may run the O(n) budget audit; see
-    /// [`BUDGET_AUDIT_INTERVAL`].
-    next_budget_audit: Instant,
     /// Tracks the finalized height so the published view carries it forward; the
     /// reactor folds it into its `finalized_height` mirror with a `max`.
     finalized_height: block::Height,
@@ -256,7 +242,6 @@ impl SequencerTask {
             work,
             actions,
             committed_throughput,
-            next_budget_audit: Instant::now(),
             finalized_height: frontiers.finalized_height,
             verified_block_hash: frontiers.verified_block_hash,
             reset_epoch: 0,
@@ -747,29 +732,23 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
-        let now = Instant::now();
-        self.committed_throughput.sample(now);
+        self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
-        // The budget audit recomputes the reserved total by scanning the whole
-        // work queue (O(pending + in_flight)). Since `publish_view` runs on every
-        // body/control event, keep that scan off the hot path and sample it on an
-        // interval instead (see `BUDGET_AUDIT_INTERVAL`); the published view below
-        // does not depend on it.
-        if now >= self.next_budget_audit {
-            let body_input_bytes = self
-                .body_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let expected_budget = self
-                .work
-                .reserved_bytes()
-                .saturating_add(reorder_buffered_bytes)
-                .saturating_add(applying_buffered_bytes)
-                .saturating_add(body_input_bytes);
-            self.budget
-                .audit(expected_budget, "block-sync sequencer view");
-            self.next_budget_audit = now + BUDGET_AUDIT_INTERVAL;
-        }
+        let body_input_bytes = self
+            .body_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Cross-layer drift check: the independently-maintained `ByteBudget` total
+        // must equal the sum of the component counters. `work.reserved_bytes()` is
+        // now an O(1) counter, so this runs on every event without a work-queue scan.
+        let expected_budget = self
+            .work
+            .reserved_bytes()
+            .saturating_add(reorder_buffered_bytes)
+            .saturating_add(applying_buffered_bytes)
+            .saturating_add(body_input_bytes);
+        self.budget
+            .audit(expected_budget, "block-sync sequencer view");
         let _ = self.view_tx.send_replace(SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,

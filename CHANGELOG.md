@@ -9,17 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
-- Fix a quadratic slowdown in the Zakura block-sync sequencer that stalled the
-  commit pipeline for tens of seconds during checkpoint sync. `publish_view` ran
-  on every body and control event and each time re-derived the reserved-byte
-  total with an O(pending + in_flight) scan of the work queue, purely to feed a
-  budget drift-audit metric. As the apply/commit backlog grew to thousands of
-  blocks, that per-event scan became quadratic and saturated the single sequencer
-  task, starving the commit-compute threads (observed as ~18–30s body-commit
-  freezes around the peak-backlog heights). The published view already uses the
-  budget's O(1) running counter, so the audit's full scan is now sampled at most
-  once per `BUDGET_AUDIT_INTERVAL` (1s) instead of on every event, keeping the
-  drift check while removing it from the hot path.
+- Fix work-queue scans that stalled the Zakura block-sync commit pipeline for
+  tens of seconds during checkpoint sync. When headers race far ahead of the body
+  tip, the sequencer's `WorkQueue` holds the entire lag (100k+ pending heights) in
+  mutex-guarded `BTreeMap`s, and two O(n) operations ran under that lock on the
+  hot path: `reserved_bytes()` (a full scan re-summing reserved request bytes on
+  every `publish_view`, i.e. every body/control event) and `advance_floor()` (a
+  full-map `retain` garbage-collecting committed heights on every floor advance).
+  As the backlog grew these became quadratic, saturating the single sequencer task
+  and serializing the work-queue lock so both commit *and* download stalled
+  (observed as ~12–30s body-commit freezes with peers blocked on the lock). Both
+  are now bounded: `reserved_bytes` is an O(1) incrementally-maintained counter
+  (cross-checked against the independent byte budget by the existing audit), and
+  `advance_floor`/`reset_above` pop only the committed prefix/suffix
+  (O(removed · log n)) instead of scanning the whole map.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
