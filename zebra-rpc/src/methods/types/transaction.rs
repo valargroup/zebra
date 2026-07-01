@@ -153,7 +153,7 @@ impl TransactionTemplate<NegativeOrZero> {
             };
         }
 
-        let add_orchard_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_orchard_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_orchard_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -165,8 +165,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        #[cfg(zcash_unstable = "nu6.3")]
-        let add_ironwood_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_ironwood_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_ironwood_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -178,7 +177,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
                     Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
@@ -190,7 +189,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_transparent_reward = |builder: &mut Builder<'_, _, _>, addr| {
+        let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
             trace_err!(
                 builder.add_transparent_output(addr, miner_reward),
                 "transparent"
@@ -205,22 +204,10 @@ impl TransactionTemplate<NegativeOrZero> {
                     .and_then(|addr| {
                         // Before NU6.3, pay the Orchard receiver via Orchard.
                         if upgrade < NetworkUpgrade::Nu6_3 {
-                            return add_orchard_reward(&mut builder, addr);
+                            add_orchard_reward(&mut builder, addr)
+                        } else {
+                            add_ironwood_reward(&mut builder, addr)
                         }
-
-                        // From NU6.3 on, the Orchard pool is frozen
-                        // (disabled_add_to_orchard_pool), so pay the Orchard receiver
-                        // via Ironwood, which reuses the Orchard address, when Ironwood
-                        // is compiled in.
-                        #[cfg(zcash_unstable = "nu6.3")]
-                        if upgrade >= NetworkUpgrade::Nu6_3 {
-                            return add_ironwood_reward(&mut builder, addr);
-                        }
-
-                        #[cfg(not(zcash_unstable = "nu6.3"))]
-                        let _ = addr;
-
-                        None
                     })
                     .or_else(|| {
                         addr.sapling()
@@ -642,7 +629,7 @@ pub struct JoinSplit {
 pub struct ShieldedSpend {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
     #[serde(with = "hex")]
@@ -666,20 +653,12 @@ pub struct ShieldedSpend {
     spend_auth_sig: [u8; 64],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedSpend {
-    /// The value commitment to the input note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
-}
-
 /// A Sapling output of a transaction.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct ShieldedOutput {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(rename = "cmu", with = "hex")]
@@ -696,14 +675,6 @@ pub struct ShieldedOutput {
     /// A zero-knowledge proof using the Sapling Output circuit.
     #[serde(with = "hex")]
     proof: [u8; 192],
-}
-
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedOutput {
-    /// The value commitment to the output note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
 }
 
 /// Object with Orchard or Ironwood action information.
@@ -1038,7 +1009,7 @@ impl TransactionObject {
                     let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();
 
                     ShieldedSpend {
-                        cv: spend.cv.clone(),
+                        cv: spend.cv,
                         anchor,
                         nullifier,
                         rk,
@@ -1058,7 +1029,7 @@ impl TransactionObject {
                     let out_ciphertext: [u8; 80] = output.out_ciphertext.into();
 
                     ShieldedOutput {
-                        cv: output.cv.clone(),
+                        cv: output.cv,
                         cm_u,
                         ephemeral_key,
                         enc_ciphertext,

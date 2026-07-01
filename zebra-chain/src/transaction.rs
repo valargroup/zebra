@@ -38,7 +38,6 @@ pub use unmined::{
 };
 use zcash_protocol::consensus;
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
@@ -150,7 +149,6 @@ pub enum Transaction {
     },
     /// A `version = 6` transaction, which supports Sapling, Orchard, transparent,
     /// and Ironwood.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     V6 {
         /// The Network Upgrade for this transaction.
         ///
@@ -281,7 +279,6 @@ impl Transaction {
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => None,
             Transaction::V5 { .. } => Some(AuthDigest::from(self)),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Some(AuthDigest::from(self)),
         }
     }
@@ -301,7 +298,6 @@ impl Transaction {
                     crate::primitives::zcash_primitives::txid_and_auth_digest(self);
                 (txid, Some(auth_digest))
             }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => {
                 let (txid, auth_digest) =
                     crate::primitives::zcash_primitives::txid_and_auth_digest(self);
@@ -417,7 +413,6 @@ impl Transaction {
         match self {
             Transaction::V1 { .. } | Transaction::V2 { .. } => false,
             Transaction::V3 { .. } | Transaction::V4 { .. } | Transaction::V5 { .. } => true,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => true,
         }
     }
@@ -440,7 +435,6 @@ impl Transaction {
             Transaction::V3 { .. } => 3,
             Transaction::V4 { .. } => 4,
             Transaction::V5 { .. } => 5,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => 6,
         }
     }
@@ -453,7 +447,6 @@ impl Transaction {
             | Transaction::V3 { lock_time, .. }
             | Transaction::V4 { lock_time, .. }
             | Transaction::V5 { lock_time, .. } => *lock_time,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { lock_time, .. } => *lock_time,
         };
 
@@ -502,7 +495,6 @@ impl Transaction {
             | Transaction::V3 { lock_time, .. }
             | Transaction::V4 { lock_time, .. }
             | Transaction::V5 { lock_time, .. } => *lock_time,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { lock_time, .. } => *lock_time,
         };
         let mut lock_time_bytes = Vec::new();
@@ -540,7 +532,6 @@ impl Transaction {
                 block::Height(0) => None,
                 block::Height(expiry_height) => Some(block::Height(*expiry_height)),
             },
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { expiry_height, .. } => match expiry_height {
                 // # Consensus
                 //
@@ -565,7 +556,6 @@ impl Transaction {
             Transaction::V5 {
                 network_upgrade, ..
             } => Some(*network_upgrade),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 network_upgrade, ..
             } => Some(*network_upgrade),
@@ -582,7 +572,6 @@ impl Transaction {
             Transaction::V3 { ref inputs, .. } => inputs,
             Transaction::V4 { ref inputs, .. } => inputs,
             Transaction::V5 { ref inputs, .. } => inputs,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { ref inputs, .. } => inputs,
         }
     }
@@ -602,7 +591,6 @@ impl Transaction {
             Transaction::V3 { ref outputs, .. } => outputs,
             Transaction::V4 { ref outputs, .. } => outputs,
             Transaction::V5 { ref outputs, .. } => outputs,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { ref outputs, .. } => outputs,
         }
     }
@@ -652,7 +640,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -689,7 +676,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -726,7 +712,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => 0,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => 0,
         }
     }
@@ -767,7 +752,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -805,7 +789,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => None,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => None,
         }
     }
@@ -815,7 +798,6 @@ impl Transaction {
         match self {
             // No JoinSplits
             Transaction::V1 { .. } | Transaction::V5 { .. } => false,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => false,
 
             // JoinSplits-on-BCTV14
@@ -864,7 +846,6 @@ impl Transaction {
             }
             | Transaction::V1 { .. }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -879,7 +860,6 @@ impl Transaction {
                 sapling_shielded_data,
                 ..
             } => sapling_shielded_data.as_ref(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
@@ -904,7 +884,6 @@ impl Transaction {
                 ..
             } => Box::new(sapling_shielded_data.anchors()),
 
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -922,7 +901,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -952,7 +930,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.spends_per_anchor()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -970,7 +947,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -990,7 +966,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.outputs()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1008,7 +983,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -1030,7 +1004,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.nullifiers()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1048,7 +1021,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -1072,7 +1044,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Box::new(sapling_shielded_data.note_commitments()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1090,7 +1061,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -1110,11 +1080,36 @@ impl Transaction {
                 sapling_shielded_data,
                 ..
             } => sapling_shielded_data.is_some(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data,
                 ..
             } => sapling_shielded_data.is_some(),
+        }
+    }
+
+    /// Returns true if every Sapling value commitment and ephemeral public key in
+    /// this transaction is a canonical, non-small-order Jubjub point (or the
+    /// transaction has no Sapling data).
+    ///
+    /// These points are stored as raw bytes with their not-small-order check
+    /// deferred from deserialization, to keep point decompression off the
+    /// checkpoint-sync hot path. The semantic verifier calls this on untrusted
+    /// transactions; the checkpoint verifier trusts block hashes and skips it.
+    pub fn sapling_point_encodings_are_valid(&self) -> bool {
+        match self {
+            Transaction::V4 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            Transaction::V5 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            Transaction::V6 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            _ => true,
         }
     }
 
@@ -1129,7 +1124,6 @@ impl Transaction {
                 orchard_shielded_data,
                 ..
             } => orchard_shielded_data.as_ref(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 orchard_shielded_data,
                 ..
@@ -1186,7 +1180,6 @@ impl Transaction {
     /// regardless of version.
     pub fn ironwood_shielded_data(&self) -> Option<&ironwood::ShieldedData> {
         match self {
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 ironwood_shielded_data,
                 ..
@@ -1315,7 +1308,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -1364,7 +1356,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -1407,7 +1398,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(iter::empty()),
         };
 
@@ -1450,7 +1440,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => sapling_shielded_data.value_balance,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1467,7 +1456,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => Amount::zero(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -1491,7 +1479,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Some(sapling_shielded_data.binding_sig),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1666,7 +1653,6 @@ impl Transaction {
             Transaction::V3 { .. } => Some(OVERWINTER_VERSION_GROUP_ID),
             Transaction::V4 { .. } => Some(SAPLING_VERSION_GROUP_ID),
             Transaction::V5 { .. } => Some(TX_V5_VERSION_GROUP_ID),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Some(TX_V6_VERSION_GROUP_ID),
         }
     }
@@ -1694,7 +1680,6 @@ impl Transaction {
                 *network_upgrade = nu;
                 Ok(())
             }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 ref mut network_upgrade,
                 ..
@@ -1727,7 +1712,6 @@ impl Transaction {
                 ref mut expiry_height,
                 ..
             } => expiry_height,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 ref mut expiry_height,
                 ..
@@ -1743,7 +1727,6 @@ impl Transaction {
             Transaction::V3 { ref mut inputs, .. } => inputs,
             Transaction::V4 { ref mut inputs, .. } => inputs,
             Transaction::V5 { ref mut inputs, .. } => inputs,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { ref mut inputs, .. } => inputs,
         }
     }
@@ -1771,7 +1754,6 @@ impl Transaction {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
             } => Some(&mut sapling_shielded_data.value_balance),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: Some(sapling_shielded_data),
                 ..
@@ -1787,7 +1769,6 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => None,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 sapling_shielded_data: None,
                 ..
@@ -1840,7 +1821,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -1890,7 +1870,6 @@ impl Transaction {
                 ..
             }
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -1910,7 +1889,6 @@ impl Transaction {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
             } => Some(orchard_shielded_data),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
@@ -1924,7 +1902,6 @@ impl Transaction {
                 orchard_shielded_data: None,
                 ..
             } => None,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 orchard_shielded_data: None,
                 ..
@@ -1950,7 +1927,6 @@ impl Transaction {
             Transaction::V5 {
                 ref mut outputs, ..
             } => outputs,
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 ref mut outputs, ..
             } => outputs,
