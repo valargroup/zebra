@@ -8,7 +8,7 @@
 use bincode::Options;
 
 use zebra_chain::{
-    block::Height,
+    block::{merkle::AuthDataRoot, Height},
     orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
@@ -100,15 +100,22 @@ pub struct CommitmentRootsByHeight {
     pub sapling: sapling::tree::Root,
     /// The Orchard note-commitment tree root at this height.
     pub orchard: orchard::tree::Root,
+    /// The ZIP-244 authorizing-data root (`hashAuthDataRoot`) of this block's
+    /// transactions. Stored alongside the note-commitment roots so this node can
+    /// serve it as the co-input needed to authenticate the *predecessor's* roots
+    /// against this block's NU5+ header commitment, without re-reading the body.
+    /// Default/zero below NU5.
+    pub auth_data_root: AuthDataRoot,
 }
 
 impl IntoDisk for CommitmentRootsByHeight {
-    type Bytes = [u8; 64];
+    type Bytes = [u8; 96];
 
     fn as_bytes(&self) -> Self::Bytes {
-        let mut out = [0u8; 64];
+        let mut out = [0u8; 96];
         out[..32].copy_from_slice(&IntoDisk::as_bytes(&self.sapling));
-        out[32..].copy_from_slice(&IntoDisk::as_bytes(&self.orchard));
+        out[32..64].copy_from_slice(&IntoDisk::as_bytes(&self.orchard));
+        out[64..].copy_from_slice(&<[u8; 32]>::from(self.auth_data_root));
         out
     }
 }
@@ -116,9 +123,21 @@ impl IntoDisk for CommitmentRootsByHeight {
 impl FromDisk for CommitmentRootsByHeight {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref();
+        // Backwards compatible with the pre-auth-data 64-byte rows written by an earlier
+        // pre-release build of this database version: those decode with a zero auth-data
+        // root, so the writer falls back to the body-wait path for those heights until
+        // they are re-served with a real root. New rows are 96 bytes.
+        let auth_data_root = if bytes.len() >= 96 {
+            let mut auth_data_root = [0u8; 32];
+            auth_data_root.copy_from_slice(&bytes[64..96]);
+            AuthDataRoot::from(auth_data_root)
+        } else {
+            AuthDataRoot::from([0u8; 32])
+        };
         CommitmentRootsByHeight {
             sapling: sapling::tree::Root::from_bytes(&bytes[..32]),
-            orchard: orchard::tree::Root::from_bytes(&bytes[32..]),
+            orchard: orchard::tree::Root::from_bytes(&bytes[32..64]),
+            auth_data_root,
         }
     }
 }

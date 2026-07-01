@@ -1256,19 +1256,28 @@ mod tests {
             Height(1),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         batch.insert_commitment_roots_by_height(
             &db,
             Height(2),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
-        batch.insert_commitment_roots_by_height(&db, Height(3), &removed_sapling, &removed_orchard);
+        batch.insert_commitment_roots_by_height(
+            &db,
+            Height(3),
+            &removed_sapling,
+            &removed_orchard,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        );
         batch.insert_commitment_roots_by_height(
             &db,
             Height(4),
             &retained_sapling,
             &retained_orchard,
+            &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         );
         db.write_batch(batch)
             .expect("seeding fast-path roots succeeds");
@@ -1376,6 +1385,7 @@ mod tests {
                 Height(height),
                 &sapling_root(height.into()),
                 &orchard_root(height.into()),
+                &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
             );
         }
         db.write_batch(batch)

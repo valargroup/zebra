@@ -695,6 +695,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                         height: Height(i as u32),
                         sapling_root: trees.sapling.root(),
                         orchard_root: trees.orchard.root(),
+                        auth_data_root: blocks[i].block.auth_data_root(),
                     });
                 }
             }
@@ -827,6 +828,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
                         height: Height(i as u32),
                         sapling_root: trees.sapling.root(),
                         orchard_root: trees.orchard.root(),
+                        auth_data_root: blocks[i].block.auth_data_root(),
                     };
                     if i == target {
                         correct_target_root = Some(root.clone());
