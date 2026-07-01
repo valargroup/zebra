@@ -28,7 +28,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL` | `zebrad/src/commands/start/zakura/block_sync_driver.rs` | `5s` → `200ms` | _(this PR)_ | Recycle the checkpoint apply window promptly during checkpoint sync so the finalized writer is not left idle for ~5s between frontier refreshes. |
+| `ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL` | `zebrad/src/commands/start/zakura/block_sync_driver.rs` | `5s` → `200ms` | [#374](https://github.com/valargroup/zebra/pull/374) | Recycle the checkpoint apply window promptly during checkpoint sync so the finalized writer is not left idle for ~5s between frontier refreshes. |
 | `DEFAULT_ZAKURA_BOOTSTRAP_PEERS` | `zebra-network/src/zakura/handler.rs` | empty default → 9 native bootstrap peers | [#376](https://github.com/valargroup/zebra/pull/376) | Let Zakura nodes discover the native P2P network without requiring every operator to configure bootstrap peers manually. |
 | `DEFAULT_ZAKURA_MAX_CONNECTIONS` | `zebra-network/src/zakura/handler.rs` | `32` → `256` | [#376](https://github.com/valargroup/zebra/pull/376) | Raise the native P2P connection envelope for production sync and peer diversity. |
 | `DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES` | `zebra-network/src/zakura/handler.rs` | `8` → `32` | [#376](https://github.com/valargroup/zebra/pull/376) | Allow more simultaneous native control handshakes during bootstrap and peer churn. |
