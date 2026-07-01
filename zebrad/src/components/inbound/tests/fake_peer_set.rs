@@ -314,6 +314,83 @@ async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), crate::BoxError> {
+    let block: Arc<Block> =
+        zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
+    let base_tx = block.transactions[1].clone();
+
+    let (
+        inbound_service,
+        _mempool_guard,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        _peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let source =
+        zebra_network::PeerSource::LegacySocket(SocketAddr::from(([127, 0, 0, 1], 8233)).into());
+
+    for index in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        let mut tx = base_tx.as_ref().clone();
+        *tx.expiry_height_mut() = Height(u32::try_from(index + 1).expect("test index fits in u32"));
+
+        let response = inbound_service
+            .clone()
+            .oneshot(Request::PushTransaction(tx.into(), Some(source.clone())))
+            .await?;
+        assert_eq!(response, Response::Nil);
+    }
+
+    let mut over_cap_tx = base_tx.as_ref().clone();
+    *over_cap_tx.expiry_height_mut() = Height(
+        u32::try_from(MAX_INBOUND_CONCURRENCY_PER_PEER + 1).expect("test index fits in u32"),
+    );
+
+    let error = inbound_service
+        .clone()
+        .oneshot(Request::PushTransaction(
+            over_cap_tx.into(),
+            Some(source.clone()),
+        ))
+        .await
+        .expect_err("peer-caused full queue should be surfaced as overload");
+    assert!(
+        error
+            .downcast_ref::<tower::load_shed::error::Overloaded>()
+            .is_some(),
+        "expected overload error, got {error:?}",
+    );
+
+    for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
+        tx_verifier
+            .expect_request_that(|_| true)
+            .await
+            .respond_error(TransactionError::Other(
+                "test rejects peer-pushed transaction after admission".into(),
+            ));
+    }
+
+    let sync_gossip_result = sync_gossip_task_handle.now_or_never();
+    assert!(
+        sync_gossip_result.is_none(),
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
+    );
+
+    let tx_gossip_result = tx_gossip_task_handle.now_or_never();
+    assert!(
+        tx_gossip_result.is_none(),
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
     // get a block that has at least one non coinbase transaction
     let block: Block = zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
