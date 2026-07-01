@@ -113,8 +113,7 @@ fn format_upgrades(
             Version::new(27, 2, 0),
         )),
         Box::new(add_ironwood_activation_tree::Upgrade),
-        Box::new(rebuild_history_tree::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 9])
+    ] as [Box<dyn DiskFormatUpgrade>; 8])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

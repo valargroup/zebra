@@ -178,11 +178,10 @@ impl ZebraDb {
         //
         // The Ironwood `zcash_history` bump grew the history-tree `Entry` size, so a tip history-tree
         // entry written by a pre-Ironwood Zebra version can no longer be deserialized: any reader of
-        // the history-tree column family panics with a bincode `UnexpectedEof`. The corresponding
-        // format upgrade (`rebuild_history_tree`) rewrites that entry, but it runs in the *background*
-        // upgrade thread spawned just below, which returns immediately and races synchronous readers
-        // that run during state open (non-finalized backup restore, the block-write task, and the
-        // `z_gettreestate` RPC).
+        // the history-tree column family panics with a bincode `UnexpectedEof`. The Ironwood format
+        // upgrade rewrites that entry, but it runs in the *background* upgrade thread spawned just
+        // below, which returns immediately and races synchronous readers that run during state open
+        // (non-finalized backup restore, the block-write task, and the `z_gettreestate` RPC).
         //
         // So we repair the entry *synchronously* here, before the background thread is spawned and
         // before `ZebraDb::new` returns, guaranteeing no reader can observe the old-format entry. The
