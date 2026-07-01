@@ -9,33 +9,39 @@ use proptest::{
     test_runner::TestRunner,
 };
 use zebra_chain::{
-    amount::{Amount, NonNegative},
-    at_least_one,
+    amount::Amount,
     block::{Block, Height},
-    ironwood,
+    primitives::Groth16Proof,
+    sapling,
+    serialization::ZcashDeserializeInto,
+    sprout::{self, JoinSplit},
+    transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
+};
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use zebra_chain::{
+    amount::NonNegative,
+    at_least_one, ironwood,
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
         NetworkUpgrade,
     },
-    primitives::{Groth16Proof, Halo2Proof},
-    sapling,
-    serialization::ZcashDeserializeInto,
-    sprout::{self, JoinSplit},
-    transaction::{
-        Hash as TransactionHash, JoinSplitData, LockTime, Transaction, UnminedTx, UnminedTxId,
-    },
+    primitives::Halo2Proof,
+    transaction::{Hash as TransactionHash, UnminedTxId},
 };
 
 use crate::{
     arbitrary::Prepare,
     service::{
-        check::anchors::tx_anchors_refer_to_final_treestates, finalized_state::FinalizedState,
+        check::anchors::tx_anchors_refer_to_final_treestates,
         write::validate_and_commit_non_finalized,
     },
     tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
-    CheckpointVerifiedBlock, Config, DiskWriteBatch, SemanticallyVerifiedBlock,
-    ValidateContextError,
+    DiskWriteBatch, SemanticallyVerifiedBlock, ValidateContextError,
 };
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use crate::{service::finalized_state::FinalizedState, CheckpointVerifiedBlock, Config};
 
 // Sprout
 
