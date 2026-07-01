@@ -8,13 +8,13 @@ use zebra_chain::{
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
-/// A subtree data type that can hold Sapling or Orchard subtree roots.
+/// A subtree data type that can hold Sapling, Orchard, or Ironwood subtree roots.
 pub type SubtreeRpcData = NoteCommitmentSubtreeData<String>;
 
 /// Response to a `z_getsubtreesbyindex` RPC request.
 ///
-/// Contains the Sapling or Orchard pool label, the index of the first subtree in the list,
-/// and a list of subtree roots and end heights.
+/// Contains the shielded pool label, the index of the first subtree in the
+/// list, and a list of subtree roots and end heights.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetSubtreesByIndexResponse {
     /// The shielded pool to which the subtrees belong.
@@ -28,7 +28,8 @@ pub struct GetSubtreesByIndexResponse {
 
     /// A sequential list of complete subtrees, in `index` order.
     ///
-    /// The generic subtree root type is a hex-encoded Sapling or Orchard subtree root string.
+    /// The generic subtree root type is a hex-encoded shielded subtree root
+    /// string.
     //
     // TODO: is this needed?
     //#[serde(skip_serializing_if = "Vec::is_empty")]
@@ -38,7 +39,7 @@ pub struct GetSubtreesByIndexResponse {
 impl Default for GetSubtreesByIndexResponse {
     fn default() -> Self {
         Self {
-            pool: "sapling | orchard".to_string(),
+            pool: "sapling | orchard | ironwood".to_string(),
             start_index: NoteCommitmentSubtreeIndex(u16::default()),
             subtrees: vec![],
         }
@@ -47,7 +48,7 @@ impl Default for GetSubtreesByIndexResponse {
 
 /// Response to a `z_gettreestate` RPC request.
 ///
-/// Contains hex-encoded Sapling & Orchard note commitment trees and their corresponding
+/// Contains hex-encoded shielded note commitment trees and their corresponding
 /// [`struct@Hash`], [`Height`], and block time.
 ///
 /// The format of the serialized trees represents `CommitmentTree`s from the crate
@@ -60,6 +61,9 @@ impl Default for GetSubtreesByIndexResponse {
 /// whereas in `CommitmentTree`, the vector of ommers is sparse with [`None`] values in the gaps.
 ///
 /// The dense format might be used in future RPCs.
+///
+/// The serialized response omits `ironwood` unless Ironwood tree state is
+/// available for the requested block.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetTreestateResponse {
     /// The block hash corresponding to the treestate, hex-encoded.
@@ -80,7 +84,7 @@ pub struct GetTreestateResponse {
     /// A treestate containing a Sprout note commitment tree, hex-encoded. Zebra
     /// does not support returning it; but the field is here to enable parsing
     /// responses from other implementations.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sprout: Option<Treestate>,
 
     /// A treestate containing a Sapling note commitment tree, hex-encoded.
@@ -88,9 +92,19 @@ pub struct GetTreestateResponse {
 
     /// A treestate containing an Orchard note commitment tree, hex-encoded.
     orchard: Treestate,
+
+    /// A treestate containing an Ironwood note commitment tree, hex-encoded.
+    /// Omitted from the response unless Ironwood tree state is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ironwood: Option<Treestate>,
 }
 
 impl GetTreestateResponse {
+    /// Returns the Ironwood treestate if it was present in the RPC response.
+    pub fn optional_ironwood(&self) -> Option<&Treestate> {
+        self.ironwood.as_ref()
+    }
+
     /// Constructs [`Treestate`] from its constituent parts.
     #[deprecated(note = "Use `new` instead.")]
     pub fn from_parts(
@@ -112,7 +126,6 @@ impl GetTreestateResponse {
                 final_root: None,
             },
         };
-
         Self {
             hash,
             height,
@@ -120,6 +133,9 @@ impl GetTreestateResponse {
             sprout: None,
             sapling,
             orchard,
+            // This deprecated compatibility helper only accepts Sapling and
+            // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
+            ironwood: None,
         }
     }
 
@@ -145,6 +161,7 @@ impl Default for GetTreestateResponse {
             sprout: Default::default(),
             sapling: Default::default(),
             orchard: Default::default(),
+            ironwood: Default::default(),
         }
     }
 }
@@ -154,7 +171,7 @@ impl Default for GetTreestateResponse {
 /// [1]: https://zcash.github.io/rpc/z_gettreestate.html
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Treestate {
-    /// Contains an Orchard or Sapling serialized note commitment tree,
+    /// Contains a shielded serialized note commitment tree,
     /// hex-encoded.
     commitments: Commitments,
 }
@@ -178,21 +195,20 @@ impl Default for Treestate {
     }
 }
 
-/// A wrapper that contains either an Orchard or Sapling note commitment tree.
+/// A wrapper that contains a shielded note commitment tree.
 ///
-/// Note that in the original [`z_gettreestate`][1] RPC, [`Commitments`] also
-/// contains the field `finalRoot`. Zebra does *not* use this field.
+/// `finalRoot` and `finalState` are omitted when a specific tree state is not
+/// available.
 ///
-/// [1]: https://zcash.github.io/rpc/z_gettreestate.html
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Commitments {
-    /// Orchard or Sapling serialized note commitment tree root, hex-encoded.
+    /// Shielded serialized note commitment tree root, hex-encoded.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalRoot")]
     final_root: Option<Vec<u8>>,
-    /// Orchard or Sapling serialized note commitment tree, hex-encoded.
+    /// Shielded serialized note commitment tree, hex-encoded.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalState")]

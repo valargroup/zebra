@@ -275,6 +275,7 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
     let trees = block.trees();
     let trees_sapling = trees.sapling();
     let trees_orchard = trees.orchard();
+    let trees_ironwood = trees.ironwood();
     // We already tested that GetBlockHash is readable with `hash`, so we don't
     // bother unpacking it here
     let previous_block_hash = block.previous_block_hash();
@@ -304,12 +305,47 @@ fn test_get_block_1() -> Result<(), Box<dyn std::error::Error>> {
         difficulty,
         chain_supply,
         value_pools,
-        GetBlockTrees::new(trees_sapling, trees_orchard),
+        trees_ironwood.map_or_else(
+            || GetBlockTrees::new(trees_sapling, trees_orchard),
+            |ironwood| GetBlockTrees::new_with_ironwood(trees_sapling, trees_orchard, ironwood),
+        ),
         previous_block_hash,
         next_block_hash,
     )));
 
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_block_trees_serializes_empty_ironwood() -> Result<(), Box<dyn std::error::Error>> {
+    let trees = GetBlockTrees::new(0, 2);
+    let json = serde_json::to_value(trees)?;
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "orchard": {
+                "size": 2,
+            },
+        })
+    );
+
+    let trees = GetBlockTrees::new_with_ironwood(0, 2, 0);
+    let json = serde_json::to_value(trees)?;
+
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "orchard": {
+                "size": 2,
+            },
+            "ironwood": {
+                "size": 0,
+            },
+        })
+    );
 
     Ok(())
 }
@@ -644,6 +680,9 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_state = obj.sapling().commitments().final_state().clone();
     let orchard_final_state = obj.orchard().commitments().final_state().clone();
+    let ironwood_final_state = obj
+        .optional_ironwood()
+        .and_then(|ironwood| ironwood.commitments().final_state().clone());
     let sprout_final_root = obj
         .sprout()
         .as_ref()
@@ -653,6 +692,17 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         .clone();
     let sapling_final_root = obj.sapling().commitments().final_root().clone();
     let orchard_final_root = obj.orchard().commitments().final_root().clone();
+    let ironwood_final_root = obj
+        .optional_ironwood()
+        .and_then(|ironwood| ironwood.commitments().final_root().clone());
+    let ironwood = if ironwood_final_state.is_some() || ironwood_final_root.is_some() {
+        Some(Treestate::new(Commitments::new(
+            ironwood_final_root,
+            ironwood_final_state,
+        )))
+    } else {
+        None
+    };
 
     let new_obj = GetTreestateResponse::new(
         hash,
@@ -664,6 +714,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         ))),
         Treestate::new(Commitments::new(sapling_final_root, sapling_final_state)),
         Treestate::new(Commitments::new(orchard_final_root, orchard_final_state)),
+        ironwood,
     );
 
     assert_eq!(obj, new_obj);
@@ -697,12 +748,30 @@ fn test_z_get_subtrees_by_index() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         NoteCommitmentSubtreeIndex(start_index),
         vec![SubtreeRpcData {
-            root: subtree_root,
+            root: subtree_root.clone(),
             end_height: zebra_chain::block::Height(subtree_end_height),
         }],
     );
 
     assert_eq!(obj, new_obj);
+
+    let ironwood_json = r#"
+{
+  "pool": "ironwood",
+  "start_index": 0,
+  "subtrees": [
+    {
+      "root": "d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b",
+      "end_height": 1707429
+    }
+  ]
+}
+"#;
+    let ironwood_obj: GetSubtreesByIndexResponse = serde_json::from_str(ironwood_json)?;
+
+    assert_eq!(ironwood_obj.pool(), "ironwood");
+    assert_eq!(ironwood_obj.subtrees()[0].root, subtree_root);
+    assert_eq!(ironwood_obj.subtrees()[0].end_height.0, subtree_end_height);
 
     Ok(())
 }
@@ -887,6 +956,7 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
             binding_sig,
         )
     });
+    let ironwood = tx.ironwood().clone();
     let binding_sig = tx.binding_sig();
     let joinsplit_pub_key = tx.joinsplit_pub_key();
     let joinsplit_sig = tx.joinsplit_sig();
@@ -919,6 +989,7 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
         joinsplit_pub_key,
         joinsplit_sig,
         orchard,
+        ironwood,
         value_balance,
         value_balance_zat,
         size,

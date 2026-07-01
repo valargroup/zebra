@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added Ironwood RPC output for `getblock`, `getrawtransaction`,
+  `z_gettreestate`, and `z_getsubtreesbyindex`.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 
@@ -18,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addresses to Ironwood when the unstable NU6.3 code is compiled in.
 - `getblocktemplate` builds empty templates on PoW-disabled networks when the
   mempool is inactive.
+- Verbose transaction output omits the `ironwood` bundle unless the transaction
+  contains Ironwood shielded data.
 
 ## [9.0.0] - 2026-06-02
 
