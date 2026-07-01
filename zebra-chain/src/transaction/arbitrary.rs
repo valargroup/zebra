@@ -799,12 +799,13 @@ impl Arbitrary for Transaction {
             NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
-            | NetworkUpgrade::Nu6_2 => prop_oneof![
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3 => prop_oneof![
                 Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state)
             ]
             .boxed(),
-            NetworkUpgrade::Nu6_3 | NetworkUpgrade::Nu7 => Self::v5_strategy(ledger_state),
+            NetworkUpgrade::Nu7 => Self::v5_strategy(ledger_state),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Self::v5_strategy(ledger_state),

@@ -900,7 +900,8 @@ where
             | NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
-            | NetworkUpgrade::Nu6_2 => Ok(()),
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -909,7 +910,6 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
