@@ -1832,7 +1832,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
     let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
     let off_curve = [0xffu8; 32];
 
-    let make = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+    let make_shielded_data = |cv: [u8; 32], epk: [u8; 32]| {
         let output = Output {
             cv: ValueCommitment(cv),
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
@@ -1841,51 +1841,79 @@ fn sapling_point_encodings_check_rejects_bad_points() {
             out_ciphertext: WrappedNoteKey([0u8; 80]),
             zkproof: Groth16Proof([0u8; 192]),
         };
+
+        ShieldedData::<sapling::SharedAnchor> {
+            value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+            transfers: TransferData::JustOutputs {
+                outputs: at_least_one![output],
+            },
+            binding_sig: Signature::<Binding>::from([0u8; 64]),
+        }
+    };
+
+    let make_v5 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
         Transaction::V5 {
             network_upgrade: NetworkUpgrade::Nu5,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(0),
             inputs: vec![],
             outputs: vec![],
-            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
-                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
-                transfers: TransferData::JustOutputs {
-                    outputs: at_least_one![output],
-                },
-                binding_sig: Signature::<Binding>::from([0u8; 64]),
-            }),
+            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
             orchard_shielded_data: None,
         }
     };
 
-    // Valid points pass (a dummy proof/binding sig does not affect this check).
-    assert!(
-        make(valid, valid).sapling_point_encodings_are_valid(),
-        "valid cv/epk must pass the encoding check",
-    );
+    let check_transaction =
+        |version_name: &str, make_transaction: &dyn Fn([u8; 32], [u8; 32]) -> Transaction| {
+            // Valid points pass (a dummy proof/binding sig does not affect this check).
+            assert!(
+                make_transaction(valid, valid).sapling_point_encodings_are_valid(),
+                "{version_name} valid cv/epk must pass the encoding check",
+            );
 
-    // A small-order cv is rejected.
-    assert!(
-        !make(small_order, valid).sapling_point_encodings_are_valid(),
-        "small-order cv must be rejected",
-    );
+            // A small-order cv is rejected.
+            assert!(
+                !make_transaction(small_order, valid).sapling_point_encodings_are_valid(),
+                "{version_name} small-order cv must be rejected",
+            );
 
-    // A small-order epk is rejected. This is the isolated, executable proof of
-    // the epk rejection: the check runs independently of proof verification.
-    assert!(
-        !make(valid, small_order).sapling_point_encodings_are_valid(),
-        "small-order epk must be rejected",
-    );
+            // A small-order epk is rejected. This is the isolated, executable proof of
+            // the epk rejection: the check runs independently of proof verification.
+            assert!(
+                !make_transaction(valid, small_order).sapling_point_encodings_are_valid(),
+                "{version_name} small-order epk must be rejected",
+            );
 
-    // Off-curve / non-canonical encodings are rejected for both fields.
-    assert!(
-        !make(off_curve, valid).sapling_point_encodings_are_valid(),
-        "off-curve cv must be rejected",
-    );
-    assert!(
-        !make(valid, off_curve).sapling_point_encodings_are_valid(),
-        "off-curve epk must be rejected",
-    );
+            // Off-curve / non-canonical encodings are rejected for both fields.
+            assert!(
+                !make_transaction(off_curve, valid).sapling_point_encodings_are_valid(),
+                "{version_name} off-curve cv must be rejected",
+            );
+            assert!(
+                !make_transaction(valid, off_curve).sapling_point_encodings_are_valid(),
+                "{version_name} off-curve epk must be rejected",
+            );
+        };
+
+    check_transaction("V5", &make_v5);
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    {
+        let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+            Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                inputs: vec![],
+                outputs: vec![],
+                sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+                orchard_shielded_data: None,
+                ironwood_shielded_data: None,
+            }
+        };
+
+        check_transaction("V6", &make_v6);
+    }
 }
 
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
