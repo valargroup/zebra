@@ -956,7 +956,6 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
             binding_sig,
         )
     });
-    let ironwood = tx.ironwood().clone();
     let binding_sig = tx.binding_sig();
     let joinsplit_pub_key = tx.joinsplit_pub_key();
     let joinsplit_sig = tx.joinsplit_sig();
@@ -989,7 +988,6 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
         joinsplit_pub_key,
         joinsplit_sig,
         orchard,
-        ironwood,
         value_balance,
         value_balance_zat,
         size,

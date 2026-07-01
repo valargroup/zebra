@@ -373,6 +373,7 @@ pub struct TransactionObject {
     /// Ironwood actions of the transaction, omitted when the transaction has no
     /// Ironwood shielded data.
     #[serde(rename = "ironwood", skip_serializing_if = "Option::is_none")]
+    #[new(default)]
     pub(crate) ironwood: Option<Orchard>,
 
     /// The net value of Sapling Spends minus Outputs in ZEC
