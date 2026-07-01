@@ -11,6 +11,7 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
+    ironwood,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
@@ -999,6 +1000,14 @@ fn prune_tree_indexes(
         batch.delete_ironwood_anchor(db, &tree.root());
     }
 
+    if NetworkUpgrade::Nu6_3
+        .activation_height(&db.network())
+        .is_some_and(|activation_height| target_height < activation_height)
+    {
+        let activation_anchor = ironwood::tree::NoteCommitmentTree::default().root();
+        batch.delete_ironwood_anchor(db, &activation_anchor);
+    }
+
     // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
     // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
     // (the exclusive end of the single-index delete range) cannot overflow.
@@ -1055,6 +1064,11 @@ fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use zebra_chain::serialization::ZcashDeserializeInto;
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    use zebra_chain::parameters::testnet::{
+        ConfiguredActivationHeights, Parameters as TestnetParameters,
+    };
 
     use crate::service::finalized_state::disk_format::RawBytes;
 
@@ -1201,5 +1215,106 @@ mod tests {
         delete_zakura_headers_above(&db, &mut batch, Height(3));
         db.write_batch(batch)
             .expect("an empty truncate batch writes cleanly");
+    }
+
+    #[test]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn prune_tree_indexes_removes_standalone_ironwood_activation_anchor_below_activation() {
+        let _init_guard = zebra_test::init();
+
+        let activation_height = Height(1);
+        let network = ironwood_activation_test_network(activation_height);
+        let db = ZebraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        );
+        let (activation_anchor, post_block_anchor) =
+            seed_non_empty_ironwood_activation_tree(&db, activation_height);
+
+        let mut batch = DiskWriteBatch::new();
+        prune_tree_indexes(&db, &mut batch, Height(0), &None);
+        db.write_batch(batch)
+            .expect("pruning below Ironwood activation succeeds");
+
+        assert!(!db.contains_ironwood_anchor(&activation_anchor));
+        assert!(!db.contains_ironwood_anchor(&post_block_anchor));
+    }
+
+    #[test]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn prune_tree_indexes_keeps_ironwood_activation_anchors_at_activation() {
+        let _init_guard = zebra_test::init();
+
+        let activation_height = Height(1);
+        let network = ironwood_activation_test_network(activation_height);
+        let db = ZebraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        );
+        let (activation_anchor, post_block_anchor) =
+            seed_non_empty_ironwood_activation_tree(&db, activation_height);
+
+        let mut batch = DiskWriteBatch::new();
+        prune_tree_indexes(&db, &mut batch, activation_height, &None);
+        db.write_batch(batch)
+            .expect("pruning to Ironwood activation succeeds");
+
+        assert!(db.contains_ironwood_anchor(&activation_anchor));
+        assert!(db.contains_ironwood_anchor(&post_block_anchor));
+    }
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn ironwood_activation_test_network(activation_height: Height) -> Network {
+        TestnetParameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu6_3: Some(activation_height.0),
+                ..Default::default()
+            })
+            .expect("test activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("test network is valid")
+    }
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn seed_non_empty_ironwood_activation_tree(
+        db: &ZebraDb,
+        activation_height: Height,
+    ) -> (ironwood::tree::Root, ironwood::tree::Root) {
+        let mut ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+        let activation_anchor = ironwood_tree.root();
+        ironwood_tree
+            .append(1u64.into())
+            .expect("synthetic Ironwood note commitment fits in the tree");
+        let post_block_anchor = ironwood_tree.root();
+
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_ironwood_anchor(db, &activation_anchor);
+        batch.create_ironwood_tree(db, &activation_height, &ironwood_tree);
+        db.write_batch(batch)
+            .expect("seeding Ironwood activation anchors succeeds");
+
+        assert_ne!(
+            activation_anchor, post_block_anchor,
+            "test must use a non-empty activation block Ironwood tree",
+        );
+        assert!(db.contains_ironwood_anchor(&activation_anchor));
+        assert!(db.contains_ironwood_anchor(&post_block_anchor));
+
+        (activation_anchor, post_block_anchor)
     }
 }

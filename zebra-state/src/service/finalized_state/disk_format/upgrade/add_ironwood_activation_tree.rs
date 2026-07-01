@@ -28,17 +28,25 @@ impl DiskFormatUpgrade for Upgrade {
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<(), CancelFormatChange> {
         if let Some(activation_height) = NetworkUpgrade::Nu6_3.activation_height(&db.network()) {
-            if initial_tip_height >= activation_height
-                && db
+            if initial_tip_height >= activation_height {
+                let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+                let activation_anchor = ironwood_tree.root();
+                let activation_tree_exists = db
                     .ironwood_tree_by_height_range(..=activation_height)
                     .next()
-                    .is_none()
-            {
-                let mut batch = DiskWriteBatch::new();
-                let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
-                batch.create_ironwood_tree(db, &activation_height, &ironwood_tree);
-                db.write_batch(batch)
-                    .expect("backfilling the Ironwood activation tree should always succeed");
+                    .is_some();
+
+                if !activation_tree_exists || !db.contains_ironwood_anchor(&activation_anchor) {
+                    let mut batch = DiskWriteBatch::new();
+                    if activation_tree_exists {
+                        batch.insert_ironwood_anchor(db, &activation_anchor);
+                    } else {
+                        batch.create_ironwood_tree(db, &activation_height, &ironwood_tree);
+                    }
+
+                    db.write_batch(batch)
+                        .expect("backfilling the Ironwood activation tree should always succeed");
+                }
             }
         }
 
