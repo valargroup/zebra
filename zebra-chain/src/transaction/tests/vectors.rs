@@ -22,6 +22,8 @@ use zebra_test::{
 };
 
 use super::super::*;
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use super::ironwood_v6_tx_hash;
 
 lazy_static! {
     pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
@@ -517,32 +519,59 @@ fn zip244_auth_digest() -> Result<()> {
 /// The `native_zip244_matches_librustzcash` property test proves the native
 /// path agrees with the `librustzcash` conversion it replaces; this test pins
 /// both implementations to the independently-published expected outputs, so a
-/// shared bug in the two computations could not pass silently. The vectors are
-/// all v5 transactions, which is the only version the native path handles (v6
-/// falls back to `librustzcash`; tracked in ZCA-734).
+/// shared bug in the two computations could not pass silently.
 #[test]
 fn native_zip244_matches_test_vectors() -> Result<()> {
     let _init_guard = zebra_test::init();
 
     for test in zip0244::TEST_VECTORS.iter() {
-        let tx = test.tx.zcash_deserialize_into::<Transaction>()?;
-
-        let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
-            .expect("test vectors are v5 transactions with a native ZIP-244 digest");
-
-        assert_eq!(txid.0, test.txid, "native txid must match the test vector");
-        assert_eq!(
-            auth_digest.0, test.auth_digest,
-            "native auth digest must match the test vector"
-        );
-
-        // The separate native entry points must agree with the combined one.
-        assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5"), txid);
-        assert_eq!(
-            crate::transaction::zip244::auth_digest(&tx).expect("v5"),
-            auth_digest
-        );
+        assert_native_zip244_matches_test_vector(
+            &test.tx,
+            test.txid,
+            test.auth_digest,
+            "ZIP-244 V5",
+        )?;
     }
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
+        assert_native_zip244_matches_test_vector(
+            test.tx,
+            test.txid,
+            test.auth_digest,
+            test.scenario,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn assert_native_zip244_matches_test_vector(
+    tx_bytes: &[u8],
+    expected_txid: [u8; 32],
+    expected_auth_digest: [u8; 32],
+    vector_name: &str,
+) -> Result<()> {
+    let tx = tx_bytes.zcash_deserialize_into::<Transaction>()?;
+
+    let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+        .expect("test vectors are v5/v6 transactions with native ZIP-244 digests");
+
+    assert_eq!(
+        txid.0, expected_txid,
+        "native txid must match the {vector_name} test vector"
+    );
+    assert_eq!(
+        auth_digest.0, expected_auth_digest,
+        "native auth digest must match the {vector_name} test vector"
+    );
+
+    // The separate native entry points must agree with the combined one.
+    assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5/v6"), txid);
+    assert_eq!(
+        crate::transaction::zip244::auth_digest(&tx).expect("v5/v6"),
+        auth_digest
+    );
 
     Ok(())
 }
