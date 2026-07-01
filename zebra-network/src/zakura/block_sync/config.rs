@@ -135,6 +135,14 @@ pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
 pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = 4 * 1024 * 1024;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
+/// Default weight (percent, `0..=100`) with which a peer's measured reliability — the
+/// fraction of its requests that deliver a body — discounts its BDP-derived cwnd. `100`
+/// applies the full goodput discount (a peer delivering `r` of its requests is expected
+/// to hold `r ×` the cwnd); `0` restores plain BBR (drops do not shrink the cwnd, the
+/// A/B baseline). Unlike vanilla BBR, block-sync treats a dropped request as expensive
+/// (it can stall the contiguous floor for a whole request-timeout), so the drop cost is
+/// folded into the same cwnd formula rather than ignored.
+pub const DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT: u32 = 100;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
@@ -306,6 +314,12 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
+    /// Weight (`0..=100`) with which measured per-peer reliability (the fraction of
+    /// issued requests that deliver a body) discounts the BDP-derived cwnd. `0` is
+    /// plain BBR (drops do not shrink the cwnd); `100` applies the full goodput
+    /// discount so a request-dropping carrier holds proportionally less in flight and
+    /// yields that share of the work to reliable peers.
+    pub bbr_reliability_weight_percent: u32,
     /// Unit the BBR cwnd budgets in-flight work against (`bytes` = header-hinted
     /// reserved body bytes, default; `blocks` = request count, the A/B baseline).
     pub bbr_cwnd_unit: CwndUnit,
@@ -356,6 +370,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
             bbr_min_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
+            bbr_reliability_weight_percent: DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT,
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
@@ -462,6 +477,9 @@ impl ZakuraBlockSyncConfig {
             || self.bbr_delay_gradient_percent < 100
         {
             return Err("bbr gain/threshold percentages must be at least 100");
+        }
+        if self.bbr_reliability_weight_percent > 100 {
+            return Err("bbr_reliability_weight_percent must be at most 100");
         }
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");

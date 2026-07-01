@@ -5,7 +5,8 @@ use proptest::{prop_assert, prop_assert_eq};
 use super::*;
 use super::{
     config::{
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
+        DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FANOUT,
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
         DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
@@ -633,6 +634,113 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
     assert_eq!(window.block_liveness_deadline, Some(third + timeout));
 }
 
+#[test]
+fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
+    // Regression for the destructive-reset zombie: an unproven peer whose single
+    // probe is in flight when a destructive view reset pulls its outstanding must
+    // not stay pinned at the one-probe cap forever. Before the fix, `on_view_changed`
+    // cleared the liveness deadline but left `requests_without_block_progress` at the
+    // cap, so the peer could neither issue another request (want-work gated at
+    // `streak >= cap`) nor ever be disconnected (deadline cleared) — a permanent
+    // zombie holding a live connection.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    assert_eq!(window.requests_without_block_progress, 1);
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    // A destructive reset returns the peer's outstanding to the queue on our
+    // initiative, then runs the reset hook.
+    window.outstanding.clear();
+    window.note_view_reset();
+
+    // The peer can probe again (streak below the cap) and is not left as a zombie
+    // (liveness cleared, so `check_liveness` is `Ok`, and proof state is untouched).
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert!(window.requests_without_block_progress < window.no_progress_request_cap());
+    assert!(!window.has_block_progress());
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Ok,
+        "a reset peer must not carry a phantom liveness deadline",
+    );
+}
+
+#[test]
+fn view_reset_preserves_proof_but_reclears_streak() {
+    // A *proven* peer that is reset keeps its proof (cap stays at the proven value)
+    // but its no-progress streak restarts, since the reset cancelled its in-flight
+    // work on our side.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+    // Prove, then issue further requests that go unanswered before the reset.
+    window.outstanding.push(window_request(2));
+    window.arm_liveness(now + Duration::from_millis(2), timeout);
+    assert!(window.has_block_progress());
+    assert_eq!(window.no_progress_request_cap(), 8);
+
+    window.outstanding.clear();
+    window.note_view_reset();
+
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert!(
+        window.has_block_progress(),
+        "reset must not un-prove a peer"
+    );
+    assert_eq!(window.no_progress_request_cap(), 8);
+}
+
+#[test]
+fn backpressure_extends_liveness_instead_of_disconnecting() {
+    // Regression for the outbound-backpressure false disconnect: when the routine's
+    // outbound queue is full it stops draining inbound, so a would-be liveness
+    // disconnect is attributable to our own write-side congestion, not the peer.
+    // The routine extends the deadline via `extend_liveness_deadline` in that case;
+    // this pins the window mechanism that makes the extension turn a `Disconnect`
+    // back into `Ok`, while still enforcing the cap once the congestion clears.
+    let config = ZakuraBlockSyncConfig::default();
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect,
+        "the deadline has expired: without backpressure this disconnects",
+    );
+
+    // Under local backpressure the routine extends instead of disconnecting.
+    let extended_at = now + timeout;
+    window.extend_liveness_deadline(extended_at, timeout);
+    assert_eq!(window.check_liveness(extended_at), LivenessOutcome::Ok);
+
+    // The extension is bounded: once it too expires (congestion did not clear and no
+    // body arrived), the peer is still disconnected.
+    assert_eq!(
+        window.check_liveness(extended_at + timeout),
+        LivenessOutcome::Disconnect,
+    );
+}
+
 // The old `BlockRangeScheduler` single-pass timeout-retry bias
 // (`scheduler_retry_after_timeout_*`) is removed: the WorkQueue has no
 // per-peer assignment to bias, so a returned height is simply contestable by any
@@ -781,6 +889,10 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
     );
     assert_eq!(
+        default.bbr_reliability_weight_percent,
+        DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT,
+    );
+    assert_eq!(
         default.effective_max_reorder_lookahead_bytes(),
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
@@ -878,6 +990,12 @@ fn config_validate_rejects_degenerate_values() {
 
     config = ZakuraBlockSyncConfig {
         max_requests_without_block_progress: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        bbr_reliability_weight_percent: 101,
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -2470,6 +2588,124 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
             bs_trace::REASON,
             TraceValue::Str("block_sync_no_block_progress"),
         )],
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
+    // Regression: a peer whose probe times out but that then delivers the body late
+    // — after its own outstanding request was already removed, so the body arrives
+    // through the unmatched-queued path — must be credited with block progress and
+    // kept. Before the fix, `accept_unmatched_queued_body` buffered the useful body
+    // without resetting the no-progress streak or proving the peer, so the peer was
+    // disconnected at the liveness deadline despite delivering the block we accepted.
+    let mut config = immediate_body_download_config();
+    config.fanout = 1;
+    // Short request/floor-rescue leash so the probe times out fast; the liveness
+    // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
+    config.request_timeout = Duration::from_millis(300);
+    config.floor_rescue_timeout = Duration::from_millis(120);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x53);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: blocks[0].hash(),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    // The peer receives exactly one probe (the initial unproven budget), which arms
+    // its liveness deadline.
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    // Let that probe time out on the floor-rescue leash: height 1 returns to the
+    // queue and, being unproven, the peer is now gated at its one-probe cap.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The body arrives late, matching no outstanding request → the unmatched-queued
+    // path buffers and forwards it.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block frame encodes"),
+        )
+        .await
+        .expect("late block frame queues");
+
+    // Non-vacuous: the late body was accepted (forwarded for submission).
+    let submitted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => break block.coinbase_height(),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("the late unmatched body is accepted and submitted");
+    assert_eq!(submitted, Some(block::Height(1)));
+
+    // The credited progress must keep the peer alive past the liveness deadline
+    // (1.2s from the probe). Before the fix the peer was disconnected here.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), connection_cancel.cancelled())
+            .await
+            .is_err(),
+        "a peer that delivered an accepted (late) body must not be parked as silent",
     );
 
     reactor_task.abort();

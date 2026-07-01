@@ -482,7 +482,11 @@ impl PeerRoutine {
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
-        self.window.clear_liveness_if_idle();
+        // A destructive reset pulled this peer's outstanding on our initiative, so
+        // its no-progress probe streak must not stay charged: reset it (and clear
+        // the idle liveness deadline) so an unproven peer whose only probe was
+        // in flight at the reset can probe again instead of wedging at its cap.
+        self.window.note_view_reset();
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
     }
@@ -951,7 +955,7 @@ impl PeerRoutine {
         if timed_out.is_empty() {
             return false;
         }
-        self.window.record_timeout();
+        self.window.record_timeout(timed_out.len());
         for outstanding in &timed_out {
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
@@ -972,6 +976,18 @@ impl PeerRoutine {
             LivenessOutcome::Ok => Ok(()),
             LivenessOutcome::Disarm => {
                 self.window.clear_liveness_if_idle();
+                Ok(())
+            }
+            LivenessOutcome::Disconnect if self.session.outbound_capacity() == 0 => {
+                // This is local ordered-stream backpressure, not the peer's request
+                // window. While the outbound queue is full the select loop above does
+                // not drain inbound frames (`if outbound_queue_has_capacity`), so a
+                // useful block may already be waiting behind our own write-side
+                // congestion. Extend the deadline instead of punishing the peer for
+                // our congestion; the no-progress cap still disconnects a genuinely
+                // silent peer once the outbound clears.
+                self.window
+                    .extend_liveness_deadline(now, self.config.effective_liveness_timeout());
                 Ok(())
             }
             LivenessOutcome::Disconnect => {
@@ -1354,6 +1370,17 @@ impl PeerRoutine {
         let _ = self.work.take_in_range(height, height, 1);
         let old_charge = self.work.mark_held_direct(height, serialized_bytes);
         self.budget.release(old_charge);
+
+        // This peer delivered a real, wanted body — count it as block progress even
+        // though it no longer matches an outstanding request (typically a body that
+        // arrived just after its own request timed out). Crediting it resets the
+        // no-progress request streak and proves the peer, so a slow-but-useful peer
+        // is not parked as "silent" after a delivery we accepted. We deliberately do
+        // NOT feed the BBR RTprop/BtlBw estimators here: the originating request was
+        // already removed, so we have no trustworthy send timestamp, and a stale
+        // late-delivery interval would corrupt the rate/latency samples.
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
 
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
@@ -1776,6 +1803,14 @@ impl PeerRoutine {
                 "no_progress_request_cap",
                 u64::from(self.window.no_progress_request_cap()),
             );
+            // The reliability estimate discounts the cwnd used for this admission, so
+            // trace it at request time (not only on delivery): a dropping peer keeps
+            // requesting at a shrinking cwnd, and these rows capture the fall.
+            bs_insert_u64(
+                row,
+                "bbr_reliability_permille",
+                self.window.bbr_reliability_permille(),
+            );
             bs_insert_u64(
                 row,
                 "block_progress_proven",
@@ -1853,6 +1888,11 @@ impl PeerRoutine {
             if let Some(delay_cap) = self.window.bbr_delay_cap() {
                 bs_insert_u64(row, "bbr_delay_cap", delay_cap);
             }
+            bs_insert_u64(
+                row,
+                "bbr_reliability_permille",
+                self.window.bbr_reliability_permille(),
+            );
         });
     }
 

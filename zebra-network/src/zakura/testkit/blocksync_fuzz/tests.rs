@@ -46,6 +46,7 @@ async fn run_checked(
         max_requests_without_block_progress = report.max_requests_without_block_progress,
         max_unproven_requests_without_block_progress =
             report.max_unproven_requests_without_block_progress,
+        min_reliability_permille = report.min_reliability_permille,
         "blocksync fuzz scenario complete",
     );
     assert_core_invariants(&scenario, &outcome, &report, outstanding_slack);
@@ -252,6 +253,43 @@ async fn fuzz_silent_dropping_peer() {
         "silent drops must force re-requests: issued {} requests for {} blocks",
         report.total_requests,
         blocks,
+    );
+}
+
+/// A dropping carrier that the node cannot route around: a fast peer covers only the
+/// lower half of the chain, so the upper half must come from a peer that silently drops
+/// a third of its requests. Those drops time out and age the carrier's goodput EWMA
+/// below 1.0, which the BBR cwnd formula folds into a smaller expected window — the
+/// end-to-end proof (through the real routine) that the reliability discount engages,
+/// complementing the `bbr::bbr_tests` unit coverage. Sync still completes: the discount
+/// never latches the cwnd at zero, so the carrier keeps redeeming its dropped heights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_reliability_discounts_dropping_carrier() {
+    let blocks = 120;
+    let half = block::Height(u32::try_from(blocks).expect("fits") / 2);
+    let dropping = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 0.3,
+            ..ServeProfile::fast()
+        },
+    );
+    // The fast peer can only serve the lower half, forcing the upper half through the
+    // dropping carrier.
+    let mut fast = PeerSpec::fast(2, half);
+    fast.servable_high = half;
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, retry_config(), vec![dropping, fast]);
+    scenario.deadline = Duration::from_secs(90);
+    let (_, report) =
+        run_checked("fuzz_reliability_discounts_dropping_carrier", scenario, 32).await;
+
+    assert!(
+        report.min_reliability_permille < 1000,
+        "a request-dropping carrier must lower its measured reliability (the goodput \
+         discount folded into its BBR cwnd), got {}/1000",
+        report.min_reliability_permille,
     );
 }
 

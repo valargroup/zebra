@@ -14,6 +14,11 @@ const BBR_DELAY_EWMA_ALPHA: f64 = 0.25;
 /// Multiplicative shrink applied to the delay-gradient ceiling on each delivery whose
 /// smoothed round-trip exceeds `RTprop × delay_gradient` (queue building).
 const BBR_DELAY_CAP_DOWN: f64 = 0.9;
+/// EWMA weight for the per-peer reliability estimate — the fraction of issued requests
+/// that turn into a useful body. A completed request pulls it toward 1.0, a timed-out
+/// request toward 0.0. Small enough to average over ~10–20 request outcomes so a brief
+/// blip does not collapse a peer, sustained dropping does.
+const BBR_RELIABILITY_EWMA_ALPHA: f64 = 0.1;
 
 /// A time-windowed set of `f64` samples supporting `min` (RTprop) and `max` (BtlBw)
 /// filters — the BBR-lite estimators. Samples older than `horizon` are pruned on
@@ -79,6 +84,16 @@ struct BbrParams {
     /// the delay-gradient ceiling ratchets the cwnd down (e.g. 1.5 = shrink once the
     /// recent round-trip runs 50% over the uncontended minimum).
     delay_gradient: f64,
+    /// How strongly a peer's measured reliability (goodput fraction) discounts its
+    /// BDP-derived cwnd, in `[0, 1]`. `0` disables the discount (plain BBR, the A/B
+    /// baseline: cwnd ignores drops); `1` applies it fully (a peer that turns only
+    /// `r` of its requests into bodies is expected to hold `r ×` the cwnd). Vanilla
+    /// BBR ignores request failures because on the open internet a loss is a rare
+    /// congestion signal; here a dropped block-sync request is *expensive* (it can
+    /// stall the contiguous floor for a whole request-timeout), so the controller
+    /// folds the drop cost into the same cwnd formula rather than treating every
+    /// carrier as equally reliable.
+    reliability_weight: f64,
 }
 
 impl BbrParams {
@@ -114,6 +129,9 @@ impl BbrParams {
             probe_rtt_interval: config.bbr_probe_rtt_interval,
             probe_rtt_duration: config.bbr_probe_rtt_duration,
             delay_gradient: f64::from(config.bbr_delay_gradient_percent.max(100)) / 100.0,
+            // Clamp to [0, 1]: the discount is `1 - weight × (1 - reliability)`, so a
+            // weight outside the unit interval could drive the factor negative.
+            reliability_weight: f64::from(config.bbr_reliability_weight_percent.min(100)) / 100.0,
         }
     }
 }
@@ -207,6 +225,14 @@ pub(super) struct BbrState {
     /// overshoots the sustainable rate (max-rate and min-RTT can come from different
     /// samples under variable queueing), which would otherwise inflate the cwnd.
     delay_cap: usize,
+    /// EWMA of this peer's request goodput — the fraction of issued requests that turn
+    /// into a useful body. Starts optimistic (`1.0`); each completed request pulls it
+    /// toward 1.0 and each timed-out request toward 0.0. `effective_cwnd` discounts the
+    /// BDP-derived window by this (scaled by `reliability_weight`), so a peer that
+    /// silently drops a share of its requests is *expected* to hold proportionally less
+    /// in flight — which both bounds the requests wasted on it and frees that share of
+    /// the work for more reliable carriers, without a hard disconnect.
+    reliability: f64,
 }
 
 impl BbrState {
@@ -224,6 +250,7 @@ impl BbrState {
             probe_rtt_drained_at: None,
             smoothed_elapsed_secs: None,
             delay_cap: usize::MAX,
+            reliability: 1.0,
             params,
         }
     }
@@ -303,7 +330,28 @@ impl BbrState {
         if self.phase == BbrPhase::ProbeBw {
             self.update_delay_cap(rtt_secs, delivered_bytes);
         }
+        // A completed request is a reliability success (goodput toward 1.0).
+        self.observe_reliability(1.0);
         self.advance_phase(now, inflight);
+    }
+
+    /// Fold a request outcome into the reliability EWMA: `1.0` for a completed request,
+    /// `0.0` for a timed-out one. Kept separate from the cwnd dip so the transient
+    /// congestion response (`dip_on_timeout`) and the persistent goodput memory can
+    /// evolve on their own timescales.
+    fn observe_reliability(&mut self, outcome: f64) {
+        self.reliability += BBR_RELIABILITY_EWMA_ALPHA * (outcome - self.reliability);
+    }
+
+    /// Record `count` requests that expired without delivering a body — each is a
+    /// reliability failure. The multiplicative cwnd dip is applied once per timeout
+    /// batch by [`dip_on_timeout`](Self::dip_on_timeout); this only ages the goodput
+    /// EWMA so a chronically dropping peer keeps a suppressed cwnd even as its
+    /// occasional successes would otherwise fully restore the BDP-derived window.
+    pub(super) fn penalize_reliability(&mut self, count: usize) {
+        for _ in 0..count {
+            self.observe_reliability(0.0);
+        }
     }
 
     /// Size-residual RTprop sample (`Bytes` unit): subtract the body's transmission
@@ -418,7 +466,19 @@ impl BbrState {
     pub(super) fn effective_cwnd(&self) -> usize {
         match self.phase {
             BbrPhase::ProbeRtt => self.params.min_cwnd,
-            BbrPhase::ProbeBw => self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd),
+            BbrPhase::ProbeBw => {
+                let bdp_cwnd = self.cwnd_cap.min(self.delay_cap);
+                // Discount the BDP-derived window by measured reliability: a peer that
+                // turns only `r` of its requests into bodies is expected to hold
+                // `1 - weight × (1 - r)` of the window. `weight = 0` restores plain BBR;
+                // the result is never taken below `min_cwnd`, so even a very unreliable
+                // peer keeps a floor's worth of probing (which is how its reliability
+                // can recover). `bdp_cwnd` is a real, finite cwnd here (`delay_cap`
+                // starts unbounded, so the `min` is `cwnd_cap`).
+                let factor = 1.0 - self.params.reliability_weight * (1.0 - self.reliability);
+                let discounted = rounded_usize(bdp_cwnd as f64 * factor, bdp_cwnd);
+                discounted.max(self.params.min_cwnd)
+            }
         }
     }
 
@@ -491,6 +551,13 @@ impl BbrState {
     /// still unbounded), for tracing.
     pub(super) fn delay_cap(&self) -> Option<usize> {
         (self.delay_cap != usize::MAX).then_some(self.delay_cap)
+    }
+
+    /// Current reliability estimate (goodput fraction) scaled to per-mille (0–1000)
+    /// for the integer JSONL trace. `1000` = every issued request delivered a body.
+    pub(super) fn reliability_permille(&self) -> u64 {
+        // A finite EWMA of values in [0, 1]; clamp defensively before the cast.
+        (self.reliability.clamp(0.0, 1.0) * 1000.0).round() as u64
     }
 }
 
@@ -639,6 +706,117 @@ mod bbr_tests {
         assert_eq!(bbr.phase, BbrPhase::ProbeBw);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
         assert_eq!(bbr.last_probe_rtt_at, Some(t5));
+    }
+
+    #[test]
+    fn reliability_discounts_cwnd_for_a_request_dropping_peer() {
+        // A peer with a healthy BDP target but a run of dropped requests should be
+        // *expected* to hold less in flight: the reliability EWMA falls and discounts
+        // the cwnd below the BDP target, down toward (never below) min_cwnd. This is the
+        // drop cost baked into the cwnd formula — plain BBR would keep the full target.
+        let cfg = bbr_test_config();
+        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+        assert_eq!(bbr.reliability_permille(), 1000);
+
+        // A batch of timed-out requests (the BDP target is untouched; only reliability
+        // ages). `penalize_reliability` is what `record_timeout` feeds per timed-out
+        // request.
+        bbr.penalize_reliability(20);
+        assert!(
+            bbr.reliability_permille() < 1000,
+            "drops must lower the reliability estimate",
+        );
+        let discounted = bbr.effective_cwnd();
+        assert!(
+            discounted < EXPECTED_CWND,
+            "a dropping peer's cwnd must be discounted below the BDP target, got {discounted}",
+        );
+        assert!(
+            discounted >= min_cwnd,
+            "the discount never takes the cwnd below min_cwnd, got {discounted}",
+        );
+    }
+
+    #[test]
+    fn window_record_timeout_shrinks_effective_cwnd() {
+        // The DownloadWindow wiring: `record_timeout(n)` dips once and ages reliability
+        // by `n`, so a batch of timed-out requests shrinks the request-denominated cwnd
+        // the fill loop reads off the window.
+        let cfg = bbr_test_config();
+        let mut window = DownloadWindow::new(&cfg);
+        let t0 = Instant::now();
+        let snapshot = window.delivery_snapshot(t0 - CLEAN_ELAPSED);
+        window.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 0, snapshot);
+        let healthy = window.bbr_effective_cwnd();
+        assert!(healthy > usize::try_from(cfg.bbr_min_cwnd).unwrap());
+
+        window.record_timeout(20);
+        assert!(
+            window.bbr_effective_cwnd() < healthy,
+            "a batch of timed-out requests must shrink the peer's cwnd",
+        );
+    }
+
+    #[test]
+    fn reliability_weight_zero_restores_plain_bbr() {
+        // With the weight disabled the controller ignores drops (the A/B baseline): the
+        // cwnd stays at the BDP target however unreliable the peer is.
+        let cfg = ZakuraBlockSyncConfig {
+            bbr_reliability_weight_percent: 0,
+            ..bbr_test_config()
+        };
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        bbr.penalize_reliability(50);
+        assert_eq!(
+            bbr.effective_cwnd(),
+            EXPECTED_CWND,
+            "weight 0 = plain BBR: request drops do not shrink the cwnd",
+        );
+    }
+
+    #[test]
+    fn reliability_recovers_with_sustained_success() {
+        // Reliability is a moving average, not a latch: after a dropping spell a peer
+        // that starts delivering again climbs back toward the full cwnd. This is why the
+        // discount never latches at min_cwnd — a peer keeps enough window to redeem
+        // itself.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let mut now = Instant::now();
+        record_delivery(&mut bbr, now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+
+        bbr.penalize_reliability(20);
+        let dropped = bbr.effective_cwnd();
+        assert!(dropped < EXPECTED_CWND);
+
+        // Sustained clean deliveries (well inside one ProbeRtt interval) restore it.
+        for _ in 0..60 {
+            now += Duration::from_millis(5);
+            record_delivery(&mut bbr, now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        }
+        assert_eq!(
+            bbr.phase,
+            BbrPhase::ProbeBw,
+            "stay in ProbeBw for this test"
+        );
+        assert!(
+            bbr.effective_cwnd() > dropped,
+            "sustained success must lift the cwnd back up",
+        );
+        assert_eq!(
+            bbr.effective_cwnd(),
+            EXPECTED_CWND,
+            "a fully-redeemed peer regains the full BDP target",
+        );
     }
 
     #[test]

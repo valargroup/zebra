@@ -466,6 +466,12 @@ impl DownloadWindow {
             .map(|cap| u64::try_from(cap).unwrap_or(u64::MAX))
     }
 
+    /// This peer's reliability estimate (goodput fraction) in per-mille (0–1000), for
+    /// tracing the cwnd discount applied to a request-dropping carrier.
+    pub(super) fn bbr_reliability_permille(&self) -> u64 {
+        self.bbr.reliability_permille()
+    }
+
     pub(super) fn available_slots(&self) -> usize {
         self.available_slots_with_bonus(0)
     }
@@ -533,10 +539,14 @@ impl DownloadWindow {
         })
     }
 
-    /// Apply the BBR cwnd dip on a real request timeout (one multiplicative dip,
-    /// bounded by the minimum cwnd).
-    pub(super) fn record_timeout(&mut self) {
+    /// Record `timed_out` requests that expired without delivering a body. Applies the
+    /// BBR cwnd dip once (one multiplicative, min-cwnd-bounded dip per timeout batch)
+    /// and ages the per-peer reliability EWMA once per timed-out request, so a
+    /// chronically dropping peer keeps a suppressed cwnd (and thus takes a smaller
+    /// share of the work) rather than fully recovering on its next success.
+    pub(super) fn record_timeout(&mut self, timed_out: usize) {
         self.bbr.dip_on_timeout();
+        self.bbr.penalize_reliability(timed_out);
     }
 
     pub(super) fn has_block_progress(&self) -> bool {
@@ -585,6 +595,27 @@ impl DownloadWindow {
         if self.outstanding.is_empty() {
             self.block_liveness_deadline = None;
         }
+    }
+
+    /// Reset the per-view no-progress accounting after a destructive view reset.
+    /// The reset returned this peer's outstanding to the queue on *our* initiative
+    /// (a reorg/rollback, not the peer's fault), so the in-flight probe streak must
+    /// not stay charged against it. Clearing `requests_without_block_progress` lets
+    /// an unproven peer probe again instead of wedging at its one-probe cap forever
+    /// (the reset also cleared its liveness deadline, so nothing would ever
+    /// disconnect it). Proof state (`last_block_at`) is preserved.
+    pub(super) fn note_view_reset(&mut self) {
+        self.requests_without_block_progress = 0;
+        self.clear_liveness_if_idle();
+    }
+
+    /// Push the block-liveness deadline out by `timeout`, used when a would-be
+    /// disconnect is attributable to *local* outbound backpressure rather than the
+    /// peer: while our outbound queue is full the routine stops draining inbound, so
+    /// a useful body may be sitting unread. Extending avoids punishing the peer for
+    /// our own write-side congestion.
+    pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
+        self.block_liveness_deadline = Some(now + timeout);
     }
 
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {

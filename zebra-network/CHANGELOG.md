@@ -73,7 +73,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are not delivering accepted block bodies. A peer receives only
   `initial_block_probe_requests` before its first accepted body; after that,
   `max_requests_without_block_progress` is the hard cap before the no-progress
-  liveness deadline disconnects it.
+  liveness deadline disconnects it. The policy only penalises genuine silence: a
+  useful body accepted through the late/unmatched path still counts as progress
+  (so a slow peer whose probe timed out but that then delivered is kept), a
+  destructive view reset clears the probe streak (so an unproven peer whose only
+  probe was in flight at the reset can probe again rather than wedging), and a
+  would-be liveness disconnect caused by *local* outbound backpressure extends
+  the deadline instead of parking the peer.
+- Zakura block-sync BBR now folds per-peer reliability into the cwnd. Vanilla BBR
+  ignores request failures, but a dropped block-sync request is expensive (it can
+  stall the contiguous floor for a whole request-timeout), so the controller tracks
+  each peer's goodput (the fraction of its requests that deliver a body) and
+  discounts its BDP-derived cwnd by it: a carrier that silently drops a share of its
+  requests is expected to hold proportionally less in flight, bounding the requests
+  wasted on it and shifting that share of the work to reliable peers — without a hard
+  disconnect, and self-healing as the peer recovers. Tunable via
+  `bbr_reliability_weight_percent` (`0` = plain BBR, the A/B baseline; `100` = full
+  goodput discount, the default).
 
 ### Fixed
 
