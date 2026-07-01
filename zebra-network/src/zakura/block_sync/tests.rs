@@ -1448,6 +1448,102 @@ fn work_queue_force_cancel_and_owner_timeout_release_once() {
 }
 
 #[test]
+fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
+    // Exercise every ledger transition and assert the O(1) `reserved_bytes` counter
+    // never drifts from the O(n) ground-truth scan.
+    let queue = work_queue_with(
+        0,
+        (1..=6).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
+    );
+    let check = |label: &str| {
+        assert_eq!(
+            queue.reserved_bytes(),
+            queue.reserved_bytes_scanned(),
+            "reserved_bytes counter drifted from scan after {label}"
+        );
+    };
+    // Nothing reserved yet: all pending items are `Released`.
+    assert_eq!(queue.reserved_bytes(), 0);
+    check("seed");
+
+    // take + mark_reserved: Released -> Reserved.
+    let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
+    assert_eq!(taken.len(), 6);
+    assert_eq!(queue.mark_reserved((1..=6).map(block::Height)), 600);
+    assert_eq!(queue.reserved_bytes(), 600);
+    check("mark_reserved");
+
+    // settle: Reserved -> Held drops the reservation for height 1.
+    queue
+        .settle_active_reserved_height(block::Height(1), 80)
+        .expect("height 1 is reserved");
+    assert_eq!(queue.reserved_bytes(), 500);
+    check("settle");
+
+    // mark_held_direct: Reserved -> Held drops height 2's reservation.
+    queue.mark_held_direct(block::Height(2), 90);
+    assert_eq!(queue.reserved_bytes(), 400);
+    check("mark_held_direct");
+
+    // release_heights: Reserved -> Released for height 3.
+    queue.release_heights([block::Height(3)]);
+    assert_eq!(queue.reserved_bytes(), 300);
+    check("release_heights");
+
+    // release_reserved_and_return_items: only the still-reserved height 4 releases.
+    let released = queue.release_reserved_and_return_items([block::Height(4)]);
+    assert_eq!(released, 100);
+    assert_eq!(queue.reserved_bytes(), 200);
+    check("release_reserved_and_return_items");
+
+    // advance_floor drops the committed `<= floor` prefix. Heights 1 (Held) and 2
+    // (Held) contribute no reservation; height 3 is already Released. Only heights
+    // 5 and 6 remain reserved above the new floor.
+    let released = queue.advance_floor(block::Height(4));
+    assert_eq!(released, 0, "heights <= 4 owned no live reservation");
+    assert!(!queue.pending_contains(block::Height(1)));
+    assert!(!queue.in_flight_contains(block::Height(2)));
+    assert_eq!(queue.reserved_bytes(), 200);
+    check("advance_floor");
+
+    // reset_above drops the `> floor` suffix (heights 5 and 6), releasing their
+    // reservations and zeroing the counter.
+    let released = queue.reset_above(block::Height(4));
+    assert_eq!(released, 200);
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert!(!queue.in_flight_contains(block::Height(5)));
+    assert!(!queue.in_flight_contains(block::Height(6)));
+    check("reset_above");
+}
+
+#[test]
+fn work_queue_advance_floor_drops_only_committed_prefix() {
+    let queue = work_queue_with(
+        0,
+        (1..=10).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
+    );
+    // Reserve a contiguous run so we can see the reservation accounting on GC.
+    let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
+    assert_eq!(queue.mark_reserved((1..=10).map(block::Height)), 1000);
+
+    // advance_floor to 4: drops heights 1..=4 (still reserved -> released), keeps 5..=10.
+    let released = queue.advance_floor(block::Height(4));
+    assert_eq!(released, 400, "reserved bytes for the dropped 1..=4 prefix");
+    for h in 1..=4 {
+        assert!(!queue.in_flight_contains(block::Height(h)));
+    }
+    for h in 5..=10 {
+        assert!(queue.in_flight_contains(block::Height(h)));
+    }
+    assert_eq!(queue.reserved_bytes(), 600);
+    assert_eq!(queue.reserved_bytes(), queue.reserved_bytes_scanned());
+
+    // A lower floor is a no-op (floor only advances).
+    assert_eq!(queue.advance_floor(block::Height(2)), 0);
+    assert_eq!(queue.reserved_bytes(), 600);
+}
+
+#[test]
 fn watchdog_after_held_settle_releases_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
@@ -2753,6 +2849,93 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         seq.applying_hash(block::Height(2)),
         Some(distinguishable_decoded_block2.hash())
     );
+}
+
+#[test]
+fn sequencer_applying_counters_match_scan_across_transitions() {
+    // Assert the O(1) applying counters (buffered bytes, submitted count/bytes)
+    // never drift from a full scan across insert / submit / unsubmit / remove /
+    // commit-release / reset.
+    let mut seq = test_sequencer(0, 8);
+    let blocks = mainnet_blocks_1_to_3();
+    let check = |seq: &Sequencer, label: &str| {
+        assert_eq!(
+            seq.applying_buffered_bytes(),
+            seq.applying_buffered_bytes_scanned(),
+            "applying_buffered_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.submitted_applying_count(),
+            seq.submitted_applying_count_scanned(),
+            "submitted_applying_count drifted after {label}"
+        );
+        assert_eq!(
+            seq.submitted_applying_bytes(),
+            seq.submitted_applying_bytes_scanned(),
+            "submitted_applying_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.unsubmitted_applying_count(),
+            seq.applying_len() - seq.submitted_applying_count(),
+            "unsubmitted derivation wrong after {label}"
+        );
+    };
+
+    // Buffer heights 1..=3 with distinct sizes and drain them into `applying`.
+    for (i, block) in blocks.iter().enumerate() {
+        let height = (i + 1) as u32;
+        seq.accept_body(
+            block::Height(height),
+            block.hash(),
+            block.clone(),
+            100 * u64::from(height),
+            peer(0),
+        );
+    }
+    assert_eq!(
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+    assert_eq!(seq.applying_buffered_bytes(), 600);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    check(&seq, "drain");
+
+    // Submit heights 1 and 2.
+    let item1 = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 applying");
+    let _ = seq
+        .prepare_submit(block::Height(2))
+        .expect("height 2 applying");
+    assert_eq!(seq.submitted_applying_count(), 2);
+    assert_eq!(seq.submitted_applying_bytes(), 300);
+    assert_eq!(seq.unsubmitted_applying_count(), 1);
+    check(&seq, "submit 1,2");
+
+    // Roll back the submit for height 1.
+    seq.unsubmit(block::Height(1), item1.token);
+    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.submitted_applying_bytes(), 200);
+    check(&seq, "unsubmit 1");
+
+    // Remove the still-submitted height 2 directly.
+    seq.remove_applying(block::Height(2));
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.applying_buffered_bytes(), 400);
+    check(&seq, "remove submitted 2");
+
+    // Commit through height 1: releases the applied body (height 1) from `applying`.
+    seq.advance_verified_tip(block::Height(1), true);
+    assert_eq!(seq.applying_buffered_bytes(), 300);
+    check(&seq, "advance_verified_tip");
+
+    // Reset drops all applying state and zeroes the counters.
+    seq.reset_to(block::Height(0), false);
+    assert_eq!(seq.applying_buffered_bytes(), 0);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    check(&seq, "reset");
 }
 
 #[test]

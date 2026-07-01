@@ -56,6 +56,12 @@ struct WorkQueueInner {
     floor: block::Height,
     /// Floor clamp for size estimates (overridable for tests).
     floor_estimate_bytes: u64,
+    /// Running sum of `reserved_charge()` across every `pending` + `in_flight`
+    /// item, maintained incrementally at each ledger transition so
+    /// [`WorkQueue::reserved_bytes`] is O(1) instead of an O(pending + in_flight)
+    /// scan on the sequencer's hot path. `debug_assert`s and the throttled budget
+    /// audit cross-check it against the map contents.
+    reserved_bytes: u64,
 }
 
 impl WorkQueueInner {
@@ -91,6 +97,7 @@ impl WorkQueue {
                 in_flight: std::collections::BTreeMap::new(),
                 floor,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
+                reserved_bytes: 0,
             }),
             available: Notify::new(),
         }
@@ -300,6 +307,9 @@ impl WorkQueue {
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             marked = marked.saturating_add(item.estimated_bytes);
         }
+        // Released (0) -> Reserved(estimate): the reserved total grows by exactly
+        // the bytes just marked.
+        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
         marked
     }
 
@@ -314,10 +324,16 @@ impl WorkQueue {
         actual: u64,
     ) -> Option<i128> {
         let mut inner = self.lock();
-        let item = inner.in_flight.get_mut(&height)?;
-        item.budget
-            .is_reserved()
-            .then(|| item.budget.settle(actual))
+        let (reserved_before, delta) = {
+            let item = inner.in_flight.get_mut(&height)?;
+            if !item.budget.is_reserved() {
+                return None;
+            }
+            // Reserved(reserved) -> Held(actual): the reserved charge drops to 0.
+            (item.budget.reserved_charge(), item.budget.settle(actual))
+        };
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
+        Some(delta)
     }
 
     /// Mark a height as directly held after the caller admitted `actual` bytes.
@@ -327,14 +343,19 @@ impl WorkQueue {
     pub(super) fn mark_held_direct(&self, height: block::Height, actual: u64) -> u64 {
         let mut inner = self.lock();
         if let Some(item) = inner.in_flight.get_mut(&height) {
+            // X -> Held(actual): any reserved charge this item still owned is gone.
+            let reserved_before = item.budget.reserved_charge();
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
         }
         if let Some(mut item) = inner.pending.remove(&height) {
+            let reserved_before = item.budget.reserved_charge();
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
             inner.in_flight.insert(height, item);
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
         }
         0
@@ -343,14 +364,18 @@ impl WorkQueue {
     /// Release any live charges for `heights`, exactly once.
     pub(super) fn release_heights(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
         let mut released = 0u64;
+        let mut reserved_removed = 0u64;
         let mut inner = self.lock();
         for height in heights {
             if let Some(item) = inner.in_flight.get_mut(&height) {
+                reserved_removed = reserved_removed.saturating_add(item.budget.reserved_charge());
                 released = released.saturating_add(item.budget.release());
             } else if let Some(item) = inner.pending.get_mut(&height) {
+                reserved_removed = reserved_removed.saturating_add(item.budget.reserved_charge());
                 released = released.saturating_add(item.budget.release());
             }
         }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_removed);
         released
     }
 
@@ -361,15 +386,19 @@ impl WorkQueue {
     ) -> u64 {
         let mut moved = false;
         let mut released = 0u64;
+        let mut reserved_removed = 0u64;
         {
             let mut inner = self.lock();
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
+                    reserved_removed =
+                        reserved_removed.saturating_add(item.budget.reserved_charge());
                     released = released.saturating_add(item.budget.release());
                     inner.pending.insert(height, item);
                     moved = true;
                 }
             }
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_removed);
         }
         if moved {
             self.available.notify_waiters();
@@ -401,10 +430,13 @@ impl WorkQueue {
                     .in_flight
                     .remove(&height)
                     .expect("reserved item exists because it was just checked");
+                // Only reserved items reach here, so the released bytes are exactly
+                // the reserved charge leaving the queue.
                 released = released.saturating_add(item.budget.release());
                 inner.pending.insert(height, item);
                 moved = true;
             }
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         }
         if moved {
             self.available.notify_waiters();
@@ -423,15 +455,32 @@ impl WorkQueue {
         let mut inner = self.lock();
         inner.floor = inner.floor.max(floor);
         let floor = inner.floor;
+        // Pop only the committed `<= floor` prefix from each map. `pending` can hold
+        // the entire header-ahead lag (100k+ heights), so a `retain` over the whole
+        // map on every floor advance is O(total) and serializes the work-queue lock;
+        // popping the prefix is O(removed · log n).
         let mut released = 0u64;
-        for item in inner.pending.range_mut(..=floor).map(|(_, item)| item) {
+        while let Some((&height, _)) = inner.pending.first_key_value() {
+            if height > floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .pending
+                .pop_first()
+                .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
-        for item in inner.in_flight.range_mut(..=floor).map(|(_, item)| item) {
+        while let Some((&height, _)) = inner.in_flight.first_key_value() {
+            if height > floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .in_flight
+                .pop_first()
+                .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
-        inner.pending.retain(|height, _| *height > floor);
-        inner.in_flight.retain(|height, _| *height > floor);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released
     }
 
@@ -444,23 +493,30 @@ impl WorkQueue {
     pub(super) fn reset_above(&self, floor: block::Height) -> u64 {
         let mut inner = self.lock();
         inner.floor = floor;
+        // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
+        // note in `advance_floor` on why a full-map `retain` is too expensive here.
         let mut released = 0u64;
-        for item in inner
-            .pending
-            .range_mut((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
-            .map(|(_, item)| item)
-        {
+        while let Some((&height, _)) = inner.pending.last_key_value() {
+            if height <= floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .pending
+                .pop_last()
+                .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
-        for item in inner
-            .in_flight
-            .range_mut((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
-            .map(|(_, item)| item)
-        {
+        while let Some((&height, _)) = inner.in_flight.last_key_value() {
+            if height <= floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .in_flight
+                .pop_last()
+                .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
-        inner.pending.retain(|height, _| *height <= floor);
-        inner.in_flight.retain(|height, _| *height <= floor);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released
     }
 
@@ -495,7 +551,20 @@ impl WorkQueue {
             })
     }
 
+    /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
+    ///
+    /// O(1): returns the incrementally-maintained counter (see
+    /// [`WorkQueueInner::reserved_bytes`]). This is on the sequencer's hot path via
+    /// `publish_view`, so it must not scan the maps. [`reserved_bytes_scanned`] is
+    /// the O(n) ground-truth recomputation used by the audit / tests to catch drift.
     pub(super) fn reserved_bytes(&self) -> u64 {
+        self.lock().reserved_bytes
+    }
+
+    /// Ground-truth O(pending + in_flight) recomputation of [`reserved_bytes`],
+    /// used by tests to assert the maintained counter never drifts.
+    #[cfg(test)]
+    pub(super) fn reserved_bytes_scanned(&self) -> u64 {
         let inner = self.lock();
         inner
             .pending
