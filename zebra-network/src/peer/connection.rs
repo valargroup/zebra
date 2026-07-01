@@ -44,6 +44,10 @@ use InventoryResponse::*;
 
 mod peer_tx;
 
+/// Consecutive non-ping outbound receive timeouts tolerated before the peer
+/// connection is closed. The first timeout still only fails the request.
+const MAX_CONSECUTIVE_RECEIVE_TIMEOUTS: usize = 4;
+
 #[cfg(test)]
 mod tests;
 
@@ -614,6 +618,9 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Consecutive outbound request receive timeouts, excluding pings.
+    consecutive_receive_timeouts: usize,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -631,6 +638,10 @@ where
             .field("metrics_label", &self.metrics_label)
             .field("last_metrics_state", &self.last_metrics_state)
             .field("last_overload_time", &self.last_overload_time)
+            .field(
+                "consecutive_receive_timeouts",
+                &self.consecutive_receive_timeouts,
+            )
             .finish()
     }
 }
@@ -664,6 +675,7 @@ where
             metrics_label,
             last_metrics_state: None,
             last_overload_time: None,
+            consecutive_receive_timeouts: 0,
         }
     }
 }
@@ -815,6 +827,7 @@ where
                         } else {
                             debug!(error = ?response, "error in peer response to Zebra request");
                         }
+                        self.consecutive_receive_timeouts = 0;
 
                         let _ = tx.send(response.map_err(Into::into));
                     } else {
@@ -924,10 +937,21 @@ where
                                     self.fail_with(e).await;
                                     State::Failed
                                 }
-                                // Other request timeouts fail the request.
+                                // Other request timeouts fail the request at first, then fail
+                                // the connection if the peer keeps timing out.
                                 State::AwaitingResponse { tx, .. } => {
                                     let _ = tx.send(Err(e.into()));
-                                    State::AwaitingRequest
+                                    self.consecutive_receive_timeouts += 1;
+
+                                    if self.consecutive_receive_timeouts
+                                        >= MAX_CONSECUTIVE_RECEIVE_TIMEOUTS
+                                    {
+                                        self.fail_with(PeerError::ConnectionReceiveTimeout)
+                                            .await;
+                                        State::Failed
+                                    } else {
+                                        State::AwaitingRequest
+                                    }
                                 }
                                 _ => unreachable!(
                                     "unexpected failed connection state while AwaitingResponse: client_receiver: {:?}",
