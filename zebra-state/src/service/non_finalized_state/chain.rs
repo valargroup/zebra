@@ -1883,13 +1883,7 @@ impl Chain {
                     &transaction_hash,
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
-                if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                    check::nullifier::add_ironwood_to_non_finalized_chain_unique(
-                        &mut self.ironwood_nullifiers,
-                        ironwood_shielded_data.nullifiers(),
-                        transaction_hash,
-                    )?;
-                }
+                self.update_chain_tip_with(&(ironwood_shielded_data.as_ref(), &transaction_hash))?;
             }
 
             // add key `transaction.hash` and value `(height, tx_index)` to `tx_loc_by_hash`
@@ -2105,12 +2099,10 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 position,
             );
             self.revert_chain_with(&(orchard_shielded_data, transaction_hash), position);
-            if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                check::nullifier::remove_from_non_finalized_chain(
-                    &mut self.ironwood_nullifiers,
-                    ironwood_shielded_data.nullifiers(),
-                );
-            }
+            self.revert_chain_with(
+                &(ironwood_shielded_data.as_ref(), transaction_hash),
+                position,
+            );
         }
 
         // TODO: move these to the shielded UpdateWith.revert...()?
@@ -2500,6 +2492,54 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
             check::nullifier::remove_from_non_finalized_chain(
                 &mut self.orchard_nullifiers,
                 orchard_shielded_data.nullifiers(),
+            );
+        }
+    }
+}
+
+impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for Chain {
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn update_chain_tip_with(
+        &mut self,
+        &(ironwood_shielded_data, revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+    ) -> Result<(), ValidateContextError> {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // We do note commitment tree updates in parallel rayon threads.
+
+            check::nullifier::add_ironwood_to_non_finalized_chain_unique(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
+                *revealing_tx_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if any nullifier is missing from the chain when we try to remove it.
+    ///
+    /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn revert_chain_with(
+        &mut self,
+        &(ironwood_shielded_data, _revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+        _position: RevertPosition,
+    ) {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // Note commitments are removed from the Chain during a fork,
+            // by removing trees above the fork height from the note commitment index.
+            // This happens when reverting the block itself.
+
+            check::nullifier::remove_from_non_finalized_chain(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
             );
         }
     }
