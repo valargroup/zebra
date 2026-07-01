@@ -132,6 +132,16 @@ pub struct Config {
     /// re-syncing from genesis.
     pub storage_mode: StorageMode,
 
+    /// Mirror of `consensus.checkpoint_sync`, set by zebrad at startup.
+    ///
+    /// Whether the node is syncing under checkpoint trust (the default). State-side
+    /// features that are only valid in the checkpoint-trusted range (below the last
+    /// checkpoint) gate on this. It tracks the consensus option rather than being an
+    /// independent state setting, so it is skipped in serde and not exposed as a
+    /// duplicate `[state]` key.
+    #[serde(skip)]
+    pub checkpoint_sync: bool,
+
     // Debug configs
     //
     /// Commit blocks to the finalized state up to this height, then exit Zebra.
@@ -404,6 +414,8 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
+            // Mirrors `consensus.checkpoint_sync` (default true), set by zebrad.
+            checkpoint_sync: true,
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
             debug_skip_non_finalized_state_backup_task: false,
