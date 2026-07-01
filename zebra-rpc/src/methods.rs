@@ -50,6 +50,7 @@ use jsonrpsee::core::{async_trait, RpcResult as Result};
 use jsonrpsee_proc_macros::rpc;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use schemars::JsonSchema;
+use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, watch},
     task::JoinHandle,
@@ -3356,6 +3357,44 @@ impl GetInfoResponse {
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
 pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
+fn deserialize_blockchain_value_pool_balances<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BlockchainValuePoolBalances, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value_pools = Vec::<GetBlockchainInfoBalance>::deserialize(deserializer)?;
+    blockchain_value_pool_balances_from_vec(value_pools)
+}
+
+fn deserialize_optional_blockchain_value_pool_balances<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BlockchainValuePoolBalances>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<GetBlockchainInfoBalance>>::deserialize(deserializer)?
+        .map(blockchain_value_pool_balances_from_vec)
+        .transpose()
+}
+
+fn blockchain_value_pool_balances_from_vec<E>(
+    mut value_pools: Vec<GetBlockchainInfoBalance>,
+) -> std::result::Result<BlockchainValuePoolBalances, E>
+where
+    E: serde::de::Error,
+{
+    match value_pools.len() {
+        5 => value_pools.insert(4, GetBlockchainInfoBalance::ironwood(Amount::zero(), None)),
+        6 => {}
+        len => return Err(E::invalid_length(len, &"five or six value pool balances")),
+    }
+
+    value_pools
+        .try_into()
+        .map_err(|_| E::custom("invalid value pool balance count"))
+}
+
 /// Response to a `getblockchaininfo` RPC request.
 ///
 /// See the notes for the [`Rpc::get_blockchain_info` method].
@@ -3411,6 +3450,7 @@ pub struct GetBlockchainInfoResponse {
 
     /// Value pool balances
     #[serde(rename = "valuePools")]
+    #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
     value_pools: BlockchainValuePoolBalances,
 
     /// Status of network upgrades
@@ -3933,7 +3973,11 @@ pub struct BlockObject {
 
     /// Value pool balances
     #[serde(rename = "valuePools")]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_blockchain_value_pool_balances"
+    )]
     value_pools: Option<BlockchainValuePoolBalances>,
 
     /// Information about the note commitment trees.
