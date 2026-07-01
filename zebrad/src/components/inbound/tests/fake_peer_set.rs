@@ -351,21 +351,18 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
         u32::try_from(MAX_INBOUND_CONCURRENCY_PER_PEER + 1).expect("test index fits in u32"),
     );
 
-    let error = inbound_service
+    let response = inbound_service
         .clone()
         .oneshot(Request::PushTransaction(
             over_cap_tx.into(),
             Some(source.clone()),
         ))
         .await
-        .expect_err("peer-caused full queue should be surfaced as overload");
-    assert!(
-        error
-            .downcast_ref::<tower::load_shed::error::Overloaded>()
-            .is_some(),
-        "expected overload error, got {error:?}",
-    );
+        .expect("over-cap push is refused silently, not surfaced as an error");
+    assert_eq!(response, Response::Nil);
 
+    // Only the admitted transactions reach the verifier. The refused
+    // transaction should not start any additional mempool admission work.
     for _ in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
         tx_verifier
             .expect_request_that(|_| true)
@@ -374,6 +371,7 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
                 "test rejects peer-pushed transaction after admission".into(),
             ));
     }
+    tx_verifier.expect_no_requests().await;
 
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();
     assert!(
