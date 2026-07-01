@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zebra_chain::block;
 
-use super::scenario::{peer_rng, PeerSpec};
+use super::scenario::{peer_rng, DegradeMode, PeerSpec};
 use super::sleep_or_cancel;
 use crate::zakura::testkit::mock_blocksync::SyntheticBlockCorpus;
 use crate::zakura::testkit::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
@@ -68,6 +68,8 @@ async fn serve_loop(
 ) {
     let mut rng = peer_rng(scenario_seed, spec);
     let mut responses: u64 = 0;
+    // Wall-clock anchor for a mid-run `Degrade` (measured from this peer's connect time).
+    let started = tokio::time::Instant::now();
 
     let disconnect = async {
         match disconnect_after {
@@ -95,6 +97,26 @@ async fn serve_loop(
             continue;
         };
         responses = responses.saturating_add(1);
+
+        // A mid-run degradation takes effect once the peer has been connected for
+        // `degrade.at`. `GoSilent` models a peer that wedges (drops everything from now
+        // on); `SlowTo` overrides the serve bandwidth/RTT so the peer keeps delivering but
+        // far more slowly.
+        let degraded_mode = spec
+            .serve
+            .degrade
+            .filter(|degrade| started.elapsed() >= degrade.at)
+            .map(|degrade| degrade.mode);
+        if matches!(degraded_mode, Some(DegradeMode::GoSilent)) {
+            continue;
+        }
+        let (effective_first_block_latency, effective_bandwidth) = match degraded_mode {
+            Some(DegradeMode::SlowTo {
+                base_rtt,
+                bandwidth_bytes_per_sec,
+            }) => (Some(base_rtt), Some(bandwidth_bytes_per_sec.max(1))),
+            _ => (None, spec.serve.bandwidth_bytes_per_sec),
+        };
 
         // Silent drop: no response at all, exercising the node's request-timeout path.
         let drop_p = spec.serve.drop_probability.clamp(0.0, 1.0);
@@ -140,18 +162,23 @@ async fn serve_loop(
             blocks.reverse();
         }
 
-        if !spec.serve.first_block_is_zero() {
-            let delay = spec.serve.first_block_latency.sample(&mut rng);
-            if sleep_or_cancel(shutdown, delay).await {
-                return;
+        // The first-block delay is the degraded base RTT when slowed, else the profile's.
+        let first_block_delay = match effective_first_block_latency {
+            Some(rtt) => rtt,
+            None if !spec.serve.first_block_is_zero() => {
+                spec.serve.first_block_latency.sample(&mut rng)
             }
+            None => Duration::ZERO,
+        };
+        if !first_block_delay.is_zero() && sleep_or_cancel(shutdown, first_block_delay).await {
+            return;
         }
 
         let mut returned = 0u32;
         for (_, block, block_bytes) in &blocks {
             // Byte-accurate serve when a bandwidth is set: the block's transmission time
             // is `bytes / bandwidth`. Otherwise fall back to the fixed per-block latency.
-            let per_block_delay = match spec.serve.bandwidth_bytes_per_sec {
+            let per_block_delay = match effective_bandwidth {
                 Some(bandwidth) => Duration::from_secs_f64(*block_bytes as f64 / bandwidth as f64),
                 None if !spec.serve.per_block_is_zero() => {
                     spec.serve.per_block_latency.sample(&mut rng)

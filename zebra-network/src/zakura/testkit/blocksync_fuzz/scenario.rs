@@ -57,6 +57,33 @@ pub(crate) struct IdleGap {
     pub(crate) duration: Duration,
 }
 
+/// A mid-run change to how a peer serves, applied once the peer has been connected for
+/// `at`. Models a peer that was healthy and then degrades partway through a sync — the
+/// two cases the failure mechanism must distinguish: a peer that *wedges* (goes silent,
+/// must be disconnected) versus one that becomes *radically slower* but keeps delivering
+/// (must be kept, only weaker).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Degrade {
+    /// Elapsed time since this peer connected after which `mode` takes effect.
+    pub(crate) at: Duration,
+    pub(crate) mode: DegradeMode,
+}
+
+/// What a [`Degrade`] switches a peer to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DegradeMode {
+    /// Silently drop every subsequent request (the peer wedges / dies). The node must
+    /// seal it off and disconnect it via the liveness timer.
+    GoSilent,
+    /// Switch to a finite serve bandwidth (bytes/sec) behind a fixed base RTT: the peer
+    /// keeps delivering but far more slowly. The node must keep it (its cwnd/params just
+    /// shrink), not disconnect it.
+    SlowTo {
+        base_rtt: Duration,
+        bandwidth_bytes_per_sec: u64,
+    },
+}
+
 /// How a synthetic peer answers the node's `GetBlocks`. This is where slow / fast /
 /// idle / withholding / reordering peers are realised; the node's real `PeerRoutine`
 /// reacts to whatever this produces.
@@ -85,6 +112,9 @@ pub(crate) struct ServeProfile {
     pub(crate) withhold: Option<(block::Height, block::Height)>,
     /// Serve the blocks of a response in reverse order, exercising the reorder buffer.
     pub(crate) reorder: bool,
+    /// Optional mid-run degradation (wedge or slow-down) applied once the peer has been
+    /// connected for [`Degrade::at`].
+    pub(crate) degrade: Option<Degrade>,
 }
 
 impl ServeProfile {
@@ -98,6 +128,7 @@ impl ServeProfile {
             drop_probability: 0.0,
             withhold: None,
             reorder: false,
+            degrade: None,
         }
     }
 

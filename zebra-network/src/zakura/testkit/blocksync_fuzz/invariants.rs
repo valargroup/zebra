@@ -54,6 +54,18 @@ pub(crate) struct InvariantReport {
     /// a value below `1000` proves the reliability discount engaged end-to-end for a
     /// request-dropping carrier.
     pub(crate) min_reliability_permille: u64,
+    /// The last per-peer byte cwnd observed in the run (`bbr_cwnd_bytes`, byte unit only),
+    /// across `block_body_received` and `block_peer_bbr` heartbeat rows. Paired with
+    /// [`peak_cwnd_bytes`](Self::peak_cwnd_bytes) it shows a peer whose bandwidth dropped
+    /// mid-run settling to a *smaller* window (the controller adapting — "kept but
+    /// weaker") rather than being cut off. `0` if the field never appeared.
+    pub(crate) final_cwnd_bytes: u64,
+    /// The last reliability (goodput per-mille) observed in the run. Unlike
+    /// [`min_reliability_permille`](Self::min_reliability_permille) (which captures the
+    /// deepest transient trough), this is the settled value — a peer that slowed but keeps
+    /// delivering recovers here as its late bodies credit back, distinguishing it from a
+    /// wedged peer whose reliability stays collapsed.
+    pub(crate) final_reliability_permille: u64,
 }
 
 /// Extract the report from a flushed trace reader.
@@ -126,6 +138,23 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter_map(|row| u64_field(row, "bbr_reliability_permille"))
         .min()
         .unwrap_or(1000);
+    // The byte cwnd emitted last in the run — the settled window after any mid-run
+    // bandwidth change. `block_peer_bbr` heartbeats keep this fresh even when a peer stops
+    // completing deliveries.
+    let final_cwnd_bytes = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .rev()
+        .find_map(|row| u64_field(row, "bbr_cwnd_bytes"))
+        .unwrap_or(0);
+    let final_reliability_permille = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .rev()
+        .find_map(|row| u64_field(row, "bbr_reliability_permille"))
+        .unwrap_or(1000);
 
     InvariantReport {
         state_samples: state_rows.len(),
@@ -141,6 +170,8 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         peak_inflight_bytes,
         peak_cwnd_requests,
         min_reliability_permille,
+        final_cwnd_bytes,
+        final_reliability_permille,
     }
 }
 

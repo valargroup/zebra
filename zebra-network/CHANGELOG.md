@@ -86,10 +86,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each peer's goodput (the fraction of its requests that deliver a body) and
   discounts its BDP-derived cwnd by it: a carrier that silently drops a share of its
   requests is expected to hold proportionally less in flight, bounding the requests
-  wasted on it and shifting that share of the work to reliable peers — without a hard
-  disconnect, and self-healing as the peer recovers. Tunable via
-  `bbr_reliability_weight_percent` (`0` = plain BBR, the A/B baseline; `100` = full
-  goodput discount, the default).
+  wasted on it and shifting that share of the work to reliable peers, and self-healing
+  as the peer recovers. Tunable via `bbr_reliability_weight_percent` (`0` = plain BBR,
+  the A/B baseline; `100` = full goodput discount, the default).
+- The reliability discount now **ramps the effective window to zero** for a peer that
+  stops turning requests into bodies (the discount is applied after, not floored at,
+  the minimum window). This is a fast-acting seal — a sealed peer receives no new work,
+  and the generous no-progress liveness timer then decides whether it is actually dead.
+  A peer that is merely *slow but still delivering* is never sealed: a body that arrives
+  late (after its own request already timed out) credits its reliability back, offsetting
+  the timeout charge, so a sudden-bandwidth-drop peer keeps a reduced-but-nonzero window
+  (kept, weaker) instead of being cut off.
+- Short block-sync responses now count against reliability: the missing heights of a
+  `BlocksDone` that returns fewer bodies than requested, or a `RangeUnavailable`, age
+  the goodput EWMA (without a cwnd dip — a short response is a goodput failure, not a
+  congestion signal), so a peer cannot deliver one body per request to keep its
+  liveness/no-progress accounting reset while dropping the rest of every range.
+- The BBR base-round-trip / delivery-rate windows are now filtered against the current
+  time at read time, not only pruned on insert, so a peer that was fast and then stops
+  completing requests no longer keeps advertising a stale-low round-trip / stale-high
+  rate past the window horizon (which had kept it looking like a fast floor server and
+  tightened its request deadlines).
+- Under the byte cwnd unit, a request's byte reservation is now bounded by the peer's
+  remaining window bytes (window − reserved, plus the bounded floor bypass), so a peer
+  whose window is nearly full can no longer issue a large multi-body request that
+  overshoots it — the byte cwnd is a real admission limit, not just a non-empty gate.
 - Retuned the Zakura block-sync BBR cold start for a conservative start and a faster
   ramp, now that the reliability discount and delay-gradient ceiling backstop an
   over-eager window: lowered `bbr_min_cwnd_bytes` from 4 MiB to ≈2.5 MB (one max block

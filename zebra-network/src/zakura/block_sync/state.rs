@@ -412,27 +412,32 @@ impl DownloadWindow {
         (self.outstanding_reserved_bytes() / outstanding).max(1)
     }
 
-    /// The current RTprop estimate in milliseconds, for tracing.
-    pub(super) fn bbr_rtprop_ms(&self) -> Option<u64> {
-        self.bbr.rtprop_ms()
+    /// The current RTprop estimate in milliseconds (windowed min as of `now`), for
+    /// tracing and floor-server preference. Filtering by `now` means a deteriorating
+    /// peer whose only fast samples have aged past the horizon reports `None` (treated as
+    /// the worst floor server) rather than a stale-low RTprop.
+    pub(super) fn bbr_rtprop_ms(&self, now: Instant) -> Option<u64> {
+        self.bbr.rtprop_ms(now)
     }
 
     /// The current BtlBw estimate in milli-blocks/sec (blocks/sec × 1000), for tracing.
     /// `None` under `Bytes`, where [`bbr_btlbw_bytes_per_sec`](Self::bbr_btlbw_bytes_per_sec)
     /// is the meaningful rate.
-    pub(super) fn bbr_btlbw_milliblocks(&self) -> Option<u64> {
+    pub(super) fn bbr_btlbw_milliblocks(&self, now: Instant) -> Option<u64> {
         matches!(self.cwnd_unit, CwndUnit::Blocks)
-            .then(|| self.bbr.btlbw_milliblocks_per_sec())
+            .then(|| self.bbr.btlbw_milliblocks_per_sec(now))
             .flatten()
     }
 
-    /// The current BtlBw estimate in bytes/sec under `Bytes` (`None` under `Blocks`).
-    pub(super) fn bbr_btlbw_bytes_per_sec(&self) -> Option<u64> {
+    /// The current BtlBw estimate in bytes/sec under `Bytes` (`None` under `Blocks`), as
+    /// of `now`. Filtering by `now` keeps a stale-high rate from tightening the
+    /// above-floor request deadline after the peer has stopped delivering.
+    pub(super) fn bbr_btlbw_bytes_per_sec(&self, now: Instant) -> Option<u64> {
         if !matches!(self.cwnd_unit, CwndUnit::Bytes) {
             return None;
         }
         self.bbr
-            .btlbw_units_per_sec()
+            .btlbw_units_per_sec(now)
             // A non-negative finite bytes/sec rate rounds into u64 for any real link.
             .map(|rate| rate.round() as u64)
     }
@@ -530,6 +535,26 @@ impl DownloadWindow {
         }
     }
 
+    /// Remaining cwnd **byte** headroom for a take under [`CwndUnit::Bytes`]: the byte
+    /// window (plus `bonus` representative bodies of floor-bypass headroom) less the bytes
+    /// already reserved across in-flight requests. `None` under [`CwndUnit::Blocks`],
+    /// where the window is a request count enforced by [`available_slots_with_bonus`] and
+    /// the per-request count cap, not a byte ceiling.
+    ///
+    /// Feeding this as the byte cap of the work-queue take is what makes the byte cwnd an
+    /// actual admission limit (spec: outstanding reserved bytes must not exceed the
+    /// window) rather than merely a nonzero gate — so a small window cannot issue a large
+    /// multi-body request. The take still always admits its first item to guarantee floor
+    /// progress, so the only permitted overshoot is that single unavoidable body.
+    pub(super) fn cwnd_byte_headroom(&self, bonus: usize) -> Option<u64> {
+        match self.cwnd_unit {
+            CwndUnit::Blocks => None,
+            // `available_slots_with_bonus` already returns the remaining byte headroom
+            // (cwnd bytes + bonus bodies − reserved) under `Bytes`.
+            CwndUnit::Bytes => Some(self.available_slots_with_bonus(bonus) as u64),
+        }
+    }
+
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
@@ -547,6 +572,25 @@ impl DownloadWindow {
     pub(super) fn record_timeout(&mut self, timed_out: usize) {
         self.bbr.dip_on_timeout();
         self.bbr.penalize_reliability(timed_out);
+    }
+
+    /// Age the reliability EWMA once per height a short response failed to deliver
+    /// (a `BlocksDone` terminator or `RangeUnavailable` that left heights missing).
+    /// Unlike a timeout this does *not* dip the cwnd — a short response is a goodput
+    /// failure, not a latency/congestion signal — but it must still count against
+    /// reliability so a peer cannot deliver one body per request to keep its liveness
+    /// and no-progress accounting reset while silently dropping the rest of every range.
+    pub(super) fn penalize_short_response(&mut self, missing: usize) {
+        self.bbr.penalize_reliability(missing);
+    }
+
+    /// Credit the reliability EWMA for a body that arrived *late* — after its own request
+    /// had already timed out (and been charged as a failure). The peer delivered, just
+    /// slowly, so this offsets that charge: a suddenly-slower peer whose fast-window
+    /// backlog drains past the per-request deadline stays "weaker but kept" instead of
+    /// being sealed like a dropping/wedged peer (which sends no late body to credit).
+    pub(super) fn credit_late_delivery(&mut self) {
+        self.bbr.credit_late_success();
     }
 
     pub(super) fn has_block_progress(&self) -> bool {

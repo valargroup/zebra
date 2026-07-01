@@ -66,18 +66,28 @@ BBR/code identifier follows in parentheses.
 ## Measured signals (per peer)
 
 - **Base round-trip** — windowed _min_ of the raw request round-trip
-  (`bbr_rtprop_window`, 10 s). The propagation floor; never collapses to zero.
+  (`bbr_rtprop_window`, 10 s). The propagation floor; never collapses to zero. The
+  min/max windows MUST be filtered against the current time at _read_ time, not only
+  pruned on insert, so a peer that was fast and then stops completing requests does not
+  keep advertising a stale-low base round-trip / stale-high BDR past the horizon (which
+  would keep it looking like a fast floor server and tighten its deadlines).
 - **BDR** — windowed _max_ of the per-response delivery rate in bytes/s
-  (`bbr_delivery_rate_window`, 10 s).
+  (`bbr_delivery_rate_window`, 10 s), read with the same freshness filter.
 - **BDP** = `BDR × base round-trip` (bytes). Window target =
   `max(min window, BDP × gain × reliability_factor)` (`gain = 300%`).
 - **Delay gradient** — a smoothed round-trip compared against a size-aware healthy
   baseline (`base round-trip + bytes/BDR`), used to detect a building queue.
 - **Reliability** — a per-peer EWMA of request _goodput_: the fraction of issued
-  requests that deliver a body (α = 0.1, ~10-outcome memory). Starts optimistic (1.0);
-  a completed request pulls it toward 1.0, a timed-out request toward 0.0. The base
-  round-trip and BDR are min/max filters over _completed_ requests, so they cannot see
-  drops — reliability is the separate signal that does.
+  requests that deliver a body (α = 0.1, ~10-outcome memory). Starts optimistic (1.0).
+  It pulls toward 1.0 on a completed request and toward 0.0 on each request that fails
+  to deliver — a timeout **and** the missing heights of a short response (`BlocksDone`
+  with fewer bodies than requested, or `RangeUnavailable`), so a peer cannot deliver one
+  body per request to keep its liveness/no-progress accounting reset while dropping the
+  rest of every range. A body that arrives _late_ (after its own request already timed
+  out) credits reliability back, because the peer did deliver — just slowly; this is what
+  distinguishes a slow peer from a wedged one. The base round-trip and BDR are min/max
+  filters over _completed_ requests, so they cannot see drops — reliability is the
+  separate signal that does.
 
 In-flight admission compares a peer's **reserved body bytes** against its window; the
 in-flight _request count_ falls out as `window ÷ body size`.
@@ -111,10 +121,16 @@ in-flight _request count_ falls out as `window ÷ body size`.
   stall the contiguous floor for a whole request-timeout), so the drop cost is folded
   into the same window formula: a carrier that turns only `r` of its requests into
   bodies is expected to hold `r ×` the window, bounding requests wasted on it and
-  removing it from floor-carrier preference as it saturates. The scale is floored at the
-  minimum window (a peer always keeps a probe's worth to redeem itself) and, being an
-  EWMA, self-heals as the peer recovers. This is a persistent goodput memory,
-  complementing the transient `×0.85` dip above.
+  removing it from floor-carrier preference as it saturates. Unlike the BDP floor, the
+  reliability factor is applied _after_ the minimum-window floor and **MAY ramp the
+  effective window all the way to zero** — the fast-acting seal on a peer that stops
+  turning requests into bodies. A sealed peer receives no new work; the generous
+  liveness timer (below) then decides whether it is actually dead. Being an EWMA the
+  factor self-heals as a peer recovers, so a peer that is merely _slow but still
+  delivering_ is never sealed: every completion (and every late-arriving body, which
+  credits reliability back — see the slow-vs-wedged edge case) keeps `r` up, so only its
+  measured BDP shrinks. This is a persistent goodput memory, complementing the transient
+  `×0.85` dip above.
 
 ---
 
@@ -129,11 +145,13 @@ floor.
 - The BDP MUST be sized from the **raw** round-trip minimum, never a
   transmission-stripped residual (the residual is used only by the delay gate, so a
   big body's honest transfer time is not mistaken for a queue).
-- The window MUST be floored at `bbr_min_cwnd_bytes` (≈2.5 MB — one max block plus
-  headroom, the primary concurrency lever) so a near-zero BDP still keeps the pipe
-  primed. The floor is sized to just fit a single worst-case body: a freshly-proven
+- The **BDP-derived** window MUST be floored at `bbr_min_cwnd_bytes` (≈2.5 MB — one max
+  block plus headroom, the primary concurrency lever) so a near-zero BDP still keeps the
+  pipe primed. The floor is sized to just fit a single worst-case body: a freshly-proven
   peer then rides its own measured BDP up via the 300% gain rather than teleporting to
-  a multi-megabyte burst — a conservative start paired with a faster ramp.
+  a multi-megabyte burst — a conservative start paired with a faster ramp. This floor
+  bounds the BDP/cold-start term only; the reliability discount is applied _after_ it and
+  MAY drive the effective window below the floor to zero (the seal).
 
 ### Problem: a burst of buffered bodies inflates the BDR
 
@@ -167,6 +185,11 @@ land fast.
 - The advertised request-count cap (≤ `MAX_BS_INFLIGHT_REQUESTS = 32 768`) MUST bind
   even when byte headroom remains, so a peer serving tiny bodies cannot be issued an
   unbounded request count.
+- A request's byte reservation MUST be bounded by the peer's **remaining window bytes**
+  (window − reserved, plus the floor bypass), not merely gated by "window is non-empty":
+  the work-queue take is capped by that remaining headroom so a small window cannot fund
+  a large multi-body request. The one exception is the single always-taken item that
+  guarantees floor progress — the only permitted overshoot, and only for the floor.
 - The reorder look-ahead and the serving-request heap MUST be bounded.
 
 ### Problem: an unbounded wait wedges a peer
@@ -198,6 +221,24 @@ probe-first no-progress policy:
   - a would-be liveness disconnect attributable to **local** outbound backpressure
     (our outbound queue is full, so we stopped draining inbound) MUST extend the
     deadline instead of disconnecting the peer for our own write-side congestion.
+
+### Problem: distinguishing a wedged peer from a merely-slow one
+
+Both a wedged peer and a suddenly-slower peer miss deadlines; only the wedged one should
+be disconnected. The design keeps these apart without a slowness-based disconnect:
+
+- **Wedged** (stops delivering): its completions cease, so reliability collapses and the
+  window ramps to zero (the seal) — it receives no new work. It also makes no accepted
+  block progress, so the generous liveness deadline (`request_timeout ×
+  BLOCK_PROGRESS_TIMEOUT_REQUESTS`) elapses and disconnects it. The reliability seal is
+  the _fast_ reaction; the liveness timer is the _authority_ on death.
+- **Slow but delivering** (a sudden bandwidth drop): every body still arrives, just late.
+  Each completion is a reliability success, and a body accepted through the late/unmatched
+  path credits reliability back to offset the timeout its own request was charged — so a
+  slow peer is **not** sealed. Its measured BDP shrinks, so its window adapts _downward_
+  (kept, but weaker); its late bodies keep resetting the liveness deadline, so it is not
+  disconnected. Freshening the base-round-trip/BDR filters (above) is what keeps a
+  now-slow peer's deadline from being tightened by its own stale-fast estimates.
 
 ### Observability — SHOULD
 
