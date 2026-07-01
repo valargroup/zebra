@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Fix a quadratic slowdown in the Zakura block-sync sequencer that stalled the
+  commit pipeline for tens of seconds during checkpoint sync. `publish_view` ran
+  on every body and control event and each time re-derived the reserved-byte
+  total with an O(pending + in_flight) scan of the work queue, purely to feed a
+  budget drift-audit metric. As the apply/commit backlog grew to thousands of
+  blocks, that per-event scan became quadratic and saturated the single sequencer
+  task, starving the commit-compute threads (observed as ~18–30s body-commit
+  freezes around the peak-backlog heights). The published view already uses the
+  budget's O(1) running counter, so the audit's full scan is now sampled at most
+  once per `BUDGET_AUDIT_INTERVAL` (1s) instead of on every event, keeping the
+  drift check while removing it from the hot path.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
