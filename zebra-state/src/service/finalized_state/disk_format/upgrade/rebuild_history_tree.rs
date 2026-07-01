@@ -295,13 +295,13 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RebuildError::MissingData { height })?
         .root();
-    // Ironwood trees are only stored from the Ironwood activation height onwards, and are
-    // de-duplicated, so search backwards for the most recent one. Before Ironwood activation the
-    // root is the empty-tree root, which the pre-Ironwood history tree versions ignore.
-    let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
-        Some((_height, tree)) => tree.root(),
-        None => Default::default(),
-    };
+    // `ironwood_tree_by_height()` searches backwards for the most recent stored tree and returns
+    // the empty note commitment tree when no Ironwood tree has been stored yet. That empty-tree
+    // root is distinct from `ironwood::tree::Root::default()`.
+    let ironwood_root = db
+        .ironwood_tree_by_height(&height)
+        .ok_or(RebuildError::MissingData { height })?
+        .root();
 
     Ok((block, sapling_root, orchard_root, ironwood_root))
 }

@@ -23,6 +23,7 @@ use std::env;
 
 use zebra_chain::{
     block::Height,
+    ironwood,
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
         Network, NetworkUpgrade,
@@ -216,6 +217,103 @@ fn rebuild_reproduces_stored_history_root() -> Result<()> {
                 db.history_tree().hash(),
                 stored_root,
                 "the repaired history tree root must match the originally stored root",
+            );
+        }
+    );
+
+    Ok(())
+}
+
+/// If the Ironwood tree backfill has not run yet, the rebuild still needs the empty Ironwood note
+/// commitment tree root, not `ironwood::tree::Root::default()`.
+#[test]
+fn rebuild_uses_empty_ironwood_tree_root_without_backfill() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = rebuild_test_network();
+    let target_height = NetworkUpgrade::Nu6_3
+        .activation_height(&network)
+        .expect("NU6.3 activation height is configured");
+    let target_index = usize::try_from(target_height.0).expect("test height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, Some(5), true);
+
+    proptest!(
+        ProptestConfig::with_cases(proptest_cases()),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())| {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            prop_assume!(synced.len() > target_index + 1);
+
+            let state = sync_to(&network, &synced);
+            let db = &state.db;
+
+            let tip_height = db
+                .finalized_tip_height()
+                .expect("synced database has a finalized tip");
+            let stored_root = db.history_tree().hash();
+            prop_assert!(
+                stored_root.is_some(),
+                "a NU6.3-onward chain should store a non-empty history tree",
+            );
+
+            let zero_ironwood_root = ironwood::tree::Root::default();
+            let empty_ironwood_tree_root = ironwood::tree::NoteCommitmentTree::default().root();
+            prop_assert_ne!(
+                zero_ironwood_root,
+                empty_ironwood_tree_root,
+                "the zero Ironwood root is not the empty note commitment tree root",
+            );
+
+            let ironwood_trees = db
+                .ironwood_tree_by_height_range(..=tip_height)
+                .collect::<Vec<_>>();
+            prop_assert!(
+                !ironwood_trees.is_empty(),
+                "fresh sync should store the Ironwood activation tree",
+            );
+            prop_assert!(
+                ironwood_trees
+                    .iter()
+                    .all(|(_, tree)| tree.root() == empty_ironwood_tree_root),
+                "this test needs the activation-window empty Ironwood tree state",
+            );
+
+            let mut batch = DiskWriteBatch::new();
+            for (height, tree) in ironwood_trees {
+                batch.delete_ironwood_tree(db, &height);
+                batch.delete_ironwood_anchor(db, &tree.root());
+            }
+            db.write_batch(batch)
+                .expect("deleting Ironwood trees to simulate missing backfill succeeds");
+            prop_assert!(
+                db.ironwood_tree_by_height_range(..=tip_height).next().is_none(),
+                "the Ironwood tree column family should be empty after deleting the rows",
+            );
+            prop_assert!(
+                !db.contains_ironwood_anchor(&empty_ironwood_tree_root),
+                "the Ironwood anchor column family should not contain the empty tree root",
+            );
+
+            corrupt_tip_history_tree_to_old_format(db);
+
+            rebuild_history_tree::rebuild_tip_history_tree_if_needed(db, tip_height)
+                .expect("rebuild should use the empty Ironwood tree root when backfill is missing");
+
+            prop_assert!(
+                !rebuild_history_tree::needs_rebuild(db),
+                "the entry must be readable in the current format after the repair",
+            );
+            prop_assert!(
+                rebuild_history_tree::quick_check(db).is_ok(),
+                "history tree should pass its validity check after the repair",
+            );
+            prop_assert_eq!(
+                db.history_tree().hash(),
+                stored_root,
+                "rebuild without Ironwood tree rows must match the fresh-sync history root",
             );
         }
     );
