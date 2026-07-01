@@ -2382,7 +2382,7 @@ where
 
             if precomputed_coinbase
                 .as_ref()
-                .map_or(true, |(height, _)| *height != precomputed_height)
+                .is_none_or(|(height, _)| *height != precomputed_height)
             {
                 // Precompute the coinbase tx for an empty block that will sit on the new tip. We
                 // will return this provisional block upon a chain tip change so that miners can
