@@ -84,7 +84,7 @@ pub struct GetTreestateResponse {
     /// A treestate containing a Sprout note commitment tree, hex-encoded. Zebra
     /// does not support returning it; but the field is here to enable parsing
     /// responses from other implementations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     sprout: Option<Treestate>,
 
     /// A treestate containing a Sapling note commitment tree, hex-encoded.
@@ -95,7 +95,7 @@ pub struct GetTreestateResponse {
 
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
     /// Omitted from the response unless Ironwood tree state is available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[new(default)]
     ironwood: Option<Treestate>,
 }
