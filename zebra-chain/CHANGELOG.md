@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Block::ironwood_nullifiers` and `Block::ironwood_note_commitments`.
 - `SigHasher::ironwood_bundle`.
 
+### Changed
+
+- V6 transactions are validated with `librustzcash` during deserialization,
+  matching the V5 path and rejecting malformed Orchard data before verification.
+
 ## [9.0.0] - 2026-06-02
 
 ### Added
