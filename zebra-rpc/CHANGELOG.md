@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added Ironwood RPC output for `getblock`, `getblockchaininfo`,
-  `getrawtransaction`, `z_gettreestate`, and `z_getsubtreesbyindex`.
+- Added Ironwood RPC output for `getrawtransaction`, `z_gettreestate`, and
+  `z_getsubtreesbyindex`.
+- Added Ironwood value pool entries to `getblockchaininfo` and verbose
+  `getblock` RPC output.
 
 ### Changed
 

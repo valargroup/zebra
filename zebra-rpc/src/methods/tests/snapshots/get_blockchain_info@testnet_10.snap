@@ -45,13 +45,13 @@ expression: info
       "monitored": false
     },
     {
-      "id": "ironwood",
+      "id": "lockbox",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false
     },
     {
-      "id": "lockbox",
+      "id": "ironwood",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false
