@@ -427,10 +427,9 @@ pub(crate) fn reconcile_window(
         return Ok(start_value_pool);
     }
 
-    // Batch-resolve every spent outpoint from disk. Sort by txid (so repeated txids
-    // dedup and the `output_location`/`tx_loc_by_hash` reads are grouped), then sort
-    // the resolved locations so the `utxo_by_out_loc` value reads are sequential-ish
-    // rather than random per block.
+    // Collect the window's spent outpoints, deduped (each UTXO is spent once, so the
+    // dedup is defensive). Sorting by txid also groups repeated txids for the
+    // `output_location`/`tx_loc_by_hash` reads.
     let mut outpoints: Vec<transparent::OutPoint> = records
         .iter()
         .flat_map(|r| r.spent.iter().copied())
@@ -438,27 +437,40 @@ pub(crate) fn reconcile_window(
     outpoints.sort_unstable_by_key(|outpoint| (outpoint.hash.0, outpoint.index));
     outpoints.dedup();
 
-    let mut located: Vec<(transparent::OutPoint, OutputLocation)> =
-        Vec::with_capacity(outpoints.len());
-    for outpoint in outpoints {
-        let out_loc = db.output_location(&outpoint).ok_or_else(|| {
-            format!("deferred spent outpoint missing from state at reconcile: {outpoint:?}")
-        })?;
-        located.push((outpoint, out_loc));
-    }
-    located.sort_unstable_by_key(|(_outpoint, out_loc)| *out_loc);
-
-    let mut resolved: HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)> =
-        HashMap::with_capacity(located.len());
-    for (outpoint, out_loc) in located {
-        let utxo = db
-            .utxo_by_location(out_loc)
-            .ok_or_else(|| {
-                format!("deferred spent UTXO missing from state at reconcile: {outpoint:?}")
-            })?
-            .utxo;
-        resolved.insert(outpoint, (out_loc, utxo));
-    }
+    // Batch-resolve every spent outpoint from disk in parallel. Each resolve is
+    // `output_location` (txid → location, `tx_loc_by_hash`) then `utxo_by_location`
+    // (location → value, `utxo_by_out_loc`); both are CPU-bound (page-cache-resident
+    // decode + index traversal) and independent across outpoints, and RocksDB reads
+    // are thread-safe through the cloneable `DiskDb`. This runs off the assembler
+    // thread on the worker, spreading the resolution across otherwise-idle cores.
+    use rayon::prelude::*;
+    let resolved: HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)> =
+        outpoints
+            .par_iter()
+            .map(
+                |outpoint| -> Result<
+                    (transparent::OutPoint, (OutputLocation, transparent::Utxo)),
+                    BoxError,
+                > {
+                    let out_loc = db.output_location(outpoint).ok_or_else(|| -> BoxError {
+                        format!(
+                            "deferred spent outpoint missing from state at reconcile: {outpoint:?}"
+                        )
+                        .into()
+                    })?;
+                    let utxo = db
+                        .utxo_by_location(out_loc)
+                        .ok_or_else(|| -> BoxError {
+                            format!(
+                                "deferred spent UTXO missing from state at reconcile: {outpoint:?}"
+                            )
+                            .into()
+                        })?
+                        .utxo;
+                    Ok((*outpoint, (out_loc, utxo)))
+                },
+            )
+            .collect::<Result<HashMap<_, _>, BoxError>>()?;
 
     db.commit_checkpoint_reconcile(network, start_value_pool, records, &resolved)
 }

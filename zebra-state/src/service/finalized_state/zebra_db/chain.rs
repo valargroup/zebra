@@ -17,7 +17,7 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::NonNegative,
+    amount::{NegativeAllowed, NonNegative},
     block::Height,
     block_info::BlockInfo,
     history_tree::HistoryTree,
@@ -290,41 +290,57 @@ impl ZebraDb {
             true,
         );
 
-        // Recompute the value pool sequentially in block order, writing each block's
-        // running pool into `BlockInfo` (exactly as the inline per-block path does),
-        // and the final pool into the single-key tip CF once at the end.
+        // Compute each block's independent value-pool delta and serialized size in
+        // parallel — `chain_value_pool_change` re-folds every transaction's value
+        // balance and the size sums every transaction's serialized length, so this is
+        // the CPU-heavy pass, and it is independent across the window's blocks. Then
+        // apply the deltas in block order sequentially (cheap integer adds) to get the
+        // per-height running pool for `BlockInfo`. Splitting the parallel per-block
+        // work from the ordered running-sum keeps the result byte-identical to the
+        // inline per-block path (same deltas, same application order).
+        use rayon::prelude::*;
+        let per_block: Vec<(ValueBalance<NegativeAllowed>, usize)> = records
+            .par_iter()
+            .map(
+                |record| -> Result<(ValueBalance<NegativeAllowed>, usize), BoxError> {
+                    let spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo> = record
+                        .spent
+                        .iter()
+                        .map(|outpoint| {
+                            let (_out_loc, utxo) = resolved
+                                .get(outpoint)
+                                .expect("every deferred spend was resolved above");
+                            (*outpoint, utxo.clone())
+                        })
+                        .collect();
+
+                    let delta = record
+                        .block
+                        .chain_value_pool_change(&spent_by_block, record.deferred_pool_change)?;
+
+                    // Block size, summed per-transaction (byte-identical to serializing the
+                    // whole block), as in `prepare_chain_value_pools_batch`.
+                    let transactions = &record.block.transactions;
+                    let transactions_size: usize = transactions
+                        .iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum();
+                    let tx_count_size = CompactSizeMessage::try_from(transactions.len())
+                        .expect("block must have a valid transaction count")
+                        .zcash_serialized_size();
+                    let block_size = record.block.header.zcash_serialized_size()
+                        + tx_count_size
+                        + transactions_size;
+
+                    Ok((delta, block_size))
+                },
+            )
+            .collect::<Result<Vec<_>, BoxError>>()?;
+
         let mut value_pool = start_value_pool;
-        for record in records {
-            let spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo> = record
-                .spent
-                .iter()
-                .map(|outpoint| {
-                    let (_out_loc, utxo) = resolved
-                        .get(outpoint)
-                        .expect("every deferred spend was resolved above");
-                    (*outpoint, utxo.clone())
-                })
-                .collect();
-
-            let block_value_pool_change = record
-                .block
-                .chain_value_pool_change(&spent_by_block, record.deferred_pool_change)?;
-            value_pool = value_pool.add_chain_value_pool_change(block_value_pool_change)?;
+        for (record, (delta, block_size)) in records.iter().zip(per_block) {
+            value_pool = value_pool.add_chain_value_pool_change(delta)?;
             value_pool_metrics(&value_pool);
-
-            // Block size, summed per-transaction (byte-identical to serializing the
-            // whole block), as in `prepare_chain_value_pools_batch`.
-            let block_size = {
-                let transactions = &record.block.transactions;
-                let transactions_size: usize = transactions
-                    .iter()
-                    .map(|transaction| transaction.zcash_serialized_size())
-                    .sum();
-                let tx_count_size = CompactSizeMessage::try_from(transactions.len())
-                    .expect("block must have a valid transaction count")
-                    .zcash_serialized_size();
-                record.block.header.zcash_serialized_size() + tx_count_size + transactions_size
-            };
 
             let _ = self
                 .block_info_cf()
