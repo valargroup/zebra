@@ -153,7 +153,7 @@ impl TransactionTemplate<NegativeOrZero> {
             };
         }
 
-        let add_orchard_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_orchard_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_orchard_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -165,8 +165,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        #[cfg(zcash_unstable = "nu6.3")]
-        let add_ironwood_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_ironwood_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_ironwood_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -178,7 +177,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
                     Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
@@ -190,7 +189,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_transparent_reward = |builder: &mut Builder<'_, _, _>, addr| {
+        let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
             trace_err!(
                 builder.add_transparent_output(addr, miner_reward),
                 "transparent"
@@ -215,13 +214,9 @@ impl TransactionTemplate<NegativeOrZero> {
                         // coinbase outputs while NU6.3 is the current upgrade. After NU6.3
                         // neither pool is accepted, so an Orchard-only address cannot
                         // receive a coinbase reward.
-                        #[cfg(zcash_unstable = "nu6.3")]
                         if upgrade == NetworkUpgrade::Nu6_3 {
                             return add_ironwood_reward(&mut builder, addr);
                         }
-
-                        #[cfg(not(zcash_unstable = "nu6.3"))]
-                        let _ = addr;
 
                         None
                     })
@@ -1107,7 +1102,7 @@ impl TransactionObject {
     }
 }
 
-#[cfg(all(test, zcash_unstable = "nu6.3"))]
+#[cfg(test)]
 mod tests {
     use proptest::{
         prelude::any,

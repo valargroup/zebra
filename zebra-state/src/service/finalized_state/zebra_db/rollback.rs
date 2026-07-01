@@ -1065,7 +1065,6 @@ fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
 mod tests {
     use zebra_chain::serialization::ZcashDeserializeInto;
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     use zebra_chain::parameters::testnet::{
         ConfiguredActivationHeights, Parameters as TestnetParameters,
     };
@@ -1218,7 +1217,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn prune_tree_indexes_removes_standalone_ironwood_activation_anchor_below_activation() {
         let _init_guard = zebra_test::init();
 
@@ -1248,7 +1246,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn prune_tree_indexes_keeps_ironwood_activation_anchors_at_activation() {
         let _init_guard = zebra_test::init();
 
@@ -1277,7 +1274,6 @@ mod tests {
         assert!(db.contains_ironwood_anchor(&post_block_anchor));
     }
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn ironwood_activation_test_network(activation_height: Height) -> Network {
         TestnetParameters::build()
             .with_activation_heights(ConfiguredActivationHeights {
@@ -1290,7 +1286,6 @@ mod tests {
             .expect("test network is valid")
     }
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn seed_non_empty_ironwood_activation_tree(
         db: &ZebraDb,
         activation_height: Height,

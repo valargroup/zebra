@@ -51,7 +51,6 @@ use crate::{
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock, TransactionLocation,
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use zebra_chain::{ironwood, parallel::tree::NoteCommitmentTrees};
 
 /// Storage round-trip test for block and transaction data in the finalized state database.
@@ -944,7 +943,6 @@ fn full_block_commit_overwrites_conflicting_header_only_rows() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_activation_stores_empty_anchor_with_non_empty_post_block_tree() {
     let _init_guard = zebra_test::init();
 

@@ -543,7 +543,6 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                 )?,
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -1008,7 +1007,6 @@ where
     }
 
     /// Verify a V6 transaction.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,
@@ -1039,7 +1037,6 @@ where
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction_network_upgrade(
         transaction: &Transaction,
         network_upgrade: NetworkUpgrade,
