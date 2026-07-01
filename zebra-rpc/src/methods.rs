@@ -203,6 +203,9 @@ pub trait Rpc {
     ///
     /// Some fields from the zcashd reference are missing from Zebra's [`GetBlockchainInfoResponse`]. It only contains the fields
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L72-L89)
+    ///
+    /// Zebra includes an `ironwood` value pool entry. Like other value pool
+    /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
 
@@ -3351,7 +3354,7 @@ impl GetInfoResponse {
 }
 
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
-pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 5];
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
 /// Response to a `getblockchaininfo` RPC request.
 ///
