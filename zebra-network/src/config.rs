@@ -336,11 +336,8 @@ impl Config {
         let dns_peers =
             Config::resolve_peers(&self.initial_peer_hostnames().iter().cloned().collect()).await;
 
-        if self.network.is_regtest() || self.network.disable_pow() {
-            // Only return local peer addresses and skip loading the peer cache on Regtest and other
-            // PoW-disabled networks. This avoids accidental remote bootstrapping for local mining
-            // networks, but it is not a complete no-peers invariant. Sync and mempool readiness
-            // are still determined separately.
+        if self.network.is_regtest() {
+            // Only return local peer addresses and skip loading the peer cache on Regtest.
             dns_peers
                 .into_iter()
                 .filter(PeerSocketAddr::is_localhost)

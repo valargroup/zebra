@@ -3,7 +3,6 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::iter;
-use std::sync::Arc;
 
 use color_eyre::eyre::Result;
 
@@ -42,7 +41,7 @@ fn ironwood_action() -> zebra_chain::ironwood::Action {
 fn ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
-) -> Arc<zebra_chain::transaction::Transaction> {
+) -> std::sync::Arc<zebra_chain::transaction::Transaction> {
     use zebra_chain::{
         at_least_one, ironwood,
         orchard::{self, tree},
@@ -51,7 +50,7 @@ fn ironwood_v6_tx(
         transaction::{LockTime, Transaction},
     };
 
-    Arc::new(Transaction::V6 {
+    std::sync::Arc::new(Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height,
@@ -84,7 +83,7 @@ fn verified_ironwood_v6_tx(
         miner_fee,
         0,
         0,
-        Arc::new(vec![]),
+        std::sync::Arc::new(vec![]),
     )
     .expect("test transaction has a valid mempool fee")
 }
