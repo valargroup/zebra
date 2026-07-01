@@ -750,6 +750,7 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::fake_populated_pool(),
     );
     chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
@@ -1019,6 +1020,15 @@ proptest! {
         for block in finalized_blocks {
             let expected_block = block.clone();
 
+            let result_receiver = state_service.queue_and_commit_to_finalized_state(block);
+            let result = result_receiver.blocking_recv();
+
+            prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
+
+            // Wait for the channels to be updated by the block commit task.
+            // TODO: add a blocking method on ChainTipChange
+            std::thread::sleep(Duration::from_secs(1));
+
             let expected_action = if expected_block.height == block::Height(0) {
                 // Height 0 is reset by initialization. The BeforeOverwinter upgrade
                 // (activation height 1) also resets at height 0 rather than at height 1,
@@ -1030,26 +1040,12 @@ proptest! {
                 TipAction::grow_with(expected_block.clone().into())
             };
 
-            let result_receiver = state_service.queue_and_commit_to_finalized_state(block);
-            let result = result_receiver.blocking_recv();
-
-            prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
-
-            // Wait for the channels to be updated by the block commit task.
-            // TODO: add a blocking method on ChainTipChange
-            std::thread::sleep(Duration::from_secs(1));
-
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
             prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
         }
 
         for block in non_finalized_blocks {
             let expected_block = block.clone();
-
-            // The genesis block (height 0) is always finalized, and the BeforeOverwinter
-            // reset fires at height 0 (one block before its activation height of 1), so
-            // every non-finalized block (height >= 1) grows the chain.
-            let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
             let result = result_receiver.blocking_recv();
@@ -1059,6 +1055,11 @@ proptest! {
             // Wait for the channels to be updated by the block commit task.
             // TODO: add a blocking method on ChainTipChange
             std::thread::sleep(Duration::from_secs(1));
+
+            // The genesis block (height 0) is always finalized, and the BeforeOverwinter
+            // reset fires at height 0 (one block before its activation height of 1), so
+            // every non-finalized block (height >= 1) grows the chain.
+            let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             prop_assert_eq!(latest_chain_tip.best_tip_height(), Some(expected_block.height));
             prop_assert_eq!(chain_tip_change.last_tip_change(), Some(expected_action));
