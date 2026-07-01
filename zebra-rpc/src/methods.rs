@@ -2454,6 +2454,12 @@ where
                         .take()
                         .expect("coinbase precomputation starts before waiting for a new tip");
 
+                    // Await before fetching chain info, so any extra tip change during slow
+                    // coinbase construction is reflected in the response below.
+                    let precomputed_coinbase = precomputed_coinbase
+                        .await
+                        .expect("coinbase precomputation task should not panic");
+
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
 
                     let server_long_poll_id = LongPollInput::new(
@@ -2472,9 +2478,6 @@ where
                     // (multi-block advance, reorg, or spurious notification) — its
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
-                    let precomputed_coinbase = precomputed_coinbase
-                        .await
-                        .expect("coinbase precomputation task should not panic");
                     let precomputed_coinbase = (next_height == precomputed_height)
                         .then_some(precomputed_coinbase)
                         .transpose()
