@@ -1977,23 +1977,20 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 
     check_transaction("V5", &make_v5);
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-    {
-        let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
-            Transaction::V6 {
-                network_upgrade: NetworkUpgrade::Nu6_3,
-                lock_time: LockTime::unlocked(),
-                expiry_height: Height(0),
-                inputs: vec![],
-                outputs: vec![],
-                sapling_shielded_data: Some(make_shielded_data(cv, epk)),
-                orchard_shielded_data: None,
-                ironwood_shielded_data: None,
-            }
-        };
+    let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+        Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        }
+    };
 
-        check_transaction("V6", &make_v6);
-    }
+    check_transaction("V6", &make_v6);
 }
 
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
