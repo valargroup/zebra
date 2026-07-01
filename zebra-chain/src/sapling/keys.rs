@@ -238,15 +238,20 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 
 /// An [ephemeral public key][1] for Sapling key agreement.
 ///
-/// Public keys containing points of small order are not allowed.
+/// Consensus validation rejects public keys containing points of small order.
+/// This type stores the transaction encoding first and performs that point check
+/// only when [`EphemeralPublicKey::is_valid_not_small_order`] or transaction
+/// semantic verification asks for it.
 ///
-/// It is denoted by `epk` in the specification. (This type does _not_
-/// represent [KA^{Sapling}.Public][2], which allows any points, including
-/// of small order).
+/// It is denoted by `epk` in the specification. Its serialized form is
+/// [KA^{Sapling}.Public][2], but a constructed or deserialized
+/// `EphemeralPublicKey` is not guaranteed to be consensus-valid until the
+/// deferred check has run.
 ///
 /// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
 /// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-/// A Sapling ephemeral public key, stored as its canonical 32-byte encoding.
+/// A Sapling ephemeral public key, stored as the 32-byte encoding from the
+/// transaction.
 ///
 /// The key is a Jubjub curve point, but the validator only ever needs its bytes
 /// (for the txid digest and serialization); the point itself is needed only for
@@ -256,13 +261,20 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 ///
 /// # Consensus
 ///
+/// `TryFrom<[u8; 32]>` and `ZcashDeserialize` preserve the encoding exactly;
+/// they do not prove that the bytes are a canonical, non-small-order Jubjub
+/// point. Call [`EphemeralPublicKey::is_valid_not_small_order`] when the caller
+/// needs a consensus-valid point.
+///
 /// The not-small-order check that this type used to perform at deserialization
 /// is deferred, but still enforced for every untrusted transaction. The
 /// checkpoint verifier trusts block hashes and does not need it. The semantic
-/// verifier and the mempool convert every transaction via `to_librustzcash`
-/// (`CachedFfiTransaction::new`) and verify the Sapling bundle, and
-/// librustzcash enforces the rule in `SaplingVerificationContext::check_output`
-/// (sapling-crypto `verifier.rs`, `epk.is_small_order()`). Validated by
+/// verifier and the mempool call
+/// [`crate::transaction::Transaction::sapling_point_encodings_are_valid`],
+/// convert every transaction via `to_librustzcash` (`CachedFfiTransaction::new`)
+/// and verify the Sapling bundle, and librustzcash enforces the rule in
+/// `SaplingVerificationContext::check_output` (sapling-crypto `verifier.rs`,
+/// `epk.is_small_order()`). Validated by
 /// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
 /// `transaction/tests/vectors.rs`.
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -326,8 +338,11 @@ impl PartialEq<[u8; 32]> for EphemeralPublicKey {
 impl TryFrom<[u8; 32]> for EphemeralPublicKey {
     type Error = &'static str;
 
-    /// Store an EphemeralPublicKey from a byte array, deferring point
+    /// Store an `EphemeralPublicKey` from a byte array, deferring point
     /// decompression and the not-small-order check (see the type docs).
+    ///
+    /// This constructor is fallible only to match older call sites and trait
+    /// bounds; any 32-byte array is stored successfully.
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
         Ok(Self(bytes))
     }

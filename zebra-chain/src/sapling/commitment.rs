@@ -16,8 +16,8 @@ mod test_vectors;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CommitmentRandomness(jubjub::Fr);
 
-/// A Sapling value commitment, stored as its canonical 32-byte compressed
-/// encoding.
+/// A Sapling value commitment, stored as the 32-byte compressed encoding from
+/// the transaction.
 ///
 /// The commitment is a Jubjub curve point. Recovering the point from its
 /// encoding requires a field square root (point decompression), which is
@@ -28,16 +28,23 @@ pub struct CommitmentRandomness(jubjub::Fr);
 ///
 /// # Consensus
 ///
+/// `ZcashDeserialize` and `FromHex` only check the byte length and preserve the
+/// encoding exactly; they do not prove that the bytes are a canonical,
+/// non-small-order Jubjub point. Call [`ValueCommitment::commitment`] or
+/// [`ValueCommitment::is_valid_not_small_order`] when the caller needs a
+/// consensus-valid point.
+///
 /// The not-small-order check that this type used to perform at deserialization
 /// is deferred, but still enforced for every untrusted transaction. The
 /// checkpoint verifier trusts block hashes and does not need it. The semantic
-/// verifier and the mempool convert every transaction via `to_librustzcash`
-/// (`CachedFfiTransaction::new`), and librustzcash enforces the rule at *read*:
-/// `zcash_primitives`'s `read_value_commitment` uses
-/// `ValueCommitment::from_bytes_not_small_order`, so a small-order `cv` makes the
-/// conversion fail and the transaction is rejected. Validated by
-/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
-/// `transaction/tests/vectors.rs`.
+/// verifier and the mempool call
+/// [`crate::transaction::Transaction::sapling_point_encodings_are_valid`] and
+/// convert every transaction via `to_librustzcash` (`CachedFfiTransaction::new`);
+/// librustzcash also enforces the rule at *read*: `zcash_primitives`'
+/// `read_value_commitment` uses `ValueCommitment::from_bytes_not_small_order`, so
+/// a small-order `cv` makes the conversion fail and the transaction is rejected.
+/// Validated by `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash`
+/// in `transaction/tests/vectors.rs`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ValueCommitment(pub(crate) [u8; 32]);
 
@@ -57,7 +64,7 @@ impl ValueCommitment {
         sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).into_option()
     }
 
-    /// Return the canonical 32-byte (little-endian) compressed encoding.
+    /// Return the stored 32-byte (little-endian) compressed encoding.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
@@ -147,8 +154,8 @@ impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
 
 impl ZcashDeserialize for ValueCommitment {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        // Store the canonical encoding without decompressing the Jubjub point.
-        // The point (and its non-small-order check) is recovered lazily in
+        // Store the encoding bytes without decompressing the Jubjub point. The
+        // point (and its non-small-order check) is recovered lazily in
         // `ValueCommitment::commitment`, only where the point is actually needed.
         let mut bytes = [0u8; 32];
         reader.read_exact(&mut bytes)?;
