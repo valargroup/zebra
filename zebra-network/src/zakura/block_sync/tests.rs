@@ -3138,6 +3138,175 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
 }
 
 #[test]
+fn sequencer_release_applying_blocks_from_keeps_submitted_counters_consistent() {
+    // `release_applying_blocks_from` removes each height through `remove_applying`,
+    // which must decrement the O(1) submitted counters for any *submitted* body it
+    // drops. Existing reject coverage only releases unsubmitted bodies, so this
+    // exercises the submitted-counter branch of that path.
+    let mut seq = test_sequencer(0, 8);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(
+            height,
+            block.hash(),
+            block.clone(),
+            100 * (index as u64 + 1),
+            peer(0),
+        );
+    }
+    seq.drain_ready_into_applying();
+    // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
+    let _ = seq
+        .prepare_submit(block::Height(2))
+        .expect("height 2 applying");
+    let _ = seq
+        .prepare_submit(block::Height(3))
+        .expect("height 3 applying");
+    assert_eq!(seq.submitted_applying_count(), 2);
+    assert_eq!(seq.submitted_applying_bytes(), 200 + 300);
+
+    let released = seq.release_applying_blocks_from(block::Height(2));
+    assert_eq!(released, 500);
+    assert_eq!(seq.applying_len(), 1);
+    // Only the unsubmitted height 1 (100 bytes) survives; the submitted counters
+    // shed exactly the released bodies' contribution.
+    assert_eq!(seq.applying_buffered_bytes(), 100);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    // Every maintained counter still agrees with a full scan.
+    assert_eq!(
+        seq.applying_buffered_bytes(),
+        seq.applying_buffered_bytes_scanned()
+    );
+    assert_eq!(
+        seq.submitted_applying_count(),
+        seq.submitted_applying_count_scanned()
+    );
+    assert_eq!(
+        seq.submitted_applying_bytes(),
+        seq.submitted_applying_bytes_scanned()
+    );
+}
+
+#[test]
+fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
+    // `unsubmit` only rolls back (and decrements the submitted counters) when the
+    // token still matches the live submission, so a stale rollback cannot clobber a
+    // newer one or double-decrement the O(1) counters.
+    let mut seq = test_sequencer(0, 4);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
+    seq.drain_ready_into_applying();
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 applying");
+    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.submitted_applying_bytes(), 100);
+
+    // A rollback carrying a non-matching token is ignored: the submission and the
+    // counters are untouched.
+    seq.unsubmit(block::Height(1), item.token + 1);
+    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.submitted_applying_bytes(), 100);
+    assert_eq!(
+        seq.submitted_applying_count(),
+        seq.submitted_applying_count_scanned()
+    );
+    assert_eq!(
+        seq.submitted_applying_bytes(),
+        seq.submitted_applying_bytes_scanned()
+    );
+
+    // The matching rollback frees the slot exactly once.
+    seq.unsubmit(block::Height(1), item.token);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+
+    // Replaying the now-stale token must not decrement a second time.
+    seq.unsubmit(block::Height(1), item.token);
+    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(
+        seq.submitted_applying_count(),
+        seq.submitted_applying_count_scanned()
+    );
+    assert_eq!(
+        seq.submitted_applying_bytes(),
+        seq.submitted_applying_bytes_scanned()
+    );
+}
+
+#[test]
+fn sequencer_reorder_max_height_reports_highest_buffered() {
+    let mut seq = test_sequencer(0, 8);
+    let blocks = mainnet_blocks_1_to_3();
+    // Empty reorder buffer has no top.
+    assert_eq!(seq.reorder_max_height(), None);
+    // Buffer heights 1 and 3, leaving a gap at 2; the top is the highest buffered.
+    seq.accept_body(
+        block::Height(1),
+        blocks[0].hash(),
+        blocks[0].clone(),
+        100,
+        peer(0),
+    );
+    seq.accept_body(
+        block::Height(3),
+        blocks[2].hash(),
+        blocks[2].clone(),
+        300,
+        peer(0),
+    );
+    assert_eq!(seq.reorder_max_height(), Some(block::Height(3)));
+    // Draining the contiguous prefix removes height 1 but leaves the top (3).
+    seq.drain_ready_into_applying();
+    assert_eq!(seq.reorder_max_height(), Some(block::Height(3)));
+    // Filling the gap drains 2 and 3 out, emptying the reorder buffer.
+    seq.accept_body(
+        block::Height(2),
+        blocks[1].hash(),
+        blocks[1].clone(),
+        200,
+        peer(0),
+    );
+    seq.drain_ready_into_applying();
+    assert_eq!(seq.reorder_max_height(), None);
+}
+
+#[test]
+fn sequencer_keeps_whole_body_for_contiguous_height() {
+    // The retain-for-backlog trim only applies to *non-contiguous* bodies. A body
+    // arriving at the next contiguous height above the floor is kept whole, so its
+    // decoded block — not a re-decode of the raw payload — drains into `applying`.
+    // This is the mirror of `sequencer_retains_raw_bytes_for_non_contiguous_backlog`.
+    let mut seq = test_sequencer(0, 4);
+    let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    // A decoded block distinguishable from its own raw payload lets us observe which
+    // half of `DecodedWithRawFramePayload` survived acceptance.
+    let distinguishable_decoded_block1 = forked_block(&block1, 99);
+    assert_ne!(distinguishable_decoded_block1.hash(), block1.hash());
+
+    let body = BufferedBlockBody::from_decoded_block(
+        distinguishable_decoded_block1.clone(),
+        Some(raw_block_payload(&block1)),
+    );
+    // Height 1 is the next contiguous height above the floor (0).
+    assert_eq!(
+        seq.accept_buffered_body(block::Height(1), block1.hash(), body, 100, peer(0)),
+        AcceptOutcome::Buffered {
+            covered: block::Height(1)
+        }
+    );
+    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    // The kept decoded block drained in, not a re-decode of the raw payload.
+    assert_eq!(
+        seq.applying_hash(block::Height(1)),
+        Some(distinguishable_decoded_block1.hash())
+    );
+}
+
+#[test]
 fn reorder_fuzzes_arrival_order_as_parent_first() {
     let orders = [
         [1, 2, 3, 4],
