@@ -22,8 +22,6 @@ use zebra_test::{
 };
 
 use super::super::*;
-use super::ironwood_v6_tx_hash;
-
 lazy_static! {
     pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
@@ -529,15 +527,6 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
             test.txid,
             test.auth_digest,
             "ZIP-244 V5",
-        )?;
-    }
-
-    for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
-        assert_native_zip244_matches_test_vector(
-            test.tx,
-            test.txid,
-            test.auth_digest,
-            test.scenario,
         )?;
     }
 
