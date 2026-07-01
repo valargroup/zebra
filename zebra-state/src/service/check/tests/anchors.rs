@@ -365,7 +365,7 @@ fn check_sapling_anchors() {
 
 #[test]
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn mempool_allows_empty_ironwood_anchor_at_activation() {
+fn mempool_allows_default_ironwood_anchor_at_activation() {
     let _init_guard = zebra_test::init();
 
     let network = TestnetParameters::build()
