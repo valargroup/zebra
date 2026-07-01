@@ -206,6 +206,13 @@ pub enum RollbackFinalizedStateError {
         height: block::Height,
     },
 
+    /// An Ironwood note commitment tree required for rollback could not be loaded.
+    #[error("missing Ironwood note commitment tree at height {height:?}")]
+    MissingIronwoodTree {
+        /// Missing tree height.
+        height: block::Height,
+    },
+
     /// Address balance arithmetic failed while reversing transparent indexes.
     #[error("transparent address balance update failed")]
     AddressBalance(#[from] amount::Error),
@@ -595,10 +602,10 @@ fn history_rebuild_inputs_at_height(
         .orchard_tree_by_height(&height)
         .ok_or(RollbackFinalizedStateError::MissingOrchardTree { height })?
         .root();
-    let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
-        Some((_height, tree)) => tree.root(),
-        None => Default::default(),
-    };
+    let ironwood_root = db
+        .ironwood_tree_by_height(&height)
+        .ok_or(RollbackFinalizedStateError::MissingIronwoodTree { height })?
+        .root();
 
     Ok((block, sapling_root, orchard_root, ironwood_root))
 }

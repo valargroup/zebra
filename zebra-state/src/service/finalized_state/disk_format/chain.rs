@@ -110,34 +110,35 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        const LEGACY_VALUE_BALANCE_LEN: usize = 40;
-        const VALUE_BALANCE_LEN: usize = 48;
+        // We have two different DB formats, one from NU6_1 (Lockbox) one for Ironwood and onwards.
+        const NU6_1_VALUE_BALANCE_LEN: usize = 40;
+        const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
         const BLOCK_SIZE_LEN: usize = 4;
-        const LEGACY_BLOCK_INFO_LEN: usize = LEGACY_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
-        const BLOCK_INFO_LEN: usize = VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
         let bytes = bytes.as_ref();
 
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
         match bytes.len() {
-            BLOCK_INFO_LEN.. => {
+            IRONWOOD_BLOCK_INFO_LEN.. => {
                 let value_pools =
-                    ValueBalance::<NonNegative>::from_bytes(&bytes[..VALUE_BALANCE_LEN])
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..IRONWOOD_VALUE_BALANCE_LEN])
                         .expect("must work for 48 bytes");
                 let size = u32::from_le_bytes(
-                    bytes[VALUE_BALANCE_LEN..VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                    bytes[IRONWOOD_VALUE_BALANCE_LEN..IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
                         .try_into()
                         .expect("must be 4 bytes"),
                 );
                 BlockInfo::new(value_pools, size)
             }
-            LEGACY_BLOCK_INFO_LEN.. => {
+            NU6_1_BLOCK_INFO_LEN.. => {
                 let value_pools =
-                    ValueBalance::<NonNegative>::from_bytes(&bytes[..LEGACY_VALUE_BALANCE_LEN])
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..NU6_1_VALUE_BALANCE_LEN])
                         .expect("must work for 40 bytes");
                 let size = u32::from_le_bytes(
-                    bytes[LEGACY_VALUE_BALANCE_LEN..LEGACY_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                    bytes[NU6_1_VALUE_BALANCE_LEN..NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
                         .try_into()
                         .expect("must be 4 bytes"),
                 );

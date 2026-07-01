@@ -52,7 +52,7 @@ pub fn run(
                         .filter_map(|input| Some(input.outpoint()?.into()))
                         .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                         .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                        .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
                         .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
                         .next()
                     {
