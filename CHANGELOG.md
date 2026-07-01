@@ -250,7 +250,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   real chain.
 - A single required block that is unavailable from all ready peers can no longer
   globally stall block-download dispatch. Previously any hash parked on its
-  registry-miss backoff set a head-of-line gate that paused *all* reserve
+  registry-miss backoff set a head-of-line gate that paused _all_ reserve
   dispatch until the retry cleared, so a peer that advertised a required hash it
   would not serve could delay unrelated block downloads for roughly the retry
   budget (~2 minutes) — a targeted node-level sync/catch-up DoS. The syncer now
