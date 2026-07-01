@@ -485,22 +485,10 @@ impl WriteBlockWorkerTask {
                 }
             }
 
-            // A non-handoff VCT fast block's supplied roots are authenticated by
-            // its successor's header. If the successor is not buffered yet, keep
-            // this block local and wait instead of surfacing a checkpoint commit
-            // error through the invalid-block reset path.
-            if finalized_lookahead.is_empty()
-                && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
-            {
-                tracing::trace!(
-                    height = ?ordered_block.0.height,
-                    hash = ?ordered_block.0.hash,
-                    "VCT: deferring fast checkpoint commit until successor is buffered"
-                );
-                retry_finalized_block = Some(ordered_block);
-                std::thread::park_timeout(Duration::from_millis(10));
-                continue;
-            }
+            // A VCT fast block's supplied roots were already verified against the header chain
+            // at header-sync commit (design §6), so the committer no longer needs the buffered
+            // successor to confirm them — the block commits directly, without the wait that
+            // previously coupled the write worker to the body-download pipeline.
 
             // Use the precompute for this block if we started it last iteration and
             // it is for this exact block; otherwise cancel it (so the spawned task
@@ -538,13 +526,6 @@ impl WriteBlockWorkerTask {
                 }
             }
 
-            // The buffered successor (if any) lets the committer verify this block's
-            // verified-commitment-trees fixture roots before trusting them: a block's
-            // roots are only committed by the next block's header. Its auth data root
-            // is already precomputed by the checkpoint verifier.
-            let next_checkpoint = finalized_lookahead
-                .front()
-                .map(|next| (next.0.block.clone(), next.0.auth_data_root));
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 
@@ -556,7 +537,6 @@ impl WriteBlockWorkerTask {
                 ordered_block,
                 prev_note_commitment_trees,
                 note_precompute,
-                next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
                     // Whether this successful commit consumed header-carried
@@ -825,7 +805,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();

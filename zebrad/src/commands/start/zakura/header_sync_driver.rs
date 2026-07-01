@@ -1112,10 +1112,16 @@ pub(crate) fn header_range_commit_failure_kind(
         // fork. Treat it as non-scoring so this stays a liveness/correctness guard,
         // not peer punishment.
         | zebra_state::CommitHeaderRangeError::LowerWorkConflict { .. }
+        // A local state inconsistency (the frontier tree could not be positioned at the anchor),
+        // not peer misbehavior: don't score, header sync retries.
+        | zebra_state::CommitHeaderRangeError::HeaderFrontierUnavailable { .. }
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }
-        zebra_state::CommitHeaderRangeError::EmptyRange
+        // The peer's supplied roots failed verification against our checkpoint-committed header
+        // chain (design §6): score it and refetch the range.
+        zebra_state::CommitHeaderRangeError::InvalidCommitmentRoots { .. }
+        | zebra_state::CommitHeaderRangeError::EmptyRange
         | zebra_state::CommitHeaderRangeError::RangeTooLong { .. }
         | zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
         | zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }

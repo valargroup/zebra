@@ -49,7 +49,7 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, None, "prune tests")
+            .commit_finalized_direct(block.into(), None, None, "prune tests")
             .expect("test block is valid");
     }
 
@@ -80,7 +80,7 @@ fn new_state_with_checkpoint_retention(
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, None, "checkpoint retention tests")
+            .commit_finalized_direct(block.into(), None, None, "checkpoint retention tests")
             .expect("test block is valid");
     }
 
@@ -351,7 +351,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, None, "checkpoint handoff tests")
+            .commit_finalized_direct(block.into(), None, None, "checkpoint handoff tests")
             .expect("test block is valid");
     }
 
@@ -386,7 +386,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         .expect("test data deserializes");
 
     state
-        .commit_finalized_direct(block.into(), None, None, None, "checkpoint handoff tests")
+        .commit_finalized_direct(block.into(), None, None, "checkpoint handoff tests")
         .expect("handoff block is valid");
 
     let online_prune_until =
@@ -630,7 +630,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, None, None, "archive phase")
+            .commit_finalized_direct(block.into(), None, None, "archive phase")
             .expect("archive block is valid");
     }
 
@@ -734,7 +734,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, None, None, "archive phase")
+            .commit_finalized_direct(block.into(), None, None, "archive phase")
             .expect("archive block is valid");
     }
     std::mem::drop(archive_state);
@@ -876,7 +876,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
     let finalizable = FinalizableBlock::new(contextually_verified, Treestate::default());
 
     state
-        .commit_finalized_direct(finalizable, None, None, None, "contextual retention tests")
+        .commit_finalized_direct(finalizable, None, None, "contextual retention tests")
         .expect("contextual block is valid");
 
     assert!(

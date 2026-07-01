@@ -801,7 +801,6 @@ impl FinalizedState {
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
-        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
@@ -811,7 +810,6 @@ impl FinalizedState {
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
             note_precompute,
-            next_checkpoint,
             "commit checkpoint-verified request",
         );
 
@@ -860,12 +858,6 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         note_precompute: Option<BlockNotePrecompute>,
-        // The next checkpoint block (and its precomputed
-        // auth data root), used to verify this block's fixture roots before the fast
-        // path trusts them. `None` is only valid for fast blocks at the checkpoint
-        // handoff, where the embedded final frontiers independently authenticate
-        // this height's roots, or outside the checkpoint commit path.
-        next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (
@@ -936,42 +928,25 @@ impl FinalizedState {
                         .as_ref()
                         .and_then(|v| v.final_frontiers_for_last_checkpoint(height));
 
-                    // This block's own commitment check is identical to the
-                    // previous vct block's look-ahead. When that look-ahead
-                    // already validated this exact header, skip the duplicate.
-                    let block_hash = block.hash();
-                    let is_prevalidated = self.vct_prevalidated_next == Some((height, block_hash));
-                    if is_prevalidated {
-                        if let Some(v) = &self.vct {
-                            v.record_prevalidated();
-                        }
-                        // Observability: the previous fast block's look-ahead already
-                        // validated this header, so its commitment check was skipped (the
-                        // dedup). A subset of `state.vct.fast.block.count`.
-                        metrics::counter!("state.vct.prevalidated.block.count").increment(1);
-                    }
-
-                    let mut verification_items = vec![
+                    // These supplied roots were already verified against the checkpoint-committed
+                    // header chain at header-sync commit (design §6, folded into the
+                    // `zakura_header_frontier_tree` MMR before they were persisted), so the
+                    // committer trusts them. It re-checks this block's own header commitment
+                    // against the running tree as a cheap consensus-equivalence invariant and
+                    // folds the roots — but no longer waits for a buffered successor to confirm
+                    // them, removing the successor dependency that deadlocked the write worker.
+                    let verification_items = vec![
                         commitment_aux_verify::CommitmentRootVerification::with_roots(
                             block.clone(),
                             sapling_root,
                             orchard_root,
                             precomputed_auth_data_root,
-                            is_prevalidated,
+                            false,
                         ),
                     ];
-                    if let Some((next_block, next_auth)) = &next_checkpoint {
-                        verification_items.push(
-                            commitment_aux_verify::CommitmentRootVerification::header_only(
-                                next_block.clone(),
-                                *next_auth,
-                            ),
-                        );
-                    }
 
-                    // Verifies this block's own header, folds its supplied roots into
-                    // the candidate tree, and when buffered checks the successor header
-                    // against that candidate (the one-block lag).
+                    // Confirms this block's own header commitment against the running tree and
+                    // folds its supplied roots into the candidate tree.
                     let candidate = COMMIT_COMPUTE_POOL
                         .install(|| {
                             commitment_aux_verify::verify_commitment_roots(
@@ -981,32 +956,8 @@ impl FinalizedState {
                             )
                         })
                         .map_err(|(_fail_height, error)| {
-                            self.vct_prevalidated_next = None;
                             self.vct_reject_supplied_root(height, error)
                         })?;
-
-                    if let Some((next_block, _next_auth)) = &next_checkpoint {
-                        self.vct_prevalidated_next = Some((
-                            (height + 1).expect("checkpoint block heights are valid"),
-                            next_block.hash(),
-                        ));
-                    } else if self
-                        .vct
-                        .as_ref()
-                        .is_some_and(|v| v.vct_root_needs_successor(height, &network))
-                    {
-                        // Untrusted root at/above Heartwood, no successor to confirm it,
-                        // not the last checkpoint: defer rather than persist it unverified. Leaves
-                        // the database untouched; the block re-commits once the successor
-                        // is buffered.
-                        metrics::counter!("state.vct.root.await_successor.count").increment(1);
-                        return Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
-                            height,
-                        }
-                        .into());
-                    } else {
-                        self.vct_prevalidated_next = None;
-                    }
 
                     history_tree = Arc::new(candidate);
                     if let Some(v) = &self.vct {
