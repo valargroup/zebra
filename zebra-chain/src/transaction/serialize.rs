@@ -1155,7 +1155,7 @@ impl ZcashDeserialize for Transaction {
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
-                let tx = Transaction::V5 {
+                Ok(Transaction::V5 {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1163,11 +1163,7 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                };
-
-                tx.to_librustzcash(network_upgrade)?;
-
-                Ok(tx)
+                })
             }
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
@@ -1228,7 +1224,7 @@ impl ZcashDeserialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
-                let tx = Transaction::V6 {
+                Ok(Transaction::V6 {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1237,11 +1233,7 @@ impl ZcashDeserialize for Transaction {
                     sapling_shielded_data,
                     orchard_shielded_data,
                     ironwood_shielded_data,
-                };
-
-                tx.to_librustzcash(network_upgrade)?;
-
-                Ok(tx)
+                })
             }
             (_, _) => Err(SerializationError::Parse("bad tx header")),
         }
