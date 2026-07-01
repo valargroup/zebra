@@ -239,23 +239,19 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 /// An [ephemeral public key][1] (`epk`) for Sapling key agreement, stored as its
 /// 32-byte encoding.
 ///
-/// The key is a Jubjub point, but nodes only need its bytes (for the
-/// txid digest and serialization); the point itself is only needed for wallet
-/// trial-decryption. So we keep the raw bytes and skip decompression at
-/// deserialization, keeping the field square root off the checkpoint-sync hot
-/// path, where every Sapling output carries an `epk`.
+/// The key is a Jubjub point, but nodes only need its bytes for the txid digest
+/// and serialization. The point itself is only used for wallet trial decryption,
+/// so Zebra keeps the raw bytes and skips decompression during deserialization.
 ///
 /// # Consensus
 ///
-/// Deserialization only checks the byte length; it does not prove the bytes are
-/// a canonical, non-small-order point. The not-small-order check is deferred to
-/// the semantic verifier and mempool, which call
+/// Deserialization only checks the byte length; the semantic verifier and
+/// mempool must check that it is a canonical, non-small-order point. They do so
+/// by calling
 /// [`EphemeralPublicKey::is_valid_not_small_order`] (via
-/// [`Transaction::sapling_point_encodings_are_valid`]) and also verify the
+/// [`Transaction::sapling_point_encodings_are_valid`]). They also verify the
 /// Sapling bundle through librustzcash, whose `check_output` rejects a
-/// small-order `epk`. The checkpoint verifier trusts block hashes and skips the
-/// check. Covered by
-/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash`.
+/// small-order `epk`.
 ///
 /// Its serialized form is [KA^{Sapling}.Public][2].
 ///
