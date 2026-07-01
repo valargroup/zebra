@@ -407,25 +407,7 @@ where
             check::has_enough_ironwood_flags(&tx)?;
             check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
-
-            // # Consensus
-            //
-            // > Check that an Output description's cv and epk are not of small
-            // > order, [and] that a Spend description's cv and rk are not of
-            // > small order.
-            //
-            // https://zips.z.cash/protocol/protocol.pdf#outputdesc
-            // https://zips.z.cash/protocol/protocol.pdf#spenddesc
-            //
-            // Deserialization stores Sapling cv and epk as raw bytes and defers
-            // their not-small-order check to keep point decompression off the
-            // checkpoint-sync hot path. We enforce it here, on the semantic and
-            // mempool paths that process untrusted transactions, before any state
-            // lookup or librustzcash conversion so an invalid point fails fast.
-            // (Spend rk is still validated at deserialization.)
-            if !tx.sapling_point_encodings_are_valid() {
-                return Err(TransactionError::SmallOrder);
-            }
+            check::sapling_point_encodings_are_valid(&tx)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //
