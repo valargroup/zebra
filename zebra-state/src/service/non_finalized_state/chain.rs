@@ -1260,14 +1260,19 @@ impl Chain {
     fn remove_ironwood_tree_and_anchor(&mut self, position: RevertPosition, height: Height) {
         let (removed_heights, highest_removed_tree) = if position == RevertPosition::Root {
             (
+                // Remove all trees and anchors at or below the removed block.
+                // This makes sure the temporary trees from finalized tip forks are removed.
                 self.ironwood_anchors_by_height
                     .keys()
                     .cloned()
                     .filter(|index_height| *index_height <= height)
                     .collect(),
+                // Cache the highest (rightmost) tree before its removal.
                 self.ironwood_tree(height.into()),
             )
         } else {
+            // Just remove the reverted tip trees and anchors.
+            // We don't need to cache the highest (rightmost) tree.
             (vec![height], None)
         };
 
@@ -1289,6 +1294,14 @@ impl Chain {
             );
         }
 
+        // # Invariant
+        //
+        // The height following after the removed heights in a non-empty non-finalized state must
+        // always have its tree.
+        //
+        // The loop above can violate the invariant, and if `position` is [`RevertPosition::Root`],
+        // it will always violate the invariant. We restore the invariant by storing the highest
+        // (rightmost) removed tree just above `height` if there is no tree at that height.
         if !self.is_empty() && height < self.non_finalized_tip_height() {
             let next_height = height
                 .next()
