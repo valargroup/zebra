@@ -28,10 +28,10 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `DEFAULT_ZAKURA_BOOTSTRAP_PEERS` | `zebra-network/src/zakura/handler.rs` | empty default → 9 native bootstrap peers | _(this PR)_ | Let Zakura nodes discover the native P2P network without requiring every operator to configure bootstrap peers manually. |
-| `DEFAULT_ZAKURA_MAX_CONNECTIONS` | `zebra-network/src/zakura/handler.rs` | `32` → `256` | _(this PR)_ | Raise the native P2P connection envelope for production sync and peer diversity. |
-| `DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES` | `zebra-network/src/zakura/handler.rs` | `8` → `32` | _(this PR)_ | Allow more simultaneous native control handshakes during bootstrap and peer churn. |
-| `DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND` | `zebra-network/src/zakura/handler.rs` | `16` → `32` | _(this PR)_ | Permit higher stream-open churn across the larger default peer set. |
-| `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `zebra-network/src/zakura/handler.rs` | `3 MiB` → `32 MiB` | _(this PR)_ | Avoid throttling high-throughput native streams with the earlier conservative per-stream receive window. |
-| `DEFAULT_ZAKURA_RECEIVE_WINDOW` | `zebra-network/src/zakura/handler.rs` | `16 MiB` → `32 MiB` | _(this PR)_ | Match the connection receive window to the larger stream window used for production sync. |
-| `DEFAULT_ZAKURA_SEND_WINDOW` | `zebra-network/src/zakura/handler.rs` | `16 MiB` → `32 MiB` | _(this PR)_ | Keep the native QUIC send window from becoming the bottleneck for larger receive windows. |
+| `DEFAULT_ZAKURA_BOOTSTRAP_PEERS` | `zebra-network/src/zakura/handler.rs` | empty default → 9 native bootstrap peers | [#376](https://github.com/valargroup/zebra/pull/376) | Let Zakura nodes discover the native P2P network without requiring every operator to configure bootstrap peers manually. |
+| `DEFAULT_ZAKURA_MAX_CONNECTIONS` | `zebra-network/src/zakura/handler.rs` | `32` → `256` | [#376](https://github.com/valargroup/zebra/pull/376) | Raise the native P2P connection envelope for production sync and peer diversity. |
+| `DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES` | `zebra-network/src/zakura/handler.rs` | `8` → `32` | [#376](https://github.com/valargroup/zebra/pull/376) | Allow more simultaneous native control handshakes during bootstrap and peer churn. |
+| `DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND` | `zebra-network/src/zakura/handler.rs` | `16` → `32` | [#376](https://github.com/valargroup/zebra/pull/376) | Permit higher stream-open churn across the larger default peer set. |
+| `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `zebra-network/src/zakura/handler.rs` | `3 MiB` → `32 MiB` | [#376](https://github.com/valargroup/zebra/pull/376) | Avoid throttling high-throughput native streams with the earlier conservative per-stream receive window. |
+| `DEFAULT_ZAKURA_RECEIVE_WINDOW` | `zebra-network/src/zakura/handler.rs` | `16 MiB` → `32 MiB` | [#376](https://github.com/valargroup/zebra/pull/376) | Match the connection receive window to the larger stream window used for production sync. |
+| `DEFAULT_ZAKURA_SEND_WINDOW` | `zebra-network/src/zakura/handler.rs` | `16 MiB` → `32 MiB` | [#376](https://github.com/valargroup/zebra/pull/376) | Keep the native QUIC send window from becoming the bottleneck for larger receive windows. |
