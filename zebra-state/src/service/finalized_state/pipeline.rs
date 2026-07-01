@@ -443,6 +443,7 @@ pub(crate) fn reconcile_window(
     // decode + index traversal) and independent across outpoints, and RocksDB reads
     // are thread-safe through the cloneable `DiskDb`. This runs off the assembler
     // thread on the worker, spreading the resolution across otherwise-idle cores.
+    let resolve_start = std::time::Instant::now();
     use rayon::prelude::*;
     let resolved: HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)> =
         outpoints
@@ -471,6 +472,15 @@ pub(crate) fn reconcile_window(
                 },
             )
             .collect::<Result<HashMap<_, _>, BoxError>>()?;
+
+    if std::env::var("ZRB_RECONCILE_DEBUG").is_ok() {
+        let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+        eprintln!(
+            "[recon-resolve] last_h={last_h} n_outpoints={} resolve_ms={:.1}",
+            outpoints.len(),
+            resolve_start.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     db.commit_checkpoint_reconcile(network, start_value_pool, records, &resolved)
 }

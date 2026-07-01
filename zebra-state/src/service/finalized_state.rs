@@ -76,6 +76,27 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .expect("rayon thread pool configuration is valid")
 });
 
+/// A dedicated rayon thread pool for the deferred-transparent reconcile worker's
+/// per-interval parallel passes (spent-UTXO resolution + per-block value-pool
+/// deltas).
+///
+/// Isolating the worker's large `par_iter`s (a heavy interval resolves ~900k
+/// outpoints) onto their own pool keeps them out of the global pool's shared queue,
+/// so the concurrently-running assembler's smaller `par_iter`s (raw-tx
+/// serialization) are not stuck behind them. The worker has spare time per interval,
+/// so a separate queue trades a little worker parallelism for steadier assembler
+/// progress.
+pub(crate) static RECONCILE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("reconcile-{i}"))
+        .build()
+        .expect("rayon thread pool configuration is valid")
+});
+
 /// Spawns the note-commitment tree per-leaf hashing for `block` onto the
 /// commit-compute pool, returning a receiver for the result and a cancellation
 /// flag.

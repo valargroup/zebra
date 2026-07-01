@@ -272,12 +272,17 @@ impl ZebraDb {
         records: &[ReconcileBlock],
         resolved: &HashMap<transparent::OutPoint, (OutputLocation, transparent::Utxo)>,
     ) -> Result<ValueBalance<NonNegative>, BoxError> {
+        // Env-gated per-phase timing for the A2 bottleneck study.
+        let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+        let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+
         let mut batch = DiskWriteBatch::new();
 
         // The deletes: every resolved spend, keyed by output location. The address
         // index is off in the deferred range, so `skip_index = true` makes this
         // delete only the `utxo_by_out_loc` entries (no address-link deletes), and
         // the empty `address_balances` is never consulted.
+        let deletes_start = std::time::Instant::now();
         let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = resolved
             .values()
             .map(|(out_loc, utxo)| (*out_loc, utxo.clone()))
@@ -289,6 +294,8 @@ impl ZebraDb {
             &AddressBalanceLocationUpdates::Insert(HashMap::new()),
             true,
         );
+        let deletes_dur = deletes_start.elapsed();
+        let n_deletes = spent_utxos_by_out_loc.len();
 
         // Compute each block's independent value-pool delta and serialized size in
         // parallel — `chain_value_pool_change` re-folds every transaction's value
@@ -298,6 +305,7 @@ impl ZebraDb {
         // per-height running pool for `BlockInfo`. Splitting the parallel per-block
         // work from the ordered running-sum keeps the result byte-identical to the
         // inline per-block path (same deltas, same application order).
+        let vp_start = std::time::Instant::now();
         use rayon::prelude::*;
         let per_block: Vec<(ValueBalance<NegativeAllowed>, usize)> = records
             .par_iter()
@@ -336,7 +344,9 @@ impl ZebraDb {
                 },
             )
             .collect::<Result<Vec<_>, BoxError>>()?;
+        let vp_dur = vp_start.elapsed();
 
+        let bi_start = std::time::Instant::now();
         let mut value_pool = start_value_pool;
         for (record, (delta, block_size)) in records.iter().zip(per_block) {
             value_pool = value_pool.add_chain_value_pool_change(delta)?;
@@ -355,8 +365,23 @@ impl ZebraDb {
             .chain_value_pools_cf()
             .with_batch_for_writing(&mut batch)
             .zs_insert(&(), &value_pool);
+        let bi_dur = bi_start.elapsed();
 
+        let write_start = std::time::Instant::now();
         self.write_batch(batch)?;
+        let write_dur = write_start.elapsed();
+
+        if debug {
+            eprintln!(
+                "[recon-commit] last_h={last_h} n_blocks={} n_deletes={n_deletes} \
+                 deletes_ms={:.1} vp_ms={:.1} blockinfo_ms={:.1} write_ms={:.1}",
+                records.len(),
+                deletes_dur.as_secs_f64() * 1e3,
+                vp_dur.as_secs_f64() * 1e3,
+                bi_dur.as_secs_f64() * 1e3,
+                write_dur.as_secs_f64() * 1e3,
+            );
+        }
 
         Ok(value_pool)
     }
