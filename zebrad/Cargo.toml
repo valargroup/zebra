@@ -267,6 +267,8 @@ tonic-prost-build = { workspace = true, optional = true }
 [dev-dependencies]
 abscissa_core = { workspace = true, features = ["testing"] }
 anyhow = { workspace = true }
+# Local in-process metrics recorder for asserting gauge values in tests.
+metrics-util = "0.19"
 hex = { workspace = true }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }

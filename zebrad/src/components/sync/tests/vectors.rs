@@ -1739,6 +1739,128 @@ async fn registry_miss_does_not_block_unrelated_reserve_dispatch() -> Result<(),
     Ok(())
 }
 
+/// End-to-end on the real code path: a genuine `NotFoundRegistry` download failure drives the
+/// `sync.registry_miss.pending` gauge above zero through the real handler and `update_metrics`, and
+/// while the miss is parked, unrelated reserve hashes still dispatch. Uses an in-process metrics
+/// recorder to read the real gauge value — the same signal exposed on a live node's `/metrics`.
+///
+/// Pinned to a current-thread runtime so the thread-local recorder installed here is visible to the
+/// `metrics::gauge!` calls in `update_metrics`, which is only ever invoked inline on this thread.
+#[tokio::test(flavor = "current_thread")]
+async fn registry_miss_raises_pending_gauge_and_keeps_dispatching() -> Result<(), crate::BoxError> {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    /// Reads the current value of a named gauge from the local recorder snapshot.
+    fn gauge_value(snapshotter: &Snapshotter, name: &str) -> Option<f64> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, _unit, _desc, _value)| key.key().name() == name)
+            .and_then(|(_key, _unit, _desc, value)| match value {
+                DebugValue::Gauge(v) => Some(v.into_inner()),
+                _ => None,
+            })
+    }
+
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+    // Nothing missing yet: the gauge reads zero once `update_metrics` has published it.
+    chain_sync.update_metrics();
+    assert_eq!(
+        gauge_value(&snapshotter, "sync.registry_miss.pending").unwrap_or(0.0),
+        0.0,
+        "no registry miss should be pending before any download failure",
+    );
+
+    // A required block that the peer set reports as missing from every ready peer — the synthetic
+    // `NotFoundRegistry` classification, fed through the real handler that schedules the retry.
+    let missing_hash = block::Hash::from([0x99; 32]);
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::DownloadFailed {
+            error: not_found_registry_error(missing_hash),
+            hash: missing_hash,
+        }))
+        .await
+        .expect("a registry miss within budget keeps the round alive");
+
+    chain_sync.update_metrics();
+    assert_eq!(
+        gauge_value(&snapshotter, "sync.registry_miss.pending"),
+        Some(1.0),
+        "a parked registry miss should raise sync.registry_miss.pending above zero",
+    );
+
+    // While the miss is parked, unrelated available reserve hashes must still dispatch: the
+    // reservation withholds only a single slot, not the whole window.
+    let first_block: Arc<Block> =
+        zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let first_hash = first_block.hash();
+    let second_block: Arc<Block> =
+        zebra_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let second_hash = second_block.hash();
+    let reserve = IndexSet::from_iter([first_hash, second_hash]);
+
+    let lookahead_limit = chain_sync.lookahead_limit(reserve.len());
+    let dispatch_limit = chain_sync.reserve_dispatch_limit(lookahead_limit);
+    assert!(
+        dispatch_limit >= reserve.len(),
+        "spare capacity should remain for unrelated reserve hashes while a miss is pending",
+    );
+
+    let dispatch = tokio::spawn(async move {
+        let response = chain_sync.request_blocks(reserve, dispatch_limit).await;
+        (chain_sync, response)
+    });
+
+    for (hash, block) in [(first_hash, first_block), (second_hash, second_block)] {
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((block, None))]));
+    }
+
+    let (mut chain_sync, extra_hashes) = dispatch
+        .await
+        .expect("request_blocks task should not panic");
+    extra_hashes.expect("dispatch within the reserved budget should succeed");
+
+    for hash in [first_hash, second_hash] {
+        block_verifier_router
+            .expect_request_that(|req| req.block().hash() == hash)
+            .await
+            .respond(hash);
+    }
+
+    // The miss is still parked after unrelated dispatch, so the gauge stays above zero.
+    chain_sync.update_metrics();
+    assert_eq!(
+        gauge_value(&snapshotter, "sync.registry_miss.pending"),
+        Some(1.0),
+        "the registry miss should remain pending (and observable) after unrelated dispatch",
+    );
+    assert!(
+        chain_sync.registry_miss_retry.contains_key(&missing_hash),
+        "the registry-miss retry must remain scheduled through unrelated reserve dispatch",
+    );
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
 /// A registry miss (every ready peer marked missing the block) within budget schedules a backoff
 /// retry instead of blocking the loop or restarting the round, and does not re-request the block
 /// inline — the retry is deferred to the sync loop's timer arm so peers can drain meanwhile.
