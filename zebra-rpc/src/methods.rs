@@ -2257,18 +2257,10 @@ where
 
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
-        let miner_params = self.gbt.miner_params().map_err(|error| {
-            let message = if matches!(
-                error,
-                types::get_block_template::MinerParamsError::MissingAddr
-            ) {
-                "miner parameters are required for get_block_template".to_string()
-            } else {
-                error.to_string()
-            };
-
-            ErrorObject::owned(0, message, None::<()>)
-        })?;
+        let miner_params = self
+            .gbt
+            .miner_params()
+            .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
         // - Checks and fetches that can change during long polling
         //

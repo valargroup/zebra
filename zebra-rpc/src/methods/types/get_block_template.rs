@@ -539,7 +539,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Miner parameters, including the miner address, data, and memo.
-    miner_params: Result<MinerParams, Arc<MinerParamsError>>,
+    miner_params: Option<MinerParams>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -566,7 +566,7 @@ where
         mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> Self {
         Self {
-            miner_params: MinerParams::new(net, conf).map_err(Arc::new),
+            miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -575,8 +575,8 @@ where
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
-    pub fn miner_params(&self) -> Result<&MinerParams, &MinerParamsError> {
-        self.miner_params.as_ref().map_err(Arc::as_ref)
+    pub fn miner_params(&self) -> Option<&MinerParams> {
+        self.miner_params.as_ref()
     }
 
     /// Returns the sync status.
@@ -600,7 +600,7 @@ where
 
     /// Randomizes the coinbase data, if miner parameters are set.
     pub fn randomize_coinbase_data(&mut self) {
-        if let Ok(miner_params) = &mut self.miner_params {
+        if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
         }
