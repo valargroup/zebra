@@ -151,8 +151,26 @@ fn run_reconcile_worker(
     job_receiver: std::sync::mpsc::Receiver<ReconcileJob>,
 ) {
     let network = db.network();
-    while let Ok(ReconcileJob { records }) = job_receiver.recv() {
-        match reconcile_window(&db, &network, &records, value_pool) {
+    let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+    loop {
+        // Env-gated: time how long the worker sits idle waiting for the next window. A
+        // large wait means the worker is faster than the assembler produces intervals.
+        let recv_start = std::time::Instant::now();
+        let Ok(ReconcileJob { records }) = job_receiver.recv() else {
+            break;
+        };
+        if debug {
+            let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+            eprintln!(
+                "[recon-recv] last_h={last_h} recv_wait_ms={:.1}",
+                recv_start.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        // Run the interval's parallel passes on the dedicated reconcile pool so they
+        // do not share the global pool's queue with the assembler's `par_iter`s.
+        let result = crate::service::finalized_state::RECONCILE_POOL
+            .install(|| reconcile_window(&db, &network, &records, value_pool));
+        match result {
             Ok(new_pool) => value_pool = new_pool,
             Err(error) => panic!("deferred transparent reconcile worker failed: {error}"),
         }
@@ -177,11 +195,23 @@ impl ReconcileWorker {
             return;
         }
         if let Some(sender) = self.sender.as_ref() {
+            // Env-gated: time how long the bounded send blocks. A large wait means the
+            // worker is behind (the capacity-1 channel is full), i.e. the reconcile
+            // gates the assembler.
+            let debug = std::env::var("ZRB_RECONCILE_DEBUG").is_ok();
+            let last_h = records.last().map(|r| r.height.0).unwrap_or(0);
+            let send_start = std::time::Instant::now();
             // The worker only stops on channel close, so a send error means it
             // panicked mid-reconcile; that is fatal (inconsistent value pool / UTXOs).
             sender
                 .send(ReconcileJob { records })
                 .expect("reconcile worker thread has gone away");
+            if debug {
+                eprintln!(
+                    "[recon-send] last_h={last_h} backpressure_ms={:.1}",
+                    send_start.elapsed().as_secs_f64() * 1e3,
+                );
+            }
         }
     }
 
