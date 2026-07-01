@@ -71,8 +71,8 @@ fn cf_len(state: &FinalizedState, cf_name: &str) -> usize {
         .count()
 }
 
-/// A pruned + checkpoint-syncing node commits the UTXO set but skips the three
-/// transparent address-index column families; an archive node populates all of them.
+/// A pruned + checkpoint-syncing node commits the UTXO set but skips transparent
+/// archive-only index column families; an archive node populates all of them.
 #[test]
 fn pruned_checkpoint_commit_skips_the_transparent_address_index() {
     let _init_guard = zebra_test::init();
@@ -81,14 +81,15 @@ fn pruned_checkpoint_commit_skips_the_transparent_address_index() {
     const BALANCE_CF: &str = "balance_by_transparent_addr";
     const UTXO_LOC_CF: &str = "utxo_loc_by_transparent_addr_loc";
     const TX_LOC_CF: &str = "tx_loc_by_transparent_addr_loc";
+    const SPENT_TX_LOC_CF: &str = "tx_loc_by_spent_out_loc";
     const UTXO_SET_CF: &str = "utxo_by_out_loc";
 
     // Archive mode keeps the address index: the early coinbase outputs populate all
     // three address column families.
     let archive = new_state_with_blocks(&Config::ephemeral(), &network);
     assert!(
-        !archive.db.config().skip_address_index(),
-        "archive mode keeps the transparent address index"
+        !archive.db.config().skip_archive_indexes(),
+        "archive mode keeps transparent archive-only indexes"
     );
     assert!(
         cf_len(&archive, BALANCE_CF) > 0
@@ -100,21 +101,22 @@ fn pruned_checkpoint_commit_skips_the_transparent_address_index() {
         cf_len(&archive, TX_LOC_CF),
     );
 
-    // Pruned + checkpoint-sync skips the address index entirely, but still writes the
-    // consensus-critical UTXO set.
+    // Pruned + checkpoint-sync skips archive-only indexes entirely, but still writes
+    // the consensus-critical UTXO set.
     let pruned = new_state_with_blocks(&pruned_config(), &network);
     assert!(
-        pruned.db.config().skip_address_index(),
-        "pruned + checkpoint-sync skips the transparent address index"
+        pruned.db.config().skip_archive_indexes(),
+        "pruned + checkpoint-sync skips transparent archive-only indexes"
     );
     assert_eq!(
         (
             cf_len(&pruned, BALANCE_CF),
             cf_len(&pruned, UTXO_LOC_CF),
             cf_len(&pruned, TX_LOC_CF),
+            cf_len(&pruned, SPENT_TX_LOC_CF),
         ),
-        (0, 0, 0),
-        "pruned + checkpoint-sync writes no transparent address index entries"
+        (0, 0, 0, 0),
+        "pruned + checkpoint-sync writes no transparent archive-only index entries"
     );
     assert!(
         cf_len(&pruned, UTXO_SET_CF) > 0,

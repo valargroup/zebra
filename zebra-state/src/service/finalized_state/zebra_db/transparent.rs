@@ -434,12 +434,12 @@ impl DiskWriteBatch {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
 
-        // A pruned, checkpoint-syncing node skips the auxiliary transparent address
-        // index entirely. The UTXO-set passes still run (they write/delete
-        // `utxo_by_out_loc`), but the address-balance update, the per-tx address
-        // indexing, and the address balance CF are all elided. The UTXO/value-pool/
+        // A pruned, checkpoint-syncing node skips transparent archive-only indexes.
+        // The UTXO-set passes still run (they write/delete `utxo_by_out_loc`), but
+        // the address-balance update, address index writes, and finalized
+        // transparent spender index writes are all elided. The UTXO/value-pool/
         // nullifier state is unchanged.
-        let skip_index = zebra_db.config().skip_address_index();
+        let skip_index = zebra_db.config().skip_archive_indexes();
 
         // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
         // before crediting outputs within each transaction. This ordering keeps every

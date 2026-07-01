@@ -681,10 +681,11 @@ fn reverse_transparent_block(
     // (see `prepare_transparent_transaction_batch`). Undoing the operations in the exact reverse
     // order retraces those same in-range intermediate balances, so the checked balance arithmetic
     // below cannot spuriously overflow or underflow.
-    // A pruned, checkpoint-syncing node never built the transparent address index
-    // ([`Config::skip_address_index`]), so there is nothing to un-credit / un-debit
-    // for it. The UTXO-set reversal (`utxo_by_out_loc`) below still runs.
-    let skip_index = db.config().skip_address_index();
+    // A pruned, checkpoint-syncing node never built the transparent archive-only indexes
+    // ([`Config::skip_archive_indexes`]), so there is nothing to un-credit / un-debit
+    // or remove from the finalized transparent spender index. The UTXO-set reversal
+    // (`utxo_by_out_loc`) below still runs.
+    let skip_index = db.config().skip_archive_indexes();
 
     for (tx_index, transaction) in block.transactions.iter().enumerate().rev() {
         let tx_location = TransactionLocation::from_usize(height, tx_index);

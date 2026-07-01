@@ -273,11 +273,11 @@ impl DiskFormatUpgrade for Upgrade {
             return Err(CancelFormatChange);
         }
 
-        // A pruned, checkpoint-syncing node does not build the transparent address
-        // index ([`Config::skip_address_index`]), so the received-balance check below
+        // A pruned, checkpoint-syncing node does not build transparent archive-only
+        // indexes ([`Config::skip_archive_indexes`]), so the received-balance check below
         // does not apply — the balances are intentionally absent. The BlockInfo check
         // above still runs, since block info is written regardless of the address index.
-        if db.config().skip_address_index() {
+        if db.config().skip_archive_indexes() {
             return Ok(Ok(()));
         }
 

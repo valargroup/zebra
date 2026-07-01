@@ -88,11 +88,12 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
-/// Returned for transparent address-lookup requests when the address index was
-/// not built (pruned storage mode). The index is RPC-only, not consensus.
-const ADDRESS_INDEX_DISABLED: &str =
-    "the transparent address index is disabled in pruned storage mode; \
-     getaddressbalance, getaddressutxos, and getaddresstxids require an archive node";
+/// Returned for transparent archive/indexer lookups when the required indexes were
+/// not built. These indexes are RPC-only, not consensus.
+const ARCHIVE_INDEXES_DISABLED: &str =
+    "the transparent archive indexes are disabled in pruned checkpoint-sync mode; \
+     getaddressbalance, getaddressutxos, getaddresstxids, and finalized transparent \
+     spender lookups require an archive node or full semantic verification";
 
 /// A read-write service for Zebra's cached blockchain state.
 ///
@@ -1664,9 +1665,19 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             #[cfg(feature = "indexer")]
-            ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
-            )),
+            ReadRequest::SpendingTransactionId(spend) => {
+                let spending_transaction_hash =
+                    read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend);
+
+                if spending_transaction_hash.is_none()
+                    && matches!(spend, crate::request::Spend::OutPoint(_))
+                    && state.db.config().skip_archive_indexes()
+                {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
+                } else {
+                    Ok(ReadResponse::TransactionId(spending_transaction_hash))
+                }
+            }
 
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),
@@ -1813,8 +1824,8 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_address_balance RPC.
             ReadRequest::AddressBalance(addresses) => {
-                if state.db.config().skip_address_index() {
-                    Err(ADDRESS_INDEX_DISABLED.into())
+                if state.db.config().skip_archive_indexes() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
                 } else {
                     let (balance, received) =
                         read::transparent_balance(state.latest_best_chain(), &state.db, addresses)?;
@@ -1827,8 +1838,8 @@ impl Service<ReadRequest> for ReadStateService {
                 addresses,
                 height_range,
             } => {
-                if state.db.config().skip_address_index() {
-                    Err(ADDRESS_INDEX_DISABLED.into())
+                if state.db.config().skip_archive_indexes() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
                 } else {
                     read::transparent_tx_ids(
                         state.latest_best_chain(),
@@ -1842,8 +1853,8 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_address_utxos RPC.
             ReadRequest::UtxosByAddresses(addresses) => {
-                if state.db.config().skip_address_index() {
-                    Err(ADDRESS_INDEX_DISABLED.into())
+                if state.db.config().skip_archive_indexes() {
+                    Err(ARCHIVE_INDEXES_DISABLED.into())
                 } else {
                     read::address_utxos(
                         &state.network,

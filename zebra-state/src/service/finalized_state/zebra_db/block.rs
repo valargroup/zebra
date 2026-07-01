@@ -920,10 +920,12 @@ impl ZebraDb {
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
         //
-        // When the address index is skipped (pruned + checkpoint-sync fast-validator),
+        // When archive-only indexes are skipped (pruned + checkpoint-sync fast-validator),
         // none of the per-address balance reads happen and `address_balances` is left
         // empty; the gated transparent index passes below then write no address entries.
-        let address_balances: AddressBalanceLocationUpdates = if self.config().skip_address_index()
+        let address_balances: AddressBalanceLocationUpdates = if self
+            .config()
+            .skip_archive_indexes()
         {
             AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {

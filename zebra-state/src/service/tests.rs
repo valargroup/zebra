@@ -644,6 +644,37 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
     Ok(())
 }
 
+#[cfg(feature = "indexer")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_checkpoint_transparent_spender_lookup_returns_disabled_index_error(
+) -> std::result::Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let config = Config {
+        storage_mode: crate::config::StorageMode::Pruned(crate::PruningConfig::default()),
+        checkpoint_sync: true,
+        ..Config::ephemeral()
+    };
+    let (_, read_state, _, _) = StateService::new(config, &network, Height::MAX, 0).await;
+
+    let outpoint = transparent::OutPoint::from_usize(transaction::Hash([0; 32]), 0);
+    let error = read_state
+        .oneshot(ReadRequest::SpendingTransactionId(
+            crate::request::Spend::OutPoint(outpoint),
+        ))
+        .await
+        .expect_err("transparent spender lookup should require archive indexes");
+
+    assert!(
+        error
+            .to_string()
+            .contains("transparent archive indexes are disabled"),
+        "unexpected error: {error}",
+    );
+
+    Ok(())
+}
+
 /// A node still in the finalized (checkpoint) write phase must be able to commit
 /// a Zakura header range.
 ///

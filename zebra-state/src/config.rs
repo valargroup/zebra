@@ -258,20 +258,19 @@ impl Config {
         }
     }
 
-    /// Whether to omit the auxiliary transparent **address index** (balances,
-    /// address→utxo, address→tx).
+    /// Whether to omit archive/indexer-only data that is not required for consensus.
     ///
-    /// The address index is RPC-only state, not consensus. It is skipped only for the
-    /// minimal fast-validator configuration: a node that is both [`StorageMode::Pruned`]
-    /// **and** checkpoint-syncing ([`checkpoint_sync`](Config::checkpoint_sync)). That
-    /// drops the per-block address-balance reads and index writes, just as pruned mode
-    /// drops raw-transaction storage.
+    /// These indexes are RPC-only state, not consensus. They are skipped only for
+    /// the minimal fast-validator configuration: a node that is both
+    /// [`StorageMode::Pruned`] **and** checkpoint-syncing
+    /// ([`checkpoint_sync`](Config::checkpoint_sync)). This drops historical
+    /// transparent address-index writes and transparent finalized-spender lookups,
+    /// just as pruned mode drops raw-transaction storage.
     ///
-    /// An archive node keeps the index; so does a node with checkpoint sync disabled
-    /// (full semantic verification), even when pruned. Address-lookup RPCs
-    /// (`getaddressbalance`/`getaddressutxos`/`getaddresstxids`) return an error when
-    /// the index is skipped, rather than wrong (empty) results.
-    pub fn skip_address_index(&self) -> bool {
+    /// An archive node keeps these indexes; so does a node with checkpoint sync
+    /// disabled (full semantic verification), even when pruned. RPCs backed by
+    /// skipped indexes return an error rather than wrong (empty) results.
+    pub fn skip_archive_indexes(&self) -> bool {
         matches!(self.storage_mode, StorageMode::Pruned(_)) && self.checkpoint_sync
     }
 
@@ -451,15 +450,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skip_address_index_only_when_pruned_and_checkpoint_syncing() {
+    fn skip_archive_indexes_only_when_pruned_and_checkpoint_syncing() {
         let pruned_checkpoint = Config {
             storage_mode: StorageMode::Pruned(PruningConfig::default()),
             checkpoint_sync: true,
             ..Default::default()
         };
         assert!(
-            pruned_checkpoint.skip_address_index(),
-            "pruned + checkpoint-sync skips the transparent address index"
+            pruned_checkpoint.skip_archive_indexes(),
+            "pruned + checkpoint-sync skips archive-only indexes"
         );
 
         let archive = Config {
@@ -468,8 +467,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !archive.skip_address_index(),
-            "archive mode keeps the address index"
+            !archive.skip_archive_indexes(),
+            "archive mode keeps archive-only indexes"
         );
 
         let pruned_legacy = Config {
@@ -478,8 +477,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !pruned_legacy.skip_address_index(),
-            "pruned with checkpoint sync disabled keeps the address index"
+            !pruned_legacy.skip_archive_indexes(),
+            "pruned with checkpoint sync disabled keeps archive-only indexes"
         );
     }
 
