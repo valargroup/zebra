@@ -23,7 +23,7 @@ use zebra_chain::{
     orchard,
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
-        Network,
+        Network, NetworkUpgrade,
     },
     primitives::ed25519,
     sapling::ValueCommitment,
@@ -153,7 +153,7 @@ impl TransactionTemplate<NegativeOrZero> {
             };
         }
 
-        let add_orchard_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_orchard_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_orchard_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -165,7 +165,19 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_ironwood_reward = |builder: &mut Builder<_, _>, addr: &_| {
+            trace_err!(
+                builder.add_ironwood_output::<String>(
+                    Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
+                    *addr,
+                    miner_reward,
+                    memo.clone(),
+                ),
+                "Ironwood"
+            )
+        };
+
+        let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
                     Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
@@ -177,7 +189,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_transparent_reward = |builder: &mut Builder<'_, _, _>, addr| {
+        let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
             trace_err!(
                 builder.add_transparent_output(addr, miner_reward),
                 "transparent"
@@ -185,17 +197,26 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         match miner_params.addr() {
-            Address::Unified(addr) => addr
-                .orchard()
-                .and_then(|addr| add_orchard_reward(&mut builder, addr))
-                .or_else(|| {
-                    addr.sapling()
-                        .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                })
-                .or_else(|| {
-                    addr.transparent()
-                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                }),
+            Address::Unified(addr) => {
+                let upgrade = NetworkUpgrade::current(net, height);
+
+                addr.orchard()
+                    .and_then(|addr| {
+                        if upgrade < NetworkUpgrade::Nu6_3 {
+                            add_orchard_reward(&mut builder, addr)
+                        } else {
+                            add_ironwood_reward(&mut builder, addr)
+                        }
+                    })
+                    .or_else(|| {
+                        addr.sapling()
+                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                    })
+                    .or_else(|| {
+                        addr.transparent()
+                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                    })
+            }
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 
@@ -206,7 +227,7 @@ impl TransactionTemplate<NegativeOrZero> {
             ))?,
         }
         .ok_or(TransactionError::CoinbaseConstruction(
-            "Could not construct output with miner reward".to_string(),
+            "Could not construct miner reward output".to_string(),
         ))?;
 
         let mut funding_streams = funding_stream_values(height, net, block_subsidy)?
@@ -601,7 +622,7 @@ pub struct JoinSplit {
 pub struct ShieldedSpend {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// Merkle root of the Sapling note commitment tree.
     #[serde(with = "hex")]
@@ -625,20 +646,12 @@ pub struct ShieldedSpend {
     spend_auth_sig: [u8; 64],
 }
 
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedSpend {
-    /// The value commitment to the input note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
-}
-
 /// A Sapling output of a transaction.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct ShieldedOutput {
     /// Value commitment to the input note.
     #[serde(with = "hex")]
-    #[getter(skip)]
+    #[getter(copy)]
     cv: ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(rename = "cmu", with = "hex")]
@@ -655,14 +668,6 @@ pub struct ShieldedOutput {
     /// A zero-knowledge proof using the Sapling Output circuit.
     #[serde(with = "hex")]
     proof: [u8; 192],
-}
-
-// We can't use `#[getter(copy)]` as upstream `sapling_crypto::note::ValueCommitment` is not `Copy`.
-impl ShieldedOutput {
-    /// The value commitment to the output note.
-    pub fn cv(&self) -> ValueCommitment {
-        self.cv.clone()
-    }
 }
 
 /// Object with Orchard-specific information.
@@ -899,7 +904,7 @@ impl TransactionObject {
                     let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();
 
                     ShieldedSpend {
-                        cv: spend.cv.clone(),
+                        cv: spend.cv,
                         anchor,
                         nullifier,
                         rk,
@@ -919,7 +924,7 @@ impl TransactionObject {
                     let out_ciphertext: [u8; 80] = output.out_ciphertext.into();
 
                     ShieldedOutput {
-                        cv: output.cv.clone(),
+                        cv: output.cv,
                         cm_u,
                         ephemeral_key,
                         enc_ciphertext,
