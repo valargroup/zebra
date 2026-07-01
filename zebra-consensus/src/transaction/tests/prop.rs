@@ -362,7 +362,7 @@ fn sanitize_transaction_version(
             Nu7 => (5, 5),
 
             #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => (5, 5),
+            NetworkUpgrade::ZFuture => (5, u8::MAX),
         }
     };
 
