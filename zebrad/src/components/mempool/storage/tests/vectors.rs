@@ -3,8 +3,6 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::iter;
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use std::sync::Arc;
 
 use color_eyre::eyre::Result;
 
@@ -45,7 +43,7 @@ fn ironwood_action() -> zebra_chain::ironwood::Action {
 fn ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
-) -> Arc<zebra_chain::transaction::Transaction> {
+) -> std::sync::Arc<zebra_chain::transaction::Transaction> {
     use zebra_chain::{
         at_least_one, ironwood,
         orchard::{self, tree},
@@ -54,7 +52,7 @@ fn ironwood_v6_tx(
         transaction::{LockTime, Transaction},
     };
 
-    Arc::new(Transaction::V6 {
+    std::sync::Arc::new(Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height,
@@ -88,7 +86,7 @@ fn verified_ironwood_v6_tx(
         miner_fee,
         0,
         0,
-        Arc::new(vec![]),
+        std::sync::Arc::new(vec![]),
     )
     .expect("test transaction has a valid mempool fee")
 }
@@ -346,6 +344,42 @@ fn mempool_removes_ironwood_duplicate_spends() {
     assert_eq!(
         storage.insert(mempool_tx, Vec::new(), None),
         Err(SameEffectsChainRejectionError::DuplicateSpend.into())
+    );
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn mempool_rejects_ironwood_conflict_on_insert() {
+    let _init_guard = zebra_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let action = ironwood_action();
+    let first_mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
+    let second_mempool_tx = verified_ironwood_v6_tx(Height(2), action);
+
+    let first_mempool_id = first_mempool_tx.transaction.id;
+    let second_mempool_id = second_mempool_tx.transaction.id;
+
+    assert_eq!(
+        storage.insert(first_mempool_tx, Vec::new(), None),
+        Ok(first_mempool_id)
+    );
+
+    assert_eq!(
+        storage.insert(second_mempool_tx, Vec::new(), None),
+        Err(SameEffectsTipRejectionError::SpendConflict.into())
+    );
+
+    assert!(storage.contains_transaction_exact(&first_mempool_id.mined_id()));
+    assert!(!storage.contains_transaction_exact(&second_mempool_id.mined_id()));
+    assert_eq!(
+        storage.rejection_error(&second_mempool_id),
+        Some(SameEffectsTipRejectionError::SpendConflict.into())
     );
 }
 
