@@ -207,18 +207,9 @@ impl TransactionTemplate<NegativeOrZero> {
                             return add_orchard_reward(&mut builder, addr);
                         }
 
-                        // From NU6.3 on, the Orchard pool is frozen
-                        // (disabled_add_to_orchard_pool). At NU6.3 the Orchard receiver is
-                        // paid via Ironwood — which reuses the Orchard address — when
-                        // Ironwood is compiled in; the verifier only accepts V6/Ironwood
-                        // coinbase outputs while NU6.3 is the current upgrade. After NU6.3
-                        // neither pool is accepted, so an Orchard-only address cannot
-                        // receive a coinbase reward.
-                        if upgrade == NetworkUpgrade::Nu6_3 {
-                            return add_ironwood_reward(&mut builder, addr);
-                        }
-
-                        None
+                        // From NU6.3 onward, Orchard net-new value is disabled, so pay the
+                        // Orchard receiver through Ironwood.
+                        add_ironwood_reward(&mut builder, addr)
                     })
                     .or_else(|| {
                         addr.sapling()

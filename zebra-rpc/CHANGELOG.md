@@ -18,8 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Verbose transaction output omits the `ironwood` bundle unless the transaction
   contains Ironwood shielded data.
-- `getblocktemplate` routes post-NU6.3 Orchard-only unified miner addresses to
-  Ironwood when the unstable NU6.3 code is compiled in.
+- `getblocktemplate` routes post-NU6.3 Orchard receivers in unified miner
+  addresses to Ironwood.
 - `getblocktemplate` builds empty templates on PoW-disabled networks when the
   mempool is inactive.
 - `GetBlockTemplateHandler::miner_params()` now returns the stored
