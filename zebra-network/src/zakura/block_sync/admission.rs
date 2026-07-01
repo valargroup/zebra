@@ -56,15 +56,6 @@ pub(super) fn request_priority(
     }
 }
 
-/// Returns the admission decision for a candidate block response starting at `start_height`.
-///
-/// Floor-rescue requests may use any available response budget up to `response_byte_cap`.
-/// Speculative requests above the floor are admitted only while the configured reorder
-/// lookahead byte and block limits still have capacity.
-///
-/// Returns `None` when no bytes can be admitted, or when an above-floor request would
-/// exceed the lookahead limits.
-
 /// The per-request network deadline (the one sanctioned timer), set by priority:
 ///
 /// - **Floor**: a short fixed leash. On expiry the lowest missing height is rescued
@@ -97,6 +88,14 @@ pub(super) fn request_deadline(
     }
 }
 
+/// Returns the admission decision for a candidate block response starting at `start_height`.
+///
+/// Floor-rescue requests may use any available response budget up to `response_byte_cap`.
+/// Speculative requests above the floor are admitted only while the configured reorder
+/// lookahead byte and block limits still have capacity.
+///
+/// Returns `None` when no bytes can be admitted, or when an above-floor request would
+/// exceed the lookahead limits.
 pub(super) fn admission_decision(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,

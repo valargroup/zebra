@@ -72,6 +72,16 @@ pub(super) struct Sequencer {
     submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
     next_apply_token: BlockApplyToken,
 
+    /// Running totals over `applying`, maintained incrementally at every
+    /// insert/remove/submit-flag change so `publish_view` reads them in O(1)
+    /// instead of scanning `applying` (which holds the whole apply backlog) on
+    /// every body/control event. `unsubmitted` is derived as
+    /// `applying.len() - submitted_applying_count`. Tests assert these never drift
+    /// from a full scan.
+    applying_buffered_bytes: u64,
+    submitted_applying_count: usize,
+    submitted_applying_bytes: u64,
+
     // The highest block height whose body has already been accepted into the contiguous
     // download-apply pipeline.
     body_download_floor: block::Height,
@@ -86,6 +96,9 @@ impl Sequencer {
             applying: BTreeMap::new(),
             submitted_applies: BTreeMap::new(),
             next_apply_token: 1,
+            applying_buffered_bytes: 0,
+            submitted_applying_count: 0,
+            submitted_applying_bytes: 0,
             body_download_floor: verified_block_tip,
             verified_block_tip,
             submitted_apply_limit,
@@ -126,6 +139,13 @@ impl Sequencer {
     }
 
     pub(super) fn applying_buffered_bytes(&self) -> u64 {
+        self.applying_buffered_bytes
+    }
+
+    /// Ground-truth recomputation of [`applying_buffered_bytes`], used by tests to
+    /// assert the maintained counter never drifts.
+    #[cfg(test)]
+    pub(super) fn applying_buffered_bytes_scanned(&self) -> u64 {
         self.applying
             .values()
             .map(|applying| applying.bytes)
@@ -142,25 +162,36 @@ impl Sequencer {
     }
 
     pub(super) fn unsubmitted_applying_count(&self) -> usize {
+        // Derived: every applying body is either submitted or not.
         self.applying
-            .values()
-            .filter(|applying| !applying.submitted)
-            .count()
+            .len()
+            .saturating_sub(self.submitted_applying_count)
     }
 
     pub(super) fn submitted_applying_bytes(&self) -> u64 {
-        self.applying
-            .values()
-            .filter_map(|applying| applying.submitted.then_some(applying.bytes))
-            .fold(0u64, u64::saturating_add)
+        self.submitted_applying_bytes
     }
 
     /// Number of `applying` bodies already submitted to the verifier.
     pub(super) fn submitted_applying_count(&self) -> usize {
+        self.submitted_applying_count
+    }
+
+    /// Ground-truth recomputations of the submitted-apply counters, for tests.
+    #[cfg(test)]
+    pub(super) fn submitted_applying_count_scanned(&self) -> usize {
         self.applying
             .values()
             .filter(|applying| applying.submitted)
             .count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn submitted_applying_bytes_scanned(&self) -> u64 {
+        self.applying
+            .values()
+            .filter_map(|applying| applying.submitted.then_some(applying.bytes))
+            .fold(0u64, u64::saturating_add)
     }
 
     pub(super) fn has_submitted_apply(&self, height: block::Height, hash: block::Hash) -> bool {
@@ -296,6 +327,8 @@ impl Sequencer {
                     source_peer,
                 },
             );
+            // New bodies enter `applying` unsubmitted, so only the total grows.
+            self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_add(bytes);
         }
         covered
     }
@@ -327,12 +360,20 @@ impl Sequencer {
             .get(&height)
             .map(|applying| applying.block.clone())?;
         let token = self.next_apply_token();
-        let applying = self.applying.get_mut(&height)?;
-        applying.token = token;
-        applying.submitted = true;
+        let (hash, bytes, was_submitted) = {
+            let applying = self.applying.get_mut(&height)?;
+            applying.token = token;
+            let was_submitted = applying.submitted;
+            applying.submitted = true;
+            (applying.hash, applying.bytes, was_submitted)
+        };
+        if !was_submitted {
+            self.submitted_applying_count = self.submitted_applying_count.saturating_add(1);
+            self.submitted_applying_bytes = self.submitted_applying_bytes.saturating_add(bytes);
+        }
         Some(SubmitItem {
             height,
-            hash: applying.hash,
+            hash,
             token,
             block,
         })
@@ -341,11 +382,23 @@ impl Sequencer {
     /// Roll back a submit whose dispatch failed (only if the token still matches,
     /// so a stale rollback cannot clobber a newer submission).
     pub(super) fn unsubmit(&mut self, height: block::Height, token: BlockApplyToken) {
-        if let Some(applying) = self.applying.get_mut(&height) {
-            if applying.token == token {
-                applying.token = 0;
-                applying.submitted = false;
+        let unsubmitted_bytes = {
+            let Some(applying) = self.applying.get_mut(&height) else {
+                return;
+            };
+            if applying.token != token {
+                return;
             }
+            // Only a currently-submitted body affects the submitted counters; if the
+            // matched token was already rolled back, just clear it.
+            let was_submitted = applying.submitted;
+            applying.token = 0;
+            applying.submitted = false;
+            was_submitted.then_some(applying.bytes)
+        };
+        if let Some(bytes) = unsubmitted_bytes {
+            self.submitted_applying_count = self.submitted_applying_count.saturating_sub(1);
+            self.submitted_applying_bytes = self.submitted_applying_bytes.saturating_sub(bytes);
         }
     }
 
@@ -422,7 +475,14 @@ impl Sequencer {
     }
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
-        self.applying.remove(&height)
+        let removed = self.applying.remove(&height)?;
+        self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
+        if removed.submitted {
+            self.submitted_applying_count = self.submitted_applying_count.saturating_sub(1);
+            self.submitted_applying_bytes =
+                self.submitted_applying_bytes.saturating_sub(removed.bytes);
+        }
+        Some(removed)
     }
 
     /// After a rejected/timed-out apply at `height`, roll the download floor back
@@ -448,7 +508,7 @@ impl Sequencer {
             .collect();
         let mut released = 0u64;
         for height in heights {
-            if let Some(applying) = self.applying.remove(&height) {
+            if let Some(applying) = self.remove_applying(height) {
                 released = released.saturating_add(applying.bytes);
             }
         }
@@ -466,7 +526,7 @@ impl Sequencer {
         self.clear_submitted_applies_through(tip);
         let mut released = 0u64;
         for height in applied {
-            if let Some(applying) = self.applying.remove(&height) {
+            if let Some(applying) = self.remove_applying(height) {
                 released = released.saturating_add(applying.bytes);
             }
         }
@@ -521,6 +581,9 @@ impl Sequencer {
             self.submitted_applies.clear();
         }
         self.applying.clear();
+        self.applying_buffered_bytes = 0;
+        self.submitted_applying_count = 0;
+        self.submitted_applying_bytes = 0;
         released
     }
 }
