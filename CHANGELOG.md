@@ -203,6 +203,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized
   root block or reconsider the same invalidated block twice.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
