@@ -1,5 +1,4 @@
-//! Cross-client commitment-auxiliary payload types for the verified-commitment-trees
-//! fast path and Zakura header sync (`docs/design/verified-commitment-trees.md` §5).
+//! Cross-client commitment-auxiliary payload types for Zakura header sync.
 //!
 //! These travel over the Zakura `tree_aux` stream (increment 6) and are also produced
 //! and consumed locally by `zebra-state`. They live here in `zebra-chain` so both
