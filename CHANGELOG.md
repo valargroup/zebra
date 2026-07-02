@@ -206,11 +206,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized
   root block or reconsider the same invalidated block twice.
 - Keep invalidated non-finalized block records until `reconsiderblock` replay
   succeeds, so failed reconsider attempts no longer drop the record needed for a
   later retry.
+- Compare RPC authentication cookies in constant time after checking their
+  length.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so
