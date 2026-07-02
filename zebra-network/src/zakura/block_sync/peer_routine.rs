@@ -722,8 +722,10 @@ impl PeerRoutine {
                         response_byte_cap,
                     ) {
                         AdmissionOutcome::Admit(grant) => {
-                            let floor_cwnd_cap =
-                                self.window.cwnd_byte_headroom(floor_bonus).unwrap_or(u64::MAX);
+                            let floor_cwnd_cap = self
+                                .window
+                                .cwnd_byte_headroom(floor_bonus)
+                                .unwrap_or(u64::MAX);
                             items = self.work.take_in_range_budgeted(
                                 servable_low,
                                 grant.take_high,
@@ -1444,24 +1446,19 @@ impl PeerRoutine {
         if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
-            let admitted_bytes = match admit(
-                &self.config,
-                snapshot,
-                height,
-                height,
-                serialized_bytes,
-            ) {
-                AdmissionOutcome::Admit(grant) => grant.max_request_bytes,
-                AdmissionOutcome::LookaheadAtCap | AdmissionOutcome::InflightBudgetEmpty => {
-                    tracing::debug!(
-                        peer = ?self.peer,
-                        ?height,
-                        serialized_bytes,
-                        "not buffering unmatched queued block-sync body at look-ahead cap"
-                    );
-                    return true;
-                }
-            };
+            let admitted_bytes =
+                match admit(&self.config, snapshot, height, height, serialized_bytes) {
+                    AdmissionOutcome::Admit(grant) => grant.max_request_bytes,
+                    AdmissionOutcome::LookaheadAtCap | AdmissionOutcome::InflightBudgetEmpty => {
+                        tracing::debug!(
+                            peer = ?self.peer,
+                            ?height,
+                            serialized_bytes,
+                            "not buffering unmatched queued block-sync body at look-ahead cap"
+                        );
+                        return true;
+                    }
+                };
             if admitted_bytes < serialized_bytes {
                 tracing::debug!(
                     peer = ?self.peer,
