@@ -5464,34 +5464,29 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     // happened, the duplicate-pending guard intentionally suppresses another
     // identical query after apply-finished advances the state frontier.
     if !saw_refill_query {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match actions
-                    .recv()
-                    .await
-                    .expect("block-sync action channel should stay open")
-                {
-                    BlockSyncAction::QueryNeededBlocks {
-                        from: block::Height(3),
-                        best_header_tip,
-                        ..
-                    } => {
-                        assert_eq!(
-                            best_header_tip,
-                            block::Height(3),
-                            "missing-body query must skip already submitted contiguous bodies",
-                        );
-                        break;
-                    }
-                    BlockSyncAction::QueryNeededBlocks { from, .. } => {
-                        panic!("missing-body query should skip submitted bodies, got from {from:?}")
-                    }
-                    action => panic!("unexpected action before needed-block query: {action:?}"),
-                }
+        let action = tokio::time::timeout(Duration::from_secs(5), actions.recv())
+            .await
+            .expect(
+                "bounded needed-block query should arrive after apply-finished advances the floor",
+            )
+            .expect("block-sync action channel should stay open");
+        match action {
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(3),
+                best_header_tip,
+                ..
+            } => {
+                assert_eq!(
+                    best_header_tip,
+                    block::Height(3),
+                    "missing-body query must skip already submitted contiguous bodies",
+                );
             }
-        })
-        .await
-        .expect("bounded needed-block query should arrive after apply-finished advances the floor");
+            BlockSyncAction::QueryNeededBlocks { from, .. } => {
+                panic!("missing-body query should skip submitted bodies, got from {from:?}")
+            }
+            action => panic!("unexpected action before needed-block query: {action:?}"),
+        }
     }
 
     reactor_task.abort();
