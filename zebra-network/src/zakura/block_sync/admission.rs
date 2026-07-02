@@ -146,10 +146,7 @@ pub(super) fn request_deadline(
 ///
 /// This is a fixed consensus-derived bound, not `config.submitted_apply_limit()`,
 /// because the configured submit window can be much larger and would weaken the
-/// memory gate. It is numerically equal to
-/// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` today, but kept as a named
-/// constant so the exemption span can diverge from the channel floor without
-/// touching admission call sites.
+/// memory gate.
 const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
 
 /// Hard block-count cap on speculative look-ahead bookkeeping.
