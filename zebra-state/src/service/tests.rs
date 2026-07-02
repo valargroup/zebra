@@ -28,9 +28,8 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{
-        arbitrary::populated_state, block_roots_by_height_range, chain_tip::TipAction,
-        headers_by_height_range, non_finalized_state::Chain, root_covered_best_header_tip,
-        StateService, ARCHIVE_INDEXES_DISABLED,
+        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
+        non_finalized_state::Chain, StateService, ARCHIVE_INDEXES_DISABLED,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -913,45 +912,6 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
             (start, block1_hash, block1.header.clone()),
             (start.next().unwrap(), block2_hash, block2.header.clone()),
         ],
-    );
-    let roots = block_roots_by_height_range(Some(chain), &state_service.read_service.db, start, 2);
-    assert_eq!(roots.len(), 2);
-    assert_eq!(roots[0].height, start);
-    assert_eq!(roots[1].height, start.next().unwrap());
-    let verified_tip = ((start - 1).unwrap(), block::Hash([0; 32]));
-    let best_header_tip = (start.next().unwrap(), block2_hash);
-    assert_eq!(
-        root_covered_best_header_tip(
-            None::<Arc<Chain>>,
-            &state_service.read_service.db,
-            Some(best_header_tip),
-            Some(verified_tip),
-        ),
-        Some(verified_tip),
-        "rootless durable header tips are capped to the verified block tip"
-    );
-    assert_eq!(
-        root_covered_best_header_tip(
-            Some(Arc::new(
-                Chain::new(
-                    &network,
-                    (start - 1).unwrap(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                    ValueBalance::fake_populated_pool(),
-                )
-                .push(block1.prepare().test_with_zero_spent_utxos())?
-                .push(block2.prepare().test_with_zero_spent_utxos())?,
-            )),
-            &state_service.read_service.db,
-            Some(best_header_tip),
-            Some(verified_tip),
-        ),
-        Some(best_header_tip),
-        "verified non-finalized roots allow the header tip to stay ahead"
     );
     assert_eq!(
         headers_by_height_range(None::<Arc<Chain>>, &state_service.read_service.db, start, 2),

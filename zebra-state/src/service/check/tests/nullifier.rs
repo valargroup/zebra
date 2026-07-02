@@ -1025,7 +1025,8 @@ proptest! {
         let block1_hash;
         if duplicate_in_finalized_state {
             let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
-            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
+            let commit_result =
+                finalized_state.commit_finalized_direct(block1.clone().into(), None, None, "test");
 
             prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
             prop_assert!(commit_result.is_ok());

@@ -499,7 +499,7 @@ fn pruned_checkpoint_restart_without_checkpoint_sync_keeps_address_index_unavail
             .expect("test data deserializes");
 
         checkpoint_state
-            .commit_finalized_direct(block.into(), None, None, None, "checkpoint restart tests")
+            .commit_finalized_direct(block.into(), None, None, "checkpoint restart tests")
             .expect("test block is valid");
     }
 

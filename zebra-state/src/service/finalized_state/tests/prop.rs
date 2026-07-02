@@ -130,6 +130,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                     let err = state.commit_finalized_direct(
                         checkpoint_verified.into(),
                         None,
+                        None,
                         "all_upgrades bad auth root test"
                     ).expect_err("Must fail when the supplied auth data root is incorrect");
                     let commit_error = err

@@ -89,13 +89,6 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
-/// Error returned for historical note-commitment tree/subtree read requests on a
-/// verified-commitment-trees fast-synced database, where the per-height trees
-/// below the checkpoint handoff height were never written.
-const FAST_SYNCED_TREE_UNAVAILABLE_ERROR: &str =
-    "note commitment treestate is unavailable below the checkpoint on a fast-synced node; \
-     historical treestate queries require an archive node";
-
 /// Returned for transparent archive/indexer lookups when the required indexes were
 /// not built. These indexes are RPC-only, not consensus.
 pub(crate) const ARCHIVE_INDEXES_DISABLED: &str =

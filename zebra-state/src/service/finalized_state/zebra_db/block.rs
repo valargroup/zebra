@@ -48,7 +48,7 @@ use crate::{
             IntoDisk,
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        FromDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
     HashOrHeight,
 };

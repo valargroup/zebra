@@ -126,10 +126,23 @@ pub fn run_roots(
             .db
             .orchard_tree_by_height(&height)
             .ok_or_else(|| eyre!("source missing orchard tree at height {h}"))?;
+        let ironwood = state
+            .db
+            .ironwood_tree_by_height(&height)
+            .unwrap_or_default();
+        let block = state
+            .db
+            .block(HashOrHeight::Height(height))
+            .ok_or_else(|| eyre!("source missing block at height {h}"))?;
         roots.push(BlockCommitmentRoots {
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
+            ironwood_root: ironwood.root(),
+            sapling_tx: block.sapling_transactions_count(),
+            orchard_tx: block.orchard_transactions_count(),
+            ironwood_tx: block.ironwood_transactions_count(),
+            auth_data_root: block.auth_data_root(),
         });
         let done = h - start + 1;
         if done.is_multiple_of(5000) || done == total {
