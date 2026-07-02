@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{await_until, TraceCapture, ZakuraTestNode};
+use super::{await_until, TraceCapture, ZakuraTestNode, TEST_NET_TIMEOUT};
 use crate::{zakura::ZakuraPeerId, BoxError};
 
 /// Supported deterministic topologies.
@@ -760,7 +760,7 @@ mod tests {
 
         async fn wait_for_tip(&self, node: usize, height: block::Height) -> Result<(), BoxError> {
             let handle = self.nodes[node].view.handle.clone();
-            await_until("header-sync e2e best tip", Duration::from_secs(5), || {
+            await_until("header-sync e2e best tip", TEST_NET_TIMEOUT, || {
                 handle.best_header_tip().0 >= height
             })
             .await
@@ -2667,17 +2667,39 @@ mod tests {
         cluster.start_drivers();
         cluster.connect_all().await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        await_until("header-sync status trace rows", TEST_NET_TIMEOUT, || {
+            capture.reader().is_ok_and(|reader| {
+                let source_trace = reader.node("01").table("header_sync");
+                let target_trace = reader.node("02").table("header_sync");
+
+                source_trace.count(hs_trace::HEADER_STATUS_SENT) >= 1
+                    && target_trace.rows().iter().any(|row| {
+                        row.get("event").and_then(serde_json::Value::as_str)
+                            == Some(hs_trace::HEADER_EVENT_RECEIVED)
+                            && row.get(hs_trace::KIND).and_then(serde_json::Value::as_str)
+                                == Some("wire_message")
+                            && row
+                                .get(hs_trace::REASON)
+                                .and_then(serde_json::Value::as_str)
+                                == Some("status")
+                    })
+            })
+        })
+        .await?;
+
         capture.flush().await;
         let reader = capture.reader()?;
         reader
             .node("01")
             .table("header_sync")
             .assert_event(hs_trace::HEADER_STATUS_SENT);
-        reader
-            .node("02")
-            .table("header_sync")
-            .assert_event(hs_trace::HEADER_STATUS_RECEIVED);
+        reader.node("02").table("header_sync").assert_row(
+            hs_trace::HEADER_EVENT_RECEIVED,
+            &[
+                (hs_trace::KIND, TraceValue::Str("wire_message")),
+                (hs_trace::REASON, TraceValue::Str("status")),
+            ],
+        );
 
         cluster.shutdown().await;
         assert!(capture.finish().await?.is_none());
