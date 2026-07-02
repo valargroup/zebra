@@ -6,6 +6,8 @@
 //! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
 //! they reconstruct a history tree consistent with the header commitments.
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::sync::Arc;
 
 use zebra_chain::{
@@ -195,18 +197,19 @@ where
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
-        history_tree.push(
-            network,
-            block,
-            &sapling_root,
-            &orchard_root,
-            // TODO: add ironwood root
-            // https://linear.app/zcale/issue/ZCA-746/wire-up-ironwood-into-vct
-            &Default::default(),
-        )
-        .map_err(Arc::new)
-        .map_err(ValidateContextError::from)
-        .map_err(|error| (height, error))?;
+        history_tree
+            .push(
+                network,
+                block,
+                &sapling_root,
+                &orchard_root,
+                // TODO: add ironwood root
+                // https://linear.app/zcale/issue/ZCA-746/wire-up-ironwood-into-vct
+                &Default::default(),
+            )
+            .map_err(Arc::new)
+            .map_err(ValidateContextError::from)
+            .map_err(|error| (height, error))?;
     }
 
     Ok(history_tree)
