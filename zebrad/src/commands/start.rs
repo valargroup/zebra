@@ -2911,11 +2911,10 @@ mod zakura_header_sync_driver_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if read_requests
+                if !read_requests
                     .lock()
                     .expect("test read request log is not poisoned")
-                    .len()
-                    >= 1
+                    .is_empty()
                 {
                     break;
                 }
@@ -3054,11 +3053,10 @@ mod zakura_header_sync_driver_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if read_requests
+                if !read_requests
                     .lock()
                     .expect("test read request log is not poisoned")
-                    .len()
-                    >= 1
+                    .is_empty()
                 {
                     break;
                 }
