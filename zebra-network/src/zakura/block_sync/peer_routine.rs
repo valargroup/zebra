@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admission_decision, floor_rescue_high, request_deadline, AdmissionSnapshot, RequestPriority,
+        admit, floor_rescue_high, request_deadline, AdmissionOutcome, AdmissionSnapshot,
+        RequestPriority,
     },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
@@ -41,7 +42,7 @@ use super::{
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
     state::{
-        next_height, DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
+        DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
     work_queue::{WorkItem, WorkQueue},
@@ -71,6 +72,54 @@ const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// emits controller state on a fixed interval so a trace can spot oscillation even while
 /// the peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Why a fill pass stopped issuing requests. Typed so every admission refusal is
+/// attributed exhaustively; the `as_str` labels feed the `sync.block.fill_stop`
+/// metric and the fill-stop trace.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum FillStop {
+    NoStatus,
+    CwndSaturated,
+    NoWork,
+    /// The resident look-ahead gate refused an above-window take (either lane: the floor lane or the speculative lane / above floor lane).
+    LookaheadCap,
+    /// The gate has headroom but the in-flight byte budget funds zero bytes.
+    /// This can happen when the in-flight byte budget is exhausted
+    /// but the resident look-ahead gate is not full.
+    /// This status is for the above floor speculative lane.
+    InflightBudget,
+    RetryAvoid,
+    Budget,
+    Internal,
+    OutboundFull,
+    SendError,
+    /// The proven-peer no-progress request cap: this peer has served at least one
+    /// body but reached `max_requests_without_block_progress` with no further
+    /// accepted body, so the no-progress liveness deadline governs from here.
+    NoBlockProgressRequestCap,
+    /// The probe-first cap: an unproven peer's single cold-start probe is in flight,
+    /// so no further request is issued until it serves (or fails) a body.
+    InitialBlockProbeRequestCap,
+}
+
+impl FillStop {
+    fn as_str(self) -> &'static str {
+        match self {
+            FillStop::NoStatus => "no_status",
+            FillStop::CwndSaturated => "cwnd_saturated",
+            FillStop::NoWork => "no_work",
+            FillStop::LookaheadCap => "lookahead_cap",
+            FillStop::InflightBudget => "inflight_budget",
+            FillStop::RetryAvoid => "retry_avoid",
+            FillStop::Budget => "budget",
+            FillStop::Internal => "internal",
+            FillStop::OutboundFull => "outbound_full",
+            FillStop::SendError => "send_error",
+            FillStop::NoBlockProgressRequestCap => "no_block_progress_request_cap",
+            FillStop::InitialBlockProbeRequestCap => "initial_block_probe_request_cap",
+        }
+    }
+}
 const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
 /// Whether a due block-liveness deadline gets one bounded grace instead of disconnecting.
@@ -596,7 +645,7 @@ impl PeerRoutine {
         // `&'static str` reason via `break`; a pass that issues nothing (`fill_sent == 0`)
         // is a candidate bubble.
         let mut fill_sent = 0u32;
-        let fill_stop: &'static str = loop {
+        let fill_stop: FillStop = loop {
             // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
             // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
             // above-window slots even for a near-floor block.
@@ -609,18 +658,18 @@ impl PeerRoutine {
             // `floor_bonus` slots so the lowest missing height keeps moving — unless the
             // peer is sealed (`floor_bonus` is 0), which gets no work.
             if !self.received_status {
-                break "no_status";
+                break FillStop::NoStatus;
             }
             if self.window.requests_without_block_progress >= self.window.no_progress_request_cap()
             {
                 break if self.window.has_block_progress() {
-                    "no_block_progress_request_cap"
+                    FillStop::NoBlockProgressRequestCap
                 } else {
-                    "initial_block_probe_request_cap"
+                    FillStop::InitialBlockProbeRequestCap
                 };
             }
             if floor_slots == 0 {
-                break "cwnd_saturated";
+                break FillStop::CwndSaturated;
             }
             let in_bypass = normal_slots == 0;
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
@@ -634,114 +683,111 @@ impl PeerRoutine {
             let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
             let mut request_priority = RequestPriority::Floor;
-            let reserved_above_floor = self.work.reserved_above(view.download_floor);
-            // The floor rides the fastest servable carrier: defer it whenever a
-            // preferred peer can take it. Outside the bypass region only a strictly
-            // faster carrier makes this peer defer (equal carriers stay eligible, so a
-            // slow peer hands the floor up but two equal carriers both contest it); in
-            // the bypass region (this peer's cwnd is saturated) an equal-RTprop peer is
-            // preferred too, so a scarce bypass slot is only spent when no
-            // equal-or-faster peer can take the floor normally. If every servable peer
-            // is saturated this is `false` and the floor still moves.
+            // One snapshot per iteration: the floor and speculative lanes decide
+            // against the same memory picture, and `admit` is the single authority
+            // for the commit-window exemption, the resident gate, and take sizing
+            // (geometry included — an exempt grant is clamped at the window top, so
+            // no above-window height can ride an exempt request past the gate).
+            let snapshot = self.admission_snapshot(&view);
+            // This asks the shared peer registry:
+            // "Is there another pper that should take the floor instead of this peer?"
+            // This is helpful for rescuing the floor with a peer who has better latency score and
+            // is not saturated.
             let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
                 view.download_floor,
                 &self.peer,
                 self.window.bbr_rtprop_ms(now),
                 in_bypass,
             );
-            let mut items = if floor_arm_allowed
-                && servable_low <= floor_high
-                && self
+            let mut items = Vec::new();
+            if floor_arm_allowed && servable_low <= floor_high {
+                if let Some(floor_start) = self
                     .work
                     .first_pending_in_range(servable_low, servable_high.min(floor_high))
-                    .is_some()
-            {
-                // Size the floor take by the live budget as usual, but never below one
-                // byte. `take_in_range_budgeted` always takes its first item regardless of
-                // the byte cap, so a `>= 1` cap guarantees the floor block itself is taken
-                // even when the budget is exactly full — which reaches
-                // `reserve_request_budget`'s floor path, whose `FundFloorReservation` sheds
-                // an above-floor reorder body to fund the floor. The bare `budget.available()`
-                // cap collapsed to an *empty* take at `available() == 0`, breaking the fill
-                // loop before the funding path and wedging the floor permanently. The
-                // `.min(response_byte_cap)` still bounds the speculative above-floor tail to
-                // the live budget, so a funded floor request never over-commits.
-                // Also bound the take by the remaining cwnd byte headroom (byte mode), so
-                // the byte window is a real admission limit: a saturated window cannot fund
-                // a large speculative tail. The floor bypass adds `floor_bonus` bodies of
-                // headroom. `.max(1)` preserves the always-take-first-item floor-progress
-                // guarantee even at zero headroom (that single body is the only permitted
-                // overshoot; the funding path below sheds a reorder body to pay for it).
-                let floor_cwnd_cap = self
-                    .window
-                    .cwnd_byte_headroom(floor_bonus)
-                    .unwrap_or(u64::MAX);
-                let floor_available = self
-                    .budget
-                    .available()
-                    .min(response_byte_cap)
-                    .min(floor_cwnd_cap)
-                    .max(1);
-                let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
-                    admission_decision(
+                {
+                    // Prioritize the lowest missing block so commit can keep moving, even if
+                    // that means freeing look-ahead budget. `admit` is the single authority
+                    // for the commit-window exemption, the resident-memory gate, and take
+                    // geometry/sizing; layer the per-peer BBR byte window
+                    // (`cwnd_byte_headroom`) on top so a saturated congestion window cannot
+                    // fund a large speculative tail. The floor bypass adds `floor_bonus`
+                    // bodies of headroom. `.max(1)` preserves the always-take-first-item
+                    // floor-progress guarantee even at zero headroom (that single body is the
+                    // only permitted overshoot; `reserve_request_budget`'s floor path sheds an
+                    // above-floor reorder body to pay for it).
+                    match admit(
                         &self.config,
-                        self.admission_snapshot(view, reserved_above_floor),
-                        tail_start,
+                        snapshot,
+                        floor_start,
+                        servable_high,
                         response_byte_cap,
-                    )
-                }) {
-                    Some(_) => servable_high,
-                    None => servable_high.min(floor_high),
-                };
-                self.work.take_in_range_budgeted(
-                    servable_low,
-                    floor_take_high,
-                    max_count,
-                    floor_available,
-                )
-            } else {
-                Vec::new()
-            };
+                    ) {
+                        AdmissionOutcome::Admit(grant) => {
+                            let floor_cwnd_cap =
+                                self.window.cwnd_byte_headroom(floor_bonus).unwrap_or(u64::MAX);
+                            items = self.work.take_in_range_budgeted(
+                                servable_low,
+                                grant.take_high,
+                                max_count,
+                                grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                            );
+                        }
+                        AdmissionOutcome::LookaheadAtCap => break FillStop::LookaheadCap,
+                        // Unreachable for floor-priority starts (their cap is floored
+                        // at one byte); attribute honestly if it ever fires.
+                        AdmissionOutcome::InflightBudgetEmpty => break FillStop::InflightBudget,
+                    }
+                }
+            }
 
             if items.is_empty() {
                 if in_bypass {
                     // Saturated cwnd: the floor bypass funds the floor only, never a
                     // speculative above-floor fetch. Nothing more to take this pass.
-                    break "cwnd_saturated";
+                    break FillStop::CwndSaturated;
                 }
                 let Some(start_height) = self
                     .work
                     .first_pending_in_range(servable_low, servable_high)
                 else {
-                    break "no_work";
+                    break FillStop::NoWork;
                 };
-                let Some(decision) = admission_decision(
+                match admit(
                     &self.config,
-                    self.admission_snapshot(view, reserved_above_floor),
+                    snapshot,
                     start_height,
+                    servable_high,
                     response_byte_cap,
-                ) else {
-                    metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
-                    break "lookahead_cap";
-                };
-
-                if decision.priority == RequestPriority::AboveFloor {
-                    metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
-                    request_priority = RequestPriority::AboveFloor;
-                    // Bound the take by remaining cwnd byte headroom (byte mode, no floor
-                    // bonus) so an above-floor request never overshoots the byte window
-                    // beyond the one always-taken item.
-                    let above_cwnd_cap = self.window.cwnd_byte_headroom(0).unwrap_or(u64::MAX);
-                    items = self.work.take_in_range_budgeted(
-                        servable_low,
-                        servable_high,
-                        max_count,
-                        decision.max_request_bytes.min(above_cwnd_cap),
-                    );
+                ) {
+                    AdmissionOutcome::Admit(grant)
+                        if grant.priority == RequestPriority::AboveFloor =>
+                    {
+                        metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
+                        request_priority = RequestPriority::AboveFloor;
+                        // Bound the take by remaining cwnd byte headroom (byte mode, no floor
+                        // bonus) so an above-floor request never overshoots the byte window
+                        // beyond the one always-taken item.
+                        let above_cwnd_cap = self.window.cwnd_byte_headroom(0).unwrap_or(u64::MAX);
+                        items = self.work.take_in_range_budgeted(
+                            servable_low,
+                            grant.take_high,
+                            max_count,
+                            grant.max_request_bytes.min(above_cwnd_cap),
+                        );
+                    }
+                    // A floor-priority start while the floor arm deferred to a
+                    // preferred carrier: leave the take to that peer (falls through
+                    // to `no_work`, exactly as before).
+                    AdmissionOutcome::Admit(_) => {}
+                    AdmissionOutcome::LookaheadAtCap => {
+                        metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
+                        break FillStop::LookaheadCap;
+                    }
+                    AdmissionOutcome::InflightBudgetEmpty => break FillStop::InflightBudget,
                 }
             }
             if items.is_empty() {
-                break "no_work";
+                break FillStop::NoWork;
             }
             // Peer-local retry bias: if the contiguous chunk we just took leads
             // with heights this routine recently *failed* (RangeUnavailable /
@@ -768,7 +814,7 @@ impl PeerRoutine {
                     None => {
                         let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
                         self.work.return_items_quiet(avoided);
-                        break "retry_avoid";
+                        break FillStop::RetryAvoid;
                     }
                 }
             }
@@ -788,7 +834,7 @@ impl PeerRoutine {
                 .await
             {
                 self.return_taken_items(&items);
-                break "budget";
+                break FillStop::Budget;
             }
             let marked = self
                 .work
@@ -798,7 +844,7 @@ impl PeerRoutine {
                 let _ = self
                     .work
                     .release_and_return_items(items.iter().map(|(height, _)| *height));
-                break "internal";
+                break FillStop::Internal;
             }
 
             let count = match u32::try_from(kept_count) {
@@ -808,7 +854,7 @@ impl PeerRoutine {
                         .work
                         .release_and_return_items(items.iter().map(|(height, _)| *height));
                     self.budget.release(released);
-                    break "internal";
+                    break FillStop::Internal;
                 }
             };
             let request = BlockRangeRequest {
@@ -847,10 +893,10 @@ impl PeerRoutine {
                     .release_and_return_items(items.iter().map(|(height, _)| *height));
                 self.budget.release(released);
                 if matches!(error, OrderedSendError::Full) {
-                    break "outbound_full";
+                    break FillStop::OutboundFull;
                 }
                 self.session.cancel_token().cancel();
-                break "send_error";
+                break FillStop::SendError;
             }
 
             let deadline = request_deadline(
@@ -893,10 +939,14 @@ impl PeerRoutine {
         // Attribute this pass's stop. A pass that issued nothing is a candidate bubble;
         // the reason + the live slot/budget/work snapshot let a trace tell a legitimate
         // stop (no_work with empty queue, cwnd_saturated) from a recoverable one (slots +
-        // budget + work all free, stopped anyway).
-        metrics::counter!("sync.block.fill_stop", "reason" => fill_stop).increment(1);
+        // budget + work all free, stopped anyway). The at-cap gauge is latched here so
+        // every gate refusal — floor arm, speculative arm, in bypass or not — sets it.
+        if fill_stop == FillStop::LookaheadCap {
+            metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
+        }
+        metrics::counter!("sync.block.fill_stop", "reason" => fill_stop.as_str()).increment(1);
         if fill_sent == 0 {
-            self.trace_fill_stop(fill_stop);
+            self.trace_fill_stop(fill_stop.as_str());
         }
 
         // If pending work is running low, ping the reactor to re-query (the
@@ -908,14 +958,12 @@ impl PeerRoutine {
         }
     }
 
-    fn admission_snapshot(
-        &self,
-        view: SequencerView,
-        reserved_above_floor: (u64, u64),
-    ) -> AdmissionSnapshot {
-        let (reserved_above_floor_bytes, reserved_above_floor_blocks) = reserved_above_floor;
+    fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
+        let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
+            self.work.reserved_above(view.download_floor);
         AdmissionSnapshot {
             download_floor: view.download_floor,
+            verified_block_tip: view.verified_tip,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,
@@ -1390,40 +1438,31 @@ impl PeerRoutine {
 
         if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
-            let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-                self.work.reserved_above(sequencer_view.download_floor);
-            let Some(decision) = admission_decision(
+            let snapshot = self.admission_snapshot(&sequencer_view);
+            let admitted_bytes = match admit(
                 &self.config,
-                AdmissionSnapshot {
-                    download_floor: sequencer_view.download_floor,
-                    reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
-                    reorder_buffered_blocks: sequencer_view.reorder_len,
-                    applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
-                    applying_buffered_blocks: sequencer_view.applying_len,
-                    sequencer_input_queued_bytes: self
-                        .sequencer_input_bytes
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    reserved_above_floor_bytes,
-                    reserved_above_floor_blocks,
-                    budget_available: self.budget.available(),
-                },
+                snapshot,
+                height,
                 height,
                 serialized_bytes,
-            ) else {
-                tracing::debug!(
-                    peer = ?self.peer,
-                    ?height,
-                    serialized_bytes,
-                    "not buffering unmatched queued block-sync body at look-ahead cap"
-                );
-                return true;
+            ) {
+                AdmissionOutcome::Admit(grant) => grant.max_request_bytes,
+                AdmissionOutcome::LookaheadAtCap | AdmissionOutcome::InflightBudgetEmpty => {
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        ?height,
+                        serialized_bytes,
+                        "not buffering unmatched queued block-sync body at look-ahead cap"
+                    );
+                    return true;
+                }
             };
-            if decision.max_request_bytes < serialized_bytes {
+            if admitted_bytes < serialized_bytes {
                 tracing::debug!(
                     peer = ?self.peer,
                     ?height,
                     serialized_bytes,
-                    admitted_bytes = decision.max_request_bytes,
+                    admitted_bytes,
                     "not buffering unmatched queued block-sync body; insufficient admitted budget"
                 );
                 return true;

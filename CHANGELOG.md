@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed an out-of-memory crash during Zakura block sync when the header chain
+  runs far ahead of the commit tip. The block-sync applying buffer holds decoded
+  block bodies ahead of the in-order committer; its look-ahead budget counted
+  wire bytes (not the ~4× larger decoded footprint) and the floor-rescue path
+  bypassed the budget entirely and advanced with the _download_ floor, so the
+  buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
+  node. The budget now bounds estimated resident memory (retained and in-flight
+  wire bytes at the decoded multiple) and gates the floor lane, exempting one
+  checkpoint range above the verified tip (the commit window) so a pinned
+  checkpoint range can always assemble and the committer can always drain the
+  pipeline (no deadlock). Resident memory now plateaus near the configured budget
+  plus at most one worst-case commit window (~3.2 GB), with only bounded transient
+  overshoot from floor-rescue requests.
+
 ### Performance
 
 - Improve Zakura block-sync download scheduling for checkpoint sync. A
@@ -104,6 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
+- V6 transactions with supported NU6.3-or-later consensus branch IDs now
+  serialize and deserialize successfully, while unsupported later placeholders
+  are rejected.
 - Route post-NU6.3 coinbase rewards for Orchard receivers in unified miner
   addresses to the Ironwood pool instead of rejecting them or falling back to a
   lower-priority receiver.
@@ -210,8 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized
   root block or reconsider the same invalidated block twice.
+- Compare RPC authentication cookies in constant time after checking their
+  length.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so
