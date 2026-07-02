@@ -34,6 +34,7 @@ use tower::buffer::Buffer;
 use zebra_chain::{
     block::{self, CountedHeader, HeightDiff},
     diagnostic::CodeTimer,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     subtree::NoteCommitmentSubtreeIndex,
@@ -60,7 +61,6 @@ use crate::{
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
     Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
 };
-use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
 pub mod block_iter;
 pub mod chain_tip;
@@ -1497,19 +1497,15 @@ fn block_roots_by_height_range<C>(
 where
     C: AsRef<Chain>,
 {
-    // Cap the count to the maximum header sync height range
-    let mut roots = Vec::with_capacity(
-        usize::try_from(count.min(MAX_HEADER_SYNC_HEIGHT_RANGE))
-            .expect("capped root count fits in usize"),
-    );
+    let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let mut roots =
+        Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
 
-    // Iterate over the height range
-    for offset in 0..count.min(MAX_HEADER_SYNC_HEIGHT_RANGE) {
+    for offset in 0..capped_count {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
-        // If the height is at or below the finalized tip height, serve the roots from the finalized state
         let root = if db
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
@@ -1517,7 +1513,6 @@ where
             finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
-            // If the height is in the chain, serve the roots from the chain
         } else if let Some(chain) = chain
             .as_ref()
             .map(|chain| chain.as_ref())
@@ -1549,6 +1544,7 @@ where
                             0,
                             zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
                         ));
+
                     Some(BlockCommitmentRoots {
                         height,
                         sapling_root: sapling.root(),
@@ -1563,7 +1559,6 @@ where
                 }
                 _ => None,
             }
-            // If the height is not in the chain, serve the roots from the zakura header commitment roots by height range
         } else {
             db.zakura_header_commitment_roots_by_height_range(height..=height)
                 .into_iter()
@@ -1709,24 +1704,6 @@ impl Service<ReadRequest> for ReadStateService {
 
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::IsPruned => Ok(ReadResponse::IsPruned(state.db.is_pruned())),
-
-            // The verified-commitment-trees `tree_aux` serving read (design §9).
-            ReadRequest::BlockRoots {
-                start_height,
-                count,
-            } => {
-                let roots = if count == 0 {
-                    Vec::new()
-                } else {
-                    block_roots_by_height_range(
-                        state.latest_best_chain(),
-                        &state.db,
-                        start_height,
-                        count,
-                    )
-                };
-                Ok(ReadResponse::BlockRoots(roots))
-            }
 
             // Used by the StateService.
             ReadRequest::Tip => Ok(ReadResponse::Tip(read::tip(
@@ -1898,6 +1875,24 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
                 headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
             )),
+
+            ReadRequest::BlockRoots {
+                start_height,
+                count,
+            } => {
+                let roots = if count == 0 {
+                    Vec::new()
+                } else {
+                    block_roots_by_height_range(
+                        state.latest_best_chain(),
+                        &state.db,
+                        start_height,
+                        count,
+                    )
+                };
+
+                Ok(ReadResponse::BlockRoots(roots))
+            }
 
             ReadRequest::BestHeaderTip => {
                 let best_disk_header_tip = state.db.best_header_tip();

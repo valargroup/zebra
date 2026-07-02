@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Improve Zakura block-sync download scheduling for checkpoint sync. A
+  byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
+  per-peer admission control (`block_sync/admission.rs`) replace the previous
+  request pacing, a floor-rescue path keeps the lowest missing body height
+  fundable even under a full byte budget, and the checkpoint-frontier refresh
+  interval is shortened (5s → 200ms) so the checkpoint apply window recycles
+  promptly instead of leaving the finalized writer idle between refreshes. Also
+  adds an offline block-sync `Sequencer` benchmark helper
+  (`zakura::spawn_bench_sequencer`) behind a new `internal-bench` feature.
 - Remove O(n) scans from the Zakura block-sync sequencer's per-event hot path,
   which stalled the checkpoint-sync commit pipeline for tens of seconds. During
   checkpoint sync, headers race far ahead of the body tip, so the sequencer's
@@ -27,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   budget by the existing `publish_view` audit, and asserted drift-free by new unit
   tests), and `advance_floor`/`reset_above` pop only the committed prefix/suffix
   instead of scanning the whole map.
+- Precompute checkpoint-zone auth data roots before finalized-state commitment,
+  and reuse the shared txid/auth-digest conversion while preparing semantic block
+  data. This moves ZIP-244 authorizing-data commitment work off the finalized
+  committer's critical path when available, while preserving the existing
+  recompute fallback.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
@@ -106,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Zakura header-sync commitment roots to ranged header responses. Stream
+  version 5 requests and serves one tree-aux root payload per header, persists
+  received roots with header-only ranges, and caps rootless header tips until
+  matching roots are available.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned

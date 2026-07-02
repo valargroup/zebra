@@ -584,7 +584,21 @@ impl CheckpointVerifiedBlock {
     /// Note: a [`CheckpointVerifiedBlock`] isn't actually finalized
     /// until [`Request::CommitCheckpointVerifiedBlock`] returns success.
     pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
-        Self(SemanticallyVerifiedBlock::with_hash(block, hash))
+        let height = block
+            .coinbase_height()
+            .expect("checkpoint verified block should have a coinbase height");
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+
+        Self(SemanticallyVerifiedBlock {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            deferred_pool_balance_change: None,
+            auth_data_root: None,
+        })
     }
 }
 
@@ -1282,18 +1296,6 @@ pub enum ReadRequest {
     /// with whether the database has pruned historical data.
     IsPruned,
 
-    /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
-    /// with the per-block Sapling/Orchard commitment roots for the heights
-    /// `[start_height, start_height + count)` that this node holds, in ascending height
-    /// order (the verified-commitment-trees `tree_aux` serving read). May return fewer
-    /// than `count` roots if the node does not hold the whole range.
-    BlockRoots {
-        /// First requested height.
-        start_height: block::Height,
-        /// Number of consecutive heights requested.
-        count: u32,
-    },
-
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)
     /// with the current best chain tip.
     Tip,
@@ -1486,6 +1488,16 @@ pub enum ReadRequest {
         /// First height to read.
         start: block::Height,
         /// Maximum number of headers to return.
+        count: u32,
+    },
+
+    /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
+    /// with the per-block commitment roots for the requested heights, in ascending height
+    /// order. May return fewer than `count` roots if the node does not hold the whole range.
+    BlockRoots {
+        /// First requested height.
+        start_height: block::Height,
+        /// Number of consecutive heights requested.
         count: u32,
     },
 
@@ -1691,7 +1703,6 @@ impl ReadRequest {
         match self {
             ReadRequest::UsageInfo => "usage_info",
             ReadRequest::IsPruned => "is_pruned",
-            ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::Tip => "tip",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
@@ -1711,6 +1722,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
@@ -1859,6 +1871,25 @@ mod tests {
                 .zcash_deserialize_into::<Block>()
                 .expect("NU5 test vector block deserializes"),
         )
+    }
+
+    #[test]
+    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
+        let _init_guard = zebra_test::init();
+
+        let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("NU5 mainnet block deserializes");
+
+        let (transaction_hashes, auth_data_root, _new_outputs) = prepare_block_data(&block);
+        let expected_transaction_hashes: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.hash())
+            .collect();
+
+        assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
+        assert_eq!(auth_data_root, block.auth_data_root());
     }
 
     /// Every [`CheckpointVerifiedBlock`] constructor must precompute the

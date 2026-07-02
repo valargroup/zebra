@@ -2063,9 +2063,8 @@ mod zakura_header_sync_driver_tests {
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::mpsc;
     use tower::{service_fn, util::BoxService, ServiceExt};
-    use zebra_chain::block;
     use zebra_chain::serialization::ZcashDeserializeInto;
-    use zebra_chain::{orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
+    use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
     use zebra_network::zakura::{
         commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,

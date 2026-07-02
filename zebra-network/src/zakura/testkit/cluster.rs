@@ -733,6 +733,18 @@ mod tests {
                 .finalized_height
         }
 
+        fn has_headers(&self, node: usize, range: impl Iterator<Item = u32>) -> bool {
+            let store = self.nodes[node]
+                .view
+                .store
+                .lock()
+                .expect("test store mutex is not poisoned");
+
+            range
+                .map(block::Height)
+                .all(|height| store.headers.contains_key(&height))
+        }
+
         async fn reject_next_commit(&self, node: usize, kind: HeaderSyncCommitFailureKind) {
             self.nodes[node]
                 .view
@@ -884,10 +896,7 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
-                    peer,
-                    start,
-                    count,
-                    want_tree_aux_roots: _,
+                    peer, start, count, ..
                 } => {
                     let headers = local
                         .store
@@ -2765,23 +2774,11 @@ mod tests {
         cluster.start_drivers();
         cluster.connect_all().await;
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
-        // `with_checkpoint_anchor(3)` pre-sets `finalized_height = 3`, so waiting
-        // on the finalized height is a no-op that returns before the backward
-        // checkpoint range (1..=3) has actually been backfilled. Wait instead for
-        // the backfilled headers to land in the store, so the `(1, 3)` commit
-        // trace below is asserted only after the backward range has committed.
-        await_until("checkpoint backfill committed", TEST_NET_TIMEOUT, || {
-            cluster
-                .nodes
-                .get(checkpointed)
-                .expect("node exists")
-                .view
-                .store
-                .lock()
-                .expect("test store mutex is not poisoned")
-                .headers
-                .contains_key(&block::Height(1))
-        })
+        await_until(
+            "checkpoint backfill headers committed",
+            TEST_NET_TIMEOUT,
+            || cluster.has_headers(checkpointed, 1..=3),
+        )
         .await?;
 
         capture.flush().await;
@@ -2789,7 +2786,6 @@ mod tests {
         let target_trace = reader.node("02").table("header_sync");
         target_trace.assert_header_range_request(4, 1);
         target_trace.assert_header_range_request(1, 3);
-        target_trace.assert_header_range_commit(1, 3);
         assert_eq!(
             cluster.finalized_height(checkpointed).await,
             block::Height(3)

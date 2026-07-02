@@ -17,11 +17,12 @@ use tokio::sync::{
 };
 
 use tracing::Span;
-use zebra_chain::block::{self, Height};
-
-use zebra_chain::parallel::{
-    commitment_aux::BlockCommitmentRoots,
-    tree::{BlockNotePrecompute, NoteCommitmentTrees},
+use zebra_chain::{
+    block::{self, Height},
+    parallel::{
+        commitment_aux::BlockCommitmentRoots,
+        tree::{BlockNotePrecompute, NoteCommitmentTrees},
+    },
 };
 
 use crate::{

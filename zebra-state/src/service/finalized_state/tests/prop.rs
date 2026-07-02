@@ -1,6 +1,6 @@
 //! Randomised property tests for the finalized state.
 
-use std::{collections::HashMap, env, fs, sync::Arc};
+use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
 
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -225,6 +225,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             let nu5_height_plus1 = (nu5_height + 1).unwrap();
 
             let mut failure_count = 0;
+            let mut bad_auth_root_failure_count = 0;
             for block in chain.iter() {
                 let block_hash = block.hash;
                 let current_height = block.block.coinbase_height().unwrap();
@@ -248,6 +249,34 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                         },
                     _ => {},
                 }
+                if current_height == nu5_height_plus1 {
+                    let mut checkpoint_verified =
+                        CheckpointVerifiedBlock::from(block.block.clone());
+                    checkpoint_verified.0.auth_data_root = Some([0x42; 32].into());
+                    let err = state.commit_finalized_direct(
+                        checkpoint_verified.into(),
+                        None,
+                        None,
+                        None,
+                        "all_upgrades bad auth root test"
+                    ).expect_err("Must fail when the supplied auth data root is incorrect");
+                    let commit_error = err
+                        .source()
+                        .and_then(|source| source.downcast_ref::<crate::error::CommitBlockError>())
+                        .expect("checkpoint commit error wraps a commit block error");
+                    let bad_auth_root_is_rejected = matches!(
+                        commit_error,
+                        crate::error::CommitBlockError::ValidateContextError(source)
+                            if matches!(
+                                source.as_ref(),
+                                crate::ValidateContextError::InvalidBlockCommitment(
+                                    zebra_chain::block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+                                )
+                            )
+                    );
+                    prop_assert!(bad_auth_root_is_rejected);
+                    bad_auth_root_failure_count += 1;
+                }
                 let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
                 let (hash, _) = state.commit_finalized_direct(
                     checkpoint_verified.into(),
@@ -262,6 +291,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             }
             // Make sure the failure path was triggered
             prop_assert_eq!(failure_count, 4);
+            prop_assert_eq!(bad_auth_root_failure_count, 1);
     });
 
     Ok(())
