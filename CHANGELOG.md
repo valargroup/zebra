@@ -84,18 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
-- Precompute note-commitment tree hashing ahead of the finalized committer. The
-  per-leaf Merkle hashing for a block (the dominant committer cost on shielded
-  blocks) depends only on the starting note count, not the frontier's hashes, so
-  the finalized write loop now does a one-block look-ahead and runs the next
-  block's Sapling/Orchard/Ironwood hashing on idle cores while the current block commits;
-  the committer then only applies the precomputed subtree roots onto the frontier
-  (`update_trees_parallel_with` in `zebra-chain`). The precompute is applied only
-  if its starting tree size still matches at commit time and otherwise falls back
-  to inline hashing, so it affects only speed, never the resulting tree. This cuts
-  the committer's tree-update cost by ~54% (12.5 → 5.7 ms/block) where the
-  committer is the bottleneck.
-
 ### Changed
 
 - Increased Zakura's default connection, handshake, stream-open, and QUIC

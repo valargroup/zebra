@@ -25,7 +25,7 @@ use std::{
 use zebra_chain::{
     block::{self, merkle::AuthDataRoot, Block},
     ironwood, orchard,
-    parallel::tree::{BlockNotePrecompute, NoteCommitmentTrees},
+    parallel::tree::NoteCommitmentTrees,
     parameters::Network,
     sapling,
 };
@@ -75,52 +75,6 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("rayon thread pool configuration is valid")
 });
-
-/// Spawns the note-commitment tree per-leaf hashing for `block` onto the
-/// commit-compute pool, returning a receiver for the result and a cancellation
-/// flag.
-///
-/// The off-committer half of the tree-update pipeline: the finalized write loop
-/// starts this for the *next* block — using the running tree sizes `sapling_start`
-/// / `orchard_start` / `ironwood_start` (the tree `count`s the block will commit at) — so the heavy
-/// hashing overlaps the *current* block's commit on otherwise idle cores. The
-/// committer then only applies the precomputed subtree roots. If the precompute is stale (its `start_size` no
-/// longer matches the tree), the committer falls back to inline hashing, so this
-/// is purely a scheduling optimization.
-///
-/// Because it is started speculatively before the current block has committed, the
-/// caller must keep the returned flag and set it if it discards the precompute —
-/// e.g. when the current block's commit fails. The spawned task checks the flag
-/// before each pool's hashing (and skips the send if cancelled), so a discarded
-/// child that has not started a pool yet avoids that pool's work.
-pub(crate) fn spawn_note_precompute(
-    sapling_start: u64,
-    orchard_start: u64,
-    ironwood_start: u64,
-    block: Arc<block::Block>,
-) -> (
-    crossbeam_channel::Receiver<BlockNotePrecompute>,
-    Arc<AtomicBool>,
-) {
-    let (tx, rx) = crossbeam_channel::bounded(1);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let task_cancel = cancel.clone();
-    COMMIT_COMPUTE_POOL.spawn(move || {
-        let result = BlockNotePrecompute::compute(
-            sapling_start,
-            orchard_start,
-            ironwood_start,
-            &block,
-            &task_cancel,
-        );
-        // If the precompute was cancelled, the receiver has been (or is being)
-        // dropped and the result is unwanted; skip the send.
-        if !task_cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(result);
-        }
-    });
-    (rx, cancel)
-}
 
 pub mod column_family;
 
@@ -794,7 +748,6 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        note_precompute: Option<BlockNotePrecompute>,
         next_checkpoint: Option<(Arc<Block>, Option<AuthDataRoot>)>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
@@ -804,7 +757,6 @@ impl FinalizedState {
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
-            note_precompute,
             next_checkpoint,
             "commit checkpoint-verified request",
         );
@@ -853,7 +805,6 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        note_precompute: Option<BlockNotePrecompute>,
         // The next checkpoint block (and its precomputed
         // auth data root), used to verify this block's fixture roots before the fast
         // path trusts them. `None` is only valid for fast blocks at the checkpoint
@@ -1112,13 +1063,9 @@ impl FinalizedState {
                                 ));
                             });
 
-                            // `note_precompute`, if present and still size-matched,
-                            // lets the committer apply the precomputed subtree roots
-                            // instead of re-hashing the notes here; else hashes inline.
                             timed_commit_phase!(
                                 "zebra.state.write.update_trees.duration_seconds",
-                                note_commitment_trees
-                                    .update_trees_parallel_with(&block, note_precompute)
+                                note_commitment_trees.update_trees_parallel(&block)
                             )
                         })
                     });
@@ -1217,16 +1164,9 @@ impl FinalizedState {
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
         // Run `write_block` directly on the committer thread rather than entering the
-        // dedicated commit-compute pool via `install()`.
-        //
-        // The committer is not a member of `COMMIT_COMPUTE_POOL`, so `install()` is a
-        // synchronous cross-thread handoff: the committer parks until a pool worker
-        // picks up the job, runs it, and signals back. The look-ahead note-commitment
-        // precompute (`spawn_note_precompute`) keeps those workers busy, so the handoff
-        // waits on a contended pool, and that wait dominates the isolation it was meant
-        // to provide for `write_block`'s internal rayon (`join`/`par_iter`). Running
-        // `write_block` here removes the per-block round-trip; its internal rayon uses
-        // the global pool instead. Measured net win on the sandblast region (see PR).
+        // dedicated commit-compute pool via `install()`. The committer is not a
+        // member of `COMMIT_COMPUTE_POOL`, so `install()` would add a synchronous
+        // cross-thread handoff before `write_block`'s internal rayon work.
         let network = self.network();
         let result = self.db.write_block(
             finalized,
@@ -1282,8 +1222,8 @@ impl FinalizedState {
     /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will
     /// apply to `height` — i.e. fast mode is active *and* the source already holds this
     /// height's roots, so the committer will fold them in and skip the frontier recompute.
-    /// The write loop uses this to skip the off-thread note precompute only when its result
-    /// would be discarded; a legacy-fallback block (root not supplied) still precomputes.
+    /// The write loop uses this to record fast-path hit/miss metrics after a
+    /// successful checkpoint commit.
     pub(crate) fn vct_fast_will_apply(&self, height: block::Height) -> bool {
         self.vct
             .as_ref()

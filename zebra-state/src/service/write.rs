@@ -3,10 +3,7 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,10 +16,7 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::{
     block::{self, Height},
-    parallel::{
-        commitment_aux::BlockCommitmentRoots,
-        tree::{BlockNotePrecompute, NoteCommitmentTrees},
-    },
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
 };
 
 use crate::{
@@ -30,7 +24,7 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
+        finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -44,15 +38,6 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
-
-/// A speculatively-started note-commitment precompute for an upcoming finalized
-/// block: the block hash it was started for, the channel to receive the result on,
-/// and a flag to cancel it if the block is no longer going to be committed.
-type PendingPrecompute = (
-    block::Hash,
-    crossbeam_channel::Receiver<BlockNotePrecompute>,
-    Arc<AtomicBool>,
-);
 
 /// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
 const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
@@ -69,16 +54,6 @@ const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
 /// and — by design — the committer will not recompute against the stale frontier, so the node
 /// cannot advance until a peer supplies it. Surfacing that loudly is the operator's only signal.
 const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
-
-/// Cancels and drops a pending look-ahead precompute, if any.
-///
-/// Tripping the flag tells the spawned task (started before the current block
-/// committed) to stop instead of hashing a block that will not be committed.
-fn cancel_pending_precompute(pending: &mut Option<PendingPrecompute>) {
-    if let Some((_hash, _rx, cancel)) = pending.take() {
-        cancel.store(true, Ordering::Relaxed);
-    }
-}
 
 /// The maximum size of the parent error map.
 ///
@@ -372,21 +347,8 @@ impl WriteBlockWorkerTask {
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
         let mut deferred_non_finalized_messages = VecDeque::new();
 
-        // One-block look-ahead so the next block's note-commitment tree hashing can
-        // be precomputed off the committer (on idle cores) while the current block
-        // commits. `pending_precompute` holds the receiver and cancellation flag for
-        // the block started last iteration; `finalized_lookahead` buffers the peeked
-        // next block. The precompute is keyed on the running tree sizes and only
-        // applied if those still match at commit time, so this never affects
-        // correctness, only speed.
-        //
-        // Because the next block's precompute is started before the current block
-        // commits, a current block that fails to commit (e.g. an invalid block from
-        // a peer) leaves that speculative work unwanted. Whenever this loop discards
-        // a pending precompute it trips the cancellation flag via
-        // [`cancel_pending_precompute`], so the spawned task stops instead of hashing
-        // a block that will never be committed.
-        let mut pending_precompute: Option<PendingPrecompute> = None;
+        // One-block look-ahead buffers the next checkpoint block so VCT fast-path
+        // roots can be authenticated by the successor header before being trusted.
         let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
         let mut retry_finalized_block: Option<QueuedCheckpointVerified> = None;
 
@@ -465,10 +427,8 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
-                // The pipeline is broken; cancel and drop any look-ahead so the next
-                // precompute re-seeds from the real tip (a stale precompute would
-                // only fall back anyway, but cancelling stops the wasted hashing).
-                cancel_pending_precompute(&mut pending_precompute);
+                // The pipeline is broken; drop any buffered look-ahead so the next
+                // commit re-seeds from the real tip.
                 finalized_lookahead.clear();
                 finalized_state.clear_vct_prevalidated_next();
 
@@ -477,9 +437,8 @@ impl WriteBlockWorkerTask {
                 continue;
             }
 
-            // Peek the next block and start its precompute, so the heavy hashing
-            // overlaps this block's commit. Its start sizes are the current tree
-            // sizes plus this block's note counts (the sizes after this block).
+            // Peek the next block so VCT can authenticate this block's supplied
+            // roots against its successor before committing them.
             if finalized_lookahead.is_empty() {
                 if let Ok(next) = finalized_block_write_receiver.try_recv() {
                     finalized_lookahead.push_back(next);
@@ -503,48 +462,6 @@ impl WriteBlockWorkerTask {
                 continue;
             }
 
-            // Use the precompute for this block if we started it last iteration and
-            // it is for this exact block; otherwise cancel it (so the spawned task
-            // stops) and let the committer hash inline.
-            let note_precompute = match pending_precompute.take() {
-                Some((hash, rx, _cancel)) if hash == ordered_block.0.hash => rx.recv().ok(),
-                Some((_hash, _rx, cancel)) => {
-                    cancel.store(true, Ordering::Relaxed);
-                    None
-                }
-                None => None,
-            };
-
-            // In verified-commitment-trees mode, the committer skips the
-            // note-commitment frontier entirely, so the off-thread precompute would
-            // just be discarded. Skip it only when the *next* block will actually
-            // take the vct path (its roots are already supplied). A legacy-fallback block
-            // (no peer roots yet, or never) still gets the precompute overlap.
-            let next_block_takes_vct_path = finalized_lookahead
-                .front()
-                .is_some_and(|next| finalized_state.vct_fast_will_apply(next.0.height));
-            if !next_block_takes_vct_path {
-                if let (Some(trees), Some(next)) = (
-                    prev_finalized_note_commitment_trees.as_ref(),
-                    finalized_lookahead.front(),
-                ) {
-                    let block = &ordered_block.0.block;
-                    let sapling_start =
-                        trees.sapling.count() + block.sapling_note_commitments().count() as u64;
-                    let orchard_start =
-                        trees.orchard.count() + block.orchard_note_commitments().count() as u64;
-                    let ironwood_start =
-                        trees.ironwood.count() + block.ironwood_note_commitments().count() as u64;
-                    let (rx, cancel) = spawn_note_precompute(
-                        sapling_start,
-                        orchard_start,
-                        ironwood_start,
-                        next.0.block.clone(),
-                    );
-                    pending_precompute = Some((next.0.hash, rx, cancel));
-                }
-            }
-
             // The buffered successor (if any) lets the committer verify this block's
             // verified-commitment-trees fixture roots before trusting them: a block's
             // roots are only committed by the next block's header. Its auth data root
@@ -562,7 +479,6 @@ impl WriteBlockWorkerTask {
             match finalized_state.commit_finalized(
                 ordered_block,
                 prev_note_commitment_trees,
-                note_precompute,
                 next_checkpoint,
             ) {
                 Ok((finalized, note_commitment_trees)) => {
@@ -642,7 +558,6 @@ impl WriteBlockWorkerTask {
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         retry_finalized_block = Some(ordered_block);
-                        cancel_pending_precompute(&mut pending_precompute);
                         std::thread::park_timeout(if needs_refetch.is_some() {
                             VCT_ROOT_RETRY_WAIT
                         } else {
@@ -654,11 +569,8 @@ impl WriteBlockWorkerTask {
                     let finalized_tip = finalized_state.db.tip();
                     let _ = ordered_block.1.send(Err(error.clone()));
 
-                    // The commit failed and the queue is being reset, so any
-                    // look-ahead precompute is for a block that will not be
-                    // committed: cancel it so the spawned task stops instead of
-                    // hashing the discarded child, and clear the look-ahead.
-                    cancel_pending_precompute(&mut pending_precompute);
+                    // The commit failed and the queue is being reset, so clear
+                    // the buffered successor.
                     finalized_lookahead.clear();
                     finalized_state.clear_vct_prevalidated_next();
 
@@ -832,7 +744,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();

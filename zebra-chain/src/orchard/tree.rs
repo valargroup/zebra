@@ -28,29 +28,12 @@ use zcash_primitives::merkle_tree::HashSer;
 use sinsemilla::HashDomain;
 
 use crate::{
-    parallel::batch_frontier::{
-        apply_append_batch_with_subtree, precompute_append_batch_with_subtree, BatchFrontierError,
-        PrecomputedSubtreeAppend,
-    },
+    parallel::batch_frontier::BatchFrontierError,
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
-
-/// The precomputed parallel-append work for one block's Orchard note commitments,
-/// produced off the committer by [`NoteCommitmentTree::precompute_append`] and
-/// applied with [`NoteCommitmentTree::apply_precomputed_append`].
-#[derive(Clone, Debug)]
-pub(crate) struct PrecomputedAppendBatch(PrecomputedSubtreeAppend<Node>);
-
-impl PrecomputedAppendBatch {
-    /// The tree size (leaf [`count`](NoteCommitmentTree::count)) this precompute
-    /// must be applied to.
-    pub(crate) fn start_size(&self) -> u64 {
-        self.0.start_size()
-    }
-}
 
 pub mod legacy;
 use legacy::LegacyNoteCommitmentTree;
@@ -362,9 +345,6 @@ impl<'de> serde::Deserialize<'de> for Node {
 pub enum NoteCommitmentTreeError {
     #[error("The note commitment tree is full")]
     FullTree,
-
-    #[error("Invalid precompute: empty batch, stale start size, or multi-subtree batch")]
-    InvalidPrecompute,
 }
 
 impl From<BatchFrontierError> for NoteCommitmentTreeError {
@@ -372,13 +352,7 @@ impl From<BatchFrontierError> for NoteCommitmentTreeError {
         match error {
             // A capacity overflow is the tree being full.
             BatchFrontierError::Frontier(_) => NoteCommitmentTreeError::FullTree,
-            // The remaining variants are caller-supplied precompute misuse, which
-            // is reported as a recoverable error rather than panicking.
-            BatchFrontierError::BatchSpansMultipleSubtrees
-            | BatchFrontierError::EmptyBatch
-            | BatchFrontierError::PrecomputeStartMismatch { .. } => {
-                NoteCommitmentTreeError::InvalidPrecompute
-            }
+            BatchFrontierError::BatchSpansMultipleSubtrees => NoteCommitmentTreeError::FullTree,
         }
     }
 }
@@ -493,67 +467,6 @@ impl NoteCommitmentTree {
             );
             (index, root)
         }))
-    }
-
-    /// Precomputes the parallel-append work for `note_commitments` against a tree
-    /// of size `start_size`, off the committer. See the Sapling equivalent. Returns
-    /// [`NoteCommitmentTreeError::InvalidPrecompute`] for an empty `note_commitments`,
-    /// rather than panicking.
-    pub(crate) fn precompute_append(
-        start_size: u64,
-        note_commitments: &[NoteCommitmentUpdate],
-    ) -> Result<PrecomputedAppendBatch, NoteCommitmentTreeError> {
-        let nodes: Vec<Node> = note_commitments
-            .iter()
-            .map(|commitment_x| (*commitment_x).into())
-            .collect();
-
-        let inner = precompute_append_batch_with_subtree::<_, MERKLE_DEPTH>(start_size, &nodes)?;
-
-        Ok(PrecomputedAppendBatch(inner))
-    }
-
-    /// Applies a [`PrecomputedAppendBatch`] from [`Self::precompute_append`],
-    /// returning any completed [`TRACKED_SUBTREE_HEIGHT`] subtree, exactly like
-    /// [`Self::append_batch`]. `precomputed.start_size()` must equal this tree's
-    /// [`count`](Self::count); a stale precompute returns
-    /// [`NoteCommitmentTreeError::InvalidPrecompute`] (rather than panicking) so
-    /// callers can fall back to [`Self::append_batch`].
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn apply_precomputed_append(
-        &mut self,
-        precomputed: PrecomputedAppendBatch,
-    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
-        let (frontier, completed) =
-            apply_append_batch_with_subtree(self.inner.clone(), precomputed.0)?;
-
-        self.inner = frontier;
-        *self
-            .cached_root
-            .get_mut()
-            .expect("a thread that previously held exclusive lock access panicked") = None;
-
-        Ok(completed.map(|(index_value, root)| {
-            let index = NoteCommitmentSubtreeIndex(
-                index_value.try_into().expect("subtree index fits in u16"),
-            );
-            (index, root)
-        }))
-    }
-
-    /// Benchmark-only: precompute the parallel append for `note_commitments`
-    /// (rayon hashing), apply the precomputed subtree roots onto a fresh tree, and return the resulting root.
-    /// Mirrors the committer's precompute path end-to-end so the
-    /// `precompute_threshold` benchmark can compare it against a serial append.
-    #[cfg(feature = "bench")]
-    #[doc(hidden)]
-    pub fn precompute_then_apply_root(note_commitments: &[NoteCommitmentUpdate]) -> [u8; 32] {
-        let mut tree = NoteCommitmentTree::default();
-        let precomputed =
-            Self::precompute_append(0, note_commitments).expect("non-empty batch in benchmark");
-        tree.apply_precomputed_append(precomputed)
-            .expect("fresh tree matches start size 0");
-        tree.root().into()
     }
 
     /// Returns frontier of non-empty tree, or `None` if the tree is empty.

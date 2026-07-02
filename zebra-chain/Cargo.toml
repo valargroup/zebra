@@ -173,10 +173,5 @@ harness = false
 name = "note_commitment_hash"
 harness = false
 
-[[bench]]
-name = "precompute_threshold"
-harness = false
-required-features = ["bench"]
-
 [lints]
 workspace = true

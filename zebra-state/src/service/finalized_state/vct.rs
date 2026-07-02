@@ -131,8 +131,7 @@ impl VctState {
             // filled by the driver; the committer reads them per height and folds them in,
             // skipping the recompute. A height the peer cannot supply — or any node with no
             // serving peers — stays in legacy mode, bit-identical to a legacy committer by
-            // construction (the precompute overlap is preserved for those blocks; see
-            // `vct_fast_will_apply`).
+            // construction.
             SourceMode::Peer => {
                 let parsed = embedded?;
                 tracing::info!(
