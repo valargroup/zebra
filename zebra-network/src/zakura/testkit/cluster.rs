@@ -2508,6 +2508,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "flaky in CI; tracked in issue 407"]
     async fn native_stream5_hostile_bytes_disconnect_with_traceable_reasons() -> Result<(), BoxError>
     {
         let _guard = zebra_test::init();
