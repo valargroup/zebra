@@ -1,19 +1,14 @@
 //! Payload types and the producer/serving half of the verified-commitment-trees
-//! fast path (`docs/design/verified-commitment-trees.md` §5).
+//! fast path (`docs/design/verified-commitment-trees.md`).
 //!
 //! The fast path consumes per-block Sapling/Orchard roots and a final frontier at the
-//! checkpoint handoff. This module provides the **producer** half
+//! last checkpoint. This module provides the **producer** half
 //! ([`produce_block_roots`] / [`produce_final_frontiers`]): deriving that payload from
-//! an existing database's per-height trees. That is the read path a serving node runs,
-//! and tests can feed the DB-produced payload back through the fast path in-process to
-//! prove producer and consumer agreement without networking.
+//! an existing database's per-height trees.
 //!
 //! [`serve_block_roots`] is the serving entry point: it stitches the
 //! `commitment_roots_by_height` index with the per-height trees at the upgrade height,
 //! so upgraded and fast-synced nodes keep serving one gap-free `tree_aux` payload.
-//!
-//! The consumer-side source seam (`CommitmentRootSource` and the transport-backed
-//! peer source) lands with the committer fast path in a follow-up increment.
 
 use std::{fmt, sync::Arc};
 
@@ -25,15 +20,12 @@ use zebra_chain::{
 
 use super::{FromDisk, IntoDisk, ZebraDb};
 
-/// Per-block verified commitment roots — the essential fast-path payload (design §5.1),
-/// the wire payload carried over `tree_aux` (increment 6a). Defined in `zebra-chain` so
-/// `zebra-network` and `zebra-state` share it without a dependency cycle.
+/// Per-block verified commitment roots
 pub(super) use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 
-/// The verified final note-commitment frontiers at the checkpoint handoff height
-/// (design §5.2).
+/// The verified final note-commitment frontiers at the last checkpoint height.
 ///
-/// Fast mode skips the per-block frontier recompute below the checkpoint, so the
+/// Verified-commitment-tree (VCT) mode skips the per-block frontier recompute below the checkpoint, so the
 /// running Sapling/Orchard frontiers are never advanced. To let post-checkpoint
 /// semantic verification resume, the real frontiers at the checkpoint are supplied
 /// here, verified (`frontier.root() == the verified root at the checkpoint`), and
@@ -343,13 +335,14 @@ pub(crate) fn serve_block_roots(
     db: &ZebraDb,
     range: std::ops::RangeInclusive<block::Height>,
 ) -> Vec<BlockCommitmentRoots> {
+    // Below the VCT upgrade height, we use the per-height trees to derive the roots.
     let Some(upgrade) = db.vct_upgrade_height() else {
         return produce_block_roots(db, range);
     };
 
     let (start, end) = (*range.start(), *range.end());
 
-    // Wholly at/above `U`: the index covers it. (`U == 0` for a node that fast-synced from
+    // Wholly at/above `U`: the VCT-specific index covers it. (`U == 0` for a node that fast-synced from
     // genesis takes this path for every request, never touching the absent per-height trees.)
     if start >= upgrade {
         return db.commitment_roots_by_height_range(range);
