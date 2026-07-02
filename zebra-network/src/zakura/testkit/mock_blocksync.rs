@@ -236,6 +236,18 @@ impl MockApplyFrontier {
         }
     }
 
+    pub(crate) fn frontiers(&self) -> BlockSyncFrontiers {
+        let state = self
+            .inner
+            .lock()
+            .expect("mock apply frontier mutex is not poisoned");
+        BlockSyncFrontiers {
+            finalized_height: state.frontier,
+            verified_block_tip: state.frontier,
+            verified_block_hash: state.frontier_hash,
+        }
+    }
+
     /// Roll the mock commit frontier back to `height` (a reorg). Only ever lowers the
     /// frontier: a `height` at or above the current frontier is a no-op, so a reset to
     /// a height the node has not yet committed cannot punch a gap in the committed

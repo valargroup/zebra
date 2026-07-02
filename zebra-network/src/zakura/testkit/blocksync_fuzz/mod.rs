@@ -337,10 +337,20 @@ fn spawn_timeline_driver(
             elapsed = event.at;
             // Roll the mock committer back first so re-downloaded blocks above the
             // reset re-commit cleanly once the node resets.
-            if let TipEventKind::VerifiedReset(height) = event.kind {
-                apply.reset_to(height);
-            }
-            let current = exchange.current_frontier().frontier;
+            let apply_frontiers = if let TipEventKind::VerifiedReset(height) = event.kind {
+                apply.reset_to(height)
+            } else {
+                apply.frontiers()
+            };
+            let mut current = exchange.current_frontier().frontier;
+            current.finalized = Frontier::new(
+                apply_frontiers.finalized_height,
+                apply_frontiers.verified_block_hash,
+            );
+            current.verified_body = Frontier::new(
+                apply_frontiers.verified_block_tip,
+                apply_frontiers.verified_block_hash,
+            );
             let (frontier, change) = apply_tip_event(&corpus, current, event.kind);
             exchange.publish_frontier(
                 FrontierUpdate { frontier, change },
