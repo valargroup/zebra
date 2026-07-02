@@ -264,15 +264,7 @@ impl FinalFrontiers {
 
 /// Produce the per-block roots payload for `range` from `db`'s per-height trees.
 ///
-/// This is the serving read path (the future `TreeAuxStatePort::read_block_roots`),
-/// minus the network: it derives each root from the stored per-height tree, exactly
-/// the value the fast path folds into the anchor set. It requires per-height trees, so
-/// the caller restricts it to a non-fast-synced (archive/pre-index) database within the
-/// tip, where the trees are present. As defense-in-depth on this peer-triggered read, a
-/// height whose tree is unexpectedly absent stops the scan and serves the contiguous
-/// prefix collected so far rather than panicking; the wire client validates contiguity
-/// and treats a short batch as partial progress.
-// The `ReadRequest::BlockRoots` serving read path; also exercised by the round-trip test.
+/// Derives each root from the per-height note commitment tree.
 pub(crate) fn produce_block_roots(
     db: &ZebraDb,
     range: std::ops::RangeInclusive<block::Height>,
