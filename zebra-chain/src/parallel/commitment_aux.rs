@@ -18,7 +18,7 @@ use crate::{
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
-/// Per-block verified commitment roots — the essential fast-path payload (design §5.1).
+/// Per-block commitment roots carried with Zakura header-sync ranges.
 ///
 /// One entry per height; each root is the note-commitment treestate root as of
 /// end-of-block-`height`. `orchard_root` is the empty/default root below NU5.
