@@ -25,69 +25,6 @@ use super::{
     *,
 };
 
-/// Favor the lowest needed height over the speculative high tail.
-///
-/// While the byte budget cannot fund even one worst-case request yet the lowest
-/// needed height (pending or outstanding) sits *below* the highest buffered body,
-/// drop that top body: release its bytes to the budget and return its height to
-/// `pending` (it was held, hence in `work.in_flight` per the `held ⟺ in_flight`
-/// invariant) for later re-fetch. Because another top can always be shed, a low
-/// retry never blocks on budget; the floor can never wedge behind a full buffer,
-/// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. The rescue path is purely demand-driven:
-/// it runs inline after each accepted body and synchronously when a floor requester
-/// needs budget through [`SequencerControlInput::FundFloorReservation`]. Returns
-/// whether it shed anything.
-pub(super) fn shed_top_until_available(
-    budget: &mut ByteBudget,
-    work: &WorkQueue,
-    sequencer: &mut Sequencer,
-    target_available: u64,
-) -> bool {
-    let mut shed_any = false;
-    while budget.available() < target_available {
-        let lowest_needed = match (work.min_pending(), work.min_in_flight()) {
-            (Some(pending), Some(in_flight)) => pending.min(in_flight),
-            (Some(pending), None) => pending,
-            (None, Some(in_flight)) => in_flight,
-            (None, None) => break,
-        };
-        let Some(top) = sequencer.reorder_max_height() else {
-            break;
-        };
-        // Only shed a body that sits above a starved lower height: we trade a
-        // far-from-floor body for the ability to fetch a nearer, higher-value one.
-        if lowest_needed >= top {
-            break;
-        }
-        let freed = sequencer.drop_reorder_from(top);
-        if freed == 0 {
-            break;
-        }
-        let released = work.release_and_return_items([top]);
-        debug_assert!(
-            released == 0 || released == freed,
-            "shed reorder release must match the per-height budget ledger when present"
-        );
-        budget.release(if released == 0 { freed } else { released });
-        shed_any = true;
-    }
-    shed_any
-}
-
-pub(super) fn shed_top_for_floor_starvation(
-    budget: &mut ByteBudget,
-    work: &WorkQueue,
-    sequencer: &mut Sequencer,
-) -> bool {
-    shed_top_until_available(
-        budget,
-        work,
-        sequencer,
-        super::config::BS_PER_BLOCK_WORST_CASE_BYTES,
-    )
-}
-
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
@@ -105,9 +42,9 @@ pub(super) struct SequencedBody {
 /// Progress-critical Sequencer events forwarded by the reactor.
 ///
 /// These events must not sit behind downloaded bodies. `ApplyFinished` releases
-/// budget and verifier slots, and frontier/reset events can release or discard
-/// stale body work. They are locally generated and tiny, so they use a separate
-/// unbounded channel and are prioritized by the Sequencer task.
+/// retained bodies and verifier slots, and frontier/reset events can release or
+/// discard stale body work. They are locally generated and tiny, so they use a
+/// separate unbounded channel and are prioritized by the Sequencer task.
 #[derive(Debug)]
 pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
@@ -136,12 +73,6 @@ pub(super) enum SequencerControlInput {
         hash: block::Hash,
         result: BlockApplyResult,
         local_frontier: Option<BlockSyncFrontiers>,
-    },
-    /// Synchronously pop the speculative high tail until a floor request can
-    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
-    FundFloorReservation {
-        needed_bytes: u64,
-        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -286,11 +217,6 @@ impl SequencerTask {
                         Some(body) => {
                             self.release_body_input_bytes(body.bytes);
                             self.handle_accept_body(body).await;
-                            shed_top_for_floor_starvation(
-                                &mut self.budget,
-                                &self.work,
-                                &mut self.sequencer,
-                            );
                             self.publish_view();
                         }
                         None => body_open = false,
@@ -339,19 +265,6 @@ impl SequencerTask {
                 self.handle_apply_finished(token, height, hash, result, local_frontier)
                     .await
             }
-            SequencerControlInput::FundFloorReservation {
-                needed_bytes,
-                reply,
-            } => {
-                let shed = shed_top_until_available(
-                    &mut self.budget,
-                    &self.work,
-                    &mut self.sequencer,
-                    needed_bytes,
-                );
-                let _ = reply.send(self.budget.available() >= needed_bytes);
-                shed
-            }
         }
     }
 
@@ -363,8 +276,8 @@ impl SequencerTask {
         );
     }
 
-    /// Body-acceptance tail: offer the body to the reorder buffer, release its
-    /// bytes on a `Redundant` outcome, then drain the ready contiguous prefix into
+    /// Body-acceptance tail: offer the body to the reorder buffer (a `Redundant`
+    /// body is simply dropped), then drain the ready contiguous prefix into
     /// applying and submit it.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
@@ -376,10 +289,9 @@ impl SequencerTask {
             body.peer,
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
-            AcceptOutcome::Redundant { release_bytes } => {
-                self.budget.release(release_bytes);
-                "redundant"
-            }
+            // A dropped redundant body frees no wire budget: its request
+            // reservation was already released at receipt.
+            AcceptOutcome::Redundant { .. } => "redundant",
         };
         self.trace_body_accepted(body.height, queued_elapsed, outcome);
         self.release_contiguous_blocks().await;
@@ -403,10 +315,12 @@ impl SequencerTask {
             return;
         }
         self.verified_block_hash = frontiers.verified_block_hash;
+        // `advance_verified_tip` drops superseded bodies; those never charged the
+        // wire budget, so only the work queue's still-reserved request estimates
+        // (unreceived heights GC'd by the floor) are returned to it.
         let advance = self
             .sequencer
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
-        self.budget.release(advance.release_bytes);
         if advance.changed {
             let released = self.work.advance_floor(frontiers.verified_block_tip);
             self.budget.release(released);
@@ -479,15 +393,14 @@ impl SequencerTask {
         self.verified_block_hash = frontiers.verified_block_hash;
 
         // The Sequencer pins its verified tip and floor to the reset target and
-        // clears the reorder/applying buffers, returning the freed bytes for
-        // release.
-        let released = self
+        // clears the reorder/applying buffers. Their body bytes never charged
+        // the wire budget; nothing to release for them.
+        let _ = self
             .sequencer
             .reset_to(frontiers.verified_block_tip, remember_released_applies);
-        self.budget.release(released);
         // Drop every download work item above the reset target (their buffers
         // were cleared by `reset_to`); the reactor's `query_needed_blocks`
-        // re-fills.
+        // re-fills. Their unreceived request reservations return to the budget.
         let released = self.work.reset_above(self.sequencer.floor());
         self.budget.release(released);
         // A destructive reset: bump the epoch so the reactor drops *all*
@@ -495,7 +408,7 @@ impl SequencerTask {
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Handle a verifier apply completion: release the body's bytes and verifier
+    /// Handle a verifier apply completion: release the body and its verifier
     /// slot, fold in any embedded `local_frontier` as a frontier advance with
     /// `release_applied: false`, and on a rejection roll the floor back below the
     /// bad block so its range is re-requestable. Returns whether the reactor needs
@@ -546,7 +459,6 @@ impl SequencerTask {
             .remove_applying(height)
             .expect("applying entry exists because it was just checked");
 
-        self.budget.release(applying.bytes);
         // A `Committed` result is a body that newly extended the chain; count it
         // toward commit throughput (the apply rate the download path is racing).
         if matches!(result, BlockApplyResult::Committed) {
@@ -562,13 +474,13 @@ impl SequencerTask {
                 // reorder), roll the floor back below it, and drop the WorkQueue
                 // entries above the rolled-back floor so the heights are
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
-                let released = self.sequencer.release_applying_blocks_from(height);
-                self.budget.release(released);
+                // Only the work queue's unreceived request reservations return
+                // to the wire budget; the dropped bodies never charged it.
+                let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
                 let released = self.work.reset_above(self.sequencer.floor());
                 self.budget.release(released);
-                let dropped = self.sequencer.drop_reorder_from(height);
-                self.budget.release(dropped);
+                let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result means consensus found the body invalid.
                 // Attribute it to the delivering peer so repeat offenders are
                 // scored and eventually disconnected. `TimedOut` is a local apply
@@ -584,10 +496,9 @@ impl SequencerTask {
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {}
         }
         if let Some(frontiers) = accepted_local_frontier {
-            let released = self
+            let _ = self
                 .sequencer
                 .release_applied_through(frontiers.verified_block_tip);
-            self.budget.release(released);
         }
 
         self.release_contiguous_blocks().await;
@@ -735,20 +646,12 @@ impl SequencerTask {
         self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
-        let body_input_bytes = self
-            .body_input_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
         // Cross-layer drift check: the independently-maintained `ByteBudget` total
-        // must equal the sum of the component counters. `work.reserved_bytes()` is
-        // now an O(1) counter, so this runs on every event without a work-queue scan.
-        let expected_budget = self
-            .work
-            .reserved_bytes()
-            .saturating_add(reorder_buffered_bytes)
-            .saturating_add(applying_buffered_bytes)
-            .saturating_add(body_input_bytes);
+        // must equal the work queue's outstanding-request reservations (retained
+        // bodies never charge it). `work.reserved_bytes()` is an O(1) counter, so
+        // this runs on every event without a work-queue scan.
         self.budget
-            .audit(expected_budget, "block-sync sequencer view");
+            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
         let _ = self.view_tx.send_replace(SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
