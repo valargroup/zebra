@@ -306,7 +306,7 @@ impl LegacyRequestFrame {
             }
             Request::MempoolTransactionIds => Ok(Self::MempoolTransactionIds),
             Request::Ping(_) => Ok(Self::Ping),
-            Request::PushTransaction(transaction) => Ok(Self::PushTransaction(transaction)),
+            Request::PushTransaction(transaction, _) => Ok(Self::PushTransaction(transaction)),
             request => Err(LegacyGossipError::UnsupportedRequest(request.command())),
         }
     }
@@ -421,7 +421,7 @@ impl LegacyRequestFrame {
         }
     }
 
-    fn into_service_request(self) -> Option<Request> {
+    fn into_service_request(self, peer_id: ZakuraPeerId) -> Option<Request> {
         match self {
             Self::BlocksByHash(hashes) => Some(Request::BlocksByHash(hashes.into_iter().collect())),
             Self::TransactionsById(ids) => {
@@ -435,7 +435,10 @@ impl LegacyRequestFrame {
             }
             Self::MempoolTransactionIds => Some(Request::MempoolTransactionIds),
             Self::Ping => None,
-            Self::PushTransaction(transaction) => Some(Request::PushTransaction(transaction)),
+            Self::PushTransaction(transaction) => Some(Request::PushTransaction(
+                transaction,
+                Some(PeerSource::Zakura(peer_id)),
+            )),
         }
     }
 
@@ -2566,7 +2569,7 @@ async fn handle_legacy_request<Inbound>(
     let request_id = request.request_id;
     let request_kind = request.frame.kind();
     let mut response_tx = request.response_tx;
-    let Some(legacy_request) = request.frame.into_service_request() else {
+    let Some(legacy_request) = request.frame.into_service_request(peer_id.clone()) else {
         // Inbound legacy Ping is handled locally; the requester measures round-trip time.
         let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
@@ -2895,7 +2898,7 @@ mod tests {
 
     use crate::zakura::{
         framed_channel,
-        testkit::{HostilePeer, ZakuraTestNode},
+        testkit::{HostilePeer, ZakuraTestNode, TEST_NET_TIMEOUT},
         ZAKURA_CAP_LEGACY_GOSSIP,
     };
 
@@ -3245,7 +3248,7 @@ mod tests {
                             .collect(),
                     )
                 }
-                Request::PushTransaction(transaction) => {
+                Request::PushTransaction(transaction, _) => {
                     if let Err(error) = self.pushed_tx.send(transaction.id) {
                         return std::future::ready(Err(Box::new(error)));
                     }
@@ -3361,7 +3364,7 @@ mod tests {
     }
 
     async fn recv_request(rx: &mut UnboundedReceiver<Request>) -> Result<Request, BoxError> {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(TEST_NET_TIMEOUT, rx.recv())
             .await
             .map_err(|_| -> BoxError { "timed out waiting for request".into() })?
             .ok_or_else(|| "request recorder closed".into())
@@ -3370,7 +3373,7 @@ mod tests {
     async fn recv_pushed_tx_id(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<UnminedTxId>,
     ) -> Result<UnminedTxId, BoxError> {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(TEST_NET_TIMEOUT, rx.recv())
             .await
             .map_err(|_| -> BoxError { "timed out waiting for pushed transaction".into() })?
             .ok_or_else(|| "pushed transaction recorder closed".into())
@@ -3410,7 +3413,7 @@ mod tests {
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
                 if node.supervisor().registered_ids().await.len() == count {
                     return;
@@ -3468,7 +3471,7 @@ mod tests {
         // The handler must observe the dropped receiver, abort the service work, and
         // release the permit promptly. Without the fix this times out because the
         // handler stays blocked in `service.call` until `LEGACY_REQUEST_TIMEOUT`.
-        tokio::time::timeout(Duration::from_secs(5), handler)
+        tokio::time::timeout(TEST_NET_TIMEOUT, handler)
             .await
             .expect("handler aborts promptly after the request stream drops the receiver")
             .expect("handler task does not panic");
@@ -3501,9 +3504,7 @@ mod tests {
         let _guard = zebra_test::init();
         let (node_a, mut rx_a) = legacy_node(11).await?;
         let (node_b, mut rx_b) = legacy_node(12).await?;
-        node_a
-            .connect_native(&node_b, Duration::from_secs(5))
-            .await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let mut adapter = LegacyGossipAdapter::new(node_a.supervisor());
@@ -3549,9 +3550,7 @@ mod tests {
         let transaction = UnminedTx::from(empty_v5_transaction(1));
         let node_a = inventory_node(61, transaction).await?;
         let node_b = ZakuraTestNode::builder(62).spawn().await?;
-        node_b
-            .connect_native(&node_a, Duration::from_secs(5))
-            .await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
         let hash = block_hash(90);
 
@@ -3589,9 +3588,7 @@ mod tests {
 
         let node_a = block_inventory_node(68, block.clone()).await?;
         let node_b = ZakuraTestNode::builder(69).spawn().await?;
-        node_b
-            .connect_native(&node_a, Duration::from_secs(5))
-            .await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
@@ -3623,9 +3620,7 @@ mod tests {
         let missing_id = witnessed_tx_id(99);
         let node_a = inventory_node(63, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(64).spawn().await?;
-        node_b
-            .connect_native(&node_a, Duration::from_secs(5))
-            .await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
@@ -3663,9 +3658,7 @@ mod tests {
         let transaction = UnminedTx::from(empty_v5_transaction(4));
         let (node_a, _pushed_rx) = normal_network_node(81, block.clone(), transaction).await?;
         let node_b = ZakuraTestNode::builder(82).spawn().await?;
-        node_b
-            .connect_native(&node_a, Duration::from_secs(5))
-            .await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
@@ -3740,15 +3733,9 @@ mod tests {
         let (node_b, mut rx_b) = legacy_node(86).await?;
         let (node_c, mut rx_c) = legacy_node(87).await?;
 
-        node_a
-            .connect_native(&node_b, Duration::from_secs(5))
-            .await?;
-        node_a
-            .connect_native(&node_c, Duration::from_secs(5))
-            .await?;
-        node_b
-            .connect_native(&node_c, Duration::from_secs(5))
-            .await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        node_a.connect_native(&node_c, TEST_NET_TIMEOUT).await?;
+        node_b.connect_native(&node_c, TEST_NET_TIMEOUT).await?;
         wait_registered_count(&node_a, 2).await?;
         wait_registered_count(&node_b, 2).await?;
         wait_registered_count(&node_c, 2).await?;
@@ -3847,9 +3834,7 @@ mod tests {
         let pushed_id = pushed_transaction.id;
         let (node_a, mut pushed_rx) = normal_network_node(83, block, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(84).spawn().await?;
-        node_b
-            .connect_native(&node_a, Duration::from_secs(5))
-            .await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
@@ -3870,7 +3855,7 @@ mod tests {
         assert!(matches!(ping, Response::Pong(_)));
 
         let push_response = adapter
-            .request_from_source(Request::PushTransaction(pushed_transaction), None)
+            .request_from_source(Request::PushTransaction(pushed_transaction, None), None)
             .await?;
         assert_eq!(push_response, Response::Nil);
         assert_eq!(recv_pushed_tx_id(&mut pushed_rx).await?, pushed_id);
@@ -4003,10 +3988,10 @@ mod tests {
             .spawn()
             .await?;
         requester
-            .connect_native(&advertiser, Duration::from_secs(5))
+            .connect_native(&advertiser, TEST_NET_TIMEOUT)
             .await?;
         requester
-            .connect_native(&fallback, Duration::from_secs(5))
+            .connect_native(&fallback, TEST_NET_TIMEOUT)
             .await?;
         wait_registered_count(&requester, 2).await?;
         let advertiser_id = node_peer_id(&advertiser).await?;
@@ -4051,12 +4036,8 @@ mod tests {
         let (node_b, mut rx_b) = legacy_node(22).await?;
         let (node_c, mut rx_c) = legacy_node(23).await?;
 
-        node_a
-            .connect_native(&node_b, Duration::from_secs(5))
-            .await?;
-        node_b
-            .connect_native(&node_c, Duration::from_secs(5))
-            .await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        node_b.connect_native(&node_c, TEST_NET_TIMEOUT).await?;
 
         wait_registered_count(&node_b, 2).await?;
 
@@ -4105,9 +4086,7 @@ mod tests {
         let _guard = zebra_test::init();
         let (node_a, mut rx_a) = legacy_node(51).await?;
         let (node_b, mut rx_b) = legacy_node(52).await?;
-        node_a
-            .connect_native(&node_b, Duration::from_secs(5))
-            .await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
         let hostile = HostilePeer::connect_native(&node_a, 53).await?;
         wait_registered_count(&node_a, 2).await?;
 
@@ -4964,6 +4943,7 @@ mod tests {
                         orchard_shielded_data: None,
                     }
                     .into(),
+                    None,
                 ),
                 "PushTransaction",
             ),
@@ -5328,9 +5308,7 @@ mod tests {
         // node_a originates; node_b records gossip delivered over Zakura.
         let (node_a, _rx_a) = legacy_node(201).await?;
         let (node_b, mut rx_b) = legacy_node(202).await?;
-        node_a
-            .connect_native(&node_b, Duration::from_secs(5))
-            .await?;
+        node_a.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
         let a_peer_id = node_peer_id(&node_a).await?;
 
         let (legacy_tx, mut rx_legacy) = tokio::sync::mpsc::unbounded_channel();
@@ -5377,7 +5355,7 @@ mod tests {
         let advertiser = inventory_node(203, transaction.clone()).await?;
         let requester = ZakuraTestNode::builder(204).spawn().await?;
         requester
-            .connect_native(&advertiser, Duration::from_secs(5))
+            .connect_native(&advertiser, TEST_NET_TIMEOUT)
             .await?;
 
         let (legacy_tx, _rx_legacy) = tokio::sync::mpsc::unbounded_channel();
@@ -5449,7 +5427,7 @@ mod tests {
         let advertiser = inventory_node(206, transaction.clone()).await?;
         let requester = ZakuraTestNode::builder(207).spawn().await?;
         requester
-            .connect_native(&advertiser, Duration::from_secs(5))
+            .connect_native(&advertiser, TEST_NET_TIMEOUT)
             .await?;
 
         // legacy_enabled = false; the stub errors if it is ever consulted.
@@ -5494,7 +5472,7 @@ mod tests {
             normal_network_node(220, block.clone(), transaction.clone()).await?;
         let requester = ZakuraTestNode::builder(221).spawn().await?;
         requester
-            .connect_native(&responder, Duration::from_secs(5))
+            .connect_native(&responder, TEST_NET_TIMEOUT)
             .await?;
 
         // legacy_enabled = false; the stub errors if the legacy peer set is ever
@@ -5550,7 +5528,7 @@ mod tests {
         composite
             .ready()
             .await?
-            .call(Request::PushTransaction(transaction.clone()))
+            .call(Request::PushTransaction(transaction.clone(), None))
             .await?;
         let pushed = pushed_rx
             .recv()

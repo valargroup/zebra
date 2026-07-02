@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Improve Zakura block-sync download scheduling for checkpoint sync. A
+  byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
+  per-peer admission control (`block_sync/admission.rs`) replace the previous
+  request pacing, a floor-rescue path keeps the lowest missing body height
+  fundable even under a full byte budget, and the checkpoint-frontier refresh
+  interval is shortened (5s → 200ms) so the checkpoint apply window recycles
+  promptly instead of leaving the finalized writer idle between refreshes. Also
+  adds an offline block-sync `Sequencer` benchmark helper
+  (`zakura::spawn_bench_sequencer`) behind a new `internal-bench` feature.
+- Remove O(n) scans from the Zakura block-sync sequencer's per-event hot path,
+  which stalled the checkpoint-sync commit pipeline for tens of seconds. During
+  checkpoint sync, headers race far ahead of the body tip, so the sequencer's
+  `WorkQueue` holds the entire lag (100k+ pending heights) in mutex-guarded
+  `BTreeMap`s and the `applying` map holds thousands of buffered bodies. Three
+  operations scanned these on every body/control event or floor advance, going
+  quadratic as the backlog grew and serializing the work-queue lock (freezing
+  both commit and download): (1) `WorkQueue::reserved_bytes()` re-summed reserved
+  request bytes across `pending` + `in_flight` on every `publish_view`;
+  (2) `advance_floor`/`reset_above` ran a full-map `retain` to drop committed
+  heights; and (3) `publish_view`'s `applying_buffered_bytes` /
+  `submitted_applying_count` / `submitted_applying_bytes` /
+  `unsubmitted_applying_count` each folded over the whole `applying` map. All are
+  now O(1) or O(removed·log n): `reserved_bytes` and the applying totals are
+  incrementally-maintained counters (cross-checked against the independent byte
+  budget by the existing `publish_view` audit, and asserted drift-free by new unit
+  tests), and `advance_floor`/`reset_above` pop only the committed prefix/suffix
+  instead of scanning the whole map.
+- Precompute checkpoint-zone auth data roots before finalized-state commitment,
+  and reuse the shared txid/auth-digest conversion while preparing semantic block
+  data. This moves ZIP-244 authorizing-data commitment work off the finalized
+  committer's critical path when available, while preserving the existing
+  recompute fallback.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
@@ -58,6 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Increased Zakura's default connection, handshake, stream-open, and QUIC
+  window limits, and configured default native Zakura bootstrap peers. The
+  larger defaults are intended for the production native-P2P sync path rather
+  than the earlier conservative test-network envelope.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note
@@ -76,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Zakura header-sync commitment roots to ranged header responses. Stream
+  version 5 requests and serves one tree-aux root payload per header, persists
+  received roots with header-only ranges, and caps rootless header tips until
+  matching roots are available.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
