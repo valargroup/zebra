@@ -210,6 +210,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   root block or reconsider the same invalidated block twice.
 - Prevent read-only state opens from creating cache directories, reusing older
   database directories, or silently creating a missing finalized database.
+- Compare RPC authentication cookies in constant time after checking their
+  length.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so
