@@ -428,26 +428,21 @@ impl NonFinalizedState {
     ) -> Result<Vec<block::Hash>, ReconsiderError> {
         // Keep the invalidation record live until replay succeeds, so a
         // recoverable error can't lose it.
-        let (height, invalidated_blocks) = self
+        let (height, blocks) = self
             .invalidated_blocks
             .iter()
             .find_map(|(height, blocks)| {
                 if blocks.first()?.hash == block_hash {
-                    Some((*height, (**blocks).clone()))
+                    Some((*height, Arc::clone(blocks)))
                 } else {
                     None
                 }
             })
             .ok_or(ReconsiderError::MissingInvalidatedBlock(block_hash))?;
 
-        let invalidated_block_hashes = invalidated_blocks
-            .iter()
-            .map(|block| block.hash)
-            .collect::<Vec<_>>();
-
         // Find and fork the parent chain of the invalidated_root. Update the parent chain
         // with the invalidated_descendants
-        let invalidated_root = invalidated_blocks
+        let invalidated_root = blocks
             .first()
             .ok_or(ReconsiderError::InvalidatedBlocksEmpty)?;
 
@@ -475,6 +470,12 @@ impl NonFinalizedState {
             self.parent_chain(root_parent_hash)
                 .map_err(|_| ReconsiderError::ParentChainNotFound(block_hash))?
         };
+
+        let invalidated_blocks = blocks.as_ref().clone();
+        let invalidated_block_hashes = invalidated_blocks
+            .iter()
+            .map(|block| block.hash)
+            .collect::<Vec<_>>();
 
         let mut modified_chain = Arc::unwrap_or_clone(chain_result);
         for block in invalidated_blocks {
