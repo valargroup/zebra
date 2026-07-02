@@ -282,7 +282,20 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
     let mut fast = PeerSpec::fast(2, half);
     fast.servable_high = half;
 
-    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, retry_config(), vec![dropping, fast]);
+    // A dropped probe must not shed the only upper-half carrier: with the default
+    // one-probe budget, schedulings where the carrier's first request is dropped wedge
+    // it at `InitialBlockProbeRequestCap`, liveness then parks and disconnects it
+    // (`rejects=1`), and — since fuzz peers never reconnect — the sync stalls at the
+    // fast peer's ceiling. The probe-shed policy is covered by
+    // `fuzz_silent_peer_request_cap`; this test is about the reliability discount, so
+    // give the unproven carrier enough probe budget to survive its 30% drop rate under
+    // any scheduling.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 8,
+        ..retry_config()
+    };
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, config, vec![dropping, fast]);
     scenario.deadline = Duration::from_secs(90);
     let (_, report) =
         run_checked("fuzz_reliability_discounts_dropping_carrier", scenario, 32).await;
