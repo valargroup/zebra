@@ -1,14 +1,5 @@
 //! Payload types and the producer/serving half of the verified-commitment-trees
-//! fast path (`docs/design/verified-commitment-trees.md`).
-//!
-//! The fast path consumes per-block Sapling/Orchard roots and a final frontier at the
-//! last checkpoint. This module provides the **producer** half
-//! ([`produce_block_roots`] / [`produce_final_frontiers`]): deriving that payload from
-//! an existing database's per-height trees.
-//!
-//! [`serve_block_roots`] is the serving entry point: it stitches the
-//! `commitment_roots_by_height` index with the per-height trees at the upgrade height,
-//! so upgraded and fast-synced nodes keep serving one gap-free `tree_aux` payload.
+//! (`docs/design/verified-commitment-trees.md`).
 
 use std::{fmt, sync::Arc};
 
@@ -389,7 +380,282 @@ pub fn produce_final_frontiers_bytes(
 
 #[cfg(test)]
 mod tests {
+    use zebra_chain::{ironwood, parameters::Network};
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::{
+            disk_db::WriteDisk, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
+        Config,
+    };
+
     use super::*;
+
+    fn ephemeral_mainnet_db() -> ZebraDb {
+        let network = Network::Mainnet;
+        ZebraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+    }
+
+    fn sapling_note_commitment(value: u64) -> sapling::tree::NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<sapling::tree::NoteCommitmentUpdate>::from(
+            sapling::tree::NoteCommitmentUpdate::from_bytes(&bytes),
+        )
+        .expect("small little-endian integers are canonical Jubjub field elements")
+    }
+
+    fn sapling_tree(value: u64) -> sapling::tree::NoteCommitmentTree {
+        let mut tree = sapling::tree::NoteCommitmentTree::default();
+        tree.append(sapling_note_commitment(value))
+            .expect("single-note Sapling tree is not full");
+        tree
+    }
+
+    fn orchard_tree(value: u64) -> orchard::tree::NoteCommitmentTree {
+        let mut tree = orchard::tree::NoteCommitmentTree::default();
+        tree.append(halo2::pasta::pallas::Base::from(value))
+            .expect("single-note Orchard tree is not full");
+        tree
+    }
+
+    fn seed_trees(db: &ZebraDb, heights: impl IntoIterator<Item = u32>) {
+        let mut batch = DiskWriteBatch::new();
+        for height in heights {
+            let height = block::Height(height);
+            batch.create_sapling_tree(db, &height, &sapling_tree(u64::from(height.0)));
+            batch.create_orchard_tree(db, &height, &orchard_tree(u64::from(height.0)));
+        }
+        db.write_batch(batch).expect("seeding trees succeeds");
+    }
+
+    fn seed_sprout_tree(db: &ZebraDb, tree: &sprout::tree::NoteCommitmentTree) {
+        let mut batch = DiskWriteBatch::new();
+        batch.update_sprout_tree(db, tree);
+        db.write_batch(batch).expect("seeding Sprout tree succeeds");
+    }
+
+    fn seed_finalized_tip(db: &ZebraDb, height: block::Height) {
+        let hash_by_height = db.db().cf_handle("hash_by_height").unwrap();
+        let height_byte =
+            u8::try_from(height.0).expect("test heights fit in a byte for hash fixtures");
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&hash_by_height, height, block::Hash([height_byte; 32]));
+        db.write_batch(batch)
+            .expect("seeding finalized tip succeeds");
+    }
+
+    fn seed_index_roots(db: &ZebraDb, heights: impl IntoIterator<Item = u32>) {
+        let mut batch = DiskWriteBatch::new();
+        for height in heights {
+            let height_byte =
+                u8::try_from(height).expect("test heights fit in a byte for auth root fixtures");
+            batch.insert_commitment_roots_by_height(
+                db,
+                block::Height(height),
+                &sapling_tree(u64::from(height) + 100).root(),
+                &orchard_tree(u64::from(height) + 100).root(),
+                &ironwood::tree::NoteCommitmentTree::default().root(),
+                u64::from(height),
+                u64::from(height) + 1,
+                u64::from(height) + 2,
+                &AuthDataRoot::from([height_byte; 32]),
+            );
+        }
+        db.write_batch(batch)
+            .expect("seeding commitment root index succeeds");
+    }
+
+    fn set_upgrade_height(db: &ZebraDb, height: block::Height) {
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(db, height);
+        db.write_batch(batch)
+            .expect("seeding VCT upgrade marker succeeds");
+    }
+
+    fn expected_tree_roots(height: u32) -> BlockCommitmentRoots {
+        BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: sapling_tree(u64::from(height)).root(),
+            orchard_root: orchard_tree(u64::from(height)).root(),
+            ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+            auth_data_root: AuthDataRoot::from([0; 32]),
+        }
+    }
+
+    fn expected_index_roots(height: u32) -> BlockCommitmentRoots {
+        let height_byte =
+            u8::try_from(height).expect("test heights fit in a byte for auth root fixtures");
+        BlockCommitmentRoots {
+            height: block::Height(height),
+            sapling_root: sapling_tree(u64::from(height) + 100).root(),
+            orchard_root: orchard_tree(u64::from(height) + 100).root(),
+            ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: u64::from(height),
+            orchard_tx: u64::from(height) + 1,
+            ironwood_tx: u64::from(height) + 2,
+            auth_data_root: AuthDataRoot::from([height_byte; 32]),
+        }
+    }
+
+    #[test]
+    fn produce_block_roots_derives_contiguous_tree_roots() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [1, 2]);
+        seed_finalized_tip(&db, block::Height(2));
+
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(4));
+
+        assert_eq!(
+            roots,
+            vec![expected_tree_roots(1), expected_tree_roots(2)],
+            "tree-derived roots stop at the first missing height"
+        );
+    }
+
+    #[test]
+    fn serve_block_roots_without_upgrade_marker_uses_tree_fallback() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [1, 2]);
+        seed_index_roots(&db, [1, 2]);
+        seed_finalized_tip(&db, block::Height(2));
+
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(2));
+
+        assert_eq!(
+            roots,
+            vec![expected_tree_roots(1), expected_tree_roots(2)],
+            "pre-index archive databases derive roots from per-height trees"
+        );
+    }
+
+    #[test]
+    fn serve_block_roots_stitches_trees_to_index_at_upgrade() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [1, 2]);
+        seed_index_roots(&db, [3, 4]);
+        seed_finalized_tip(&db, block::Height(4));
+        set_upgrade_height(&db, block::Height(3));
+
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+
+        assert_eq!(
+            roots,
+            vec![
+                expected_tree_roots(1),
+                expected_tree_roots(2),
+                expected_index_roots(3),
+                expected_index_roots(4),
+            ],
+            "ranges crossing U are served as one contiguous tree/index run"
+        );
+    }
+
+    #[test]
+    fn serve_block_roots_does_not_cross_short_tree_prefix_below_upgrade() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [1]);
+        seed_index_roots(&db, [3, 4]);
+        seed_finalized_tip(&db, block::Height(1));
+        set_upgrade_height(&db, block::Height(3));
+
+        let roots = serve_block_roots(&db, block::Height(1)..=block::Height(4));
+
+        assert_eq!(
+            roots,
+            vec![expected_tree_roots(1)],
+            "a short tree-derived prefix below U is not extended with index rows"
+        );
+    }
+
+    #[test]
+    fn serve_block_roots_at_or_above_upgrade_uses_index() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [3, 4]);
+        seed_index_roots(&db, [3, 4]);
+        seed_finalized_tip(&db, block::Height(4));
+        set_upgrade_height(&db, block::Height(3));
+
+        let roots = serve_block_roots(&db, block::Height(3)..=block::Height(4));
+
+        assert_eq!(
+            roots,
+            vec![expected_index_roots(3), expected_index_roots(4)],
+            "requests at or above U are served from the compact index"
+        );
+    }
+
+    #[test]
+    fn produce_final_frontiers_reads_requested_trees_and_tip_sprout() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        let sprout = sprout::tree::NoteCommitmentTree::default();
+        seed_trees(&db, [2]);
+        seed_sprout_tree(&db, &sprout);
+        seed_finalized_tip(&db, height);
+
+        let frontiers =
+            produce_final_frontiers(&db, height).expect("seeded frontiers should be produced");
+
+        assert_eq!(frontiers.height, height);
+        assert_eq!(frontiers.sapling.root(), sapling_tree(2).root());
+        assert_eq!(frontiers.orchard.root(), orchard_tree(2).root());
+        assert_eq!(frontiers.sprout.root(), sprout.root());
+    }
+
+    #[test]
+    fn produce_final_frontiers_reports_missing_trees() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+
+        assert_eq!(
+            produce_final_frontiers(&db, height).expect_err("Sapling absence is reported first"),
+            FinalFrontiersGenerationError::MissingSaplingTree { height },
+        );
+    }
+
+    #[test]
+    fn produce_final_frontiers_bytes_serializes_generated_frontiers() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        seed_trees(&db, [2]);
+        seed_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        seed_finalized_tip(&db, height);
+
+        let frontiers =
+            produce_final_frontiers(&db, height).expect("seeded frontiers should be produced");
+        let bytes = produce_final_frontiers_bytes(&db, height)
+            .expect("seeded frontiers should serialize to bytes");
+
+        assert_eq!(
+            bytes,
+            frontiers.to_bytes(),
+            "public byte producer serializes the generated final frontiers"
+        );
+    }
 
     /// The final-frontier serialization round-trips: parsed frontiers carry the same
     /// height and tree roots as the originals.
@@ -420,6 +686,53 @@ mod tests {
             parsed.sprout.root(),
             frontiers.sprout.root(),
             "sprout frontier round-trips"
+        );
+    }
+
+    #[test]
+    fn final_frontiers_bytes_reject_malformed_payloads() {
+        assert_eq!(
+            FinalFrontiers::from_bytes(&[0, 0, 0]).expect_err("short height is rejected"),
+            FinalFrontiersParseError::MissingHeight { actual_len: 3 }
+        );
+
+        assert_eq!(
+            FinalFrontiers::from_bytes(&block::Height(1).0.to_le_bytes())
+                .expect_err("missing first length prefix is rejected"),
+            FinalFrontiersParseError::MissingLength {
+                tree: "sapling",
+                offset: 4,
+                remaining: 0,
+            }
+        );
+
+        let mut truncated = block::Height(1).0.to_le_bytes().to_vec();
+        truncated.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            FinalFrontiers::from_bytes(&truncated).expect_err("truncated first blob is rejected"),
+            FinalFrontiersParseError::TruncatedBlob {
+                tree: "sapling",
+                offset: 8,
+                expected_len: 1,
+                remaining: 0,
+            }
+        );
+
+        let frontiers = FinalFrontiers {
+            height: block::Height(1_687_200),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        };
+        let mut trailing = frontiers.to_bytes();
+        trailing.push(0);
+
+        assert_eq!(
+            FinalFrontiers::from_bytes(&trailing).expect_err("trailing bytes are rejected"),
+            FinalFrontiersParseError::TrailingBytes {
+                offset: frontiers.to_bytes().len(),
+                trailing_len: 1,
+            }
         );
     }
 }
