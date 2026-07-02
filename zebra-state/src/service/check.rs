@@ -235,18 +235,8 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
                     "the history tree of the previous block must exist \
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
-            let auth_data_root = block.auth_data_root();
-            if let Some(precomputed_auth_data_root) = precomputed_auth_data_root {
-                if precomputed_auth_data_root != auth_data_root {
-                    return Err(ValidateContextError::InvalidBlockCommitment(
-                        CommitmentError::InvalidAuthDataRoot {
-                            actual: precomputed_auth_data_root.into(),
-                            expected: auth_data_root.into(),
-                        },
-                    ));
-                }
-            }
-
+            let auth_data_root =
+                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,
