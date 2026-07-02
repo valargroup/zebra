@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (so a slow peer whose probe timed out but that then delivered is kept), a
   destructive view reset clears the probe streak (so an unproven peer whose only
   probe was in flight at the reset can probe again rather than wedging), and a
-  would-be liveness disconnect caused by *transient* local outbound backpressure
+  would-be liveness disconnect caused by _transient_ local outbound backpressure
   is briefly deferred (see the bounded grace below).
 - Zakura block-sync BBR now folds per-peer reliability into the cwnd. Vanilla BBR
   ignores request failures, but a dropped block-sync request is expensive (it can
@@ -93,7 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops turning requests into bodies (the discount is applied after, not floored at,
   the minimum window). This is a fast-acting seal — a sealed peer receives no new work,
   and the generous no-progress liveness timer then decides whether it is actually dead.
-  A peer that is merely *slow but still delivering* is never sealed: a body that arrives
+  A peer that is merely _slow but still delivering_ is never sealed: a body that arrives
   late (after its own request already timed out) credits its reliability back, offsetting
   the timeout charge, so a sudden-bandwidth-drop peer keeps a reduced-but-nonzero window
   (kept, weaker) instead of being cut off.
@@ -114,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The block-sync liveness disconnect is now **bounded**: a peer that stops reading our
   stream backs our outbound queue up and holds it full, and the previous escape
   (`outbound_capacity() == 0` → extend the deadline) treated that as our own write
-  congestion and extended *indefinitely*, so a wedged, non-reading peer was never
+  congestion and extended _indefinitely_, so a wedged, non-reading peer was never
   disconnected by the application (it survived until the ~150 s transport idle timeout)
   while we kept queuing requests it never read. The grace is now granted only while the
   outbound queue has been continuously full for less than `request_timeout` (genuinely

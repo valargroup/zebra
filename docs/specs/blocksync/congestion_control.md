@@ -30,26 +30,26 @@ Plain term (code identifier):
 - **ProbeBw / ProbeRtt** — steady state (window ≈ BDP) / brief drain to re-measure RTprop.
 - **Delay gradient** — round-trip risen above base by more than a set ratio; a forming queue.
 - **Floor** — lowest height still needed (commit can't pass it); a slow floor carrier
-  gets the height *rescued* to a faster peer.
+  gets the height _rescued_ to a faster peer.
 
 ## Measured signals (per peer)
 
-Windowed min/max signals MUST be filtered against the clock at *read* time, not just
+Windowed min/max signals MUST be filtered against the clock at _read_ time, not just
 pruned on insert — else a peer that went fast then stalled keeps advertising a stale-low
 round-trip / stale-high BDR and still looks like a fast floor server.
 
-- **Base round-trip** — windowed *min* of raw request round-trip (`bbr_rtprop_window`,
+- **Base round-trip** — windowed _min_ of raw request round-trip (`bbr_rtprop_window`,
   10 s); never zero.
-- **BDR** — windowed *max* of per-response delivery rate (`bbr_delivery_rate_window`, 10 s).
+- **BDR** — windowed _max_ of per-response delivery rate (`bbr_delivery_rate_window`, 10 s).
 - **BDP** = `BDR × base round-trip`; window target =
   `max(min window, BDP × gain × reliability_factor)`, `gain = 300%`.
 - **Delay gradient** — smoothed round-trip vs a size-aware baseline
   (`base round-trip + bytes/BDR`).
-- **Reliability** — per-peer EWMA of *goodput*: the fraction of issued requests that
+- **Reliability** — per-peer EWMA of _goodput_: the fraction of issued requests that
   deliver a body (α = 0.1, starts at 1.0). It falls on every non-delivery — a timeout
-  *and* the missing heights of a short response (`BlocksDone`/`RangeUnavailable`) — so a
+  _and_ the missing heights of a short response (`BlocksDone`/`RangeUnavailable`) — so a
   peer can't serve one body per request to reset its liveness while dropping the rest of
-  each range. A *late* body (arriving after its request timed out) credits reliability
+  each range. A _late_ body (arriving after its request timed out) credits reliability
   back. Min/max filters see only completed requests; reliability is the drop signal.
 
 Admission compares a peer's **reserved body bytes** against its window.
@@ -76,7 +76,7 @@ Admission compares a peer's **reserved body bytes** against its window.
   (`weight = bbr_reliability_weight_percent ÷ 100`; default 100% ⇒ factor = reliability,
   `0` = plain BBR). A dropped request is expensive — it can stall the floor for a whole
   timeout — so a carrier delivering `r` of its requests holds `r ×` the window. Applied
-  *after* the minimum-window floor, it MAY ramp the window to zero — the fast seal on a
+  _after_ the minimum-window floor, it MAY ramp the window to zero — the fast seal on a
   peer that stops delivering (see [wedged vs slow](#wedged-vs-slow)). Being an EWMA it
   self-heals as the peer recovers.
 
@@ -116,7 +116,7 @@ slow carrier must not pin it.
   hints MUST NOT exceed the per-block worst case.
 - The request-count cap (≤ `MAX_BS_INFLIGHT_REQUESTS = 32 768`) MUST bind even with byte
   headroom, so tiny bodies can't buy an unbounded request count.
-- A reservation MUST be bounded by *remaining* window bytes (window − reserved, plus the
+- A reservation MUST be bounded by _remaining_ window bytes (window − reserved, plus the
   floor bypass), so a small window can't fund a large multi-body request — except the
   single always-taken item that guarantees floor progress.
 - The reorder look-ahead and the serving-request heap MUST be bounded.
