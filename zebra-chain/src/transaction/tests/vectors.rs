@@ -1625,7 +1625,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
 /// small-order `cv`/`epk`) and the safety net (`to_librustzcash` rejects the
 /// small-order `cv`; the small-order `epk` is flagged by the verifier's check).
 #[test]
-fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
+fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash_v5_regression() {
     use group::Group;
 
     use crate::{
@@ -1756,7 +1756,7 @@ fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
 /// - Sapling `rk` was not made lazy, so a small-order `rk` is still rejected at
 ///   deserialization.
 #[test]
-fn sapling_lazy_cv_epk_edge_cases() {
+fn sapling_lazy_cv_epk_edge_cases_v5_regression() {
     use group::Group;
 
     use crate::{
@@ -1886,7 +1886,7 @@ fn sapling_lazy_cv_epk_edge_cases() {
 /// verification it is isolated, so we can exercise it directly: it rejects a
 /// small-order or off-curve `cv` and `epk`, and accepts valid points.
 #[test]
-fn sapling_point_encodings_check_rejects_bad_points() {
+fn sapling_point_encodings_check_rejects_bad_points_v5_regression() {
     use group::Group;
 
     use crate::{
@@ -2008,7 +2008,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 ///   rejects it when `epk.is_small_order()`. Zebra decodes as an `AffinePoint`, so
 ///   this also guards that the two decoders agree.
 #[test]
-fn sapling_point_checks_match_librustzcash_predicates() {
+fn sapling_point_checks_match_librustzcash_predicates_v5_regression() {
     use group::{Group, GroupEncoding};
 
     use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
@@ -2054,6 +2054,481 @@ fn sapling_point_checks_match_librustzcash_predicates() {
     // Guard against a vacuous comparison: the corpus must contain both accepted
     // and rejected encodings, otherwise an all-accept or all-reject bug could
     // pass the equivalence assertion below.
+    assert!(
+        inputs.iter().any(|&b| librustzcash_cv_valid(b))
+            && inputs.iter().any(|&b| !librustzcash_cv_valid(b)),
+        "cv corpus must contain both accepted and rejected encodings",
+    );
+    assert!(
+        inputs.iter().any(|&b| librustzcash_epk_valid(b))
+            && inputs.iter().any(|&b| !librustzcash_epk_valid(b)),
+        "epk corpus must contain both accepted and rejected encodings",
+    );
+
+    for bytes in inputs {
+        assert_eq!(
+            ValueCommitment(bytes).is_valid_not_small_order(),
+            librustzcash_cv_valid(bytes),
+            "ValueCommitment::is_valid_not_small_order must match librustzcash \
+             read_value_commitment for {bytes:02x?}",
+        );
+        assert_eq!(
+            EphemeralPublicKey(bytes).is_valid_not_small_order(),
+            librustzcash_epk_valid(bytes),
+            "EphemeralPublicKey::is_valid_not_small_order must match librustzcash \
+             check_output for {bytes:02x?}",
+        );
+    }
+}
+
+/// Validates that lazy Sapling `cv` / `ephemeral_key` deserialization stays
+/// consensus-safe.
+///
+/// To keep the Jubjub point decompression (a field square root) off the
+/// checkpoint-sync hot path, `cv` and `ephemeral_key` are now stored as raw
+/// bytes and the not-small-order consensus check is deferred. This is safe
+/// because every *untrusted* transaction (semantic block verification, the
+/// mempool, and `sendrawtransaction`) is converted via `to_librustzcash`
+/// (`CachedFfiTransaction::new`) before it is accepted, and librustzcash
+/// independently enforces the same rules:
+///
+/// - `cv`: rejected at *read* — `zcash_primitives`'s `read_value_commitment`
+///   uses `ValueCommitment::from_bytes_not_small_order`, so `to_librustzcash`
+///   fails on a small-order `cv`.
+/// - `ephemeral_key`: rejected at *verify* — `SaplingVerificationContext::
+///   check_output` (sapling-crypto `verifier.rs`) checks `epk.is_small_order()`.
+///
+/// The checkpoint verifier does not need these checks: it trusts block hashes,
+/// and a malicious block with a small-order point either fails its checkpoint
+/// hash or the header merkle root.
+///
+/// This test asserts the deferral (Zebra now *accepts* a small-order `cv`/`epk`
+/// at deserialization) and the safety net (`to_librustzcash` *rejects* the
+/// small-order `cv`, and the small-order `epk` is detectably small-order, which
+/// is what the Sapling verifier checks).
+#[test]
+fn sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::EphemeralPublicKey,
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        serialization::{ZcashDeserializeInto, ZcashSerialize},
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    // The Jubjub identity point is a valid encoding, but it is small order
+    // (order 1), so the not-small-order consensus check must reject it.
+    let small_order_bytes = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
+
+    // These are the exact library functions the semantic/mempool path uses, so
+    // they must detect the small-order point.
+    assert!(
+        bool::from(
+            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&small_order_bytes)
+                .is_none()
+        ),
+        "from_bytes_not_small_order (used by librustzcash read_value_commitment) must reject \
+         the small-order cv",
+    );
+    assert!(
+        bool::from(
+            jubjub::AffinePoint::from_bytes(small_order_bytes)
+                .unwrap()
+                .is_small_order()
+        ),
+        "is_small_order (used by the Sapling verifier check_output) must flag the small-order epk",
+    );
+
+    // A valid, non-small-order point (the Jubjub generator), used to isolate the
+    // `epk` case from the `cv` case below.
+    let valid_cv_bytes = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    assert!(
+        bool::from(
+            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&valid_cv_bytes)
+                .is_some()
+        ),
+        "the Jubjub generator is a valid non-small-order cv",
+    );
+
+    // Build a minimal V5 transaction with one Sapling output with the given cv
+    // and ephemeral_key bytes, round-trip it through Zebra's (now lazy)
+    // deserializer, and return whether `to_librustzcash` accepts it.
+    let build_and_convert = |cv_bytes: [u8; 32], epk_bytes: [u8; 32]| -> bool {
+        let output = Output {
+            cv: ValueCommitment(cv_bytes),
+            cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
+            ephemeral_key: EphemeralPublicKey(epk_bytes),
+            enc_ciphertext: EncryptedNote([0u8; 580]),
+            out_ciphertext: WrappedNoteKey([0u8; 80]),
+            zkproof: Groth16Proof([0u8; 192]),
+        };
+
+        let shielded_data: ShieldedData<sapling::SharedAnchor> = ShieldedData {
+            value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+            transfers: TransferData::JustOutputs {
+                outputs: at_least_one![output],
+            },
+            binding_sig: Signature::<Binding>::from([0u8; 64]),
+        };
+
+        let tx = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(shielded_data),
+            orchard_shielded_data: None,
+        };
+
+        let bytes = tx
+            .zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize");
+
+        // Deferral: Zebra now accepts a small-order cv/epk at deserialization
+        // (the not-small-order check no longer runs here).
+        let tx: Transaction = bytes
+            .zcash_deserialize_into()
+            .expect("lazy deserialization accepts a small-order cv/epk; validation is deferred");
+
+        tx.to_librustzcash(NetworkUpgrade::Nu5).is_ok()
+    };
+
+    // cv is enforced at *read*: `read_value_commitment` uses
+    // `from_bytes_not_small_order`, so `to_librustzcash` (run for every untrusted
+    // transaction via `CachedFfiTransaction::new`) rejects a small-order cv.
+    assert!(
+        !build_and_convert(small_order_bytes, valid_cv_bytes),
+        "to_librustzcash must reject a small-order Sapling cv at read",
+    );
+
+    // epk is enforced at *verify*, not at read: a small-order epk (with a valid
+    // cv) passes `to_librustzcash`, then the Sapling verifier's `check_output`
+    // rejects it via `epk.is_small_order()` (asserted above). This locates the
+    // enforcement at the verifier, which `verify_sapling_bundle` invokes for
+    // every untrusted transaction.
+    //
+    // A fully isolated end-to-end verifier test is intentionally omitted: mutating
+    // epk also changes the SigHash (breaking the binding signature) and the
+    // output proof cannot be forged without proving keys, so any consensus-level
+    // rejection would be confounded. The `is_small_order` assertion above checks
+    // the exact, unchanged librustzcash code path that performs the rejection.
+    assert!(
+        build_and_convert(valid_cv_bytes, small_order_bytes),
+        "to_librustzcash must accept a small-order epk (it is enforced at verify, not read)",
+    );
+}
+
+/// Edge cases for the lazy Sapling `cv` / `ephemeral_key` deserialization.
+///
+/// Beyond the small-order case, this validates:
+/// - an off-curve / non-canonical `cv` is also rejected by `to_librustzcash`, so
+///   the safety net covers every invalid encoding, not just small-order points;
+/// - an off-curve / non-canonical `ephemeral_key` is detectably invalid (the
+///   Sapling verifier decompresses `epk`, which fails for an off-curve point);
+/// - the lazy types preserve the encoding byte-for-byte through a
+///   serialize/deserialize round-trip — the txid and block merkle root hash these
+///   bytes, so any change would be consensus-breaking;
+/// - `cv.commitment()` decompresses a valid encoding back to the same point;
+/// - Sapling `rk` (`ValidatingKey`) is still validated at deserialization — it
+///   was not made lazy, so a small-order `rk` is still rejected at read.
+#[test]
+fn sapling_lazy_cv_epk_edge_cases() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::{EphemeralPublicKey, ValidatingKey},
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        serialization::{ZcashDeserializeInto, ZcashSerialize},
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    // A non-canonical / off-curve 32-byte value: not a valid Jubjub point.
+    let off_curve = [0xffu8; 32];
+    assert!(
+        bool::from(jubjub::AffinePoint::from_bytes(off_curve).is_none()),
+        "0xff..ff must not be a valid Jubjub point encoding",
+    );
+    let valid_cv = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
+
+    let make_v5 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+        let output = Output {
+            cv: ValueCommitment(cv),
+            cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
+            ephemeral_key: EphemeralPublicKey(epk),
+            enc_ciphertext: EncryptedNote([0u8; 580]),
+            out_ciphertext: WrappedNoteKey([0u8; 80]),
+            zkproof: Groth16Proof([0u8; 192]),
+        };
+        Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::JustOutputs {
+                    outputs: at_least_one![output],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+            orchard_shielded_data: None,
+        }
+    };
+
+    // An off-curve cv is rejected by to_librustzcash, covering invalid encodings
+    // that are not small-order.
+    let tx_off_curve_cv: Transaction = make_v5(off_curve, valid_cv)
+        .zcash_serialize_to_vec()
+        .expect("serializes")
+        .zcash_deserialize_into()
+        .expect("lazy deserialization accepts an off-curve cv");
+    assert!(
+        tx_off_curve_cv
+            .to_librustzcash(NetworkUpgrade::Nu5)
+            .is_err(),
+        "to_librustzcash must reject an off-curve cv",
+    );
+
+    // Byte-identity: arbitrary (here non-canonical) cv/epk bytes survive a
+    // serialize -> deserialize -> serialize round-trip unchanged, so the txid and
+    // merkle root computed from them are unaffected by the lazy representation.
+    let bytes_in = make_v5(off_curve, off_curve)
+        .zcash_serialize_to_vec()
+        .expect("serializes");
+    let tx_round: Transaction = bytes_in
+        .clone()
+        .zcash_deserialize_into()
+        .expect("round-trips");
+    let bytes_out = tx_round.zcash_serialize_to_vec().expect("re-serializes");
+    assert_eq!(
+        bytes_in, bytes_out,
+        "lazy cv/epk must round-trip byte-for-byte",
+    );
+    match &tx_round {
+        Transaction::V5 {
+            sapling_shielded_data: Some(sd),
+            ..
+        } => {
+            let out = sd.outputs().next().expect("one output");
+            assert_eq!(out.cv.0, off_curve, "cv bytes preserved exactly");
+            assert_eq!(
+                out.ephemeral_key.0, off_curve,
+                "epk bytes preserved exactly"
+            );
+        }
+        _ => panic!("expected a V5 transaction with Sapling data"),
+    }
+
+    // `commitment()` decompresses a valid encoding to the same point.
+    assert_eq!(
+        ValueCommitment(valid_cv)
+            .commitment()
+            .expect("the generator is a valid value commitment")
+            .to_bytes(),
+        valid_cv,
+        "commitment() must round-trip a valid value commitment",
+    );
+
+    // `rk` was not made lazy: a small-order rk is still rejected at deserialization
+    // (`SpendPrefixInTransactionV5` reads it via `ValidatingKey::try_from`).
+    assert!(
+        ValidatingKey::try_from(small_order).is_err(),
+        "Sapling rk must still reject a small-order point at deserialization",
+    );
+}
+
+/// The explicit Sapling cv/epk not-small-order check used by the semantic
+/// verifier rejects bad points.
+///
+/// `Transaction::sapling_point_encodings_are_valid` is the deferred check,
+/// relocated from deserialization to the semantic verification path (it is what
+/// `Verifier::verify_v4_transaction` / `verify_v5_transaction` call, returning
+/// `TransactionError::SmallOrder` on failure). Unlike the proof/binding-signature
+/// verification, this check is isolated, so it can be exercised directly: it
+/// rejects a small-order or off-curve `cv` *and* a small-order or off-curve
+/// `epk`, and accepts valid points. The checkpoint verifier never calls it.
+#[test]
+fn sapling_point_encodings_check_rejects_bad_points() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::EphemeralPublicKey,
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let small_order = jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes();
+    let off_curve = [0xffu8; 32];
+
+    let make = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+        let output = Output {
+            cv: ValueCommitment(cv),
+            cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32]).unwrap(),
+            ephemeral_key: EphemeralPublicKey(epk),
+            enc_ciphertext: EncryptedNote([0u8; 580]),
+            out_ciphertext: WrappedNoteKey([0u8; 80]),
+            zkproof: Groth16Proof([0u8; 192]),
+        };
+        Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(ShieldedData::<sapling::SharedAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::JustOutputs {
+                    outputs: at_least_one![output],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+            orchard_shielded_data: None,
+        }
+    };
+
+    // Valid points pass (a dummy proof/binding sig does not affect this check).
+    assert!(
+        make(valid, valid).sapling_point_encodings_are_valid(),
+        "valid cv/epk must pass the encoding check",
+    );
+
+    // A small-order cv is rejected.
+    assert!(
+        !make(small_order, valid).sapling_point_encodings_are_valid(),
+        "small-order cv must be rejected",
+    );
+
+    // A small-order epk is rejected. This is the isolated, executable proof of
+    // the epk rejection: the check runs independently of proof verification.
+    assert!(
+        !make(valid, small_order).sapling_point_encodings_are_valid(),
+        "small-order epk must be rejected",
+    );
+
+    // Off-curve / non-canonical encodings are rejected for both fields.
+    assert!(
+        !make(off_curve, valid).sapling_point_encodings_are_valid(),
+        "off-curve cv must be rejected",
+    );
+    assert!(
+        !make(valid, off_curve).sapling_point_encodings_are_valid(),
+        "off-curve epk must be rejected",
+    );
+}
+
+/// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
+/// same encodings as the librustzcash functions they mirror.
+///
+/// The consensus check was moved off the deserialization path into
+/// `ValueCommitment::is_valid_not_small_order` and
+/// `EphemeralPublicKey::is_valid_not_small_order`. If either ever diverged from
+/// what librustzcash enforces at the FFI boundary, Zebra would accept or reject a
+/// transaction that the rest of the network does not — a chain split, not a local
+/// bug. This pins each Zebra predicate against the exact library predicate, over a
+/// corpus that covers both verdicts:
+///
+/// - `cv`: `zcash_primitives`'s `read_value_commitment` accepts a `cv` iff
+///   `sapling_crypto::value::ValueCommitment::from_bytes_not_small_order` returns
+///   a point.
+/// - `epk`: sapling-crypto decodes `epk` via `jubjub::ExtendedPoint::from_bytes`
+///   (`verifier/batch.rs`) and `check_output` rejects it when
+///   `epk.is_small_order()` (`verifier.rs`). Zebra decodes as an `AffinePoint`, so
+///   this also guards that the two decoders agree across the input space.
+#[test]
+fn sapling_point_checks_match_librustzcash_predicates() {
+    use group::{Group, GroupEncoding};
+
+    use crate::sapling::{keys::EphemeralPublicKey, ValueCommitment};
+
+    let _init_guard = zebra_test::init();
+
+    // The exact predicate librustzcash applies to a `cv` at read.
+    let librustzcash_cv_valid = |bytes: [u8; 32]| -> bool {
+        bool::from(
+            sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes).is_some(),
+        )
+    };
+
+    // The exact predicate librustzcash applies to an `epk`: decode as an
+    // `ExtendedPoint` (as sapling-crypto's batch verifier does), then reject a
+    // small-order point (as `check_output` does).
+    let librustzcash_epk_valid = |bytes: [u8; 32]| -> bool {
+        match jubjub::ExtendedPoint::from_bytes(&bytes).into_option() {
+            Some(point) => !bool::from(point.is_small_order()),
+            None => false,
+        }
+    };
+
+    // A representative spread of encodings: the three consensus-relevant classes
+    // (valid non-small-order, valid small-order, off-curve/non-canonical), a
+    // deterministic byte-pattern sweep that mixes decodable and undecodable
+    // encodings, and many prime-order points `[k]·G` to exercise the accepting
+    // branch heavily.
+    let mut inputs: Vec<[u8; 32]> = vec![
+        jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes(),
+        jubjub::AffinePoint::from(jubjub::ExtendedPoint::identity()).to_bytes(),
+        [0xffu8; 32],
+        [0x00u8; 32],
+    ];
+    for b in 0u8..=255 {
+        inputs.push([b; 32]);
+    }
+    let mut acc = jubjub::ExtendedPoint::generator();
+    for _ in 0..64 {
+        inputs.push(jubjub::AffinePoint::from(acc).to_bytes());
+        acc += jubjub::ExtendedPoint::generator();
+    }
+
+    // Guard against a vacuous comparison: the corpus must contain both accepted
+    // and rejected encodings for each predicate, otherwise an all-accept or
+    // all-reject bug could pass the equivalence assertion below.
     assert!(
         inputs.iter().any(|&b| librustzcash_cv_valid(b))
             && inputs.iter().any(|&b| !librustzcash_cv_valid(b)),

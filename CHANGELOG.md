@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Skip the redundant librustzcash convertibility re-check when deserializing V5
+  transactions. That check re-runs the full conversion — decompressing every
+  Jubjub/Pallas curve point — on every block and is the dominant CPU cost of the
+  checkpoint-sync deserialize path. It is redundant: the not-small-order rule is
+  still enforced for untrusted transactions by the semantic verifier and mempool
+  (which convert via `CachedFfiTransaction::new`), while pre-checkpoint blocks are
+  trusted by hash. Behaviour on the untrusted path is unchanged; new regression
+  tests cover the deferred small-order `cv`/`epk` cases.
 - Improve Zakura block-sync download scheduling for checkpoint sync. A
   byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
   per-peer admission control (`block_sync/admission.rs`) replace the previous

@@ -237,11 +237,12 @@ where
     /// Returns true if every value commitment and ephemeral public key in this
     /// bundle is a canonical, non-small-order Jubjub point.
     ///
-    /// These points are stored as raw bytes with their not-small-order check
-    /// deferred from deserialization, to keep point decompression off the
-    /// checkpoint-sync hot path. This runs that check for the semantic verifier;
-    /// the checkpoint verifier trusts block hashes and skips it. Spend `rk` is
-    /// validated separately at deserialization.
+    /// Deserialization stores these points as raw bytes and defers the
+    /// not-small-order check to keep point decompression off the checkpoint-sync
+    /// hot path. This method performs that deferred check; the semantic verifier
+    /// calls it for untrusted transactions, while the checkpoint verifier (which
+    /// trusts block hashes) does not. Spend `rk` is validated separately at
+    /// deserialization.
     pub fn point_encodings_are_valid(&self) -> bool {
         self.spends()
             .all(|spend| spend.cv.is_valid_not_small_order())

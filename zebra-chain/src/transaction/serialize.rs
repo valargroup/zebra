@@ -1153,6 +1153,16 @@ impl ZcashDeserialize for Transaction {
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
+                // Convertibility to the librustzcash transaction type is
+                // intentionally not re-checked here. That check re-runs the full
+                // conversion, which decompresses every Jubjub/Pallas curve point,
+                // on every block, and it is the dominant CPU cost of checkpoint
+                // sync. It is also redundant: untrusted transactions that are not
+                // convertible are still rejected by the semantic verifier, which
+                // converts every transaction via `CachedFfiTransaction::new`
+                // before accepting it, while blocks below the checkpoints are
+                // trusted by their hash (and validated against the header merkle
+                // root built from the transaction IDs).
                 Ok(Transaction::V5 {
                     network_upgrade,
                     lock_time,
