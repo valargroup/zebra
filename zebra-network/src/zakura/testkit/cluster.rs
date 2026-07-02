@@ -768,16 +768,12 @@ mod tests {
 
         async fn wait_for_body(&self, node: usize, hash: block::Hash) -> Result<(), BoxError> {
             let store = self.nodes[node].view.store.clone();
-            await_until(
-                "header-sync e2e body commit",
-                TEST_NET_TIMEOUT,
-                || {
-                    store
-                        .lock()
-                        .expect("test store mutex is not poisoned")
-                        .has_body(hash)
-                },
-            )
+            await_until("header-sync e2e body commit", TEST_NET_TIMEOUT, || {
+                store
+                    .lock()
+                    .expect("test store mutex is not poisoned")
+                    .has_body(hash)
+            })
             .await
             .map_err(Into::into)
         }
