@@ -73,7 +73,7 @@ impl NoteCommitmentTrees {
         &mut self,
         block: &Arc<Block>,
     ) -> Result<(), NoteCommitmentTreeError> {
-        self.update_trees_parallel_with(block, None)
+        self.update_trees_parallel_precompute(block, None)
     }
 
     /// Like [`update_trees_parallel`](Self::update_trees_parallel), but applies a
@@ -86,7 +86,7 @@ impl NoteCommitmentTrees {
     /// size-mismatched precompute transparently falls back to hashing inline, so the
     /// result is always identical to the plain update.
     #[allow(clippy::unwrap_in_result)]
-    pub fn update_trees_parallel_with(
+    pub fn update_trees_parallel_precompute(
         &mut self,
         block: &Arc<Block>,
         precompute: Option<BlockNotePrecompute>,
@@ -405,14 +405,14 @@ impl NoteCommitmentTrees {
 
 /// The off-committer precomputed parallel-append work for one block's Sapling,
 /// Orchard, and Ironwood note commitments, produced by [`BlockNotePrecompute::compute`]
-/// and applied via [`NoteCommitmentTrees::update_trees_parallel_with`].
+/// and applied via [`NoteCommitmentTrees::update_trees_parallel_precompute`].
 #[derive(Clone, Debug)]
 pub struct BlockNotePrecompute {
     /// The hash of the block this precompute was computed for. The committer
     /// applies the precompute only to this exact block, so a precompute that was
     /// accidentally paired with a different block (even one with the same starting
     /// tree size) is rejected instead of applying the wrong leaves. See
-    /// [`NoteCommitmentTrees::update_trees_parallel_with`].
+    /// [`NoteCommitmentTrees::update_trees_parallel_precompute`].
     pub(crate) block_hash: block::Hash,
     /// Precomputed Sapling append, if the block has Sapling outputs.
     pub(crate) sapling: Option<sapling::tree::PrecomputedAppendBatch>,
@@ -598,7 +598,7 @@ mod tests {
 
         let mut mismatched = NoteCommitmentTrees::default();
         mismatched
-            .update_trees_parallel_with(&block_a, Some(pre_b))
+            .update_trees_parallel_precompute(&block_a, Some(pre_b))
             .expect("update succeeds");
         assert_eq!(
             mismatched.sapling.root(),
@@ -610,7 +610,7 @@ mod tests {
         let pre_a = BlockNotePrecompute::compute(0, 0, 0, &block_a, &AtomicBool::new(false));
         let mut matched = NoteCommitmentTrees::default();
         matched
-            .update_trees_parallel_with(&block_a, Some(pre_a))
+            .update_trees_parallel_precompute(&block_a, Some(pre_a))
             .expect("update succeeds");
         assert_eq!(
             matched.sapling.root(),
