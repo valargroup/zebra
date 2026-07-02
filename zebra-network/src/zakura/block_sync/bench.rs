@@ -105,9 +105,7 @@ pub struct BenchSubmissions {
 pub struct BenchCommitter {
     control: mpsc::UnboundedSender<SequencerControlInput>,
     view: watch::Receiver<SequencerView>,
-    /// Bytes currently queued in the sequencer body-input channel; needed so the
-    /// snapshot row's `retained_pipeline_wire_bytes` matches the production
-    /// reactor's formula.
+    /// Bytes currently queued in the sequencer body-input channel
     body_input_bytes: Arc<AtomicU64>,
     // A clone of the sequencer's trace emitter, so the bench driver can write the
     // periodic `block_sync_state` snapshot rows the full reactor emits in production
