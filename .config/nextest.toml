@@ -32,7 +32,7 @@ filter = "not test(=trusted_chain_sync_handles_forks_correctly) and not test(=de
 # TODO: We need a better test architecture to run all non-stateful
 [profile.all-tests]
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~default_test_node_uses_production_per_ip_cap) and not test(~written_peer_cache_is_automatically_read_on_startup) and not test(~written_peer_cache_can_be_read_manually) and not test(~request_genesis_is_rate_limited) and not test(~ephemeral_existing_directory) and not test(~ephemeral_missing_directory) and not test(~terminate_child_kills_after_grace_period) and not test(~inv_registry_empty_ok) and not test(~mempool_transactions_are_sent_to_caller) and not test(~mempool_transaction_expiration) and not test(~chain_tip_sender_is_updated) and not test(~test_rpc_response_data) and not test(~rpc_getaddresstxids_response) and not test(~verifier_routes_each_network_upgrade_to_the_correct_key)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
 
 # The Zakura block-sync tests drive the real reactor through a real-time (wall-clock)
 # scenario harness — multi-threaded tokio with real sleeps and timeouts. Under a loaded
@@ -51,7 +51,7 @@ retries = 2
 # no-fail-fast without hiding fast unit failures.
 [profile.full-tests]
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~default_test_node_uses_production_per_ip_cap) and not test(~written_peer_cache_is_automatically_read_on_startup) and not test(~written_peer_cache_can_be_read_manually) and not test(~request_genesis_is_rate_limited) and not test(~ephemeral_existing_directory) and not test(~ephemeral_missing_directory) and not test(~terminate_child_kills_after_grace_period) and not test(~inv_registry_empty_ok) and not test(~mempool_transactions_are_sent_to_caller) and not test(~mempool_transaction_expiration) and not test(~chain_tip_sender_is_updated) and not test(~test_rpc_response_data) and not test(~rpc_getaddresstxids_response) and not test(~verifier_routes_each_network_upgrade_to_the_correct_key)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
 
 # Retry the real-time Zakura block-sync scenario tests under load (see the note on the
 # `all-tests` override above).
@@ -83,18 +83,6 @@ slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'package(zebra-network) and test(~zakura::testkit::blocksync_fuzz)'
 
-# Required, always-on lane for the known-slow unit/integration tests. It runs on
-# every PR in parallel with `all-tests`, so moving a slow test here keeps its PR
-# gating but pulls it off the broad unit lane's critical path. These are the
-# tests measured over ~20s in the 2026-07-02 unit log (fixed sleeps, production
-# intervals, background-updater waits, heavy proptest/fixture setup, or verifier
-# key init); they are slow, not skipped, and are expected to move back to
-# `all-tests` once their subsystem PRs make them fast/deterministic.
-[profile.slow-unit-tests]
-fail-fast = false
-slow-timeout = { period = "2m", terminate-after = 1 }
-failure-output = "immediate"
-default-filter = 'test(~default_test_node_uses_production_per_ip_cap) or test(~written_peer_cache_is_automatically_read_on_startup) or test(~written_peer_cache_can_be_read_manually) or test(~request_genesis_is_rate_limited) or test(~ephemeral_existing_directory) or test(~ephemeral_missing_directory) or test(~terminate_child_kills_after_grace_period) or test(~inv_registry_empty_ok) or test(~mempool_transactions_are_sent_to_caller) or test(~mempool_transaction_expiration) or test(~chain_tip_sender_is_updated) or test(~test_rpc_response_data) or test(~rpc_getaddresstxids_response) or test(~verifier_routes_each_network_upgrade_to_the_correct_key)'
 
 [profile.sync-large-checkpoints-empty]
 slow-timeout = { period = "60m", terminate-after = 2 }
