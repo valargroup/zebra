@@ -236,16 +236,6 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
     }
 }
 
-/// An [ephemeral public key][1] for Sapling key agreement.
-///
-/// Public keys containing points of small order are not allowed.
-///
-/// It is denoted by `epk` in the specification. (This type does _not_
-/// represent [KA^{Sapling}.Public][2], which allows any points, including
-/// of small order).
-///
-/// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
-/// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
 /// A Sapling ephemeral public key, stored as its canonical 32-byte encoding.
 ///
 /// The key is a Jubjub curve point, but the validator only ever needs its bytes
@@ -265,6 +255,12 @@ impl PartialEq<[u8; 32]> for TransmissionKey {
 /// (sapling-crypto `verifier.rs`, `epk.is_small_order()`). Validated by
 /// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
 /// `transaction/tests/vectors.rs`.
+///
+/// Its serialized form is [KA^{Sapling}.Public][2].
+///
+/// [1]: https://zips.z.cash/protocol/protocol.pdf#outputdesc
+/// [2]: https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
+/// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Copy, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct EphemeralPublicKey(pub(crate) [u8; 32]);
 
@@ -326,8 +322,11 @@ impl PartialEq<[u8; 32]> for EphemeralPublicKey {
 impl TryFrom<[u8; 32]> for EphemeralPublicKey {
     type Error = &'static str;
 
-    /// Store an EphemeralPublicKey from a byte array, deferring point
+    /// Store an `EphemeralPublicKey` from a byte array, deferring point
     /// decompression and the not-small-order check (see the type docs).
+    ///
+    /// This constructor is fallible only to match older call sites and trait
+    /// bounds; any 32-byte array is stored successfully.
     fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
         Ok(Self(bytes))
     }

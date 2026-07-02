@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use bincode::Options;
+use serde_big_array::BigArray;
 
 use zebra_chain::{
     amount::NonNegative,
@@ -53,7 +54,14 @@ pub struct HistoryTreeParts {
 impl HistoryTreeParts {
     /// Deserializes history tree parts from raw database bytes.
     pub(crate) fn from_bytes_result(bytes: impl AsRef<[u8]>) -> Result<Self, bincode::Error> {
-        bincode::DefaultOptions::new().deserialize(bytes.as_ref())
+        let bytes = bytes.as_ref();
+        let options = bincode::DefaultOptions::new();
+
+        options.deserialize::<HistoryTreeParts>(bytes).or_else(|_| {
+            options
+                .deserialize::<LegacyHistoryTreeParts>(bytes)
+                .map(HistoryTreeParts::from)
+        })
     }
 
     /// Converts [`HistoryTreeParts`] to a [`NonEmptyHistoryTree`].
@@ -89,6 +97,46 @@ impl IntoDisk for HistoryTreeParts {
         bincode::DefaultOptions::new()
             .serialize(self)
             .expect("serialization to vec doesn't fail")
+    }
+}
+
+/// The width of a history-tree [`zcash_history::Entry`] as serialized by database formats written
+/// before NU6.3 widened `zcash_history::NodeData`.
+const LEGACY_MAX_ENTRY_SIZE: usize = 253;
+
+/// A mirror of [`HistoryTreeParts`] using the pre-NU6.3 [`zcash_history::Entry`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyHistoryTreeParts {
+    network_kind: NetworkKind,
+    size: u32,
+    peaks: BTreeMap<u32, LegacyEntry>,
+    current_height: Height,
+}
+
+/// A history-tree entry serialized at the pre-NU6.3 [`LEGACY_MAX_ENTRY_SIZE`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyEntry {
+    #[serde(with = "BigArray")]
+    inner: [u8; LEGACY_MAX_ENTRY_SIZE],
+}
+
+impl From<LegacyHistoryTreeParts> for HistoryTreeParts {
+    fn from(legacy: LegacyHistoryTreeParts) -> Self {
+        HistoryTreeParts {
+            network_kind: legacy.network_kind,
+            size: legacy.size,
+            peaks: legacy
+                .peaks
+                .into_iter()
+                .map(|(index, entry)| {
+                    (
+                        index,
+                        zcash_history::Entry::from_raw_bytes_padded(&entry.inner),
+                    )
+                })
+                .collect(),
+            current_height: legacy.current_height,
+        }
     }
 }
 
@@ -152,3 +200,6 @@ impl FromDisk for BlockInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -17,7 +17,6 @@ use zebra_chain::{
     transaction::{JoinSplitData, LockTime, Transaction},
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use zebra_chain::{ironwood, parameters::NetworkUpgrade::Nu6_3, primitives::Halo2Proof};
 
 use crate::{
@@ -32,7 +31,6 @@ use crate::{
     },
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use crate::ValidateContextError::DuplicateIronwoodNullifier;
 
 // These tests use the `Arbitrary` trait to easily generate complex types,
@@ -979,7 +977,6 @@ proptest! {
     /// Make sure duplicate ironwood nullifiers are rejected by state contextual
     /// validation with an Ironwood-specific error.
     #[test]
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn reject_duplicate_ironwood_nullifiers_in_chain(
         authorized_action1 in TypeNameToDebug::<ironwood::AuthorizedAction>::arbitrary(),
         mut authorized_action2 in TypeNameToDebug::<ironwood::AuthorizedAction>::arbitrary(),
@@ -1028,7 +1025,8 @@ proptest! {
         let block1_hash;
         if duplicate_in_finalized_state {
             let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
-            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
+            let commit_result =
+                finalized_state.commit_finalized_direct(block1.clone().into(), None, None, None, "test");
 
             prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
             prop_assert!(commit_result.is_ok());
@@ -1500,7 +1498,6 @@ fn transaction_v5_with_orchard_shielded_data(
 /// # Panics
 ///
 /// If there are no `AuthorizedAction`s in `authorized_actions`.
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn transaction_v6_with_ironwood_shielded_data(
     ironwood_shielded_data: impl Into<Option<ironwood::ShieldedData>>,
     authorized_actions: impl IntoIterator<Item = ironwood::AuthorizedAction>,

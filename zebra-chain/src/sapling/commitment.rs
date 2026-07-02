@@ -38,6 +38,8 @@ pub struct CommitmentRandomness(jubjub::Fr);
 /// conversion fail and the transaction is rejected. Validated by
 /// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
 /// `transaction/tests/vectors.rs`.
+///
+/// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ValueCommitment(pub(crate) [u8; 32]);
 
