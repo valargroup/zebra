@@ -1134,9 +1134,6 @@ impl PeerRoutine {
 
         let Some(index) = self.window.outstanding_index_for_height(height) else {
             // No outstanding match — run the unmatched fallthroughs locally.
-            if self.ignore_stale_response(height, "body").await {
-                return;
-            }
             if self
                 .accept_unmatched_queued_body(
                     height,
@@ -1148,6 +1145,9 @@ impl PeerRoutine {
                 )
                 .await
             {
+                return;
+            }
+            if self.ignore_stale_response(height, "body").await {
                 return;
             }
             if self.ignore_unmatched_needed_response(height, "body") {
@@ -1344,10 +1344,10 @@ impl PeerRoutine {
         self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
     }
 
-    /// Accept a queued body whose original requester is gone (a routine only runs
-    /// for a live peer, so there is no disconnected-peer branch): the routine
-    /// reserves the body's actual size, claims the height into `in_flight`, and
-    /// forwards it.
+    /// Accept a wanted unmatched body whose original requester is gone or whose height
+    /// is currently reserved by another peer. Queued heights reserve their actual size
+    /// before buffering; reserved in-flight heights settle the existing reservation to
+    /// the actual held bytes.
     async fn accept_unmatched_queued_body(
         &mut self,
         height: block::Height,
@@ -1382,70 +1382,89 @@ impl PeerRoutine {
             },
         };
 
-        metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+        let reserved_in_flight = self.work.reserved_in_flight_charge(height);
+        let is_pending = self.work.pending_contains(height);
+        if reserved_in_flight.is_none() && !is_pending {
+            return false;
+        }
+
+        if is_pending {
+            let sequencer_view = *self.sequencer_view.borrow();
+            let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
+                self.work.reserved_above(sequencer_view.download_floor);
+            let Some(decision) = admission_decision(
+                &self.config,
+                AdmissionSnapshot {
+                    download_floor: sequencer_view.download_floor,
+                    reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
+                    reorder_buffered_blocks: sequencer_view.reorder_len,
+                    applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
+                    applying_buffered_blocks: sequencer_view.applying_len,
+                    sequencer_input_queued_bytes: self
+                        .sequencer_input_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    reserved_above_floor_bytes,
+                    reserved_above_floor_blocks,
+                    budget_available: self.budget.available(),
+                },
+                height,
+                serialized_bytes,
+            ) else {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    "not buffering unmatched queued block-sync body at look-ahead cap"
+                );
+                return true;
+            };
+            if decision.max_request_bytes < serialized_bytes {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    admitted_bytes = decision.max_request_bytes,
+                    "not buffering unmatched queued block-sync body; insufficient admitted budget"
+                );
+                return true;
+            }
+
+            // This queued height owns no prior reservation: reserve its actual size
+            // before buffering. If the budget is genuinely full of other legitimate
+            // bodies, skip buffering (the height stays queued for retry with its own
+            // size-estimate reservation, so no valid body is lost overall).
+            if !self.budget.try_reserve(serialized_bytes) {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    "not buffering unmatched queued block-sync body; height stays queued for retry"
+                );
+                return true;
+            }
+
+            // Claim this height into `in_flight` so it leaves `pending`.
+            let _ = self.work.take_in_range(height, height, 1);
+            let old_charge = self.work.mark_held_direct(height, serialized_bytes);
+            self.budget.release(old_charge);
+            metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+        } else {
+            // First-completion-wins for a timed-out height already re-issued to another
+            // peer: convert the active request reservation into held bytes and settle
+            // only the delta, instead of discarding a valid body because another peer
+            // currently owns the request slot.
+            let Some(delta) = self
+                .work
+                .settle_active_reserved_height(height, serialized_bytes)
+            else {
+                return false;
+            };
+            self.apply_budget_delta(delta);
+            metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+        }
+
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
-
-        let sequencer_view = *self.sequencer_view.borrow();
-        let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-            self.work.reserved_above(sequencer_view.download_floor);
-        let Some(decision) = admission_decision(
-            &self.config,
-            AdmissionSnapshot {
-                download_floor: sequencer_view.download_floor,
-                reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
-                reorder_buffered_blocks: sequencer_view.reorder_len,
-                applying_buffered_bytes: sequencer_view.applying_buffered_bytes,
-                applying_buffered_blocks: sequencer_view.applying_len,
-                sequencer_input_queued_bytes: self
-                    .sequencer_input_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                reserved_above_floor_bytes,
-                reserved_above_floor_blocks,
-                budget_available: self.budget.available(),
-            },
-            height,
-            serialized_bytes,
-        ) else {
-            tracing::debug!(
-                peer = ?self.peer,
-                ?height,
-                serialized_bytes,
-                "not buffering unmatched queued block-sync body at look-ahead cap"
-            );
-            return true;
-        };
-        if decision.max_request_bytes < serialized_bytes {
-            tracing::debug!(
-                peer = ?self.peer,
-                ?height,
-                serialized_bytes,
-                admitted_bytes = decision.max_request_bytes,
-                "not buffering unmatched queued block-sync body; insufficient admitted budget"
-            );
-            return true;
-        }
-
-        // This queued height owns no prior reservation: reserve its actual size
-        // before buffering. If the budget is genuinely full of other legitimate
-        // bodies, skip buffering (the height stays queued for retry with its own
-        // size-estimate reservation, so no valid body is lost overall).
-        if !self.budget.try_reserve(serialized_bytes) {
-            tracing::debug!(
-                peer = ?self.peer,
-                ?height,
-                serialized_bytes,
-                "not buffering unmatched queued block-sync body; height stays queued for retry"
-            );
-            return true;
-        }
-
-        // Claim this height into `in_flight` so it leaves `pending`; if it is
-        // already `in_flight` the take is a no-op and the Sequencer drops the
-        // later duplicate.
-        let _ = self.work.take_in_range(height, height, 1);
-        let old_charge = self.work.mark_held_direct(height, serialized_bytes);
-        self.budget.release(old_charge);
 
         // A real, wanted body that no longer matches an outstanding request (typically
         // arrived just after its request timed out). Count it as block progress: resets

@@ -11356,7 +11356,7 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
 }
 
 #[tokio::test]
-async fn reactor_ignores_unmatched_response_for_height_active_on_another_request() {
+async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
@@ -11419,14 +11419,36 @@ async fn reactor_ignores_unmatched_response_for_height_active_on_another_request
         .expect("empty needed metadata queues");
 
     // The peer that did NOT get the request sends the body+terminator as real
-    // inbound frames; its routine must drop them (another peer holds the active
-    // request) without scoring misbehavior.
+    // inbound frames. First valid completion wins: the body is accepted even
+    // though another peer currently owns the request slot, and the later
+    // duplicate from the original owner will be dropped by the sequencer.
     let (late_peer, late_inbound) = if requested_peer == peer1 {
         (peer2, inbound2)
     } else {
         (peer1, inbound1)
     };
     send_inbound(&late_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
+    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => return block.hash(),
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                BlockSyncAction::Misbehavior { peer, reason } => {
+                    assert_ne!(
+                        peer, late_peer,
+                        "late active body was reported as {reason:?}"
+                    );
+                }
+                action => {
+                    panic!("unexpected action while waiting for late body submit: {action:?}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("late active body is accepted and submitted");
+    assert_eq!(submitted, blocks[1].hash());
+
     send_inbound(
         &late_inbound,
         BlockSyncMessage::BlocksDone {

@@ -308,6 +308,8 @@ pub(super) struct DownloadWindow {
     bbr: BbrState,
     /// Whether the cwnd budgets outstanding work in request slots or reserved bytes.
     cwnd_unit: CwndUnit,
+    /// Request-count cap used while byte-cwnd has no fresh BDP sample.
+    pub(super) startup_request_cap: usize,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
     /// Last time this peer was sent a block-body request.
@@ -336,6 +338,9 @@ impl DownloadWindow {
             outstanding: Vec::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
+            startup_request_cap: usize::try_from(config.initial_inflight_requests)
+                .unwrap_or(usize::MAX)
+                .max(1),
             block_liveness_deadline: None,
             last_request_at: None,
             last_block_at: None,
@@ -518,6 +523,12 @@ impl DownloadWindow {
                 let outstanding = self.outstanding.len();
                 if outstanding >= hard_cap {
                     return 0;
+                }
+                if !self.bbr.has_fresh_bdp(Instant::now()) {
+                    let startup_cap = self.startup_request_cap.saturating_add(bonus).min(hard_cap);
+                    if outstanding >= startup_cap {
+                        return 0;
+                    }
                 }
                 // The cwnd is already a byte budget. The floor bypass grants `bonus`
                 // *representative* bodies of extra byte headroom — sized to the recent

@@ -540,6 +540,10 @@ impl BbrState {
         Some(cwnd.max(self.params.min_cwnd))
     }
 
+    pub(super) fn has_fresh_bdp(&self, now: Instant) -> bool {
+        self.bdp(now).is_some()
+    }
+
     pub(super) fn rtprop_ms(&self, now: Instant) -> Option<u64> {
         self.rtprop_secs.min(now).map(secs_to_ms)
     }
@@ -1190,6 +1194,45 @@ mod bbr_tests {
         );
         // The floor bypass must not breach the advertised cap either.
         assert_eq!(window.available_slots_with_bonus(2), 0);
+    }
+
+    #[test]
+    fn byte_cwnd_cold_start_is_also_request_count_capped() {
+        let cfg = byte_test_config(400_000, 256);
+        let mut window = DownloadWindow::new(&cfg);
+
+        assert_eq!(window.startup_request_cap, 16);
+        assert!(
+            window.available_slots() > 0,
+            "cold byte window starts with byte headroom"
+        );
+
+        push_outstanding_bytes(&mut window, 16, 10);
+        assert_eq!(
+            window.available_slots(),
+            0,
+            "cold byte mode must not open more than the startup request count"
+        );
+        assert!(
+            window.available_slots_with_bonus(2) > 0,
+            "floor bypass can still borrow its configured cold-start count bonus"
+        );
+        push_outstanding_bytes(&mut window, 2, 10);
+        assert_eq!(window.available_slots_with_bonus(2), 0);
+
+        let now = Instant::now();
+        let snapshot = window.delivery_snapshot(now);
+        window.record_delivery(
+            now + Duration::from_millis(10),
+            Duration::from_millis(10),
+            1,
+            10,
+            snapshot,
+        );
+        assert!(
+            window.available_slots() > 0,
+            "a fresh BDP sample releases the cold request-count gate while byte headroom remains"
+        );
     }
 
     #[test]

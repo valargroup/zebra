@@ -641,6 +641,14 @@ impl WorkQueue {
         self.lock().pending.contains_key(&height)
     }
 
+    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
+        self.lock().in_flight.get(&height).and_then(|item| {
+            item.budget
+                .is_reserved()
+                .then(|| item.budget.reserved_charge())
+        })
+    }
+
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {
         self.lock().in_flight.contains_key(&height)
     }
