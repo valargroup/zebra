@@ -15,10 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   wire bytes (not the ~4× larger decoded footprint) and the floor-rescue path
   bypassed the budget entirely and advanced with the _download_ floor, so the
   buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
-  node. The budget now bounds resident memory and gates the floor lane, exempting
-  only the single commit-frontier block so the committer can always drain the
-  pipeline (no deadlock). Resident memory now plateaus near the configured budget,
-  with only bounded transient overshoot from floor-rescue requests.
+  node. The budget now bounds estimated resident memory (retained and in-flight
+  wire bytes at the decoded multiple) and gates the floor lane, exempting one
+  checkpoint range above the verified tip (the commit window) so a pinned
+  checkpoint range can always assemble and the committer can always drain the
+  pipeline (no deadlock). Resident memory now plateaus near the configured budget
+  plus at most one worst-case commit window (~3.2 GB), with only bounded transient
+  overshoot from floor-rescue requests.
 
 ### Performance
 

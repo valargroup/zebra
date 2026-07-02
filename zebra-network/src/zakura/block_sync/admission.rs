@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use zebra_chain::block;
 
-use super::{config::ZakuraBlockSyncConfig, state::next_height};
+use super::{
+    config::{ZakuraBlockSyncConfig, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES},
+    state::next_height,
+};
 
 /// Delivery rate assumed when sizing an above-floor deadline for a peer whose
 /// measured BtlBw is still near zero, so the patience window is bounded rather than
@@ -18,22 +21,26 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling —
 /// the ZCA-742 OOM, where ~569k decoded blocks held under a wire-byte cap reached ~26 GiB RSS.
 ///
-/// Applied only to the *decoded* pipeline stages (applying + sequencer input); the
-/// wire-retained reorder backlog is charged ~1× and unreceived reservations 0×. See
+/// Applied to every look-ahead pool at its *eventual* decoded cost — including the
+/// wire-retained reorder backlog and outstanding reservations — because the
+/// reorder→applying drain decodes without re-consulting admission; see
 /// [`estimated_resident_pipeline_bytes`].
 ///
 // TODO(ZCA-742): replace this flat factor with a precise per-block heap-size estimate
 // (a structural walk, or a `GetSize`-style measure on `Block`), so the budget tracks real
 // memory exactly. The factor is a deliberately conservative calibration from the measured
 // ~3.3–4x wire→resident ratio; it is an approximation, not a true per-block size.
-pub(super) const DESERIALIZED_MEM_FACTOR: u64 = 4;
+// Stage-aware charging (reorder/reservations at ~1× wire) becomes sound only once bodies
+// stay wire-retained through `applying` and decode at submit, bounded by the submit window.
+pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 
 /// Pure inputs for deciding whether a block request may consume budget.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct AdmissionSnapshot {
     pub(super) download_floor: block::Height,
-    /// The verified (commit) tip. The single contiguous block above it is always fundable
-    /// (liveness), so commit can drain the pipeline; everything else is memory-gated.
+    /// The verified (commit) tip. Heights within one checkpoint range above it (the
+    /// commit window) are always fundable (liveness), so a pinned checkpoint range can
+    /// assemble and commit can drain the pipeline; everything else is memory-gated.
     pub(super) verified_block_tip: block::Height,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) reorder_buffered_blocks: u64,
@@ -108,40 +115,58 @@ pub(super) fn request_deadline(
     }
 }
 
-/// The block that lets commit advance next (`verified_tip + 1`). Always fundable, so the
-/// pipeline can drain even when the look-ahead budget is full.
-fn commit_frontier(snapshot: &AdmissionSnapshot) -> block::Height {
-    next_height(snapshot.verified_block_tip).unwrap_or(snapshot.verified_block_tip)
+/// Heights within this many blocks above the verified tip are exempt from the
+/// look-ahead gates: one worst-case checkpoint range.
+///
+/// During checkpoint sync the checkpoint verifier resolves a range only once the whole
+/// range — up to this many blocks — is submitted, and the verified tip stays pinned to
+/// the previous checkpoint until then. Every block of the active range must therefore
+/// stay fundable even when the look-ahead budget and block cap are full, or the range
+/// can never assemble and sync wedges (ZCA-742).
+///
+/// Deliberately a constant rather than `config.submitted_apply_limit()`: that accessor
+/// has a floor but no ceiling, so a huge configured submit window would widen the
+/// exemption until the memory gate is disabled entirely.
+// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
+// (= 401), which fits `u32` losslessly.
+const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
+
+/// Highest height exempt from look-ahead backpressure: the top of the commit window
+/// ([`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS`] above the verified tip). Anchored to the
+/// verified tip — which advances only on commit — so the window cannot escalate with
+/// the download floor.
+fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
+    // Valid heights sit far below `u32::MAX`, so the saturation is unreachable; it
+    // just keeps the arithmetic total.
+    block::Height(
+        snapshot
+            .verified_block_tip
+            .0
+            .saturating_add(COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS),
+    )
 }
 
-/// Resident bytes of a decoded pipeline stage holding `wire_bytes` of block bodies
-/// (`wire_bytes * DESERIALIZED_MEM_FACTOR`).
-fn decoded_resident_bytes(wire_bytes: u64) -> u64 {
-    wire_bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
-}
-
-/// Estimated resident memory of the block bodies already held in the pipeline.
+/// Estimated resident memory of the block bodies the pipeline has retained or is
+/// committed to fetch.
 ///
-/// Stage-aware, because the pools differ in resident cost:
-/// - `applying_buffered_bytes` and `sequencer_input_queued_bytes` hold *decoded* bodies, so
-///   they cost `DESERIALIZED_MEM_FACTOR`× their wire size.
-/// - `reorder_buffered_bytes` is the wire-retained backlog (bodies are stripped to their
-///   `RawFramePayload` and re-decoded only on drain — see `reorder::retain_for_backlog`), so
-///   it costs ~1× (wire).
-/// - `reserved_above_floor_bytes` are worst-case reservations for bytes *not yet received*, so
-///   they hold no resident memory yet and are not charged here (they still count toward the
-///   block cap via [`held_blocks`], and toward the in-flight byte budget elsewhere).
-///
-/// Charging the wire-retained backlog and unreceived reservations at the decoded multiple
-/// (the earlier flat model) throttled effective look-ahead depth up to ~4× below the
-/// configured budget in reorder-/reservation-heavy burst states.
+/// Every pool is charged at its *eventual* decoded cost (`× DESERIALIZED_MEM_FACTOR`),
+/// not its current retention state:
+/// - `applying_buffered_bytes` and `sequencer_input_queued_bytes` already hold decoded
+///   bodies (`Arc<Block>`), retained until the verified tip advances.
+/// - `reorder_buffered_bytes` is wire-retained today (`reorder::retain_for_backlog`),
+///   but the reorder→applying drain decodes the whole contiguous prefix unconditionally
+///   the moment a gap fills, with no admission re-gate — charging reorder below its
+///   decoded cost lets a gap-fill drain burst breach the budget after admission.
+/// - `reserved_above_floor_bytes` are outstanding requests whose bodies land and decode
+///   the same way; charging them nothing makes in-flight volume invisible to the gate
+///   until it is already resident.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     snapshot
         .reorder_buffered_bytes
-        .saturating_add(decoded_resident_bytes(snapshot.applying_buffered_bytes))
-        .saturating_add(decoded_resident_bytes(
-            snapshot.sequencer_input_queued_bytes,
-        ))
+        .saturating_add(snapshot.applying_buffered_bytes)
+        .saturating_add(snapshot.sequencer_input_queued_bytes)
+        .saturating_add(snapshot.reserved_above_floor_bytes)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR)
 }
 
 fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
@@ -160,41 +185,45 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
 /// Whether a floor-priority take at `start_height` is allowed past the resident-memory
 /// look-ahead backpressure.
 ///
-/// The commit-frontier block is always allowed (liveness — the committer must be able to
-/// fetch the block it needs to advance, which also reaches the floor-reservation funding
-/// path); every other height is allowed only while the resident-memory budget and block
-/// cap have headroom. This is deliberately **independent of the in-flight byte budget**, so
-/// an exhausted in-flight budget still lets the commit-frontier floor reach its funding
-/// path — unlike [`admission_decision`], whose `max_request_bytes` collapses to zero when
-/// the in-flight budget is spent. Anchoring the floor exemption to the commit frontier
-/// (rather than the download floor, which advances on every download) is what stops
-/// `body_download_floor` from escalating unboundedly ahead of commit (ZCA-742).
+/// Heights in the commit window (one checkpoint range above the verified tip) are always
+/// allowed (liveness — the whole active range must become co-resident before commit can
+/// advance during checkpoint sync, and the committer's next block must reach the
+/// floor-reservation funding path); every other height is allowed only while the
+/// resident-memory budget and block cap have headroom. This is deliberately
+/// **independent of the in-flight byte budget**, so an exhausted in-flight budget still
+/// lets a commit-window floor request reach its funding path — unlike
+/// [`admission_decision`], whose `max_request_bytes` collapses to zero when the in-flight
+/// budget is spent. Anchoring the exemption to the verified tip (rather than the download
+/// floor, which advances on every download) is what stops `body_download_floor` from
+/// escalating unboundedly ahead of commit (ZCA-742).
 pub(super) fn floor_take_allowed(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
     start_height: block::Height,
 ) -> bool {
-    start_height <= commit_frontier(&snapshot) || !lookahead_over_budget(config, &snapshot)
+    start_height <= commit_window_high(&snapshot) || !lookahead_over_budget(config, &snapshot)
 }
 
 /// Returns the admission decision for a candidate block response starting at `start_height`.
 ///
-/// The single contiguous block just above the *verified* (commit) frontier is always
-/// fundable, so the committer can advance and drain the pipeline even when the look-ahead
-/// budget is full. Every other request — floor-priority included — is admitted only while
-/// the configured look-ahead limits still have capacity, measured against the *resident*
-/// memory of the buffered bodies (see [`estimated_resident_pipeline_bytes`]: decoded stages
-/// cost `DESERIALIZED_MEM_FACTOR`×, the wire-retained reorder backlog ~1×, and unreceived
-/// reservations nothing) rather than a flat multiple of all wire bytes.
+/// Heights in the commit window (one checkpoint range above the *verified* tip) are always
+/// fundable, so the committer can advance — and a pinned checkpoint range can fully
+/// assemble — even when the look-ahead budget is full. Every other request —
+/// floor-priority included — is admitted only while the configured look-ahead limits
+/// still have capacity, measured against the estimated *resident* cost of the buffered
+/// and in-flight bodies (see [`estimated_resident_pipeline_bytes`]).
 ///
-/// Gating the floor lane (with only the commit-frontier exempt) is what bounds the applying
+/// Gating the floor lane (with only the commit window exempt) is what bounds the applying
 /// queue: the download floor advances on every download, so a floor exemption tied to it
-/// escalates unboundedly ahead of commit. Anchoring the exemption to the commit frontier
-/// caps the pipeline to the look-ahead budget regardless of how far headers/downloads run
-/// ahead (ZCA-742).
+/// escalates unboundedly ahead of commit. Anchoring the exemption to the verified tip
+/// caps the pipeline to the look-ahead budget plus one worst-case window
+/// (`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS × MAX_BLOCK_BYTES × DESERIALIZED_MEM_FACTOR`
+/// ≈ 3.2 GB; a single in-window response can also exceed the byte gate by up to the
+/// response cap × the factor) regardless of how far headers/downloads run ahead
+/// (ZCA-742).
 ///
-/// Returns `None` when no bytes can be admitted, or when a non-frontier request would exceed
-/// the look-ahead limits.
+/// Returns `None` when no bytes can be admitted, or when a request above the commit
+/// window would exceed the look-ahead limits.
 pub(super) fn admission_decision(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
@@ -203,7 +232,7 @@ pub(super) fn admission_decision(
 ) -> Option<AdmissionDecision> {
     let priority = request_priority(snapshot.download_floor, start_height);
 
-    let max_request_bytes = if start_height <= commit_frontier(&snapshot) {
+    let max_request_bytes = if start_height <= commit_window_high(&snapshot) {
         snapshot.budget_available.min(response_byte_cap)
     } else {
         if lookahead_over_budget(config, &snapshot) {
@@ -295,11 +324,11 @@ mod tests {
 
     /// ZCA-742 checkpoint-sync deadlock regression: during checkpoint sync `verified_tip`
     /// stays pinned to the previous checkpoint until the whole range (up to
-    /// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` blocks) is co-resident, and only the
-    /// commit-frontier block bypasses the resident-memory gate. So the resident look-ahead
-    /// budget must admit a full range or checkpoint sync wedges. A legal 1 GiB in-flight
-    /// budget must allow it (the earlier `min(max_reorder, max_inflight)` collapsed the
-    /// resident budget to the 1 GiB *wire* value, admitting only ~256 MB of wire bodies).
+    /// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` blocks) is co-resident. The whole range
+    /// is commit-window exempt, and the resident budget under a legal 1 GiB in-flight
+    /// budget must also leave gated headroom just above the window (the earlier
+    /// `min(max_reorder, max_inflight)` collapsed the resident budget to the 1 GiB *wire*
+    /// value, admitting only ~256 MB of wire bodies).
     #[test]
     fn checkpoint_range_fits_under_one_gib_inflight_budget() {
         use super::super::config::{
@@ -319,9 +348,7 @@ mod tests {
             range_resident,
         );
 
-        // One block short of a full co-resident range, with `verified_tip` pinned at 0 so the
-        // range's heights are memory-gated (not commit-frontier exempt). The final block must
-        // still be admitted, or the range could never assemble.
+        // One block short of a full co-resident range, with `verified_tip` pinned at 0.
         let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
             .expect("checkpoint range block count fits in u32");
         let snapshot = AdmissionSnapshot {
@@ -336,9 +363,18 @@ mod tests {
             reserved_above_floor_blocks: 0,
             budget_available: config.max_inflight_block_bytes,
         };
+        // The range-completing block is inside the commit window, so it is exempt.
         assert!(
             admission_decision(&config, snapshot, block::Height(range_blocks), u64::MAX).is_some(),
             "the final block of a checkpoint range must be admissible under a 1 GiB in-flight budget",
+        );
+        // The first height above the window is memory-gated but must still have headroom
+        // under this budget: (802 MB - 2 MB) * 4 resident < 4 GiB effective. This keeps the
+        // assertion non-vacuous now that the whole range is window-exempt.
+        assert!(
+            admission_decision(&config, snapshot, block::Height(range_blocks + 1), u64::MAX)
+                .is_some(),
+            "the first gated height above the commit window must still be admissible",
         );
     }
 

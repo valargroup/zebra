@@ -1316,8 +1316,9 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
     assert_eq!(floor.max_request_bytes, 1_000);
 
+    // Height 412 is the first height above the commit window (verified_tip 10 + 401).
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
         None,
         "above-floor work stops at the look-ahead cap"
     );
@@ -1328,15 +1329,14 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         ..snapshot
     };
     let above =
-        super::admission::admission_decision(&config, under_cap, block::Height(12), u64::MAX)
+        super::admission::admission_decision(&config, under_cap, block::Height(412), u64::MAX)
             .expect("above-floor work is admitted below the cap");
     assert_eq!(
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    // The reorder backlog is wire-retained (charged ~1×), so remaining resident headroom is
-    // (500 - 100) / 4 = 100 wire bytes for the next (decoded) body.
-    assert_eq!(above.max_request_bytes, 100);
+    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
+    assert_eq!(above.max_request_bytes, 25);
 }
 
 #[test]
@@ -1360,8 +1360,9 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
         None,
         "above-floor admission includes bytes already queued to the sequencer"
     );
@@ -1388,8 +1389,9 @@ fn total_resident_plateaus_under_commit_stall() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
         None,
         "above-floor admission includes applying bytes held during a commit stall"
     );
@@ -1416,8 +1418,10 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401): the speculative tail of a
+    // floor-starting request is refused at the cap once it leaves the window.
     assert_eq!(
-        super::admission::admission_decision(&config, capped, block::Height(12), 1_000),
+        super::admission::admission_decision(&config, capped, block::Height(412), 1_000),
         None,
         "the above-floor tail of a floor-starting request is refused at the cap"
     );
@@ -1430,11 +1434,12 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
 }
 
 #[test]
-fn reorder_and_reservations_are_not_charged_as_decoded_resident_memory() {
-    // The reorder backlog is wire-retained (~1×) and above-floor reservations are for bytes
-    // not yet received (0× resident), so neither is charged at the decoded multiple. Charging
-    // them ×4 (the old flat model) throttled look-ahead depth up to ~4× below the configured
-    // budget in the reorder-/reservation-heavy burst states this budget exists to deepen.
+fn outstanding_reservations_are_charged_at_the_resident_multiple() {
+    // Regression for the reserved-0× hole: outstanding above-floor reservations land and
+    // decode like every other pool, so they must be pre-charged at the resident multiple.
+    // Charging them nothing makes in-flight volume invisible to the byte gate until it is
+    // already resident — in a commit stall the pipeline could fill the whole in-flight wire
+    // budget and then decode ×factor past the plateau (the ZCA-742 OOM, reopened).
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1442,10 +1447,10 @@ fn reorder_and_reservations_are_not_charged_as_decoded_resident_memory() {
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
-        download_floor: block::Height(10),
+        download_floor: block::Height(600),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 700,
-        reorder_buffered_blocks: 1,
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
@@ -1453,25 +1458,31 @@ fn reorder_and_reservations_are_not_charged_as_decoded_resident_memory() {
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
     };
-    // Old flat model: (700 + 700) * 4 = 5_600 >= 1_000 → denied. Stage-aware: reorder 700 (×1)
-    // + reserved 0 = 700 < 1_000 → admitted with (1_000 - 700) / 4 = 75 wire bytes of headroom.
-    let above =
-        super::admission::admission_decision(&config, snapshot, block::Height(12), u64::MAX)
-            .expect("wire-retained backlog + unreceived reservations must not be charged decoded");
+    // Reservations alone fill the budget: 700 * 4 = 2_800 >= 1_000, so both the speculative
+    // lane and an escalated floor block above the commit window are refused.
     assert_eq!(
-        above.priority,
-        super::admission::RequestPriority::AboveFloor
+        super::admission::admission_decision(&config, snapshot, block::Height(602), u64::MAX),
+        None,
+        "outstanding reservations must count against the resident budget",
     );
-    assert_eq!(above.max_request_bytes, 75);
+    assert!(
+        !super::admission::floor_take_allowed(&config, snapshot, block::Height(601)),
+        "an escalated floor take above the commit window is refused on reserved bytes alone",
+    );
+    // The commit window stays exempt so the committer can always drain.
+    let window = super::admission::admission_decision(&config, snapshot, block::Height(411), 1_000)
+        .expect("the commit window is exempt from the reservation charge");
+    assert_eq!(window.max_request_bytes, 1_000);
 }
 
 #[test]
 fn floor_backpressures_when_download_floor_escalates_past_commit() {
     // Regression for the ZCA-742 OOM. The download floor advances on every download, so a
     // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
-    // commit. With the exemption anchored to the *commit* frontier, a floor-priority request
-    // far above the commit tip is backpressured once the resident-memory look-ahead budget
-    // is full, while the single commit-frontier block stays fundable so commit can drain.
+    // commit. With the exemption anchored to the *commit window* (one checkpoint range above
+    // the verified tip), a floor-priority request far above the commit tip is backpressured
+    // once the resident-memory look-ahead budget is full, while the commit window stays
+    // fundable so a pinned checkpoint range can assemble and commit can drain.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1495,7 +1506,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     };
 
     // The download-frontier request (floor+1) is still classified floor-priority, but is now
-    // refused: it is above the commit frontier, so it no longer bypasses the memory cap.
+    // refused: it is above the commit window, so it no longer bypasses the memory cap.
     assert_eq!(
         super::admission::request_priority(snapshot.download_floor, block::Height(1_001)),
         super::admission::RequestPriority::Floor,
@@ -1506,12 +1517,98 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         "a floor request far ahead of commit is backpressured when the memory budget is full",
     );
 
-    // The single contiguous commit-frontier block (verified_tip + 1) stays fundable, so the
-    // committer can advance and drain the pipeline — no deadlock.
-    let commit_frontier =
+    // The commit window (verified_tip + 1 ..= verified_tip + 401) stays fundable, so the
+    // committer can advance and drain the pipeline — no deadlock. The boundary is exact:
+    // 411 is the last exempt height, 412 the first gated one.
+    let frontier =
         super::admission::admission_decision(&config, snapshot, block::Height(11), 1_000)
             .expect("the commit-frontier block is always fundable");
-    assert_eq!(commit_frontier.max_request_bytes, 1_000);
+    assert_eq!(frontier.max_request_bytes, 1_000);
+    let window_top =
+        super::admission::admission_decision(&config, snapshot, block::Height(411), 1_000)
+            .expect("the top of the commit window is still fundable");
+    assert_eq!(window_top.max_request_bytes, 1_000);
+    assert_eq!(
+        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
+        None,
+        "the first height above the commit window is memory-gated",
+    );
+}
+
+#[test]
+fn commit_window_stays_fundable_at_exact_floor() {
+    // Regression for the exact-fit clamp deadlock: a config clamped to the checkpoint-range
+    // floors used to leave zero margin, so one next-range reorder body or reservation pushed
+    // the gate over budget and the range-completing block was refused — checkpoint sync
+    // wedged. With the whole commit window exempt, the active range assembles regardless of
+    // how full the gate is.
+    use super::config::{
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+    };
+
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_reorder_lookahead_bytes: 1,
+        max_reorder_lookahead_blocks: 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.clamp_reorder_lookahead_to_floor();
+    let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+        .expect("checkpoint range block count fits in u32");
+
+    // verified_tip pinned at 0; applying holds all but the last worst-case range block, plus
+    // next-range contamination in reorder and outstanding reservations. Both gates are full:
+    // resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000 and blocks 400 + 4 + 2 >= 401.
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(range_blocks - 1),
+        verified_block_tip: block::Height(0),
+        reorder_buffered_bytes: 8_388_608,
+        reorder_buffered_blocks: 4,
+        applying_buffered_bytes: 800_000_000,
+        applying_buffered_blocks: u64::from(range_blocks) - 1,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 4_000_000,
+        reserved_above_floor_blocks: 2,
+        budget_available: 2_000_000,
+    };
+
+    // The range-completing block (inside the commit window) stays fundable on both lanes.
+    assert_eq!(
+        super::admission::request_priority(snapshot.download_floor, block::Height(range_blocks)),
+        super::admission::RequestPriority::Floor,
+    );
+    assert!(
+        super::admission::floor_take_allowed(&config, snapshot, block::Height(range_blocks)),
+        "the range-completing floor take must pass a full gate",
+    );
+    let completing = super::admission::admission_decision(
+        &config,
+        snapshot,
+        block::Height(range_blocks),
+        u64::MAX,
+    )
+    .expect("the range-completing block must be admissible at the exact clamp floor");
+    assert_eq!(
+        completing.priority,
+        super::admission::RequestPriority::Floor
+    );
+    assert_eq!(completing.max_request_bytes, 2_000_000);
+
+    // The first height above the window is refused on both lanes while the gate is full.
+    assert!(!super::admission::floor_take_allowed(
+        &config,
+        snapshot,
+        block::Height(range_blocks + 1)
+    ));
+    assert_eq!(
+        super::admission::admission_decision(
+            &config,
+            snapshot,
+            block::Height(range_blocks + 1),
+            u64::MAX
+        ),
+        None,
+    );
 }
 
 #[test]
@@ -3557,8 +3654,10 @@ proptest::proptest! {
             max_reorder_lookahead_blocks: 10,
             ..ZakuraBlockSyncConfig::default()
         };
+        // The download floor sits far above the commit window (verified_tip 10 + 401 = 411),
+        // so the gated probe below is genuinely memory-gated, not window-exempt.
         let snapshot = super::admission::AdmissionSnapshot {
-            download_floor: block::Height(10),
+            download_floor: block::Height(600),
             verified_block_tip: block::Height(10),
             reorder_buffered_bytes: reorder_bytes,
             reorder_buffered_blocks: reorder_blocks,
@@ -3569,13 +3668,15 @@ proptest::proptest! {
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
         };
-        // Stage-aware resident estimate: decoded stages (applying + sequencer input) at
-        // ×factor, the wire-retained reorder backlog at ~1×, and reservations 0× — mirrors
+        // The resident estimate charges every pool — including the wire-retained reorder
+        // backlog and outstanding reservations — at its eventual decoded cost; mirrors
         // admission::estimated_resident_pipeline_bytes.
         let factor = super::admission::DESERIALIZED_MEM_FACTOR;
         let estimated_resident = reorder_bytes
-            .saturating_add(applying_bytes.saturating_mul(factor))
-            .saturating_add(input_bytes.saturating_mul(factor));
+            .saturating_add(applying_bytes)
+            .saturating_add(input_bytes)
+            .saturating_add(reserved_bytes)
+            .saturating_mul(factor);
         let held_blocks = reorder_blocks
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
@@ -3583,7 +3684,7 @@ proptest::proptest! {
         let above = super::admission::admission_decision(
             &config,
             snapshot,
-            block::Height(12),
+            block::Height(602),
             1_000,
         );
         if estimated_resident >= effective
@@ -3591,7 +3692,7 @@ proptest::proptest! {
         {
             prop_assert_eq!(above, None);
         } else {
-            // A non-frontier request funds min(budget, remaining_wire, response_cap); the next
+            // A gated request funds min(budget, remaining_wire, response_cap); the next
             // body is sized as decoded, so remaining_wire = (effective - resident) / factor.
             let remaining_wire = (effective - estimated_resident) / factor;
             let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
@@ -3601,16 +3702,28 @@ proptest::proptest! {
                 prop_assert_eq!(above, None);
             }
         }
+        // Single-admission no-breach invariant: whatever the gate admits cannot push the
+        // resident estimate past the budget once it lands and decodes.
+        if let Some(decision) = above {
+            prop_assert!(
+                estimated_resident
+                    .saturating_add(decision.max_request_bytes.saturating_mul(factor))
+                    <= effective
+            );
+        }
 
-        let floor = super::admission::admission_decision(
+        // The commit window (heights <= 411) stays fundable regardless of pool fill.
+        let window = super::admission::admission_decision(
             &config,
             snapshot,
             block::Height(11),
             1_000,
         );
         prop_assert_eq!(
-            floor.expect("floor remains admitted while budget is available").priority,
-            super::admission::RequestPriority::Floor
+            window
+                .expect("the commit window remains admitted while budget is available")
+                .max_request_bytes,
+            1_000
         );
     }
 }

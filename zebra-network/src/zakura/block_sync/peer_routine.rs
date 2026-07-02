@@ -597,16 +597,17 @@ impl PeerRoutine {
             let mut items = if floor_arm_allowed
                 && servable_low <= floor_high
                 && floor_pending.is_some_and(|floor_start| {
-                    // Bound the floor-rescue to the commit-frontier memory window (ZCA-742).
-                    // The commit-frontier block (`verified_tip + 1`) is always allowed for
-                    // liveness (a genuine gap blocking commit is still fetched, and this reaches
-                    // the floor-reservation funding path); but an escalated floor block far ahead
-                    // of the verified tip is refused once the resident-memory look-ahead budget
-                    // is full. Without this, the floor-rescue take sizes by the in-flight budget
-                    // and advances `body_download_floor` unboundedly ahead of commit, filling
-                    // `applying` to the in-flight budget. `floor_take_allowed` (not
-                    // `admission_decision`) is used so an exhausted in-flight budget still lets
-                    // the commit-frontier floor through to its funding path.
+                    // Bound the floor-rescue to the commit-window memory gate (ZCA-742).
+                    // Heights in the commit window (one checkpoint range above the verified
+                    // tip) are always allowed for liveness (a genuine gap blocking commit is
+                    // still fetched — a pinned checkpoint range must fully assemble — and this
+                    // reaches the floor-reservation funding path); but an escalated floor block
+                    // far ahead of the verified tip is refused once the resident-memory
+                    // look-ahead budget is full. Without this, the floor-rescue take sizes by
+                    // the in-flight budget and advances `body_download_floor` unboundedly ahead
+                    // of commit, filling `applying` to the in-flight budget. `floor_take_allowed`
+                    // (not `admission_decision`) is used so an exhausted in-flight budget still
+                    // lets a commit-window floor through to its funding path.
                     floor_take_allowed(
                         &self.config,
                         self.admission_snapshot(view, reserved_above_floor),

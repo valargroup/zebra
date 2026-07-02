@@ -39,11 +39,14 @@ pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
 /// never exceed this worst case and the shrink is always non-negative.
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
-/// Default byte cap for speculative reorder look-ahead above the download floor.
+/// Default cap on the estimated *resident* memory of the look-ahead pipeline.
 ///
-/// The default leaves one advertised response worth of headroom below the global
-/// byte budget. The synchronous floor-pop path is the funding guarantee when
-/// that headroom has been consumed by races or changed configuration.
+/// Denominated in resident bytes, not wire bytes: admission compares it against the
+/// retained and in-flight wire bytes scaled by `DESERIALIZED_MEM_FACTOR` (see
+/// `admission::estimated_resident_pipeline_bytes`), so the default admits roughly a
+/// quarter of its nominal value in wire bytes. The numeric value is kept aligned with
+/// the in-flight wire budget minus one advertised response, which under the resident
+/// interpretation yields a deep (~1.5 GiB wire) look-ahead buffer.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
@@ -379,14 +382,12 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of the buffered bodies
-        // — admission compares it against a stage-aware resident estimate (decoded stages ×
-        // `DESERIALIZED_MEM_FACTOR`, the wire-retained reorder backlog ~1×; see
-        // `admission::estimated_resident_pipeline_bytes`). Cap it against the *resident*
-        // equivalent of the in-flight wire budget; capping against the
-        // raw wire `max_inflight_block_bytes` would pull the resident budget down to a wire
-        // quantity, so a full checkpoint range (which must be co-resident before `verified_tip`
-        // advances during checkpoint sync) could never assemble and sync would deadlock (ZCA-742).
+        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of the buffered and
+        // in-flight bodies — admission compares it against every pool's wire bytes scaled by
+        // `DESERIALIZED_MEM_FACTOR` (see `admission::estimated_resident_pipeline_bytes`).
+        // Cap it against the *resident* equivalent of the in-flight wire budget; capping
+        // against the raw wire `max_inflight_block_bytes` would pull the resident budget down
+        // to a wire quantity, needlessly starving look-ahead depth (ZCA-742).
         self.max_reorder_lookahead_bytes.min(
             self.max_inflight_block_bytes
                 .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
@@ -494,12 +495,13 @@ impl ZakuraBlockSyncConfig {
     /// Clamp the resident look-ahead budget up to hold one worst-case checkpoint range.
     ///
     /// Mirrors [`clamp_inflight_block_bytes_to_floor`] for the resident look-ahead gate.
-    /// Admission bounds buffered decoded bodies at `max_reorder_lookahead_bytes` (interpreted
-    /// as resident memory via [`effective_max_reorder_lookahead_bytes`]), and during checkpoint
-    /// sync `verified_tip` advances only once the whole range is submitted — only the
-    /// commit-frontier block bypasses the gate. A resident budget below one range
-    /// (`BS_CHECKPOINT_RANGE_BYTE_FLOOR * DESERIALIZED_MEM_FACTOR`), or a block cap below one
-    /// range, can therefore never assemble a range: a deadlock. Clamp both up (ZCA-742).
+    /// Defense-in-depth sizing only: checkpoint-sync liveness is guaranteed by the
+    /// commit-window exemption in admission (one whole checkpoint range above the verified
+    /// tip bypasses the gate, so a pinned range always assembles regardless of budget).
+    /// This clamp keeps a sub-range budget from thrashing the gated speculative lane — a
+    /// resident budget below one range (`BS_CHECKPOINT_RANGE_BYTE_FLOOR *
+    /// DESERIALIZED_MEM_FACTOR`), or a block cap below one range, would refuse nearly all
+    /// above-window work. Clamp both up (ZCA-742).
     ///
     /// [`effective_max_reorder_lookahead_bytes`]: Self::effective_max_reorder_lookahead_bytes
     pub fn clamp_reorder_lookahead_to_floor(&mut self) {
