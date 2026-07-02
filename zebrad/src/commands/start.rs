@@ -543,6 +543,10 @@ impl StartCmd {
 
         let mut state_config = config.state.clone();
         state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+        // State owns the VCT commit path, but users configure its checkpoint-sync controls
+        // together under `[consensus]`.
+        state_config.checkpoint_sync = config.consensus.checkpoint_sync;
+        state_config.vct_fast_sync = config.consensus.vct_fast_sync;
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(

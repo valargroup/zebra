@@ -81,11 +81,26 @@ pub fn quick_check(db: &ZebraDb) -> Result<(), String> {
         return Ok(());
     }
 
-    // A fast-sync commit can set the VCT marker after the `is_vct_synced()`
-    // check above but before these tree reads. In that case the readers return
-    // `None` for the absent per-height trees, and this genesis-root check no
-    // longer applies. Non-VCT databases still panic on genuinely missing genesis
-    // trees inside the readers.
+    // The genesis-tree reads below are not race-free against an in-progress fast
+    // sync. This validity check runs on a background thread (see
+    // `DbFormatChange::spawn_format_change`) concurrently with block commits, and
+    // the per-height tree readers (`sapling_tree_by_height` etc.) return `None`
+    // for any height in a fast-synced database's `[U, H)` absent band -- a guard
+    // that re-reads the `vct_synced_below` marker. The `is_vct_synced()` check
+    // above reads that same marker, but a fast-sync commit can set it in the
+    // window between the two reads: this function then passes the `is_vct_synced()`
+    // guard (marker still unset) and *afterwards* a genesis read returns `None`
+    // (marker now set, so height 0 is in the absent band). Before this change the
+    // `.expect("just checked for genesis block")` panicked on exactly that
+    // interleaving, surfacing under the test suite's parallelism as a flaky
+    // `vct_mode_switches_continue_from_safe_boundaries` failure.
+    //
+    // A `None` here can only mean the absent-band guard fired, i.e. the database
+    // is (now) fast-synced and the genesis-root-caching invariant does not apply
+    // to it -- a genuinely missing genesis tree on a non-fast database makes these
+    // readers panic with their own "must exist" message rather than return `None`.
+    // So treat `None` as "invariant not applicable" and return `Ok` instead of
+    // racing the marker.
     let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
     let Some(sprout_genesis_tree) = db.sprout_tree_by_anchor(&sprout_genesis_tree.root()) else {
         return Ok(());

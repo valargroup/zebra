@@ -14,8 +14,8 @@ state as the legacy committer, far less work — and no new cryptography.
 **The one invariant that makes it safe:** _no root influences consensus state until it has been
 authenticated against a header commitment._ Everything else (the transport, the cache, the peer
 policy) is plumbing around that invariant. A root that cannot be obtained or verified is refused,
-never guessed: while VCT fast sync is using verified roots below the last checkpoint, the committer
-stops and retries rather than recomputing from a stale frontier (§8).
+never guessed — inside the post-fold "frozen" window the committer **fails closed** rather than
+recomputing against a now-stale frontier (§8).
 
 **Data flow (fetch + commit path):**
 
@@ -62,9 +62,9 @@ the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (�
 | **last checkpoint height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
 | **Fast root** | A peer-supplied `(sapling_root, orchard_root)` for one height, folded in after verification instead of being recomputed. |
 | **Final frontier** | The real Sapling/Orchard/Sprout note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
-| **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
+| **Frozen frontier** | The window `tip < last_checkpoint_height` during a fast sync where the on-disk frontier is intentionally stale (roots folded, trees not advanced). Legacy recompute here would corrupt state, so the committer fails closed (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
-| **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
+| **Fail closed** | In the frozen window, refuse the commit (retryable) rather than recompute or guess (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `zakura_header_commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
 | **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
 | **Kill switch** | `consensus.vct_fast_sync = false`: keep checkpoint sync but force the legacy committer (§4.4). |

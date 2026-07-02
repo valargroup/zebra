@@ -3037,12 +3037,14 @@ fn v4_with_sapling_outputs_and_no_spends() {
 /// A transaction whose Sapling output has an invalid (off-curve) ephemeral key
 /// is rejected by the verifier with `SmallOrder`.
 ///
-/// The Sapling `cv`/`epk` not-small-order check is deferred from deserialization
-/// and re-enforced in the verifier's early quick checks via
-/// `Transaction::sapling_point_encodings_are_valid`. This drives the full verifier
-/// end-to-end: the state service is `unreachable!` because the check fires before
-/// any state lookup. It mirrors `v4_with_sapling_outputs_and_no_spends` (which
-/// accepts this shape) with only the ephemeral key corrupted.
+/// The not-small-order consensus check for Sapling `cv`/`epk` is deferred from
+/// deserialization (to keep point decompression off the checkpoint-sync hot
+/// path) and re-enforced by `Verifier::call` via
+/// `Transaction::sapling_point_encodings_are_valid`, in the early quick checks.
+/// This drives the full verifier end-to-end and confirms the rejection: the
+/// state service is `unreachable!` because the check fires before any state
+/// lookup. It mirrors `v4_with_sapling_outputs_and_no_spends` (which accepts the
+/// same transaction shape) with only the ephemeral key corrupted.
 #[test]
 fn sapling_output_with_invalid_ephemeral_key_is_rejected() {
     let _init_guard = zebra_test::init();

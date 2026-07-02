@@ -16,25 +16,28 @@ mod test_vectors;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CommitmentRandomness(jubjub::Fr);
 
-/// A Sapling value commitment, stored as its 32-byte compressed encoding.
+/// A Sapling value commitment, stored as its canonical 32-byte compressed
+/// encoding.
 ///
-/// The commitment is a Jubjub point, but decompressing it needs a field square
-/// root, which is expensive. Since the note-commitment tree uses `cm_u` rather
-/// than `cv`, we keep the raw bytes and decompress lazily via
-/// [`ValueCommitment::commitment`], keeping point decompression off the
-/// checkpoint-sync hot path.
+/// The commitment is a Jubjub curve point. Recovering the point from its
+/// encoding requires a field square root (point decompression), which is
+/// expensive, and the note-commitment tree uses the note commitment `cm_u`, not
+/// `cv`, so the point is decompressed lazily via [`ValueCommitment::commitment`]
+/// rather than eagerly at deserialization. This keeps the dominant per-block CPU
+/// cost of checkpoint sync (Jubjub point decompression) off the hot path.
 ///
 /// # Consensus
 ///
-/// Deserialization only checks the byte length; it does not prove the bytes are
-/// a canonical, non-small-order point. The not-small-order check is deferred to
-/// the semantic verifier and mempool, which call
-/// [`ValueCommitment::is_valid_not_small_order`] (via
-/// [`Transaction::sapling_point_encodings_are_valid`]) and also convert the
-/// transaction through librustzcash, whose `read_value_commitment` rejects a
-/// small-order `cv`. The checkpoint verifier trusts block hashes and skips the
-/// check. Covered by
-/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash`.
+/// The not-small-order check that this type used to perform at deserialization
+/// is deferred, but still enforced for every untrusted transaction. The
+/// checkpoint verifier trusts block hashes and does not need it. The semantic
+/// verifier and the mempool convert every transaction via `to_librustzcash`
+/// (`CachedFfiTransaction::new`), and librustzcash enforces the rule at *read*:
+/// `zcash_primitives`'s `read_value_commitment` uses
+/// `ValueCommitment::from_bytes_not_small_order`, so a small-order `cv` makes the
+/// conversion fail and the transaction is rejected. Validated by
+/// `sapling_small_order_cv_epk_deferred_but_caught_by_librustzcash` in
+/// `transaction/tests/vectors.rs`.
 ///
 /// [`Transaction::sapling_point_encodings_are_valid`]: crate::transaction::Transaction::sapling_point_encodings_are_valid
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -45,14 +48,18 @@ impl ValueCommitment {
     /// commitment, or `None` if the stored bytes are not a canonical,
     /// non-small-order Jubjub point.
     ///
-    /// This is the point decompression that deserialization defers, so it is
-    /// fallible: callers must handle an invalid commitment rather than assume the
-    /// stored bytes are valid.
+    /// This performs the point decompression that deserialization defers, so it
+    /// is fallible by design: the encoding is validated only where the point is
+    /// used, and callers must handle an invalid commitment rather than assume it
+    /// is valid. Consensus validation of the encoding happens on the semantic
+    /// path via [`crate::transaction::Transaction::sapling_point_encodings_are_valid`]
+    /// and `to_librustzcash`; the checkpoint verifier trusts block hashes and
+    /// never calls this.
     pub fn commitment(&self) -> Option<sapling_crypto::value::ValueCommitment> {
         sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).into_option()
     }
 
-    /// Return the stored 32-byte (little-endian) compressed encoding.
+    /// Return the canonical 32-byte (little-endian) compressed encoding.
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0
     }
@@ -60,15 +67,21 @@ impl ValueCommitment {
     /// Returns true if the stored encoding is a canonical, non-small-order
     /// Jubjub point, i.e. a valid value commitment per the consensus rules.
     ///
-    /// This is the not-small-order check deferred from deserialization, run by
-    /// the semantic verifier (not the checkpoint verifier) on untrusted
-    /// transactions.
+    /// This performs the point decompression that deserialization defers; it is
+    /// called by the semantic verifier (not the checkpoint verifier) to enforce
+    /// the not-small-order rule on untrusted transactions.
     ///
-    /// To stay in consensus with the rest of the network, this must accept
-    /// exactly the `cv` encodings librustzcash accepts, so it calls the same
-    /// `from_bytes_not_small_order` that `read_value_commitment` uses. Do not
-    /// swap in a different decoder. Equivalence is pinned by
-    /// `sapling_point_checks_match_librustzcash_predicates`.
+    /// # Consensus equivalence
+    ///
+    /// This MUST accept exactly the encodings that librustzcash accepts for a
+    /// `cv` on the verification path. If it diverged, Zebra and the rest of the
+    /// network would disagree on transaction validity — a chain split, not a
+    /// local bug. `zcash_primitives`'s `read_value_commitment` rejects a `cv`
+    /// unless `sapling_crypto::value::ValueCommitment::from_bytes_not_small_order`
+    /// returns a point, so this calls that exact function. Do not reimplement it
+    /// in terms of a different decoder. The equivalence is pinned by
+    /// `sapling_point_checks_match_librustzcash_predicates` in
+    /// `transaction/tests/vectors.rs`.
     pub fn is_valid_not_small_order(&self) -> bool {
         bool::from(
             sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&self.0).is_some(),
@@ -136,9 +149,9 @@ impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
 
 impl ZcashDeserialize for ValueCommitment {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        // Store the raw bytes without decompressing the Jubjub point; the point
-        // and its not-small-order check are recovered lazily in
-        // `ValueCommitment::commitment`.
+        // Store the canonical encoding without decompressing the Jubjub point.
+        // The point (and its non-small-order check) is recovered lazily in
+        // `ValueCommitment::commitment`, only where the point is actually needed.
         let mut bytes = [0u8; 32];
         reader.read_exact(&mut bytes)?;
         Ok(Self(bytes))

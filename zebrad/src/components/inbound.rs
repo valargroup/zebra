@@ -422,7 +422,12 @@ impl Service<zn::Request> for Inbound {
                     Ok(response)
                 }.boxed()
             }
-            zn::Request::BlocksByHash(hashes) | zn::Request::BlocksByHashFrom { hashes, .. } => {
+            // `HedgedBlocksByHash` is an outbound-only routing directive (the peer set
+            // rewrites it before it reaches a peer), so peers never send it to us. Handle
+            // it identically as a defensive fallback.
+            zn::Request::BlocksByHash(hashes)
+            | zn::Request::BlocksByHashFrom { hashes, .. }
+            | zn::Request::HedgedBlocksByHash { hashes, .. } => {
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
                 if hashes.is_empty() {

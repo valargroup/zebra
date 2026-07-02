@@ -103,6 +103,30 @@ pub enum Request {
         source: PeerSource,
     },
 
+    /// Hedged single-block download.
+    ///
+    /// Fans the request out to up to `fanout` random ready peers, *ignoring
+    /// inventory markers*, and returns the first peer that delivers the block.
+    ///
+    /// This is used only for the head-of-line block after a registry-miss, to
+    /// bypass stale "missing" inventory markers: the peers usually do have the
+    /// block, only the local marker is stale. The peer set rewrites this to a
+    /// per-peer [`Request::BlocksByHash`], so peers and connections see a normal
+    /// request and no wire/connection changes are needed.
+    ///
+    /// The set must contain exactly one hash. A small `fanout` keeps this
+    /// DoS-bounded; it is clamped to the number of ready peers.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    HedgedBlocksByHash {
+        /// Requested block hashes (exactly one).
+        hashes: HashSet<block::Hash>,
+        /// Maximum number of ready peers to fan the request out to.
+        fanout: usize,
+    },
+
     /// Request transactions by their unmined transaction ID.
     ///
     /// v4 transactions use a legacy transaction ID, and
@@ -275,6 +299,9 @@ impl fmt::Display for Request {
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
+            Request::HedgedBlocksByHash { hashes, fanout } => {
+                format!("HedgedBlocksByHash({}, fanout: {fanout})", hashes.len())
+            }
             Request::TransactionsById(ids) => format!("TransactionsById({})", ids.len()),
             Request::TransactionsByIdFrom { ids, .. } => {
                 format!("TransactionsByIdFrom({})", ids.len())
@@ -310,7 +337,9 @@ impl Request {
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
+            Request::BlocksByHash(_)
+            | Request::BlocksByHashFrom { .. }
+            | Request::HedgedBlocksByHash { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -332,6 +361,7 @@ impl Request {
             self,
             Request::BlocksByHash(_)
                 | Request::BlocksByHashFrom { .. }
+                | Request::HedgedBlocksByHash { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
         )
@@ -342,6 +372,10 @@ impl Request {
         match self {
             Request::BlocksByHash(block_hashes)
             | Request::BlocksByHashFrom {
+                hashes: block_hashes,
+                ..
+            }
+            | Request::HedgedBlocksByHash {
                 hashes: block_hashes,
                 ..
             } => block_hashes.clone(),

@@ -41,7 +41,8 @@ zebra-checkpoints = [
     "itertools",
     "tokio",
     "zebra-chain/json-conversion",
-    "zebra-node-services/rpc-client"
+    "zebra-node-services/rpc-client",
+    "zebra-state",
 ]
 
 search-issue-refs = [
@@ -62,6 +63,7 @@ thiserror = { workspace = true }
 
 zebra-node-services = { path = "../zebra-node-services", version = "7.0.0" }
 zebra-chain = { path = "../zebra-chain", version = "9.0.0" }
+zebra-state = { path = "../zebra-state", version = "8.0.0", optional = true }
 
 # These crates are needed for the block-template-to-proposal binary
 zebra-rpc = { path = "../zebra-rpc", version = "9.0.0" }
