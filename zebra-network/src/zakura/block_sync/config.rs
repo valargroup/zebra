@@ -379,8 +379,16 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        self.max_reorder_lookahead_bytes
-            .min(self.max_inflight_block_bytes)
+        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of buffered decoded
+        // bodies — admission compares it against `held_wire * DESERIALIZED_MEM_FACTOR`. Cap it
+        // against the *resident* equivalent of the in-flight wire budget; capping against the
+        // raw wire `max_inflight_block_bytes` would pull the resident budget down to a wire
+        // quantity, so a full checkpoint range (which must be co-resident before `verified_tip`
+        // advances during checkpoint sync) could never assemble and sync would deadlock (ZCA-742).
+        self.max_reorder_lookahead_bytes.min(
+            self.max_inflight_block_bytes
+                .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
+        )
     }
 
     /// Return the floor avoid cooldown clamped to a positive duration.
@@ -478,6 +486,46 @@ impl ZakuraBlockSyncConfig {
                  floor; clamping it up so checkpoint sync cannot deadlock",
             );
             self.max_inflight_block_bytes = BS_CHECKPOINT_RANGE_BYTE_FLOOR;
+        }
+    }
+
+    /// Clamp the resident look-ahead budget up to hold one worst-case checkpoint range.
+    ///
+    /// Mirrors [`clamp_inflight_block_bytes_to_floor`] for the resident look-ahead gate.
+    /// Admission bounds buffered decoded bodies at `max_reorder_lookahead_bytes` (interpreted
+    /// as resident memory via [`effective_max_reorder_lookahead_bytes`]), and during checkpoint
+    /// sync `verified_tip` advances only once the whole range is submitted — only the
+    /// commit-frontier block bypasses the gate. A resident budget below one range
+    /// (`BS_CHECKPOINT_RANGE_BYTE_FLOOR * DESERIALIZED_MEM_FACTOR`), or a block cap below one
+    /// range, can therefore never assemble a range: a deadlock. Clamp both up (ZCA-742).
+    ///
+    /// [`effective_max_reorder_lookahead_bytes`]: Self::effective_max_reorder_lookahead_bytes
+    pub fn clamp_reorder_lookahead_to_floor(&mut self) {
+        let resident_range_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR
+            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR);
+        if self.max_reorder_lookahead_bytes > 0
+            && self.max_reorder_lookahead_bytes < resident_range_floor
+        {
+            tracing::warn!(
+                configured_max_reorder_lookahead_bytes = self.max_reorder_lookahead_bytes,
+                resident_checkpoint_range_floor = resident_range_floor,
+                "zakura.block_sync.max_reorder_lookahead_bytes is below the resident \
+                 checkpoint-range floor; clamping it up so checkpoint sync cannot deadlock",
+            );
+            self.max_reorder_lookahead_bytes = resident_range_floor;
+        }
+
+        let block_floor =
+            u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES).unwrap_or(u32::MAX);
+        if self.max_reorder_lookahead_blocks > 0 && self.max_reorder_lookahead_blocks < block_floor
+        {
+            tracing::warn!(
+                configured_max_reorder_lookahead_blocks = self.max_reorder_lookahead_blocks,
+                checkpoint_range_block_floor = block_floor,
+                "zakura.block_sync.max_reorder_lookahead_blocks is below one checkpoint range; \
+                 clamping it up so checkpoint sync cannot deadlock",
+            );
+            self.max_reorder_lookahead_blocks = block_floor;
         }
     }
 

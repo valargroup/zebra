@@ -268,4 +268,75 @@ mod tests {
         assert!(fast > now + TIMEOUT);
         assert!(fast < now + TIMEOUT + Duration::from_millis(100));
     }
+
+    /// ZCA-742 checkpoint-sync deadlock regression: during checkpoint sync `verified_tip`
+    /// stays pinned to the previous checkpoint until the whole range (up to
+    /// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` blocks) is co-resident, and only the
+    /// commit-frontier block bypasses the resident-memory gate. So the resident look-ahead
+    /// budget must admit a full range or checkpoint sync wedges. A legal 1 GiB in-flight
+    /// budget must allow it (the earlier `min(max_reorder, max_inflight)` collapsed the
+    /// resident budget to the 1 GiB *wire* value, admitting only ~256 MB of wire bodies).
+    #[test]
+    fn checkpoint_range_fits_under_one_gib_inflight_budget() {
+        use super::super::config::{
+            BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
+            MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+        };
+
+        let config = ZakuraBlockSyncConfig {
+            max_inflight_block_bytes: 1024 * 1024 * 1024,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let range_resident = BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR);
+        assert!(
+            config.effective_max_reorder_lookahead_bytes() >= range_resident,
+            "effective resident look-ahead ({}) must hold one checkpoint range ({})",
+            config.effective_max_reorder_lookahead_bytes(),
+            range_resident,
+        );
+
+        // One block short of a full co-resident range, with `verified_tip` pinned at 0 so the
+        // range's heights are memory-gated (not commit-frontier exempt). The final block must
+        // still be admitted, or the range could never assemble.
+        let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+            .expect("checkpoint range block count fits in u32");
+        let snapshot = AdmissionSnapshot {
+            download_floor: block::Height(range_blocks - 1),
+            verified_block_tip: block::Height(0),
+            reorder_buffered_bytes: 0,
+            reorder_buffered_blocks: 0,
+            applying_buffered_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - BS_PER_BLOCK_WORST_CASE_BYTES,
+            applying_buffered_blocks: u64::from(range_blocks) - 1,
+            sequencer_input_queued_bytes: 0,
+            reserved_above_floor_bytes: 0,
+            reserved_above_floor_blocks: 0,
+            budget_available: config.max_inflight_block_bytes,
+        };
+        assert!(
+            admission_decision(&config, snapshot, block::Height(range_blocks), u64::MAX).is_some(),
+            "the final block of a checkpoint range must be admissible under a 1 GiB in-flight budget",
+        );
+    }
+
+    /// A sub-range configured budget/block cap is clamped up so checkpoint sync cannot wedge.
+    #[test]
+    fn clamp_reorder_lookahead_floors_sub_range_configs() {
+        use super::super::config::{
+            BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+        };
+        let mut config = ZakuraBlockSyncConfig {
+            max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB resident, far below one range
+            max_reorder_lookahead_blocks: 8,          // far below one range
+            ..ZakuraBlockSyncConfig::default()
+        };
+        config.clamp_reorder_lookahead_to_floor();
+        assert!(
+            config.max_reorder_lookahead_bytes
+                >= BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR)
+        );
+        assert!(
+            config.max_reorder_lookahead_blocks as usize
+                >= MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
+        );
+    }
 }
