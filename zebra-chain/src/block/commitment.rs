@@ -397,6 +397,16 @@ pub enum CommitmentError {
     },
 
     #[error(
+        "invalid auth data root: expected {:?}, actual: {:?}",
+        hex::encode(expected),
+        hex::encode(actual)
+    )]
+    InvalidAuthDataRoot {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
+    #[error(
         "invalid pre-NU5 orchard root: expected the empty-tree root {:?}, actual: {:?}",
         hex::encode(expected),
         hex::encode(actual)
