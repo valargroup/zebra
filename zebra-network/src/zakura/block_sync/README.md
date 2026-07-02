@@ -75,9 +75,9 @@ range can never assemble and sync wedges. The span is deliberately a constant, n
 `config.submitted_apply_limit()`: that knob has no ceiling, and a huge configured
 submit window would widen the exemption until the memory gate is disabled.
 
-Because the window is anchored to the **verified tip**, it advances only on commit —
-this is what breaks the escalator: a floor that has run far ahead of commit is just
-another gated height.
+Because the window is anchored to the **verified tip**, it advances only on commit. This is
+in contrast to the donwload floor that moves on every download and can run
+far ahead of commit.
 
 ### Decision table
 
