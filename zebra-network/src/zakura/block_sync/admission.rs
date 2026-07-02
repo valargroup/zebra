@@ -171,20 +171,13 @@ fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
     )
 }
 
-/// Estimated resident memory of the block bodies the pipeline has retained or is
-/// committed to fetch.
+/// Estimated resident memory of block bodies retained by, or already committed
+/// to enter, the pipeline.
 ///
-/// Every pool is charged at its *eventual* decoded cost (`× DESERIALIZED_MEM_FACTOR`),
-/// not its current retention state:
-/// - `applying_buffered_bytes` and `sequencer_input_queued_bytes` already hold decoded
-///   bodies (`Arc<Block>`), retained until the verified tip advances.
-/// - `reorder_buffered_bytes` is wire-retained today (`reorder::retain_for_backlog`),
-///   but the reorder→applying drain decodes the whole contiguous prefix unconditionally
-///   the moment a gap fills, with no admission re-gate — charging reorder below its
-///   decoded cost lets a gap-fill drain burst breach the budget after admission.
-/// - `reserved_above_floor_bytes` are outstanding requests whose bodies land and decode
-///   the same way; charging them nothing makes in-flight volume invisible to the gate
-///   until it is already resident.
+/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`).Applying and
+/// sequencer queues already hold decoded blocks; reorder and reserved bytes may
+/// still be wire/in-flight, but a gap-fill can decode them into applying without
+/// another admission check.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     snapshot
         .reorder_buffered_bytes
