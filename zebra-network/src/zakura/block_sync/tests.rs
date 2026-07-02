@@ -1334,8 +1334,9 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
-    assert_eq!(above.max_request_bytes, 25);
+    // The reorder backlog is wire-retained (charged ~1×), so remaining resident headroom is
+    // (500 - 100) / 4 = 100 wire bytes for the next (decoded) body.
+    assert_eq!(above.max_request_bytes, 100);
 }
 
 #[test]
@@ -1426,6 +1427,42 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
             .priority,
         super::admission::RequestPriority::Floor
     );
+}
+
+#[test]
+fn reorder_and_reservations_are_not_charged_as_decoded_resident_memory() {
+    // The reorder backlog is wire-retained (~1×) and above-floor reservations are for bytes
+    // not yet received (0× resident), so neither is charged at the decoded multiple. Charging
+    // them ×4 (the old flat model) throttled look-ahead depth up to ~4× below the configured
+    // budget in the reorder-/reservation-heavy burst states this budget exists to deepen.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        max_reorder_lookahead_blocks: 100,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 700,
+        reorder_buffered_blocks: 1,
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 700,
+        reserved_above_floor_blocks: 1,
+        budget_available: 64_000_000,
+    };
+    // Old flat model: (700 + 700) * 4 = 5_600 >= 1_000 → denied. Stage-aware: reorder 700 (×1)
+    // + reserved 0 = 700 < 1_000 → admitted with (1_000 - 700) / 4 = 75 wire bytes of headroom.
+    let above =
+        super::admission::admission_decision(&config, snapshot, block::Height(12), u64::MAX)
+            .expect("wire-retained backlog + unreceived reservations must not be charged decoded");
+    assert_eq!(
+        above.priority,
+        super::admission::RequestPriority::AboveFloor
+    );
+    assert_eq!(above.max_request_bytes, 75);
 }
 
 #[test]
@@ -3532,27 +3569,37 @@ proptest::proptest! {
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
         };
-        let held_bytes = reorder_bytes
-            .saturating_add(applying_bytes)
-            .saturating_add(input_bytes)
-            .saturating_add(reserved_bytes);
+        // Stage-aware resident estimate: decoded stages (applying + sequencer input) at
+        // ×factor, the wire-retained reorder backlog at ~1×, and reservations 0× — mirrors
+        // admission::estimated_resident_pipeline_bytes.
+        let factor = super::admission::DESERIALIZED_MEM_FACTOR;
+        let estimated_resident = reorder_bytes
+            .saturating_add(applying_bytes.saturating_mul(factor))
+            .saturating_add(input_bytes.saturating_mul(factor));
         let held_blocks = reorder_blocks
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
+        let effective = config.effective_max_reorder_lookahead_bytes();
         let above = super::admission::admission_decision(
             &config,
             snapshot,
             block::Height(12),
             1_000,
         );
-        // The look-ahead byte budget bounds resident memory (serialized * factor), not wire bytes.
-        if held_bytes.saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR)
-            >= config.effective_max_reorder_lookahead_bytes()
+        if estimated_resident >= effective
             || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
         {
             prop_assert_eq!(above, None);
         } else {
-            prop_assert!(above.is_some());
+            // A non-frontier request funds min(budget, remaining_wire, response_cap); the next
+            // body is sized as decoded, so remaining_wire = (effective - resident) / factor.
+            let remaining_wire = (effective - estimated_resident) / factor;
+            let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
+            if expected > 0 {
+                prop_assert_eq!(above.map(|d| d.max_request_bytes), Some(expected));
+            } else {
+                prop_assert_eq!(above, None);
+            }
         }
 
         let floor = super::admission::admission_decision(

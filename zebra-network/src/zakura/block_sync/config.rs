@@ -379,9 +379,11 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of buffered decoded
-        // bodies — admission compares it against `held_wire * DESERIALIZED_MEM_FACTOR`. Cap it
-        // against the *resident* equivalent of the in-flight wire budget; capping against the
+        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of the buffered bodies
+        // — admission compares it against a stage-aware resident estimate (decoded stages ×
+        // `DESERIALIZED_MEM_FACTOR`, the wire-retained reorder backlog ~1×; see
+        // `admission::estimated_resident_pipeline_bytes`). Cap it against the *resident*
+        // equivalent of the in-flight wire budget; capping against the
         // raw wire `max_inflight_block_bytes` would pull the resident budget down to a wire
         // quantity, so a full checkpoint range (which must be co-resident before `verified_tip`
         // advances during checkpoint sync) could never assemble and sync would deadlock (ZCA-742).

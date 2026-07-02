@@ -13,11 +13,14 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 
 /// Estimated resident-memory multiple of a buffered block body's serialized size.
 ///
-/// Buffered bodies are held decoded (`Arc<Block>`, `sequencer::ApplyingBlock`), whose
-/// in-memory footprint is several times their wire/serialized size. The look-ahead byte
-/// budget must bound that *resident* cost, not the wire bytes, or a small-block backlog
-/// blows past the intended memory ceiling — the ZCA-742 OOM, where ~569k decoded blocks
-/// held under a wire-byte cap reached ~26 GiB RSS.
+/// Decoded bodies (`Arc<Block>`, `sequencer::ApplyingBlock`) have an in-memory footprint
+/// several times their wire/serialized size. The look-ahead budget must bound that *resident*
+/// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling —
+/// the ZCA-742 OOM, where ~569k decoded blocks held under a wire-byte cap reached ~26 GiB RSS.
+///
+/// Applied only to the *decoded* pipeline stages (applying + sequencer input); the
+/// wire-retained reorder backlog is charged ~1× and unreceived reservations 0×. See
+/// [`estimated_resident_pipeline_bytes`].
 ///
 // TODO(ZCA-742): replace this flat factor with a precise per-block heap-size estimate
 // (a structural walk, or a `GetSize`-style measure on `Block`), so the budget tracks real
@@ -111,15 +114,34 @@ fn commit_frontier(snapshot: &AdmissionSnapshot) -> block::Height {
     next_height(snapshot.verified_block_tip).unwrap_or(snapshot.verified_block_tip)
 }
 
-/// Estimated resident memory of the decoded bodies already held in the pipeline
-/// (`held wire bytes * DESERIALIZED_MEM_FACTOR`).
-fn held_memory_bytes(snapshot: &AdmissionSnapshot) -> u64 {
+/// Resident bytes of a decoded pipeline stage holding `wire_bytes` of block bodies
+/// (`wire_bytes * DESERIALIZED_MEM_FACTOR`).
+fn decoded_resident_bytes(wire_bytes: u64) -> u64 {
+    wire_bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
+}
+
+/// Estimated resident memory of the block bodies already held in the pipeline.
+///
+/// Stage-aware, because the pools differ in resident cost:
+/// - `applying_buffered_bytes` and `sequencer_input_queued_bytes` hold *decoded* bodies, so
+///   they cost `DESERIALIZED_MEM_FACTOR`× their wire size.
+/// - `reorder_buffered_bytes` is the wire-retained backlog (bodies are stripped to their
+///   `RawFramePayload` and re-decoded only on drain — see `reorder::retain_for_backlog`), so
+///   it costs ~1× (wire).
+/// - `reserved_above_floor_bytes` are worst-case reservations for bytes *not yet received*, so
+///   they hold no resident memory yet and are not charged here (they still count toward the
+///   block cap via [`held_blocks`], and toward the in-flight byte budget elsewhere).
+///
+/// Charging the wire-retained backlog and unreceived reservations at the decoded multiple
+/// (the earlier flat model) throttled effective look-ahead depth up to ~4× below the
+/// configured budget in reorder-/reservation-heavy burst states.
+fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     snapshot
         .reorder_buffered_bytes
-        .saturating_add(snapshot.applying_buffered_bytes)
-        .saturating_add(snapshot.sequencer_input_queued_bytes)
-        .saturating_add(snapshot.reserved_above_floor_bytes)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR)
+        .saturating_add(decoded_resident_bytes(snapshot.applying_buffered_bytes))
+        .saturating_add(decoded_resident_bytes(
+            snapshot.sequencer_input_queued_bytes,
+        ))
 }
 
 fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
@@ -131,7 +153,7 @@ fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
 
 /// Whether the resident-memory look-ahead budget (or the block cap) is already full.
 fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSnapshot) -> bool {
-    held_memory_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
+    estimated_resident_pipeline_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
         || held_blocks(snapshot) >= u64::from(config.max_reorder_lookahead_blocks)
 }
 
@@ -161,8 +183,9 @@ pub(super) fn floor_take_allowed(
 /// fundable, so the committer can advance and drain the pipeline even when the look-ahead
 /// budget is full. Every other request — floor-priority included — is admitted only while
 /// the configured look-ahead limits still have capacity, measured against the *resident*
-/// memory of the buffered decoded bodies (`held_bytes * DESERIALIZED_MEM_FACTOR`) rather
-/// than their wire bytes.
+/// memory of the buffered bodies (see [`estimated_resident_pipeline_bytes`]: decoded stages
+/// cost `DESERIALIZED_MEM_FACTOR`×, the wire-retained reorder backlog ~1×, and unreceived
+/// reservations nothing) rather than a flat multiple of all wire bytes.
 ///
 /// Gating the floor lane (with only the commit-frontier exempt) is what bounds the applying
 /// queue: the download floor advances on every download, so a floor exemption tied to it
@@ -187,10 +210,11 @@ pub(super) fn admission_decision(
             return None;
         }
         // Remaining memory headroom, expressed back in wire bytes for the response cap so a
-        // single response can't push resident memory past the budget.
+        // single response can't push resident memory past the budget. The next admitted body
+        // will usually become decoded soon, so it is sized as if it costs the decoded multiple.
         let remaining_wire_bytes = config
             .effective_max_reorder_lookahead_bytes()
-            .saturating_sub(held_memory_bytes(&snapshot))
+            .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
             / DESERIALIZED_MEM_FACTOR;
         snapshot
             .budget_available
