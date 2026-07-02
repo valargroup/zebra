@@ -29,7 +29,7 @@ pub(super) use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
 /// running Sapling/Orchard frontiers are never advanced. To let post-checkpoint
 /// semantic verification resume, the real frontiers at the checkpoint are supplied
 /// here, verified (`frontier.root() == the verified root at the checkpoint`), and
-/// written as the tip treestate at the handoff. Subtree tips are not carried: the
+/// written as the tip treestate at the last checkpoint. Subtree tips are not carried: the
 /// resuming chain recomputes them from the frontier position.
 #[derive(Clone, Debug)]
 pub(super) struct FinalFrontiers {
