@@ -272,6 +272,11 @@ impl DbFormatChange {
         matches!(self, Upgrade { .. })
     }
 
+    /// Returns true if this format change indicates a newly created database.
+    pub fn is_newly_created(&self) -> bool {
+        matches!(self, NewlyCreated { .. })
+    }
+
     /// Returns true if this format change/check happens at startup.
     #[allow(dead_code)]
     pub fn is_run_at_startup(&self) -> bool {

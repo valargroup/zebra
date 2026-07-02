@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Read-only finalized-state opens now verify the configured cache directory
+  without creating it, skip automatic database reuse, and reject missing
+  database paths before opening RocksDB.
 - Bumped the state database format to 28 during upgrade, backfilling empty
   Ironwood tree, value pool, and index data, then rebuilding stored history tree
   entries so they use the Ironwood-capable entry size.

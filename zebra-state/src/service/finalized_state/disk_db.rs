@@ -1003,7 +1003,11 @@ impl DiskDb {
     ) -> DiskDb {
         // If the database is ephemeral, we don't need to check the cache directory.
         if !config.ephemeral {
-            DiskDb::validate_cache_dir(&config.cache_dir);
+            if read_only {
+                DiskDb::check_cache_dir_readable(&config.cache_dir);
+            } else {
+                DiskDb::validate_cache_dir(&config.cache_dir);
+            }
         }
 
         let db_kind = db_kind.as_ref();
@@ -1696,6 +1700,21 @@ impl DiskDb {
             assert!(
                 self.zs_is_empty(&default_cf),
                 "Zebra should not store data in the 'default' column family"
+            );
+        }
+    }
+
+    // Checks that a cache directory already exists and is readable, without creating it.
+    //
+    // Used when opening a read-only secondary instance, which must never create the
+    // primary's cache directory.
+    pub(crate) fn check_cache_dir_readable(cache_dir: &Path) {
+        if let Err(e) = fs::read_dir(cache_dir) {
+            panic!(
+                "cannot open read-only state: cache directory {cache_dir:?} is missing or unreadable. \
+                 Hint: a read-only state requires an existing Zebra cache directory; check that the \
+                 state cache_dir in the Zebra config points at a running Zebra node's cache directory. \
+                 Error: {e}"
             );
         }
     }

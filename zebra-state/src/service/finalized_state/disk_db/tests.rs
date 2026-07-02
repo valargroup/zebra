@@ -72,3 +72,24 @@ fn zs_iter_opts_increments_key_by_one() {
         }
     }
 }
+
+#[test]
+#[should_panic(expected = "cannot open read-only state: cache directory")]
+fn read_only_cache_dir_check_does_not_create_missing_dir() {
+    let _init_guard = zebra_test::init();
+
+    let tempdir = tempfile::tempdir().expect("temporary cache parent is created");
+    let missing_cache_dir = tempdir.path().join("missing-cache");
+
+    let result = std::panic::catch_unwind(|| {
+        DiskDb::check_cache_dir_readable(&missing_cache_dir);
+    });
+
+    assert!(result.is_err());
+    assert!(
+        !missing_cache_dir.exists(),
+        "read-only cache check must not create a missing cache directory"
+    );
+
+    std::panic::resume_unwind(result.expect_err("read-only cache check should panic"));
+}
