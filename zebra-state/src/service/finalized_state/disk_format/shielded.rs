@@ -9,7 +9,7 @@ use bincode::Options;
 
 use zebra_chain::{
     block::Height,
-    orchard, sapling, sprout,
+    ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
@@ -38,6 +38,15 @@ impl IntoDisk for orchard::Nullifier {
 
     fn as_bytes(&self) -> Self::Bytes {
         let nullifier: orchard::Nullifier = *self;
+        nullifier.into()
+    }
+}
+
+impl IntoDisk for ironwood::Nullifier {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let nullifier: ironwood::Nullifier = *self;
         nullifier.into()
     }
 }

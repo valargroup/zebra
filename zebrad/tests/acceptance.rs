@@ -4008,8 +4008,8 @@ async fn has_spending_transaction_ids() -> Result<()> {
                 .map(Spend::from)
                 .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                 .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
-                .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
+                .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                .chain(tx.ironwood_nullifiers().map(Spend::from))
                 .map(|spend| (spend, tx_hash))
                 .collect::<Vec<_>>()
         });

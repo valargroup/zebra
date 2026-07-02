@@ -367,7 +367,7 @@ impl ZcashSerialize for Option<orchard::ShieldedData> {
     /// rules, where the cross-address bit is reserved.
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         serialize_optional_orchard_shielded_data_with_flags(
-            self,
+            self.as_ref(),
             &mut writer,
             !ALLOW_CROSS_ADDRESS_BIT,
         )
@@ -375,7 +375,7 @@ impl ZcashSerialize for Option<orchard::ShieldedData> {
 }
 
 fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
-    orchard_shielded_data: &Option<orchard::ShieldedData>,
+    orchard_shielded_data: Option<&orchard::ShieldedData>,
     mut writer: W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
@@ -452,6 +452,22 @@ impl ZcashSerialize for orchard::ShieldedData {
     /// rules, where the cross-address bit is reserved.
     fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
         serialize_orchard_shielded_data_with_flags(self, writer, !ALLOW_CROSS_ADDRESS_BIT)
+    }
+}
+
+impl ZcashSerialize for orchard::ShieldedDataV6 {
+    /// Serializes v6 Orchard shielded data using the NU6.3 Orchard-style flag
+    /// rules, where the cross-address bit is permitted.
+    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+        serialize_orchard_shielded_data_with_flags(self.data(), writer, ALLOW_CROSS_ADDRESS_BIT)
+    }
+}
+
+impl ZcashSerialize for ironwood::ShieldedData {
+    /// Serializes Ironwood shielded data using the NU6.3 Orchard-style flag
+    /// rules, where the cross-address bit is permitted.
+    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+        serialize_orchard_shielded_data_with_flags(self.data(), writer, ALLOW_CROSS_ADDRESS_BIT)
     }
 }
 
@@ -799,7 +815,7 @@ impl ZcashSerialize for Transaction {
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
+                    orchard_shielded_data.as_ref(),
                     &mut writer,
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -858,7 +874,9 @@ impl ZcashSerialize for Transaction {
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
+                    orchard_shielded_data
+                        .as_ref()
+                        .map(orchard::ShieldedDataV6::data),
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -868,7 +886,9 @@ impl ZcashSerialize for Transaction {
                 // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    ironwood_shielded_data,
+                    ironwood_shielded_data
+                        .as_ref()
+                        .map(ironwood::ShieldedData::data),
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -1210,7 +1230,8 @@ impl ZcashDeserialize for Transaction {
                 let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
-                )?;
+                )?
+                .map(orchard::ShieldedDataV6::new);
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
                 // `vActionsIronwood`, `flagsIronwood`, `valueBalanceIronwood`,
@@ -1219,7 +1240,9 @@ impl ZcashDeserialize for Transaction {
                 let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
                     ALLOW_CROSS_ADDRESS_BIT,
-                )?;
+                )?
+                .map(orchard::ShieldedDataV6::new)
+                .map(ironwood::ShieldedData::new);
 
                 Ok(Transaction::V6 {
                     network_upgrade,

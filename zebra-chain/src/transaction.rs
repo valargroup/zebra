@@ -165,8 +165,8 @@ pub enum Transaction {
         outputs: Vec<transparent::Output>,
         /// The sapling shielded data for this transaction, if any.
         sapling_shielded_data: Option<sapling::ShieldedData<sapling::SharedAnchor>>,
-        /// The orchard data for this transaction, if any.
-        orchard_shielded_data: Option<orchard::ShieldedData>,
+        /// The v6 Orchard data for this transaction, if any.
+        orchard_shielded_data: Option<orchard::ShieldedDataV6>,
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
@@ -1127,7 +1127,9 @@ impl Transaction {
             Transaction::V6 {
                 orchard_shielded_data,
                 ..
-            } => orchard_shielded_data.as_ref(),
+            } => orchard_shielded_data
+                .as_ref()
+                .map(orchard::ShieldedDataV6::data),
 
             // No Orchard shielded data
             Transaction::V1 { .. }
@@ -1203,7 +1205,7 @@ impl Transaction {
 
     /// Access the [`ironwood::Nullifier`]s in this transaction, if there are
     /// any, regardless of version.
-    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = &ironwood::Nullifier> {
+    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = ironwood::Nullifier> + '_ {
         self.ironwood_shielded_data()
             .into_iter()
             .flat_map(ironwood::ShieldedData::nullifiers)
@@ -1892,7 +1894,7 @@ impl Transaction {
             Transaction::V6 {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
-            } => Some(orchard_shielded_data),
+            } => Some(orchard_shielded_data.data_mut()),
 
             Transaction::V1 { .. }
             | Transaction::V2 { .. }

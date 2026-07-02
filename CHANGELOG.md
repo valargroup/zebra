@@ -90,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Split V6 Orchard and Ironwood shielded data/nullifiers into distinct wrapper
+  types while preserving their Orchard-style wire encoding and proof machinery.
 - Increased Zakura's default connection, handshake, stream-open, and QUIC
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather

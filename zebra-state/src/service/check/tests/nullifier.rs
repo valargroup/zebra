@@ -993,8 +993,9 @@ proptest! {
             .zcash_deserialize_into::<Block>()
             .expect("block should deserialize");
 
-        let duplicate_nullifier = authorized_action1.action.nullifier;
-        authorized_action2.action.nullifier = duplicate_nullifier;
+        let duplicate_orchard_nullifier = authorized_action1.action.nullifier;
+        authorized_action2.action.nullifier = duplicate_orchard_nullifier;
+        let duplicate_nullifier = ironwood::Nullifier::from(duplicate_orchard_nullifier);
 
         let transaction1 = Arc::new(transaction_v6_with_ironwood_shielded_data(
             ironwood_shielded_data1.0,

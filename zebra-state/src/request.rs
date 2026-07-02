@@ -45,11 +45,7 @@ use crate::{
 /// This enum supports [`transparent::OutPoint`], [`sprout::Nullifier`],
 /// [`sapling::Nullifier`], [`orchard::Nullifier`], and [`ironwood::Nullifier`] spends.
 ///
-/// This enum implements `From` for [`transparent::OutPoint`], [`sprout::Nullifier`], and
-/// [`sapling::Nullifier`].
-///
-/// Orchard and Ironwood nullifiers share the same concrete type, so callers must construct
-/// [`Spend::Orchard`] or [`Spend::Ironwood`] explicitly.
+/// This enum implements `From` for each supported spend identifier.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg(feature = "indexer")]
 pub enum Spend {
@@ -83,6 +79,20 @@ impl From<sprout::Nullifier> for Spend {
 impl From<sapling::Nullifier> for Spend {
     fn from(sapling_nullifier: sapling::Nullifier) -> Self {
         Self::Sapling(sapling_nullifier)
+    }
+}
+
+#[cfg(feature = "indexer")]
+impl From<orchard::Nullifier> for Spend {
+    fn from(orchard_nullifier: orchard::Nullifier) -> Self {
+        Self::Orchard(orchard_nullifier)
+    }
+}
+
+#[cfg(feature = "indexer")]
+impl From<ironwood::Nullifier> for Spend {
+    fn from(ironwood_nullifier: ironwood::Nullifier) -> Self {
+        Self::Ironwood(ironwood_nullifier)
     }
 }
 

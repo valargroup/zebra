@@ -162,7 +162,7 @@ impl Block {
     }
 
     /// Access the [`ironwood::Nullifier`]s from all transactions in this block.
-    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = &ironwood::Nullifier> {
+    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = ironwood::Nullifier> + '_ {
         self.transactions
             .iter()
             .flat_map(|transaction| transaction.ironwood_nullifiers())

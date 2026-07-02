@@ -9,6 +9,7 @@ use std::io::ErrorKind;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
+    ironwood, orchard,
     parameters::Network,
     primitives::zcash_primitives::PrecomputedTxData,
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
@@ -1266,7 +1267,7 @@ fn v6_txid_commits_to_ironwood_digest() {
     use crate::{
         at_least_one,
         ironwood::{self, tree},
-        orchard::Flags,
+        orchard::{self, Flags},
         primitives::Halo2Proof,
     };
 
@@ -1289,17 +1290,18 @@ fn v6_txid_commits_to_ironwood_digest() {
         .expect("test action strategy creates a value")
         .current();
 
-    let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
-        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
-        shared_anchor: tree::Root::default(),
-        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
-        actions: at_least_one![ironwood::AuthorizedAction {
-            action,
-            spend_auth_sig: [0u8; 64].into(),
-        }],
-        binding_sig: [0u8; 64].into(),
-    };
+    let ironwood_shielded_data =
+        ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(orchard::ShieldedData {
+            flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+            value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }));
 
     let mut tx_with_ironwood = tx_without_ironwood.clone();
     let Transaction::V6 {
@@ -1329,7 +1331,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     use crate::{
         at_least_one,
         ironwood::{self, tree},
-        orchard::Flags,
+        orchard::{self, Flags},
         primitives::Halo2Proof,
     };
 
@@ -1347,17 +1349,18 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
         .expect("test action strategy creates a value")
         .current();
 
-    let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
-        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
-        shared_anchor: test_anchor(1),
-        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
-        actions: at_least_one![ironwood::AuthorizedAction {
-            action,
-            spend_auth_sig: [0u8; 64].into(),
-        }],
-        binding_sig: [0u8; 64].into(),
-    };
+    let ironwood_shielded_data =
+        ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(orchard::ShieldedData {
+            flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+            value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+            shared_anchor: test_anchor(1),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }));
 
     let tx_a = Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
@@ -1399,6 +1402,7 @@ fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
     let orchard_shielded_data = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .map(orchard::ShieldedDataV6::new)
         .expect("test vectors include an Orchard transaction");
 
     let make_tx = |orchard_shielded_data| Transaction::V6 {
@@ -1456,6 +1460,8 @@ fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
     let ironwood_shielded_data = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .map(orchard::ShieldedDataV6::new)
+        .map(ironwood::ShieldedData::new)
         .expect("test vectors include an Orchard-shaped bundle");
 
     let make_tx = |ironwood_shielded_data| Transaction::V6 {
@@ -1598,7 +1604,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
             inputs: vec![],
             outputs: vec![],
             sapling_shielded_data: None,
-            orchard_shielded_data,
+            orchard_shielded_data: orchard_shielded_data.map(orchard::ShieldedDataV6::new),
             ironwood_shielded_data: None,
         };
 

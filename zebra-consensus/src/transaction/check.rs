@@ -399,7 +399,7 @@ pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError
     let sprout_nullifiers = transaction.sprout_nullifiers().map(Cow::Borrowed);
     let sapling_nullifiers = transaction.sapling_nullifiers().map(Cow::Borrowed);
     let orchard_nullifiers = transaction.orchard_nullifiers().map(Cow::Borrowed);
-    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Borrowed);
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Owned);
 
     check_for_duplicates(transparent_outpoints, DuplicateTransparentSpend)?;
     check_for_duplicates(sprout_nullifiers, DuplicateSproutNullifier)?;

@@ -32,7 +32,7 @@ use std::io;
 use blake2b_simd::{Hash as Blake2bHash, Params, State};
 
 use crate::{
-    orchard,
+    ironwood, orchard,
     parameters::{NetworkUpgrade, TX_V5_VERSION_GROUP_ID, TX_V6_VERSION_GROUP_ID},
     sapling,
     serialization::ZcashSerialize,
@@ -278,7 +278,9 @@ fn zip244_parts(tx: &Transaction) -> Option<Zip244Parts<'_>> {
         outputs: tx.outputs(),
         sapling: tx.sapling_shielded_data(),
         orchard: tx.orchard_shielded_data(),
-        ironwood: tx.ironwood_shielded_data(),
+        ironwood: tx
+            .ironwood_shielded_data()
+            .map(ironwood::ShieldedData::data),
     })
 }
 

@@ -58,17 +58,19 @@ fn ironwood_v6_tx(
         outputs: Vec::new(),
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood::ShieldedData {
-            flags: orchard::Flags::ENABLE_SPENDS,
-            value_balance: Amount::zero(),
-            shared_anchor: tree::Root::default(),
-            proof: Halo2Proof(vec![0; 4992]),
-            actions: at_least_one![ironwood::AuthorizedAction {
-                action,
-                spend_auth_sig: [0u8; 64].into(),
-            }],
-            binding_sig: [0u8; 64].into(),
-        }),
+        ironwood_shielded_data: Some(ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(
+            orchard::ShieldedData {
+                flags: orchard::Flags::ENABLE_SPENDS,
+                value_balance: Amount::zero(),
+                shared_anchor: tree::Root::default(),
+                proof: Halo2Proof(vec![0; 4992]),
+                actions: at_least_one![ironwood::AuthorizedAction {
+                    action,
+                    spend_auth_sig: [0u8; 64].into(),
+                }],
+                binding_sig: [0u8; 64].into(),
+            },
+        ))),
     })
 }
 

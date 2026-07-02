@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tracing::trace;
-use zebra_chain::{ironwood, transaction::Transaction};
+use zebra_chain::transaction::Transaction;
 
 use crate::{
     error::DuplicateNullifierError,
@@ -57,8 +57,8 @@ pub(crate) fn no_duplicates_in_finalized_chain(
     }
 
     for nullifier in semantically_verified.block.ironwood_nullifiers() {
-        if finalized_state.contains_ironwood_nullifier(nullifier) {
-            Err(duplicate_ironwood_nullifier_error(nullifier, true))?;
+        if finalized_state.contains_ironwood_nullifier(&nullifier) {
+            Err(nullifier.duplicate_nullifier_error(true))?;
         }
     }
 
@@ -119,19 +119,6 @@ where
     )
 }
 
-// Ironwood reuses `orchard::Nullifier` (`ironwood::Nullifier` is a re-export), so it
-// can't have its own `impl DuplicateNullifierError` without conflicting with the Orchard
-// impl (E0119). Its pool is distinguished at the call site via the `*_with` helpers below.
-fn duplicate_ironwood_nullifier_error(
-    nullifier: &ironwood::Nullifier,
-    in_finalized_state: bool,
-) -> ValidateContextError {
-    ValidateContextError::DuplicateIronwoodNullifier {
-        nullifier: *nullifier,
-        in_finalized_state,
-    }
-}
-
 /// Reject double-spends of nullifiers:
 /// - one from this [`Transaction`], and the other already committed to the
 ///   provided non-finalized [`Chain`] or [`ZebraDb`].
@@ -171,12 +158,12 @@ pub(crate) fn tx_no_duplicates_in_chain(
             .map(|chain| |nullifier| chain.orchard_nullifiers.contains_key(nullifier)),
     )?;
 
-    find_duplicate_nullifier_with(
-        transaction.ironwood_nullifiers(),
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().collect::<Vec<_>>();
+    find_duplicate_nullifier(
+        ironwood_nullifiers.iter(),
         |nullifier| finalized_chain.contains_ironwood_nullifier(nullifier),
         non_finalized_chain
             .map(|chain| |nullifier| chain.ironwood_nullifiers.contains_key(nullifier)),
-        duplicate_ironwood_nullifier_error,
     )?;
 
     Ok(())
@@ -247,20 +234,6 @@ where
         shielded_data_nullifiers,
         revealing_tx_id,
         |nullifier, in_finalized_state| nullifier.duplicate_nullifier_error(in_finalized_state),
-    )
-}
-
-#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
-pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
-    chain_nullifiers: &mut HashMap<ironwood::Nullifier, SpendingTransactionId>,
-    shielded_data_nullifiers: impl IntoIterator<Item = &'block ironwood::Nullifier>,
-    revealing_tx_id: SpendingTransactionId,
-) -> Result<(), ValidateContextError> {
-    add_to_non_finalized_chain_unique_with(
-        chain_nullifiers,
-        shielded_data_nullifiers,
-        revealing_tx_id,
-        duplicate_ironwood_nullifier_error,
     )
 }
 

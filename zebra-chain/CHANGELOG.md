@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_ironwood_value_balance` helpers.
 - V3 chain-history entries for NU6.3 onward, including Ironwood note
   commitment roots and transaction counts.
-- `ironwood` module re-exporting Orchard-style Ironwood bundle types.
+- `ironwood` module providing Orchard-style Ironwood bundle types.
 - `Transaction::V6::ironwood_shielded_data` and Ironwood accessors on
   `Transaction`, including actions, nullifiers, note commitments, flags,
   shielded-data presence, flag sufficiency, and value balance.
@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Split V6 Orchard and Ironwood shielded data/nullifiers into distinct wrapper
+  types while preserving their Orchard-style wire encoding and proof machinery.
 - V5/V6 transaction IDs and ZIP-244 authorizing-data digests are now computed
   natively instead of via a `librustzcash` conversion. The output is unchanged.
 - V5/V6 deserialization no longer runs a `librustzcash` conversion. Transactions

@@ -605,19 +605,20 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
         .new_tree(&mut runner)
         .expect("test action strategy creates a value")
         .current();
-    let nullifier = action.nullifier;
+    let nullifier = ironwood::Nullifier::from(action.nullifier);
 
-    let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: orchard::Flags::ENABLE_SPENDS,
-        value_balance: Amount::zero(),
-        shared_anchor: tree::Root::default(),
-        proof: Halo2Proof(vec![0; 4992]),
-        actions: at_least_one![ironwood::AuthorizedAction {
-            action,
-            spend_auth_sig: [0u8; 64].into(),
-        }],
-        binding_sig: [0u8; 64].into(),
-    };
+    let ironwood_shielded_data =
+        ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(orchard::ShieldedData {
+            flags: orchard::Flags::ENABLE_SPENDS,
+            value_balance: Amount::zero(),
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; 4992]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }));
 
     (
         Arc::new(Transaction::V6 {

@@ -589,7 +589,7 @@ impl Storage {
                         .any(|nullifier| orchard_nullifiers.contains(nullifier))
                     || tx
                         .ironwood_nullifiers()
-                        .any(|nullifier| ironwood_nullifiers.contains(nullifier)))
+                        .any(|nullifier| ironwood_nullifiers.contains(&nullifier)))
                 .then_some(tx_id)
             })
             .collect();

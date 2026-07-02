@@ -741,7 +741,10 @@ impl SpendConflictTestInput {
                 Transaction::V6 {
                     orchard_shielded_data,
                     ..
-                } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),
+                } => Self::remove_v6_orchard_actions_with_conflicts(
+                    orchard_shielded_data,
+                    &conflicts,
+                ),
 
                 // No Spends
                 Transaction::V1 { .. }
@@ -761,20 +764,38 @@ impl SpendConflictTestInput {
         conflicts: &HashSet<orchard::Nullifier>,
     ) {
         if let Some(shielded_data) = maybe_shielded_data.take() {
-            let updated_actions: Vec<_> = shielded_data
-                .actions
-                .to_vec()
-                .into_iter()
-                .filter(|action| !conflicts.contains(&action.action.nullifier))
-                .collect();
-
-            if let Ok(actions) = AtLeastOne::try_from(updated_actions) {
-                *maybe_shielded_data = Some(orchard::ShieldedData {
-                    actions,
-                    ..shielded_data
-                });
-            }
+            *maybe_shielded_data = Self::orchard_data_without_conflicts(shielded_data, conflicts);
         }
+    }
+
+    fn remove_v6_orchard_actions_with_conflicts(
+        maybe_shielded_data: &mut Option<orchard::ShieldedDataV6>,
+        conflicts: &HashSet<orchard::Nullifier>,
+    ) {
+        if let Some(shielded_data) = maybe_shielded_data.take() {
+            *maybe_shielded_data =
+                Self::orchard_data_without_conflicts(shielded_data.into_inner(), conflicts)
+                    .map(orchard::ShieldedDataV6::new);
+        }
+    }
+
+    fn orchard_data_without_conflicts(
+        shielded_data: orchard::ShieldedData,
+        conflicts: &HashSet<orchard::Nullifier>,
+    ) -> Option<orchard::ShieldedData> {
+        let updated_actions: Vec<_> = shielded_data
+            .actions
+            .to_vec()
+            .into_iter()
+            .filter(|action| !conflicts.contains(&action.action.nullifier))
+            .collect();
+
+        let actions = AtLeastOne::try_from(updated_actions).ok()?;
+
+        Some(orchard::ShieldedData {
+            actions,
+            ..shielded_data
+        })
     }
 }
 

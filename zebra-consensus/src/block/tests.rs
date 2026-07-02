@@ -839,7 +839,7 @@ fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
     shielded_data.value_balance =
         Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
 
-    shielded_data
+    ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(shielded_data))
 }
 
 #[test]

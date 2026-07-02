@@ -52,8 +52,8 @@ pub fn run(
                         .filter_map(|input| Some(input.outpoint()?.into()))
                         .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                         .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
-                        .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
+                        .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                        .chain(tx.ironwood_nullifiers().map(Spend::from))
                         .next()
                     {
                         if read::spending_transaction_hash::<Arc<Chain>>(None, zebra_db, spend)

@@ -1129,6 +1129,7 @@ mod tests {
         at_least_one,
         block::Height,
         ironwood::{self, tree},
+        orchard,
         parameters::NetworkUpgrade,
         primitives::Halo2Proof,
         transaction::LockTime,
@@ -1170,19 +1171,20 @@ mod tests {
 
         let value_balance: Amount = 123i64.try_into().expect("test amount is valid");
         let proof = Halo2Proof(vec![1; ::orchard::Proof::expected_proof_size(1)]);
-        let ironwood_shielded_data = ironwood::ShieldedData {
-            flags: ironwood::Flags::ENABLE_SPENDS
-                | ironwood::Flags::ENABLE_OUTPUTS
-                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
-            value_balance,
-            shared_anchor: tree::Root::default(),
-            proof: proof.clone(),
-            actions: at_least_one![ironwood::AuthorizedAction {
-                action,
-                spend_auth_sig: [7u8; 64].into(),
-            }],
-            binding_sig: [9u8; 64].into(),
-        };
+        let ironwood_shielded_data =
+            ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(orchard::ShieldedData {
+                flags: ironwood::Flags::ENABLE_SPENDS
+                    | ironwood::Flags::ENABLE_OUTPUTS
+                    | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+                value_balance,
+                shared_anchor: tree::Root::default(),
+                proof: proof.clone(),
+                actions: at_least_one![ironwood::AuthorizedAction {
+                    action,
+                    spend_auth_sig: [7u8; 64].into(),
+                }],
+                binding_sig: [9u8; 64].into(),
+            }));
 
         let tx = Arc::new(Transaction::V6 {
             network_upgrade: NetworkUpgrade::Nu6_3,

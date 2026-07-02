@@ -56,6 +56,50 @@ pub struct ShieldedData {
     pub binding_sig: Signature<Binding>,
 }
 
+/// A v6 Orchard-protocol shielded bundle.
+///
+/// This wrapper keeps the v6 Orchard bundle format distinct from the v5 Orchard
+/// bundle format, because v6 permits the cross-address flag bit that is reserved
+/// in v5. The inner bundle shape is otherwise the Orchard action/proof format.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ShieldedDataV6(ShieldedData);
+
+impl ShieldedDataV6 {
+    /// Wraps an Orchard shielded bundle as a v6 Orchard-protocol bundle.
+    pub fn new(shielded_data: ShieldedData) -> Self {
+        Self(shielded_data)
+    }
+
+    /// Returns the inner Orchard shielded bundle.
+    pub fn data(&self) -> &ShieldedData {
+        &self.0
+    }
+
+    /// Returns the inner Orchard shielded bundle mutably.
+    pub fn data_mut(&mut self) -> &mut ShieldedData {
+        &mut self.0
+    }
+
+    /// Consumes this wrapper and returns the inner Orchard shielded bundle.
+    pub fn into_inner(self) -> ShieldedData {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ShieldedDataV6 {
+    type Target = ShieldedData;
+
+    fn deref(&self) -> &Self::Target {
+        self.data()
+    }
+}
+
+impl std::ops::DerefMut for ShieldedDataV6 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.data_mut()
+    }
+}
+
 impl fmt::Display for ShieldedData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = f.debug_struct("orchard::ShieldedData");

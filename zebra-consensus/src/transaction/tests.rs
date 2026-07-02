@@ -165,7 +165,7 @@ fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwoo
         Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
     shielded_data.flags = flags;
 
-    shielded_data
+    ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(shielded_data))
 }
 
 fn v6_pool_flow_transaction(
@@ -180,7 +180,7 @@ fn v6_pool_flow_transaction(
         inputs: vec![],
         outputs: transparent_outputs,
         sapling_shielded_data: None,
-        orchard_shielded_data,
+        orchard_shielded_data: orchard_shielded_data.map(orchard::ShieldedDataV6::new),
         ironwood_shielded_data,
     }
 }
@@ -267,7 +267,10 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
         inputs: vec![coinbase_input()],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        orchard_shielded_data: Some(orchard::ShieldedDataV6::new(orchard_shielded_data(
+            0,
+            Flags::ENABLE_OUTPUTS,
+        ))),
         ironwood_shielded_data: None,
     };
     assert!(coinbase_with_orchard.is_coinbase());

@@ -327,7 +327,7 @@ impl VerifiedSet {
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
             || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
             || Self::has_conflicts(&self.orchard_nullifiers, tx.orchard_nullifiers().copied())
-            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers().copied())
+            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers())
     }
 
     /// Removes the tracked transaction outputs from the mempool.
@@ -346,7 +346,7 @@ impl VerifiedSet {
         let sprout_nullifiers = tx.sprout_nullifiers().map(Cow::Borrowed);
         let sapling_nullifiers = tx.sapling_nullifiers().map(Cow::Borrowed);
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
-        let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Borrowed);
+        let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Owned);
 
         Self::remove_from_set(&mut self.spent_outpoints, spent_outpoints);
         Self::remove_from_set(&mut self.sprout_nullifiers, sprout_nullifiers);

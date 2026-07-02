@@ -1821,7 +1821,7 @@ impl Chain {
                     joinsplit_data,
                     sapling_shielded_data,
                     &None,
-                    &None,
+                    None,
                     &None::<ironwood::ShieldedData>,
                 ),
                 V5 {
@@ -1836,7 +1836,7 @@ impl Chain {
                     &None,
                     &None,
                     sapling_shielded_data,
-                    orchard_shielded_data,
+                    orchard_shielded_data.as_ref(),
                     &None::<ironwood::ShieldedData>,
                 ),
                 V6 {
@@ -1852,7 +1852,9 @@ impl Chain {
                     &None,
                     &None,
                     sapling_shielded_data,
-                    orchard_shielded_data,
+                    orchard_shielded_data
+                        .as_ref()
+                        .map(orchard::ShieldedDataV6::data),
                     ironwood_shielded_data,
                 ),
 
@@ -2030,7 +2032,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     joinsplit_data,
                     sapling_shielded_data,
                     &None,
-                    &None,
+                    None,
                     &None::<ironwood::ShieldedData>,
                 ),
                 V5 {
@@ -2045,7 +2047,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     &None,
                     sapling_shielded_data,
-                    orchard_shielded_data,
+                    orchard_shielded_data.as_ref(),
                     &None::<ironwood::ShieldedData>,
                 ),
                 V6 {
@@ -2061,7 +2063,9 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     &None,
                     sapling_shielded_data,
-                    orchard_shielded_data,
+                    orchard_shielded_data
+                        .as_ref()
+                        .map(orchard::ShieldedDataV6::data),
                     ironwood_shielded_data,
                 ),
 
@@ -2447,12 +2451,12 @@ where
     }
 }
 
-impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Chain {
+impl UpdateWith<(Option<&orchard::ShieldedData>, &SpendingTransactionId)> for Chain {
     #[instrument(skip(self, orchard_shielded_data))]
     fn update_chain_tip_with(
         &mut self,
         &(orchard_shielded_data, revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            Option<&orchard::ShieldedData>,
             &SpendingTransactionId,
         ),
     ) -> Result<(), ValidateContextError> {
@@ -2477,7 +2481,7 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
     fn revert_chain_with(
         &mut self,
         (orchard_shielded_data, _revealing_tx_id): &(
-            &Option<orchard::ShieldedData>,
+            Option<&orchard::ShieldedData>,
             &SpendingTransactionId,
         ),
         _position: RevertPosition,
@@ -2506,10 +2510,11 @@ impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for C
     ) -> Result<(), ValidateContextError> {
         if let Some(ironwood_shielded_data) = ironwood_shielded_data {
             // We do note commitment tree updates in parallel rayon threads.
+            let nullifiers = ironwood_shielded_data.nullifiers().collect::<Vec<_>>();
 
-            check::nullifier::add_ironwood_to_non_finalized_chain_unique(
+            check::nullifier::add_to_non_finalized_chain_unique(
                 &mut self.ironwood_nullifiers,
-                ironwood_shielded_data.nullifiers(),
+                nullifiers.iter(),
                 *revealing_tx_id,
             )?;
         }
@@ -2534,10 +2539,11 @@ impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for C
             // Note commitments are removed from the Chain during a fork,
             // by removing trees above the fork height from the note commitment index.
             // This happens when reverting the block itself.
+            let nullifiers = ironwood_shielded_data.nullifiers().collect::<Vec<_>>();
 
             check::nullifier::remove_from_non_finalized_chain(
                 &mut self.ironwood_nullifiers,
-                ironwood_shielded_data.nullifiers(),
+                nullifiers.iter(),
             );
         }
     }

@@ -34,7 +34,7 @@ fn zip317_counts_ironwood_actions() {
 
     use crate::{
         amount::{Amount, NegativeAllowed},
-        at_least_one, ironwood,
+        at_least_one, ironwood, orchard,
         parameters::NetworkUpgrade,
         primitives::Halo2Proof,
         transaction::{LockTime, Transaction},
@@ -45,14 +45,15 @@ fn zip317_counts_ironwood_actions() {
         .new_tree(&mut runner)
         .expect("test action strategy creates a value")
         .current();
-    let ironwood_shielded_data = ironwood::ShieldedData {
-        flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
-        value_balance: Amount::<NegativeAllowed>::zero(),
-        shared_anchor: ironwood::tree::Root::default(),
-        proof: Halo2Proof(vec![]),
-        actions: at_least_one![action; 3],
-        binding_sig: [0u8; 64].into(),
-    };
+    let ironwood_shielded_data =
+        ironwood::ShieldedData::new(orchard::ShieldedDataV6::new(orchard::ShieldedData {
+            flags: ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+            value_balance: Amount::<NegativeAllowed>::zero(),
+            shared_anchor: ironwood::tree::Root::default(),
+            proof: Halo2Proof(vec![]),
+            actions: at_least_one![action; 3],
+            binding_sig: [0u8; 64].into(),
+        }));
     let transaction = Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),

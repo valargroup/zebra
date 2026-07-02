@@ -62,7 +62,10 @@ fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
             ),
             v6_tx_strategy(
                 Just(None).boxed(),
-                any::<orchard::ShieldedData>().prop_map(Some).boxed(),
+                any::<orchard::ShieldedData>()
+                    .prop_map(orchard::ShieldedDataV6::new)
+                    .prop_map(Some)
+                    .boxed(),
                 Just(None).boxed()
             ),
             v6_tx_strategy(
@@ -74,7 +77,10 @@ fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
                 any::<sapling::ShieldedData<sapling::SharedAnchor>>()
                     .prop_map(Some)
                     .boxed(),
-                orchard_with_multiple_actions().prop_map(Some).boxed(),
+                orchard_with_multiple_actions()
+                    .prop_map(orchard::ShieldedDataV6::new)
+                    .prop_map(Some)
+                    .boxed(),
                 any::<ironwood::ShieldedData>().prop_map(Some).boxed(),
             ),
         ]
@@ -119,7 +125,7 @@ fn v5_tx_strategy(
 
 fn v6_tx_strategy(
     sapling_shielded_data: BoxedStrategy<Option<sapling::ShieldedData<sapling::SharedAnchor>>>,
-    orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedData>>,
+    orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedDataV6>>,
     ironwood_shielded_data: BoxedStrategy<Option<ironwood::ShieldedData>>,
 ) -> BoxedStrategy<Transaction> {
     (
