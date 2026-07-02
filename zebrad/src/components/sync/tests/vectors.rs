@@ -1748,20 +1748,64 @@ async fn registry_miss_does_not_block_unrelated_reserve_dispatch() -> Result<(),
 /// `metrics::gauge!` calls in `update_metrics`, which is only ever invoked inline on this thread.
 #[tokio::test(flavor = "current_thread")]
 async fn registry_miss_raises_pending_gauge_and_keeps_dispatching() -> Result<(), crate::BoxError> {
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+    use std::sync::Mutex;
 
-    /// Reads the current value of a named gauge from the local recorder snapshot.
-    fn gauge_value(snapshotter: &Snapshotter, name: &str) -> Option<f64> {
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find(|(key, _unit, _desc, _value)| key.key().name() == name)
-            .and_then(|(_key, _unit, _desc, value)| match value {
-                DebugValue::Gauge(v) => Some(v.into_inner()),
-                _ => None,
-            })
+    use metrics::{Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, Unit};
+
+    // A minimal in-process recorder that captures the latest value of each gauge, so the test can
+    // read the real `sync.registry_miss.pending` value emitted by `update_metrics` without pulling
+    // in an external metrics-capture crate.
+    #[derive(Clone, Default)]
+    struct GaugeCapture(Arc<Mutex<HashMap<String, f64>>>);
+
+    struct CapturedGauge {
+        name: String,
+        store: Arc<Mutex<HashMap<String, f64>>>,
     }
+
+    impl GaugeFn for CapturedGauge {
+        fn increment(&self, value: f64) {
+            *self
+                .store
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default() += value;
+        }
+        fn decrement(&self, value: f64) {
+            *self
+                .store
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default() -= value;
+        }
+        fn set(&self, value: f64) {
+            self.store.lock().unwrap().insert(self.name.clone(), value);
+        }
+    }
+
+    impl Recorder for GaugeCapture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: metrics::SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: metrics::SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: metrics::SharedString) {}
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(CapturedGauge {
+                name: key.name().to_string(),
+                store: self.0.clone(),
+            }))
+        }
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    let recorder = GaugeCapture::default();
+    let store = recorder.0.clone();
+    let gauge_value = move |name: &str| store.lock().unwrap().get(name).copied();
 
     let (
         mut chain_sync,
@@ -1772,14 +1816,12 @@ async fn registry_miss_raises_pending_gauge_and_keeps_dispatching() -> Result<()
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
     let _recorder_guard = metrics::set_default_local_recorder(&recorder);
 
     // Nothing missing yet: the gauge reads zero once `update_metrics` has published it.
     chain_sync.update_metrics();
     assert_eq!(
-        gauge_value(&snapshotter, "sync.registry_miss.pending").unwrap_or(0.0),
+        gauge_value("sync.registry_miss.pending").unwrap_or(0.0),
         0.0,
         "no registry miss should be pending before any download failure",
     );
@@ -1797,7 +1839,7 @@ async fn registry_miss_raises_pending_gauge_and_keeps_dispatching() -> Result<()
 
     chain_sync.update_metrics();
     assert_eq!(
-        gauge_value(&snapshotter, "sync.registry_miss.pending"),
+        gauge_value("sync.registry_miss.pending"),
         Some(1.0),
         "a parked registry miss should raise sync.registry_miss.pending above zero",
     );
@@ -1846,7 +1888,7 @@ async fn registry_miss_raises_pending_gauge_and_keeps_dispatching() -> Result<()
     // The miss is still parked after unrelated dispatch, so the gauge stays above zero.
     chain_sync.update_metrics();
     assert_eq!(
-        gauge_value(&snapshotter, "sync.registry_miss.pending"),
+        gauge_value("sync.registry_miss.pending"),
         Some(1.0),
         "the registry miss should remain pending (and observable) after unrelated dispatch",
     );
