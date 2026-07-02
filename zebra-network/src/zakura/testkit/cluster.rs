@@ -144,7 +144,7 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError};
+    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError, TEST_NET_TIMEOUT};
     use super::*;
     use crate::{
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
@@ -759,7 +759,7 @@ mod tests {
 
         async fn wait_for_tip(&self, node: usize, height: block::Height) -> Result<(), BoxError> {
             let handle = self.nodes[node].view.handle.clone();
-            await_until("header-sync e2e best tip", Duration::from_secs(5), || {
+            await_until("header-sync e2e best tip", TEST_NET_TIMEOUT, || {
                 handle.best_header_tip().0 >= height
             })
             .await
@@ -770,7 +770,7 @@ mod tests {
             let store = self.nodes[node].view.store.clone();
             await_until(
                 "header-sync e2e body commit",
-                Duration::from_secs(5),
+                TEST_NET_TIMEOUT,
                 || {
                     store
                         .lock()
