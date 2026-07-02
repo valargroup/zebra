@@ -10128,6 +10128,93 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
     reactor_task.abort();
 }
 
+/// The bounded-refill window must advance past the already-claimed heights rather
+/// than re-scanning from the download floor every time.
+///
+/// This is the memory-and-throughput guard for the work-queue bound: with a far
+/// ahead header tip the refill `from` is `max_claimed + 1`, not `request_floor +
+/// 1`. A regression to the floor would keep re-querying the same low window
+/// (silently re-scanning heights already in flight), collapsing the download
+/// pipeline to a couple of blocks and re-inflating the work queue — while still
+/// completing sync, so the fuzz completion checks would not catch it. Every
+/// existing `from`-assertion runs with `max_claimed == request_floor`, so this is
+/// the only test that pins the advance itself.
+#[tokio::test]
+async fn reactor_refill_window_advances_past_claimed_heights() {
+    let best_header_tip = block::Height(50_000);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([50; 32])));
+    // low-water = peers(1) * max_inflight(4) * max_blocks(1) = 4, fanout = 8. Three
+    // claimed heights sit below low-water, so the next refill fires immediately.
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        max_inflight_requests: 4,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([50; 32])),
+        tip_rx,
+        config,
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    // Startup refill scans from the floor (queue empty → `max_claimed` is None).
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            from: block::Height(1),
+            limit: 8,
+            best_header_tip: block::Height(50_000),
+        }
+    ));
+
+    // Populate the work queue with heights 1..=3 (max_claimed = 3), then nudge the
+    // producer. `NeededBlocks` and `HeaderTipChanged` share one FIFO event channel,
+    // so the queue is populated before the re-query runs (no watch race).
+    let metas: Vec<_> = (1..=3)
+        .map(|height| BlockSyncBlockMeta {
+            height: block::Height(height),
+            hash: block::Hash([u8::try_from(height).expect("height fits u8"); 32]),
+            size: BlockSizeEstimate::Advertised(1_000),
+        })
+        .collect();
+    handle
+        .send(BlockSyncEvent::NeededBlocks(metas))
+        .await
+        .expect("needed-blocks event queues");
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(50_001),
+            hash: block::Hash([51; 32]),
+        })
+        .await
+        .expect("header-tip event queues");
+
+    // The refill now starts at max_claimed + 1 (= 4), never back at the floor (1).
+    match next_action(&mut actions).await {
+        BlockSyncAction::QueryNeededBlocks {
+            from,
+            limit,
+            best_header_tip,
+        } => {
+            assert_eq!(
+                from,
+                block::Height(4),
+                "refill must advance past the claimed heights, not rescan from the floor",
+            );
+            assert_eq!(limit, 8);
+            assert_eq!(best_header_tip, block::Height(50_001));
+        }
+        action => panic!("expected the advanced refill query, got {action:?}"),
+    }
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_ignores_stale_non_reset_frontier_updates() {
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3600), block::Hash([36; 32])));
