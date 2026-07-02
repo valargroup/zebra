@@ -160,6 +160,7 @@ pub async fn run(network: Network) -> Result<()> {
         test_type,
         zebra_rpc_address,
         last_checkpoint,
+        &zebrad_state_path,
     )?;
 
     let show_zebrad_logs = env::var(LOG_ZEBRAD_CHECKPOINTS).is_ok();
@@ -208,13 +209,19 @@ pub fn spawn_zebra_checkpoints_direct(
     test_type: TestType,
     zebrad_rpc_address: SocketAddr,
     last_checkpoint: &str,
+    zebrad_state_path: &Path,
 ) -> Result<TestChild<TempDir>> {
     let zebrad_rpc_address = zebrad_rpc_address.to_string();
 
-    let arguments = args![
+    let mut arguments = args![
         "--addr": zebrad_rpc_address,
         "--last-checkpoint": last_checkpoint,
     ];
+    if network == Network::Mainnet {
+        arguments.set_parameter("--mainnet-frontier-output", "/tmp/mainnet-frontier.bin");
+        arguments.set_parameter("--state-cache-dir", zebrad_state_path.display().to_string());
+        arguments.set_parameter("--frontier-height", "auto");
+    }
 
     // TODO: add logs for different kinds of zebra_checkpoints failures
     let zebra_checkpoints_failure_messages = PROCESS_FAILURE_MESSAGES

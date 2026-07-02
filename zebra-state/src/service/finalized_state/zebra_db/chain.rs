@@ -29,7 +29,7 @@ use zebra_chain::{
 use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
-        disk_db::DiskWriteBatch,
+        disk_db::{DiskWriteBatch, ReadDisk},
         disk_format::{chain::HistoryTreeParts, RawBytes},
         zebra_db::{metrics::value_pool_metrics, ZebraDb},
         TypedColumnFamily,
@@ -155,6 +155,40 @@ impl ZebraDb {
             )
         });
         Arc::new(HistoryTree::from(history_tree))
+    }
+
+    /// Returns `Ok(())` if the stored tip history tree decodes with the current
+    /// `HistoryTreeParts` format.
+    ///
+    /// This is a non-panicking compatibility probe used during DB open before
+    /// background format checks can call [`Self::history_tree`]. It reads raw
+    /// bytes and performs the same current-key then legacy-key fallback as
+    /// [`Self::history_tree`].
+    pub(crate) fn check_tip_history_tree_decodes(&self) -> Result<(), String> {
+        let history_tree_cf = self
+            .db
+            .cf_handle(HISTORY_TREE)
+            .expect("column family was created when database was created");
+
+        let raw_parts: Option<RawBytes> = self.db.zs_get(&history_tree_cf, &());
+        let raw_parts = raw_parts.or_else(|| {
+            self.db
+                .zs_last_key_value::<_, RawBytes, RawBytes>(&history_tree_cf)
+                .map(|(_height_key, tree_value)| tree_value)
+        });
+
+        let Some(raw_parts) = raw_parts else {
+            return Ok(());
+        };
+
+        let parts = HistoryTreeParts::from_bytes_result(raw_parts.raw_bytes())
+            .map_err(|error| format!("stored history tree does not deserialize: {error}"))?;
+
+        parts
+            .with_network(&self.db.network())
+            .map_err(|error| format!("stored history tree is invalid for this network: {error}"))?;
+
+        Ok(())
     }
 
     /// Returns all the history tip trees.

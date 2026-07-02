@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Reject `consensus.checkpoint_sync = false` with
+  `consensus.vct_fast_sync = true` at startup, because VCT fast sync relies on
+  the full checkpoint-sync verification range.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
@@ -116,9 +119,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
-- V6 transactions with supported NU6.3-or-later consensus branch IDs now
-  serialize and deserialize successfully, while unsupported later placeholders
-  are rejected.
 - Route post-NU6.3 coinbase rewards for Orchard receivers in unified miner
   addresses to the Ironwood pool instead of rejecting them or falling back to a
   lower-priority receiver.
@@ -167,6 +167,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   duplicate-peer handling scaffolding.
 - Added bounded Zakura header-sync stream-5 wire messages, stateless header
   validation, and the default `network.zakura.header_sync` config surface.
+- Verified-commitment-trees fast checkpoint sync. Below the last checkpoint Zebra
+  now fetches per-block Sapling/Orchard commitment roots from peers over a new
+  header-sync-aligned `tree_aux` stream, verifies each root against the node's own
+  checkpoint-committed block headers (the ZIP-221 ChainHistory MMR plus direct
+  below-Heartwood/below-NU5 checks), and folds the verified roots into the anchor
+  set and history tree — skipping the per-block note-commitment frontier recompute
+  that dominates checkpoint-sync CPU cost. At the checkpoint handoff an embedded
+  final frontier, verified against that block's proven root, is written as the tip
+  treestate and normal per-block recompute resumes. The resulting consensus state
+  is byte-identical to the legacy recompute; a root that cannot be obtained or
+  verified is rejected rather than recomputed against the stale frozen frontier, so
+  no untrusted data can influence consensus state. This is the default whenever
+  `consensus.checkpoint_sync = true` on a network with an embedded handoff frontier
+  (Mainnet), for both Archive and Pruned storage modes. The new
+  `consensus.vct_fast_sync` flag (default `true`) selects this fast path; set it to
+  `false` to keep checkpoint sync enabled while forcing the legacy per-block
+  recompute. Bumps the state database
+  format to 27.3.0 (new column families only; no data migration).
 - Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.
@@ -225,6 +243,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Stop the database format-validity check from panicking with "just checked for
+  genesis block" while a verified-commitment-trees fast sync is in progress. The
+  check runs on a background thread, concurrently with block commits, and could
+  read its `is_vct_synced()` guard as `false` and then read an absent genesis
+  note-commitment tree once a concurrent fast-sync commit set the marker in
+  between. It now treats an absent genesis tree as a (mid-flight) fast-synced
+  database — where the genesis-root-caching invariant does not apply — instead of
+  panicking.
 - Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
   and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized

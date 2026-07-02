@@ -1311,6 +1311,7 @@ fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
             "test",
             RetentionPlan::Store,
             None,
+            None,
         )
         .expect("block commit succeeds");
 }

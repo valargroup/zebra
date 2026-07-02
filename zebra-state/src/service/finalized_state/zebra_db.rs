@@ -175,9 +175,23 @@ impl ZebraDb {
             )
         }
 
+        db.run_blocking_format_repairs(network);
         db.spawn_format_change(format_change);
 
         db
+    }
+
+    /// Run synchronous compatibility repairs before background format checks can read the DB.
+    pub fn run_blocking_format_repairs(&self, network: &Network) {
+        if self.debug_skip_format_upgrades {
+            return;
+        }
+
+        // Repair incompatible stored history-tree bytes before the background
+        // format-validity check can read and panic on them. Healthy databases are
+        // a no-op, and read-only/offline-tool opens keep their existing
+        // skip-upgrade behavior.
+        rollback::repair_tip_history_tree_if_incompatible(self, network);
     }
 
     /// Launch any required format changes or format checks, and store their thread handle.

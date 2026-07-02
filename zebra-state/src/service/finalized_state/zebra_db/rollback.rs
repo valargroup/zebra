@@ -511,6 +511,43 @@ fn prepare_rollback(
     })
 }
 
+pub(super) fn repair_tip_history_tree_if_incompatible(db: &ZebraDb, network: &Network) {
+    if db.check_tip_history_tree_decodes().is_ok() {
+        return;
+    }
+
+    let Some(tip_height) = db.finalized_tip_height() else {
+        return;
+    };
+
+    match rebuild_history_tree_from_upgrade_activation(db, network, tip_height) {
+        Ok(history_tree) => {
+            let mut batch = DiskWriteBatch::new();
+            batch.update_history_tree(db, &history_tree);
+
+            if let Err(error) = db.write_batch(batch) {
+                warn!(
+                    ?tip_height,
+                    ?error,
+                    "failed to repair incompatible tip history tree"
+                );
+            } else {
+                info!(
+                    ?tip_height,
+                    "repaired incompatible tip history tree before format check"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                ?tip_height,
+                ?error,
+                "failed to rebuild incompatible tip history tree"
+            );
+        }
+    }
+}
+
 struct RebuiltTreestate {
     sprout_tree: Arc<zebra_chain::sprout::tree::NoteCommitmentTree>,
     history_tree: HistoryTree,
@@ -1366,6 +1403,43 @@ mod tests {
                 "U >= H leaves an empty band, so height {height} is servable"
             );
         }
+    }
+
+    /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight
+    /// from the serving index, without touching the per-height trees.
+    #[test]
+    fn serve_block_roots_serves_at_or_above_upgrade_from_index() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // Index covers [4, 6]; the upgrade height is U = 4.
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        for height in 4u32..=6 {
+            batch.insert_commitment_roots_by_height(
+                &db,
+                Height(height),
+                &sapling_root(height.into()),
+                &orchard_root(height.into()),
+                &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                0,
+                0,
+                0,
+                &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            );
+        }
+        db.write_batch(batch)
+            .expect("seeding the serving index succeeds");
+
+        let served = crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6));
+        assert_eq!(
+            served
+                .into_iter()
+                .map(|root| root.height)
+                .collect::<Vec<_>>(),
+            vec![Height(4), Height(5), Height(6)],
+            "a request at or above U is served from the index"
+        );
     }
 
     /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,

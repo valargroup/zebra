@@ -187,12 +187,14 @@ orthogonal pruning axis). The resulting modes:
 | **Archive** (default) | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the last checkpoint height _for now_ (§7, §10). |
 | **Pruning** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode.pruned` | Fast — same as Archive, **plus** raw-tx/index pruning outside the retention window. |
 | **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard trees per block. |
-| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block, using only mandatory checkpoints. |
+| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block, using only mandatory checkpoints. |
 
 Gating fast on `checkpoint_sync` is also a correctness precondition: the embedded last checkpoint height
 frontier is pinned to the network's **full** max checkpoint height (§5.2), which only applies
 when `checkpoint_sync = true` (with it `false`, the effective max checkpoint drops to the
-Canopy mandatory checkpoint, so there is no valid last checkpoint height to resume from). zebrad mirrors
+Canopy mandatory checkpoint, so there is no valid last checkpoint height to resume from). For
+that reason, zebrad rejects `consensus.checkpoint_sync = false` together with
+`consensus.vct_fast_sync = true` at startup. zebrad mirrors
 `consensus.checkpoint_sync` into the state config at startup
 (`state_config.checkpoint_sync`), so the state makes the decision without depending on
 `zebra-consensus`.
@@ -201,7 +203,7 @@ Precedence is resolved by a pure, unit-tested `select_source_mode` (no process e
 files in the decision — `consensus.checkpoint_sync`, `consensus.vct_fast_sync`, and the
 embedded-frontier presence are passed in as plain inputs):
 
-1. `consensus.checkpoint_sync = false`, `consensus.vct_fast_sync = false`, or a network
+1. `consensus.vct_fast_sync = false` or a network
    with **no embedded frontier** → **legacy** (no VCT state, zero overhead);
 2. else → **peer** (the default under checkpoint sync where embedded frontiers exist).
 
@@ -427,16 +429,16 @@ occurred — the needed `H+1` witness is merely not buffered yet.
 to `pruning_metadata`, not a reuse — pruning drops tx bytes and keeps trees, fast-sync drops the
 per-height trees; a DB can be both. Because fast sync deletes nothing, a **completed** fast-synced
 DB (tip at/above the last checkpoint height) **reopens in any storage mode** — a reopen loses no servable data,
-and `consensus.vct_fast_sync = false` or `consensus.checkpoint_sync = false` simply resumes
-the legacy recompute from the real tip frontier.
+and `consensus.vct_fast_sync = false` simply resumes the legacy recompute from the real tip
+frontier.
 
 The one reopen that _is_ refused is an **interrupted** fast sync (frozen frontier, tip below the
 last checkpoint height) reopened with the fast path disabled (legacy mode —
-`consensus.vct_fast_sync = false`, `consensus.checkpoint_sync = false`, or no embedded
-frontier). The on-disk frontier is stale and no source can supply the verified roots, so the
-fail-closed policy (§8) would refuse every below-last checkpoint height block forever. The open guard refuses
-with a clear recovery path (finish the fast sync under `consensus.checkpoint_sync = true` and
-`consensus.vct_fast_sync = true`, or re-sync from genesis) instead of stalling silently.
+`consensus.vct_fast_sync = false` or no embedded frontier). The on-disk frontier is stale and no
+source can supply the verified roots, so the fail-closed policy (§8) would refuse every below-last
+checkpoint height block forever. The open guard refuses with a clear recovery path (finish the fast
+sync under `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true`, or re-sync from
+genesis) instead of stalling silently.
 Guards: per-height tree reads return `None` below the last checkpoint height (before the backward search, so no
 stale tree and no panic); `z_gettreestate` returns a typed archive-mode error below the last checkpoint height;
 genesis-root and subtree format-validity checks skip fast-synced DBs.
@@ -623,7 +625,7 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | Metric | Meaning |
 | --- | --- |
 | `state.vct.fast.block.count` | block folded supplied roots, skipped the recompute |
-| `state.vct.legacy.block.count` | block recomputed the frontier (`consensus.vct_fast_sync = false`, `consensus.checkpoint_sync = false`, or fell back outside the frozen window) |
+| `state.vct.legacy.block.count` | block recomputed the frontier (`consensus.vct_fast_sync = false` or fell back outside the frozen window) |
 | `state.vct.prevalidated.block.count` | dedup sub-case: the previous fast block's look-ahead already validated this header |
 | `state.vct.root.rejected.count` | supplied root failed verification and was deleted for re-delivery |
 | `state.vct.root.unavailable.count` | frozen-frontier height with no valid root; commit refused (retryable) |
@@ -644,9 +646,9 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
   invalid-marker / unrequested-roots rejections
   (`decode_rejects_tree_aux_roots_when_not_requested`,
   `non_finalized_response_carrying_tree_aux_roots_is_malformed`) and the byte-budget clamp with
-  roots requested; `select_source_mode` precedence (`consensus.vct_fast_sync = false` or
-  `consensus.checkpoint_sync = false` ⇒ legacy regardless of storage mode or embedded frontier;
-  checkpoint sync + enabled VCT + embedded frontier ⇒ peer); a completed fast-synced DB reopens
+  roots requested; `select_source_mode` precedence (`consensus.vct_fast_sync = false` ⇒ legacy
+  regardless of storage mode or embedded frontier; checkpoint sync + enabled VCT + embedded
+  frontier ⇒ peer); a completed fast-synced DB reopens
   in archive mode (`reopening_fast_synced_database_in_archive_mode_succeeds`) while an interrupted
   one reopened with the fast path off is refused
   (`reopening_interrupted_fast_sync_without_a_root_source_panics`); the below-NU5 Orchard pin and
