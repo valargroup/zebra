@@ -167,7 +167,7 @@ impl BbrPhase {
     }
 }
 
-fn rounded_usize(value: f64, fallback: usize) -> usize {
+pub(super) fn rounded_usize(value: f64, fallback: usize) -> usize {
     // BBR rates, windows, and gains are non-negative in normal operation. Keep a
     // fallback for NaN/inf or defensive underflow before casting.
     if value.is_finite() && value >= 0.0 {

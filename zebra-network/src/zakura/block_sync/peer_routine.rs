@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admit, floor_rescue_high, request_deadline, AdmissionOutcome, AdmissionSnapshot,
-        RequestPriority,
+        admit, floor_rescue_high, request_deadline, request_priority as classify_priority,
+        AdmissionOutcome, AdmissionSnapshot, RequestPriority,
     },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
@@ -682,7 +682,6 @@ impl PeerRoutine {
 
             let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
-            let mut request_priority = RequestPriority::Floor;
             // One snapshot per iteration: the floor and speculative lanes decide
             // against the same memory picture, and `admit` is the single authority
             // for the commit-window exemption, the resident gate, and take sizing
@@ -763,7 +762,6 @@ impl PeerRoutine {
                         if grant.priority == RequestPriority::AboveFloor =>
                     {
                         metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
-                        request_priority = RequestPriority::AboveFloor;
                         // Bound the take by remaining cwnd byte headroom (byte mode, no floor
                         // bonus) so an above-floor request never overshoots the byte window
                         // beyond the one always-taken item.
@@ -825,6 +823,13 @@ impl PeerRoutine {
             // `take_in_range_budgeted` already bounded the summed estimate to the
             // response-byte cap.
             let kept_count = items.len();
+
+            // Mislabel guard: another routine may have taken the intended (floor) start
+            // between our `first_pending_in_range` probe and the take, so the contiguous
+            // chunk we actually kept can begin above the floor-rescue window. Label the
+            // request by its *actual* lowest height, so a purely speculative take is never
+            // funded as a floor reservation or given the short floor-rescue leash.
+            let request_priority = classify_priority(view.download_floor, items[0].0);
 
             let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
                 acc.saturating_add(item.estimated_bytes)
@@ -1654,11 +1659,12 @@ impl PeerRoutine {
         self.finish_outstanding_at(index, disposition);
     }
 
-    /// Fold a short response into the reliability EWMA: every still-unreceived height of
-    /// the outstanding request at `index` is a goodput failure, like a timeout. A
-    /// `Satisfied` disposition means the shortfall was covered by the floor advancing (not
-    /// the peer's fault), so it is not charged. Reads the outstanding *before*
-    /// `finish_outstanding_at` removes it.
+    /// Fold a short response into the reliability EWMA: a `BlocksDone`/`RangeUnavailable`
+    /// that leaves the outstanding request at `index` with any unreceived height is one
+    /// goodput failure for the request, like a timeout — per request, not per missing height
+    /// (see `penalize_short_response`). A `Satisfied` disposition means the shortfall was
+    /// covered by the floor advancing (not the peer's fault), so it is not charged. Reads the
+    /// outstanding *before* `finish_outstanding_at` removes it.
     fn charge_short_response_reliability(&mut self, index: usize, disposition: Disposition) {
         if disposition == Disposition::Satisfied {
             return;
@@ -1669,9 +1675,7 @@ impl PeerRoutine {
             .get(index)
             .map(|outstanding| unreceived_heights(outstanding).count())
             .unwrap_or(0);
-        if missing > 0 {
-            self.window.penalize_short_response(missing);
-        }
+        self.window.penalize_short_response(missing);
     }
 
     /// A late response can still match after the floor moved through its prefix;
@@ -1959,16 +1963,7 @@ impl PeerRoutine {
                 "peer_outstanding",
                 self.window.outstanding.len() as u64,
             );
-            bs_insert_u64(
-                row,
-                "requests_without_block_progress",
-                u64::from(self.window.requests_without_block_progress),
-            );
-            bs_insert_u64(
-                row,
-                "no_progress_request_cap",
-                u64::from(self.window.no_progress_request_cap()),
-            );
+            self.insert_no_progress_fields(row);
             // The reliability estimate discounts the admission cwnd, so trace it at
             // request time too (not only on delivery): a dropping peer keeps requesting at
             // a shrinking cwnd, and these rows capture the fall.
@@ -1976,15 +1971,6 @@ impl PeerRoutine {
                 row,
                 "bbr_reliability_permille",
                 self.window.bbr_reliability_permille(),
-            );
-            bs_insert_u64(
-                row,
-                "block_progress_proven",
-                if self.window.has_block_progress() {
-                    1
-                } else {
-                    0
-                },
             );
             // A floor request issued while the peer was saturated at its cwnd — borrowed
             // a floor-bypass slot. Lets the analysis confirm the bypass actually fired.
@@ -2032,6 +2018,27 @@ impl PeerRoutine {
     /// delay-gradient ceiling, reliability) into a trace row. Shared by the per-delivery
     /// `block_body_received` row and the `block_peer_bbr` heartbeat so both report an
     /// identical field set.
+    /// Insert the per-peer no-progress accounting fields shared by the GetBlocks-sent row
+    /// and the BBR heartbeat, so the two row types stay in lockstep — one definition of the
+    /// field names and their `u64` encoding, rather than a copy that can drift stylistically.
+    fn insert_no_progress_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
+        bs_insert_u64(
+            row,
+            "requests_without_block_progress",
+            u64::from(self.window.requests_without_block_progress),
+        );
+        bs_insert_u64(
+            row,
+            "no_progress_request_cap",
+            u64::from(self.window.no_progress_request_cap()),
+        );
+        bs_insert_u64(
+            row,
+            "block_progress_proven",
+            u64::from(self.window.has_block_progress()),
+        );
+    }
+
     fn insert_bbr_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
         // Read the windowed estimators as of now, so a trace taken during a quiet bad
         // period reports freshly-filtered (possibly `None`) values, not stale ones.
@@ -2085,21 +2092,7 @@ impl PeerRoutine {
                 self.window.outstanding.len() as u64,
             );
             bs_insert_u64(row, "budget_reserved", self.budget.reserved());
-            bs_insert_u64(
-                row,
-                "requests_without_block_progress",
-                u64::from(self.window.requests_without_block_progress),
-            );
-            bs_insert_u64(
-                row,
-                "no_progress_request_cap",
-                u64::from(self.window.no_progress_request_cap()),
-            );
-            bs_insert_u64(
-                row,
-                "block_progress_proven",
-                u64::from(self.window.has_block_progress()),
-            );
+            self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);
         });
         // Refresh the published slot diagnostics on the same cadence so the cross-peer

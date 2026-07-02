@@ -515,8 +515,13 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
     );
 }
 
+/// The defensive `Disarm` arm in `check_liveness`: a block-liveness deadline that exists
+/// with no recorded request (`last_request_at == None`) was never armed by `arm_liveness`,
+/// so it is disarmed rather than treated as a disconnect. This state is unreachable in
+/// production — every deadline setter runs after a request is sent — so the test sets the
+/// deadline directly to exercise the arm.
 #[test]
-fn block_liveness_never_disconnects_idle_peer() {
+fn block_liveness_disarms_a_deadline_set_without_a_request() {
     let now = Instant::now();
     let mut window = download_window();
 
@@ -527,6 +532,37 @@ fn block_liveness_never_disconnects_idle_peer() {
     window.clear_liveness_if_idle();
     assert_eq!(window.block_liveness_deadline, None);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+}
+
+/// The reliability EWMA is a per-request goodput fraction: a completed request credits one
+/// success and a timed-out request charges one failure. A short response
+/// (`BlocksDone`/`RangeUnavailable`) that leaves many heights unreceived must likewise be
+/// ONE failure for the request — not one per missing height, which (once
+/// `max_blocks_per_response > 1`) would near-seal a peer for a single protocol-legal short
+/// answer. This asserts the charge is independent of the missing-height count.
+#[test]
+fn short_response_charges_one_reliability_failure_per_request_not_per_height() {
+    let fresh = download_window().reliability_factor();
+
+    let one_missing = {
+        let mut window = download_window();
+        window.penalize_short_response(1);
+        window.reliability_factor()
+    };
+    let many_missing = {
+        let mut window = download_window();
+        window.penalize_short_response(64);
+        window.reliability_factor()
+    };
+
+    assert!(
+        one_missing < fresh,
+        "a short response must lower reliability (one goodput failure)"
+    );
+    assert_eq!(
+        one_missing, many_missing,
+        "a short response is one failure per request, independent of the missing-height count"
+    );
 }
 
 #[test]

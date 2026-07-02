@@ -1,4 +1,10 @@
-use super::{bbr::BbrState, config::*, request::*, work_queue::WorkQueue, *};
+use super::{
+    bbr::{rounded_usize, BbrState},
+    config::*,
+    request::*,
+    work_queue::WorkQueue,
+    *,
+};
 use crate::zakura::{
     chain_frontier_from_parts, Frontier, FrontierUpdate, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
@@ -570,14 +576,15 @@ impl DownloadWindow {
     /// the window. A healthy peer (factor ≈ 1) keeps the full bypass; a sealed peer
     /// (factor → 0) gets none, so a wedged peer receives no requests of any kind.
     pub(super) fn scaled_floor_bonus(&self, base: usize) -> usize {
-        let scaled = (base as f64 * self.bbr.reliability_factor()).round();
-        // Finite, non-negative by construction (base ≥ 0, factor ∈ [0, 1]); guard is
-        // defensive against a non-finite factor, sealing the bypass rather than opening it.
-        if scaled.is_finite() && scaled >= 0.0 {
-            scaled as usize
-        } else {
-            0
-        }
+        // Shares the finite/non-negative rounding policy with `effective_cwnd` via
+        // `rounded_usize`: the fallback `0` seals the bypass on a non-finite factor rather
+        // than opening it (base ≥ 0 and factor ∈ [0, 1], so the fallback is defensive only).
+        rounded_usize(base as f64 * self.bbr.reliability_factor(), 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reliability_factor(&self) -> f64 {
+        self.bbr.reliability_factor()
     }
 
     /// Bytes reserved across this peer's in-flight requests (the per-request size
@@ -598,13 +605,21 @@ impl DownloadWindow {
         self.bbr.penalize_reliability(timed_out);
     }
 
-    /// Age the reliability EWMA once per height a short response left missing (a
-    /// `BlocksDone` terminator or `RangeUnavailable`). Unlike a timeout this does *not* dip
-    /// the cwnd — a short response is a goodput, not a latency/congestion, signal — but it
-    /// must still count against reliability so a peer cannot deliver one body per request to
-    /// keep its liveness/no-progress accounting reset while silently dropping the rest.
+    /// Age the reliability EWMA by **one** goodput failure for a short response (a
+    /// `BlocksDone` terminator or `RangeUnavailable`) that left `missing > 0` heights
+    /// unreceived. One failure *per request*, matching the per-request timeout charge
+    /// ([`record_timeout`](Self::record_timeout)) and the per-request delivery credit
+    /// ([`credit_late_delivery`](Self::credit_late_delivery)): the EWMA is a per-request
+    /// goodput fraction, so charging one-per-missing-height would near-seal a peer for a
+    /// single protocol-legal short answer once `max_blocks_per_response > 1` (at the shipped
+    /// default of 1 the two denominations coincide). Unlike a timeout this does *not* dip the
+    /// cwnd — a short response is a goodput, not a latency/congestion, signal — but it must
+    /// still count so a peer cannot deliver one body per request to keep its
+    /// liveness/no-progress accounting reset while dropping the rest.
     pub(super) fn penalize_short_response(&mut self, missing: usize) {
-        self.bbr.penalize_reliability(missing);
+        if missing > 0 {
+            self.bbr.penalize_reliability(1);
+        }
     }
 
     /// Credit the reliability EWMA for a body that arrived *late* — after its request had
@@ -685,6 +700,12 @@ impl DownloadWindow {
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
         match self.block_liveness_deadline {
             None => LivenessOutcome::Ok,
+            // Defensive: a deadline that exists with no recorded request was never armed by
+            // `arm_liveness` (which always sets `last_request_at`), so it was not actually
+            // earned by an outstanding request. Unreachable in production — every deadline
+            // setter runs after a request is sent — so disarm it rather than disconnect the
+            // peer over a deadline it never earned. Reached only by tests that set the
+            // deadline directly.
             Some(deadline) if self.last_request_at.is_none() && now >= deadline => {
                 LivenessOutcome::Disarm
             }
