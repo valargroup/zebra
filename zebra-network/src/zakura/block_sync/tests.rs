@@ -5394,6 +5394,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     }
 
     let mut submitted = Vec::new();
+    let mut saw_refill_query = false;
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock { token, block } => {
@@ -5402,7 +5403,21 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
                     token,
                 ));
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(3),
+                best_header_tip,
+                ..
+            } => {
+                assert_eq!(
+                    best_header_tip,
+                    block::Height(3),
+                    "missing-body query must skip already claimed contiguous bodies",
+                );
+                saw_refill_query = true;
+            }
+            BlockSyncAction::QueryNeededBlocks { from, .. } => {
+                panic!("missing-body query should skip claimed bodies, got from {from:?}")
+            }
             action => panic!("unexpected action before checkpoint submissions: {action:?}"),
         }
     }
@@ -5420,32 +5435,63 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
             height: block::Height(1),
             hash: blocks[0].hash(),
             result: BlockApplyResult::Committed,
-            local_frontier: None,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: blocks[0].hash(),
+            }),
         })
         .await
         .expect("apply-finished event queues");
 
-    // routines ping the producer on a low-water timer, so an early query can
-    // fire while the contiguous prefix is still draining into `applying` (floor
-    // still 1). Wait for the query whose lower bound has reached the submitted
-    // floor (2) — that is the one that must skip the already-submitted bodies.
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(3),
-                best_header_tip,
-                ..
-            } => {
-                assert_eq!(
-                    best_header_tip,
-                    block::Height(3),
-                    "missing-body query must skip already submitted contiguous bodies",
-                );
-                break;
+    handle
+        .send(BlockSyncEvent::BlockApplyFinished {
+            token: submitted[1].1,
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+            result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(2),
+                verified_block_hash: blocks[1].hash(),
+            }),
+        })
+        .await
+        .expect("apply-finished event queues");
+
+    // The low-water ping can dispatch the refill as soon as heights 1 and 2 are
+    // claimed, before this test has observed both `SubmitBlock` actions. If that
+    // happened, the duplicate-pending guard intentionally suppresses another
+    // identical query after apply-finished advances the state frontier.
+    if !saw_refill_query {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match actions
+                    .recv()
+                    .await
+                    .expect("block-sync action channel should stay open")
+                {
+                    BlockSyncAction::QueryNeededBlocks {
+                        from: block::Height(3),
+                        best_header_tip,
+                        ..
+                    } => {
+                        assert_eq!(
+                            best_header_tip,
+                            block::Height(3),
+                            "missing-body query must skip already submitted contiguous bodies",
+                        );
+                        break;
+                    }
+                    BlockSyncAction::QueryNeededBlocks { from, .. } => {
+                        panic!("missing-body query should skip submitted bodies, got from {from:?}")
+                    }
+                    action => panic!("unexpected action before needed-block query: {action:?}"),
+                }
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before needed-block query: {action:?}"),
-        }
+        })
+        .await
+        .expect("bounded needed-block query should arrive after apply-finished advances the floor");
     }
 
     reactor_task.abort();
