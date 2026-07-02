@@ -157,7 +157,6 @@ const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_
 /// `effective_budget / (DESERIALIZED_MEM_FACTOR × 262_144)` wire bytes
 /// (~6.1 KB at the default budget), i.e. for tiny early-chain bodies whose
 /// per-entry bookkeeping overhead the flat resident factor does not model.
-/// A constant rather than a config knob: it never needed operator tuning.
 pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
 
 /// Highest height exempt from look-ahead backpressure: the top of the commit window
