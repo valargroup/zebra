@@ -131,7 +131,7 @@ At config load (`clamp_reorder_lookahead_to_floor`, serde path only), sub-range 
 are raised to one worst-case checkpoint range — `BS_CHECKPOINT_RANGE_BYTE_FLOOR × 4`
 (401 × 2 MB × 4 ≈ 3.208 GB) bytes and 401 blocks — with a warning. The clamps are
 defense-in-depth _sizing_ only: liveness is guaranteed by the commit-window exemption,
-not by budget size. Zero values are rejected by `validate()`.
+not by budget size. Zero config values are rejected.
 
 ### The bound
 
@@ -201,11 +201,14 @@ borrowed a bypass slot.
 - **Flat ×4 factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
   measured ~3.3–4× wire→decoded ratio, not a per-block heap measure (TODO in
   `admission.rs`).
-- **Eventual-cost charging costs depth.** Charging wire-retained reorder and unreceived
-  reservations at ×4 spends look-ahead depth (~¼ of the nominal budget in wire bytes)
-  in reservation-heavy bursts. The sound reclaim is **decode-at-submit** (bodies stay
-  wire-retained through applying and decode inside the submit window), which makes
-  stage-aware per-pool multipliers safe.
+- **Conservative memory accounting reduces look-ahead.** Reorder blocks kept in
+  wire form, and reservations for blocks we have not received yet, are charged at
+  the decoded-memory estimate (`wire bytes × 4`). During reservation-heavy bursts,
+  that means the look-ahead budget admits about a quarter of its nominal size in
+  wire bytes. A better follow-up is **decode-at-submit**: keep bodies in wire form
+  until they enter the submit window, then decode them there. Once each pool has a
+  fixed representation, we can safely charge serialized pools near `×1` and
+  decoded/applying pools near `×4`.
   `estimated_resident_pipeline_bytes` is the single edit point.
 - **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
   commit window costs one extra request per crossing (the price of the never-span
