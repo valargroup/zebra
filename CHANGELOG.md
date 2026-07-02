@@ -84,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
+
 ### Changed
 
 - Increased Zakura's default connection, handshake, stream-open, and QUIC

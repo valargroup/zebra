@@ -105,9 +105,8 @@ fn merge_complete_subtree<H: Hashable + Clone>(
 }
 
 /// Computes the root of a perfect subtree of exactly `2^k` `leaves`, using a
-/// parallel divide-and-conquer reduction across the rayon pool. The combine hashes
-/// within and across the two halves are independent, so this scales across cores.
-/// Used for large batches; small batches use [`perfect_subtree_root_serial`].
+/// parallel divide-and-conquer reduction. The combine hashes within and across
+/// the two halves are independent, so this scales across the rayon pool.
 fn perfect_subtree_root<H: Hashable + Clone + Send + Sync>(leaves: &[H]) -> H {
     debug_assert!(leaves.len().is_power_of_two());
     if leaves.len() == 1 {
@@ -560,7 +559,6 @@ mod tests {
                 "frontier parts mismatch"
             );
         }
-
     }
 
     /// Spot-check small exhaustive sizes for off-by-one boundary bugs.
