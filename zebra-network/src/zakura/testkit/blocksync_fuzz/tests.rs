@@ -563,6 +563,95 @@ async fn fuzz_commit_stall_resident_plateau() {
     );
 }
 
+/// The resident plateau with **multi-block responses** (the fuzz-default 16 blocks per
+/// request, unlike the single-block pin above). Multi-block takes are the regime where a
+/// take whose admission-checked start is inside the commit window could carry
+/// above-window heights past a full resident gate if the take geometry were sized by the
+/// in-flight budget instead of clamped at the window top (`admit`'s never-span-the-
+/// boundary rule). This is end-to-end coverage of the multi-block regime; the bound's
+/// commit-window slack is larger than a per-crossing overshoot at this block size, so
+/// the *pin* for the take geometry itself is the unit test
+/// `exempt_take_never_spans_the_commit_window_boundary` and the `admit` proptest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_commit_stall_resident_plateau_multiblock() {
+    let blocks = 1_200;
+    let body_bytes = 32 * 1024usize;
+    let resident_budget: u64 = 8 * 1024 * 1024;
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64 * 1024 * 1024,
+        max_reorder_lookahead_bytes: resident_budget,
+        max_reorder_lookahead_blocks: 100_000,
+        // Deliberately NOT pinned to 1: fuzz_config()'s 16-block responses exercise
+        // window-crossing take geometry.
+        ..fuzz_config()
+    };
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_000e,
+        config,
+        vec![
+            PeerSpec::fast(1, target(blocks)),
+            PeerSpec::fast(2, target(blocks)),
+        ],
+    );
+    scenario.target_block_bytes = Some(body_bytes);
+    scenario.commit = CommitProfile {
+        per_commit_delay: Duration::from_millis(1),
+        burst: Some(CommitBurstStall {
+            every_commits: 40,
+            duration: Duration::from_millis(120),
+        }),
+    };
+    scenario.deadline = Duration::from_secs(120);
+    let (_, report) = run_checked(
+        "fuzz_commit_stall_resident_plateau_multiblock",
+        scenario,
+        64,
+    )
+    .await;
+
+    // Same bound as the single-block plateau: budget + one commit window of exempt
+    // bodies + a small request-boundary margin. A take-geometry regression (an exempt
+    // multi-block take extending above the window sized by the in-flight budget) drives
+    // retention toward the full ~150 MB resident chain instead.
+    // `usize → u64` widenings are lossless on all supported (64-bit) targets.
+    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
+        .saturating_mul(body_bytes as u64)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let margin = (body_bytes as u64)
+        .saturating_mul(16)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let peak_retained_resident = report
+        .peak_retained_pipeline_wire_bytes
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let bound = resident_budget
+        .saturating_add(window_slack)
+        .saturating_add(margin);
+    assert!(
+        peak_retained_resident <= bound,
+        "peak retained resident cost {} must stay within the {} B budget \
+         (+{} B commit-window slack, +{} B margin) with multi-block responses",
+        peak_retained_resident,
+        resident_budget,
+        window_slack,
+        margin,
+    );
+    assert!(
+        peak_retained_resident >= resident_budget / 2,
+        "the commit stall should have created real retained-memory pressure \
+         (retained {} of the {} B budget)",
+        peak_retained_resident,
+        resident_budget,
+    );
+    tracing::info!(
+        peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
+        peak_retained_resident,
+        resident_budget,
+        window_slack,
+        "commit_stall multi-block resident-plateau observation",
+    );
+}
+
 /// A single high-bandwidth peer with real headroom, served byte-accurately, under the
 /// byte unit. The controller must drive a clean sync to the tip while keeping the byte
 /// window the binding constraint — a per-peer byte cwnd is traced and the in-flight

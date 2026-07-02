@@ -59,10 +59,36 @@ pub(super) enum RequestPriority {
     AboveFloor,
 }
 
-/// Admission result for one candidate request.
+/// Admission verdict for one candidate take: a grant carrying the full take
+/// geometry and sizing, or a typed refusal the fill loop can attribute.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct AdmissionDecision {
+pub(super) enum AdmissionOutcome {
+    Admit(AdmissionGrant),
+    /// The start height is above the commit window and the resident look-ahead
+    /// gate (byte budget or block cap) is full, or the remaining wire headroom
+    /// rounds to zero.
+    LookaheadAtCap,
+    /// The look-ahead gate has headroom but zero bytes are fundable right now
+    /// (the in-flight byte budget is spent). Never returned for floor-priority
+    /// starts: their byte cap is floored at one so the floor block always
+    /// reaches the floor-reservation funding path.
+    InflightBudgetEmpty,
+}
+
+/// Complete geometry and sizing for one contiguous take. Produced only by
+/// [`admit`]; the fill loop feeds it verbatim to the work queue, so a take that
+/// crosses the commit window unbounded by resident headroom cannot be
+/// constructed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct AdmissionGrant {
     pub(super) priority: RequestPriority,
+    /// Inclusive highest height the take may include. Exempt (in-window) grants
+    /// are clamped to the commit window top, so no height above the window ever
+    /// rides an exempt request; gated (above-window) grants pass the caller's
+    /// servable ceiling through.
+    pub(super) take_high: block::Height,
+    /// Authoritative summed-estimate byte cap for the take and its reservation.
+    /// Nothing downstream may substitute its own sizing.
     pub(super) max_request_bytes: u64,
 }
 
@@ -182,61 +208,54 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
         || held_blocks(snapshot) >= u64::from(config.max_reorder_lookahead_blocks)
 }
 
-/// Whether a floor-priority take at `start_height` is allowed past the resident-memory
-/// look-ahead backpressure.
+/// Plans one contiguous take starting at `start_height`: the single authority for
+/// the commit-window exemption, the resident-memory gate, and request sizing.
 ///
-/// Heights in the commit window (one checkpoint range above the verified tip) are always
-/// allowed (liveness — the whole active range must become co-resident before commit can
-/// advance during checkpoint sync, and the committer's next block must reach the
-/// floor-reservation funding path); every other height is allowed only while the
-/// resident-memory budget and block cap have headroom. This is deliberately
-/// **independent of the in-flight byte budget**, so an exhausted in-flight budget still
-/// lets a commit-window floor request reach its funding path — unlike
-/// [`admission_decision`], whose `max_request_bytes` collapses to zero when the in-flight
-/// budget is spent. Anchoring the exemption to the verified tip (rather than the download
-/// floor, which advances on every download) is what stops `body_download_floor` from
-/// escalating unboundedly ahead of commit (ZCA-742).
-pub(super) fn floor_take_allowed(
-    config: &ZakuraBlockSyncConfig,
-    snapshot: AdmissionSnapshot,
-    start_height: block::Height,
-) -> bool {
-    start_height <= commit_window_high(&snapshot) || !lookahead_over_budget(config, &snapshot)
-}
-
-/// Returns the admission decision for a candidate block response starting at `start_height`.
-///
-/// Heights in the commit window (one checkpoint range above the *verified* tip) are always
-/// fundable, so the committer can advance — and a pinned checkpoint range can fully
-/// assemble — even when the look-ahead budget is full. Every other request —
+/// Heights in the commit window (one checkpoint range above the *verified* tip) are
+/// always fundable, so the committer can advance — and a pinned checkpoint range can
+/// fully assemble — even when the look-ahead budget is full. An exempt grant's
+/// `take_high` is clamped to the window top: takes never span the window boundary, so
+/// every above-window height passes through the gated arm and no unexamined height
+/// can ride an exempt request past the resident check. Every other request —
 /// floor-priority included — is admitted only while the configured look-ahead limits
 /// still have capacity, measured against the estimated *resident* cost of the buffered
 /// and in-flight bodies (see [`estimated_resident_pipeline_bytes`]).
 ///
-/// Gating the floor lane (with only the commit window exempt) is what bounds the applying
-/// queue: the download floor advances on every download, so a floor exemption tied to it
-/// escalates unboundedly ahead of commit. Anchoring the exemption to the verified tip
-/// caps the pipeline to the look-ahead budget plus one worst-case window
+/// Gating the floor lane (with only the commit window exempt) is what bounds the
+/// applying queue: the download floor advances on every download, so a floor exemption
+/// tied to it escalates unboundedly ahead of commit. Anchoring the exemption to the
+/// verified tip caps the pipeline to the look-ahead budget plus one worst-case window
 /// (`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS × MAX_BLOCK_BYTES × DESERIALIZED_MEM_FACTOR`
 /// ≈ 3.2 GB; a single in-window response can also exceed the byte gate by up to the
 /// response cap × the factor) regardless of how far headers/downloads run ahead
 /// (ZCA-742).
 ///
-/// Returns `None` when no bytes can be admitted, or when a request above the commit
-/// window would exceed the look-ahead limits.
-pub(super) fn admission_decision(
+/// Floor-priority grants never size below one byte: `take_in_range_budgeted` always
+/// takes its first item regardless of the byte cap, so a `>= 1` cap guarantees the
+/// floor block itself is taken even when the in-flight budget is exactly full — which
+/// reaches `reserve_request_budget`'s floor path, whose `FundFloorReservation` sheds
+/// an above-floor reorder body to fund the floor. This deliberately keeps commit-window
+/// floor liveness **independent of the in-flight byte budget**.
+pub(super) fn admit(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
     start_height: block::Height,
+    servable_high: block::Height,
     response_byte_cap: u64,
-) -> Option<AdmissionDecision> {
+) -> AdmissionOutcome {
     let priority = request_priority(snapshot.download_floor, start_height);
+    let window_high = commit_window_high(&snapshot);
 
-    let max_request_bytes = if start_height <= commit_window_high(&snapshot) {
-        snapshot.budget_available.min(response_byte_cap)
+    let (take_high, max_request_bytes) = if start_height <= window_high {
+        // Exempt: liveness sizing, take clamped at the window top so the resident
+        // gate's coverage of above-window heights is total.
+        (
+            servable_high.min(window_high),
+            snapshot.budget_available.min(response_byte_cap),
+        )
     } else {
         if lookahead_over_budget(config, &snapshot) {
-            return None;
+            return AdmissionOutcome::LookaheadAtCap;
         }
         // Remaining memory headroom, expressed back in wire bytes for the response cap so a
         // single response can't push resident memory past the budget. The next admitted body
@@ -245,14 +264,29 @@ pub(super) fn admission_decision(
             .effective_max_reorder_lookahead_bytes()
             .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
             / DESERIALIZED_MEM_FACTOR;
-        snapshot
-            .budget_available
-            .min(remaining_wire_bytes)
-            .min(response_byte_cap)
+        if remaining_wire_bytes == 0 {
+            return AdmissionOutcome::LookaheadAtCap;
+        }
+        (
+            servable_high,
+            snapshot
+                .budget_available
+                .min(remaining_wire_bytes)
+                .min(response_byte_cap),
+        )
     };
 
-    (max_request_bytes > 0).then_some(AdmissionDecision {
+    let max_request_bytes = if priority == RequestPriority::Floor {
+        max_request_bytes.max(1)
+    } else {
+        max_request_bytes
+    };
+    if max_request_bytes == 0 {
+        return AdmissionOutcome::InflightBudgetEmpty;
+    }
+    AdmissionOutcome::Admit(AdmissionGrant {
         priority,
+        take_high,
         max_request_bytes,
     })
 }
@@ -365,15 +399,32 @@ mod tests {
         };
         // The range-completing block is inside the commit window, so it is exempt.
         assert!(
-            admission_decision(&config, snapshot, block::Height(range_blocks), u64::MAX).is_some(),
+            matches!(
+                admit(
+                    &config,
+                    snapshot,
+                    block::Height(range_blocks),
+                    block::Height(range_blocks),
+                    u64::MAX
+                ),
+                AdmissionOutcome::Admit(_)
+            ),
             "the final block of a checkpoint range must be admissible under a 1 GiB in-flight budget",
         );
         // The first height above the window is memory-gated but must still have headroom
         // under this budget: (802 MB - 2 MB) * 4 resident < 4 GiB effective. This keeps the
         // assertion non-vacuous now that the whole range is window-exempt.
         assert!(
-            admission_decision(&config, snapshot, block::Height(range_blocks + 1), u64::MAX)
-                .is_some(),
+            matches!(
+                admit(
+                    &config,
+                    snapshot,
+                    block::Height(range_blocks + 1),
+                    block::Height(range_blocks + 1),
+                    u64::MAX
+                ),
+                AdmissionOutcome::Admit(_)
+            ),
             "the first gated height above the commit window must still be admissible",
         );
     }
