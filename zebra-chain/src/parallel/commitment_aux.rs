@@ -23,7 +23,7 @@ use crate::{
 /// end-of-block-`height`. `orchard_root` is the empty/default root below NU5.
 ///
 /// This payload carries no trust: a recipient re-verifies every root against its own
-/// checkpoint-committed block headers (design §6) before the fast path folds it in, so
+/// checkpoint-committed block headers before accepting it, so
 /// a forwarding/serving node is exactly as trustworthy as an originating one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockCommitmentRoots {
