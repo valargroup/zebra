@@ -1290,6 +1290,21 @@ fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
     assert_eq!(retaken[0].1.estimated_bytes, 12_345);
 }
 
+/// Test shorthand: the grant for an admitted take, or `None` on any refusal.
+fn admit_grant(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: super::admission::AdmissionSnapshot,
+    start: block::Height,
+    servable_high: block::Height,
+    response_byte_cap: u64,
+) -> Option<super::admission::AdmissionGrant> {
+    match super::admission::admit(config, snapshot, start, servable_high, response_byte_cap) {
+        super::admission::AdmissionOutcome::Admit(grant) => Some(grant),
+        super::admission::AdmissionOutcome::LookaheadAtCap
+        | super::admission::AdmissionOutcome::InflightBudgetEmpty => None,
+    }
+}
+
 #[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
@@ -1311,14 +1326,26 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         budget_available: 40_000_000,
     };
 
-    let floor = super::admission::admission_decision(&config, snapshot, block::Height(11), 1_000)
-        .expect("floor rescue remains admitted at the look-ahead cap");
+    let floor = admit_grant(
+        &config,
+        snapshot,
+        block::Height(11),
+        block::Height(11),
+        1_000,
+    )
+    .expect("floor rescue remains admitted at the look-ahead cap");
     assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
     assert_eq!(floor.max_request_bytes, 1_000);
 
     // Height 412 is the first height above the commit window (verified_tip 10 + 401).
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor work stops at the look-ahead cap"
     );
@@ -1328,9 +1355,14 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         budget_available: 40_000_000,
         ..snapshot
     };
-    let above =
-        super::admission::admission_decision(&config, under_cap, block::Height(412), u64::MAX)
-            .expect("above-floor work is admitted below the cap");
+    let above = admit_grant(
+        &config,
+        under_cap,
+        block::Height(412),
+        block::Height(412),
+        u64::MAX,
+    )
+    .expect("above-floor work is admitted below the cap");
     assert_eq!(
         above.priority,
         super::admission::RequestPriority::AboveFloor
@@ -1362,7 +1394,13 @@ fn admission_counts_inflight_to_sequencer_bytes() {
 
     // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor admission includes bytes already queued to the sequencer"
     );
@@ -1391,7 +1429,13 @@ fn total_resident_plateaus_under_commit_stall() {
 
     // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor admission includes applying bytes held during a commit stall"
     );
@@ -1421,16 +1465,28 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     // Probe above the commit window (verified_tip 10 + 401): the speculative tail of a
     // floor-starting request is refused at the cap once it leaves the window.
     assert_eq!(
-        super::admission::admission_decision(&config, capped, block::Height(412), 1_000),
+        admit_grant(
+            &config,
+            capped,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "the above-floor tail of a floor-starting request is refused at the cap"
     );
-    assert_eq!(
-        super::admission::admission_decision(&config, capped, block::Height(11), 1_000)
-            .expect("floor height remains fundable")
-            .priority,
-        super::admission::RequestPriority::Floor
-    );
+    let floor = admit_grant(
+        &config,
+        capped,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("floor height remains fundable");
+    assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
+    // The exempt grant is clamped at the commit-window top: the take cannot carry
+    // above-window heights past the full gate.
+    assert_eq!(floor.take_high, block::Height(411));
 }
 
 #[test]
@@ -1439,7 +1495,7 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
     // decode like every other pool, so they must be pre-charged at the resident multiple.
     // Charging them nothing makes in-flight volume invisible to the byte gate until it is
     // already resident — in a commit stall the pipeline could fill the whole in-flight wire
-    // budget and then decode ×factor past the plateau (the ZCA-742 OOM, reopened).
+    // budget and then decode ×factor past the plateau.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1461,23 +1517,44 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
     // Reservations alone fill the budget: 700 * 4 = 2_800 >= 1_000, so both the speculative
     // lane and an escalated floor block above the commit window are refused.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(602), u64::MAX),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(602),
+            block::Height(602),
+            u64::MAX
+        ),
         None,
         "outstanding reservations must count against the resident budget",
     );
     assert!(
-        !super::admission::floor_take_allowed(&config, snapshot, block::Height(601)),
+        matches!(
+            super::admission::admit(
+                &config,
+                snapshot,
+                block::Height(601),
+                block::Height(601),
+                u64::MAX
+            ),
+            super::admission::AdmissionOutcome::LookaheadAtCap
+        ),
         "an escalated floor take above the commit window is refused on reserved bytes alone",
     );
     // The commit window stays exempt so the committer can always drain.
-    let window = super::admission::admission_decision(&config, snapshot, block::Height(411), 1_000)
-        .expect("the commit window is exempt from the reservation charge");
+    let window = admit_grant(
+        &config,
+        snapshot,
+        block::Height(411),
+        block::Height(411),
+        1_000,
+    )
+    .expect("the commit window is exempt from the reservation charge");
     assert_eq!(window.max_request_bytes, 1_000);
 }
 
 #[test]
 fn floor_backpressures_when_download_floor_escalates_past_commit() {
-    // Regression for the ZCA-742 OOM. The download floor advances on every download, so a
+    // Regression for the OOM. The download floor advances on every download, so a
     // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
     // commit. With the exemption anchored to the *commit window* (one checkpoint range above
     // the verified tip), a floor-priority request far above the commit tip is backpressured
@@ -1512,7 +1589,13 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         super::admission::RequestPriority::Floor,
     );
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(1_001), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(1_001),
+            block::Height(1_001),
+            1_000
+        ),
         None,
         "a floor request far ahead of commit is backpressured when the memory budget is full",
     );
@@ -1520,19 +1603,106 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     // The commit window (verified_tip + 1 ..= verified_tip + 401) stays fundable, so the
     // committer can advance and drain the pipeline — no deadlock. The boundary is exact:
     // 411 is the last exempt height, 412 the first gated one.
-    let frontier =
-        super::admission::admission_decision(&config, snapshot, block::Height(11), 1_000)
-            .expect("the commit-frontier block is always fundable");
+    let frontier = admit_grant(
+        &config,
+        snapshot,
+        block::Height(11),
+        block::Height(11),
+        1_000,
+    )
+    .expect("the commit-frontier block is always fundable");
     assert_eq!(frontier.max_request_bytes, 1_000);
-    let window_top =
-        super::admission::admission_decision(&config, snapshot, block::Height(411), 1_000)
-            .expect("the top of the commit window is still fundable");
+    let window_top = admit_grant(
+        &config,
+        snapshot,
+        block::Height(411),
+        block::Height(411),
+        1_000,
+    )
+    .expect("the top of the commit window is still fundable");
     assert_eq!(window_top.max_request_bytes, 1_000);
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(412), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "the first height above the commit window is memory-gated",
     );
+}
+
+#[test]
+fn exempt_take_never_spans_the_commit_window_boundary() {
+    // Pin for the above-window take bypass: with multi-block responses, a take whose
+    // admission-checked start sits inside the commit window must not extend above the
+    // window top — otherwise above-window heights ride the exempt request past the
+    // resident gate, sized only by the in-flight budget. The clamp is structural
+    // (gate-independent), so it holds whether or not the gate is full.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        max_reorder_lookahead_blocks: 1_000_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    // Gate full: 300 wire * 4 = 1_200 resident >= 1_000 budget.
+    let full = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 300,
+        applying_buffered_blocks: 10,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        budget_available: 64_000_000,
+    };
+    let grant = admit_grant(
+        &config,
+        full,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("an in-window start stays fundable at a full gate");
+    assert_eq!(
+        grant.take_high,
+        block::Height(411),
+        "the exempt take is clamped at the commit-window top",
+    );
+    assert_eq!(grant.max_request_bytes, 1_000);
+
+    // Same clamp with the gate open: no exempt take ever spans the boundary.
+    let open = super::admission::AdmissionSnapshot {
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        ..full
+    };
+    let grant = admit_grant(
+        &config,
+        open,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("an in-window start is fundable with the gate open");
+    assert_eq!(grant.take_high, block::Height(411));
+
+    // An above-window start with headroom extends to the servable ceiling, sized by the
+    // remaining resident headroom in wire bytes: (1_000 - 0) / 4 = 250.
+    let grant = admit_grant(
+        &config,
+        open,
+        block::Height(412),
+        block::Height(10_000),
+        u64::MAX,
+    )
+    .expect("an above-window start is admitted below the cap");
+    assert_eq!(grant.take_high, block::Height(10_000));
+    assert_eq!(grant.max_request_bytes, 250);
 }
 
 #[test]
@@ -1577,38 +1747,32 @@ fn commit_window_stays_fundable_at_exact_floor() {
         super::admission::request_priority(snapshot.download_floor, block::Height(range_blocks)),
         super::admission::RequestPriority::Floor,
     );
-    assert!(
-        super::admission::floor_take_allowed(&config, snapshot, block::Height(range_blocks)),
-        "the range-completing floor take must pass a full gate",
-    );
-    let completing = super::admission::admission_decision(
+    let completing = admit_grant(
         &config,
         snapshot,
         block::Height(range_blocks),
+        block::Height(range_blocks),
         u64::MAX,
     )
-    .expect("the range-completing block must be admissible at the exact clamp floor");
+    .expect("the range-completing floor take must pass a full gate");
     assert_eq!(
         completing.priority,
         super::admission::RequestPriority::Floor
     );
     assert_eq!(completing.max_request_bytes, 2_000_000);
 
-    // The first height above the window is refused on both lanes while the gate is full.
-    assert!(!super::admission::floor_take_allowed(
-        &config,
-        snapshot,
-        block::Height(range_blocks + 1)
-    ));
-    assert_eq!(
-        super::admission::admission_decision(
+    // The first height above the window is refused while the gate is full — on both
+    // lanes, since `admit` gates every above-window start regardless of priority.
+    assert!(matches!(
+        super::admission::admit(
             &config,
             snapshot,
             block::Height(range_blocks + 1),
+            block::Height(range_blocks + 1),
             u64::MAX
         ),
-        None,
-    );
+        super::admission::AdmissionOutcome::LookaheadAtCap
+    ));
 }
 
 #[test]
@@ -3639,7 +3803,7 @@ proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(256))]
 
     #[test]
-    fn admission_decision_respects_lookahead_bounds(
+    fn admit_respects_lookahead_bounds(
         reorder_bytes in 0u64..2_000,
         applying_bytes in 0u64..2_000,
         input_bytes in 0u64..2_000,
@@ -3681,50 +3845,60 @@ proptest::proptest! {
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
         let effective = config.effective_max_reorder_lookahead_bytes();
-        let above = super::admission::admission_decision(
+        let above = super::admission::admit(
             &config,
             snapshot,
             block::Height(602),
+            block::Height(100_000),
             1_000,
         );
         if estimated_resident >= effective
             || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
+            || (effective - estimated_resident) / factor == 0
         {
-            prop_assert_eq!(above, None);
+            prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
         } else {
             // A gated request funds min(budget, remaining_wire, response_cap); the next
             // body is sized as decoded, so remaining_wire = (effective - resident) / factor.
             let remaining_wire = (effective - estimated_resident) / factor;
             let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
-            if expected > 0 {
-                prop_assert_eq!(above.map(|d| d.max_request_bytes), Some(expected));
-            } else {
-                prop_assert_eq!(above, None);
+            match above {
+                super::admission::AdmissionOutcome::Admit(grant) => {
+                    prop_assert_eq!(grant.max_request_bytes, expected);
+                    // Gated grants pass the servable ceiling through unchanged.
+                    prop_assert_eq!(grant.take_high, block::Height(100_000));
+                    // Single-admission no-breach invariant: whatever the gate admits
+                    // cannot push the resident estimate past the budget once it lands
+                    // and decodes.
+                    prop_assert!(
+                        estimated_resident
+                            .saturating_add(grant.max_request_bytes.saturating_mul(factor))
+                            <= effective
+                    );
+                }
+                other => prop_assert!(false, "expected a gated grant, got {:?}", other),
             }
         }
-        // Single-admission no-breach invariant: whatever the gate admits cannot push the
-        // resident estimate past the budget once it lands and decodes.
-        if let Some(decision) = above {
-            prop_assert!(
-                estimated_resident
-                    .saturating_add(decision.max_request_bytes.saturating_mul(factor))
-                    <= effective
-            );
-        }
 
-        // The commit window (heights <= 411) stays fundable regardless of pool fill.
-        let window = super::admission::admission_decision(
+        // The commit window (heights <= 411) stays fundable regardless of pool fill,
+        // and the exempt grant never spans the window boundary.
+        match super::admission::admit(
             &config,
             snapshot,
             block::Height(11),
+            block::Height(100_000),
             1_000,
-        );
-        prop_assert_eq!(
-            window
-                .expect("the commit window remains admitted while budget is available")
-                .max_request_bytes,
-            1_000
-        );
+        ) {
+            super::admission::AdmissionOutcome::Admit(grant) => {
+                prop_assert_eq!(grant.max_request_bytes, 1_000);
+                prop_assert_eq!(grant.take_high, block::Height(411));
+            }
+            other => prop_assert!(
+                false,
+                "the commit window remains admitted while budget is available, got {:?}",
+                other
+            ),
+        }
     }
 }
 
