@@ -96,20 +96,10 @@ pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     Ok(())
 }
 
-/// Verifies a supplied Orchard root for a *pre-NU5* block (design §6.1).
+/// Verifies a supplied Orchard root for a pre-NU5 block.
 ///
-/// The Orchard tree does not activate until NU5, and no header below NU5 commits to an
-/// Orchard root: the ZIP-221 V1 history leaf (Heartwood..Canopy) *ignores* the Orchard
-/// root entirely (`zcash_history.rs`, `V1::block_to_history_node`), and below Heartwood
-/// there is no MMR at all. So the MMR path that authenticates Orchard roots from NU5
-/// onward cannot vouch for any root below NU5 — yet the fast path folds the supplied
-/// Orchard root into the anchor set for every block. Without this check an untrusted
-/// source could inject an arbitrary Orchard anchor below NU5 that the legacy recompute
-/// path never produces, breaking the §11 trust boundary and consensus equivalence.
-///
-/// Below NU5 the Orchard tree is always the empty default, so the supplied root must
-/// equal the empty-tree root. At and above NU5 activation the MMR path authenticates
-/// the root, so this accepts.
+/// Blocks before NU5 do not commit to Orchard roots, so the MMR cannot
+/// authenticate them. The supplied root must therefore be the empty-tree root.
 pub(crate) fn verify_supplied_orchard_root_below_nu5(
     network: &Network,
     height: Height,
