@@ -11,10 +11,7 @@ use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 use crate::{
     amount,
     block::MAX_BLOCK_BYTES,
-    parameters::{
-        ConsensusBranchId, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
-        TX_V5_VERSION_GROUP_ID,
-    },
+    parameters::{OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID, TX_V5_VERSION_GROUP_ID},
     primitives::{Halo2Proof, ZkSnarkProof},
     serialization::{
         zcash_deserialize_external_count, zcash_serialize_empty_list,
@@ -31,26 +28,6 @@ use crate::sapling;
 
 const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
-const UNSUPPORTED_V6_BRANCH_ID_ERROR: &str =
-    "v6 transaction must have a supported NU6.3 or later consensus branch ID";
-
-fn supported_v6_branch_id(
-    network_upgrade: NetworkUpgrade,
-) -> Result<ConsensusBranchId, &'static str> {
-    if network_upgrade < NetworkUpgrade::Nu6_3 {
-        return Err(UNSUPPORTED_V6_BRANCH_ID_ERROR);
-    }
-
-    let Some(branch_id) = network_upgrade.branch_id() else {
-        return Err(UNSUPPORTED_V6_BRANCH_ID_ERROR);
-    };
-
-    if zcash_protocol::consensus::BranchId::try_from(branch_id).is_err() {
-        return Err(UNSUPPORTED_V6_BRANCH_ID_ERROR);
-    }
-
-    Ok(branch_id)
-}
 
 impl ZcashDeserialize for jubjub::Fq {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
@@ -838,8 +815,12 @@ impl ZcashSerialize for Transaction {
                 orchard_shielded_data,
                 ironwood_shielded_data,
             } => {
-                let branch_id = supported_v6_branch_id(*network_upgrade)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if *network_upgrade < NetworkUpgrade::Nu6_3 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "v6 transaction must have a NU6.3 or later consensus branch ID",
+                    ));
+                }
 
                 // Transaction V6 spec:
                 // https://zips.z.cash/zip-0229
@@ -848,7 +829,11 @@ impl ZcashSerialize for Transaction {
                 writer.write_u32::<LittleEndian>(TX_V6_VERSION_GROUP_ID)?;
 
                 // Denoted as `nConsensusBranchId` in the spec.
-                writer.write_u32::<LittleEndian>(u32::from(branch_id))?;
+                writer.write_u32::<LittleEndian>(u32::from(
+                    network_upgrade
+                        .branch_id()
+                        .expect("valid transactions must have a network upgrade with a branch id"),
+                ))?;
 
                 // Denoted as `lock_time` in the spec.
                 lock_time.zcash_serialize(&mut writer)?;
@@ -1191,7 +1176,11 @@ impl ZcashDeserialize for Transaction {
                 // Convert it to a NetworkUpgrade
                 let network_upgrade =
                     NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
-                supported_v6_branch_id(network_upgrade).map_err(SerializationError::Parse)?;
+                if network_upgrade < NetworkUpgrade::Nu6_3 {
+                    return Err(SerializationError::Parse(
+                        "v6 transaction must have a NU6.3 or later consensus branch ID",
+                    ));
+                }
                 // Denoted as `lock_time` in the spec.
                 let lock_time = LockTime::zcash_deserialize(&mut limited_reader)?;
 

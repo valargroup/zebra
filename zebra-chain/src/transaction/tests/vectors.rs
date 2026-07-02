@@ -1212,7 +1212,7 @@ fn test_coinbase_script() -> Result<()> {
 }
 
 #[test]
-fn v6_transactions_accept_supported_nu6_3_and_later_branch_ids() {
+fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
     let _init_guard = zebra_test::init();
@@ -1246,12 +1246,9 @@ fn v6_transactions_accept_supported_nu6_3_and_later_branch_ids() {
 
         let tx_bytes = empty_v6_transaction_bytes(branch_id);
 
-        let supported_by_librustzcash =
-            zcash_protocol::consensus::BranchId::try_from(branch_id).is_ok();
-
-        if network_upgrade < NetworkUpgrade::Nu6_3 || !supported_by_librustzcash {
+        if network_upgrade < NetworkUpgrade::Nu6_3 {
             let error = Transaction::zcash_deserialize(&tx_bytes[..])
-                .expect_err("V6 transactions must use a supported NU6.3 or later branch ID");
+                .expect_err("V6 transactions must use a NU6.3 or later branch ID");
 
             assert!(
                 matches!(error, SerializationError::Parse(message) if message.contains("NU6.3")),
@@ -1267,9 +1264,8 @@ fn v6_transactions_accept_supported_nu6_3_and_later_branch_ids() {
                 "unexpected V6 branch ID serialization error for {network_upgrade:?}: {error:?}"
             );
         } else {
-            let tx = Transaction::zcash_deserialize(&tx_bytes[..]).expect(
-                "V6 transaction with a supported NU6.3 or later branch ID must deserialize",
-            );
+            let tx = Transaction::zcash_deserialize(&tx_bytes[..])
+                .expect("V6 transaction with a NU6.3 or later branch ID must deserialize");
 
             assert_eq!(tx.version(), 6);
             assert_eq!(tx.network_upgrade(), Some(network_upgrade));
