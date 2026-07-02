@@ -492,18 +492,12 @@ impl ZakuraBlockSyncConfig {
         }
     }
 
-    /// Clamp the resident look-ahead budget up to hold one worst-case checkpoint range.
+    /// Clamp the resident look-ahead budget up to one worst-case checkpoint range.
     ///
-    /// Mirrors [`clamp_inflight_block_bytes_to_floor`] for the resident look-ahead gate.
-    /// Defense-in-depth sizing only: checkpoint-sync liveness is guaranteed by the
-    /// commit-window exemption in admission (one whole checkpoint range above the verified
-    /// tip bypasses the gate, so a pinned range always assembles regardless of budget).
-    /// This clamp keeps a sub-range budget from thrashing the gated speculative lane — a
-    /// resident budget below one range (`BS_CHECKPOINT_RANGE_BYTE_FLOOR *
-    /// DESERIALIZED_MEM_FACTOR`), or a block cap below one range, would refuse nearly all
-    /// above-window work. Clamp both up.
-    ///
-    /// [`effective_max_reorder_lookahead_bytes`]: Self::effective_max_reorder_lookahead_bytes
+    /// This is defense-in-depth for the speculative above-window lane: checkpoint
+    /// sync liveness already comes from the commit-window admission exemption, but
+    /// sub-range byte or block budgets would reject nearly all gated look-ahead work.
+    /// Clamp both floors up to match the range-sized admission model.
     pub fn clamp_reorder_lookahead_to_floor(&mut self) {
         let resident_range_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR
             .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR);
