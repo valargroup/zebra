@@ -1502,7 +1502,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            db.finalized_commitment_roots_by_height_range(height..=height)
+            finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain
@@ -1515,6 +1515,11 @@ where
                 chain.orchard_tree(height.into()),
             ) {
                 (Some(sapling), Some(orchard)) => {
+                    // The non-finalized chain holds the full block, so derive its shielded
+                    // tx-counts and ZIP-244 auth-data root — the ZIP-221 leaf inputs the
+                    // header and roots don't provide — to serve for header-sync verification
+                    // (zero only if the block is unexpectedly absent). The Ironwood tree does
+                    // not exist below Nu7, so its root is the empty-tree root here.
                     let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
                         .block(height.into())
                         .map(|block| {
