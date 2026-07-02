@@ -388,6 +388,116 @@ fn invalidate_root_block_removes_entire_chain_for_network(network: Network) -> R
 }
 
 #[test]
+fn reconsider_block_removes_live_entry_and_second_call_returns_missing() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    for network in Network::iter() {
+        reconsider_block_removes_live_entry_and_second_call_returns_missing_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn reconsider_block_removes_live_entry_and_second_call_returns_missing_for_network(
+    network: Network,
+) -> Result<()> {
+    let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+    let block3 = block2.make_fake_child().set_work(1);
+
+    let mut state = NonFinalizedState::new(&network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+    finalized_state.set_finalized_value_pool(fake_value_pool);
+
+    state.commit_new_chain(block1.prepare(), &finalized_state)?;
+    state.commit_block(block2.clone().prepare(), &finalized_state)?;
+    state.commit_block(block3.prepare(), &finalized_state)?;
+
+    state.invalidate_block(block2.hash())?;
+    state.reconsider_block(block2.hash(), &finalized_state.db)?;
+
+    assert!(
+        state.invalidated_blocks().values().all(|blocks| {
+            blocks
+                .first()
+                .map(|block| block.hash != block2.hash())
+                .unwrap_or(true)
+        }),
+        "first reconsider should remove the invalidated entry from the live map"
+    );
+
+    let second = state.reconsider_block(block2.hash(), &finalized_state.db);
+    assert!(
+        matches!(second, Err(ReconsiderError::MissingInvalidatedBlock(_))),
+        "a second reconsider for the same hash should return MissingInvalidatedBlock; got {second:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn reconsider_block_preserves_record_when_parent_chain_missing() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    for network in Network::iter() {
+        reconsider_block_preserves_record_when_parent_chain_missing_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn reconsider_block_preserves_record_when_parent_chain_missing_for_network(
+    network: Network,
+) -> Result<()> {
+    let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+    let block3 = block2.make_fake_child().set_work(1);
+
+    let mut state = NonFinalizedState::new(&network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+    finalized_state.set_finalized_value_pool(fake_value_pool);
+
+    state.commit_new_chain(block1.clone().prepare(), &finalized_state)?;
+    state.commit_block(block2.clone().prepare(), &finalized_state)?;
+    state.commit_block(block3.prepare(), &finalized_state)?;
+
+    state.invalidate_block(block2.hash())?;
+    state.invalidate_block(block1.hash())?;
+
+    let result = state.reconsider_block(block2.hash(), &finalized_state.db);
+    assert!(
+        matches!(result, Err(ReconsiderError::ParentChainNotFound(_))),
+        "reconsider with missing parent chain should fail, got {result:?}"
+    );
+
+    assert!(
+        state.invalidated_blocks().values().any(|blocks| {
+            blocks
+                .first()
+                .map(|block| block.hash == block2.hash())
+                .unwrap_or(false)
+        }),
+        "a failed reconsider must not destroy the invalidation record"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn reconsider_block_and_reconsider_chain_correctly_reconsiders_blocks_and_descendants() -> Result<()>
 {
     let _init_guard = zebra_test::init();

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added `ReconsiderError::ReplayFailed`, returned when replaying a previously
+  invalidated block fails during `reconsiderblock`.
 - Bumped the state database format to 28 during upgrade, backfilling empty
   Ironwood tree, value pool, and index data, then rebuilding stored history tree
   entries so they use the Ironwood-capable entry size.
