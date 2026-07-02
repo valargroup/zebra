@@ -778,7 +778,6 @@ impl FinalizedState {
                 source,
                 retention,
                 None,
-                None,
             )
         });
 

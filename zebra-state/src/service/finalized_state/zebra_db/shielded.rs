@@ -33,7 +33,7 @@ use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{shielded::CommitmentRootsByHeight, RawBytes},
-        zebra_db::ZebraDb,
+        zebra_db::{block::VctData, ZebraDb},
         COMMITMENT_ROOTS_BY_HEIGHT,
     },
     TransactionLocation,
@@ -775,8 +775,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
-        vct_sync_below: Option<Height>,
+        vct_data: Option<VctData>,
     ) {
         let FinalizedBlock {
             height,
@@ -819,8 +818,8 @@ impl DiskWriteBatch {
         // below the checkpoint handoff height). Written in the same atomic batch as
         // every vct commit, so a vct-synced database always carries the marker and
         // the read/validity guards never see absent trees without it.
-        if let Some(handoff) = vct_sync_below {
-            self.update_vct_sync_marker(zebra_db, handoff);
+        if let Some(VctData { sync_below, .. }) = vct_data {
+            self.update_vct_sync_marker(zebra_db, sync_below);
         }
 
         // POC (verified-commitment-trees) vct path: the committer skipped the
@@ -830,7 +829,15 @@ impl DiskWriteBatch {
         // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
         // modern checkpoint, so it is correctly left untouched here.
         // See docs/design/verified-commitment-trees.md.
-        if let Some((sapling_root, orchard_root)) = vct_anchor_roots {
+        if let Some(VctData {
+            anchor_roots: (sapling_root, orchard_root),
+            sync_below,
+        }) = vct_data
+        {
+            // Mark the database as vct-synced in the same atomic batch as every
+            // fast commit, so the read/validity guards never see absent trees
+            // without the handoff marker.
+            self.update_vct_sync_marker(zebra_db, sync_below);
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);
             // Persist the per-height roots into the serving index even though no per-height
