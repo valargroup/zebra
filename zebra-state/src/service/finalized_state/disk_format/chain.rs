@@ -52,18 +52,6 @@ pub struct HistoryTreeParts {
 }
 
 impl HistoryTreeParts {
-    /// Deserializes history tree parts from raw database bytes.
-    pub(crate) fn from_bytes_result(bytes: impl AsRef<[u8]>) -> Result<Self, bincode::Error> {
-        let bytes = bytes.as_ref();
-        let options = bincode::DefaultOptions::new();
-
-        options.deserialize::<HistoryTreeParts>(bytes).or_else(|_| {
-            options
-                .deserialize::<LegacyHistoryTreeParts>(bytes)
-                .map(HistoryTreeParts::from)
-        })
-    }
-
     /// Converts [`HistoryTreeParts`] to a [`NonEmptyHistoryTree`].
     pub(crate) fn with_network(
         self,
@@ -142,7 +130,23 @@ impl From<LegacyHistoryTreeParts> for HistoryTreeParts {
 
 impl FromDisk for HistoryTreeParts {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        Self::from_bytes_result(bytes)
+        let bytes = bytes.as_ref();
+        let options = bincode::DefaultOptions::new();
+
+        // Try the current entry width first. Databases written before NU6.3 widened
+        // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
+        // so fall back to the legacy width and zero-pad each entry up to the current width.
+        //
+        // Legacy-width rows can fail the current-width decoder with errors other than
+        // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
+        // interpret arbitrary entry bytes as bincode control bytes.
+        options
+            .deserialize::<HistoryTreeParts>(bytes)
+            .or_else(|_| {
+                options
+                    .deserialize::<LegacyHistoryTreeParts>(bytes)
+                    .map(HistoryTreeParts::from)
+            })
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }
