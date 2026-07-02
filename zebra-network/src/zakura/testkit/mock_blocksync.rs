@@ -525,7 +525,8 @@ async fn drive_mock_block_sync_actions(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip,
+                    from,
+                    limit,
                     best_header_tip,
                 } => {
                     if let Some(gate) = needed_blocks_gate.as_mut() {
@@ -535,12 +536,19 @@ async fn drive_mock_block_sync_actions(
                             }
                         }
                     }
-                    let start = verified_block_tip.next().unwrap_or(verified_block_tip);
-                    let end = best_header_tip.min(corpus.target_height());
-                    let metas = if start <= end {
-                        corpus.metas_between(start, end)
-                    } else {
+                    let start = from;
+                    let metas = if limit == 0 {
                         Vec::new()
+                    } else {
+                        let end = (start + i64::from(limit.saturating_sub(1)))
+                            .unwrap_or(block::Height::MAX)
+                            .min(best_header_tip)
+                            .min(corpus.target_height());
+                        if start <= end {
+                            corpus.metas_between(start, end)
+                        } else {
+                            Vec::new()
+                        }
                     };
                     let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                 }

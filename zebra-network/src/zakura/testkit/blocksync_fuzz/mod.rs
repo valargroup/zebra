@@ -229,15 +229,23 @@ fn spawn_action_driver(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip,
+                    from,
+                    limit,
                     best_header_tip,
                 } => {
-                    let start = verified_block_tip.next().unwrap_or(verified_block_tip);
-                    let end = best_header_tip.min(target);
-                    let metas = if start <= end {
-                        corpus.metas_between(start, end)
-                    } else {
+                    let start = from;
+                    let metas = if limit == 0 {
                         Vec::new()
+                    } else {
+                        let end = (start + i64::from(limit.saturating_sub(1)))
+                            .unwrap_or(block::Height::MAX)
+                            .min(best_header_tip)
+                            .min(target);
+                        if start <= end {
+                            corpus.metas_between(start, end)
+                        } else {
+                            Vec::new()
+                        }
                     };
                     if handle
                         .send(BlockSyncEvent::NeededBlocks(metas))

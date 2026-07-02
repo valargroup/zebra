@@ -654,6 +654,19 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .await?,
         ReadResponse::MissingBlockBodies(vec![Height(1), Height(2)]),
     );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::MissingBlockBodyMetadata {
+                from: Height(1),
+                limit: 10,
+            })
+            .await?,
+        ReadResponse::MissingBlockBodyMetadata(vec![
+            (Height(1), block1_hash, Some(999_999)),
+            (Height(2), block2_hash, None),
+        ]),
+    );
 
     assert_eq!(
         read_state.oneshot(ReadRequest::FinalizedTip).await?,

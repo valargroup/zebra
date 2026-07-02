@@ -235,12 +235,14 @@ async fn wait_for_query_needed_blocks(
     verified_block_tip: block::Height,
     best_header_tip: block::Height,
 ) {
+    let expected_from = verified_block_tip.next().unwrap_or(verified_block_tip);
     loop {
         match next_action(actions).await {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: actual_verified,
+                from,
                 best_header_tip: actual_best,
-            } if actual_verified == verified_block_tip && actual_best == best_header_tip => return,
+                ..
+            } if from == expected_from && actual_best == best_header_tip => return,
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before target QueryNeededBlocks: {action:?}"),
         }
@@ -4208,10 +4210,11 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
                 best_header_tip,
+                ..
             } => {
-                assert_eq!(verified_block_tip, block::Height(0));
+                assert_eq!(from, block::Height(1));
                 // The startup query carries best_header_tip 0; wait for the
                 // tip-1 query (there is no near-tip pause to suppress either).
                 if best_header_tip == block::Height(1) {
@@ -5429,8 +5432,9 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(2),
+                from: block::Height(3),
                 best_header_tip,
+                ..
             } => {
                 assert_eq!(
                     best_header_tip,
@@ -6116,8 +6120,9 @@ async fn reactor_zero_pause_threshold_preserves_lag_one_downloads() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(0),
+            from: block::Height(1),
             best_header_tip: block::Height(1),
+            ..
         }
     ) {}
 
@@ -6245,8 +6250,9 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(3),
+            from: block::Height(4),
             best_header_tip: block::Height(6),
+            ..
         }
     ) {}
 
@@ -6574,10 +6580,11 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
 
     match next_action(&mut actions).await {
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip,
+            from,
             best_header_tip,
+            ..
         } => {
-            assert_eq!(verified_block_tip, block::Height(0));
+            assert_eq!(from, block::Height(1));
             assert_eq!(best_header_tip, block::Height(3));
         }
         action => panic!("restart from genesis must query missing bodies, got {action:?}"),
@@ -6940,14 +6947,15 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                 action = actions.recv() => {
                     match action.expect("block-sync action channel should stay open") {
                         BlockSyncAction::QueryNeededBlocks {
-                            verified_block_tip,
+                            from,
                             best_header_tip,
+                            ..
                         } => {
                             // queries fire at various floor states as commits
                             // advance the floor (it starts at 800 and climbs as the
                             // prefix commits), so the lower bound is `>= 800`, not
                             // exactly 800.
-                            assert!(verified_block_tip >= block::Height(800));
+                            assert!(from >= block::Height(801));
                             assert_eq!(best_header_tip, block::Height(BEST_HEADER_TIP));
                             handle
                                 .send(BlockSyncEvent::NeededBlocks(metas.clone()))
@@ -7108,8 +7116,9 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(3),
+            ..
         }
     ) {}
 
@@ -7241,8 +7250,9 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(3),
+            ..
         }
     ) {}
 
@@ -7369,8 +7379,9 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(3),
+            ..
         }
     ) {}
 
@@ -7463,8 +7474,9 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(3),
+            ..
         }
     ) {}
 
@@ -7619,8 +7631,9 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(2),
+            ..
         }
     ) {}
 
@@ -7697,7 +7710,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             ..
         }
     ) {}
@@ -7954,8 +7967,9 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(3),
+            ..
         }
     ) {}
 
@@ -8003,8 +8017,9 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(3),
+            from: block::Height(4),
             best_header_tip: block::Height(4),
+            ..
         }
     ) {}
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -8142,8 +8157,9 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         while !matches!(
             next_action(&mut actions).await,
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
                 best_header_tip: block::Height(3),
+                ..
             }
         ) {}
         handle
@@ -8189,8 +8205,9 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         while !matches!(
             next_action(&mut actions).await,
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(1),
+                from: block::Height(2),
                 best_header_tip: block::Height(3),
+                ..
             }
         ) {}
         submitted_tip = block::Height(1);
@@ -8201,8 +8218,9 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         while !matches!(
             next_action(&mut actions).await,
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(1),
+                from: block::Height(2),
                 best_header_tip: block::Height(3),
+                ..
             }
         ) {}
 
@@ -8306,8 +8324,9 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         while !matches!(
             next_action(&mut actions).await,
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(3),
+                from: block::Height(4),
                 best_header_tip: block::Height(4),
+                ..
             }
         ) {}
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -8522,8 +8541,9 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(1),
+            from: block::Height(2),
             best_header_tip: block::Height(2),
+            ..
         }
     ) {}
     handle
@@ -10035,6 +10055,39 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
 }
 
 #[tokio::test]
+async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
+    let best_header_tip = block::Height(50_000);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([50; 32])));
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        max_inflight_requests: 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([50; 32])),
+        tip_rx,
+        config,
+    );
+    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            from: block::Height(1),
+            limit: 2,
+            best_header_tip: block::Height(50_000),
+        }
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_ignores_stale_non_reset_frontier_updates() {
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3600), block::Hash([36; 32])));
     let startup = BlockSyncStartup::new(
@@ -10052,8 +10105,9 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
     assert!(matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: block::Height(3200),
+            from: block::Height(3201),
             best_header_tip: block::Height(3600),
+            ..
         }
     ));
 
