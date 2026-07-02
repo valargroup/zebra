@@ -214,7 +214,7 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
 /// above the *verified* tip) are always fundable, so the committer can advance.
 /// This lets a pinned checkpoint range fully assemble even when the look-ahead
 /// budget is full.
-/// 
+///
 /// Exempt requests are capped at the top of the commit window, so one request
 /// cannot include both exempt in-window blocks and gated above-window blocks.
 /// Anything above the commit window must pass the normal look-ahead memory check.

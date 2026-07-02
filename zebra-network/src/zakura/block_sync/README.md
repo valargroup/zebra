@@ -68,7 +68,7 @@ sizing.
 
 Heights in `(verified_tip, verified_tip + 401]` are the **commit window**
 (`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS` = `MAX_CHECKPOINT_HEIGHT_GAP + 1`). The checkpoint
-verifier resolves a range only once the *whole* range (up to 401 blocks) is submitted,
+verifier resolves a range only once the _whole_ range (up to 401 blocks) is submitted,
 while the verified tip stays pinned to the previous checkpoint. So every block of the
 active range must stay fundable even when the look-ahead budget is full — otherwise the
 range can never assemble and sync wedges. The span is deliberately a constant, not
@@ -105,7 +105,7 @@ production default of one block per response this split never occurs.
 
 The look-ahead budget bounds **estimated resident memory**, not wire bytes. Decoded
 bodies occupy roughly 3.3–4× their serialized size, so every pool is charged at its
-*eventual* decoded cost, `wire_bytes × DESERIALIZED_MEM_FACTOR` (= 4):
+_eventual_ decoded cost, `wire_bytes × DESERIALIZED_MEM_FACTOR` (= 4):
 
 | Pool (snapshot field) | Actual retention today | Charged at ×4 because… |
 | --- | --- | --- |
@@ -123,14 +123,14 @@ Two gates, checked together in `lookahead_over_budget`:
 
 This is separate from the **in-flight wire budget** (`max_inflight_block_bytes`,
 default 6 GiB, tracked by `ByteBudget`): that bounds bytes concurrently on the wire;
-the look-ahead gate bounds bytes *retained* by the pipeline.
+the look-ahead gate bounds bytes _retained_ by the pipeline.
 
 ### Config clamps
 
 At config load (`clamp_reorder_lookahead_to_floor`, serde path only), sub-range budgets
 are raised to one worst-case checkpoint range — `BS_CHECKPOINT_RANGE_BYTE_FLOOR × 4`
 (401 × 2 MB × 4 ≈ 3.208 GB) bytes and 401 blocks — with a warning. The clamps are
-defense-in-depth *sizing* only: liveness is guaranteed by the commit-window exemption,
+defense-in-depth _sizing_ only: liveness is guaranteed by the commit-window exemption,
 not by budget size. Zero values are rejected by `validate()`.
 
 ### The bound
