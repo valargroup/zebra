@@ -140,20 +140,16 @@ pub(super) fn request_deadline(
     }
 }
 
-/// Heights within this many blocks above the verified tip are exempt from the
-/// look-ahead gates: one worst-case checkpoint range.
+/// Heights within one worst-case checkpoint range above the verified tip bypass
+/// look-ahead gates.
 ///
-/// During checkpoint sync the checkpoint verifier resolves a range only once the whole
-/// range — up to this many blocks — is submitted, and the verified tip stays pinned to
-/// the previous checkpoint until then. Every block of the active range must therefore
-/// stay fundable even when the look-ahead budget and block cap are full, or the range
-/// can never assemble and sync wedges.
+/// During checkpoint sync, the verified tip remains at the previous checkpoint
+/// until the full range is submitted, so every block in that range must remain
+/// fundable even when normal look-ahead limits are full.
 ///
-/// Deliberately a constant rather than `config.submitted_apply_limit()`: that accessor
-/// has a floor but no ceiling, so a huge configured submit window would widen the
-/// exemption until the memory gate is disabled entirely.
-// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
-// (= 401), which fits `u32` losslessly.
+/// This is a fixed consensus-derived bound, not `config.submitted_apply_limit()`,
+/// because the configured submit window can be much larger and would weaken the
+/// memory gate.
 const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
 
 /// Highest height exempt from look-ahead backpressure: the top of the commit window
