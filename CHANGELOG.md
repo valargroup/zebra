@@ -88,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   per-leaf Merkle hashing for a block (the dominant committer cost on shielded
   blocks) depends only on the starting note count, not the frontier's hashes, so
   the finalized write loop now does a one-block look-ahead and runs the next
-  block's Sapling/Orchard hashing on idle cores while the current block commits;
+  block's Sapling/Orchard/Ironwood hashing on idle cores while the current block commits;
   the committer then only applies the precomputed subtree roots onto the frontier
   (`update_trees_parallel_with` in `zebra-chain`). The precompute is applied only
   if its starting tree size still matches at commit time and otherwise falls back

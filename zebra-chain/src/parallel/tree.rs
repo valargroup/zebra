@@ -80,7 +80,7 @@ impl NoteCommitmentTrees {
     /// [`BlockNotePrecompute`] computed ahead of time off the committer when one is
     /// supplied and still matches the current tree sizes.
     ///
-    /// The Sapling/Orchard per-leaf Merkle hashing is the dominant cost of
+    /// The Sapling/Orchard/Ironwood per-leaf Merkle hashing is the dominant cost of
     /// committing a shielded block; precomputing it concurrently (keyed only on the
     /// note position) lets the committer do just the cheap apply the precomputed subtree roots. A `None` or
     /// size-mismatched precompute transparently falls back to hashing inline, so the
@@ -117,9 +117,9 @@ impl NoteCommitmentTrees {
         // size would apply the wrong leaves and silently produce a wrong root. A
         // mismatch (or `None`) falls back to inline hashing, which is correct, just
         // slower — so this can only cost speed, never correctness.
-        let (sapling_precompute, orchard_precompute) = match precompute {
-            Some(p) if p.block_hash == block.hash() => (p.sapling, p.orchard),
-            _ => (None, None),
+        let (sapling_precompute, orchard_precompute, ironwood_precompute) = match precompute {
+            Some(p) if p.block_hash == block.hash() => (p.sapling, p.orchard, p.ironwood),
+            _ => (None, None, None),
         };
 
         let mut sprout_result = None;
@@ -159,9 +159,10 @@ impl NoteCommitmentTrees {
 
             if !ironwood_note_commitments.is_empty() {
                 scope.spawn_fifo(|_scope| {
-                    ironwood_result = Some(Self::update_ironwood_note_commitment_tree(
+                    ironwood_result = Some(Self::update_ironwood_note_commitment_tree_with(
                         ironwood,
                         ironwood_note_commitments,
+                        ironwood_precompute,
                     ));
                 });
             }
@@ -369,11 +370,42 @@ impl NoteCommitmentTrees {
 
         Ok((ironwood, subtree_root))
     }
+
+    /// Like [`update_ironwood_note_commitment_tree`](Self::update_ironwood_note_commitment_tree),
+    /// but applies `precompute` when present and size-matched; otherwise inline. Identical result.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn update_ironwood_note_commitment_tree_with(
+        mut ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
+        ironwood_note_commitments: Vec<ironwood::tree::NoteCommitmentUpdate>,
+        precompute: Option<ironwood::tree::PrecomputedAppendBatch>,
+    ) -> Result<
+        (
+            Arc<ironwood::tree::NoteCommitmentTree>,
+            Option<(NoteCommitmentSubtreeIndex, ironwood::tree::Node)>,
+        ),
+        NoteCommitmentTreeError,
+    > {
+        let ironwood_nct = Arc::make_mut(&mut ironwood);
+
+        let subtree_root = match precompute {
+            Some(pre) if pre.start_size() == ironwood_nct.count() => ironwood_nct
+                .apply_precomputed_append(pre)
+                .map_err(NoteCommitmentTreeError::Ironwood)?,
+            _ => ironwood_nct
+                .append_batch(&ironwood_note_commitments)
+                .map_err(NoteCommitmentTreeError::Ironwood)?,
+        };
+
+        // Re-calculate and cache the tree root.
+        let _ = ironwood_nct.root();
+
+        Ok((ironwood, subtree_root))
+    }
 }
 
-/// The off-committer precomputed parallel-append work for one block's Sapling and
-/// Orchard note commitments, produced by [`BlockNotePrecompute::compute`] and applied
-/// via [`NoteCommitmentTrees::update_trees_parallel_with`].
+/// The off-committer precomputed parallel-append work for one block's Sapling,
+/// Orchard, and Ironwood note commitments, produced by [`BlockNotePrecompute::compute`]
+/// and applied via [`NoteCommitmentTrees::update_trees_parallel_with`].
 #[derive(Clone, Debug)]
 pub struct BlockNotePrecompute {
     /// The hash of the block this precompute was computed for. The committer
@@ -386,24 +418,27 @@ pub struct BlockNotePrecompute {
     pub(crate) sapling: Option<sapling::tree::PrecomputedAppendBatch>,
     /// Precomputed Orchard append, if the block has Orchard actions.
     pub(crate) orchard: Option<orchard::tree::PrecomputedAppendBatch>,
+    /// Precomputed Ironwood append, if the block has Ironwood actions.
+    pub(crate) ironwood: Option<ironwood::tree::PrecomputedAppendBatch>,
 }
 
 impl BlockNotePrecompute {
-    /// Precomputes the Sapling and Orchard per-leaf Merkle hashing for `block`,
-    /// given the tree sizes (cumulative note counts) the block will commit at.
+    /// Precomputes the Sapling, Orchard, and Ironwood per-leaf Merkle hashing for
+    /// `block`, given the tree sizes (cumulative note counts) the block will commit at.
     ///
     /// Runs off the committer, concurrently across blocks. The committer then only
-    /// applies the precomputed subtree roots. `sapling_start` / `orchard_start` are the respective tree `count`s
-    /// immediately before this block; the committer re-checks them and falls back to
-    /// inline hashing on any mismatch. Pools with no notes (or a precompute error)
-    /// are left `None`, also falling back to inline.
+    /// applies the precomputed subtree roots. `sapling_start` / `orchard_start` /
+    /// `ironwood_start` are the respective tree `count`s immediately before this block;
+    /// the committer re-checks them and falls back to inline hashing on any mismatch.
+    /// Pools with no notes (or a precompute error) are left `None`, also falling back
+    /// to inline.
     ///
-    /// The Sapling and Orchard precomputes run concurrently via [`rayon::join`],
+    /// The three pools' precomputes run concurrently via nested [`rayon::join`],
     /// mirroring the per-pool parallelism of [`NoteCommitmentTrees::update_trees_parallel`]:
-    /// each pool's hashing is already internally parallel, and the join lets the two
-    /// pools overlap. For small blocks (both pools below [`PARALLEL_HASH_THRESHOLD`])
-    /// they are computed sequentially, since there is too little hashing to repay the
-    /// cross-pool join.
+    /// each pool's hashing is already internally parallel, and the joins let the pools
+    /// overlap. For small blocks (every pool below [`PARALLEL_HASH_THRESHOLD`]) they are
+    /// computed sequentially, since there is too little hashing to repay the cross-pool
+    /// join.
     ///
     /// # Cancellation
     ///
@@ -418,6 +453,7 @@ impl BlockNotePrecompute {
     pub fn compute(
         sapling_start: u64,
         orchard_start: u64,
+        ironwood_start: u64,
         block: &Block,
         cancel: &AtomicBool,
     ) -> Self {
@@ -428,11 +464,13 @@ impl BlockNotePrecompute {
                 block_hash,
                 sapling: None,
                 orchard: None,
+                ironwood: None,
             };
         }
 
         let sapling_notes: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_notes: Vec<_> = block.orchard_note_commitments().cloned().collect();
+        let ironwood_notes: Vec<_> = block.ironwood_note_commitments().cloned().collect();
 
         let sapling_fn = || {
             if cancel.load(Ordering::Relaxed) || sapling_notes.is_empty() {
@@ -446,19 +484,28 @@ impl BlockNotePrecompute {
             }
             orchard::tree::NoteCommitmentTree::precompute_append(orchard_start, &orchard_notes).ok()
         };
+        let ironwood_fn = || {
+            if cancel.load(Ordering::Relaxed) || ironwood_notes.is_empty() {
+                return None;
+            }
+            ironwood::tree::NoteCommitmentTree::precompute_append(ironwood_start, &ironwood_notes)
+                .ok()
+        };
 
         let overlap_pools = sapling_notes.len() >= PARALLEL_HASH_THRESHOLD
-            || orchard_notes.len() >= PARALLEL_HASH_THRESHOLD;
-        let (sapling, orchard) = if overlap_pools {
-            rayon::join(sapling_fn, orchard_fn)
+            || orchard_notes.len() >= PARALLEL_HASH_THRESHOLD
+            || ironwood_notes.len() >= PARALLEL_HASH_THRESHOLD;
+        let (sapling, (orchard, ironwood)) = if overlap_pools {
+            rayon::join(sapling_fn, || rayon::join(orchard_fn, ironwood_fn))
         } else {
-            (sapling_fn(), orchard_fn())
+            (sapling_fn(), (orchard_fn(), ironwood_fn()))
         };
 
         Self {
             block_hash,
             sapling,
             orchard,
+            ironwood,
         }
     }
 }
@@ -488,7 +535,7 @@ mod tests {
         );
 
         // Not cancelled: the Sapling pool is precomputed.
-        let live = BlockNotePrecompute::compute(0, 0, &block, &AtomicBool::new(false));
+        let live = BlockNotePrecompute::compute(0, 0, 0, &block, &AtomicBool::new(false));
         assert!(
             live.sapling.is_some(),
             "a live precompute hashes the populated pool"
@@ -496,7 +543,7 @@ mod tests {
 
         // Cancelled before it runs: no hashing, an empty precompute the committer
         // treats as a miss (hashing inline instead).
-        let cancelled = BlockNotePrecompute::compute(0, 0, &block, &AtomicBool::new(true));
+        let cancelled = BlockNotePrecompute::compute(0, 0, 0, &block, &AtomicBool::new(true));
         assert!(
             cancelled.sapling.is_none() && cancelled.orchard.is_none(),
             "a cancelled precompute does no work"
@@ -543,7 +590,7 @@ mod tests {
         // A precompute built for block B at the same starting tree size (0) as A: its
         // `start_size` matches A's tree, so the size-only guard would have applied B's
         // leaves. The block-hash binding must reject it instead.
-        let pre_b = BlockNotePrecompute::compute(0, 0, &block_b, &AtomicBool::new(false));
+        let pre_b = BlockNotePrecompute::compute(0, 0, 0, &block_b, &AtomicBool::new(false));
         assert!(
             pre_b.sapling.is_some(),
             "block B exercises the Sapling pool"
@@ -560,7 +607,7 @@ mod tests {
         );
 
         // The correctly-bound precompute for A is still applied and matches.
-        let pre_a = BlockNotePrecompute::compute(0, 0, &block_a, &AtomicBool::new(false));
+        let pre_a = BlockNotePrecompute::compute(0, 0, 0, &block_a, &AtomicBool::new(false));
         let mut matched = NoteCommitmentTrees::default();
         matched
             .update_trees_parallel_with(&block_a, Some(pre_a))
@@ -569,6 +616,70 @@ mod tests {
             matched.sapling.root(),
             correct.sapling.root(),
             "a precompute bound to this block is applied"
+        );
+    }
+
+    /// The Ironwood precompute path must produce the same tree state as the inline
+    /// append. Ironwood reuses Orchard's tree type but keeps a separate tree, so this
+    /// checks that `update_ironwood_note_commitment_tree_with` applies a size-matched
+    /// precompute — and falls back on a size mismatch — exactly like the inline update.
+    ///
+    /// The synthetic leaves are arbitrary field elements: the note-commitment tree
+    /// hashes its leaves without interpreting them, so this exercises the append/apply
+    /// hashing that the precompute optimizes, independently of note validity. (There
+    /// are no Mainnet Ironwood block vectors yet; the underlying subtree-completion
+    /// equivalence is covered generically by the `batch_frontier` proptests.)
+    #[test]
+    fn ironwood_precompute_matches_inline() {
+        use halo2::pasta::pallas;
+
+        let _init_guard = zebra_test::init();
+
+        let notes: Vec<ironwood::tree::NoteCommitmentUpdate> =
+            (1..=50u64).map(pallas::Base::from).collect();
+
+        // Inline append onto the genesis (empty) tree.
+        let (inline_tree, inline_subtree) =
+            NoteCommitmentTrees::update_ironwood_note_commitment_tree(
+                Arc::new(ironwood::tree::NoteCommitmentTree::default()),
+                notes.clone(),
+            )
+            .expect("inline ironwood append succeeds");
+
+        // A precompute at the matching start size (0) must apply and match exactly.
+        let precompute = ironwood::tree::NoteCommitmentTree::precompute_append(0, &notes)
+            .expect("ironwood precompute succeeds");
+        let (precomputed_tree, precomputed_subtree) =
+            NoteCommitmentTrees::update_ironwood_note_commitment_tree_with(
+                Arc::new(ironwood::tree::NoteCommitmentTree::default()),
+                notes.clone(),
+                Some(precompute),
+            )
+            .expect("ironwood precomputed append succeeds");
+        assert_eq!(
+            inline_tree.root(),
+            precomputed_tree.root(),
+            "a size-matched ironwood precompute must yield the same root as inline append"
+        );
+        assert!(
+            inline_subtree == precomputed_subtree,
+            "the completed-subtree output must match too"
+        );
+
+        // A precompute whose start size does not match the tree must be ignored and
+        // fall back to inline hashing, never grafting the wrong leaves.
+        let stale = ironwood::tree::NoteCommitmentTree::precompute_append(7, &notes)
+            .expect("ironwood precompute succeeds");
+        let (fallback_tree, _) = NoteCommitmentTrees::update_ironwood_note_commitment_tree_with(
+            Arc::new(ironwood::tree::NoteCommitmentTree::default()),
+            notes.clone(),
+            Some(stale),
+        )
+        .expect("ironwood fallback append succeeds");
+        assert_eq!(
+            inline_tree.root(),
+            fallback_tree.root(),
+            "a size-mismatched ironwood precompute must fall back to inline, not corrupt the tree"
         );
     }
 }
