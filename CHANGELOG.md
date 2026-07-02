@@ -84,6 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
+- Limit RocksDB write-ahead logs to 4 GiB in the finalized state database. Heavy
+  sync could otherwise accumulate tens of GiB of WAL files, making restarts spend
+  minutes replaying logs before Zebra could resume syncing.
 
 ### Changed
 
@@ -203,8 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized
   root block or reconsider the same invalidated block twice.
+- Compare RPC authentication cookies in constant time after checking their
+  length.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so
