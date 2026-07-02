@@ -28,7 +28,6 @@ use zcash_primitives::merkle_tree::HashSer;
 use sinsemilla::HashDomain;
 
 use crate::{
-    parallel::batch_frontier::BatchFrontierError,
     serialization::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
@@ -345,16 +344,6 @@ impl<'de> serde::Deserialize<'de> for Node {
 pub enum NoteCommitmentTreeError {
     #[error("The note commitment tree is full")]
     FullTree,
-}
-
-impl From<BatchFrontierError> for NoteCommitmentTreeError {
-    fn from(error: BatchFrontierError) -> Self {
-        match error {
-            // A capacity overflow is the tree being full.
-            BatchFrontierError::Frontier(_) => NoteCommitmentTreeError::FullTree,
-            BatchFrontierError::BatchSpansMultipleSubtrees => NoteCommitmentTreeError::FullTree,
-        }
-    }
 }
 
 /// Orchard Incremental Note Commitment Tree
