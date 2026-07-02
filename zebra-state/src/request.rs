@@ -40,6 +40,27 @@ use crate::{
     CommitSemanticallyVerifiedError,
 };
 
+/// Times `$body` and records its duration to the named histogram when the
+/// `commit-metrics` feature is enabled; otherwise just evaluates `$body` with
+/// zero overhead. Used to profile checkpoint prepare phases.
+macro_rules! timed_prepare_phase {
+    ($name:expr, $body:expr) => {{
+        #[cfg(feature = "commit-metrics")]
+        let _start = std::time::Instant::now();
+        let result = $body;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
+        result
+    }};
+}
+
+/// Minimum transaction count before checkpoint prepare uses Rayon for
+/// per-transaction digest fanout.
+///
+/// Small blocks are faster serially because Rayon scheduling costs dominate the
+/// native ZIP-244 digest work.
+const MIN_PARALLEL_CHECKPOINT_PREPARE_TRANSACTIONS: usize = 16;
+
 /// Identify a spend by a transparent outpoint or revealed nullifier.
 ///
 /// This enum supports [`transparent::OutPoint`], [`sprout::Nullifier`],
@@ -268,9 +289,19 @@ pub struct SemanticallyVerifiedBlock {
     /// The precomputed ZIP-244 authorizing-data commitment root for this block,
     /// if it was computed during verification.
     ///
-    /// The checkpoint verifier can set this ahead of the single-threaded
-    /// finalized committer. `None` means the committer falls back to computing
-    /// it from the block's transactions.
+    /// The checkpoint verifier sets this (it runs with high concurrency, ahead
+    /// of the single-threaded finalized committer) so the committer does not
+    /// have to recompute the per-transaction auth digests on its critical path.
+    /// `None` means "not precomputed"; the committer falls back to computing it.
+    ///
+    /// # Security
+    ///
+    /// The finalized checkpoint committer **trusts** a `Some` value as the
+    /// authorizing data for the ZIP-244 `hashBlockCommitments` header check
+    /// (`check::block_commitment_is_valid_for_chain_history`), so it must always
+    /// equal `block.auth_data_root()`. The constructors in this module derive it
+    /// from `block`, so a value set that way can never be desynced from the block
+    /// it commits.
     pub auth_data_root: Option<AuthDataRoot>,
 }
 
@@ -541,7 +572,7 @@ impl CheckpointVerifiedBlock {
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Self {
         let mut block = Self::with_hash(block.clone(), hash.unwrap_or(block.hash()));
-        block.deferred_pool_balance_change = deferred_pool_balance_change;
+        block.set_deferred_pool_balance_change(deferred_pool_balance_change);
         block
     }
     /// Creates a block that's ready to be committed to the finalized state,
@@ -568,14 +599,77 @@ impl CheckpointVerifiedBlock {
     }
 }
 
+fn prepare_block_data(
+    block: &Block,
+) -> (
+    Arc<[transaction::Hash]>,
+    AuthDataRoot,
+    HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) {
+    #[cfg(feature = "commit-metrics")]
+    {
+        let transaction_count = block.transactions.len();
+        let output_count: usize = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.outputs().len())
+            .sum();
+        let v5_transaction_count = block
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.version() == 5)
+            .count();
+
+        if let Some(height) = block.coinbase_height() {
+            metrics::gauge!("zebra.state.prepare.block.height").set(height.0 as f64);
+        }
+        metrics::histogram!("zebra.state.prepare.block_tx_count").record(transaction_count as f64);
+        metrics::histogram!("zebra.state.prepare.block_output_count").record(output_count as f64);
+        metrics::histogram!("zebra.state.prepare.block_v5_tx_count")
+            .record(v5_transaction_count as f64);
+    }
+
+    // Compute each transaction's txid and ZIP-244 auth digest together, for efficiency.
+    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) =
+        timed_prepare_phase!("zebra.state.prepare.txid_auth_digest.duration_seconds", {
+            if block.transactions.len() < MIN_PARALLEL_CHECKPOINT_PREPARE_TRANSACTIONS {
+                block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.txid_and_auth_digest())
+                    .unzip()
+            } else {
+                use rayon::prelude::*;
+                block
+                    .transactions
+                    .par_iter()
+                    .map(|tx| tx.txid_and_auth_digest())
+                    .unzip()
+            }
+        });
+    let transaction_hashes: Arc<[_]> = transaction_hashes.into();
+    let auth_data_root = timed_prepare_phase!(
+        "zebra.state.prepare.auth_data_root.duration_seconds",
+        auth_digests
+            .into_iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect::<AuthDataRoot>()
+    );
+    let new_outputs = timed_prepare_phase!(
+        "zebra.state.prepare.new_ordered_outputs.duration_seconds",
+        transparent::new_ordered_outputs(block, &transaction_hashes)
+    );
+
+    (transaction_hashes, auth_data_root, new_outputs)
+}
+
 impl SemanticallyVerifiedBlock {
     /// Creates [`SemanticallyVerifiedBlock`] from [`Block`] and [`block::Hash`].
     pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let (transaction_hashes, auth_data_root, new_outputs) = prepare_block_data(&block);
 
         Self {
             block,
@@ -585,6 +679,34 @@ impl SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+        }
+    }
+
+    /// Creates a [`SemanticallyVerifiedBlock`] from data the semantic verifier
+    /// has already prepared, leaving the authorizing-data root unset.
+    ///
+    /// The semantic verifier binds the ZIP-244 auth-data commitment during
+    /// contextual validation and the committer recomputes it on that path, so it
+    /// is not precomputed here. This constructor exists so callers outside the
+    /// crate build the block through a checked entry point rather than a struct
+    /// literal, leaving the [`auth_data_root`](Self::auth_data_root) cache unset
+    /// (see its security note).
+    pub fn from_semantic_data(
+        block: Arc<Block>,
+        hash: block::Hash,
+        height: block::Height,
+        new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        transaction_hashes: Arc<[transaction::Hash]>,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        Self {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            deferred_pool_balance_change,
+            auth_data_root: None,
         }
     }
 
@@ -610,8 +732,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+        let (transaction_hashes, auth_data_root, new_outputs) = prepare_block_data(&block);
 
         Self {
             block,
@@ -622,52 +743,6 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
         }
-    }
-}
-
-/// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
-fn transaction_hashes_and_auth_data_root(
-    block: &Block,
-) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
-    use rayon::prelude::*;
-
-    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
-        .transactions
-        .par_iter()
-        .map(|transaction| transaction.txid_and_auth_digest())
-        .unzip();
-
-    let auth_data_root = auth_digests
-        .into_iter()
-        .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
-        .collect();
-
-    (transaction_hashes.into(), auth_data_root)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use zebra_chain::serialization::ZcashDeserializeInto;
-
-    #[test]
-    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
-        let _init_guard = zebra_test::init();
-
-        let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
-            .zcash_deserialize_into::<Block>()
-            .expect("NU5 mainnet block deserializes");
-
-        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
-        let expected_transaction_hashes: Vec<_> = block
-            .transactions
-            .iter()
-            .map(|transaction| transaction.hash())
-            .collect();
-
-        assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
-        assert_eq!(auth_data_root, block.auth_data_root());
     }
 }
 
@@ -714,9 +789,26 @@ impl Deref for CheckpointVerifiedBlock {
         &self.0
     }
 }
+
 impl DerefMut for CheckpointVerifiedBlock {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl CheckpointVerifiedBlock {
+    /// Sets the deferred pool balance change computed by the checkpoint verifier
+    /// after construction.
+    ///
+    /// This is the only post-construction mutation a caller may perform; it does
+    /// not touch the block or the precomputed authorizing-data root, so the
+    /// committer's trusted cache stays bound to the block (see
+    /// [`SemanticallyVerifiedBlock::auth_data_root`]).
+    pub fn set_deferred_pool_balance_change(
+        &mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
     }
 }
 
@@ -1417,8 +1509,8 @@ pub enum ReadRequest {
 
     /// Returns scheduling-only body-size hints for a contiguous height range.
     ///
-    /// Confirmed committed block sizes win over untrusted advertised header
-    /// hints. Unknown advertised sizes are returned as `None`.
+    /// Confirmed committed block sizes are preferred over advertised header
+    /// hints. Unknown sizes are returned as `None`.
     BlockSizeHints {
         /// First height to read.
         from: block::Height,
@@ -1757,5 +1849,95 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    use super::*;
+
+    /// Loads the NU5 mainnet block 1,687,106 (its v5 transactions exercise the
+    /// ZIP-244 authorizing-data digests).
+    fn nu5_block() -> Arc<Block> {
+        Arc::new(
+            zebra_test::vectors::BLOCK_MAINNET_1687106_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("NU5 test vector block deserializes"),
+        )
+    }
+
+    #[test]
+    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
+        let _init_guard = zebra_test::init();
+
+        let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("NU5 mainnet block deserializes");
+
+        let (transaction_hashes, auth_data_root, _new_outputs) = prepare_block_data(&block);
+        let expected_transaction_hashes: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.hash())
+            .collect();
+
+        assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
+        assert_eq!(auth_data_root, block.auth_data_root());
+    }
+
+    /// The committer trusts a `Some` authorizing-data root for the ZIP-244 header
+    /// commitment check, so any constructor that *does* precompute it must derive
+    /// it *from its own block*. The [`From<Arc<Block>>`] conversion precomputes it
+    /// (via `prepare_block_data`), so its cached value must equal the block's own
+    /// root. The `with_hash`/`new` constructors leave it unset and the committer
+    /// recomputes it at commit time (only for NU5+), so the trusted-cache invariant
+    /// is never violated.
+    #[test]
+    fn checkpoint_verified_block_caches_its_own_auth_data_root() {
+        let block = nu5_block();
+        let expected = Some(block.auth_data_root());
+
+        assert_eq!(
+            CheckpointVerifiedBlock::from(block.clone()).auth_data_root,
+            expected,
+            "From<Arc<Block>> must cache the block's own auth data root",
+        );
+        assert_eq!(
+            CheckpointVerifiedBlock::with_hash(block.clone(), block.hash()).auth_data_root,
+            None,
+            "with_hash defers the auth data root to commit-time recompute",
+        );
+        assert_eq!(
+            CheckpointVerifiedBlock::new(block.clone(), None, None).auth_data_root,
+            None,
+            "new defers the auth data root to commit-time recompute",
+        );
+    }
+
+    /// The semantic-verifier constructor leaves the cache empty: that path binds
+    /// the auth-data commitment during contextual validation, and the committer
+    /// recomputes it, so there is no precomputed value to trust.
+    #[test]
+    fn semantic_constructor_leaves_auth_data_root_unset() {
+        let block = nu5_block();
+        let hash = block.hash();
+        let height = block.coinbase_height().expect("test block has a height");
+        let (transaction_hashes, _auth_data_root, new_outputs) = prepare_block_data(&block);
+
+        let semantic = SemanticallyVerifiedBlock::from_semantic_data(
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            None,
+        );
+
+        assert_eq!(
+            semantic.auth_data_root, None,
+            "the semantic path must not precompute an auth data root the committer would trust",
+        );
     }
 }

@@ -1,4 +1,5 @@
-//! Cross-client commitment-auxiliary payload types for Zakura header sync.
+//! Cross-client commitment-auxiliary payload types for the verified-commitment-trees
+//! fast path and Zakura header sync (`docs/design/verified-commitment-trees.md` §5).
 //!
 //! These travel over the Zakura `tree_aux` stream (increment 6) and are also produced
 //! and consumed locally by `zebra-state`. They live here in `zebra-chain` so both
@@ -17,13 +18,13 @@ use crate::{
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
-/// Per-block commitment roots carried with Zakura header-sync ranges.
+/// Per-block verified commitment roots — the essential fast-path payload (design §5.1).
 ///
 /// One entry per height; each root is the note-commitment treestate root as of
 /// end-of-block-`height`. `orchard_root` is the empty/default root below NU5.
 ///
 /// This payload carries no trust: a recipient re-verifies every root against its own
-/// checkpoint-committed block headers before accepting it, so
+/// checkpoint-committed block headers (design §6) before the fast path folds it in, so
 /// a forwarding/serving node is exactly as trustworthy as an originating one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockCommitmentRoots {

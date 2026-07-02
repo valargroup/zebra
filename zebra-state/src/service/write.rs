@@ -3,8 +3,11 @@
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use indexmap::IndexMap;
@@ -16,7 +19,10 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::{
     block::{self, Height},
-    parallel::commitment_aux::BlockCommitmentRoots,
+    parallel::{
+        commitment_aux::BlockCommitmentRoots,
+        tree::{BlockNotePrecompute, NoteCommitmentTrees},
+    },
 };
 
 use crate::{
@@ -24,7 +30,7 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZebraDb},
+        finalized_state::{spawn_note_precompute, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -38,6 +44,41 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
+
+/// A speculatively-started note-commitment precompute for an upcoming finalized
+/// block: the block hash it was started for, the channel to receive the result on,
+/// and a flag to cancel it if the block is no longer going to be committed.
+type PendingPrecompute = (
+    block::Hash,
+    crossbeam_channel::Receiver<BlockNotePrecompute>,
+    Arc<AtomicBool>,
+);
+
+/// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
+const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// Delay between retryable VCT await-successor commit attempts. Shorter than
+/// [`VCT_ROOT_RETRY_WAIT`]: the root is already cached and only the next block needs to be
+/// downloaded into the look-ahead, so a tighter poll keeps the one-block commit lag small.
+const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
+
+/// How long a single checkpoint height may stay stuck on a retryable VCT root stall before
+/// the committer escalates to an error-level log and a `state.vct.root.stalled.height` gauge.
+/// Transient waits (a successor still downloading, a root still in flight) clear well within
+/// this; staying stuck past it means no peer can serve a root the frozen frontier requires,
+/// and — by design — the committer will not recompute against the stale frontier, so the node
+/// cannot advance until a peer supplies it. Surfacing that loudly is the operator's only signal.
+const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
+
+/// Cancels and drops a pending look-ahead precompute, if any.
+///
+/// Tripping the flag tells the spawned task (started before the current block
+/// committed) to stop instead of hashing a block that will not be committed.
+fn cancel_pending_precompute(pending: &mut Option<PendingPrecompute>) {
+    if let Some((_hash, _rx, cancel)) = pending.take() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 /// The maximum size of the parent error map.
 ///
@@ -220,7 +261,7 @@ impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
 /// `finalized_state` or `non_finalized_state` and channels for sending
 /// it blocks.
 #[derive(Clone, Debug)]
-pub(super) struct BlockWriteSender {
+pub struct BlockWriteSender {
     /// A channel to send blocks to the `block_write_task`,
     /// so they can be written to the [`NonFinalizedState`].
     pub non_finalized: Option<tokio::sync::mpsc::UnboundedSender<NonFinalizedWriteMessage>>,
@@ -328,8 +369,32 @@ impl WriteBlockWorkerTask {
             backup_dir_path,
         } = &mut self;
 
-        let mut prev_finalized_note_commitment_trees = None;
+        let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
         let mut deferred_non_finalized_messages = VecDeque::new();
+
+        // One-block look-ahead so the next block's note-commitment tree hashing can
+        // be precomputed off the committer (on idle cores) while the current block
+        // commits. `pending_precompute` holds the receiver and cancellation flag for
+        // the block started last iteration; `finalized_lookahead` buffers the peeked
+        // next block. The precompute is keyed on the running tree sizes and only
+        // applied if those still match at commit time, so this never affects
+        // correctness, only speed.
+        //
+        // Because the next block's precompute is started before the current block
+        // commits, a current block that fails to commit (e.g. an invalid block from
+        // a peer) leaves that speculative work unwanted. Whenever this loop discards
+        // a pending precompute it trips the cancellation flag via
+        // [`cancel_pending_precompute`], so the spawned task stops instead of hashing
+        // a block that will never be committed.
+        let mut pending_precompute: Option<PendingPrecompute> = None;
+        let mut finalized_lookahead: VecDeque<QueuedCheckpointVerified> = VecDeque::new();
+        let mut retry_finalized_block: Option<QueuedCheckpointVerified> = None;
+
+        // Tracks how long the committer has been stuck retrying a single VCT root stall, so a
+        // genuine stall (no peer can serve a frozen-frontier height) escalates to a loud,
+        // observable signal while a transient wait stays quiet. `(height, first-seen)`.
+        let mut vct_root_stall: Option<(Height, Instant)> = None;
+        let mut vct_root_stall_logged = false;
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -357,13 +422,19 @@ impl WriteBlockWorkerTask {
                 Err(TryRecvError::Disconnected) => {}
             }
 
-            let ordered_block = match finalized_block_write_receiver.try_recv() {
-                Ok(block) => block,
-                Err(TryRecvError::Empty) => {
-                    std::thread::park_timeout(Duration::from_millis(10));
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => break,
+            let ordered_block = match retry_finalized_block
+                .take()
+                .or_else(|| finalized_lookahead.pop_front())
+            {
+                Some(block) => block,
+                None => match finalized_block_write_receiver.try_recv() {
+                    Ok(block) => block,
+                    Err(TryRecvError::Empty) => {
+                        std::thread::park_timeout(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                },
             };
 
             // TODO: split these checks into separate functions
@@ -394,22 +465,202 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
+                // The pipeline is broken; cancel and drop any look-ahead so the next
+                // precompute re-seeds from the real tip (a stale precompute would
+                // only fall back anyway, but cancelling stops the wasted hashing).
+                cancel_pending_precompute(&mut pending_precompute);
+                finalized_lookahead.clear();
+                finalized_state.clear_vct_prevalidated_next();
+
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
                 std::mem::drop(ordered_block);
                 continue;
             }
 
-            // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
+            // Peek the next block and start its precompute, so the heavy hashing
+            // overlaps this block's commit. Its start sizes are the current tree
+            // sizes plus this block's note counts (the sizes after this block).
+            if finalized_lookahead.is_empty() {
+                if let Ok(next) = finalized_block_write_receiver.try_recv() {
+                    finalized_lookahead.push_back(next);
+                }
+            }
+
+            // A non-handoff VCT fast block's supplied roots are authenticated by
+            // its successor's header. If the successor is not buffered yet, keep
+            // this block local and wait instead of surfacing a checkpoint commit
+            // error through the invalid-block reset path.
+            if finalized_lookahead.is_empty()
+                && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
             {
+                tracing::trace!(
+                    height = ?ordered_block.0.height,
+                    hash = ?ordered_block.0.hash,
+                    "VCT: deferring fast checkpoint commit until successor is buffered"
+                );
+                retry_finalized_block = Some(ordered_block);
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
+
+            // Use the precompute for this block if we started it last iteration and
+            // it is for this exact block; otherwise cancel it (so the spawned task
+            // stops) and let the committer hash inline.
+            let note_precompute = match pending_precompute.take() {
+                Some((hash, rx, _cancel)) if hash == ordered_block.0.hash => rx.recv().ok(),
+                Some((_hash, _rx, cancel)) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    None
+                }
+                None => None,
+            };
+
+            // In verified-commitment-trees mode, the committer skips the
+            // note-commitment frontier entirely, so the off-thread precompute would
+            // just be discarded. Skip it only when the *next* block will actually
+            // take the vct path (its roots are already supplied). A legacy-fallback block
+            // (no peer roots yet, or never) still gets the precompute overlap.
+            let next_block_takes_vct_path = finalized_lookahead
+                .front()
+                .is_some_and(|next| finalized_state.vct_fast_will_apply(next.0.height));
+            if !next_block_takes_vct_path {
+                if let (Some(trees), Some(next)) = (
+                    prev_finalized_note_commitment_trees.as_ref(),
+                    finalized_lookahead.front(),
+                ) {
+                    let block = &ordered_block.0.block;
+                    let sapling_start =
+                        trees.sapling.count() + block.sapling_note_commitments().count() as u64;
+                    let orchard_start =
+                        trees.orchard.count() + block.orchard_note_commitments().count() as u64;
+                    let ironwood_start =
+                        trees.ironwood.count() + block.ironwood_note_commitments().count() as u64;
+                    let (rx, cancel) = spawn_note_precompute(
+                        sapling_start,
+                        orchard_start,
+                        ironwood_start,
+                        next.0.block.clone(),
+                    );
+                    pending_precompute = Some((next.0.hash, rx, cancel));
+                }
+            }
+
+            // The buffered successor (if any) lets the committer verify this block's
+            // verified-commitment-trees fixture roots before trusting them: a block's
+            // roots are only committed by the next block's header. Its auth data root
+            // is already precomputed by the checkpoint verifier.
+            let next_checkpoint = finalized_lookahead
+                .front()
+                .map(|next| (next.0.block.clone(), next.0.auth_data_root));
+            let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
+            let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
+
+            let next_block_took_vct_path =
+                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+
+            // Try committing the block
+            match finalized_state.commit_finalized(
+                ordered_block,
+                prev_note_commitment_trees,
+                note_precompute,
+                next_checkpoint,
+            ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Whether this successful commit consumed header-carried
+                    // tree-aux roots to skip the note-commitment frontier rebuild.
+                    if next_block_took_vct_path {
+                        metrics::counter!("state.vct.fast_path.hit").increment(1);
+                    } else {
+                        metrics::counter!("state.vct.fast_path.miss").increment(1);
+                    }
+
+                    // A successful commit clears any VCT root stall: log recovery and reset
+                    // the stalled-height gauge if it had been raised.
+                    if vct_root_stall.is_some() {
+                        if vct_root_stall_logged {
+                            info!(
+                                stalled_height = ?vct_root_stall.map(|(h, _)| h),
+                                "VCT: checkpoint commit recovered; the stalled height now has a verifiable supplied root"
+                            );
+                            metrics::gauge!("state.vct.root.stalled.height").set(0.0);
+                        }
+                        vct_root_stall = None;
+                        vct_root_stall_logged = false;
+                    }
+
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
-                Err(error) => {
+                Err((ordered_block, error)) => {
+                    // Retryable VCT root stalls (an absent/evicted root, or one not yet
+                    // verifiable for lack of a buffered successor) park-and-retry the same
+                    // block in place rather than resetting the queue. An absent root waits
+                    // for header sync to deliver it; an await-successor stall just waits for
+                    // the next block to be downloaded into the look-ahead, so it polls faster.
+                    if let Some(height) = error.vct_retryable_height() {
+                        metrics::counter!("state.vct.root.retry.count").increment(1);
+                        let needs_refetch = error.vct_supplied_root_unavailable_height();
+
+                        // Escalate a stall that persists on the same height past the warn
+                        // threshold: a transient wait resolves in a few polls and stays
+                        // quiet, but a height stuck longer means no peer can serve a root the
+                        // frozen frontier requires — the node will not advance (it will not,
+                        // by design, recompute against the stale frontier). Surface it loudly.
+                        match vct_root_stall {
+                            Some((stuck, _)) if stuck == height => {}
+                            _ => {
+                                vct_root_stall = Some((height, Instant::now()));
+                                vct_root_stall_logged = false;
+                            }
+                        }
+                        if !vct_root_stall_logged
+                            && vct_root_stall.is_some_and(|(_, since)| {
+                                since.elapsed() >= VCT_ROOT_STALL_WARN_AFTER
+                            })
+                        {
+                            tracing::error!(
+                                ?height,
+                                awaiting_refetch = needs_refetch.is_some(),
+                                stalled_for = ?VCT_ROOT_STALL_WARN_AFTER,
+                                "VCT: checkpoint commit stalled with no verifiable supplied root; \
+                                 the node cannot advance until a peer serves this height (it will \
+                                 not recompute against the frozen frontier)"
+                            );
+                            metrics::gauge!("state.vct.root.stalled.height")
+                                .set(f64::from(height.0));
+                            vct_root_stall_logged = true;
+                        } else {
+                            tracing::warn!(
+                                ?height,
+                                block_height = ?ordered_block.0.height,
+                                block_hash = ?ordered_block.0.hash,
+                                awaiting_refetch = needs_refetch.is_some(),
+                                "VCT: supplied root not yet verifiable; retrying checkpoint commit in place"
+                            );
+                        }
+
+                        prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
+                        retry_finalized_block = Some(ordered_block);
+                        cancel_pending_precompute(&mut pending_precompute);
+                        std::thread::park_timeout(if needs_refetch.is_some() {
+                            VCT_ROOT_RETRY_WAIT
+                        } else {
+                            VCT_AWAIT_SUCCESSOR_WAIT
+                        });
+                        continue;
+                    }
+
                     let finalized_tip = finalized_state.db.tip();
+                    let _ = ordered_block.1.send(Err(error.clone()));
+
+                    // The commit failed and the queue is being reset, so any
+                    // look-ahead precompute is for a block that will not be
+                    // committed: cancel it so the spawned task stops instead of
+                    // hashing the discarded child, and clear the look-ahead.
+                    cancel_pending_precompute(&mut pending_precompute);
+                    finalized_lookahead.clear();
+                    finalized_state.clear_vct_prevalidated_next();
 
                     // The last block in the queue failed, so we can't commit the next block.
                     // Instead, we need to reset the state queue,
@@ -581,7 +832,7 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
+                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), None, None, "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();

@@ -12,8 +12,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bumped the state database format to 28 during upgrade, backfilling empty
   Ironwood tree, value pool, and index data, then rebuilding stored history tree
   entries so they use the Ironwood-capable entry size.
-- Extended value-pool disk serialization with an Ironwood slot after the
-  deferred pool, and bumped the state database format version to `27.3.0`.
+- Extended value-pool disk serialization with an Ironwood slot after the deferred pool, with the
+  verified-commitment-trees state database format changes preserved as the intermediate
+  no-migration version `27.3.0`.
+- Extended the `commitment_roots_by_height` serving index (and the `tree_aux` header-sync
+  payload it is served from) with each block's per-height ZIP-244 `auth_data_root`, so a node
+  can serve the co-input a peer needs to authenticate a block's note-commitment roots against
+  its successor's NU5+ header commitment. Consolidated under database format version `27.3.0`
+  (no version bump); serving-index rows from an earlier pre-release build (64 bytes, no
+  auth-data root) remain readable. Carrying the auth-data root bumps the Zakura header-sync
+  stream format to version 5, a breaking wire change (all peers must run the new format).
+- Extended the same serving index and `tree_aux` payload with each block's Ironwood
+  note-commitment root and its three per-pool shielded transaction counts
+  (Sapling/Orchard/Ironwood). Together with the roots and auth-data root, these are the complete
+  set of ZIP-221 history-leaf inputs a recipient needs to rebuild each leaf and verify the
+  supplied roots against its own header commitments during header sync, without downloading the
+  block body. Rows grow to 152 bytes with a backward-compatible `FromDisk`; still consolidated
+  under `27.3.0`. Carried in the (already breaking, still version 5) Zakura header-sync stream
+  format, with `auth_data_root` serialized last. This is the data-carrying half only — nothing
+  consumes the new fields yet.
+- Added the `vct_upgrade_metadata` column family, recording the upgrade height `U` (the lowest
+  height this binary committed). `tree_aux` root serving now stitches the per-height trees below
+  `U` with the serving index at and above `U`, so a node that upgraded mid-chain serves a range
+  crossing `U` as one gap-free batch instead of a short prefix that stalled the fetch client.
+  Historical note-commitment tree RPCs are unavailable only within the band `[U, H)` (where `H`
+  is the checkpoint handoff), and available below `U` and at or above `H`.
 
 ## [8.0.0] - 2026-06-02
 
