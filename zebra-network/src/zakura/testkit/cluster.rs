@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{await_until, TraceCapture, ZakuraTestNode, TEST_NET_TIMEOUT};
+use super::{await_until, TraceCapture, ZakuraTestNode};
 use crate::{zakura::ZakuraPeerId, BoxError};
 
 /// Supported deterministic topologies.
@@ -144,7 +144,7 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError};
+    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError, TEST_NET_TIMEOUT};
     use super::*;
     use crate::{
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
