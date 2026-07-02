@@ -1300,6 +1300,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 500,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 0,
@@ -1333,7 +1334,8 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    assert_eq!(above.max_request_bytes, 400);
+    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
+    assert_eq!(above.max_request_bytes, 25);
 }
 
 #[test]
@@ -1346,6 +1348,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 200,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 200,
@@ -1373,6 +1376,7 @@ fn total_resident_plateaus_under_commit_stall() {
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 300,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 700,
@@ -1400,6 +1404,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     };
     let capped = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 1_000,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 0,
@@ -1421,6 +1426,55 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
             .priority,
         super::admission::RequestPriority::Floor
     );
+}
+
+#[test]
+fn floor_backpressures_when_download_floor_escalates_past_commit() {
+    // Regression for the ZCA-742 OOM. The download floor advances on every download, so a
+    // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
+    // commit. With the exemption anchored to the *commit* frontier, a floor-priority request
+    // far above the commit tip is backpressured once the resident-memory look-ahead budget
+    // is full, while the single commit-frontier block stays fundable so commit can drain.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        // Large enough that the byte (memory) cap, not the block cap, is what bites here.
+        max_reorder_lookahead_blocks: 1_000_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    // Commit stalled far below the download floor; applying holds a full budget of bodies:
+    // 300 serialized * DESERIALIZED_MEM_FACTOR (4) = 1_200 resident >= 1_000 budget.
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(1_000),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 300,
+        applying_buffered_blocks: 990,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        budget_available: 64_000_000,
+    };
+
+    // The download-frontier request (floor+1) is still classified floor-priority, but is now
+    // refused: it is above the commit frontier, so it no longer bypasses the memory cap.
+    assert_eq!(
+        super::admission::request_priority(snapshot.download_floor, block::Height(1_001)),
+        super::admission::RequestPriority::Floor,
+    );
+    assert_eq!(
+        super::admission::admission_decision(&config, snapshot, block::Height(1_001), 1_000),
+        None,
+        "a floor request far ahead of commit is backpressured when the memory budget is full",
+    );
+
+    // The single contiguous commit-frontier block (verified_tip + 1) stays fundable, so the
+    // committer can advance and drain the pipeline — no deadlock.
+    let commit_frontier =
+        super::admission::admission_decision(&config, snapshot, block::Height(11), 1_000)
+            .expect("the commit-frontier block is always fundable");
+    assert_eq!(commit_frontier.max_request_bytes, 1_000);
 }
 
 #[test]
@@ -3468,6 +3522,7 @@ proptest::proptest! {
         };
         let snapshot = super::admission::AdmissionSnapshot {
             download_floor: block::Height(10),
+            verified_block_tip: block::Height(10),
             reorder_buffered_bytes: reorder_bytes,
             reorder_buffered_blocks: reorder_blocks,
             applying_buffered_bytes: applying_bytes,
@@ -3490,7 +3545,9 @@ proptest::proptest! {
             block::Height(12),
             1_000,
         );
-        if held_bytes >= config.effective_max_reorder_lookahead_bytes()
+        // The look-ahead byte budget bounds resident memory (serialized * factor), not wire bytes.
+        if held_bytes.saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR)
+            >= config.effective_max_reorder_lookahead_bytes()
             || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
         {
             prop_assert_eq!(above, None);

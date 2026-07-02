@@ -11,10 +11,27 @@ use super::{config::ZakuraBlockSyncConfig, state::next_height};
 /// "a block every ~16 s is fine" tolerance the directive sets for speculative work.
 const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 
+/// Estimated resident-memory multiple of a buffered block body's serialized size.
+///
+/// Buffered bodies are held decoded (`Arc<Block>`, `sequencer::ApplyingBlock`), whose
+/// in-memory footprint is several times their wire/serialized size. The look-ahead byte
+/// budget must bound that *resident* cost, not the wire bytes, or a small-block backlog
+/// blows past the intended memory ceiling — the ZCA-742 OOM, where ~569k decoded blocks
+/// held under a wire-byte cap reached ~26 GiB RSS.
+///
+// TODO(ZCA-742): replace this flat factor with a precise per-block heap-size estimate
+// (a structural walk, or a `GetSize`-style measure on `Block`), so the budget tracks real
+// memory exactly. The factor is a deliberately conservative calibration from the measured
+// ~3.3–4x wire→resident ratio; it is an approximation, not a true per-block size.
+pub(super) const DESERIALIZED_MEM_FACTOR: u64 = 4;
+
 /// Pure inputs for deciding whether a block request may consume budget.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct AdmissionSnapshot {
     pub(super) download_floor: block::Height,
+    /// The verified (commit) tip. The single contiguous block above it is always fundable
+    /// (liveness), so commit can drain the pipeline; everything else is memory-gated.
+    pub(super) verified_block_tip: block::Height,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) reorder_buffered_blocks: u64,
     pub(super) applying_buffered_bytes: u64,
@@ -88,14 +105,73 @@ pub(super) fn request_deadline(
     }
 }
 
+/// The block that lets commit advance next (`verified_tip + 1`). Always fundable, so the
+/// pipeline can drain even when the look-ahead budget is full.
+fn commit_frontier(snapshot: &AdmissionSnapshot) -> block::Height {
+    next_height(snapshot.verified_block_tip).unwrap_or(snapshot.verified_block_tip)
+}
+
+/// Estimated resident memory of the decoded bodies already held in the pipeline
+/// (`held wire bytes * DESERIALIZED_MEM_FACTOR`).
+fn held_memory_bytes(snapshot: &AdmissionSnapshot) -> u64 {
+    snapshot
+        .reorder_buffered_bytes
+        .saturating_add(snapshot.applying_buffered_bytes)
+        .saturating_add(snapshot.sequencer_input_queued_bytes)
+        .saturating_add(snapshot.reserved_above_floor_bytes)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR)
+}
+
+fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
+    snapshot
+        .reorder_buffered_blocks
+        .saturating_add(snapshot.applying_buffered_blocks)
+        .saturating_add(snapshot.reserved_above_floor_blocks)
+}
+
+/// Whether the resident-memory look-ahead budget (or the block cap) is already full.
+fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSnapshot) -> bool {
+    held_memory_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
+        || held_blocks(snapshot) >= u64::from(config.max_reorder_lookahead_blocks)
+}
+
+/// Whether a floor-priority take at `start_height` is allowed past the resident-memory
+/// look-ahead backpressure.
+///
+/// The commit-frontier block is always allowed (liveness — the committer must be able to
+/// fetch the block it needs to advance, which also reaches the floor-reservation funding
+/// path); every other height is allowed only while the resident-memory budget and block
+/// cap have headroom. This is deliberately **independent of the in-flight byte budget**, so
+/// an exhausted in-flight budget still lets the commit-frontier floor reach its funding
+/// path — unlike [`admission_decision`], whose `max_request_bytes` collapses to zero when
+/// the in-flight budget is spent. Anchoring the floor exemption to the commit frontier
+/// (rather than the download floor, which advances on every download) is what stops
+/// `body_download_floor` from escalating unboundedly ahead of commit (ZCA-742).
+pub(super) fn floor_take_allowed(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: AdmissionSnapshot,
+    start_height: block::Height,
+) -> bool {
+    start_height <= commit_frontier(&snapshot) || !lookahead_over_budget(config, &snapshot)
+}
+
 /// Returns the admission decision for a candidate block response starting at `start_height`.
 ///
-/// Floor-rescue requests may use any available response budget up to `response_byte_cap`.
-/// Speculative requests above the floor are admitted only while the configured reorder
-/// lookahead byte and block limits still have capacity.
+/// The single contiguous block just above the *verified* (commit) frontier is always
+/// fundable, so the committer can advance and drain the pipeline even when the look-ahead
+/// budget is full. Every other request — floor-priority included — is admitted only while
+/// the configured look-ahead limits still have capacity, measured against the *resident*
+/// memory of the buffered decoded bodies (`held_bytes * DESERIALIZED_MEM_FACTOR`) rather
+/// than their wire bytes.
 ///
-/// Returns `None` when no bytes can be admitted, or when an above-floor request would
-/// exceed the lookahead limits.
+/// Gating the floor lane (with only the commit-frontier exempt) is what bounds the applying
+/// queue: the download floor advances on every download, so a floor exemption tied to it
+/// escalates unboundedly ahead of commit. Anchoring the exemption to the commit frontier
+/// caps the pipeline to the look-ahead budget regardless of how far headers/downloads run
+/// ahead (ZCA-742).
+///
+/// Returns `None` when no bytes can be admitted, or when a non-frontier request would exceed
+/// the look-ahead limits.
 pub(super) fn admission_decision(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
@@ -103,35 +179,23 @@ pub(super) fn admission_decision(
     response_byte_cap: u64,
 ) -> Option<AdmissionDecision> {
     let priority = request_priority(snapshot.download_floor, start_height);
-    let max_request_bytes = match priority {
-        // Floor requests can use any available budget up to the response byte cap.
-        RequestPriority::Floor => snapshot.budget_available.min(response_byte_cap),
-        // Above-floor requests are admitted only if the reorder lookahead limits have capacity
-        // and the response byte cap is not exceeded.
-        RequestPriority::AboveFloor => {
-            let held_bytes = snapshot
-                .reorder_buffered_bytes
-                .saturating_add(snapshot.applying_buffered_bytes)
-                .saturating_add(snapshot.sequencer_input_queued_bytes)
-                .saturating_add(snapshot.reserved_above_floor_bytes);
-            let held_blocks = snapshot
-                .reorder_buffered_blocks
-                .saturating_add(snapshot.applying_buffered_blocks)
-                .saturating_add(snapshot.reserved_above_floor_blocks);
-            if held_bytes >= config.effective_max_reorder_lookahead_bytes()
-                || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
-            {
-                return None;
-            }
 
-            let remaining_lookahead_bytes = config
-                .effective_max_reorder_lookahead_bytes()
-                .saturating_sub(held_bytes);
-            snapshot
-                .budget_available
-                .min(remaining_lookahead_bytes)
-                .min(response_byte_cap)
+    let max_request_bytes = if start_height <= commit_frontier(&snapshot) {
+        snapshot.budget_available.min(response_byte_cap)
+    } else {
+        if lookahead_over_budget(config, &snapshot) {
+            return None;
         }
+        // Remaining memory headroom, expressed back in wire bytes for the response cap so a
+        // single response can't push resident memory past the budget.
+        let remaining_wire_bytes = config
+            .effective_max_reorder_lookahead_bytes()
+            .saturating_sub(held_memory_bytes(&snapshot))
+            / DESERIALIZED_MEM_FACTOR;
+        snapshot
+            .budget_available
+            .min(remaining_wire_bytes)
+            .min(response_byte_cap)
     };
 
     (max_request_bytes > 0).then_some(AdmissionDecision {

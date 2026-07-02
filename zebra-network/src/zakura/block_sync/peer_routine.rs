@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admission_decision, floor_rescue_high, request_deadline, AdmissionSnapshot, RequestPriority,
+        admission_decision, floor_rescue_high, floor_take_allowed, request_deadline,
+        AdmissionSnapshot, RequestPriority,
     },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
@@ -590,12 +591,28 @@ impl PeerRoutine {
                 self.window.bbr_rtprop_ms(),
                 in_bypass,
             );
+            let floor_pending = self
+                .work
+                .first_pending_in_range(servable_low, servable_high.min(floor_high));
             let mut items = if floor_arm_allowed
                 && servable_low <= floor_high
-                && self
-                    .work
-                    .first_pending_in_range(servable_low, servable_high.min(floor_high))
-                    .is_some()
+                && floor_pending.is_some_and(|floor_start| {
+                    // Bound the floor-rescue to the commit-frontier memory window (ZCA-742).
+                    // The commit-frontier block (`verified_tip + 1`) is always allowed for
+                    // liveness (a genuine gap blocking commit is still fetched, and this reaches
+                    // the floor-reservation funding path); but an escalated floor block far ahead
+                    // of the verified tip is refused once the resident-memory look-ahead budget
+                    // is full. Without this, the floor-rescue take sizes by the in-flight budget
+                    // and advances `body_download_floor` unboundedly ahead of commit, filling
+                    // `applying` to the in-flight budget. `floor_take_allowed` (not
+                    // `admission_decision`) is used so an exhausted in-flight budget still lets
+                    // the commit-frontier floor through to its funding path.
+                    floor_take_allowed(
+                        &self.config,
+                        self.admission_snapshot(view, reserved_above_floor),
+                        floor_start,
+                    )
+                })
             {
                 // Size the floor take by the live budget as usual, but never below one
                 // byte. `take_in_range_budgeted` always takes its first item regardless of
@@ -836,6 +853,7 @@ impl PeerRoutine {
         let (reserved_above_floor_bytes, reserved_above_floor_blocks) = reserved_above_floor;
         AdmissionSnapshot {
             download_floor: view.download_floor,
+            verified_block_tip: view.verified_tip,
             reorder_buffered_bytes: view.reorder_buffered_bytes,
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,
@@ -1302,6 +1320,7 @@ impl PeerRoutine {
             &self.config,
             AdmissionSnapshot {
                 download_floor: sequencer_view.download_floor,
+                verified_block_tip: sequencer_view.verified_tip,
                 reorder_buffered_bytes: sequencer_view.reorder_buffered_bytes,
                 reorder_buffered_blocks: sequencer_view.reorder_len,
                 applying_buffered_bytes: sequencer_view.applying_buffered_bytes,

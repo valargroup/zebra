@@ -47,8 +47,15 @@ pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
-/// Default block-count cap for speculative reorder look-ahead bookkeeping.
-pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
+/// Default block-count safety cap for speculative reorder look-ahead bookkeeping.
+///
+/// Defense-in-depth on the map/bookkeeping size only. The primary bound on buffered bodies
+/// is the resident-memory budget [`DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES`] (compared against
+/// `held_wire * DESERIALIZED_MEM_FACTOR`, see `admission.rs`). This is set well above the
+/// block count that budget admits at realistic body sizes, so the *memory* budget is the
+/// binding cap. The prior 4096 value made the buffer shallow (~one checkpoint range), which
+/// masked the byte budget and could starve the bursty committer (ZCA-742).
+pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 262_144;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
