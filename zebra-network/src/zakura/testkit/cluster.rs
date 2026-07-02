@@ -2689,6 +2689,10 @@ mod tests {
         reader
             .node("02")
             .table("header_sync")
+            .assert_event(hs_trace::HEADER_STATUS_SENT);
+        reader
+            .node("02")
+            .table("header_sync")
             .assert_event(hs_trace::HEADER_STATUS_RECEIVED);
 
         cluster.shutdown().await;
