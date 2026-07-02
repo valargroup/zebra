@@ -8,9 +8,10 @@
 //! `CheckpointVerifier` → `StateService` the verifier rung uses, reporting the commit
 //! back so the sequencer frontier advances and releases the next blocks.
 //!
-//! VCT mode only. Checkpoint batching is the same as `apply_verifier`: feed up to the
-//! last checkpoint `<= end` so the last range delivers the successors the worker's VCT
-//! path needs, but count/gate to the second-to-last checkpoint.
+//! This split replay-tooling PR runs the legacy full-recompute path that exists
+//! on `ironwood-main`. The VCT sidecar CLI flag is kept for compatibility with
+//! later benchmark branches, but is rejected until the header-root fast-path APIs
+//! are present on this base.
 
 use std::{
     path::Path,
@@ -32,9 +33,7 @@ use zebra_consensus::CheckpointVerifier;
 use zebra_network::zakura::{spawn_bench_sequencer, BenchSubmit};
 use zebra_state::{FinalizedState, PruningConfig, StorageMode};
 
-use crate::{
-    cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
-};
+use crate::{cache::CacheReader, config::state_config, prefetch, stats::Stats};
 
 /// Request-channel bound for the cloneable (buffered) state service the verifier
 /// commits through (same as `apply_verifier`).
@@ -49,8 +48,8 @@ const STATE_CHECKPOINT_CONCURRENCY: usize = 1000;
 /// of pipeline depth (>> one checkpoint range) while staying well within RAM.
 const SEQUENCER_MAX_INFLIGHT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Replays the cache through the real block-sync `Sequencer` (which submits to the
-/// checkpoint verifier → state) onto the writable base fork at `base`. VCT only.
+/// Replays the cache through the real block-sync `Sequencer` (which submits to
+/// the checkpoint verifier -> state) onto the writable base fork at `base`.
 pub fn run(
     base: &Path,
     cache_path: &Path,
@@ -77,28 +76,14 @@ pub fn run(
         eyre!("cache starts at genesis (height 0); apply needs a base at start-1")
     })?;
 
-    // The sequencer rung is VCT-only: it exercises the Zakura fast-sync pipeline.
-    let sidecar_path =
-        vct_sidecar.ok_or_else(|| eyre!("apply-sequencer is VCT-only; pass --vct-sidecar"))?;
-    let sidecar = {
-        let s = RootsSidecar::read(sidecar_path)?;
-        if s.start != start {
-            bail!("sidecar start {} != cache start {start}", s.start);
-        }
-        if s.roots.len() != header.count as usize {
-            bail!(
-                "sidecar has {} roots but cache has {} blocks",
-                s.roots.len(),
-                header.count
-            );
-        }
-        s
-    };
+    if vct_sidecar.is_some() {
+        bail!("--vct-sidecar replay requires VCT fast-sync APIs not present on ironwood-main");
+    }
 
-    // VCT (force_legacy = false). Storage mode: Pruned by default (the base must
-    // already be a pruned snapshot — pruning is one-way), matching the production
-    // mainnet config; `--archive` opts back into full raw-tx + indexes.
-    let mut config = state_config(base.to_path_buf(), /* force_legacy */ false);
+    // Storage mode: Pruned by default (the base must already be a pruned
+    // snapshot — pruning is one-way), matching the production mainnet config;
+    // `--archive` opts back into full raw-tx + indexes.
+    let mut config = state_config(base.to_path_buf());
     if !archive {
         config.storage_mode = StorageMode::Pruned(PruningConfig::default());
     }
@@ -113,8 +98,8 @@ pub fn run(
     }
 
     // Open the fork directly first: assert the tip, capture the parent hash (the
-    // sequencer/verifier initial tip), inject the per-height VCT roots. Drop before
-    // `zebra_state::init` reopens the fork.
+    // sequencer/verifier initial tip). Drop before `zebra_state::init` reopens
+    // the fork.
     let parent_hash = {
         let state = FinalizedState::new_writable(&config, &network);
         match state.db.finalized_tip_height() {
@@ -125,34 +110,18 @@ pub fn run(
             ),
             None => bail!("base fork has no finalized tip; expected height {expected_parent}"),
         }
-        tracing::info!(
-            roots = sidecar.roots.len(),
-            "injecting VCT roots into header-roots CF"
-        );
-        state
-            .db
-            .insert_zakura_header_commitment_roots(sidecar.roots.iter().cloned())
-            .map_err(|e| eyre!("inserting VCT roots: {e}"))?;
         state.db.finalized_tip_hash()
     };
 
-    // Same checkpoint boundary as apply_verifier: feed to the last checkpoint <= end,
-    // commit/gate to the second-to-last (the last block's successor is in the tail).
+    // Same checkpoint boundary as apply_verifier: feed, commit, and gate at the
+    // last checkpoint <= end.
     let checkpoint_list = network.checkpoint_list();
-    let feed_checkpoint = checkpoint_list
+    let last_checkpoint = checkpoint_list
         .max_height_in_range(..=Height(end))
         .ok_or_else(|| eyre!("no checkpoint at or below end height {end}"))?;
-    let last_checkpoint = checkpoint_list
-        .max_height_in_range(..Height(feed_checkpoint.0))
-        .ok_or_else(|| {
-            eyre!(
-                "window [{start}, {end}] spans fewer than two checkpoints; \
-                 pick a window covering at least two checkpoints"
-            )
-        })?;
     if last_checkpoint.0 < start {
         bail!(
-            "the second-to-last checkpoint {} is below the window start {start}; widen the window",
+            "the last checkpoint {} is below the window start {start}; widen the window",
             last_checkpoint.0
         );
     }
@@ -160,14 +129,12 @@ pub fn run(
         .hash(last_checkpoint)
         .ok_or_else(|| eyre!("checkpoint list has no hash for {}", last_checkpoint.0))?;
     let target = last_checkpoint.0 - start + 1;
-    let feed_target = feed_checkpoint.0 - start + 1;
     tracing::info!(
         start,
         end,
-        feed_checkpoint = feed_checkpoint.0,
         last_checkpoint = last_checkpoint.0,
         committed = target,
-        "sequencer feeds to the last checkpoint <= end, commits/gates to the second-to-last"
+        "sequencer feeds, commits, and gates to the last checkpoint <= end"
     );
 
     let max_checkpoint_height = checkpoint_list.max_height();
@@ -199,9 +166,8 @@ pub fn run(
         // Per-height serialized byte length, written by the feed task and read by the
         // driver (the SubmitBlock action does not carry the size). One slot per fed
         // block; small (8 bytes each).
-        let lens: Arc<Vec<AtomicU64>> = Arc::new(
-            (0..feed_target).map(|_| AtomicU64::new(0)).collect(),
-        );
+        let lens: Arc<Vec<AtomicU64>> =
+            Arc::new((0..target).map(|_| AtomicU64::new(0)).collect());
 
         // Spawn the real block-sync Sequencer starting from the base tip.
         let (feeder, mut submissions, mut committer) = spawn_bench_sequencer(
@@ -216,19 +182,20 @@ pub fn run(
 
         let (_producer, rx) = prefetch::spawn(reader, in_flight);
 
-        // Feed task: stream prepared blocks into the reorder queue, in height order,
-        // up to the last checkpoint (`feed_target`). Records each block's size in `lens`.
+        // Feed task: stream prepared blocks into the reorder queue, in height
+        // order, up to the last checkpoint (`target`). Records each block's size
+        // in `lens`.
         let feed_lens = lens.clone();
         let feed = tokio::spawn(async move {
             let mut fed = 0u32;
-            while fed < feed_target {
+            while fed < target {
                 // The prefetch producer is a std thread; do the blocking recv off the
                 // async executor.
                 let item = tokio::task::block_in_place(|| rx.recv());
                 let prepared = match item {
                     Ok(Ok(p)) => p,
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => break, // producer exhausted before feed_target
+                    Err(_) => break, // producer exhausted before target
                 };
                 let height = prepared.height;
                 let hash = prepared.block.hash();
@@ -271,7 +238,7 @@ pub fn run(
                     let (token, height, committed_hash, len): (_, Height, block::Hash, u64) = item?;
                     if height == last_checkpoint && committed_hash != expected_tip_hash {
                         bail!(
-                            "committed hash at the second-to-last checkpoint {} does not match the embedded checkpoint hash",
+                            "committed hash at checkpoint {} does not match the embedded checkpoint hash",
                             last_checkpoint.0
                         );
                     }
@@ -297,7 +264,7 @@ pub fn run(
                 // The next ordered submission from the sequencer: start its verify.
                 // The next ordered submission from the sequencer: start its verify.
                 // `None` (action channel closed) just leaves the drain arm to finish.
-                maybe = submissions.next_submit(), if submitted < feed_target => {
+                maybe = submissions.next_submit(), if submitted < target => {
                     if let Some(BenchSubmit { token, block }) = maybe {
                         let height = block
                             .coinbase_height()
@@ -339,9 +306,9 @@ pub fn run(
         tracing::info!(
             committed = done,
             last_checkpoint = last_checkpoint.0,
-            "replay verified (sequencer, vct): committed through the second-to-last checkpoint; hash matches"
+            "replay verified (sequencer, legacy): committed through the last checkpoint; hash matches"
         );
-        println!("mode=sequencer (vct, {storage_label})");
+        println!("mode=sequencer (legacy, {storage_label})");
         if let Some(dir) = trace_dir.as_deref() {
             println!("zakura-traces={}", dir.display());
         }

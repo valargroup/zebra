@@ -13,7 +13,7 @@ use crate::config::state_config;
 
 /// Rolls the finalized state at `base` back to `target` height.
 pub fn run(base: &Path, target: u32, network: Network) -> Result<()> {
-    let config = state_config(base.to_path_buf(), true);
+    let config = state_config(base.to_path_buf());
     tracing::info!(base = %base.display(), target, "rolling back base fork");
 
     let summary = rollback_finalized_state(

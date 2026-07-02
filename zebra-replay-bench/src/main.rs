@@ -99,9 +99,10 @@ enum Cmd {
         /// Cache file produced by `index`.
         #[arg(long)]
         cache: PathBuf,
-        /// VCT roots sidecar produced by `index-roots`. When set, the committer
-        /// runs the VCT fast path (folds supplied roots, skips the recompute);
-        /// otherwise the legacy full-recompute path runs.
+        /// VCT roots sidecar produced by `index-roots`.
+        ///
+        /// Reserved for later VCT fast-sync benchmark branches; rejected on this
+        /// `ironwood-main` split PR.
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
     },
@@ -114,14 +115,16 @@ enum Cmd {
         /// Cache file produced by `index`.
         #[arg(long)]
         cache: PathBuf,
-        /// VCT roots sidecar produced by `index-roots`. When set, the worker
-        /// drives the VCT fast path; otherwise the legacy full-recompute path runs.
+        /// VCT roots sidecar produced by `index-roots`.
+        ///
+        /// Reserved for later VCT fast-sync benchmark branches; rejected on this
+        /// `ironwood-main` split PR.
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
     },
-    /// Replay a cache through the real Zakura block-sync `Sequencer` (which reorders
-    /// bodies and submits them to the checkpoint verifier → state). VCT-only; one
-    /// altitude above `apply-verifier`. Requires `--vct-sidecar`.
+    /// Replay a cache through the real Zakura block-sync `Sequencer` (which
+    /// reorders bodies and submits them to the checkpoint verifier → state). One
+    /// altitude above `apply-verifier`.
     ApplySequencer {
         /// Base fork root (opened writable; must be at height start-1).
         #[arg(long)]
@@ -129,7 +132,10 @@ enum Cmd {
         /// Cache file produced by `index`.
         #[arg(long)]
         cache: PathBuf,
-        /// VCT roots sidecar produced by `index-roots` (required).
+        /// VCT roots sidecar produced by `index-roots`.
+        ///
+        /// Reserved for later VCT fast-sync benchmark branches; rejected on this
+        /// `ironwood-main` split PR.
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
         /// Commit in Archive storage mode (full raw-tx + indexes). The default is
@@ -152,8 +158,10 @@ enum Cmd {
         /// Cache file produced by `index`.
         #[arg(long)]
         cache: PathBuf,
-        /// VCT roots sidecar produced by `index-roots`. When set, the committer
-        /// drives the VCT fast path; otherwise the legacy full-recompute path runs.
+        /// VCT roots sidecar produced by `index-roots`.
+        ///
+        /// Reserved for later VCT fast-sync benchmark branches; rejected on this
+        /// `ironwood-main` split PR.
         #[arg(long)]
         vct_sidecar: Option<PathBuf>,
     },
@@ -174,7 +182,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Info { src } => {
-            let config = state_config(src.clone(), true);
+            let config = state_config(src.clone());
             let state = FinalizedState::new_read_only(&config, &network);
             let tip = state
                 .db

@@ -3,13 +3,10 @@
 use std::path::Path;
 
 use color_eyre::eyre::{bail, eyre, Result};
-use zebra_chain::{
-    block::Height, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network,
-    serialization::ZcashSerialize,
-};
+use zebra_chain::{block::Height, parameters::Network, serialization::ZcashSerialize};
 use zebra_state::{FinalizedState, HashOrHeight};
 
-use crate::{cache::CacheWriter, config::state_config, roots_cache::RootsSidecar};
+use crate::{cache::CacheWriter, config::state_config, roots_cache};
 
 /// Reads blocks `start..=end` from the snapshot at `src` into `cache_path`.
 ///
@@ -22,7 +19,7 @@ pub fn run(src: &Path, cache_path: &Path, start: u32, end: u32, network: Network
         bail!("end height {end} is below start height {start}");
     }
 
-    let config = state_config(src.to_path_buf(), true);
+    let config = state_config(src.to_path_buf());
     // Opened writable so RocksDB can create any column families this binary adds
     // that the (older) snapshot lacks; point this at a disposable fork, never the
     // pristine snapshot. No format upgrade runs when the fork already matches the
@@ -75,16 +72,14 @@ pub fn run(src: &Path, cache_path: &Path, start: u32, end: u32, network: Network
     Ok(())
 }
 
-/// Reads the per-height anchor roots for `start..=end`, plus the successor block
-/// at `end+1`, from the snapshot at `src` into a VCT sidecar.
+/// Reads the per-height commitment roots for `start..=end`, plus the successor
+/// block at `end+1`, from the snapshot at `src` into a sidecar for later VCT
+/// fast-sync replay branches.
 ///
-/// Roots are derived from the source's per-height trees: `*_tree_by_height` does a
-/// backward search, returning the tree as-of each height (carry-forward), so the
-/// roots are gap-free on an archive node — even for heights whose block changed
-/// neither tree. This is the same derivation `produce_block_roots` uses, and unlike
-/// the `commitment_roots_by_height` index it also works on a pre-index archive
-/// (format 27.2.0), whose index is empty. `apply --vct-sidecar` writes these roots
-/// into the base fork's header-roots column family so the fast path folds them in.
+/// Roots are derived through the finalized-state root range helper, which fills
+/// the current [`BlockCommitmentRoots`] shape from existing finalized state.
+///
+/// [`BlockCommitmentRoots`]: zebra_chain::parallel::commitment_aux::BlockCommitmentRoots
 pub fn run_roots(
     src: &Path,
     sidecar_path: &Path,
@@ -96,7 +91,7 @@ pub fn run_roots(
         bail!("end height {end} is below start height {start}");
     }
 
-    let config = state_config(src.to_path_buf(), true);
+    let config = state_config(src.to_path_buf());
     tracing::info!(src = %src.display(), "opening source fork (writable, for CF creation)");
     let state = FinalizedState::new_writable(&config, &network);
 
@@ -104,45 +99,35 @@ pub fn run_roots(
         .db
         .finalized_tip_height()
         .ok_or_else(|| eyre!("source snapshot has no finalized tip"))?;
-    // The fast path needs the successor of the last committed block (end+1) to
-    // confirm end's roots, so the window must leave one block of headroom.
+    // Later fast-sync replay branches need the successor of the last committed
+    // block (end+1) to confirm end's roots, so the window must leave one block
+    // of headroom.
     if end + 1 > tip.0 {
         bail!(
-            "VCT needs a successor at height {}, but source tip is {}",
+            "sidecar needs a successor at height {}, but source tip is {}",
             end + 1,
             tip.0
         );
     }
 
     let total = end - start + 1;
-    let mut roots = Vec::with_capacity(total as usize);
-    for h in start..=end {
-        let height = Height(h);
-        let sapling = state
-            .db
-            .sapling_tree_by_height(&height)
-            .ok_or_else(|| eyre!("source missing sapling tree at height {h}"))?;
-        let orchard = state
-            .db
-            .orchard_tree_by_height(&height)
-            .ok_or_else(|| eyre!("source missing orchard tree at height {h}"))?;
-        roots.push(BlockCommitmentRoots {
-            height,
-            sapling_root: sapling.root(),
-            orchard_root: orchard.root(),
-        });
-        let done = h - start + 1;
-        if done.is_multiple_of(5000) || done == total {
-            tracing::info!(height = h, done, total, "deriving roots");
-        }
+    let roots = state
+        .db
+        .finalized_commitment_roots_by_height_range(Height(start)..=Height(end));
+    if roots.len() != total as usize {
+        bail!(
+            "source returned {} roots for {total} requested heights",
+            roots.len()
+        );
     }
+    tracing::info!(count = roots.len(), "derived roots");
 
     let successor = state
         .db
         .block(HashOrHeight::Height(Height(end + 1)))
         .ok_or_else(|| eyre!("source missing successor block at height {}", end + 1))?;
 
-    RootsSidecar::write(sidecar_path, start, &roots, &successor)?;
+    roots_cache::write(sidecar_path, start, &roots, &successor)?;
     tracing::info!(
         count = roots.len(),
         sidecar = %sidecar_path.display(),

@@ -8,20 +8,15 @@
 //! checkpoint-range batching. The verifier is a Tower service, so unlike `apply`
 //! and `apply_worker` (sync) this path runs on a multi-thread tokio runtime.
 //!
-//! Checkpoint batching + the VCT successor boundary: the verifier only releases (and
-//! the worker commits) a block once its whole checkpoint range is contiguous. The
-//! worker's VCT fast path additionally can't commit a block until its successor is
-//! buffered (the one-block-lag root authentication). The final checkpoint's successor
-//! is in the dropped tail, and the verifier never releases it (its range can't
-//! complete past the window) — so the last checkpoint block would never commit. We
-//! therefore **feed** up to the last checkpoint `<= end` (so the last range delivers
-//! the successors the worker needs), but **count/gate** only up to the *second-to-last*
-//! checkpoint, whose successor that last range does deliver.
-//!
 //! Boundedness: blocks are read/parsed off-thread by the bounded [`crate::prefetch`]
 //! producer and fed to the verifier with a bounded in-flight window (>= the largest
 //! checkpoint gap, so ranges always complete), keeping memory flat. A periodic
 //! progress log (fed/done/front-height) makes any stall observable.
+//!
+//! This split replay-tooling PR runs the legacy full-recompute path that exists
+//! on `ironwood-main`. The VCT sidecar CLI flag is kept for compatibility with
+//! later benchmark branches, but is rejected until the header-root fast-path APIs
+//! are present on this base.
 
 use std::{
     collections::VecDeque,
@@ -39,9 +34,7 @@ use zebra_chain::{block::Height, parameters::Network};
 use zebra_consensus::{CheckpointVerifier, MAX_CHECKPOINT_HEIGHT_GAP};
 use zebra_state::FinalizedState;
 
-use crate::{
-    cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
-};
+use crate::{cache::CacheReader, config::state_config, prefetch, stats::Stats};
 
 /// Request-channel bound for the cloneable (buffered) state service the verifier
 /// commits through. Generous so concurrent per-block commit requests don't queue.
@@ -54,9 +47,8 @@ const STATE_CHECKPOINT_CONCURRENCY: usize = 1000;
 /// Replays the cache through the checkpoint verifier (which commits to a real
 /// `StateService`) onto the writable base fork at `base` (tip must be `start-1`).
 ///
-/// Feeds up to the last checkpoint `<= end`, commits/counts to the second-to-last
-/// checkpoint (see the module docs for why), and gates that block's committed hash
-/// against the embedded checkpoint hash.
+/// Feeds, commits, and counts up to the last checkpoint `<= end`, and gates that
+/// block's committed hash against the embedded checkpoint hash.
 pub fn run(
     base: &Path,
     cache_path: &Path,
@@ -81,31 +73,15 @@ pub fn run(
         eyre!("cache starts at genesis (height 0); apply needs a base at start-1")
     })?;
 
-    // Load the VCT sidecar first (if any) so we fail fast on a mismatch.
-    let sidecar = match vct_sidecar {
-        Some(path) => {
-            let s = RootsSidecar::read(path)?;
-            if s.start != start {
-                bail!("sidecar start {} != cache start {start}", s.start);
-            }
-            if s.roots.len() != header.count as usize {
-                bail!(
-                    "sidecar has {} roots but cache has {} blocks",
-                    s.roots.len(),
-                    header.count
-                );
-            }
-            Some(s)
-        }
-        None => None,
-    };
+    if vct_sidecar.is_some() {
+        bail!("--vct-sidecar replay requires VCT fast-sync APIs not present on ironwood-main");
+    }
 
-    let force_legacy = sidecar.is_none();
-    let config = state_config(base.to_path_buf(), force_legacy);
+    let config = state_config(base.to_path_buf());
 
     // Open the fork directly first: assert the tip, capture the parent hash (the
-    // verifier's initial tip), and in VCT mode inject the per-height roots into the
-    // header-roots CF. Drop this handle before `zebra_state::init` reopens the fork.
+    // verifier's initial tip). Drop this handle before `zebra_state::init`
+    // reopens the fork.
     let parent_hash = {
         let state = FinalizedState::new_writable(&config, &network);
         match state.db.finalized_tip_height() {
@@ -116,43 +92,19 @@ pub fn run(
             ),
             None => bail!("base fork has no finalized tip; expected height {expected_parent}"),
         }
-        if let Some(s) = &sidecar {
-            tracing::info!(
-                roots = s.roots.len(),
-                "injecting VCT roots into header-roots CF"
-            );
-            state
-                .db
-                .insert_zakura_header_commitment_roots(s.roots.iter().cloned())
-                .map_err(|e| eyre!("inserting VCT roots: {e}"))?;
-        }
         state.db.finalized_tip_hash()
     };
 
     // The verifier only releases (and the worker commits) a block once its whole
-    // checkpoint range is contiguous, so the verifier delivers blocks to the worker
-    // up to the last checkpoint <= end (`feed_checkpoint`). But the worker's VCT fast
-    // path can't commit a block until its successor is buffered, and the final
-    // checkpoint's successor is in the dropped tail (its range can't complete past
-    // the window). So we **feed** up to the last checkpoint (to deliver successors),
-    // but **count/gate** only up to the *second-to-last* checkpoint, whose successor
-    // the last range does deliver. The embedded checkpoint hash there is the gate.
+    // checkpoint range is contiguous, so feed, count, and gate at the last
+    // checkpoint <= end. The embedded checkpoint hash there is the gate.
     let checkpoint_list = network.checkpoint_list();
-    let feed_checkpoint = checkpoint_list
+    let last_checkpoint = checkpoint_list
         .max_height_in_range(..=Height(end))
         .ok_or_else(|| eyre!("no checkpoint at or below end height {end}"))?;
-    let last_checkpoint = checkpoint_list
-        .max_height_in_range(..Height(feed_checkpoint.0))
-        .ok_or_else(|| {
-            eyre!(
-                "window [{start}, {end}] spans fewer than two checkpoints; \
-                 the VCT fast path needs the last counted block's successor delivered, \
-                 so pick a window covering at least two checkpoints"
-            )
-        })?;
     if last_checkpoint.0 < start {
         bail!(
-            "the second-to-last checkpoint {} is below the window start {start}; widen the window",
+            "the last checkpoint {} is below the window start {start}; widen the window",
             last_checkpoint.0
         );
     }
@@ -160,16 +112,12 @@ pub fn run(
         .hash(last_checkpoint)
         .ok_or_else(|| eyre!("checkpoint list has no hash for {}", last_checkpoint.0))?;
     let target = last_checkpoint.0 - start + 1;
-    let feed_target = feed_checkpoint.0 - start + 1;
-    let dropped_tail = end - last_checkpoint.0;
     tracing::info!(
         start,
         end,
-        feed_checkpoint = feed_checkpoint.0,
         last_checkpoint = last_checkpoint.0,
         committed = target,
-        dropped_tail,
-        "verifier feeds to the last checkpoint <= end, commits/gates to the second-to-last"
+        "verifier feeds, commits, and gates to the last checkpoint <= end"
     );
 
     let max_checkpoint_height = checkpoint_list.max_height();
@@ -182,8 +130,6 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|e| eyre!("building tokio runtime: {e}"))?;
-
-    let vct = sidecar.is_some();
 
     let stats = runtime.block_on(async move {
         // Real buffered StateService on the base fork (the verifier commits into it).
@@ -274,19 +220,16 @@ pub fn run(
             }};
         }
 
-        // Prime the in-flight window (>= one checkpoint range, so ranges complete).
-        // Feed extends to `feed_target` (the last checkpoint) so the last range's
-        // successors reach the worker, even though we only count up to `target`.
-        while inflight.len() < in_flight && fed < feed_target {
+        // Prime the in-flight window (>= one checkpoint range, so ranges
+        // complete).
+        while inflight.len() < in_flight && fed < target {
             if !feed_one!() {
                 break;
             }
         }
 
-        // Drain completions in commit order until the counted target (second-to-last
-        // checkpoint); refill toward `feed_target` to keep the window bounded. The
-        // remaining in-flight handles (the last range, whose final block can't commit)
-        // are left detached and reaped when the runtime drops.
+        // Drain completions in commit order until the checkpoint target; refill
+        // toward `target` to keep the window bounded.
         while done < target {
             let Some((handle, height, len)) = inflight.pop_front() else {
                 bail!("ran out of in-flight blocks before the counted target (feed/checkpoint logic bug)");
@@ -302,11 +245,11 @@ pub fn run(
                 .await
                 .map_err(|e| eyre!("verifier task join error at height {height}: {e}"))?
                 .map_err(|e| eyre!("verify/commit failed at height {height}: {e}"))?;
-            // Correctness gate: the counted final block is the second-to-last
-            // checkpoint; its committed hash must match the embedded checkpoint hash.
+            // Correctness gate: the counted final block is a checkpoint; its
+            // committed hash must match the embedded checkpoint hash.
             if height == last_checkpoint.0 && committed_hash != expected_tip_hash {
                 bail!(
-                    "committed hash at the second-to-last checkpoint {} does not match the embedded checkpoint hash",
+                    "committed hash at checkpoint {} does not match the embedded checkpoint hash",
                     last_checkpoint.0
                 );
             }
@@ -316,7 +259,7 @@ pub fn run(
             stats.record(len, now - last);
             last = now;
 
-            if fed < feed_target {
+            if fed < target {
                 feed_one!();
             }
         }
@@ -326,12 +269,10 @@ pub fn run(
         tracing::info!(
             committed = done,
             last_checkpoint = last_checkpoint.0,
-            vct,
-            "replay verified (checkpoint-verifier): committed through the second-to-last checkpoint; hash matches"
+            "replay verified (checkpoint-verifier): committed through the last checkpoint; hash matches"
         );
 
-        let mode = if vct { "vct" } else { "legacy" };
-        println!("mode=checkpoint-verifier ({mode})");
+        println!("mode=checkpoint-verifier (legacy)");
         println!("{}", stats.report(wall));
         Ok::<Stats, color_eyre::Report>(stats)
     })?;

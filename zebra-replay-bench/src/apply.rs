@@ -1,30 +1,23 @@
 //! Phase 2: replay cached blocks through the real state committer, timed.
 //!
-//! Two modes:
-//! * **legacy** — `vct_fast_sync = false`, full per-block note-commitment
-//!   recompute; `next_checkpoint = None`.
-//! * **VCT** (`--vct-sidecar`) — `vct_fast_sync = true`, the per-height
-//!   anchor roots from the sidecar are written into the base fork's header-roots
-//!   column family so the committer folds them in and skips the recompute. Each
-//!   block is committed with its successor as `next_checkpoint`, the one-block-lag
-//!   confirmation the peer-source fast path requires.
+//! This split replay-tooling PR runs the legacy full-recompute path that exists
+//! on `ironwood-main`. The VCT sidecar CLI flag is kept for compatibility with
+//! later benchmark branches, but is rejected until the header-root fast-path APIs
+//! are present on this base.
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, time::Instant};
 
 use color_eyre::eyre::{bail, eyre, Result};
 use zebra_chain::{block::Height, parameters::Network};
 use zebra_state::FinalizedState;
 
-use crate::{
-    cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
-};
+use crate::{cache::CacheReader, config::state_config, prefetch, stats::Stats};
 
 /// Replays every block in `cache_path` onto the writable DB at `base`.
 ///
 /// `base` must be a snapshot/fork whose finalized tip is exactly `start - 1`.
-/// When `vct_sidecar` is `Some`, the VCT fast path is exercised; otherwise the
-/// legacy recompute path runs. After the replay the resulting tip hash is checked
-/// against the hash recorded in the cache header.
+/// The legacy recompute path runs. After the replay, the resulting tip hash is
+/// checked against the hash recorded in the cache header.
 pub fn run(
     base: &Path,
     cache_path: &Path,
@@ -48,30 +41,12 @@ pub fn run(
         eyre!("cache starts at genesis (height 0); apply needs a base at start-1")
     })?;
 
-    // Load the VCT sidecar first (if any) so we fail fast on a mismatch.
-    let sidecar = match vct_sidecar {
-        Some(path) => {
-            let s = RootsSidecar::read(path)?;
-            if s.start != start {
-                bail!("sidecar start {} != cache start {start}", s.start);
-            }
-            if s.roots.len() != header.count as usize {
-                bail!(
-                    "sidecar has {} roots but cache has {} blocks",
-                    s.roots.len(),
-                    header.count
-                );
-            }
-            Some(s)
-        }
-        None => None,
-    };
+    if vct_sidecar.is_some() {
+        bail!("--vct-sidecar replay requires VCT fast-sync APIs not present on ironwood-main");
+    }
 
-    // VCT mode forces the fast path on (vct_fast_sync = true); legacy
-    // mode forces the full recompute (vct_fast_sync = false).
-    let force_legacy = sidecar.is_none();
-    let config = state_config(base.to_path_buf(), force_legacy);
-    tracing::info!(base = %base.display(), vct = sidecar.is_some(), "opening base fork writable");
+    let config = state_config(base.to_path_buf());
+    tracing::info!(base = %base.display(), "opening base fork writable");
     let mut state = FinalizedState::new_writable(&config, &network);
 
     match state.db.finalized_tip_height() {
@@ -83,27 +58,12 @@ pub fn run(
         None => bail!("base fork has no finalized tip; expected height {expected_parent}"),
     }
 
-    // VCT: write the per-height roots into the base fork's header-roots column
-    // family, exactly where header sync would have placed them, so the committer's
-    // PeerSource reads and folds them per height.
-    if let Some(s) = &sidecar {
-        tracing::info!(
-            roots = s.roots.len(),
-            "injecting VCT roots into header-roots CF"
-        );
-        state
-            .db
-            .insert_zakura_header_commitment_roots(s.roots.iter().cloned())
-            .map_err(|e| eyre!("inserting VCT roots: {e}"))?;
-    }
-
     tracing::info!(start, count = header.count, "replaying window");
 
     // Stream the window through a bounded prefetch: a producer thread reads,
     // deserializes, and builds each CheckpointVerifiedBlock (the verifier-side
     // `prepare_block_data`) ahead of the committer, so the timed loop measures the
-    // committer only while memory stays bounded to the prefetch capacity. The
-    // committer keeps a one-block look-ahead for the VCT successor.
+    // committer only while memory stays bounded to the prefetch capacity.
     let (_producer, rx) = prefetch::spawn(reader, prefetch::capacity());
 
     let mut stats = Stats::default();
@@ -117,43 +77,18 @@ pub fn run(
     let wall_start = Instant::now();
 
     while let Some(p) = cur.take() {
-        // The next prepared block is both this block's VCT successor and the next
-        // iteration's block. With a full prefetch buffer this receive does not
-        // block; if the producer lags it briefly waits (counted in the wall, not
-        // the per-commit latency).
+        // With a full prefetch buffer this receive does not block; if the
+        // producer lags it briefly waits (counted in the wall, not the
+        // per-commit latency).
         let next = match rx.recv() {
             Ok(item) => Some(item?),
             Err(_) => None,
         };
 
-        let next_checkpoint = if let Some(s) = &sidecar {
-            let (successor, auth) = match &next {
-                Some(n) => (n.block.clone(), n.auth),
-                None => {
-                    let successor = Arc::new(s.successor.clone());
-                    let auth = successor.auth_data_root();
-                    (successor, auth)
-                }
-            };
-            Some((successor, Some(auth)))
-        } else {
-            None
-        };
-
         let height = p.height;
         let commit_start = Instant::now();
         let (_hash, trees) = state
-            .commit_finalized_direct(
-                p.cv.into(),
-                prev_trees.take(),
-                None,
-                next_checkpoint,
-                if sidecar.is_some() {
-                    "replay-bench-vct"
-                } else {
-                    "replay-bench"
-                },
-            )
+            .commit_finalized_direct(p.cv.into(), prev_trees.take(), "replay-bench")
             .map_err(|e| eyre!("commit failed at height {height}: {e}"))?;
         let latency = commit_start.elapsed();
 
@@ -170,10 +105,10 @@ pub fn run(
 
     let wall = wall_start.elapsed();
 
-    // Correctness gate: the committer validates each block's commitments (against
-    // the recomputed trees in legacy mode, or the folded supplied roots in VCT
-    // mode), so reaching the end height already proves consensus correctness.
-    // Confirm the final tip hash equals the source tip for good measure.
+    // Correctness gate: the committer validates each block's commitments against
+    // the recomputed trees, so reaching the end height already proves consensus
+    // correctness. Confirm the final tip hash equals the source tip for good
+    // measure.
     let tip = state
         .db
         .tip()
@@ -191,11 +126,7 @@ pub fn run(
             start + header.count - 1
         );
     }
-    tracing::info!(
-        tip = tip.0 .0,
-        vct = sidecar.is_some(),
-        "replay verified: tip hash matches source"
-    );
+    tracing::info!(tip = tip.0 .0, "replay verified: tip hash matches source");
 
     println!("{}", stats.report(wall));
     Ok(stats)

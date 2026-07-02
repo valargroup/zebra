@@ -20,10 +20,7 @@ use std::{
 };
 
 use color_eyre::eyre::{eyre, Result};
-use zebra_chain::{
-    block::{merkle::AuthDataRoot, Block},
-    serialization::ZcashDeserialize,
-};
+use zebra_chain::{block::Block, serialization::ZcashDeserialize};
 use zebra_state::CheckpointVerifiedBlock;
 
 use crate::cache::CacheReader;
@@ -46,12 +43,11 @@ pub fn capacity() -> usize {
 }
 
 /// One prepared block ready to commit: the verified block plus the per-block prep
-/// the committer's `next_checkpoint` needs (the block handle and its auth-data
-/// root), with its height and serialized byte length.
+/// the sequencer/verifier rungs need (the block handle), with its height and
+/// serialized byte length.
 pub struct Prepared {
     pub cv: CheckpointVerifiedBlock,
     pub block: Arc<Block>,
-    pub auth: AuthDataRoot,
     pub len: usize,
     pub height: u32,
 }
@@ -83,14 +79,12 @@ pub fn spawn(reader: CacheReader, capacity: usize) -> (JoinHandle<()>, Receiver<
                 return;
             }
         };
-        let auth = block.auth_data_root();
         let cv = CheckpointVerifiedBlock::from(block.clone());
 
         if tx
             .send(Ok(Prepared {
                 cv,
                 block,
-                auth,
                 len,
                 height,
             }))

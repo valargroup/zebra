@@ -7,12 +7,12 @@
 # replayed onto a fork of it.
 #
 #   replay_run.sh index             # fork the block source, dump the window to a cache
-#   replay_run.sh index-roots       # fork the source, derive per-height roots -> VCT sidecar
+#   replay_run.sh index-roots       # derive roots sidecar for later VCT branches
 #   replay_run.sh run <label> BIN   # fork the base, apply the cache, time it
 #
-# `index` (and `index-roots` for VCT) are one-time setup. `run` is the repeatable
-# A/B step — it re-forks the base each time so commits never touch the source.
-# Set REPLAY_VCT_SIDECAR to a sidecar path to drive the VCT fast path in `run`.
+# `index` is one-time setup. `run` is the repeatable A/B step — it re-forks the
+# base each time so commits never touch the source. `index-roots` is reserved
+# for later VCT fast-sync benchmark branches.
 #
 # All host paths come from cohort.env (REPLAY_* / BENCH_* vars) or the environment.
 #
@@ -38,6 +38,10 @@ BIN_DEFAULT="${REPLAY_BIN:-/root/wal-bench/zebra-replay-bench}"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 note() { echo "[replay] $*" >&2; }
+
+reject_vct_sidecar() {
+  [ -z "${REPLAY_VCT_SIDECAR:-}" ] || die "REPLAY_VCT_SIDECAR is reserved for later VCT fast-sync benchmark branches"
+}
 
 # Hard-link fork SRC -> DST, breaking links on RocksDB mutable metadata so writes
 # to the fork can never reach the source snapshot (same trick as feed_run.sh).
@@ -81,16 +85,11 @@ cmd_run() {
   local bin="${1:-$BIN_DEFAULT}"
   [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
   [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  reject_vct_sidecar
   local fork="$FORK_DIR/replay-run-$label"
   note "fork base $BASE_SRC -> $fork; apply $CACHE (expects base tip $((START - 1)))"
   clone_fork "$BASE_SRC" "$fork"
-  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
-    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
-    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
-    "$bin" apply --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
-  else
-    "$bin" apply --base "$fork" --cache "$CACHE"
-  fi
+  "$bin" apply --base "$fork" --cache "$CACHE"
   note "cleanup: rm -rf $fork"
   rm -rf "$fork"
 }
@@ -102,16 +101,11 @@ cmd_run_worker() {
   local bin="${1:-$BIN_DEFAULT}"
   [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
   [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  reject_vct_sidecar
   local fork="$FORK_DIR/replay-worker-$label"
   note "fork base $BASE_SRC -> $fork; apply-worker $CACHE (expects base tip $((START - 1)))"
   clone_fork "$BASE_SRC" "$fork"
-  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
-    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
-    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
-    "$bin" apply-worker --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
-  else
-    "$bin" apply-worker --base "$fork" --cache "$CACHE"
-  fi
+  "$bin" apply-worker --base "$fork" --cache "$CACHE"
   note "cleanup: rm -rf $fork"
   rm -rf "$fork"
 }
@@ -123,33 +117,27 @@ cmd_run_verifier() {
   local bin="${1:-$BIN_DEFAULT}"
   [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
   [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
+  reject_vct_sidecar
   local fork="$FORK_DIR/replay-verifier-$label"
   note "fork base $BASE_SRC -> $fork; apply-verifier $CACHE (expects base tip $((START - 1)))"
   clone_fork "$BASE_SRC" "$fork"
-  if [ -n "${REPLAY_VCT_SIDECAR:-}" ]; then
-    [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
-    note "VCT mode: --vct-sidecar $REPLAY_VCT_SIDECAR"
-    "$bin" apply-verifier --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR"
-  else
-    "$bin" apply-verifier --base "$fork" --cache "$CACHE"
-  fi
+  "$bin" apply-verifier --base "$fork" --cache "$CACHE"
   note "cleanup: rm -rf $fork"
   rm -rf "$fork"
 }
 
 # Like cmd_run_verifier, but replays through the real Zakura block-sync Sequencer
-# (reorder + ordered submit to the verifier->state). VCT-only.
+# (reorder + ordered submit to the verifier->state).
 cmd_run_sequencer() {
   local label="${1:?usage: replay_run.sh run-sequencer <label> [bin]}"; shift || true
   local bin="${1:-$BIN_DEFAULT}"
   [ -x "$bin" ] || die "binary not executable: $bin (build with 'make perf-build-replay-bench')"
   [ -f "$CACHE" ] || die "cache missing: $CACHE (run 'replay_run.sh index' first)"
-  [ -n "${REPLAY_VCT_SIDECAR:-}" ] || die "apply-sequencer is VCT-only; set REPLAY_VCT_SIDECAR (run 'replay_run.sh index-roots')"
-  [ -f "$REPLAY_VCT_SIDECAR" ] || die "VCT sidecar missing: $REPLAY_VCT_SIDECAR"
+  reject_vct_sidecar
   local fork="$FORK_DIR/replay-sequencer-$label"
-  note "fork base $BASE_SRC -> $fork; apply-sequencer $CACHE (VCT; expects base tip $((START - 1)))"
+  note "fork base $BASE_SRC -> $fork; apply-sequencer $CACHE (expects base tip $((START - 1)))"
   clone_fork "$BASE_SRC" "$fork"
-  local args=(apply-sequencer --base "$fork" --cache "$CACHE" --vct-sidecar "$REPLAY_VCT_SIDECAR")
+  local args=(apply-sequencer --base "$fork" --cache "$CACHE")
   # Storage mode: Pruned by default (BASE_SRC must already be a pruned snapshot; pruning
   # is one-way). REPLAY_ARCHIVE=1 opts back into Archive (needs an archive base).
   if [ -n "${REPLAY_ARCHIVE:-}" ]; then

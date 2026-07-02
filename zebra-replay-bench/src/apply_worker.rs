@@ -12,17 +12,10 @@
 //! window measures the commit pipeline only while memory stays flat regardless of
 //! window size.
 //!
-//! Two modes, differing only at the window boundary:
-//! * **legacy** (`vct_fast_sync = false`, no sidecar): feed `start..=end`,
-//!   drop both worker senders so the worker drains, hits `Disconnected`, and
-//!   exits; the worker thread is joined.
-//! * **VCT** (`--vct-sidecar`): the per-height roots are injected into the base
-//!   fork's header-roots CF and the worker builds its own `next_checkpoint` from
-//!   the look-ahead. Every committed height needs its successor buffered, so we
-//!   feed one extra trailing block (the sidecar's `successor`, height `end+1`) to
-//!   give `end` its successor. The worker then parks on `end+1` (whose successor
-//!   is never fed) and cannot be drained to exit, so we verify against a cloned
-//!   DB handle and return without joining — the parked thread is reaped at exit.
+//! This split replay-tooling PR runs the legacy full-recompute path that exists
+//! on `ironwood-main`. The VCT sidecar CLI flag is kept for compatibility with
+//! later benchmark branches, but is rejected until the header-root fast-path APIs
+//! are present on this base.
 
 use std::{path::Path, sync::Arc, time::Instant};
 
@@ -31,20 +24,15 @@ use std::collections::VecDeque;
 use color_eyre::eyre::{bail, eyre, Result};
 use tokio::sync::{oneshot, watch};
 use zebra_chain::{block::Height, parameters::Network};
-use zebra_state::{
-    BlockWriteSender, ChainTipSender, CheckpointVerifiedBlock, FinalizedState, NonFinalizedState,
-};
+use zebra_state::{BlockWriteSender, ChainTipSender, FinalizedState, NonFinalizedState};
 
-use crate::{
-    cache::CacheReader, config::state_config, prefetch, roots_cache::RootsSidecar, stats::Stats,
-};
+use crate::{cache::CacheReader, config::state_config, prefetch, stats::Stats};
 
 /// Replays every block in `cache_path` through the write worker, onto the
 /// writable DB at `base` (whose finalized tip must be exactly `start - 1`).
 ///
-/// When `vct_sidecar` is `Some`, the VCT fast path is exercised; otherwise the
-/// legacy recompute path runs. After the replay the resulting tip hash is checked
-/// against the hash recorded in the cache header.
+/// After the replay, the resulting tip hash is checked against the hash recorded
+/// in the cache header.
 pub fn run(
     base: &Path,
     cache_path: &Path,
@@ -68,30 +56,12 @@ pub fn run(
         eyre!("cache starts at genesis (height 0); apply needs a base at start-1")
     })?;
 
-    // Load the VCT sidecar first (if any) so we fail fast on a mismatch.
-    let sidecar = match vct_sidecar {
-        Some(path) => {
-            let s = RootsSidecar::read(path)?;
-            if s.start != start {
-                bail!("sidecar start {} != cache start {start}", s.start);
-            }
-            if s.roots.len() != header.count as usize {
-                bail!(
-                    "sidecar has {} roots but cache has {} blocks",
-                    s.roots.len(),
-                    header.count
-                );
-            }
-            Some(s)
-        }
-        None => None,
-    };
+    if vct_sidecar.is_some() {
+        bail!("--vct-sidecar replay requires VCT fast-sync APIs not present on ironwood-main");
+    }
 
-    // VCT mode forces the fast path on (vct_fast_sync = true); legacy
-    // mode forces the full recompute (vct_fast_sync = false).
-    let force_legacy = sidecar.is_none();
-    let config = state_config(base.to_path_buf(), force_legacy);
-    tracing::info!(base = %base.display(), vct = sidecar.is_some(), "opening base fork writable (worker)");
+    let config = state_config(base.to_path_buf());
+    tracing::info!(base = %base.display(), "opening base fork writable (worker)");
     let state = FinalizedState::new_writable(&config, &network);
 
     match state.db.finalized_tip_height() {
@@ -101,20 +71,6 @@ pub fn run(
             tip.0
         ),
         None => bail!("base fork has no finalized tip; expected height {expected_parent}"),
-    }
-
-    // VCT: write the per-height roots into the base fork's header-roots column
-    // family, exactly where header sync would have placed them, so the worker's
-    // committer reads and folds them per height.
-    if let Some(s) = &sidecar {
-        tracing::info!(
-            roots = s.roots.len(),
-            "injecting VCT roots into header-roots CF"
-        );
-        state
-            .db
-            .insert_zakura_header_commitment_roots(s.roots.iter().cloned())
-            .map_err(|e| eyre!("inserting VCT roots: {e}"))?;
     }
 
     // Keep a DB handle for the post-run correctness gate: the worker drops its own
@@ -140,8 +96,7 @@ pub fn run(
     // a bounded in-flight window: never more than `in_flight` blocks sent-but-not-
     // committed. This keeps memory flat regardless of window size and avoids dumping
     // a 30K backlog into the worker's unbounded channel (which would trigger a
-    // RocksDB write-stall). The worker builds its own VCT next_checkpoint from the
-    // look-ahead, so it only needs the CVs fed in order.
+    // RocksDB write-stall).
     let in_flight = prefetch::capacity();
     let (_producer, rx) = prefetch::spawn(reader, in_flight);
 
@@ -153,7 +108,6 @@ pub fn run(
     let mut stats = Stats::default();
     let mut completions = VecDeque::new();
     let mut window_done = false;
-    let mut successor_fed = false;
 
     let wall_start = Instant::now();
 
@@ -183,9 +137,7 @@ pub fn run(
         stats.record(len, now - last);
         last = now;
 
-        // Refill with the next window block; once the window is drained, feed the
-        // single VCT successor (height end+1) so the last counted block can commit.
-        // Its completion is intentionally not tracked — the worker parks on it.
+        // Refill with the next window block.
         if !window_done {
             match rx.recv() {
                 Ok(item) => {
@@ -198,24 +150,12 @@ pub fn run(
                 Err(_) => window_done = true,
             }
         }
-        if window_done && !successor_fed {
-            if let Some(s) = &sidecar {
-                let scv = CheckpointVerifiedBlock::from(Arc::new(s.successor.clone()));
-                let (tx, _c) = oneshot::channel();
-                fin.send((scv, tx))
-                    .map_err(|_| eyre!("worker finalized channel closed early (successor)"))?;
-            }
-            successor_fed = true;
-        }
     }
     let wall = wall_start.elapsed();
 
-    // Legacy: drop both worker senders so the worker drains and exits. VCT keeps
-    // them alive — the worker parks on the unfed successor of end+1 regardless.
-    if sidecar.is_none() {
-        drop(fin);
-        drop(sender);
-    }
+    // Drop both worker senders so the worker drains and exits.
+    drop(fin);
+    drop(sender);
 
     // Correctness gate (via the cloned DB handle). Reaching the end height already
     // proves consensus correctness — the committer validates each block's
@@ -237,36 +177,20 @@ pub fn run(
         );
     }
 
-    if sidecar.is_none() {
-        // Legacy: the worker has drained and is shutting down — join it.
-        if let Some(join) = join {
-            if let Ok(handle) = Arc::try_unwrap(join) {
-                handle
-                    .join()
-                    .map_err(|_| eyre!("write worker thread panicked"))?;
-            }
+    // The worker has drained and is shutting down; join it.
+    if let Some(join) = join {
+        if let Ok(handle) = Arc::try_unwrap(join) {
+            handle
+                .join()
+                .map_err(|_| eyre!("write worker thread panicked"))?;
         }
-        tracing::info!(
-            tip = tip.0 .0,
-            "replay verified (worker, legacy): tip hash matches source"
-        );
-    } else {
-        // VCT: the worker is parked on the unfed successor of end+1 and cannot be
-        // drained to exit. All counted blocks committed and the tip gate passed;
-        // leave the thread parked (reaped at process exit).
-        drop(join);
-        tracing::info!(
-            tip = tip.0 .0,
-            "replay verified (worker, vct): tip hash matches source; worker left parked (reaped at exit)"
-        );
     }
+    tracing::info!(
+        tip = tip.0 .0,
+        "replay verified (worker, legacy): tip hash matches source"
+    );
 
-    let mode = if vct_sidecar.is_some() {
-        "vct"
-    } else {
-        "legacy"
-    };
-    println!("mode=writer-worker ({mode})");
+    println!("mode=writer-worker (legacy)");
     println!("{}", stats.report(wall));
     Ok(stats)
 }
