@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
   node. The budget now bounds resident memory and gates the floor lane, exempting
   only the single commit-frontier block so the committer can always drain the
-  pipeline (no deadlock). Resident memory now plateaus at the configured budget.
+  pipeline (no deadlock). Resident memory now plateaus near the configured budget,
+  with only bounded transient overshoot from floor-rescue requests.
 
 ### Performance
 

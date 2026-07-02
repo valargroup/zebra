@@ -622,7 +622,9 @@ impl PeerRoutine {
                 // cap collapsed to an *empty* take at `available() == 0`, breaking the fill
                 // loop before the funding path and wedging the floor permanently. The
                 // `.min(response_byte_cap)` still bounds the speculative above-floor tail to
-                // the live budget, so a funded floor request never over-commits.
+                // the live budget. The floor block itself can transiently cross the
+                // resident look-ahead budget by the first-item progress margin, but the
+                // funding path immediately self-corrects by shedding above-floor work.
                 let floor_available = self.budget.available().min(response_byte_cap).max(1);
                 let floor_take_high = match next_height(floor_high).and_then(|tail_start| {
                     admission_decision(
