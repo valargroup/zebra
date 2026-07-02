@@ -302,18 +302,11 @@ pub(crate) fn produce_block_roots(
     roots
 }
 
-/// Serve the per-block roots for `range`, stitching the two sources at the upgrade height `U`.
+/// Serve the per-block roots for `range`, joining tree-derived roots below the VCT upgrade height
+/// with indexed roots at and above it.
 ///
-/// The `commitment_roots_by_height` serving index only covers heights at and above `U` (the lowest
-/// height this binary committed). Heights below `U` predate the index, so they are derived from the
-/// per-height trees instead, and the two runs are concatenated. This is what lets a node that
-/// upgraded mid-chain serve a request that straddles `U` as one gap-free batch, rather than the
-/// short index-only prefix that would stall the client's minimum-progress check.
-///
-/// Both sources stop at the first absent height, so the result is always a contiguous run from
-/// `range.start()`; a tree gap below `U` is served as the prefix collected so far without reaching
-/// into the index. A database that never recorded `U` — a pre-index archive node — derives the
-/// whole range from the trees, the original archive fallback.
+/// Each source stops at the first missing height, so the result is always a contiguous prefix from
+/// `range.start()`. Databases without a recorded upgrade height derive the whole range from trees.
 pub(crate) fn serve_block_roots(
     db: &ZebraDb,
     range: std::ops::RangeInclusive<block::Height>,
