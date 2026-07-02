@@ -382,12 +382,10 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        // `max_reorder_lookahead_bytes` bounds the *resident* footprint of the buffered and
-        // in-flight bodies — admission compares it against every pool's wire bytes scaled by
-        // `DESERIALIZED_MEM_FACTOR` (see `admission::estimated_resident_pipeline_bytes`).
-        // Cap it against the *resident* equivalent of the in-flight wire budget; capping
-        // against the raw wire `max_inflight_block_bytes` would pull the resident budget down
-        // to a wire quantity, needlessly starving look-ahead depth.
+        // This is a resident-memory budget: admission counts each pool's wire bytes scaled by
+        // `DESERIALIZED_MEM_FACTOR`. Cap it against the resident equivalent of the in-flight
+        // wire budget, not raw `max_inflight_block_bytes`, so look-ahead depth is not
+        // unnecessarily starved.
         self.max_reorder_lookahead_bytes.min(
             self.max_inflight_block_bytes
                 .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
