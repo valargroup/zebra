@@ -612,8 +612,7 @@ impl PeerRoutine {
                         self.admission_snapshot(view, reserved_above_floor),
                         floor_start,
                     )
-                })
-            {
+                }) {
                 // Size the floor take by the live budget as usual, but never below one
                 // byte. `take_in_range_budgeted` always takes its first item regardless of
                 // the byte cap, so a `>= 1` cap guarantees the floor block itself is taken

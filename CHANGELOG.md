@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
   wire bytes (not the ~4× larger decoded footprint) and the floor-rescue path
-  bypassed the budget entirely and advanced with the *download* floor, so the
+  bypassed the budget entirely and advanced with the _download_ floor, so the
   buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
   node. The budget now bounds resident memory and gates the floor lane, exempting
   only the single commit-frontier block so the committer can always drain the
