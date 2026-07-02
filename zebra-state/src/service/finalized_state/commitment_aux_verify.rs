@@ -30,6 +30,8 @@ pub(crate) struct CommitmentRootVerification {
 }
 
 impl CommitmentRootVerification {
+    /// Verify this block's parent-history commitment, then fold the supplied
+    /// per-block roots into the running history tree for the next block.
     pub(crate) fn with_roots(
         block: Arc<Block>,
         sapling_root: sapling::tree::Root,
@@ -45,6 +47,10 @@ impl CommitmentRootVerification {
         }
     }
 
+    /// Verify this block's parent-history commitment without folding in roots.
+    ///
+    /// This confirms the roots already accumulated in the running tree, which is useful
+    /// for the final one-block lag: the roots at height `H` are checked by height `H + 1`.
     pub(crate) fn header_only(
         block: Arc<Block>,
         precomputed_auth_data_root: Option<AuthDataRoot>,
@@ -146,19 +152,19 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
 /// `[start..=end - 1]`; pass the block at `end + 1` to confirm the root at `end`.
 pub(crate) fn verify_commitment_roots<I>(
     network: &Network,
-    mut tree: HistoryTree,
-    items: I,
+    mut history_tree: HistoryTree,
+    blocks_to_verify: I,
 ) -> Result<HistoryTree, (Height, ValidateContextError)>
 where
     I: IntoIterator<Item = CommitmentRootVerification>,
 {
-    for item in items {
+    for block_verify in blocks_to_verify {
         let CommitmentRootVerification {
             block,
             roots,
             precomputed_auth_data_root,
             skip_parent_check,
-        } = item;
+        } = block_verify;
 
         let height = block
             .coinbase_height()
@@ -166,11 +172,23 @@ where
 
         // Validate this block's header commitment against the current (parent) tree,
         // i.e. against every root already folded in.
+        // We allow the caller to control skipping this check
+        // in case the caller has already verified the parent tree
+        // For example, a block execution loop is:
+        // 1. Verify block X against block X - 1 history tree
+        // 2. Wait for block X + 1 body to verify against block X history tree
+        //    * This is so that we do not commit block X before we have verified its roots.
+        // 3. Verify block X + 1 against block X history tree
+        //
+        // Note that, when we are processing block X + 1 step 1, we are ovrlapping
+        // with step 3 of the prior iteration so verification can be skipped in that case
+        // for perf reasons.
         if !skip_parent_check {
+            // This block + history tree up to and including the previous block.
             check::block_commitment_is_valid_for_chain_history(
                 block.clone(),
                 network,
-                &tree,
+                &history_tree,
                 precomputed_auth_data_root,
             )
             .map_err(|error| (height, error))?;
@@ -187,11 +205,13 @@ where
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
-        tree.push(
+        history_tree.push(
             network,
             block,
             &sapling_root,
             &orchard_root,
+            // TODO: add ironwood root
+            // https://linear.app/zcale/issue/ZCA-746/wire-up-ironwood-into-vct
             &Default::default(),
         )
         .map_err(Arc::new)
@@ -199,7 +219,7 @@ where
         .map_err(|error| (height, error))?;
     }
 
-    Ok(tree)
+    Ok(history_tree)
 }
 
 #[cfg(test)]
