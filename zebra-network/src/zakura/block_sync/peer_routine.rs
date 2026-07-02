@@ -850,7 +850,7 @@ impl PeerRoutine {
                 self.budget.release(reserved_bytes);
                 let _ = self
                     .work
-                    .release_and_return_items(items.iter().map(|(height, _)| *height));
+                    .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
                 break FillStop::Internal;
             }
 
@@ -859,7 +859,7 @@ impl PeerRoutine {
                 Err(_) => {
                     let released = self
                         .work
-                        .release_and_return_items(items.iter().map(|(height, _)| *height));
+                        .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
                     self.budget.release(released);
                     break FillStop::Internal;
                 }
@@ -895,9 +895,12 @@ impl PeerRoutine {
                     "failed to queue Zakura block-sync GetBlocks"
                 );
                 // Nothing was received, so return every taken height to the queue.
+                // Held-aware: a competing peer's late body may have converted a taken
+                // height during the reserve await; that body is owned by the Sequencer,
+                // so skip it here rather than re-queue and double-release it.
                 let released = self
                     .work
-                    .release_and_return_items(items.iter().map(|(height, _)| *height));
+                    .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
                 self.budget.release(released);
                 if matches!(error, OrderedSendError::Full) {
                     break FillStop::OutboundFull;
@@ -1155,8 +1158,14 @@ impl PeerRoutine {
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.outstanding.remove(index);
-                released = released
-                    .saturating_add(self.work.release_heights(unreceived_heights(&outstanding)));
+                // Release only the size-estimate still reserved for unreceived
+                // heights. A height a competing peer delivered late is `Held`: its
+                // body is in the commit pipeline and the Sequencer releases those
+                // bytes on commit, so it must not be released a second time here.
+                released = released.saturating_add(
+                    self.work
+                        .release_reserved_heights(unreceived_heights(&outstanding)),
+                );
                 removed = true;
             } else {
                 index += 1;
@@ -1287,13 +1296,19 @@ impl PeerRoutine {
             .work
             .settle_active_reserved_height(height, serialized_bytes)
         else {
+            // The reservation is gone: a competing peer already delivered this
+            // height first (first-completion-wins), a watchdog released it, or it
+            // committed past the floor. In every case the body is already in the
+            // commit pipeline, so mark it received rather than re-queuing it — a
+            // retry here would phantom-re-fetch a body we already hold, and any
+            // release belongs to whoever settled it, not to this stale claim.
             tracing::debug!(
                 peer = ?self.peer,
                 ?height,
                 serialized_bytes,
-                "ignoring late block-sync body for a request already released"
+                "block-sync body already settled by another peer; marking received"
             );
-            self.finish_outstanding_at(index, Disposition::RetryMissing);
+            self.accept_already_settled_height(index, height);
             return;
         };
         self.apply_budget_delta(delta);
@@ -1687,7 +1702,10 @@ impl PeerRoutine {
         }
         let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
         let _ = outstanding.mark_received_through(tip);
-        let released_bytes = self.work.release_heights(released_heights);
+        // Held-aware: release only the still-reserved estimate for the committed
+        // prefix; a height a competing peer delivered late is owned by the
+        // Sequencer, so it is left in place instead of double-released.
+        let released_bytes = self.work.release_reserved_heights(released_heights);
         self.budget.release(released_bytes);
         if outstanding.is_complete() {
             Disposition::Satisfied
@@ -1707,17 +1725,25 @@ impl PeerRoutine {
     }
 
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
-        let released = self.work.release_heights(unreceived_heights(&outstanding));
-        self.budget.release(released);
+        // Every release path below is Held-aware: a height a competing peer
+        // delivered late settled to `Held(actual)` in the shared work queue and is
+        // owned by the Sequencer (which releases those bytes on commit), so it must
+        // never be released or re-queued from this stale claim. Only still-reserved
+        // (unreceived, never-delivered) heights are released here.
         match disposition {
             Disposition::Satisfied => {
                 // Every requested height was received and buffered; nothing
                 // returns to the queue (buffered heights stay in `in_flight`
-                // until the floor commits past them).
+                // until the floor commits past them). Release any residual
+                // reserved estimate (normally none once complete).
+                let released = self
+                    .work
+                    .release_reserved_heights(unreceived_heights(&outstanding));
+                self.budget.release(released);
             }
             // With fanout = 1 a received height is already buffered and must never
-            // be re-fetched, so both retry dispositions return only the unreceived
-            // heights to `pending`. `return_items` is idempotent.
+            // be re-fetched, so both retry dispositions return only the still-reserved
+            // unreceived heights to `pending`. `return_items` is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
                 let released = self.return_unreceived_to_queue(&outstanding);
                 self.budget.release(released);
@@ -1734,9 +1760,36 @@ impl PeerRoutine {
         }
     }
 
+    /// A body arrived for a request this peer owns, but its height was already
+    /// settled by a competing peer (first-completion-wins), released by a
+    /// watchdog, or committed past the floor — so `settle_active_reserved_height`
+    /// returned `None`. The body is already in the commit pipeline: record the
+    /// height as received so the request can complete without re-queuing a body we
+    /// already hold, and without touching the budget (the settling path owns those
+    /// bytes). Count it as block progress since a real wanted body did arrive on
+    /// this peer's stream.
+    fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        let completed = self
+            .window
+            .outstanding
+            .get_mut(index)
+            .map(|outstanding| {
+                outstanding.mark_received(height);
+                outstanding.is_complete()
+            })
+            .unwrap_or(false);
+        if completed {
+            self.finish_outstanding_at(index, Disposition::Satisfied);
+        } else {
+            self.publish_outstanding();
+        }
+    }
+
     fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
         self.work
-            .release_and_return_items(unreceived_heights(outstanding))
+            .release_reserved_and_return_items(unreceived_heights(outstanding))
     }
 
     fn apply_budget_delta(&mut self, delta: i128) {
@@ -2200,7 +2253,9 @@ impl Drop for PeerRoutine {
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
         for outstanding in self.window.outstanding.drain(..) {
-            let released = self.work.release_and_return_items(
+            // Held-aware: a height a competing peer delivered late is owned by the
+            // Sequencer, so return + release only still-reserved unreceived heights.
+            let released = self.work.release_reserved_and_return_items(
                 outstanding
                     .request
                     .expected_blocks
@@ -2335,6 +2390,115 @@ mod tests {
 
         fill.await
             .expect("try_fill completes after the funding decision");
+    }
+
+    /// First-completion-wins can settle a height a routine still owns to `Held` when
+    /// a competing peer delivers it first. This routine's teardown (`Drop`) must be
+    /// Held-aware: the held body is owned by the Sequencer, so `Drop` must neither
+    /// release its bytes a second time (the Sequencer releases them on commit) nor
+    /// re-queue a body already in the commit pipeline. The pre-fix `Drop` used
+    /// `release_and_return_items`, which for a `Held(actual)` height returned
+    /// `actual` — double-releasing the `ByteBudget` and re-queuing the height into
+    /// `pending`.
+    #[tokio::test]
+    async fn routine_drop_leaves_a_body_won_by_another_peer_to_the_sequencer() {
+        let config = ZakuraBlockSyncConfig::default();
+
+        // Ample budget so the floor take reserves directly (no funding round-trip)
+        // and sends a real request, creating the outstanding claim.
+        let budget = ByteBudget::new(1_000_000);
+        let budget_probe = budget.clone();
+
+        // Height 1 is the floor (download floor is 0) and this peer's only work item.
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )]),
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![9u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            Arc::clone(&work),
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+
+        // One fill pass: the routine reserves height 1's estimate and sends its
+        // request, creating an outstanding claim for a still-reserved height.
+        timeout(Duration::from_secs(5), routine.try_fill())
+            .await
+            .expect("try_fill completes");
+        assert!(
+            work.in_flight_contains(block::Height(1)),
+            "height 1 is reserved and outstanding after the fill"
+        );
+        assert!(!work.pending_contains(block::Height(1)));
+        assert_eq!(budget_probe.reserved(), 1_000);
+        assert_eq!(routine.window.outstanding.len(), 1);
+
+        // A competing peer delivers height 1 first: settle the shared reservation to
+        // `Held(actual)`. The estimate matches the actual, so the budget is unchanged
+        // and now holds the body's actual bytes.
+        let delta = work
+            .settle_active_reserved_height(block::Height(1), 1_000)
+            .expect("height 1 still owns its active reservation");
+        assert_eq!(delta, 0);
+        assert_eq!(budget_probe.reserved(), 1_000);
+
+        // Tear the routine down while it still lists height 1 as unreceived. `Drop`
+        // is synchronous, so its cleanup is observable immediately.
+        drop(routine);
+
+        assert_eq!(
+            budget_probe.reserved(),
+            1_000,
+            "Drop double-released the held body's bytes (ByteBudget drift)"
+        );
+        assert!(
+            !work.pending_contains(block::Height(1)),
+            "Drop phantom-re-queued a body already held in the commit pipeline"
+        );
+        assert!(
+            work.in_flight_contains(block::Height(1)),
+            "the held body stays in_flight for the Sequencer to release on commit"
+        );
     }
 
     /// The liveness grace is granted only for genuinely-transient local write congestion:

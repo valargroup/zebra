@@ -2238,6 +2238,57 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
 }
 
 #[test]
+fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
+    // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
+    // `stale_adjusted_disposition`, `finish_detached`) releases via
+    // `release_reserved_heights`. When a competing peer delivered a height late, it
+    // settled to `Held(actual)` in the shared queue; the owner must release only
+    // the still-reserved estimate and leave the held body for the Sequencer — never
+    // double-releasing its bytes. The non-Held-aware `release_heights` would return
+    // the held `actual` here and saturate the budget.
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(100)),
+            needed(2, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+    let mut budget = ByteBudget::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    assert_eq!(taken.len(), 2);
+    assert!(budget.try_reserve(200));
+    assert_eq!(
+        queue.mark_reserved([block::Height(1), block::Height(2)]),
+        200
+    );
+
+    // A competing peer's late body settles height 1 to Held(80); height 2 stays
+    // reserved (never delivered).
+    let delta = queue
+        .settle_active_reserved_height(block::Height(1), 80)
+        .expect("height 1 is reserved");
+    assert_eq!(delta, -20);
+    budget.release(20);
+    assert_eq!(budget.reserved(), 180);
+
+    // GC both heights: only the still-reserved height 2 releases. The Held height 1
+    // is skipped (owned by the Sequencer) and stays in `in_flight`.
+    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
+    budget.release(released);
+    assert_eq!(
+        released, 100,
+        "release_reserved_heights frees only the still-reserved estimate, never held body bytes"
+    );
+    assert!(queue.in_flight_contains(block::Height(1)));
+    assert_eq!(budget.reserved(), 80);
+
+    // The Sequencer releases the held body on commit; nothing drifts.
+    budget.release(80);
+    assert_eq!(queue.advance_floor(block::Height(2)), 0);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
     // The download floor is NOT an upper bound on a take: a peer fetches as far
     // above the floor as its servable range allows.
