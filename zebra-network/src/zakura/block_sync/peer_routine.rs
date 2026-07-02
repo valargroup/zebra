@@ -67,21 +67,19 @@ use zebra_chain::{block, serialization::ZcashSerialize};
 const RETRY_AVOID_BACKOFF: Duration = Duration::from_millis(50);
 /// Poll interval while this peer's outbound stream queue is full.
 const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`). Pure observability —
-/// it emits the controller state on a fixed interval so a trace can spot oscillation
-/// even while the peer is idle between deliveries; it has no control effect.
+/// Cadence of the per-peer BBR heartbeat trace (`block_peer_bbr`). Observability only:
+/// emits controller state on a fixed interval so a trace can spot oscillation even while
+/// the peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
-/// Whether a due block-liveness deadline should be granted one bounded grace instead of
-/// disconnecting the peer. The grace exists only to avoid punishing a peer for *our own*
-/// transient outbound write congestion: it is allowed exactly when our outbound queue is
-/// full **and** has been continuously full for less than `request_timeout`. A peer that
-/// has simply stopped reading its stream holds our outbound full indefinitely, so once the
-/// full stretch reaches `request_timeout` the grace is denied and the peer is disconnected
-/// at the liveness deadline — it can no longer dodge the timer by refusing to read (the bug
-/// the previous unbounded `outbound_capacity() == 0 → extend` escape allowed, which let a
-/// wedged peer survive to the ~180 s transport idle timeout).
+/// Whether a due block-liveness deadline gets one bounded grace instead of disconnecting.
+/// Granted only for *our own* transient outbound write congestion: outbound full **and**
+/// continuously full for less than `request_timeout`. A peer that stopped reading holds
+/// our outbound full indefinitely, so once the full stretch reaches `request_timeout` the
+/// grace is denied and the peer is disconnected — it can no longer dodge the timer by
+/// refusing to read (the previous unbounded `outbound_capacity() == 0 → extend` escape let
+/// a wedged peer survive to the ~180 s transport idle timeout).
 fn liveness_grace_allowed(
     outbound_full: bool,
     outbound_full_since: Option<Instant>,
@@ -178,13 +176,10 @@ pub(super) struct PeerRoutine {
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
-    /// When our outbound queue to this peer *first* filled in the current
-    /// continuous full stretch (`None` while it has capacity). A peer that stops
-    /// reading its stream backs our outbound up and holds it full; this timestamp
-    /// lets the liveness check tell genuinely-transient local write congestion
-    /// (outbound only just filled) from a peer that has stopped reading for
-    /// `request_timeout` — the latter is disconnected at the liveness deadline
-    /// rather than excused indefinitely.
+    /// When our outbound queue to this peer *first* filled in the current continuous full
+    /// stretch (`None` while it has capacity). Lets the liveness check tell transient local
+    /// write congestion (just filled) from a peer that stopped reading for `request_timeout`
+    /// — the latter is disconnected at the liveness deadline rather than excused indefinitely.
     outbound_full_since: Option<Instant>,
 
     /// Cancellation: the peer's service session token. Fires on disconnect, park,
@@ -276,8 +271,8 @@ impl PeerRoutine {
         let work = self.work.clone();
         // The per-connection oversize guard applied to inbound frames at ingress.
         let mut guard = block_sync_guard();
-        // Per-peer BBR heartbeat cadence. `Skip` so a routine that was busy past a tick
-        // emits one fresh sample rather than a catch-up burst. Observability only.
+        // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
+        // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
@@ -298,8 +293,8 @@ impl PeerRoutine {
             }
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             // Track the start of the current continuous outbound-full stretch so the
-            // liveness check can bound the write-congestion grace: a peer that has
-            // stopped reading holds this full and its `outbound_full_since` ages past
+            // liveness check can bound the write-congestion grace: a peer that stopped
+            // reading holds this full until `outbound_full_since` ages past
             // `request_timeout`, at which point it is disconnected rather than excused.
             if outbound_queue_has_capacity {
                 self.outbound_full_since = None;
@@ -529,10 +524,10 @@ impl PeerRoutine {
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
-        // A destructive reset pulled this peer's outstanding on our initiative, so
-        // its no-progress probe streak must not stay charged: reset it (and clear
-        // the idle liveness deadline) so an unproven peer whose only probe was
-        // in flight at the reset can probe again instead of wedging at its cap.
+        // A destructive reset pulled this peer's outstanding on our initiative, so its
+        // no-progress probe streak must not stay charged: reset it (and clear the idle
+        // liveness deadline) so an unproven peer whose only probe was in flight at the
+        // reset can probe again instead of wedging at its cap.
         self.window.note_view_reset();
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
@@ -602,10 +597,9 @@ impl PeerRoutine {
         // is a candidate bubble.
         let mut fill_sent = 0u32;
         let fill_stop: &'static str = loop {
-            // The floor bypass is scaled by the peer's reliability: a healthy saturated
-            // carrier keeps the full bypass so the floor keeps moving, but a
-            // failing/sealed peer earns *no* above-window slots — its limit is never
-            // bypassed just because a block is near the floor.
+            // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
+            // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
+            // above-window slots even for a near-floor block.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
             let normal_slots = self.window.available_slots();
@@ -613,7 +607,7 @@ impl PeerRoutine {
             // Break only when even a bypassed floor request has no slot. A cwnd that is
             // saturated for above-floor work (`normal_slots == 0`) still leaves up to
             // `floor_bonus` slots so the lowest missing height keeps moving — unless the
-            // peer is sealed, in which case `floor_bonus` is 0 and it gets no work.
+            // peer is sealed (`floor_bonus` is 0), which gets no work.
             if !self.received_status {
                 break "no_status";
             }
@@ -673,12 +667,11 @@ impl PeerRoutine {
                 // `.min(response_byte_cap)` still bounds the speculative above-floor tail to
                 // the live budget, so a funded floor request never over-commits.
                 // Also bound the take by the remaining cwnd byte headroom (byte mode), so
-                // the peer's byte window is a real admission limit, not just a nonzero
-                // gate — a saturated window cannot fund a large speculative tail. The
-                // floor bypass adds `floor_bonus` bodies of headroom. `.max(1)` preserves
-                // the always-take-first-item floor-progress guarantee even at zero
-                // headroom (that single body is the only permitted overshoot; the funding
-                // path below sheds a reorder body to pay for it).
+                // the byte window is a real admission limit: a saturated window cannot fund
+                // a large speculative tail. The floor bypass adds `floor_bonus` bodies of
+                // headroom. `.max(1)` preserves the always-take-first-item floor-progress
+                // guarantee even at zero headroom (that single body is the only permitted
+                // overshoot; the funding path below sheds a reorder body to pay for it).
                 let floor_cwnd_cap = self
                     .window
                     .cwnd_byte_headroom(floor_bonus)
@@ -735,9 +728,9 @@ impl PeerRoutine {
                 if decision.priority == RequestPriority::AboveFloor {
                     metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
                     request_priority = RequestPriority::AboveFloor;
-                    // Bound the speculative take by the remaining cwnd byte headroom
-                    // (byte mode, no floor bonus) so an above-floor request never
-                    // overshoots the peer's byte window beyond the one always-taken item.
+                    // Bound the take by remaining cwnd byte headroom (byte mode, no floor
+                    // bonus) so an above-floor request never overshoots the byte window
+                    // beyond the one always-taken item.
                     let above_cwnd_cap = self.window.cwnd_byte_headroom(0).unwrap_or(u64::MAX);
                     items = self.work.take_in_range_budgeted(
                         servable_low,
@@ -867,7 +860,7 @@ impl PeerRoutine {
                 self.config.effective_floor_rescue_timeout(),
                 reserved_bytes,
                 // Filter BtlBw by the request's send time so a stale-high rate from a
-                // now-slow peer cannot tighten the deadline below what the peer can meet.
+                // now-slow peer cannot tighten the deadline below what it can meet.
                 self.window.bbr_btlbw_bytes_per_sec(queued_at),
             );
             metrics::counter!("sync.block.request.sent").increment(1);
@@ -1061,18 +1054,14 @@ impl PeerRoutine {
                     self.config.request_timeout,
                 ) =>
             {
-                // Our outbound queue is full but has *only just* filled (< one
-                // `request_timeout` of continuous backpressure): this is plausibly
-                // transient local write congestion, not a dead peer. While the outbound
-                // queue is full the select loop above does not drain inbound frames
-                // (`if outbound_queue_has_capacity`), so a useful block the peer already
-                // sent may be waiting behind our own write side. Grant one short,
-                // BOUNDED grace and re-check rather than punish the peer for our
-                // congestion. This is the *only* liveness extension: unlike the previous
-                // unbounded escape, a peer that has simply stopped reading holds our
-                // outbound full past `request_timeout`, falls through to the disconnect
-                // arm below, and is disconnected at the liveness deadline — a wedged peer
-                // can no longer avoid the timer by refusing to read.
+                // Outbound full but *only just* filled (< one `request_timeout` of
+                // continuous backpressure): plausibly transient local write congestion, not
+                // a dead peer. While outbound is full the select loop does not drain inbound
+                // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
+                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
+                // is the *only* liveness extension: a peer that stopped reading holds outbound
+                // full past `request_timeout`, falls through to the disconnect arm, and is
+                // disconnected at the liveness deadline — it cannot dodge the timer.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
@@ -1458,22 +1447,19 @@ impl PeerRoutine {
         let old_charge = self.work.mark_held_direct(height, serialized_bytes);
         self.budget.release(old_charge);
 
-        // This peer delivered a real, wanted body — count it as block progress even
-        // though it no longer matches an outstanding request (typically a body that
-        // arrived just after its own request timed out). Crediting it resets the
-        // no-progress request streak and proves the peer, so a slow-but-useful peer
-        // is not parked as "silent" after a delivery we accepted. We deliberately do
-        // NOT feed the BBR RTprop/BtlBw estimators here: the originating request was
-        // already removed, so we have no trustworthy send timestamp, and a stale
-        // late-delivery interval would corrupt the rate/latency samples.
+        // A real, wanted body that no longer matches an outstanding request (typically
+        // arrived just after its request timed out). Count it as block progress: resets
+        // the no-progress streak and proves the peer, so a slow-but-useful peer is not
+        // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
+        // the originating request is gone, so there's no trustworthy send timestamp and a
+        // stale late-delivery interval would corrupt the rate/latency samples.
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
-        // Also credit the reliability EWMA: this late body offsets the reliability
-        // failure its own timeout charged, so a peer that merely slowed down (its
-        // fast-window backlog draining past the per-request deadline, but every body
-        // still arriving) keeps a reduced-but-nonzero window instead of being sealed to
-        // zero like a genuine dropper — which sends no late body to credit. This is the
-        // slow-vs-wedged distinction the ramp-to-zero seal relies on.
+        // Also credit the reliability EWMA: this late body offsets the failure its own
+        // timeout charged, so a peer that merely slowed down (backlog draining past the
+        // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
+        // window instead of being sealed to zero like a genuine dropper — which sends no
+        // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
@@ -1610,11 +1596,10 @@ impl PeerRoutine {
         self.finish_outstanding_at(index, disposition);
     }
 
-    /// Fold a short response into the reliability EWMA: every requested height the peer
-    /// left undelivered (the still-unreceived heights of the outstanding request at
-    /// `index`) is a goodput failure, exactly like a timeout for reliability purposes.
-    /// A `Satisfied` disposition means the shortfall was covered by the floor advancing
-    /// (not the peer's fault), so it is not charged. Reads the outstanding *before*
+    /// Fold a short response into the reliability EWMA: every still-unreceived height of
+    /// the outstanding request at `index` is a goodput failure, like a timeout. A
+    /// `Satisfied` disposition means the shortfall was covered by the floor advancing (not
+    /// the peer's fault), so it is not charged. Reads the outstanding *before*
     /// `finish_outstanding_at` removes it.
     fn charge_short_response_reliability(&mut self, index: usize, disposition: Disposition) {
         if disposition == Disposition::Satisfied {
@@ -1747,9 +1732,9 @@ impl PeerRoutine {
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
                 available_slots: self.window.available_slots(),
                 outstanding_requests: self.window.outstanding.len(),
-                // Filter the published RTprop by the current time so a peer that stopped
-                // completing requests stops advertising a stale-low RTprop to the
-                // cross-peer floor-preference comparison.
+                // Filter the published RTprop by now so a peer that stopped completing
+                // requests stops advertising a stale-low RTprop to the cross-peer
+                // floor-preference comparison.
                 bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
             },
         );
@@ -1879,7 +1864,7 @@ impl PeerRoutine {
     /// (slots + budget + work all free yet stopped — a wakeup gap to fix).
     fn trace_fill_stop(&self, reason: &'static str) {
         // Mirror the effective (reliability-scaled) bypass the fill loop used, so the
-        // slot snapshot reflects a sealed peer's collapsed floor bonus.
+        // snapshot reflects a sealed peer's collapsed floor bonus.
         let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
         let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
@@ -1926,9 +1911,9 @@ impl PeerRoutine {
                 "no_progress_request_cap",
                 u64::from(self.window.no_progress_request_cap()),
             );
-            // The reliability estimate discounts the cwnd used for this admission, so
-            // trace it at request time (not only on delivery): a dropping peer keeps
-            // requesting at a shrinking cwnd, and these rows capture the fall.
+            // The reliability estimate discounts the admission cwnd, so trace it at
+            // request time too (not only on delivery): a dropping peer keeps requesting at
+            // a shrinking cwnd, and these rows capture the fall.
             bs_insert_u64(
                 row,
                 "bbr_reliability_permille",
@@ -1987,11 +1972,11 @@ impl PeerRoutine {
 
     /// Insert the per-peer BBR controller fields (effective cwnd, RTprop, BtlBw, phase,
     /// delay-gradient ceiling, reliability) into a trace row. Shared by the per-delivery
-    /// `block_body_received` row and the periodic `block_peer_bbr` heartbeat so both
-    /// report the controller from an identical field set.
+    /// `block_body_received` row and the `block_peer_bbr` heartbeat so both report an
+    /// identical field set.
     fn insert_bbr_fields(&self, row: &mut serde_json::Map<String, serde_json::Value>) {
         // Read the windowed estimators as of now, so a trace taken during a quiet bad
-        // period reports the freshly-filtered (possibly `None`) values, not stale ones.
+        // period reports freshly-filtered (possibly `None`) values, not stale ones.
         let now = Instant::now();
         bs_insert_u64(
             row,
@@ -2004,10 +1989,9 @@ impl PeerRoutine {
         if let Some(btlbw) = self.window.bbr_btlbw_milliblocks(now) {
             bs_insert_u64(row, "bbr_btlbw_milliblocks_per_sec", btlbw);
         }
-        // Byte-denomination fields (emitted only under `CwndUnit::Bytes`): the byte
-        // cwnd, the bytes/sec BtlBw, and the in-flight reserved bytes. `bbr_cwnd` above
-        // stays the derived in-flight *request* count so existing analysis scripts keep
-        // working in either unit.
+        // Byte-denomination fields (emitted only under `CwndUnit::Bytes`): byte cwnd,
+        // bytes/sec BtlBw, in-flight reserved bytes. `bbr_cwnd` above stays the derived
+        // in-flight *request* count so existing analysis scripts work in either unit.
         if let Some(cwnd_bytes) = self.window.bbr_effective_cwnd_bytes() {
             bs_insert_u64(row, "bbr_cwnd_bytes", cwnd_bytes);
             bs_insert_u64(row, "bbr_inflight_bytes", self.window.bbr_inflight_bytes());
@@ -2030,10 +2014,10 @@ impl PeerRoutine {
         );
     }
 
-    /// Emit the periodic per-peer BBR heartbeat (`block_peer_bbr`). Fires on a fixed
-    /// cadence even while the peer is idle, so the controller's balance is observable
-    /// between deliveries — e.g. spotting a peer whose cwnd keeps ramping up only to be
-    /// pulled back by the reliability discount instead of settling near `r = 1.0`.
+    /// Emit the periodic per-peer BBR heartbeat (`block_peer_bbr`). Fires even while the
+    /// peer is idle, so the controller's balance is observable between deliveries — e.g.
+    /// a cwnd that keeps ramping up only to be pulled back by the reliability discount
+    /// instead of settling near `r = 1.0`.
     fn trace_bbr_sample(&self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
@@ -2061,9 +2045,9 @@ impl PeerRoutine {
             self.insert_bbr_fields(row);
         });
         // Refresh the published slot diagnostics on the same cadence so the cross-peer
-        // floor-preference view cannot hold a stale-low RTprop for a peer that has gone
-        // quiet: `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, which filters out
-        // samples aged past the horizon (→ `None` = worst floor server).
+        // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
+        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
+        // past the horizon (→ `None` = worst floor server).
         self.publish_outstanding();
     }
 
@@ -2338,16 +2322,14 @@ mod tests {
             request_timeout
         ));
 
-        // Outbound has capacity (not full): the outbound-full escape does not apply at all,
-        // so the deadline disconnects normally.
+        // Outbound has capacity (not full): the escape does not apply — disconnects normally.
         assert!(!super::liveness_grace_allowed(
             false,
             Some(fresh),
             now,
             request_timeout
         ));
-        // Full but no recorded start (should not happen while full, but be defensive):
-        // no grace.
+        // Full but no recorded start (defensive, shouldn't happen while full): no grace.
         assert!(!super::liveness_grace_allowed(
             true,
             None,

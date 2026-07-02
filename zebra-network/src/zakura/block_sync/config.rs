@@ -104,14 +104,9 @@ pub const DEFAULT_BS_FANOUT: usize = 1;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
-/// Default steady-state cwnd gain, as a percent of the bandwidth-delay product.
-///
-/// Raised to 300% to ramp a proven peer up more aggressively from the smaller
-/// cold-start floor (see [`DEFAULT_BS_BBR_MIN_CWND_BYTES`]): each round the cwnd is
-/// `3× BDP`, so it grows `1 → 3 → 9 …` rather than `1 → 2 → 4 …`. The faster ramp is
-/// safe because the reliability discount and delay-gradient ceiling pull the cwnd back
-/// if the extra concurrency starts costing drops or standing queue, so an over-eager
-/// ramp self-corrects instead of running away.
+/// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
+/// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
+/// pull it back if the extra concurrency costs drops or standing queue.
 pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 300;
 /// Default ProbeBW up-probe pacing gain, percent.
 pub const DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT: u32 = 125;
@@ -128,28 +123,19 @@ pub const DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(10
 pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
 /// Default minimum cwnd in blocks — keeps the pipe primed and lets ProbeRTT send.
 pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
-/// Default minimum cwnd in **bytes** (the floor under [`CwndUnit::Bytes`], and the
-/// cold-start window before the first delivery sample).
-///
-/// Under byte denomination the steady cwnd is `BtlBw_bytes × RTprop × gain`. This floor
-/// binds when that product is small; more importantly it is the window a *just-proven*
-/// peer jumps to on its second round, so it sets how conservative the start is. Sized to
-/// **one max block plus a little headroom** (≈2.5 MB) so a single worst-case body always
-/// fits, but a freshly-proven peer then rides its own measured BDP up (via the 300% gain)
-/// rather than teleporting straight to a multi-megabyte burst — a conservative start that
-/// pairs with the faster ramp. Lowered from 4 MB for exactly that reason. **This is the
-/// primary live-A/B concurrency lever**: raise it to push more in flight, lower it if
-/// floor head-of-line latency regresses.
+/// Default minimum cwnd in **bytes**: the [`CwndUnit::Bytes`] floor and the cold-start
+/// window before the first delivery sample. Sized to one max block plus headroom (≈2.5 MB)
+/// so a worst-case body fits, but a just-proven peer then rides its measured BDP up via the
+/// gain instead of bursting to multiple megabytes. Primary live-A/B concurrency lever:
+/// raise to push more in flight, lower if floor head-of-line latency regresses.
 pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = block::MAX_BLOCK_BYTES + 512 * 1024;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
-/// Default weight (percent, `0..=100`) with which a peer's measured reliability — the
-/// fraction of its requests that deliver a body — discounts its BDP-derived cwnd. `100`
-/// applies the full goodput discount (a peer delivering `r` of its requests is expected
-/// to hold `r ×` the cwnd); `0` restores plain BBR (drops do not shrink the cwnd, the
-/// A/B baseline). Unlike vanilla BBR, block-sync treats a dropped request as expensive
-/// (it can stall the contiguous floor for a whole request-timeout), so the drop cost is
-/// folded into the same cwnd formula rather than ignored.
+/// Default weight (`0..=100`) with which measured reliability (fraction of requests that
+/// deliver a body) discounts the BDP-derived cwnd. `100` = full goodput discount (a peer
+/// delivering `r` of its requests holds `r ×` the cwnd); `0` = plain BBR. A dropped
+/// request is expensive — it can stall the floor for a whole request-timeout — so the
+/// cost is folded into the cwnd rather than ignored.
 pub const DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT: u32 = 100;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
@@ -272,14 +258,13 @@ pub struct ZakuraBlockSyncConfig {
     /// How long to keep a peer disconnected after it makes no accepted block progress.
     #[serde(with = "humantime_serde")]
     pub no_progress_peer_cooldown: Duration,
-    /// Maximum `GetBlocks` requests to queue to a peer before it has delivered its
-    /// first accepted block body. This discovery phase keeps peers that accept
-    /// requests but never serve bodies from receiving a normal BBR cold-start burst.
+    /// `GetBlocks` requests an unproven peer may receive before its first accepted body,
+    /// so a peer that accepts requests but never serves bodies can't spend a full BBR
+    /// cold-start burst.
     pub initial_block_probe_requests: u32,
-    /// Maximum `GetBlocks` requests to queue to one peer without receiving an accepted
-    /// block body after it has proven block-body progress. Once this cap is reached,
-    /// the peer receives no more block requests until it either makes block progress or
-    /// the liveness deadline disconnects it.
+    /// After a peer has proven progress, the cap on requests without an accepted body;
+    /// past it the peer gets no more work until it makes progress or the liveness
+    /// deadline disconnects it.
     pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
@@ -322,11 +307,9 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
-    /// Weight (`0..=100`) with which measured per-peer reliability (the fraction of
-    /// issued requests that deliver a body) discounts the BDP-derived cwnd. `0` is
-    /// plain BBR (drops do not shrink the cwnd); `100` applies the full goodput
-    /// discount so a request-dropping carrier holds proportionally less in flight and
-    /// yields that share of the work to reliable peers.
+    /// Weight (`0..=100`) with which measured reliability discounts the BDP-derived cwnd:
+    /// `0` = plain BBR, `100` = full goodput discount, so a request-dropping carrier holds
+    /// proportionally less in flight. See [`DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT`].
     pub bbr_reliability_weight_percent: u32,
     /// Unit the BBR cwnd budgets in-flight work against (`bytes` = header-hinted
     /// reserved body bytes, default; `blocks` = request count, the A/B baseline).
