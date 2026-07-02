@@ -75,11 +75,29 @@ struct AdvertisedBodySize(u32);
 /// full per-height trees.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VctData {
-    /// Roots to insert into the anchor set instead of writing per-height trees.
-    pub(in super::super) anchor_roots: (sapling::tree::Root, orchard::tree::Root),
+    /// When `Some`, skip per-height tree writes and fold these roots into the
+    /// anchor set instead. `None` on the checkpoint-handoff block, which writes
+    /// the real final frontier through the legacy tree path.
+    pub(in super::super) anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
 
-    /// Height below which per-height trees are absent in a VCT-synced database.
-    pub(in super::super) sync_below: Height,
+    /// When `Some`, mark the database as vct-synced: per-height trees are
+    /// absent below this height. `None` for a non-persistent fast sync (no
+    /// embedded final frontiers loaded).
+    pub(in super::super) sync_below: Option<Height>,
+}
+
+impl VctData {
+    /// Bundles the per-commit VCT data, or returns `None` for a pure legacy
+    /// commit with no VCT work.
+    pub(in super::super) fn new(
+        anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        sync_below: Option<Height>,
+    ) -> Option<Self> {
+        (anchor_roots.is_some() || sync_below.is_some()).then_some(Self {
+            anchor_roots,
+            sync_below,
+        })
+    }
 }
 
 impl AdvertisedBodySize {
@@ -1033,6 +1051,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
