@@ -1449,7 +1449,7 @@ mod tests {
         db.write_batch(batch)
             .expect("seeding the serving index succeeds");
 
-        let served = crate::service::finalized_state::serve_block_roots(&db, Height(4)..=Height(6));
+        let served = db.commitment_roots_by_height_range(Height(4)..=Height(6));
         assert_eq!(
             served
                 .into_iter()

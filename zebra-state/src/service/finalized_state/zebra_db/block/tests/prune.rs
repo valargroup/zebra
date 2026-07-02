@@ -49,7 +49,7 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, "prune tests")
+            .commit_finalized_direct(block.into(), None, "prune tests")
             .expect("test block is valid");
     }
 
@@ -80,7 +80,7 @@ fn new_state_with_checkpoint_retention(
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, "checkpoint retention tests")
+            .commit_finalized_direct(block.into(), None, "checkpoint retention tests")
             .expect("test block is valid");
     }
 
@@ -351,7 +351,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, None, "checkpoint handoff tests")
+            .commit_finalized_direct(block.into(), None, "checkpoint handoff tests")
             .expect("test block is valid");
     }
 
@@ -386,7 +386,7 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         .expect("test data deserializes");
 
     state
-        .commit_finalized_direct(block.into(), None, None, "checkpoint handoff tests")
+        .commit_finalized_direct(block.into(), None, "checkpoint handoff tests")
         .expect("handoff block is valid");
 
     let online_prune_until =
@@ -630,7 +630,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, None, "archive phase")
+            .commit_finalized_direct(block.into(), None, "archive phase")
             .expect("archive block is valid");
     }
 
@@ -670,7 +670,7 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         .expect("test data deserializes");
 
     pruned_state
-        .commit_finalized_direct(block.into(), None, None, "archive to pruned checkpoint")
+        .commit_finalized_direct(block.into(), None, "archive to pruned checkpoint")
         .expect("checkpoint block is valid");
 
     assert_eq!(
@@ -728,7 +728,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
             .expect("test data deserializes");
 
         archive_state
-            .commit_finalized_direct(block.into(), None, None, "archive phase")
+            .commit_finalized_direct(block.into(), None, "archive phase")
             .expect("archive block is valid");
     }
     std::mem::drop(archive_state);
@@ -761,7 +761,7 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
         .zcash_deserialize_into()
         .expect("test data deserializes");
     pruned_state
-        .commit_finalized_direct(block.into(), None, None, "archive to pruned checkpoint")
+        .commit_finalized_direct(block.into(), None, "archive to pruned checkpoint")
         .expect("checkpoint block is valid");
     assert_eq!(
         pruned_state.db.lowest_retained_height(),
@@ -842,7 +842,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         .zcash_deserialize_into()
         .expect("genesis test data deserializes");
     state
-        .commit_finalized_direct(genesis.into(), None, None, "contextual retention tests")
+        .commit_finalized_direct(genesis.into(), None, "contextual retention tests")
         .expect("genesis block is valid");
 
     let block: Arc<Block> = blocks
@@ -858,7 +858,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
     let finalizable = FinalizableBlock::new(contextually_verified, Treestate::default());
 
     state
-        .commit_finalized_direct(finalizable, None, None, "contextual retention tests")
+        .commit_finalized_direct(finalizable, None, "contextual retention tests")
         .expect("contextual block is valid");
 
     assert!(
@@ -1197,8 +1197,7 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
 }
 
 #[test]
-#[should_panic(expected = "interrupted below the checkpoint handoff")]
-fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
+fn reopening_interrupted_fast_sync_without_a_root_source_succeeds() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
 
@@ -1221,19 +1220,23 @@ fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
-    // Reopening with the fast path disabled must refuse: the on-disk frontier is stale and no
-    // root source exists, so the committer would otherwise stall on every below-handoff block.
-    let _state = FinalizedState::new(
+    // This storage-only PR does not enable the fast path or its resume policy. Reopening preserves
+    // the marker so later fast-sync wiring can decide how to resume or repair.
+    let reopened = FinalizedState::new(
         &config,
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
     );
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(100)),
+        "the interrupted fast-sync marker is preserved across reopen"
+    );
 }
 
 #[test]
-#[should_panic(expected = "interrupted below the checkpoint handoff")]
-fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
+fn reopening_interrupted_fast_sync_with_vct_disabled_succeeds() {
     let _init_guard = zebra_test::init();
     let network = Mainnet;
 
@@ -1256,13 +1259,18 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
         state.db.write_batch(batch).expect("marker batch writes");
     }
 
-    // Reopening with the VCT force-disable knob must refuse: the on-disk frontier is stale and
-    // no root source exists, so the committer would otherwise stall on every below-handoff block.
-    let _state = FinalizedState::new(
+    // The force-disable knob only affects the future fast-sync source selection. The database still
+    // opens and keeps the marker available for follow-up resume or repair logic.
+    let reopened = FinalizedState::new(
         &config,
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
+    );
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(100)),
+        "the interrupted fast-sync marker is preserved across reopen"
     );
 }
 
