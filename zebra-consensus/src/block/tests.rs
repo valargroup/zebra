@@ -19,7 +19,7 @@ use zebra_chain::{
     parameters::{
         subsidy::block_subsidy,
         testnet::{ConfiguredActivationHeights, Parameters},
-        NetworkUpgrade,
+        Network, NetworkUpgrade,
     },
     primitives::Halo2Proof,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
@@ -165,6 +165,69 @@ async fn check_transcripts() -> Result<(), Report> {
         let transcript = Transcript::from(transcript_data.iter().cloned());
         transcript.check(block_verifier.clone()).await.unwrap();
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_commit_request_selects_checkpoint_precomputation() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block: Arc<Block> =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?.into();
+    let max_checkpoint_height = Height(1);
+
+    let request = Request::create_commit_request(
+        block.clone(),
+        Height(0),
+        max_checkpoint_height,
+        Network::Mainnet,
+    )
+    .await?;
+    assert!(matches!(request, Request::CommitCheckpointPrecomputed(_)));
+    assert_eq!(request.block(), block);
+
+    let request = Request::create_commit_request(
+        block.clone(),
+        max_checkpoint_height,
+        max_checkpoint_height,
+        Network::Mainnet,
+    )
+    .await?;
+    assert!(matches!(request, Request::CommitCheckpointPrecomputed(_)));
+    assert_eq!(request.block(), block);
+
+    let request = Request::create_commit_request(
+        block.clone(),
+        Height(2),
+        max_checkpoint_height,
+        Network::Mainnet,
+    )
+    .await?;
+    assert_eq!(request, Request::Commit(block));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_commit_request_rejects_invalid_checkpoint_pow() -> Result<(), Report> {
+    let _init_guard = zebra_test::init();
+
+    let block =
+        Arc::<Block>::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let mut block = Arc::try_unwrap(block).expect("genesis block should have no other references");
+    let block_height = block.coinbase_height().expect("genesis block has height");
+
+    Arc::make_mut(&mut block.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
+
+    let request =
+        Request::create_commit_request(block.into(), block_height, block_height, Network::Mainnet)
+            .await;
+
+    assert!(
+        request.is_err(),
+        "invalid checkpoint proof of work must be rejected before precomputation"
+    );
+
     Ok(())
 }
 

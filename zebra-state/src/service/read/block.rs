@@ -387,14 +387,14 @@ where
         let Some(height) = from.0.checked_add(offset).map(Height) else {
             break;
         };
-        let confirmed_size = chain
+        let size_hint = chain
             .as_ref()
             .and_then(|chain| chain.as_ref().block_info(height.into()))
             .or_else(|| db.block_info(height.into()))
-            .map(|info| info.size());
-        let size = confirmed_size.or_else(|| db.advertised_body_size(height));
+            .map(|info| info.size())
+            .or_else(|| db.advertised_body_size(height));
 
-        hints.push((height, size));
+        hints.push((height, size_hint));
     }
 
     hints

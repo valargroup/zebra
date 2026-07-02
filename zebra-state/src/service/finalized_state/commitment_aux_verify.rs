@@ -1,12 +1,16 @@
 //! Read-only verification of supplied per-block note-commitment roots against the
 //! checkpoint-committed block headers, via the ZIP-221 ChainHistory MMR.
 //!
-//! This is the "verify" component of the verified-commitment-trees design
-//! (`docs/design/verified-commitment-trees.md`). Given a sequence of per-block
+//! This is the "verify" half of the verified-commitment-trees design
+//! (`docs/design/verified-commitment-trees.md` §6): given a sequence of per-block
 //! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
-//! they reconstruct a history tree consistent with the header commitments.
-
-#![cfg_attr(not(test), allow(dead_code))]
+//! they reconstruct a history tree consistent with the header commitments. The
+//! commit path uses this module before persisting supplied roots.
+//!
+//! It reuses the existing consensus check
+//! ([`block_commitment_is_valid_for_chain_history`](crate::service::check::block_commitment_is_valid_for_chain_history))
+//! and [`HistoryTree::push`], which build the V1/V2 leaf from the block body and the
+//! supplied roots — so there is no new crypto here.
 
 use std::sync::Arc;
 
@@ -67,13 +71,21 @@ impl CommitmentRootVerification {
 }
 
 /// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
-/// block header.
+/// block header (design §6.1).
 ///
-/// The ZIP-221 history MMR does not exist below Heartwood, so `block_commitment_is_valid_for_chain_history`
+/// The ZIP-221 history MMR does not exist below Heartwood, so
+/// [`block_commitment_is_valid_for_chain_history`](check::block_commitment_is_valid_for_chain_history)
 /// is a no-op there and cannot authenticate the supplied roots. This fills that gap:
+///
 /// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
 ///   directly, so the supplied root must equal it.
-/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
+/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the
+///   empty-tree root.
+///
+/// Heartwood and later (`ChainHistoryRoot` / `ChainHistoryBlockTxAuthCommitment` /
+/// the activation-reserved block) are authenticated by the MMR path and accepted
+/// here. The Orchard root below NU5 is pinned separately by
+/// [`verify_supplied_orchard_root_below_nu5`].
 pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     network: &Network,
     block: &Block,
@@ -98,10 +110,20 @@ pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     Ok(())
 }
 
-/// Verifies a supplied Orchard root for a pre-NU5 block.
+/// Verifies a supplied Orchard root for a *pre-NU5* block (design §6.1).
 ///
-/// Blocks before NU5 do not commit to Orchard roots, so the MMR cannot
-/// authenticate them. The supplied root must therefore be the empty-tree root.
+/// The Orchard tree does not activate until NU5, and no header below NU5 commits to an
+/// Orchard root: the ZIP-221 V1 history leaf (Heartwood..Canopy) *ignores* the Orchard
+/// root entirely (`zcash_history.rs`, `V1::block_to_history_node`), and below Heartwood
+/// there is no MMR at all. So the MMR path that authenticates Orchard roots from NU5
+/// onward cannot vouch for any root below NU5 — yet the fast path folds the supplied
+/// Orchard root into the anchor set for every block. Without this check an untrusted
+/// source could inject an arbitrary Orchard anchor below NU5 that the legacy recompute
+/// path never produces, breaking the §11 trust boundary and consensus equivalence.
+///
+/// Below NU5 the Orchard tree is always the empty default, so the supplied root must
+/// equal the empty-tree root. At and above NU5 activation the MMR path authenticates
+/// the root, so this accepts.
 pub(crate) fn verify_supplied_orchard_root_below_nu5(
     network: &Network,
     height: Height,
@@ -172,11 +194,10 @@ where
         //    * This is so that we do not commit block X before we have verified its roots.
         // 3. Verify block X + 1 against block X history tree
         //
-        // Note that, when we are processing block X + 1 step 1, we are ovrlapping
+        // Note that, when we are processing block X + 1 step 1, we are overlapping
         // with step 3 of the prior iteration so verification can be skipped in that case
         // for perf reasons.
         if !skip_parent_check {
-            // This block + history tree up to and including the previous block.
             check::block_commitment_is_valid_for_chain_history(
                 block.clone(),
                 network,
@@ -203,8 +224,6 @@ where
                 block,
                 &sapling_root,
                 &orchard_root,
-                // TODO: add ironwood root
-                // https://linear.app/zcale/issue/ZCA-746/wire-up-ironwood-into-vct
                 &Default::default(),
             )
             .map_err(Arc::new)

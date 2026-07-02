@@ -2,7 +2,7 @@
 //!
 //! For usage please refer to the program help: `zebra-checkpoints --help`
 
-use std::{net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use structopt::StructOpt;
 use thiserror::Error;
@@ -91,6 +91,37 @@ impl FromStr for Transport {
 #[error("Invalid transport: {0}")]
 pub struct InvalidTransportError(String);
 
+/// The checkpoint height whose final frontier should be emitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FrontierHeight {
+    /// Use the highest checkpoint height selected by this run.
+    Auto,
+    /// Use an explicit checkpoint height.
+    Explicit(Height),
+}
+
+impl FromStr for FrontierHeight {
+    type Err = InvalidFrontierHeightError;
+
+    fn from_str(string: &str) -> Result<Self, Self::Err> {
+        if string.eq_ignore_ascii_case("auto") {
+            return Ok(FrontierHeight::Auto);
+        }
+
+        let height = string
+            .parse::<u32>()
+            .map(Height)
+            .map_err(|_| InvalidFrontierHeightError(string.to_owned()))?;
+
+        Ok(FrontierHeight::Explicit(height))
+    }
+}
+
+/// An error indicating that the supplied string is not a valid frontier height.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("Invalid frontier height: {0}")]
+pub struct InvalidFrontierHeightError(String);
+
 /// zebra-checkpoints arguments
 #[derive(Clone, Debug, Eq, PartialEq, StructOpt)]
 pub struct Args {
@@ -117,8 +148,41 @@ pub struct Args {
     #[structopt(short, long)]
     pub last_checkpoint: Option<Height>,
 
+    /// Write Mainnet VCT final-frontier bytes to this path.
+    ///
+    /// This is an explicit side artifact for checkpoint maintenance; checkpoint lines are still
+    /// printed unchanged on stdout.
+    #[structopt(long)]
+    pub mainnet_frontier_output: Option<PathBuf>,
+
+    /// Zebra state cache directory used to read the final-frontier trees.
+    ///
+    /// Required when `--mainnet-frontier-output` is supplied.
+    #[structopt(long)]
+    pub state_cache_dir: Option<PathBuf>,
+
+    /// Frontier height to write, or `auto` to use the highest checkpoint emitted by this run.
+    #[structopt(long, default_value = "auto")]
+    pub frontier_height: FrontierHeight,
+
     /// Passthrough args for `zcash-cli`.
     /// Only used if the transport is [`Cli`](Transport::Cli).
     #[structopt(last = true)]
     pub zcli_args: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontier_height_parses_auto_or_explicit_height() {
+        assert_eq!("auto".parse(), Ok(FrontierHeight::Auto));
+        assert_eq!("AUTO".parse(), Ok(FrontierHeight::Auto));
+        assert_eq!(
+            "12345".parse(),
+            Ok(FrontierHeight::Explicit(Height(12_345)))
+        );
+        assert!("not-a-height".parse::<FrontierHeight>().is_err());
+    }
 }

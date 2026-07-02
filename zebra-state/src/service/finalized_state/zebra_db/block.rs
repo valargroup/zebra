@@ -68,20 +68,6 @@ pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
 
-/// Verified-commitment-trees data used only while checkpoint fast-sync skips
-/// per-height Sapling and Orchard tree writes.
-///
-/// Live semantic sync must pass `None` for this data so it keeps writing the
-/// full per-height trees.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VctData {
-    /// Roots to insert into the anchor set instead of writing per-height trees.
-    pub(in super::super) anchor_roots: (sapling::tree::Root, orchard::tree::Root),
-
-    /// Height below which per-height trees are absent in a VCT-synced database.
-    pub(in super::super) sync_below: Height,
-}
-
 impl AdvertisedBodySize {
     fn new(size: u32) -> Option<Self> {
         (size != 0).then_some(Self(size))
@@ -1033,6 +1019,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
@@ -1040,7 +1027,11 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
-        vct_data: Option<VctData>,
+        // When `Some`, skip per-height tree writes and fold these roots into
+        // the anchor set.
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        // When `Some(height)`, mark the database as vct-synced.
+        vct_sync_below: Option<Height>,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -1224,7 +1215,8 @@ impl ZebraDb {
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
-            vct_data,
+            vct_anchor_roots,
+            vct_sync_below,
         )?;
 
         // In pruned storage mode, delete raw transaction history that has fallen
@@ -1582,7 +1574,8 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         precomputed_raw_txs: Option<Vec<RawBytes>>,
-        vct_data: Option<VctData>,
+        vct_anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+        vct_sync_below: Option<Height>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1604,7 +1597,13 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zebra_db, finalized);
-        self.prepare_trees_batch(zebra_db, finalized, prev_note_commitment_trees, vct_data);
+        self.prepare_trees_batch(
+            zebra_db,
+            finalized,
+            prev_note_commitment_trees,
+            vct_anchor_roots,
+            vct_sync_below,
+        );
 
         // # Consensus
         //
