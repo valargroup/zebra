@@ -187,10 +187,10 @@ impl ZebraDb {
             return;
         }
 
-        // Repair incompatible stored history-tree bytes before the background
-        // format-validity check can read and panic on them. Healthy databases are
-        // a no-op, and read-only/offline-tool opens keep their existing
-        // skip-upgrade behavior.
+        // This must run before the background format-validity check, because
+        // that check decodes the stored tip history tree and can panic if it was
+        // written by an incompatible older binary. The repair helper is a no-op
+        // for healthy databases.
         rollback::repair_tip_history_tree_if_incompatible(self, network);
     }
 
