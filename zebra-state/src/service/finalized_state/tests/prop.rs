@@ -39,6 +39,7 @@ fn blocks_with_v5_transactions() -> Result<()> {
                 let (hash, _) = state.commit_finalized_direct(
                     checkpoint_verified.into(),
                     None,
+                    None,
                     "blocks_with_v5_transactions test"
                 ).unwrap();
                 prop_assert_eq!(Some(height), state.finalized_tip_height());
@@ -115,6 +116,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                             state.commit_finalized_direct(
                                 checkpoint_verified.into(),
                                 None,
+                                None,
                                 "all_upgrades test"
                             ).expect_err("Must fail commitment check");
                             failure_count += 1;
@@ -127,6 +129,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                     checkpoint_verified.auth_data_root = Some([0x42; 32].into());
                     let err = state.commit_finalized_direct(
                         checkpoint_verified.into(),
+                        None,
                         None,
                         "all_upgrades bad auth root test"
                     ).expect_err("Must fail when the supplied auth data root is incorrect");
@@ -150,6 +153,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                 let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
                 let (hash, _) = state.commit_finalized_direct(
                     checkpoint_verified.into(),
+                    None,
                     None,
                     "all_upgrades test"
                 ).unwrap();

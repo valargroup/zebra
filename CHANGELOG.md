@@ -84,18 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
-- Add a `zebra-chain` API to precompute note-commitment tree hashing off the
-  finalized committer. A block's per-leaf Merkle hashing (the dominant committer
-  cost on shielded blocks) depends only on the starting note count, not the
-  frontier's existing hashes, so it can be computed ahead of time and the committer
-  left to apply only the precomputed subtree roots. This adds the position-only
-  hash/apply split in `parallel::batch_frontier`, the per-pool
-  `precompute_append` / `apply_precomputed_append` tree methods, and
-  `NoteCommitmentTrees::update_trees_parallel_precompute` with `BlockNotePrecompute`
-  for Sapling, Orchard, and Ironwood. Applying a precompute is byte-identical to the
-  inline append; a size-mismatched or absent precompute falls back to inline hashing.
-  This is an API addition with no behavior change on its own — the finalized-committer
-  wiring that drives it (and the resulting speedup) lands in a separate PR.
+- Precompute note-commitment tree hashing off the finalized committer. A block's
+  per-leaf Merkle hashing (the dominant committer cost on shielded blocks) depends
+  only on the starting note count, not the frontier's existing hashes, so the
+  finalized write loop now does a one-block look-ahead and hashes the next block's
+  Sapling/Orchard/Ironwood notes on otherwise-idle cores while the current block
+  commits; the committer then only applies the precomputed subtree roots. A stale
+  (size-mismatched) or absent precompute transparently falls back to inline hashing,
+  so the result is always identical. Cuts the committer's tree-update cost by ~54%
+  (12.5 → 5.7 ms/block) where the committer is the bottleneck.
 
 ### Changed
 
