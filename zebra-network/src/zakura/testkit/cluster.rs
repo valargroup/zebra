@@ -2673,16 +2673,7 @@ mod tests {
                 let target_trace = reader.node("02").table("header_sync");
 
                 source_trace.count(hs_trace::HEADER_STATUS_SENT) >= 1
-                    && target_trace.rows().iter().any(|row| {
-                        row.get("event").and_then(serde_json::Value::as_str)
-                            == Some(hs_trace::HEADER_EVENT_RECEIVED)
-                            && row.get(hs_trace::KIND).and_then(serde_json::Value::as_str)
-                                == Some("wire_message")
-                            && row
-                                .get(hs_trace::REASON)
-                                .and_then(serde_json::Value::as_str)
-                                == Some("status")
-                    })
+                    && target_trace.count(hs_trace::HEADER_STATUS_RECEIVED) >= 1
             })
         })
         .await?;
@@ -2693,13 +2684,10 @@ mod tests {
             .node("01")
             .table("header_sync")
             .assert_event(hs_trace::HEADER_STATUS_SENT);
-        reader.node("02").table("header_sync").assert_row(
-            hs_trace::HEADER_EVENT_RECEIVED,
-            &[
-                (hs_trace::KIND, TraceValue::Str("wire_message")),
-                (hs_trace::REASON, TraceValue::Str("status")),
-            ],
-        );
+        reader
+            .node("02")
+            .table("header_sync")
+            .assert_event(hs_trace::HEADER_STATUS_RECEIVED);
 
         cluster.shutdown().await;
         assert!(capture.finish().await?.is_none());
