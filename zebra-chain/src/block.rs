@@ -224,8 +224,8 @@ impl Block {
     }
 
     /// Count how many Ironwood transactions exist in a block,
-    /// i.e. transactions where the Ironwood action set is non-empty
-    /// (the ZIP-221 V3 history-leaf `nIronwoodTxCount`).
+    /// i.e. transactions where the Ironwood action set is     /// i.e. transactions containing Ironwood shielded data.
+    /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn ironwood_transactions_count(&self) -> u64 {
         self.transactions
             .iter()
