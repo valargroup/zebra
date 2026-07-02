@@ -170,6 +170,18 @@ fn immediate_body_download_config() -> ZakuraBlockSyncConfig {
     }
 }
 
+/// Config for tests that exercise fill-loop, budget-rotation and retry mechanics on
+/// freshly-connected peers, where the one-probe cold start (`initial_block_probe_requests`)
+/// is orthogonal noise: it would throttle a fresh peer to a single request before it has
+/// delivered a body. Opening the probe cap to the proven budget lets these tests drive a
+/// peer's full advertised window immediately. Probe-first behaviour has dedicated coverage.
+fn fill_loop_mechanics_config() -> ZakuraBlockSyncConfig {
+    ZakuraBlockSyncConfig {
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+        ..immediate_body_download_config()
+    }
+}
+
 fn test_frontier(height: u32) -> Frontier {
     let hash_byte = u8::try_from(height % 251).expect("height modulo 251 fits in u8");
     Frontier::new(block::Height(height), block::Hash([hash_byte; 32]))
@@ -1928,7 +1940,7 @@ fn work_queue_height_is_in_exactly_one_set() {
 
 #[tokio::test]
 async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2134,7 +2146,7 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
 /// peer while the rest sit idle with free slots.
 #[tokio::test]
 async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2257,7 +2269,7 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
 /// `reactor_does_not_wedge_honest_peer_under_range_unavailable_spam`.)
 #[tokio::test]
 async fn reactor_budget_constrained_issuance_rotates_across_peers() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2363,7 +2375,7 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
 /// is in recovery rather than the whole download stalling behind one straggler.
 #[tokio::test]
 async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.fanout = 1;
     // A request timeout long enough that the opening pass fans both heights out
     // before anything expires, but short enough that the slow peer's unanswered
@@ -5989,7 +6001,12 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
     // here the needed heights sit far below a high header tip, but the point is
     // that issuance proceeds regardless of how close to (or far from) the tip we
     // are — only budget + slots gate it.
-    let config = ZakuraBlockSyncConfig::default();
+    let config = ZakuraBlockSyncConfig {
+        // Open the one-probe cold start; this test exercises sustained issuance, not
+        // the probe gate (which has dedicated coverage).
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+        ..ZakuraBlockSyncConfig::default()
+    };
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -6510,7 +6527,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     // synced node can still be the server a fresh peer needs for historical
     // bodies, so closing the stream after every local catch-up would starve fresh
     // Zakura-only nodes between checkpoint windows.
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = BlockSyncStartup::new(
@@ -8483,7 +8500,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
     for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
         let mut config = ZakuraBlockSyncConfig {
             max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
-            ..immediate_body_download_config()
+            ..fill_loop_mechanics_config()
         };
         config.peer_limits.outbound_queue_depth = 16;
         let old_blocks = mainnet_blocks_1_to_3();
@@ -8839,7 +8856,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -10460,7 +10477,7 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
 #[tokio::test]
 async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -10684,7 +10701,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
 #[tokio::test]
 async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
