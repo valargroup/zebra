@@ -197,8 +197,20 @@ impl ZebraDb {
             .unwrap();
 
         self.db
-            .zs_forward_range_iter(&roots_by_height, range)
-            .map(|(_height, roots)| roots)
+            .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
+                &roots_by_height,
+                range,
+            )
+            .map(|(height, value)| BlockCommitmentRoots {
+                height,
+                sapling_root: value.sapling,
+                orchard_root: value.orchard,
+                ironwood_root: value.ironwood,
+                sapling_tx: value.sapling_tx,
+                orchard_tx: value.orchard_tx,
+                ironwood_tx: value.ironwood_tx,
+                auth_data_root: value.auth_data_root,
+            })
             .collect()
     }
 
