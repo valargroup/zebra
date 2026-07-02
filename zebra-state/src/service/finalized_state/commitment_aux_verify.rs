@@ -1,20 +1,10 @@
 //! Read-only verification of supplied per-block note-commitment roots against the
 //! checkpoint-committed block headers, via the ZIP-221 ChainHistory MMR.
 //!
-//! This is the "verify" half of the verified-commitment-trees design
-//! (`docs/design/verified-commitment-trees.md` §6): given a sequence of per-block
+//! This is the "verify" component of the verified-commitment-trees design
+//! (`docs/design/verified-commitment-trees.md`). Given a sequence of per-block
 //! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
-//! they reconstruct a history tree consistent with the header commitments. The
-//! commit path uses this module before persisting supplied roots.
-//!
-//! It reuses the existing consensus check
-//! ([`block_commitment_is_valid_for_chain_history`](crate::service::check::block_commitment_is_valid_for_chain_history))
-//! and [`HistoryTree::push`], which build the V1/V2 leaf from the block body and the
-//! supplied roots — so there is no new crypto here.
-
-// The non-test consumer is the committer fast path, which lands in a follow-up
-// increment and removes this allow; the module's own tests exercise it here.
-#![allow(dead_code)]
+//! they reconstruct a history tree consistent with the header commitments.
 
 use std::sync::Arc;
 
@@ -69,21 +59,13 @@ impl CommitmentRootVerification {
 }
 
 /// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
-/// block header (design §6.1).
+/// block header.
 ///
-/// The ZIP-221 history MMR does not exist below Heartwood, so
-/// [`block_commitment_is_valid_for_chain_history`](check::block_commitment_is_valid_for_chain_history)
+/// The ZIP-221 history MMR does not exist below Heartwood, so `block_commitment_is_valid_for_chain_history`
 /// is a no-op there and cannot authenticate the supplied roots. This fills that gap:
-///
 /// - Sapling..Heartwood: the header's `FinalSaplingRoot` commits the Sapling root
 ///   directly, so the supplied root must equal it.
-/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the
-///   empty-tree root.
-///
-/// Heartwood and later (`ChainHistoryRoot` / `ChainHistoryBlockTxAuthCommitment` /
-/// the activation-reserved block) are authenticated by the MMR path and accepted
-/// here. The Orchard root below NU5 is pinned separately by
-/// [`verify_supplied_orchard_root_below_nu5`].
+/// - Pre-Sapling: the Sapling tree is empty, so the supplied root must be the empty-tree root.
 pub(crate) fn verify_supplied_sapling_root_below_heartwood(
     network: &Network,
     block: &Block,
@@ -265,12 +247,118 @@ mod tests {
         wrong
     }
 
+    fn mainnet_block_at(height: u32) -> Arc<Block> {
+        let (blocks, _) = Mainnet.block_sapling_roots_map();
+        Arc::new(
+            blocks
+                .get(&height)
+                .expect("test vector block exists")
+                .zcash_deserialize_into::<Block>()
+                .expect("block deserializes"),
+        )
+    }
+
+    fn mainnet_sapling_root_at(height: u32) -> sapling::tree::Root {
+        let (_, sapling_roots) = Mainnet.block_sapling_roots_map();
+        sapling::tree::Root::try_from(**sapling_roots.get(&height).expect("root vector exists"))
+            .expect("valid root")
+    }
+
     fn verification_item(
         block: Arc<Block>,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
     ) -> CommitmentRootVerification {
         CommitmentRootVerification::with_roots(block, sapling_root, orchard_root, None, false)
+    }
+
+    #[test]
+    fn commitment_root_verification_constructors_set_expected_fields() {
+        let block = mainnet_block_at(1);
+        let sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        let with_roots = CommitmentRootVerification::with_roots(
+            block.clone(),
+            sapling_root,
+            orchard_root,
+            None,
+            true,
+        );
+        assert!(Arc::ptr_eq(&with_roots.block, &block));
+        assert_eq!(with_roots.roots, Some((sapling_root, orchard_root)));
+        assert_eq!(with_roots.precomputed_auth_data_root, None);
+        assert!(with_roots.skip_parent_check);
+
+        let header_only = CommitmentRootVerification::header_only(block.clone(), None);
+        assert!(Arc::ptr_eq(&header_only.block, &block));
+        assert_eq!(header_only.roots, None);
+        assert_eq!(header_only.precomputed_auth_data_root, None);
+        assert!(!header_only.skip_parent_check);
+    }
+
+    /// Below Heartwood the supplied Sapling root is authenticated directly by the
+    /// header commitment (or pinned to empty before Sapling). At/above Heartwood,
+    /// the MMR path authenticates it instead, so this direct check accepts.
+    #[test]
+    fn pins_sapling_root_below_heartwood_to_header_or_empty() {
+        let empty = sapling::tree::NoteCommitmentTree::default().root();
+        let sapling_root = mainnet_sapling_root_at(419_200);
+        let different_sapling_root = mainnet_sapling_root_at(419_201);
+        assert_ne!(
+            empty, different_sapling_root,
+            "the pre-Sapling negative case needs a non-empty root"
+        );
+        assert_ne!(
+            sapling_root, different_sapling_root,
+            "the negative cases need two distinct roots"
+        );
+
+        let pre_sapling_block = mainnet_block_at(1);
+        verify_supplied_sapling_root_below_heartwood(&Mainnet, &pre_sapling_block, &empty)
+            .expect("the empty-tree root is accepted before Sapling");
+        let error = verify_supplied_sapling_root_below_heartwood(
+            &Mainnet,
+            &pre_sapling_block,
+            &different_sapling_root,
+        )
+        .expect_err("a non-empty Sapling root must be rejected before Sapling");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidFinalSaplingRoot { .. }
+                )
+            ),
+            "rejection uses the final Sapling root error, got: {error:?}"
+        );
+
+        let sapling_block = mainnet_block_at(419_200);
+        verify_supplied_sapling_root_below_heartwood(&Mainnet, &sapling_block, &sapling_root)
+            .expect("the header's final Sapling root is accepted before Heartwood");
+        let error = verify_supplied_sapling_root_below_heartwood(
+            &Mainnet,
+            &sapling_block,
+            &different_sapling_root,
+        )
+        .expect_err("a Sapling root different from the header root must be rejected");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidFinalSaplingRoot { .. }
+                )
+            ),
+            "rejection uses the final Sapling root error, got: {error:?}"
+        );
+
+        let heartwood_block = mainnet_block_at(903_000);
+        verify_supplied_sapling_root_below_heartwood(
+            &Mainnet,
+            &heartwood_block,
+            &different_sapling_root,
+        )
+        .expect("at Heartwood the root is authenticated by the MMR, not pinned here");
     }
 
     /// Below NU5 the supplied Orchard root must equal the empty-tree root (no header
@@ -346,30 +434,15 @@ mod tests {
     /// *next* block (the one-block lag).
     #[test]
     fn verifies_real_roots_and_rejects_a_wrong_root_at_next_height() {
-        let (blocks, sapling_roots) = Mainnet.block_sapling_roots_map();
         let activation = NetworkUpgrade::Heartwood
             .activation_height(&Mainnet)
             .expect("mainnet has Heartwood")
             .0;
 
-        let block_at = |height: u32| -> Arc<Block> {
-            Arc::new(
-                blocks
-                    .get(&height)
-                    .expect("test vector block exists")
-                    .zcash_deserialize_into::<Block>()
-                    .expect("block deserializes"),
-            )
-        };
-        let root_at = |height: u32| -> sapling::tree::Root {
-            sapling::tree::Root::try_from(**sapling_roots.get(&height).expect("root vector exists"))
-                .expect("valid root")
-        };
-
-        let act_block = block_at(activation);
-        let next_block = block_at(activation + 1);
-        let act_root = root_at(activation);
-        let next_root = root_at(activation + 1);
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
         let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
 
         // Positive: the real roots reconstruct a tree the next block's header commits to.
