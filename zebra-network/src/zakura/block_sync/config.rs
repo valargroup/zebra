@@ -57,7 +57,7 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
 /// `held_wire * DESERIALIZED_MEM_FACTOR`, see `admission.rs`). This is set well above the
 /// block count that budget admits at realistic body sizes, so the *memory* budget is the
 /// binding cap. The prior 4096 value made the buffer shallow (~one checkpoint range), which
-/// masked the byte budget and could starve the bursty committer (ZCA-742).
+/// masked the byte budget and could starve the bursty committer.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 262_144;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
@@ -387,7 +387,7 @@ impl ZakuraBlockSyncConfig {
         // `DESERIALIZED_MEM_FACTOR` (see `admission::estimated_resident_pipeline_bytes`).
         // Cap it against the *resident* equivalent of the in-flight wire budget; capping
         // against the raw wire `max_inflight_block_bytes` would pull the resident budget down
-        // to a wire quantity, needlessly starving look-ahead depth (ZCA-742).
+        // to a wire quantity, needlessly starving look-ahead depth.
         self.max_reorder_lookahead_bytes.min(
             self.max_inflight_block_bytes
                 .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
@@ -501,7 +501,7 @@ impl ZakuraBlockSyncConfig {
     /// This clamp keeps a sub-range budget from thrashing the gated speculative lane — a
     /// resident budget below one range (`BS_CHECKPOINT_RANGE_BYTE_FLOOR *
     /// DESERIALIZED_MEM_FACTOR`), or a block cap below one range, would refuse nearly all
-    /// above-window work. Clamp both up (ZCA-742).
+    /// above-window work. Clamp both up.
     ///
     /// [`effective_max_reorder_lookahead_bytes`]: Self::effective_max_reorder_lookahead_bytes
     pub fn clamp_reorder_lookahead_to_floor(&mut self) {

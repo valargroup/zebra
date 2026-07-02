@@ -475,7 +475,7 @@ async fn fuzz_commit_stall() {
     );
 }
 
-/// The retained-resident plateau under a commit stall (ZCA-742 regression). The
+/// The retained-resident plateau under a commit stall. The
 /// resident look-ahead gate must hold the retained pipeline (sequencer input + reorder +
 /// applying, at the decoded multiple) near the configured budget plus at most one
 /// commit-window worth of exempt bodies — never growing toward the whole chain the way
@@ -520,7 +520,7 @@ async fn fuzz_commit_stall_resident_plateau() {
 
     // Peak retained resident cost stays within the budget, plus the commit-window
     // exemption (one checkpoint range of bodies above the verified tip bypasses the
-    // gate) and a small request-boundary margin. A gate regression (the ZCA-742
+    // gate) and a small request-boundary margin. A gate regression (the
     // escalator, or reservations invisible to the byte gate) drives retention toward
     // the full ~150 MB resident chain instead.
     // `usize → u64` widenings are lossless on all supported (64-bit) targets.

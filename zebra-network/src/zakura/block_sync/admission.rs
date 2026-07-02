@@ -18,8 +18,7 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 ///
 /// Decoded bodies (`Arc<Block>`, `sequencer::ApplyingBlock`) have an in-memory footprint
 /// several times their wire/serialized size. The look-ahead budget must bound that *resident*
-/// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling —
-/// the ZCA-742 OOM, where ~569k decoded blocks held under a wire-byte cap reached ~26 GiB RSS.
+/// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling.
 ///
 /// Applied to every look-ahead pool at its *eventual* decoded cost — including the
 /// wire-retained reorder backlog and outstanding reservations — because the
@@ -148,7 +147,7 @@ pub(super) fn request_deadline(
 /// range — up to this many blocks — is submitted, and the verified tip stays pinned to
 /// the previous checkpoint until then. Every block of the active range must therefore
 /// stay fundable even when the look-ahead budget and block cap are full, or the range
-/// can never assemble and sync wedges (ZCA-742).
+/// can never assemble and sync wedges.
 ///
 /// Deliberately a constant rather than `config.submitted_apply_limit()`: that accessor
 /// has a floor but no ceiling, so a huge configured submit window would widen the
@@ -211,15 +210,16 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
 /// Plans one contiguous take starting at `start_height`: the single authority for
 /// the commit-window exemption, the resident-memory gate, and request sizing.
 ///
-/// Heights in the commit window (one checkpoint range above the *verified* tip) are
-/// always fundable, so the committer can advance — and a pinned checkpoint range can
-/// fully assemble — even when the look-ahead budget is full. An exempt grant's
-/// `take_high` is clamped to the window top: takes never span the window boundary, so
-/// every above-window height passes through the gated arm and no unexamined height
-/// can ride an exempt request past the resident check. Every other request —
-/// floor-priority included — is admitted only while the configured look-ahead limits
-/// still have capacity, measured against the estimated *resident* cost of the buffered
-/// and in-flight bodies (see [`estimated_resident_pipeline_bytes`]).
+/// Heights in the commit window (up to `MAX_CHECKPOINT_HEIGHT_GAP + 1` blocks
+/// above the *verified* tip) are always fundable, so the committer can advance.
+/// This lets a pinned checkpoint range fully assemble even when the look-ahead
+/// budget is full.
+/// 
+/// Exempt requests are capped at the top of the commit window, so one request
+/// cannot include both exempt in-window blocks and gated above-window blocks.
+/// Anything above the commit window must pass the normal look-ahead memory check.
+/// That includes floor-priority requests if the floor has moved far ahead of the
+/// verified tip.
 ///
 /// Gating the floor lane (with only the commit window exempt) is what bounds the
 /// applying queue: the download floor advances on every download, so a floor exemption
@@ -227,15 +227,11 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
 /// verified tip caps the pipeline to the look-ahead budget plus one worst-case window
 /// (`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS × MAX_BLOCK_BYTES × DESERIALIZED_MEM_FACTOR`
 /// ≈ 3.2 GB; a single in-window response can also exceed the byte gate by up to the
-/// response cap × the factor) regardless of how far headers/downloads run ahead
-/// (ZCA-742).
+/// response cap × the factor) regardless of how far headers/downloads run ahead.
 ///
-/// Floor-priority grants never size below one byte: `take_in_range_budgeted` always
-/// takes its first item regardless of the byte cap, so a `>= 1` cap guarantees the
-/// floor block itself is taken even when the in-flight budget is exactly full — which
-/// reaches `reserve_request_budget`'s floor path, whose `FundFloorReservation` sheds
-/// an above-floor reorder body to fund the floor. This deliberately keeps commit-window
-/// floor liveness **independent of the in-flight byte budget**.
+/// Floor-priority requests are never blocked just because the normal byte budget is exactly full.
+/// If the lowest missing block is needed to let commit move forward,
+/// it can still be requested even when speculative/look-ahead work has filled the byte budget.
 pub(super) fn admit(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
@@ -356,7 +352,7 @@ mod tests {
         assert!(fast < now + TIMEOUT + Duration::from_millis(100));
     }
 
-    /// ZCA-742 checkpoint-sync deadlock regression: during checkpoint sync `verified_tip`
+    /// During checkpoint sync, `verified_tip`
     /// stays pinned to the previous checkpoint until the whole range (up to
     /// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` blocks) is co-resident. The whole range
     /// is commit-window exempt, and the resident budget under a legal 1 GiB in-flight

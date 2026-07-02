@@ -1495,7 +1495,7 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
     // decode like every other pool, so they must be pre-charged at the resident multiple.
     // Charging them nothing makes in-flight volume invisible to the byte gate until it is
     // already resident — in a commit stall the pipeline could fill the whole in-flight wire
-    // budget and then decode ×factor past the plateau (the ZCA-742 OOM, reopened).
+    // budget and then decode ×factor past the plateau.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1554,7 +1554,7 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
 
 #[test]
 fn floor_backpressures_when_download_floor_escalates_past_commit() {
-    // Regression for the ZCA-742 OOM. The download floor advances on every download, so a
+    // Regression for the OOM. The download floor advances on every download, so a
     // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
     // commit. With the exemption anchored to the *commit window* (one checkpoint range above
     // the verified tip), a floor-priority request far above the commit tip is backpressured

@@ -77,9 +77,12 @@ enum FillStop {
     NoStatus,
     CwndSaturated,
     NoWork,
-    /// The resident look-ahead gate refused an above-window take (either lane).
+    /// The resident look-ahead gate refused an above-window take (either lane: the floor lane or the speculative lane / above floor lane).
     LookaheadCap,
     /// The gate has headroom but the in-flight byte budget funds zero bytes.
+    /// This can happen when the in-flight byte budget is exhausted
+    /// but the resident look-ahead gate is not full.
+    /// This status is for the above floor speculative lane.
     InflightBudget,
     RetryAvoid,
     Budget,
@@ -618,14 +621,10 @@ impl PeerRoutine {
             // (geometry included — an exempt grant is clamped at the window top, so
             // no above-window height can ride an exempt request past the gate).
             let snapshot = self.admission_snapshot(&view);
-            // The floor rides the fastest servable carrier: defer it whenever a
-            // preferred peer can take it. Outside the bypass region only a strictly
-            // faster carrier makes this peer defer (equal carriers stay eligible, so a
-            // slow peer hands the floor up but two equal carriers both contest it); in
-            // the bypass region (this peer's cwnd is saturated) an equal-RTprop peer is
-            // preferred too, so a scarce bypass slot is only spent when no
-            // equal-or-faster peer can take the floor normally. If every servable peer
-            // is saturated this is `false` and the floor still moves.
+            // This asks the shared peer registry:
+            // "Is there another pper that should take the floor instead of this peer?"
+            // This is helpful for rescuing the floor with a peer who has better latency score and
+            // is not saturated.
             let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
                 view.download_floor,
                 &self.peer,
@@ -638,15 +637,9 @@ impl PeerRoutine {
                     .work
                     .first_pending_in_range(servable_low, servable_high.min(floor_high))
                 {
-                    // Floor rescue rides the commit-window exemption (ZCA-742): a gap
-                    // blocking commit is always fetched — the grant's `>= 1` byte cap
-                    // plus `take_in_range_budgeted`'s first-item rule reach
-                    // `reserve_request_budget`'s floor path even at zero in-flight
-                    // budget, whose `FundFloorReservation` sheds an above-floor reorder
-                    // body to fund the floor. An escalated floor far ahead of the
-                    // verified tip is refused once the resident look-ahead budget is
-                    // full, so `body_download_floor` cannot advance unboundedly ahead
-                    // of commit.
+                    // Prioritize the lowest missing block so commit can keep moving, even if that
+                    // means freeing look-ahead budget. But don't let this priority path run far
+                    // ahead of the verified chain tip.
                     match admit(
                         &self.config,
                         snapshot,
