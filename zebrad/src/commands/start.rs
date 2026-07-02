@@ -2434,8 +2434,9 @@ mod zakura_header_sync_driver_tests {
                 .await
                 .expect("mock read state succeeds");
 
+        assert_eq!(needed.fork_reset, None);
         assert_eq!(
-            needed.len(),
+            needed.blocks.len(),
             usize::try_from(count).expect("test count fits usize")
         );
         assert_eq!(
@@ -2462,6 +2463,113 @@ mod zakura_header_sync_driver_tests {
                 ("missing", block::Height(4001), 2),
                 ("headers", block::Height(4001), 2),
                 ("hints", block::Height(4001), 2),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn block_sync_needed_blocks_maps_rewound_body_gap_heights() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let block1_hash = block1.hash();
+        let block2_hash = block2.hash();
+        let block1_header = block1.header.clone();
+        let block2_header = block2.header.clone();
+        let read_state = {
+            let requests = Arc::clone(&requests);
+            service_fn(move |request| {
+                let requests = Arc::clone(&requests);
+                let block1_header = block1_header.clone();
+                let block2_header = block2_header.clone();
+                async move {
+                    match request {
+                        zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("missing", from, limit));
+                            Ok::<_, zebra_state::BoxError>(
+                                zebra_state::ReadResponse::MissingBlockBodies(vec![
+                                    block::Height(1),
+                                    block::Height(2),
+                                ]),
+                            )
+                        }
+                        zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("headers", start, count));
+                            assert_eq!(start, block::Height(1));
+                            assert_eq!(count, 2);
+                            Ok(zebra_state::ReadResponse::Headers(vec![
+                                (block::Height(1), block1_hash, block1_header),
+                                (block::Height(2), block2_hash, block2_header),
+                            ]))
+                        }
+                        zebra_state::ReadRequest::BlockSizeHints { from, count } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("hints", from, count));
+                            assert_eq!(from, block::Height(1));
+                            assert_eq!(count, 2);
+                            Ok(zebra_state::ReadResponse::BlockSizeHints(vec![
+                                (block::Height(1), Some(11)),
+                                (block::Height(2), Some(22)),
+                            ]))
+                        }
+                        zebra_state::ReadRequest::FinalizedTip => {
+                            Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                        }
+                        request => panic!("unexpected read request: {request:?}"),
+                    }
+                }
+            })
+        };
+
+        let needed = query_block_sync_needed_blocks(read_state, block::Height(2), block::Height(3))
+            .await
+            .expect("mock read state succeeds");
+
+        assert_eq!(
+            needed.blocks,
+            vec![
+                BlockSyncBlockMeta {
+                    height: block::Height(1),
+                    hash: block1_hash,
+                    size: BlockSizeEstimate::Advertised(11),
+                },
+                BlockSyncBlockMeta {
+                    height: block::Height(2),
+                    hash: block2_hash,
+                    size: BlockSizeEstimate::Advertised(22),
+                },
+            ]
+        );
+        // The lowest gap (height 1) sits at or below the queried body tip
+        // (height 2): the best header chain reorged beneath the download floor,
+        // so the block-sync body frontier must roll back to the common ancestor
+        // (height 0, the parent of the lowest gap) before the reorged bodies can
+        // be re-requested.
+        assert_eq!(
+            needed.fork_reset,
+            Some(zebra_network::zakura::BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block1.header.previous_block_hash,
+            })
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .expect("request capture mutex is not poisoned")
+                .as_slice(),
+            &[
+                ("missing", block::Height(3), 1),
+                ("headers", block::Height(1), 2),
+                ("hints", block::Height(1), 2),
             ]
         );
     }

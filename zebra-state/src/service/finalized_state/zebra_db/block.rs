@@ -39,15 +39,18 @@ use crate::{
     error::{CommitCheckpointVerifiedError, CommitHeaderRangeError},
     request::FinalizedBlock,
     service::check,
-    service::finalized_state::{
-        disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::{
-            block::TransactionLocation,
-            shielded::CommitmentRootsByHeight,
-            transparent::{AddressBalanceLocationUpdates, OutputLocation},
+    service::{
+        finalized_state::{
+            disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
+            disk_format::{
+                block::TransactionLocation,
+                shielded::CommitmentRootsByHeight,
+                transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            },
+            zebra_db::{metrics::block_precommit_metrics, ZebraDb},
+            FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
         },
-        zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        non_finalized_state::Chain,
     },
     HashOrHeight,
 };
@@ -589,26 +592,125 @@ impl ZebraDb {
         from: block::Height,
         limit: u32,
     ) -> Vec<block::Height> {
+        self.missing_block_bodies_with_chain(None, verified_block_tip, best_header_tip, from, limit)
+    }
+
+    /// Returns header-known heights whose bodies are absent or do not match the
+    /// best stored header chain.
+    pub(crate) fn missing_block_bodies_with_chain(
+        &self,
+        non_finalized_chain: Option<&Chain>,
+        verified_block_tip: Option<block::Height>,
+        best_header_tip: Option<block::Height>,
+        from: block::Height,
+        limit: u32,
+    ) -> Vec<block::Height> {
         let Some(best_header_tip) = best_header_tip else {
             return Vec::new();
         };
 
-        let start = verified_block_tip
-            .and_then(|tip| tip.next().ok())
-            .map_or(from, |first_missing| first_missing.max(from));
+        let fork_start = self.first_mismatched_body_height(
+            non_finalized_chain,
+            verified_block_tip,
+            best_header_tip,
+        );
+        let first_missing = verified_block_tip.and_then(|tip| tip.next().ok());
+        let start = match fork_start {
+            Some(fork_start) => fork_start.min(from),
+            None => first_missing.map_or(from, |first_missing| first_missing.max(from)),
+        };
 
         if start > best_header_tip {
             return Vec::new();
         }
 
         let count = limit.min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
+        let mut previous_hash = match start.previous() {
+            Ok(previous_height) => {
+                self.header_or_verified_body_hash(non_finalized_chain, previous_height)
+            }
+            Err(_) => None,
+        };
+        if start.0 > 0 && previous_hash.is_none() {
+            return Vec::new();
+        }
 
         self.headers_by_height_range(start, count)
             .into_iter()
-            .map(|(height, _, _)| height)
-            .filter(|height| !self.contains_body_at_height(*height))
+            .map_while(|(height, hash, header)| {
+                if let Some(previous_hash) = previous_hash {
+                    if header.previous_block_hash != previous_hash {
+                        return None;
+                    }
+                }
+
+                previous_hash = Some(hash);
+                Some((height, hash))
+            })
+            .filter(|(height, hash)| {
+                !self.verified_body_matches_header(non_finalized_chain, *height, *hash)
+            })
+            .map(|(height, _hash)| height)
             .take(limit as usize)
             .collect()
+    }
+
+    fn first_mismatched_body_height(
+        &self,
+        non_finalized_chain: Option<&Chain>,
+        verified_block_tip: Option<block::Height>,
+        best_header_tip: block::Height,
+    ) -> Option<block::Height> {
+        let verified_block_tip = verified_block_tip?;
+        let mut height = verified_block_tip.min(best_header_tip);
+        let mut first_mismatch = None;
+
+        loop {
+            let Some(header_hash) = self.header_hash(height) else {
+                return first_mismatch;
+            };
+
+            match self.verified_body_hash(non_finalized_chain, height) {
+                Some(body_hash) if body_hash == header_hash => return first_mismatch,
+                Some(_) => first_mismatch = Some(height),
+                None => return first_mismatch,
+            }
+
+            let Ok(previous_height) = height.previous() else {
+                return first_mismatch;
+            };
+            height = previous_height;
+        }
+    }
+
+    fn header_or_verified_body_hash(
+        &self,
+        non_finalized_chain: Option<&Chain>,
+        height: block::Height,
+    ) -> Option<block::Hash> {
+        self.header_hash(height)
+            .or_else(|| self.verified_body_hash(non_finalized_chain, height))
+    }
+
+    fn verified_body_matches_header(
+        &self,
+        non_finalized_chain: Option<&Chain>,
+        height: block::Height,
+        header_hash: block::Hash,
+    ) -> bool {
+        self.verified_body_hash(non_finalized_chain, height)
+            .or_else(|| self.hash(height))
+            == Some(header_hash)
+    }
+
+    fn verified_body_hash(
+        &self,
+        non_finalized_chain: Option<&Chain>,
+        height: block::Height,
+    ) -> Option<block::Hash> {
+        non_finalized_chain
+            .and_then(|chain| chain.hash_by_height(height))
+            .or_else(|| self.body_hash(height))
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -1828,11 +1930,28 @@ impl DiskWriteBatch {
         let zakura_roots_by_height = db
             .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
             .unwrap();
+        let body_hash_by_height = db.cf_handle("hash_by_height").unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let hash = block.hash();
         let existing_zakura_header: Option<Arc<block::Header>> =
             db.zs_get(&zakura_header_by_height, &height);
+
+        if let Ok(previous_height) = height.previous() {
+            let previous_hash = db
+                .zs_get::<_, _, block::Hash>(&body_hash_by_height, &previous_height)
+                .or_else(|| {
+                    db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &previous_height)
+                });
+
+            if previous_hash
+                .is_some_and(|previous_hash| previous_hash != block.header.previous_block_hash)
+            {
+                return Err(CommitHeaderRangeError::UnknownAnchor {
+                    anchor: block.header.previous_block_hash,
+                });
+            }
+        }
 
         if existing_zakura_header.as_ref() == Some(&block.header)
             && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)

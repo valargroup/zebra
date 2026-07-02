@@ -33,11 +33,13 @@ use zebra_chain::{
     sapling,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
     transparent::new_ordered_outputs_with_height,
+    value_balance::ValueBalance,
     work::difficulty::ParameterDifficulty,
 };
 use zebra_test::vectors::{MAINNET_BLOCKS, TESTNET_BLOCKS};
 
 use crate::{
+    arbitrary::Prepare,
     constants::{
         state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
         MAX_HEADER_SYNC_HEIGHT_RANGE, STATE_DATABASE_KIND,
@@ -50,8 +52,10 @@ use crate::{
             disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
             ZebraDb, PRUNING_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
         },
+        non_finalized_state::Chain,
         read,
     },
+    tests::FakeChainHelper,
     CheckpointVerifiedBlock, Config, SemanticallyVerifiedBlock, TransactionLocation,
 };
 
@@ -384,6 +388,94 @@ fn missing_block_bodies_respects_from_limit_and_empty_body_gap() {
 }
 
 #[test]
+fn missing_block_bodies_rewinds_to_header_body_common_ancestor() {
+    let _init_guard = zebra_test::init();
+    let state = ZebraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    );
+    let block1: Arc<Block> = Arc::new(
+        Mainnet
+            .test_block(653599, 583999)
+            .expect("fake post-Canopy test block builds"),
+    );
+    let block2 = block1.make_fake_child().set_work(10);
+    let block3 = block2.make_fake_child().set_work(1);
+    let block1_height = block1
+        .coinbase_height()
+        .expect("fake block has coinbase height");
+    let block2_height = block2
+        .coinbase_height()
+        .expect("fake child block has coinbase height");
+    let block3_height = block3
+        .coinbase_height()
+        .expect("fake grandchild block has coinbase height");
+
+    let mut chain = Chain::new(
+        &Mainnet,
+        block1_height
+            .previous()
+            .expect("fake block height has a predecessor"),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::fake_populated_pool(),
+    );
+    chain = chain
+        .push(block1.clone().prepare().test_with_zero_spent_utxos())
+        .expect("stale non-finalized block 1 pushes");
+    chain = chain
+        .push(block2.clone().prepare().test_with_zero_spent_utxos())
+        .expect("stale non-finalized block 2 pushes");
+
+    let alternate_block2 = alternate_header(block1.hash(), &block2.header, 2);
+    let alternate_block2_hash = block::Hash::from(&*alternate_block2);
+    let alternate_block3 = alternate_header(alternate_block2_hash, &block3.header, 3);
+    let alternate_block3_hash = block::Hash::from(&*alternate_block3);
+    write_zakura_headers(
+        &state,
+        &[
+            (block2_height, alternate_block2_hash, alternate_block2),
+            (block3_height, alternate_block3_hash, alternate_block3),
+        ],
+    );
+
+    assert_eq!(
+        state.missing_block_bodies_with_chain(
+            Some(&chain),
+            Some(block2_height),
+            Some(block3_height),
+            block3_height,
+            10,
+        ),
+        vec![block2_height, block3_height],
+    );
+}
+
+#[test]
+fn missing_block_bodies_ignores_unanchored_header_suffix() {
+    let _init_guard = zebra_test::init();
+    let (state, _genesis, block1) = mainnet_state_with_genesis();
+    let unanchored_header = alternate_header(block::Hash([0x99; 32]), &block1.header, 1);
+    let unanchored_hash = block::Hash::from(&*unanchored_header);
+
+    write_zakura_headers(&state, &[(Height(1), unanchored_hash, unanchored_header)]);
+
+    assert!(state
+        .missing_block_bodies(Some(Height(0)), Some(Height(1)), Height(1), 10)
+        .is_empty());
+}
+
+#[test]
 fn committed_block_does_not_retain_zakura_header() {
     let _init_guard = zebra_test::init();
     let (state, _genesis, block1) = mainnet_state_with_genesis_and_zakura_seed();
@@ -497,6 +589,33 @@ fn committed_block_releases_matching_zakura_header() {
         .db
         .zs_get::<_, _, Arc<block::Header>>(&zakura_header_by_height, &Height(1))
         .is_none());
+}
+
+#[test]
+fn seed_zakura_header_from_committed_block_rejects_discontinuous_parent() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis_and_zakura_seed();
+    let block2 = mainnet_block(2);
+    let alternate_block1 = alternate_header(genesis.hash(), &block1.header, 1);
+    let alternate_block1_hash = block::Hash::from(&*alternate_block1);
+
+    write_zakura_headers(
+        &state,
+        &[(Height(1), alternate_block1_hash, alternate_block1)],
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    assert!(matches!(
+        batch.prepare_zakura_header_from_committed_block(&state.db, Height(2), &block2),
+        Err(CommitHeaderRangeError::UnknownAnchor { anchor })
+            if anchor == block2.header.previous_block_hash
+    ));
+
+    assert_eq!(
+        state.best_header_tip(),
+        Some((Height(1), alternate_block1_hash))
+    );
+    assert!(state.headers_by_height_range(Height(2), 1).is_empty());
 }
 
 /// Committing a body at the bottom of a header-only frontier releases just that
@@ -1313,6 +1432,21 @@ fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
             None,
         )
         .expect("block commit succeeds");
+}
+
+fn write_zakura_headers(state: &ZebraDb, headers: &[(Height, block::Hash, Arc<block::Header>)]) {
+    let header_by_height = state.db.cf_handle("zakura_header_by_height").unwrap();
+    let hash_by_height = state.db.cf_handle("zakura_header_hash_by_height").unwrap();
+    let height_by_hash = state.db.cf_handle("zakura_header_height_by_hash").unwrap();
+    let mut batch = DiskWriteBatch::new();
+
+    for (height, hash, header) in headers {
+        batch.zs_insert(&header_by_height, height, header);
+        batch.zs_insert(&hash_by_height, height, hash);
+        batch.zs_insert(&height_by_hash, hash, height);
+    }
+
+    state.db.write(batch).expect("zakura header rows write");
 }
 
 fn commit_header_range(

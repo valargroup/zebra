@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 use zebra_chain::{block, chain_tip::ChainTip};
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSizeEstimate,
-    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, BlockSyncMisbehavior,
-    Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle,
+    BlockSyncMisbehavior, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
 };
 
 use crate::components::sync;
@@ -297,18 +297,40 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 )
                 .await
                 {
-                    Ok(blocks) => {
+                    Ok(needed) => {
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
                             "block_sync_driver",
                             |row| {
                                 insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, blocks.len() as u64);
+                                insert_cs_u64(
+                                    row,
+                                    cs_trace::RANGE_COUNT,
+                                    needed.blocks.len() as u64,
+                                );
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
                         );
-                        let _ = block_sync.send_control(BlockSyncEvent::NeededBlocks(blocks));
+                        // A header reorg beneath the download floor: roll the
+                        // block-sync body frontier back to the common ancestor
+                        // first, so the reorged (below-floor) bodies stop being
+                        // filtered out and the reactor re-queries from the
+                        // lowered floor.
+                        if let Some(reset) = needed.fork_reset {
+                            emit_commit_state(
+                                &trace,
+                                cs_trace::REACTOR_EVENT_SENT,
+                                "block_sync_driver",
+                                |row| {
+                                    insert_cs_str(row, cs_trace::ACTION, "fork_reset");
+                                    insert_cs_frontiers(row, &reset);
+                                },
+                            );
+                            let _ = block_sync.send_control(BlockSyncEvent::ChainTipReset(reset));
+                        }
+                        let _ =
+                            block_sync.send_control(BlockSyncEvent::NeededBlocks(needed.blocks));
                         emit_commit_state(
                             &trace,
                             cs_trace::REACTOR_EVENT_SENT,
@@ -1268,11 +1290,25 @@ fn publish_body_frontier(
     endpoint.publish_sync_frontier_from(update, "block_sync_driver");
 }
 
+/// The needed-block plan returned by [`query_block_sync_needed_blocks`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockSyncNeededBlocks {
+    /// Header-known, body-missing (or body-mismatched) blocks to download.
+    pub blocks: Vec<BlockSyncBlockMeta>,
+    /// Set when the state reports body gaps at or below the body tip we queried
+    /// with, which means the best header chain has reorged *beneath* the
+    /// block-sync download floor: the committed bodies there are on an abandoned
+    /// fork. This carries the common-ancestor frontier the floor must roll back
+    /// to (via [`BlockSyncEvent::ChainTipReset`]) before those below-floor bodies
+    /// can be re-requested.
+    pub fork_reset: Option<BlockSyncFrontiers>,
+}
+
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
     read_state: ReadState,
     verified_block_tip: block::Height,
     best_header_tip: block::Height,
-) -> Result<Vec<BlockSyncBlockMeta>, zebra_state::BoxError>
+) -> Result<BlockSyncNeededBlocks, zebra_state::BoxError>
 where
     ReadState: Service<
             zebra_state::ReadRequest,
@@ -1285,7 +1321,7 @@ where
 {
     let Some((from, limit)) = block_sync_missing_body_window(verified_block_tip, best_header_tip)
     else {
-        return Ok(Vec::new());
+        return Ok(BlockSyncNeededBlocks::default());
     };
 
     let mut needed = Vec::new();
@@ -1294,10 +1330,38 @@ where
 
     while remaining > 0 {
         let chunk_limit = remaining.min(zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE);
-        needed.extend(
+        let (chunk, first_parent_hash) =
             query_block_sync_needed_blocks_chunk(read_state.clone(), next_from, chunk_limit)
-                .await?,
-        );
+                .await?;
+
+        // The state rewinds body-gap discovery to the header/body common
+        // ancestor, so a gap at or below the body tip we queried with is the
+        // reorg-below-floor signal. Roll the floor back to the ancestor and stop
+        // paging: the reactor re-queries from the lowered floor once the reset
+        // lands, and continuing here would only re-scan the same rewound range.
+        if let Some(first) = chunk.first() {
+            if first.height <= verified_block_tip {
+                if let (Ok(fork_height), Some(fork_hash)) =
+                    (first.height.previous(), first_parent_hash)
+                {
+                    if let Some(finalized_height) =
+                        query_block_sync_finalized_height(read_state.clone()).await?
+                    {
+                        needed.extend(chunk);
+                        return Ok(BlockSyncNeededBlocks {
+                            blocks: needed,
+                            fork_reset: Some(BlockSyncFrontiers {
+                                finalized_height,
+                                verified_block_tip: fork_height,
+                                verified_block_hash: fork_hash,
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        needed.extend(chunk);
 
         remaining = remaining.saturating_sub(chunk_limit);
         let Some(after_chunk) = next_from.0.checked_add(chunk_limit).map(block::Height) else {
@@ -1306,14 +1370,52 @@ where
         next_from = after_chunk;
     }
 
-    Ok(needed)
+    Ok(BlockSyncNeededBlocks {
+        blocks: needed,
+        fork_reset: None,
+    })
+}
+
+/// Reads the shared finalized height for a fork-reset frontier. Returns `None`
+/// only when the state cannot report a finalized tip, in which case the caller
+/// skips the reset rather than publish a frontier with an unknown finalized
+/// height.
+async fn query_block_sync_finalized_height<ReadState>(
+    read_state: ReadState,
+) -> Result<Option<block::Height>, zebra_state::BoxError>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match tokio::time::timeout(
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zebra_state::ReadRequest::FinalizedTip),
+    )
+    .await
+    {
+        Ok(Ok(zebra_state::ReadResponse::FinalizedTip(tip))) => {
+            Ok(Some(tip.map_or(block::Height(0), |(height, _hash)| height)))
+        }
+        Ok(Ok(response)) => {
+            warn!(?response, "unexpected FinalizedTip response");
+            Ok(None)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(elapsed) => Err(Box::new(elapsed) as zebra_state::BoxError),
+    }
 }
 
 async fn query_block_sync_needed_blocks_chunk<ReadState>(
     read_state: ReadState,
     from: block::Height,
     limit: u32,
-) -> Result<Vec<BlockSyncBlockMeta>, zebra_state::BoxError>
+) -> Result<(Vec<BlockSyncBlockMeta>, Option<block::Hash>), zebra_state::BoxError>
 where
     ReadState: Service<
             zebra_state::ReadRequest,
@@ -1335,17 +1437,17 @@ where
         Ok(Ok(zebra_state::ReadResponse::MissingBlockBodies(heights))) => heights,
         Ok(Ok(response)) => {
             warn!(?response, "unexpected MissingBlockBodies response");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         Ok(Err(error)) => return Err(error),
         Err(elapsed) => return Err(Box::new(elapsed)),
     };
 
     let Some(first) = missing.first().copied() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let Some(last) = missing.last().copied() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     let span = last.0.saturating_sub(first.0).saturating_add(1);
 
@@ -1363,7 +1465,7 @@ where
         Ok(Ok(zebra_state::ReadResponse::Headers(headers))) => headers,
         Ok(Ok(response)) => {
             warn!(?response, "unexpected HeadersByHeightRange response");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         Ok(Err(error)) => return Err(error),
         Err(elapsed) => return Err(Box::new(elapsed)),
@@ -1387,8 +1489,17 @@ where
         Err(elapsed) => return Err(Box::new(elapsed)),
     };
 
-    Ok(block_sync_needed_blocks_from_state(
-        missing, headers, size_hints,
+    // The parent hash of the lowest gap is the header/body common ancestor when
+    // the state has rewound below the queried body tip. `headers` is ascending
+    // from `first`, so its first entry is that lowest gap.
+    let first_parent_hash = headers
+        .iter()
+        .find(|(height, _hash, _header)| *height == first)
+        .map(|(_height, _hash, header)| header.previous_block_hash);
+
+    Ok((
+        block_sync_needed_blocks_from_state(missing, headers, size_hints),
+        first_parent_hash,
     ))
 }
 

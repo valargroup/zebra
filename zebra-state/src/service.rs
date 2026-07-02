@@ -1833,7 +1833,8 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::MissingBlockBodies { from, limit } => {
-                let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
+                let best_chain = state.latest_best_chain();
+                let verified_block_tip = read::tip_height(best_chain.clone(), &state.db);
                 let best_header_tip = state
                     .db
                     .best_header_tip()
@@ -1841,9 +1842,13 @@ impl Service<ReadRequest> for ReadStateService {
                     .max(verified_block_tip);
 
                 Ok(ReadResponse::MissingBlockBodies(
-                    state
-                        .db
-                        .missing_block_bodies(verified_block_tip, best_header_tip, from, limit),
+                    state.db.missing_block_bodies_with_chain(
+                        best_chain.as_deref(),
+                        verified_block_tip,
+                        best_header_tip,
+                        from,
+                        limit,
+                    ),
                 ))
             }
 
