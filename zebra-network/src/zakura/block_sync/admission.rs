@@ -25,12 +25,9 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// reorder→applying drain decodes without re-consulting admission; see
 /// [`estimated_resident_pipeline_bytes`].
 ///
-// TODO(ZCA-742): replace this flat factor with a precise per-block heap-size estimate
-// (a structural walk, or a `GetSize`-style measure on `Block`), so the budget tracks real
-// memory exactly. The factor is a deliberately conservative calibration from the measured
-// ~3.3–4x wire→resident ratio; it is an approximation, not a true per-block size.
-// Stage-aware charging (reorder/reservations at ~1× wire) becomes sound only once bodies
-// stay wire-retained through `applying` and decode at submit, bounded by the submit window.
+// TODO(ZCA-750): replace this flat factor with a precise per-block heap-size estimate.
+// The factor is a deliberately conservative calibration from the measured ~3.3–4x
+// wire→resident ratio; it is an approximation, not a true per-block size.
 pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 
 /// Pure inputs for deciding whether a block request may consume budget.

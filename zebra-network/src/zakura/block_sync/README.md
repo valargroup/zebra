@@ -199,8 +199,9 @@ borrowed a bypass slot.
 ## Known limitations and follow-ups
 
 - **Flat ×4 factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
-  measured ~3.3–4× wire→decoded ratio, not a per-block heap measure (TODO in
-  `admission.rs`).
+  measured ~3.3–4× wire→decoded ratio, not a per-block heap measure. Replacing it with
+  a precise per-block resident estimate is tracked as
+  [ZCA-750](https://linear.app/zcale/issue/ZCA-750).
 - **Conservative memory accounting reduces look-ahead.** Reorder blocks kept in
   wire form, and reservations for blocks we have not received yet, are charged at
   the decoded-memory estimate (`wire bytes × 4`). During reservation-heavy bursts,
