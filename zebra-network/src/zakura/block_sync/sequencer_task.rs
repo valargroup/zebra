@@ -148,7 +148,7 @@ pub(super) enum SequencerControlInput {
 /// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
@@ -749,7 +749,7 @@ impl SequencerTask {
             .saturating_add(body_input_bytes);
         self.budget
             .audit(expected_budget, "block-sync sequencer view");
-        let _ = self.view_tx.send_replace(SequencerView {
+        let next = SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
             download_floor: self.sequencer.floor(),
@@ -765,6 +765,35 @@ impl SequencerTask {
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
+        };
+        // Only wake watchers (the reactor + every per-peer routine) when a field
+        // they schedule against actually changed. The two committed_*_per_sec rates
+        // are observability-only; without this guard a no-op control input — e.g. a
+        // `FundFloorReservation` that shed nothing while the byte budget is pinned —
+        // still publishes an otherwise-identical view and re-wakes the requesting
+        // routine's `sequencer_view.changed()` arm into an immediate refill retry.
+        // That is a timer-free reactor<->sequencer<->routine busy-spin: it wastes a
+        // core (and starves progress under CI load) on a real clock and fully wedges
+        // a `start_paused` test clock, which auto-advances only once every task
+        // parks. Keep the stored rates fresh, but notify only on a schedulable change.
+        self.view_tx.send_if_modified(|current| {
+            let schedulable_changed = view_schedulable_ne(current, &next);
+            *current = next;
+            schedulable_changed
         });
     }
+}
+
+/// True when two views differ in any field the reactor or per-peer routines
+/// schedule against. Ignores the observability-only committed throughput rates,
+/// which move on nearly every sample and must not, on their own, wake — or under a
+/// paused test clock, spin — the whole fleet of watchers.
+fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
+    let strip_rates = |v: &SequencerView| {
+        let mut v = *v;
+        v.committed_bytes_per_sec = 0;
+        v.committed_blocks_per_sec = 0;
+        v
+    };
+    strip_rates(a) != strip_rates(b)
 }

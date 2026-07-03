@@ -386,11 +386,11 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
 /// arm specifically. A small transport queue depth makes the outbound fill quickly (the
 /// default 1024 is too large for the node to ever fill given the no-progress cap — which is
 /// exactly why this bug was invisible to the earlier tests).
-// Kept on real-time multi-thread (not `start_paused`): this sustained-backpressure
-// scenario drives a reactor<->sequencer<->routine feedback loop that stays
-// perpetually runnable, so tokio's virtual clock never auto-advances (it only
-// advances when every task is parked) and the test livelocks under paused time.
-// Real serve/commit sleeps space the events out and let it converge.
+// Real-time multi-thread. The `publish_view` spin fix (sequencer_task.rs) let
+// `fuzz_commit_stall` go deterministic, but this wedged-peer scenario is still
+// dominated by the outbound-full 10ms poll loop and real-elapsed wedge detection,
+// which take an impractical number of virtual-time steps (or wake ahead of the
+// poll) under `start_paused`. Kept on real time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_peer_that_stops_reading_is_disconnected() {
     let blocks = 400;
@@ -790,9 +790,7 @@ async fn fuzz_mixed_block_sizes() {
 /// wedge). On top of that we assert the peak reserved bytes stayed within the configured
 /// ceiling (the queue did not grow toward the full chain) yet the ceiling was actually
 /// exercised (the stall created real backpressure — the bound is not vacuous).
-// Real-time multi-thread: the commit-stall backpressure loop livelocks under
-// `start_paused` (see `fuzz_peer_that_stops_reading_is_disconnected`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_commit_stall() {
     let blocks = 400;
     let body_bytes = 32 * 1024usize;
@@ -1134,8 +1132,10 @@ async fn fuzz_reorder() {
 /// under multi-peer contention — the spec's "concurrent reservations MUST NOT
 /// over-commit"); here we additionally assert the ceiling was genuinely approached, so
 /// that bound is not vacuous.
-// Real-time multi-thread: the tight-budget backpressure loop livelocks under
-// `start_paused` (see `fuzz_peer_that_stops_reading_is_disconnected`).
+// Real-time multi-thread: after the `publish_view` spin fix this no longer
+// wedges, but multi-peer contention on a tight byte budget still leaves residual
+// virtual-time timing sensitivity, so it is not yet reliably deterministic under
+// `start_paused`. Kept on real time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_multi_peer_tight_budget() {
     let blocks = 400;
