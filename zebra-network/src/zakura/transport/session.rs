@@ -100,6 +100,22 @@ pub enum OrderedSendError {
     Encode(#[source] BoxError),
 }
 
+pub(crate) fn try_send_with_full_retries(
+    attempts: usize,
+    mut send: impl FnMut() -> Result<(), OrderedSendError>,
+) -> Result<(), OrderedSendError> {
+    let mut result = Err(OrderedSendError::Full);
+
+    for _ in 0..attempts {
+        result = send();
+        if !matches!(result, Err(OrderedSendError::Full)) {
+            break;
+        }
+    }
+
+    result
+}
+
 fn try_send_frame(send: &FramedSend, frame: Frame) -> Result<(), OrderedSendError> {
     match send.try_send(frame) {
         Ok(()) => Ok(()),
@@ -112,6 +128,7 @@ fn try_send_frame(send: &FramedSend, frame: Frame) -> Result<(), OrderedSendErro
 mod tests {
     use super::*;
     use crate::zakura::framed_channel;
+    use std::cell::Cell;
 
     fn frame(message_type: u16) -> Frame {
         Frame {
@@ -148,5 +165,35 @@ mod tests {
             try_send_frame(&send, frame(1)),
             Err(OrderedSendError::Closed)
         ));
+    }
+
+    #[test]
+    fn retry_helper_retries_full_until_attempt_limit() {
+        let attempts = Cell::new(0);
+
+        assert!(matches!(
+            try_send_with_full_retries(4, || {
+                attempts.set(attempts.get() + 1);
+                Err(OrderedSendError::Full)
+            }),
+            Err(OrderedSendError::Full)
+        ));
+        assert_eq!(attempts.get(), 4);
+    }
+
+    #[test]
+    fn retry_helper_stops_after_non_full_result() {
+        let attempts = Cell::new(0);
+
+        assert!(try_send_with_full_retries(4, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 3 {
+                Ok(())
+            } else {
+                Err(OrderedSendError::Full)
+            }
+        })
+        .is_ok());
+        assert_eq!(attempts.get(), 3);
     }
 }

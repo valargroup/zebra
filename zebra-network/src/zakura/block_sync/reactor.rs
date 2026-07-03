@@ -2,14 +2,18 @@ use super::{
     config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, wire::*, *,
 };
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, OrderedSendError, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
+    try_send_with_full_retries, FrontierChange, FrontierUpdate, OrderedSendError,
+    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
 /// action before abandoning it. Reactor action sends are non-blocking.
 const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Non-blocking `Status` queue attempts before deferring to the next refresh path.
+const STATUS_SEND_ATTEMPTS: usize = 4;
 
 /// Spare action-channel slots kept above `submitted_apply_limit` for queries and
 /// misbehavior actions.
@@ -1227,7 +1231,7 @@ impl BlockSyncReactor {
         let msg = BlockSyncMessage::Status(status);
         let started = Instant::now();
         let session = peer_state.session.clone();
-        match session.try_send_status(status) {
+        match try_send_with_full_retries(STATUS_SEND_ATTEMPTS, || session.try_send_status(status)) {
             Ok(()) => {
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, status);

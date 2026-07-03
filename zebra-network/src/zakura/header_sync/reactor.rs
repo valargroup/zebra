@@ -1,8 +1,12 @@
 use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
+    try_send_with_full_retries, FrontierChange, FrontierUpdate, HeaderSyncServiceSummary,
+    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraHeaderSyncCandidateState,
 };
+
+/// Non-blocking `Status` queue attempts before deferring to the next refresh path.
+const STATUS_SEND_ATTEMPTS: usize = 4;
 
 /// Spawn a header-sync reactor and return its handle plus action stream.
 pub fn spawn_header_sync_reactor(
@@ -1321,7 +1325,7 @@ impl HeaderSyncReactor {
             }
             None => return false,
         };
-        match session.try_send_status(status) {
+        match try_send_with_full_retries(STATUS_SEND_ATTEMPTS, || session.try_send_status(status)) {
             Ok(()) => {
                 if let Some(peer_state) = self.state.peers.get_mut(peer) {
                     peer_state.record_sent_status(status);

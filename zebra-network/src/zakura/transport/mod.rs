@@ -30,4 +30,5 @@ pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
     StreamMode,
 };
+pub(crate) use session::try_send_with_full_retries;
 pub use session::{OrderedSendError, PeerStreamSession};
