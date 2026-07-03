@@ -9,7 +9,7 @@
 //!   block is committed with its successor as `next_checkpoint`, the one-block-lag
 //!   confirmation the peer-source fast path requires.
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, time::Instant};
 
 use color_eyre::eyre::{bail, eyre, Result};
 use zebra_chain::{block::Height, parameters::Network};
@@ -126,20 +126,6 @@ pub fn run(
             Err(_) => None,
         };
 
-        let next_checkpoint = if let Some(s) = &sidecar {
-            let (successor, auth) = match &next {
-                Some(n) => (n.block.clone(), n.auth),
-                None => {
-                    let successor = Arc::new(s.successor.clone());
-                    let auth = successor.auth_data_root();
-                    (successor, auth)
-                }
-            };
-            Some((successor, Some(auth)))
-        } else {
-            None
-        };
-
         let height = p.height;
         let commit_start = Instant::now();
         let (_hash, trees) = state
@@ -147,7 +133,6 @@ pub fn run(
                 p.cv.into(),
                 prev_trees.take(),
                 None,
-                next_checkpoint,
                 if sidecar.is_some() {
                     "replay-bench-vct"
                 } else {

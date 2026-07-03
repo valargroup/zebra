@@ -254,6 +254,33 @@ pub enum CommitHeaderRangeError {
         anchor: block::Hash,
     },
 
+    /// A supplied tree-aux root failed verification against the checkpoint-committed header
+    /// chain (design §6): the ZIP-221 MMR the supplied roots reconstruct is inconsistent with
+    /// this block's header commitment. This is a peer-data validation failure — the range is
+    /// rejected (not stored), the offending peer is scored, and the range is refetched.
+    #[error("header range commitment root at height {height:?} failed verification: {source}")]
+    InvalidCommitmentRoots {
+        /// The first offending height in the range.
+        height: block::Height,
+        /// The underlying commitment-verification error.
+        source: Box<ValidateContextError>,
+    },
+
+    /// The running header-frontier history tree could not be positioned at the range anchor to
+    /// verify its supplied roots (design §6) — the stored roots are not contiguous up to the
+    /// anchor. This is a local state inconsistency, not a peer-data failure: the range is not
+    /// stored, and header sync retries.
+    #[error(
+        "header-frontier tree could not be positioned at anchor height {anchor_height:?} \
+         (missing stored roots at {missing_height:?})"
+    )]
+    HeaderFrontierUnavailable {
+        /// The range anchor the frontier tree must be folded up to.
+        anchor_height: block::Height,
+        /// The first height whose stored roots or header were missing.
+        missing_height: block::Height,
+    },
+
     /// The inferred header height overflowed the valid block height range.
     #[error("header height overflow")]
     HeightOverflow,

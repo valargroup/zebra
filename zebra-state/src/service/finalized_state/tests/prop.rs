@@ -38,10 +38,7 @@ type OrchardTree = Arc<zebra_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zebra_chain::sprout::tree::NoteCommitmentTree>;
 
 fn enable_vct_test_fixture_source(state: &mut FinalizedState, roots: TestRootMap) {
-    state.enable_vct_fast_source(
-        Box::new(commitment_aux::FixtureSource::new(roots, None)),
-        false,
-    );
+    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(roots, None)));
 }
 
 fn enable_vct_test_fixture_source_with_handoff(
@@ -52,18 +49,15 @@ fn enable_vct_test_fixture_source_with_handoff(
     orchard: OrchardTree,
     sprout: SproutTree,
 ) {
-    state.enable_vct_fast_source(
-        Box::new(commitment_aux::FixtureSource::new(
-            roots,
-            Some(commitment_aux::FinalFrontiers {
-                height: handoff_height,
-                sapling,
-                orchard,
-                sprout,
-            }),
-        )),
-        false,
-    );
+    state.enable_vct_fast_source(Box::new(commitment_aux::FixtureSource::new(
+        roots,
+        Some(commitment_aux::FinalFrontiers {
+            height: handoff_height,
+            sapling,
+            orchard,
+            sprout,
+        }),
+    )));
 }
 
 #[test]
@@ -104,7 +98,7 @@ fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()>
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct frontier bytes legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct frontier bytes legacy")
                     .unwrap();
             }
 
@@ -164,7 +158,7 @@ fn blocks_with_v5_transactions() -> Result<()> {
                     checkpoint_verified.into(),
                     None,
                     None,
-                    None,
+
                     "blocks_with_v5_transactions test"
                 ).unwrap();
                 prop_assert_eq!(Some(height), state.finalized_tip_height());
@@ -242,7 +236,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                                 checkpoint_verified.into(),
                                 None,
                                 None,
-                                None,
+
                                 "all_upgrades test"
                             ).expect_err("Must fail commitment check");
                             failure_count += 1;
@@ -282,7 +276,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                     checkpoint_verified.into(),
                     None,
                     None,
-                    None,
+
                     "all_upgrades test"
                 ).unwrap();
                 prop_assert_eq!(Some(height), state.finalized_tip_height());
@@ -360,7 +354,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct legacy")
                     .unwrap();
                 if i > seed {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -377,33 +371,26 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             enable_vct_test_fixture_source(&mut fast, fixture.clone());
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct fast")
+                fast.commit_finalized_direct(cv.into(), None, None, "vct fast")
                     .expect("verified fast commit succeeds");
             }
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history must match legacy");
             prop_assert_eq!(fast.vct_fast_count(), (last - seed) as u64, "every fast-eligible block took the fast path");
-            // The dedup: each header commitment is checked once, not twice. Only the
-            // first fast block runs its own commitment check; every later fast block
-            // was already validated by its predecessor's look-ahead, so it is skipped.
-            prop_assert_eq!(fast.vct_prevalidated_count(), (last - seed - 1) as u64, "every fast block after the first skips its redundant own commitment check");
 
-            // A trusted local fixture may commit its tip root without a successor: it is
-            // not adversarial and the root is checked in arrears when a successor arrives.
+            // A fast block commits its tip root without a buffered successor: the roots were
+            // already verified against the header chain at header-sync commit (design §6).
             let mut no_successor = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
             enable_vct_test_fixture_source(&mut no_successor, fixture.clone());
             for i in 0..last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
                 no_successor
-                    .commit_finalized_direct(cv.into(), None, None, next, "vct no-successor seed")
+                    .commit_finalized_direct(cv.into(), None, None, "vct no-successor seed")
                     .expect("verified fast commit succeeds with successor");
             }
-            prop_assert!(!no_successor.vct_fast_needs_successor(Height(last as u32)), "a trusted fixture tip can commit without a successor");
             let cv = CheckpointVerifiedBlock::from(blocks[last].block.clone());
             no_successor
-                .commit_finalized_direct(cv.into(), None, None, None, "vct trusted fixture no successor")
+                .commit_finalized_direct(cv.into(), None, None, "vct trusted fixture no successor")
                 .expect("trusted fixture tip commits without a successor");
             prop_assert_eq!(
                 no_successor.db.finalized_tip_height(),
@@ -417,6 +404,11 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             // wrong root must be *rejected* by the next block's commitment (verify-before-
             // commit) — the commit at that height fails rather than persisting it.
             let bad_height = (nu5 + 1) as usize;
+            // A wrong Sapling MMR root is committed by the *next* block's header (the one-block
+            // lag), so the committer rejects it when that successor commits — one height later.
+            // The tip case (no successor) is caught by header-sync verification (design §6), not
+            // at the committer, so only the non-tip case is asserted here.
+            prop_assume!(bad_height < last);
             let mut bad_fixture = fixture.clone();
             let bad_entry = bad_fixture.get_mut(&(bad_height as u32)).unwrap();
             prop_assert_ne!(bad_entry.0, Default::default(), "a V2 block must have a non-empty Sapling root");
@@ -427,13 +419,12 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let mut error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                if bad.commit_finalized_direct(cv.into(), None, None, next, "vct bad").is_err() {
+                if bad.commit_finalized_direct(cv.into(), None, None, "vct bad").is_err() {
                     error_height = Some(i);
                     break;
                 }
             }
-            prop_assert_eq!(error_height, Some(bad_height), "a wrong fixture root is rejected at its own commit");
+            prop_assert_eq!(error_height, Some(bad_height + 1), "a wrong fixture Sapling root is rejected at its successor's commit (one-block lag)");
 
             // Negative (Orchard, below NU5): no header commits to an Orchard root below
             // NU5 (V1 history leaves ignore it; no MMR below Heartwood), so the fast path
@@ -458,8 +449,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             let mut orchard_error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                if bad_orchard.commit_finalized_direct(cv.into(), None, None, next, "vct bad orchard").is_err() {
+                if bad_orchard.commit_finalized_direct(cv.into(), None, None, "vct bad orchard").is_err() {
                     orchard_error_height = Some(i);
                     break;
                 }
@@ -522,7 +512,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct hole legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct hole legacy")
                     .unwrap();
                 if i > seed {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -543,8 +533,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             let mut error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
-                match fast.commit_finalized_direct(cv.into(), None, None, next, "vct hole fast") {
+                match fast.commit_finalized_direct(cv.into(), None, None, "vct hole fast") {
                     Ok(_) => {}
                     Err(error) => {
                         // The refusal is the typed, retryable error — not a generic
@@ -618,7 +607,7 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct response legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct response legacy")
                     .unwrap();
                 if i > seed {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -633,15 +622,13 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
 
             for i in 0..hole {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct response fast")
+                fast.commit_finalized_direct(cv.into(), None, None, "vct response fast")
                     .expect("pre-hole fast commits succeed");
             }
 
             let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
             let (rsp_tx, mut rsp_rx) = oneshot::channel();
-            let next = Some((blocks[hole + 1].block.clone(), None));
-            let result = fast.commit_finalized((cv, rsp_tx), None, None, next);
+            let result = fast.commit_finalized((cv, rsp_tx), None, None);
             let Err((returned_block, error)) = result else {
                 panic!("missing frozen-frontier root should return the queued block for retry");
             };
@@ -654,277 +641,6 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             prop_assert!(
                 matches!(rsp_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
                 "the checkpoint response stays pending so the write loop can retry internally"
-            );
-    });
-
-    Ok(())
-}
-
-/// An *untrusted* (peer) source must never commit a fast block whose own supplied root has
-/// no buffered successor to confirm it against the header chain. A block's roots are only
-/// committed by the next block's header (the one-block lag), so committing at the sync tip
-/// would persist a root checked only one block later — irreversibly, once on disk. A wrong
-/// tip root would then wedge the sync with no recovery (the failure surfaces at the next
-/// block and is mis-attributed to *its* root). So the committer defers: it refuses the tip
-/// block with the retryable `VctSuppliedRootAwaitingSuccessor`, leaves the database
-/// untouched, and commits the same height once a successor is buffered. A trusted local
-/// fixture is exempt (covered by `vct_fast_path_matches_legacy_and_rejects_wrong_roots`,
-/// whose tip commits on the in-arrears check); this guards the peer path specifically.
-#[test]
-#[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
-fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> {
-    use crate::service::finalized_state::commitment_aux::PeerSource;
-    use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
-
-    let _init_guard = zebra_test::init();
-
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
-    let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
-
-    proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
-
-            let blocks: Vec<_> = chain.iter().collect();
-            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
-            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
-            // The deferral target: a post-NU5 (real MMR root) height, so it sits above
-            // Heartwood where the root needs a successor to be confirmed.
-            let tip_target = (nu5 + 1) as usize;
-            prop_assert!(blocks.len() > tip_target + 1, "generated chain unexpectedly short");
-            let seed = (heartwood - 1) as usize;
-
-            // Legacy golden pass to source the correct per-block roots for the fast range.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            let mut peer_roots = Vec::new();
-            for i in 0..=tip_target {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct defer legacy")
-                    .unwrap();
-                if i > seed {
-                    peer_roots.push(BlockCommitmentRoots {
-                        height: Height(i as u32),
-                        sapling_root: trees.sapling.root(),
-                        orchard_root: trees.orchard.root(),
-                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                        sapling_tx: 0,
-                        orchard_tx: 0,
-                        ironwood_tx: 0,
-                        auth_data_root: blocks[i].block.auth_data_root(),
-                    });
-                }
-            }
-
-            // An untrusted peer source pre-filled with the *correct* roots: the deferral is
-            // about the missing successor, not a bad root.
-            let (source, writer) = PeerSource::new(None);
-            writer.insert_roots(peer_roots);
-
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(source), true);
-
-            // Commit up to (but not including) the tip target, each with its successor.
-            for i in 0..tip_target {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct defer pre-tip")
-                    .expect("pre-tip fast commits succeed");
-            }
-            prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height((tip_target - 1) as u32)));
-
-            // The tip target with no buffered successor must defer, not commit: its own
-            // (correct) root is not yet confirmed, and the peer source is untrusted.
-            prop_assert!(
-                fast.vct_fast_needs_successor(Height(tip_target as u32)),
-                "an untrusted peer tip root needs successor verification"
-            );
-            let pre_deferral_prevalidated = fast.vct_prevalidated_count();
-            let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
-            let error = fast
-                .commit_finalized_direct(cv.into(), None, None, None, "vct defer tip no successor")
-                .expect_err("an untrusted tip root with no successor must defer, not commit");
-            prop_assert!(
-                error.vct_supplied_root_unavailable_height().is_none(),
-                "deferral is not a refetch case (the root is present): {error:?}"
-            );
-            prop_assert!(
-                format!("{error:?}").contains("VctSuppliedRootAwaitingSuccessor"),
-                "the tip defers with the await-successor error, got: {error:?}"
-            );
-            prop_assert_eq!(
-                fast.db.finalized_tip_height(),
-                Some(Height((tip_target - 1) as u32)),
-                "the deferred block left the database untouched"
-            );
-            let after_deferral_prevalidated = fast.vct_prevalidated_count();
-            prop_assert_eq!(
-                after_deferral_prevalidated,
-                pre_deferral_prevalidated + 1,
-                "the deferred attempt uses the predecessor look-ahead"
-            );
-
-            // Once a successor is buffered, the very same height commits and the tip advances:
-            // the deferral was a wait, not a permanent stall.
-            let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
-            let next = Some((blocks[tip_target + 1].block.clone(), None));
-            fast.commit_finalized_direct(cv.into(), None, None, next, "vct defer tip with successor")
-                .expect("the deferred height commits once its successor is buffered");
-            prop_assert_eq!(
-                fast.vct_prevalidated_count(),
-                after_deferral_prevalidated + 1,
-                "the retry reuses the preserved predecessor look-ahead"
-            );
-            prop_assert_eq!(
-                fast.db.finalized_tip_height(),
-                Some(Height(tip_target as u32)),
-                "the tip advances once the successor confirms the root"
-            );
-    });
-
-    Ok(())
-}
-
-/// A wrong peer-supplied root must be recoverable at the same height: the committer rejects and
-/// evicts the bad cached value, leaves the database parked below the height, then commits the
-/// same block once the `tree_aux` driver refills that height with a verifiable root.
-#[test]
-#[allow(clippy::needless_range_loop)] // the loop indexes blocks[i+1] and inserts roots by height
-fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
-    use crate::service::finalized_state::commitment_aux::PeerSource;
-    use zebra_chain::parallel::commitment_aux::BlockCommitmentRoots;
-
-    let _init_guard = zebra_test::init();
-
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
-    let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
-
-    proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
-
-            let blocks: Vec<_> = chain.iter().collect();
-            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
-            let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
-            let target = (nu5 + 1) as usize;
-            prop_assert!(blocks.len() > target + 1, "generated chain unexpectedly short");
-            let seed = (heartwood - 1) as usize;
-
-            // Source the true roots from a legacy pass, then poison the target height exactly
-            // as a malicious peer would. Earlier roots are correct so the frontier freezes
-            // before the bad root is encountered.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            let mut peer_roots = Vec::new();
-            let mut correct_target_root = None;
-            for i in 0..=target {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct refill legacy")
-                    .unwrap();
-                if i > seed {
-                    let root = BlockCommitmentRoots {
-                        height: Height(i as u32),
-                        sapling_root: trees.sapling.root(),
-                        orchard_root: trees.orchard.root(),
-                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                        sapling_tx: 0,
-                        orchard_tx: 0,
-                        ironwood_tx: 0,
-                        auth_data_root: blocks[i].block.auth_data_root(),
-                    };
-                    if i == target {
-                        correct_target_root = Some(root.clone());
-                        let mut poisoned = root;
-                        prop_assert_ne!(
-                            poisoned.sapling_root,
-                            Default::default(),
-                            "a V2 target block must have a non-empty Sapling root"
-                        );
-                        poisoned.sapling_root = Default::default();
-                        peer_roots.push(poisoned);
-                    } else {
-                        peer_roots.push(root);
-                    }
-                }
-            }
-            let correct_target_root = correct_target_root.expect("target root was produced");
-
-            let (source, writer) = PeerSource::new(None);
-            writer.insert_roots(peer_roots);
-
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(source), true);
-
-            for i in 0..target {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct refill pre-target")
-                    .expect("pre-target fast commits succeed");
-            }
-            prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height((target - 1) as u32)));
-
-            let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
-            let next = Some((blocks[target + 1].block.clone(), None));
-            let error = fast
-                .commit_finalized_direct(cv.into(), None, None, next.clone(), "vct poisoned target")
-                .expect_err("the poisoned peer root must be rejected before commit");
-            prop_assert_eq!(
-                error.vct_supplied_root_unavailable_height(),
-                Some(Height(target as u32)),
-                "the bad root is exposed as a retryable refetch for its own height"
-            );
-            prop_assert_eq!(
-                fast.db.finalized_tip_height(),
-                Some(Height((target - 1) as u32)),
-                "the rejected root left the database parked below the target"
-            );
-
-            // Simulate the `tree_aux` driver refilling the evicted height from another peer.
-            writer.insert_roots([correct_target_root]);
-
-            let cv = CheckpointVerifiedBlock::from(blocks[target].block.clone());
-            fast.commit_finalized_direct(cv.into(), None, None, next, "vct refilled target")
-                .expect("the same height commits once the peer cache is refilled");
-            prop_assert_eq!(
-                fast.db.finalized_tip_height(),
-                Some(Height(target as u32)),
-                "the refilled root unblocks the parked height"
             );
     });
 
@@ -995,7 +711,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct reopen legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct reopen legacy")
                     .unwrap();
                 if i > seed {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -1032,8 +748,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 );
                 for i in 0..=stop {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = Some((blocks[i + 1].block.clone(), None));
-                    fast.commit_finalized_direct(cv.into(), None, None, next, "vct reopen fast")
+                    fast.commit_finalized_direct(cv.into(), None, None, "vct reopen fast")
                         .expect("verified fast commit succeeds");
                 }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(Height(handoff_height)), "the interrupted sync left the fast-sync marker");
@@ -1066,9 +781,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             // from the durable marker. Before the fix it came back `false` and this would
             // legacy-recompute against the stale frontier; now it refuses.
             let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
-            let next = Some((blocks[hole + 1].block.clone(), None));
             let error = reopened
-                .commit_finalized_direct(cv.into(), None, None, next, "vct reopen hole")
+                .commit_finalized_direct(cv.into(), None, None, "vct reopen hole")
                 .expect_err("a frozen-frontier hole must refuse after reopen, not recompute");
             prop_assert!(
                 format!("{error:?}").contains("VctSuppliedRootUnavailable"),
@@ -1087,9 +801,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 handoff_trees.sprout.clone(),
             );
             let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
-            let next = Some((blocks[hole + 1].block.clone(), None));
             reopened
-                .commit_finalized_direct(cv.into(), None, None, next, "vct reopen refill")
+                .commit_finalized_direct(cv.into(), None, None, "vct reopen refill")
                 .expect("the height commits once its root is fetched");
             prop_assert_eq!(reopened.db.finalized_tip_height(), Some(Height(hole as u32)), "the tip advances past the former hole once the root arrives");
     });
@@ -1157,7 +870,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct legacy")
                     .unwrap();
                 if i > seed {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -1182,11 +895,9 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
             );
-            prop_assert!(!fast.vct_fast_needs_successor(handoff), "the trusted handoff frontier authenticates the handoff root without a successor");
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct fast handoff")
+                fast.commit_finalized_direct(cv.into(), None, None, "vct fast handoff")
                     .expect("verified fast commit succeeds");
             }
 
@@ -1262,8 +973,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             let mut handoff_error = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| (blocks[i + 1].block.clone(), None));
-                match bad_handoff.commit_finalized_direct(cv.into(), None, None, next, "vct bad handoff") {
+                match bad_handoff.commit_finalized_direct(cv.into(), None, None, "vct bad handoff") {
                     Ok(_) => {}
                     Err(error) => {
                         error_height = Some(i);
@@ -1339,7 +1049,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             for i in 0..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct switch legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct switch legacy")
                     .unwrap();
                 if i > seed && i <= handoff_index {
                     fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
@@ -1377,8 +1087,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 );
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = (i < handoff_index).then(|| (blocks[i + 1].block.clone(), None));
-                    fast.commit_finalized_direct(cv.into(), None, None, next, "vct switch fast prefix")
+                    fast.commit_finalized_direct(cv.into(), None, None, "vct switch fast prefix")
                         .expect("verified fast prefix commits");
                 }
                 prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast sync reached the handoff before the switch");
@@ -1392,7 +1101,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             for i in (handoff_index + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 manual
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct switch manual suffix")
+                    .commit_finalized_direct(cv.into(), None, None, "vct switch manual suffix")
                     .expect("manual suffix commits after fast handoff");
             }
             let manual_tip = manual.db.note_commitment_trees_for_tip();
@@ -1416,7 +1125,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 for i in 0..=seed {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     manual_prefix
-                        .commit_finalized_direct(cv.into(), None, None, None, "vct switch manual prefix")
+                        .commit_finalized_direct(cv.into(), None, None, "vct switch manual prefix")
                         .expect("manual prefix commits");
                 }
             }
@@ -1448,9 +1157,8 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             );
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < post_handoff_tip).then(|| (blocks[i + 1].block.clone(), None));
                 fast_suffix
-                    .commit_finalized_direct(cv.into(), None, None, next, "vct switch fast suffix")
+                    .commit_finalized_direct(cv.into(), None, None, "vct switch fast suffix")
                     .expect("fast suffix commits after manual prefix");
             }
             prop_assert_eq!(
@@ -1464,229 +1172,6 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             prop_assert_eq!(fast_suffix_tip.sapling.root(), golden_tip.sapling.root(), "manual-to-fast sapling tip matches legacy");
             prop_assert_eq!(fast_suffix_tip.orchard.root(), golden_tip.orchard.root(), "manual-to-fast orchard tip matches legacy");
             prop_assert_eq!(fast_suffix_tip.sprout.root(), golden_tip.sprout.root(), "manual-to-fast sprout tip matches legacy");
-    });
-
-    Ok(())
-}
-
-/// Standalone test isolating the verify-before-commit **dedup**: each header
-/// commitment is checked once, not twice.
-///
-/// - **Skip:** the first fast block runs its own commitment check; the next one
-///   is skipped, because the first block's look-ahead already validated it.
-/// - **Stale-cache guard:** a cache entry with the right height but the *wrong*
-///   hash must not trigger a skip — the guard forces the own check to run, so a
-///   stale or mismatched entry can never let an unverified block through.
-/// - **Wrapper-hash guard:** a public `CheckpointVerifiedBlock::with_hash` caller
-///   cannot replay a stale cached successor hash onto a different block.
-#[test]
-fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
-    let _init_guard = zebra_test::init();
-
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
-    let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
-
-    proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
-
-            let blocks: Vec<_> = chain.iter().collect();
-            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
-
-            // Seed just before NU5, then operate on four consecutive fast blocks so
-            // the forged-wrapper regression exercises `hashBlockCommitments`.
-            let seed = nu5 - 2;
-            let last = seed + 4;
-            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
-
-            // Legacy pass to record the correct per-block roots as the fixture.
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            let mut fixture = std::collections::HashMap::new();
-            for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
-                let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
-                let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct dedup legacy")
-                    .unwrap();
-                if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
-                }
-            }
-
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            enable_vct_test_fixture_source(&mut fast, fixture);
-
-            // Commit block `i` with its real successor as the one-block look-ahead.
-            let commit = |fast: &mut FinalizedState, i: usize| {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct dedup fast")
-                    .expect("verified fast commit succeeds");
-            };
-
-            // genesis..=seed take the recompute path (no fixture entries), so the dedup
-            // never engages here.
-            for i in 0..=seed {
-                commit(&mut fast, i);
-            }
-            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "no fast blocks committed yet");
-
-            // First fast block: no cached predecessor, so it runs its own check.
-            commit(&mut fast, seed + 1);
-            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own commitment check");
-
-            // Second fast block: its predecessor's look-ahead already validated it,
-            // so the own check is skipped — the dedup engages.
-            commit(&mut fast, seed + 2);
-            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
-
-            // Stale-cache guard: overwrite the cache with the correct height but the
-            // hash of a *different* block. The next commit must NOT skip.
-            let stale_hash = blocks[seed + 1].hash;
-            prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
-            fast.vct_prevalidated_next = Some((Height((seed + 3) as u32), stale_hash));
-            commit(&mut fast, seed + 3);
-            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
-
-            // Public wrapper-hash guard: the stale cache records a real look-ahead
-            // hash, but a caller-controlled checkpoint wrapper tries to replay that
-            // hash onto a different block whose own NU5 header commitment is invalid.
-            // The skip must compare the cache against the wrapped block's real hash,
-            // not the wrapper hash, so the bad commitment is checked and rejected.
-            let forged_wrapper_hash = blocks[seed + 2].hash;
-            let bad_block = blocks[seed + 4].block.clone().set_block_commitment([0x42; 32]);
-            let bad_block_hash = bad_block.hash();
-            prop_assert_ne!(
-                forged_wrapper_hash,
-                bad_block_hash,
-                "the forged wrapper hash must differ from the bad block's real hash",
-            );
-            fast.vct_prevalidated_next =
-                Some((Height((seed + 4) as u32), forged_wrapper_hash));
-            let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
-            let error = fast
-                .commit_finalized_direct(forged.into(), None, None, None, "vct forged wrapper hash")
-                .expect_err("a forged wrapper hash must not skip the bad block's own commitment check");
-            prop_assert!(
-                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
-                "the forged wrapper hash path must reject the bad commitment, got: {error:?}",
-            );
-            prop_assert_eq!(
-                fast.vct_prevalidated_count(),
-                1,
-                "the forged wrapper hash must not increment the prevalidated count",
-            );
-            prop_assert_eq!(
-                fast.db.finalized_tip_height(),
-                Some(Height((seed + 3) as u32)),
-                "the rejected forged block must leave finalized state untouched",
-            );
-    });
-
-    Ok(())
-}
-
-/// Clearing a cached VCT successor prevalidation must disarm exactly one possible
-/// skip without disabling the normal dedup optimization for future contiguous fast
-/// blocks. This covers the write-loop reset/drop behavior indirectly: those paths
-/// call `clear_vct_prevalidated_next()` when buffered checkpoint state is discarded.
-#[test]
-fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()> {
-    let _init_guard = zebra_test::init();
-
-    let network = ParametersBuilder::default()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(10),
-            sapling: Some(15),
-            blossom: Some(20),
-            heartwood: Some(25),
-            canopy: Some(30),
-            nu5: Some(35),
-            nu6: Some(40),
-            nu6_1: Some(45),
-            nu6_2: Some(47),
-            nu6_3: Some(48),
-            nu7: Some(50),
-        })
-        .expect("failed to set activation heights")
-        .extend_funding_streams()
-        .to_network()
-        .expect("failed to build configured network");
-    let ledger_strategy =
-        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
-
-    proptest!(ProptestConfig::with_cases(1),
-        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
-
-            let blocks: Vec<_> = chain.iter().collect();
-            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
-            let seed = nu5 - 2;
-            let last = seed + 5;
-            prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
-
-            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            let mut fixture = std::collections::HashMap::new();
-            for (i, prepared) in blocks.iter().take(last + 1).enumerate() {
-                let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
-                let (_h, trees) = legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct clear legacy")
-                    .unwrap();
-                if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
-                }
-            }
-
-            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            enable_vct_test_fixture_source(&mut fast, fixture);
-
-            let commit = |fast: &mut FinalizedState, i: usize| {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct clear fast")
-                    .expect("verified fast commit succeeds");
-            };
-
-            for i in 0..=seed {
-                commit(&mut fast, i);
-            }
-            commit(&mut fast, seed + 1);
-            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "first fast block runs its own check");
-
-            commit(&mut fast, seed + 2);
-            prop_assert_eq!(fast.vct_prevalidated_count(), 1, "second fast block uses predecessor look-ahead");
-
-            fast.clear_vct_prevalidated_next();
-            commit(&mut fast, seed + 3);
-            prop_assert_eq!(
-                fast.vct_prevalidated_count(),
-                1,
-                "clearing the cache forces the next fast block to run its own check",
-            );
-
-            commit(&mut fast, seed + 4);
-            prop_assert_eq!(
-                fast.vct_prevalidated_count(),
-                2,
-                "normal successor dedup resumes after the cleared block commits",
-            );
     });
 
     Ok(())
@@ -1751,7 +1236,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct round-trip legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct round-trip legacy")
                     .unwrap();
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
@@ -1781,13 +1266,11 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
                 .collect();
             fast.enable_vct_fast_source(
-                Box::new(commitment_aux::FixtureSource::new(produced_roots, None)),
-                false,
+                Box::new(commitment_aux::FixtureSource::new(produced_roots, None))
             );
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct round-trip fast")
+                fast.commit_finalized_direct(cv.into(), None, None, "vct round-trip fast")
                     .expect("verified fast commit from DB-produced roots succeeds");
             }
 
@@ -1885,7 +1368,7 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             for block in blocks.iter().take(last + 1) {
                 let cv = CheckpointVerifiedBlock::from(block.block.clone());
                 legacy
-                    .commit_finalized_direct(cv.into(), None, None, None, "vct peer-source legacy")
+                    .commit_finalized_direct(cv.into(), None, None, "vct peer-source legacy")
                     .unwrap();
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
@@ -1909,11 +1392,10 @@ fn vct_peer_source_filled_incrementally_drives_byte_identical_state() -> Result<
             // untrusted source defers a tip commit with no successor (covered by
             // `vct_peer_source_defers_unverifiable_tip_root_until_successor`).
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
-            fast.enable_vct_fast_source(Box::new(peer_source), true);
+            fast.enable_vct_fast_source(Box::new(peer_source));
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some((blocks[i + 1].block.clone(), None));
-                fast.commit_finalized_direct(cv.into(), None, None, next, "vct peer-source fast")
+                fast.commit_finalized_direct(cv.into(), None, None, "vct peer-source fast")
                     .expect("verified fast commit from peer-source roots succeeds");
             }
 
