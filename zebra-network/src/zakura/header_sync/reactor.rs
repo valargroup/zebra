@@ -1398,11 +1398,10 @@ impl HeaderSyncReactor {
             .state
             .peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                (peer.status_differs_from_last_sent(status)
-                    && peer.meters.unsolicited.is_ready(now))
-                .then(|| peer_id.clone())
+            .filter(|(_peer_id, peer)| {
+                peer.status_differs_from_last_sent(status) && peer.meters.unsolicited.is_ready(now)
             })
+            .map(|(peer_id, _peer)| peer_id.clone())
             .collect();
 
         for peer in peer_ids {

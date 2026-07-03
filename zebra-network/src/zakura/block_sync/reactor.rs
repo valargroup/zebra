@@ -1414,9 +1414,10 @@ impl BlockSyncReactor {
                 // only reason to send is a retry to a peer that has not
                 // acknowledged our Status, which stays gated solely by that
                 // peer's `unsolicited` meter.
-                if status_changed {
-                    Some(peer_id.clone())
-                } else if unready.contains(peer_id) && peer.refresh_meter.is_ready(now) {
+                let should_send_status = status_changed
+                    || (unready.contains(peer_id) && peer.refresh_meter.is_ready(now));
+
+                if should_send_status {
                     Some(peer_id.clone())
                 } else {
                     None
