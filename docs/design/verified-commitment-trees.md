@@ -50,7 +50,7 @@ peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header
 (1) Node starts under `consensus.checkpoint_sync = true` on
 Mainnet → the committer is built in peer mode.
 (2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`) and persists the received roots provisionally into the database ahead of the committer (§4.2). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
-the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (§6, §7).
+the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
 (5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place as header sync re-delivers the root; it never writes wrong state.
 
@@ -63,7 +63,7 @@ the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (�
 | **Fast root** | A peer-supplied `(sapling_root, orchard_root, ironwood_root)` for one height, folded in after verification instead of being recomputed. |
 | **Final frontier** | The real Sapling/Orchard/Sprout/Ironwood note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
 | **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
-| **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
+| **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
 | **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |

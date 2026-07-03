@@ -3,7 +3,7 @@
 //!
 //! This is the "verify" component of the verified-commitment-trees design
 //! (`docs/design/verified-commitment-trees.md`). Given a sequence of per-block
-//! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
+//! Sapling/Orchard/Ironwood roots (from a fixture today, an untrusted peer later), confirm
 //! they reconstruct a history tree consistent with the header commitments.
 
 #![cfg_attr(not(test), allow(dead_code))]
@@ -166,7 +166,7 @@ pub(crate) fn verify_supplied_ironwood_root_below_nu6_3(
 }
 
 /// Verifies that `items` (blocks in ascending height order, with supplied
-/// Sapling/Orchard roots when they should be folded in) reconstruct a ZIP-221
+/// Sapling/Orchard/Ironwood roots when they should be folded in) reconstruct a ZIP-221
 /// history MMR consistent with the block header commitments, starting from `tree`
 /// (the parent block's history tree).
 ///
