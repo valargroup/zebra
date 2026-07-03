@@ -60,8 +60,8 @@ the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (�
 | --- | --- |
 | **Checkpoint sync** | `consensus.checkpoint_sync = true`: trust the embedded checkpoint list for headers/PoW up to the max checkpoint. Precondition for VCT. |
 | **last checkpoint height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
-| **Fast root** | A peer-supplied `(sapling_root, orchard_root)` for one height, folded in after verification instead of being recomputed. |
-| **Final frontier** | The real Sapling/Orchard/Sprout note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
+| **Fast root** | A peer-supplied `(sapling_root, orchard_root, ironwood_root)` for one height, folded in after verification instead of being recomputed. |
+| **Final frontier** | The real Sapling/Orchard/Sprout/Ironwood note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
 | **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
@@ -130,8 +130,8 @@ skipping the frontier recompute entirely — without weakening any consensus che
 The fast path needs two things, and they are sourced differently:
 
 - **Per-block roots travel over the network**, carried in-band on the header-sync `Headers`
-  message (§4.2, §5.4). `BlockCommitmentRoots { height, sapling_root, orchard_root }` (§5.1) is
-  the wire payload.
+  message (§4.2, §5.4). `BlockCommitmentRoots { height, sapling_root, orchard_root,
+  ironwood_root, .. }` (§5.1) is the wire payload.
 - **The final frontier is embedded in the binary** (§5.2), refreshed per release like a
   checkpoint, _not_ sent on the wire. There is no `GetFinalFrontiers`/`FinalFrontiers` message
   and no frontier-serving path to attack or keep available.
@@ -186,8 +186,8 @@ orthogonal pruning axis). The resulting modes:
 | --- | --- | --- |
 | **Archive** (default) | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the last checkpoint height _for now_ (§7, §10). |
 | **Pruning** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode.pruned` | Fast — same as Archive, **plus** raw-tx/index pruning outside the retention window. |
-| **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard trees per block. |
-| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block, using only mandatory checkpoints. |
+| **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard/Ironwood trees per block. |
+| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard/Ironwood trees per block, using only mandatory checkpoints. |
 
 Gating fast on `checkpoint_sync` is also a correctness precondition: the embedded last checkpoint height
 frontier is pinned to the network's **full** max checkpoint height (§5.2), which only applies
@@ -217,11 +217,13 @@ the status note at the top of this document).
 ### 5.1 Per-block commitment roots (the wire payload)
 
 `zebra_chain::parallel::commitment_aux::BlockCommitmentRoots` holds `{ height, sapling_root,
-orchard_root }` with `ZcashSerialize`/`ZcashDeserialize`. It lives in `zebra-chain` so
-`zebra-network` and `zebra-state` share one type without a dependency cycle. `orchard_root` is
-the empty/default root below NU5. The deserializer treats `height` as an unvalidated `u32`: a
-wrong or out-of-range height simply fails to match any local header during verification (§6),
-so it is harmless; malformed root bytes are rejected by the root parsers.
+orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx, auth_data_root }` with
+`ZcashSerialize`/`ZcashDeserialize`. It lives in `zebra-chain` so `zebra-network` and
+`zebra-state` share one type without a dependency cycle. `orchard_root` is the empty/default
+root below NU5, and `ironwood_root` is the empty/default root below `Nu6_3` (§6.1). The
+deserializer treats `height` as an unvalidated `u32`: a wrong or out-of-range height simply
+fails to match any local header during verification (§6), so it is harmless; malformed root
+bytes are rejected by the root parsers.
 
 The payload carries **no trust**: a recipient re-verifies every root against its own
 checkpoint-committed headers (§6) before folding it in, so a forwarding/serving node is
@@ -229,9 +231,9 @@ exactly as trustworthy as an originating one.
 
 ### 5.2 The final frontier last checkpoint height (embedded)
 
-Fast mode never advances the running Sapling/Orchard frontiers below the checkpoint, so the
-real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers { height,
-sapling, orchard, sprout }` is embedded in the binary
+Fast mode never advances the running Sapling/Orchard/Ironwood frontiers below the checkpoint,
+so the real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers {
+height, sapling, orchard, sprout, ironwood }` is embedded in the binary
 (`zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
 tied to the network's max checkpoint height (validated on load:
 `embedded VCT final frontier height must match the network's max checkpoint height`). When the
@@ -239,6 +241,12 @@ Mainnet checkpoint list advances, this file is regenerated alongside the checkpo
 by the maintenance tool described in §16.
 
 - **Sprout** is frozen far below any modern checkpoint, so the tip Sprout tree is its frontier.
+- **Ironwood** is carried the same way as Sapling/Orchard, and is authenticated at the
+  handoff (§7) against the supplied Ironwood root before it is written as the tip treestate.
+  The on-disk byte format is backward compatible: the Ironwood tree is a 4th length-prefixed
+  blob appended after Sprout, and bytes written before Ironwood existed (no 4th blob) parse
+  with the Ironwood frontier defaulted to the empty tree — the existing embedded
+  `mainnet-frontier.bin` needs no regeneration for this.
 - **Subtree tips are not carried**: the resuming chain recomputes them from the frontier
   position.
 - **Regtest** has no fixed checkpoint (its list is derived at runtime), so there is no constant
@@ -346,9 +354,9 @@ is checked against that candidate. A wrong root makes that check fail and the bl
 offending height; over `[start..=end]` it confirms `[start..=end-1]`, and `end+1` confirms
 `end`.
 
-### 6.1 Direct header checks below Heartwood and NU5
+### 6.1 Direct header checks below Heartwood, NU5, and Nu6_3
 
-The ZIP-221 MMR does not authenticate everything, so two gaps are closed by direct comparison
+The ZIP-221 MMR does not authenticate everything, so three gaps are closed by direct comparison
 (no one-block lag — a wrong root is rejected at the block's own commit):
 
 - **Sapling below Heartwood** (`verify_supplied_sapling_root_below_heartwood`): there is no MMR
@@ -363,6 +371,12 @@ The ZIP-221 MMR does not authenticate everything, so two gaps are closed by dire
   breaking the §11 trust boundary and consensus equivalence. This was a real hole, masked only
   while the source was a trusted fixture; the in-flight peer source would have armed it
   (fix in commit #190).
+- **Ironwood below Nu6_3** (`verify_supplied_ironwood_root_below_nu6_3`): `Nu6_3` is the first
+  upgrade whose history leaf (`IronwoodOnward`/V3) commits to an Ironwood root; below it, no
+  header commits to one and the Ironwood tree is provably empty (no Ironwood actions are
+  allowed), so the supplied root is pinned to the empty-tree root — the same pattern as the
+  below-NU5 Orchard pin, and closing the same class of hole. At/above `Nu6_3` the MMR path
+  authenticates it.
 
 ### 6.2 The one-block lag and the dedup
 
@@ -398,23 +412,26 @@ The commit-path hook lives in `finalized_state.rs`; everything about _where data
 lives in the `vct` and `commitment_aux` submodules, so the commit path holds only the last checkpoint height
 logic. For a checkpoint-verified block at `height`:
 
-1. **Fast-root lookup.** `vct.vct_root(height)` returns the supplied roots, or `None`.
+1. **Fast-root lookup.** `vct.vct_root(height)` returns the supplied `(sapling, orchard,
+   ironwood)` roots, or `None`.
 2. **If supplied (fast path):**
    - run the own-commitment check unless the dedup (§6.2) already validated it;
-   - apply the direct below-Heartwood/below-NU5 checks (§6.1);
+   - apply the direct below-Heartwood/below-NU5/below-Nu6_3 checks (§6.1);
    - build a candidate history tree with the roots folded in (`HistoryTree::push`);
    - **verify-before-commit:** either check the buffered successor's commitment against the
      candidate (the one-block-lag confirmation) and cache `(height+1, next_hash)` as
-     pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final frontiers
-     against this height's roots; a failure means _this_ height's root is bad → reject and
-     evict (§8);
-   - fold the roots into the anchor set, skip the frontier recompute, and **freeze** the
-     note-commitment frontier (`vct_frontier_frozen = true`) for non-last checkpoint height fast blocks.
-3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded frontier
-   against this block's verified root (`frontier.root() == verified root`; collision resistance
-   makes the root a binding commitment to the frontier), write it as the real tip treestate via
-   the normal write path, and **unfreeze** — heights at/above the last checkpoint height resume legacy
-   recompute from a correct frontier.
+     pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final
+     frontiers — including Ironwood — against this height's roots; a failure means _this_
+     height's root is bad → reject and evict (§8);
+   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the frontier
+     recompute, and **freeze** the note-commitment frontier (`vct_frontier_frozen = true`) for
+     non-last checkpoint height fast blocks.
+3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded
+   Sapling/Orchard/Ironwood frontiers against this block's verified roots (`frontier.root() ==
+   verified root` for each pool; collision resistance makes each root a binding commitment to
+   its frontier), write them as the real tip treestate via the normal write path, and
+   **unfreeze** — heights at/above the last checkpoint height resume legacy recompute from a
+   correct frontier.
 4. **If not supplied:** §8.
 
 The write worker enforces the successor side of this contract before calling the committer: if
@@ -732,15 +749,17 @@ genesis, because there is no updated last checkpoint height to pair with the fro
 
 The frontier generator must read Zebra's finalized state, not reconstruct trees from RPC block
 data. Checkpoint generation only needs block hashes and sizes, but frontier generation needs the
-exact Sapling, Orchard, and Sprout note-commitment trees. The utility therefore opens Zebra
-state read-only and calls `zebra-state` helpers that:
+exact Sapling, Orchard, Sprout, and Ironwood note-commitment trees. The utility therefore opens
+Zebra state read-only and calls `zebra-state` helpers that:
 
 - opens the finalized DB read-only from the supplied state cache directory;
-- reads the Sapling and Orchard trees at the requested height;
+- reads the Sapling, Orchard, and Ironwood trees at the requested height;
 - reads the tip Sprout tree (Sprout is frozen far below modern checkpoints);
-- serializes `FinalFrontiers { height, sapling, orchard, sprout }` using the same byte format
-  parsed by node startup: `height` as `u32` little-endian, followed by length-prefixed
-  `IntoDisk` blobs for Sapling, Orchard, and Sprout;
+- serializes `FinalFrontiers { height, sapling, orchard, sprout, ironwood }` using the same byte
+  format parsed by node startup: `height` as `u32` little-endian, followed by length-prefixed
+  `IntoDisk` blobs for Sapling, Orchard, Sprout, and Ironwood. The Ironwood blob is a
+  backward-compatible tail: bytes written before Ironwood existed (3 blobs, no trailing bytes
+  after Sprout) still parse, with the Ironwood frontier defaulted to the empty tree;
 - immediately validates the generated bytes by parsing them through the same height-checking
   path used for the embedded frontier (`produce_final_frontiers_bytes` followed by
   `validate_final_frontiers_bytes`).
@@ -759,8 +778,8 @@ Local testing proves byte compatibility with the node loader:
 - write the bytes to a temporary file;
 - load the file through the same loader/parser path used by `VCT_REGTEST_FRONTIER` and the
   embedded Mainnet frontier;
-- assert the parsed height matches, the parsed Sapling/Orchard/Sprout roots match the DB, and
-  parsing with a different expected height fails.
+- assert the parsed height matches, the parsed Sapling/Orchard/Sprout/Ironwood roots match the
+  DB, and parsing with a different expected height fails.
 
 That test is the compatibility contract: if the local tool writes bytes that pass this path, the
 node will parse the artifact in the same way at startup.
