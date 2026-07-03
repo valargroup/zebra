@@ -1659,6 +1659,13 @@ impl BlockSyncReactor {
             if let Some(start) = self.state.work_queue.min_pending() {
                 bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
             }
+            // Structure-size diagnostics for memory-growth attribution: if RSS
+            // climbs while the byte pools stay bounded, the growing map names
+            // itself here.
+            let (diag_peers, diag_outstanding, diag_parked) = self.registry.diagnostic_sizes();
+            bs_insert_u64(row, "diag_registry_peers", diag_peers);
+            bs_insert_u64(row, "diag_registry_outstanding", diag_outstanding);
+            bs_insert_u64(row, "diag_registry_parked", diag_parked);
             bs_insert_u64(
                 row,
                 bs_trace::ASSIGNED_LEN,

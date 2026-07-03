@@ -146,6 +146,21 @@ impl PeerRegistry {
             .expect("peer registry mutex is never poisoned")
     }
 
+    /// Diagnostic sizes for the periodic state trace: (peer entries, total
+    /// published outstanding height entries, parked peers). Cheap map-length
+    /// sums; used to attribute memory growth to a specific structure.
+    pub(super) fn diagnostic_sizes(&self) -> (u64, u64, u64) {
+        let peers = self.lock();
+        let outstanding: u64 = peers
+            .values()
+            .map(|entry| entry.outstanding.len() as u64)
+            .sum();
+        let peer_count = peers.len() as u64;
+        drop(peers);
+        let parked = self.lock_parked().len() as u64;
+        (peer_count, outstanding, parked)
+    }
+
     fn lock_parked(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Instant>> {
         self.parked_peers
             .lock()
