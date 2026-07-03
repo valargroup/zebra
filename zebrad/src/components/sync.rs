@@ -298,6 +298,18 @@ const GENESIS_TIMEOUT_RETRY: Duration = Duration::from_secs(10);
 /// syncer simply finds no new blocks and idles.
 const ZAKURA_BODY_SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Regtest override for [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`].
+///
+/// The mainnet timeout (10 minutes) is far longer than the Zakura regtest e2e
+/// pr-gate's catch-up budget (~3 minutes), so a node that stalls on Zakura body
+/// sync in the pr-gate would never reach the fallback before the harness gives
+/// up. Regtest produces blocks on demand (not one per ~75s), so a working node
+/// still advances its verified tip every poll and never trips this; a genuinely
+/// stalled node falls back to legacy `ChainSync` fast enough for the pr-gate to
+/// recover within the run. Falling back early is harmless (see
+/// [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`]).
+const ZAKURA_BODY_SYNC_STALL_TIMEOUT_REGTEST: Duration = Duration::from_secs(60);
+
 /// How often [`ChainSync::bootstrap_genesis_then_pause`] polls the verified tip
 /// while watching for Zakura body-sync progress.
 const ZAKURA_BODY_SYNC_STALL_POLL: Duration = Duration::from_secs(10);
@@ -962,10 +974,16 @@ where
         );
 
         // Number of consecutive idle polls (no credited progress) that trip the
-        // fallback. `as_secs` is non-zero for both constants, so this is >= 1.
-        let max_idle_polls = (ZAKURA_BODY_SYNC_STALL_TIMEOUT.as_secs()
-            / ZAKURA_BODY_SYNC_STALL_POLL.as_secs())
-        .max(1);
+        // fallback. Regtest uses a much shorter timeout so the e2e pr-gate can
+        // exercise/recover through the fallback within its short catch-up budget.
+        // `as_secs` is non-zero for both constants, so this is >= 1.
+        let stall_timeout = if self.is_regtest {
+            ZAKURA_BODY_SYNC_STALL_TIMEOUT_REGTEST
+        } else {
+            ZAKURA_BODY_SYNC_STALL_TIMEOUT
+        };
+        let max_idle_polls =
+            (stall_timeout.as_secs() / ZAKURA_BODY_SYNC_STALL_POLL.as_secs()).max(1);
 
         let initial_tip = self.latest_chain_tip.best_tip_height();
         let mut tracker = ZakuraStallTracker::new(initial_tip);
@@ -989,7 +1007,7 @@ where
                     warn!(
                         verified_tip = ?verified_height,
                         header_tip = ?header_tip_height,
-                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        stall = ?stall_timeout,
                         "Zakura body sync is not closing the gap to the network tip; legacy \
                          fallback disabled (legacy_p2p is off), continuing to wait for Zakura"
                     );
@@ -999,7 +1017,7 @@ where
                     warn!(
                         verified_tip = ?verified_height,
                         header_tip = ?header_tip_height,
-                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        stall = ?stall_timeout,
                         "Zakura body sync is not closing the gap to the network tip; stopping \
                          Zakura sync drivers and falling back to legacy ChainSync so legacy peers \
                          can drive body sync"
