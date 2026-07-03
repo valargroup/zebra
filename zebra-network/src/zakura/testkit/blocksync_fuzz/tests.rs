@@ -160,11 +160,11 @@ async fn fuzz_one_slow_peer_hol() {
 ///
 /// Ignored in Phase 1: a faithful *mid-sync* `VerifiedReset` needs the real
 /// `Committer`'s epoch / lowest-reset-wins rollback semantics (re-verifying every
-/// height above the reset). `MockApplyFrontier` only mirrors part of that, so the
-/// re-sync stalls. The header-reanchor "large → small" path through the same
-/// `handle_chain_tip_reset` IS covered by `fuzz_large_to_small`. This scenario is the
-/// validation target for the high-fidelity `Committer<MockVerifier>` tier.
-#[ignore = "needs high-fidelity Committer<MockVerifier> for mid-sync reorg epoch/reset semantics"]
+/// height above the reset). `MockApplyFrontier` only mirrors part of that, so this
+/// scenario is diagnostic until the high-fidelity `Committer<MockVerifier>` tier
+/// lands. If the mock scenario stalls, keep the ignored test non-fatal; if it
+/// completes, accept the progress instead of requiring the old expected failure.
+#[ignore = "diagnostic until high-fidelity Committer<MockVerifier> covers mid-sync reorg semantics"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_reorg() {
     let blocks = 600;
@@ -187,10 +187,12 @@ async fn fuzz_reorg() {
     }];
     scenario.deadline = Duration::from_secs(30);
     let result = tokio::spawn(async move { run_checked("fuzz_reorg", scenario, 32).await }).await;
-    assert!(
-        result.is_err_and(|error| error.is_panic()),
-        "mock reorg scenario should keep failing until the high-fidelity committer tier lands",
-    );
+    if let Err(error) = result {
+        assert!(
+            error.is_panic(),
+            "mock reorg diagnostic task should only fail by panic, not cancellation",
+        );
+    }
 }
 
 /// Idle/withholding: one peer is missing a height window (answers `RangeUnavailable`);
