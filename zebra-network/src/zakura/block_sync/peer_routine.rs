@@ -29,8 +29,9 @@ use tokio_util::sync::CancellationToken;
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admit, floor_rescue_high, request_deadline, request_priority as classify_priority,
-        AdmissionOutcome, AdmissionSnapshot, RequestPriority,
+        admit, admit_received_body, floor_rescue_high, request_deadline,
+        request_priority as classify_priority, AdmissionOutcome, AdmissionSnapshot,
+        RequestPriority,
     },
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
@@ -1436,55 +1437,39 @@ impl PeerRoutine {
             return false;
         }
 
-        // The active request-estimate reservation this arrival ended, if any;
-        // released after the forward below.
-        let mut reserved_estimate = 0u64;
-        if is_pending {
+        // The reservation this arrival ended (an active competing request, or a
+        // stale charge on the claimed height); released after the forward below.
+        let ended_reservation = if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
-            let admitted_bytes =
-                match admit(&self.config, snapshot, height, height, serialized_bytes) {
-                    AdmissionOutcome::Admit(grant) => grant.max_request_bytes,
-                    AdmissionOutcome::LookaheadAtCap | AdmissionOutcome::InflightBudgetEmpty => {
-                        tracing::debug!(
-                            peer = ?self.peer,
-                            ?height,
-                            serialized_bytes,
-                            "not buffering unmatched queued block-sync body at look-ahead cap"
-                        );
-                        return true;
-                    }
-                };
-            if admitted_bytes < serialized_bytes {
+            if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
                 tracing::debug!(
                     peer = ?self.peer,
                     ?height,
                     serialized_bytes,
-                    admitted_bytes,
-                    "not buffering unmatched queued block-sync body; insufficient admitted budget"
+                    "not buffering unmatched queued block-sync body at look-ahead cap"
                 );
                 return true;
             }
 
-            // Claim this height into `in_flight` so it leaves `pending`. The
-            // received body charges no request budget, but any stale request
-            // reservation the height still owned is released.
+            // Claim this height into `in_flight` so it leaves `pending`; if it is
+            // already `in_flight` the take is a no-op and the Sequencer drops the
+            // later duplicate. The received body charges no request budget, but any
+            // stale request reservation the height still owned is released below.
             let _ = self.work.take_in_range(height, height, 1);
-            let stale_charge = self.work.claim_received(height);
-            self.budget.release(stale_charge);
             metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+            self.work.claim_received(height)
         } else {
             // First-completion-wins for a timed-out height already re-issued to
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
-            // request slot. The estimate is released after the forward below, like
-            // any receipt, so the body is never invisible to both counters.
+            // request slot.
             let Some(estimate) = self.work.release_active_reserved_height(height) else {
                 return false;
             };
-            reserved_estimate = estimate;
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-        }
+            estimate
+        };
 
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
@@ -1507,7 +1492,11 @@ impl PeerRoutine {
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
-        self.budget.release(reserved_estimate);
+        // Release the ended reservation only now that the body is counted in
+        // `sequencer_input_bytes`, mirroring the matched receipt path above, so
+        // the bytes are never invisible to both the limiter and the resident
+        // snapshot.
+        self.budget.release(ended_reservation);
         true
     }
 
@@ -2347,13 +2336,12 @@ mod tests {
     }
 
     /// First-completion-wins can settle a height a routine still owns to `Held` when
-    /// a competing peer delivers it first. This routine's teardown (`Drop`) must be
-    /// Held-aware: the held body is owned by the Sequencer, so `Drop` must neither
-    /// release its bytes a second time (the Sequencer releases them on commit) nor
-    /// re-queue a body already in the commit pipeline. The pre-fix `Drop` used
-    /// `release_and_return_items`, which for a `Held(actual)` height returned
-    /// `actual` — double-releasing the `ByteBudget` and re-queuing the height into
-    /// `pending`.
+    /// a competing peer delivers it first. This routine's teardown (`Drop`) must
+    /// skip a height whose reservation already ended: the winner owns the release
+    /// (after its forward) and the body is in the commit pipeline, so `Drop` must
+    /// neither release the estimate a second time nor re-queue the height. The
+    /// pre-fix `Drop` used `release_and_return_items`, which double-released the
+    /// `ByteBudget` and re-queued the height into `pending`.
     #[tokio::test]
     async fn routine_drop_leaves_a_body_won_by_another_peer_to_the_sequencer() {
         let config = ZakuraBlockSyncConfig::default();
@@ -2382,7 +2370,6 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (control_tx, _control_rx) = mpsc::unbounded_channel();
         let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
@@ -2403,7 +2390,6 @@ mod tests {
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
-            control_tx,
             actions_tx,
             routine_to_reactor_tx,
             view_rx,
@@ -2427,13 +2413,13 @@ mod tests {
         assert_eq!(budget_probe.reserved(), 1_000);
         assert_eq!(routine.window.outstanding.len(), 1);
 
-        // A competing peer delivers height 1 first: settle the shared reservation to
-        // `Held(actual)`. The estimate matches the actual, so the budget is unchanged
-        // and now holds the body's actual bytes.
-        let delta = work
-            .settle_active_reserved_height(block::Height(1), 1_000)
+        // A competing peer delivers height 1 first: its receipt ends the shared
+        // request reservation. The winner releases the estimate to the ByteBudget
+        // only after its forward, so it is still charged here.
+        let estimate = work
+            .release_active_reserved_height(block::Height(1))
             .expect("height 1 still owns its active reservation");
-        assert_eq!(delta, 0);
+        assert_eq!(estimate, 1_000);
         assert_eq!(budget_probe.reserved(), 1_000);
 
         // Tear the routine down while it still lists height 1 as unreceived. `Drop`

@@ -379,7 +379,11 @@ impl WorkQueue {
         released
     }
 
-    /// Release and return `in_flight` heights to `pending`.
+    /// Release and return `in_flight` heights to `pending`, whether or not their
+    /// reservation already ended. Production paths use the reserved-only variant
+    /// below (a received height must stay claimed for the commit pipeline); this
+    /// remains to exercise the raw return arithmetic in unit tests.
+    #[cfg(test)]
     pub(super) fn release_and_return_items(
         &self,
         heights: impl IntoIterator<Item = block::Height>,

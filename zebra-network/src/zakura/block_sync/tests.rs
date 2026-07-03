@@ -1056,6 +1056,30 @@ fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
 }
 
 #[test]
+fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
+    // A stored config whose request budget cannot cover one floor request
+    // (e.g. an old 16 MiB value) loads clamped to just above the floor instead
+    // of failing `validate`'s one-floor-request lower bound, so older nodes
+    // keep starting.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 16777216
+        "#,
+    )
+    .expect("a sub-floor-request max_inflight_block_bytes config still loads");
+    let request_floor = config.zakura.block_sync.floor_request_byte_reservation();
+    assert!(
+        16_777_216 <= request_floor,
+        "test premise: the stored value is at or below one floor request"
+    );
+    assert_eq!(
+        config.zakura.block_sync.max_inflight_block_bytes,
+        request_floor + 1
+    );
+}
+
+#[test]
 fn codec_round_trips_every_message_variant() {
     round_trip(BlockSyncMessage::Status(status()));
     round_trip(BlockSyncMessage::GetBlocks {
@@ -2207,14 +2231,14 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
 }
 
 #[test]
-fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
+fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
     // `stale_adjusted_disposition`, `finish_detached`) releases via
-    // `release_reserved_heights`. When a competing peer delivered a height late, it
-    // settled to `Held(actual)` in the shared queue; the owner must release only
-    // the still-reserved estimate and leave the held body for the Sequencer — never
-    // double-releasing its bytes. The non-Held-aware `release_heights` would return
-    // the held `actual` here and saturate the budget.
+    // `release_reserved_heights`. When a competing peer delivered a height late,
+    // its receipt ended that height's reservation in the shared queue; the owner
+    // must release only the still-reserved estimates and leave the received body
+    // to the winner (which releases the ended estimate after its forward) — never
+    // double-releasing.
     let queue = work_queue_with(
         0,
         [
@@ -2231,28 +2255,28 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
         200
     );
 
-    // A competing peer's late body settles height 1 to Held(80); height 2 stays
-    // reserved (never delivered).
-    let delta = queue
-        .settle_active_reserved_height(block::Height(1), 80)
+    // A competing peer's late body ends height 1's reservation; height 2 stays
+    // reserved (never delivered). The winner releases the estimate after its
+    // forward.
+    let estimate = queue
+        .release_active_reserved_height(block::Height(1))
         .expect("height 1 is reserved");
-    assert_eq!(delta, -20);
-    budget.release(20);
-    assert_eq!(budget.reserved(), 180);
+    assert_eq!(estimate, 100);
+    budget.release(estimate);
+    assert_eq!(budget.reserved(), 100);
 
-    // GC both heights: only the still-reserved height 2 releases. The Held height 1
-    // is skipped (owned by the Sequencer) and stays in `in_flight`.
+    // GC both heights: only the still-reserved height 2 releases. The received
+    // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
     let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
     budget.release(released);
     assert_eq!(
         released, 100,
-        "release_reserved_heights frees only the still-reserved estimate, never held body bytes"
+        "release_reserved_heights frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 80);
+    assert_eq!(budget.reserved(), 0);
 
-    // The Sequencer releases the held body on commit; nothing drifts.
-    budget.release(80);
+    // Floor GC clears the bookkeeping; nothing drifts.
     assert_eq!(queue.advance_floor(block::Height(2)), 0);
     assert_eq!(budget.reserved(), 0);
 }
@@ -4000,12 +4024,64 @@ fn budget_audit_catches_injected_drift() {
     let mut budget = ByteBudget::new(1_000);
     assert!(budget.try_reserve(400));
     assert!(budget.audit(400, "test matching audit"));
+    // A budget excess is expected receipt-handoff skew (paired call sites drain
+    // the source ledger before releasing the budget), never drift.
+    assert!(budget.audit(300, "test transient handoff excess"));
+    // A budget shortfall cannot be produced by any healthy interleaving
+    // (a double release or lost charge): drift.
     assert!(
-        !budget.audit(300, "test injected drift"),
-        "audit reports mismatched derived accounting"
+        !budget.audit(500, "test injected drift"),
+        "audit reports a budget shortfall as drift"
     );
     budget.release(400);
     assert!(budget.audit(0, "test released audit"));
+}
+
+#[test]
+fn received_body_admission_ignores_request_budget() {
+    // A received body consumes no request budget, so a wire budget saturated by
+    // outstanding requests must not cause it to be dropped and re-downloaded:
+    // only the commit-window exemption and the resident gate apply.
+    let config = ZakuraBlockSyncConfig {
+        max_reorder_lookahead_bytes: 1_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(600),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        // Outstanding requests have spent the entire in-flight budget.
+        budget_available: 0,
+    };
+    let factor = super::admission::DESERIALIZED_MEM_FACTOR;
+    // In-window heights (<= verified_tip 10 + 401 = 411) stay exempt.
+    assert!(super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(411),
+        2_000_000,
+    ));
+    // Above the window the resident gate is the sole authority: a body within
+    // the remaining headroom is retained even with zero request budget...
+    assert!(super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(602),
+        1_000 / factor,
+    ));
+    // ...and one that would breach the resident budget once decoded is refused.
+    assert!(!super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(602),
+        1_000 / factor + 1,
+    ));
 }
 
 proptest::proptest! {

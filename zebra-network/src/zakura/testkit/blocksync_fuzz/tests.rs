@@ -836,9 +836,12 @@ async fn fuzz_mixed_block_sizes() {
 /// resume the instant each stall clears so the run still reaches the target.
 ///
 /// `run_checked` already asserts the target is reached (vtip resumes; no commit-induced
-/// wedge). On top of that we assert the peak retained resident cost stayed within the
-/// configured resident budget plus the commit-window exemption, yet real retention
-/// pressure built up (the bound is not vacuous).
+/// wedge). On top of that we assert real retention pressure built up (peak retained
+/// resident at least half the budget) and that the peak stayed within the budget plus
+/// the commit-window exemption. At this 400-block chain length the window slack alone
+/// covers the whole chain, so that upper bound cannot bind here — the tight-bound check
+/// is the 1_200-block `fuzz_commit_stall_resident_plateau` variant; this test pins the
+/// no-stall, pressure, and quiescence behavior of the bursty stall shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_commit_stall() {
     let blocks = 400;

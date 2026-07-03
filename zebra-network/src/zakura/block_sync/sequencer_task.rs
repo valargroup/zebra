@@ -647,9 +647,10 @@ impl SequencerTask {
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         // Cross-layer drift check: the independently-maintained `ByteBudget` total
-        // must equal the work queue's outstanding-request reservations (retained
-        // bodies never charge it). `work.reserved_bytes()` is an O(1) counter, so
-        // this runs on every event without a work-queue scan.
+        // must cover the work queue's outstanding-request reservations (retained
+        // bodies never charge it; a transient excess is expected receipt-handoff
+        // skew, see `ByteBudget::audit`). `work.reserved_bytes()` is an O(1)
+        // counter, so this runs on every event without a work-queue scan.
         self.budget
             .audit(self.work.reserved_bytes(), "block-sync sequencer view");
         let _ = self.view_tx.send_replace(SequencerView {

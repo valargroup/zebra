@@ -485,6 +485,27 @@ impl ZakuraBlockSyncConfig {
         }
     }
 
+    /// Clamp a positive but sub-floor-request `max_inflight_block_bytes` up to
+    /// just above one floor request.
+    ///
+    /// `validate()` requires the outstanding-request budget to cover at least
+    /// one floor request (the bounded floor overdraft repays against it).
+    /// Rather than refuse to start — which would break older configs written
+    /// when the field also bounded retention and small values were clamped —
+    /// raise the budget to the smallest valid value and warn.
+    pub fn clamp_inflight_block_bytes_to_request_floor(&mut self) {
+        let request_floor = self.floor_request_byte_reservation();
+        if self.max_inflight_block_bytes > 0 && self.max_inflight_block_bytes <= request_floor {
+            tracing::warn!(
+                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
+                floor_request_byte_reservation = request_floor,
+                "zakura.block_sync.max_inflight_block_bytes cannot cover one floor \
+                 request; clamping it up so the node can start",
+            );
+            self.max_inflight_block_bytes = request_floor.saturating_add(1);
+        }
+    }
+
     /// Build the inert local status used before the block-sync reactor is wired.
     pub fn initial_status(&self) -> BlockSyncStatus {
         BlockSyncStatus {

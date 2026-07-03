@@ -243,6 +243,39 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
         || held_blocks(snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP
 }
 
+/// Remaining resident look-ahead headroom, expressed back in wire bytes so one
+/// admitted response cannot push resident memory past the budget. The next
+/// admitted body will usually become decoded soon, so it is sized as if it
+/// costs the decoded multiple.
+fn remaining_lookahead_wire_bytes(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: &AdmissionSnapshot,
+) -> u64 {
+    config
+        .effective_max_reorder_lookahead_bytes()
+        .saturating_sub(estimated_resident_pipeline_bytes(snapshot))
+        / DESERIALIZED_MEM_FACTOR
+}
+
+/// Retention-only admission for a body that is already downloaded.
+///
+/// A received body consumes no request budget (its wire reservation is
+/// released at receipt), so unlike [`admit`] this never consults
+/// `budget_available`: only the commit-window exemption and the resident
+/// look-ahead gate — the two rules that bound retention — apply.
+pub(super) fn admit_received_body(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: &AdmissionSnapshot,
+    height: block::Height,
+    serialized_bytes: u64,
+) -> bool {
+    if height <= commit_window_high(snapshot) {
+        return true;
+    }
+    !lookahead_over_budget(config, snapshot)
+        && serialized_bytes <= remaining_lookahead_wire_bytes(config, snapshot)
+}
+
 /// Plans one contiguous take starting at `start_height`: the single authority for
 /// the commit-window exemption, the resident-memory gate, and request sizing.
 ///
@@ -290,13 +323,7 @@ pub(super) fn admit(
         if lookahead_over_budget(config, &snapshot) {
             return AdmissionOutcome::LookaheadAtCap;
         }
-        // Remaining memory headroom, expressed back in wire bytes for the response cap so a
-        // single response can't push resident memory past the budget. The next admitted body
-        // will usually become decoded soon, so it is sized as if it costs the decoded multiple.
-        let remaining_wire_bytes = config
-            .effective_max_reorder_lookahead_bytes()
-            .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
-            / DESERIALIZED_MEM_FACTOR;
+        let remaining_wire_bytes = remaining_lookahead_wire_bytes(config, &snapshot);
         if remaining_wire_bytes == 0 {
             return AdmissionOutcome::LookaheadAtCap;
         }

@@ -134,13 +134,21 @@ impl ByteBudget {
 
     /// Audit the shared counter against an externally-derived expected value.
     ///
-    /// The expected value can be a cross-task snapshot, so transient handoff
-    /// skew is recorded as a metric rather than emitted as a warning.
+    /// The expected value is a cross-task snapshot, and every paired call site
+    /// orders its two ledgers the same way: reserve paths charge this budget
+    /// before marking the source ledger, and release paths drain the source
+    /// ledger before releasing here. Healthy handoff skew (e.g. a routine
+    /// parked between receipt and the post-forward release) therefore only
+    /// ever leaves the budget *above* the expected value, so an excess is not
+    /// counted as drift — a *persistent* excess (a leaked release) is caught
+    /// by the quiescence drain checks instead. Only a shortfall, which no
+    /// healthy interleaving can produce (a double release or lost charge), is
+    /// recorded as drift.
     ///
-    /// Returns `true` when the budget matches.
+    /// Returns `true` when the budget covers the expected value.
     pub(crate) fn audit(&self, expected: u64, _context: &'static str) -> bool {
         let actual = self.reserved();
-        let ok = actual == expected;
+        let ok = actual >= expected;
         if !ok {
             metrics::counter!("sync.block.budget.audit_drift").increment(1);
         }
