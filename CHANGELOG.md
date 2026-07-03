@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed
+
+- Removed two Zakura block-sync config fields that never needed operator
+  tuning: `max_reorder_lookahead_blocks` (the defense-in-depth block-count cap
+  is now a fixed internal constant; the resident-memory budget remains the
+  primary bound) and `fanout` (a legacy reservation multiplier with no effect
+  on scheduling). Configs that still set either key will fail to parse and
+  should drop the lines.
+
 ### Fixed
 
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
@@ -110,6 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather
   than the earlier conservative test-network envelope.
+- Bound Zakura block-sync requests to non-responsive peers with a probe-first
+  no-progress policy: peers receive only `initial_block_probe_requests` before
+  their first accepted block body, then `max_requests_without_block_progress`
+  becomes the hard cap before liveness disconnects them.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note

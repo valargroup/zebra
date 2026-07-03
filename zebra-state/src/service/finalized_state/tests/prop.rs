@@ -134,6 +134,10 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                         .source()
                         .and_then(|source| source.downcast_ref::<crate::error::CommitBlockError>())
                         .expect("checkpoint commit error wraps a commit block error");
+                    // The committer trusts the precomputed root without re-deriving it
+                    // from the body, so a bad value fails the ZIP-244 header commitment
+                    // check (the header committed to the real root) rather than a
+                    // dedicated auth-data-root comparison.
                     let bad_auth_root_is_rejected = matches!(
                         commit_error,
                         crate::error::CommitBlockError::ValidateContextError(source)

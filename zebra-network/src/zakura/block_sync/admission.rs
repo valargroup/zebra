@@ -13,6 +13,10 @@ use super::{
 /// with the `request_timeout` base the above-floor deadline tops out near 16 s — the
 /// "a block every ~16 s is fine" tolerance the directive sets for speculative work.
 const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+/// Delivery rate assumed for floor rescue before a peer has a fresh byte-rate
+/// sample. This keeps the rescue leash short while allowing a full 2 MB body roughly
+/// two seconds of transfer time.
+const FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// Estimated resident-memory multiple of a buffered block body's serialized size.
 ///
@@ -107,9 +111,10 @@ pub(super) fn request_priority(
 
 /// The per-request network deadline (the one sanctioned timer), set by priority:
 ///
-/// - **Floor**: a short fixed leash. On expiry the lowest missing height is rescued
-///   to a faster carrier (returned to the queue + the peer retry-avoided), so the
-///   contiguous floor never waits on a slow peer — and the peer is *not* disconnected.
+/// - **Floor**: a short rescue leash plus the expected transfer time. On expiry the
+///   lowest missing height is rescued to a faster carrier (returned to the queue + the
+///   peer retry-avoided), so the contiguous floor never waits on a slow peer — and the
+///   peer is *not* disconnected.
 /// - **Above-floor**: the base `request_timeout` plus the size-expected transfer time
 ///   (`estimated_bytes / BtlBw`), so a legitimately slow large-body fetch runs to
 ///   completion. These deadlines never gate the floor, so they can afford to be
@@ -124,7 +129,13 @@ pub(super) fn request_deadline(
     btlbw_bytes_per_sec: Option<u64>,
 ) -> Instant {
     match priority {
-        RequestPriority::Floor => queued_at + floor_rescue_timeout,
+        RequestPriority::Floor => {
+            let rate = btlbw_bytes_per_sec
+                .unwrap_or(0)
+                .max(FLOOR_DEADLINE_MIN_BYTES_PER_SEC);
+            let transfer = Duration::from_secs_f64(estimated_bytes as f64 / rate as f64);
+            queued_at + floor_rescue_timeout + transfer
+        }
         RequestPriority::AboveFloor => {
             let rate = btlbw_bytes_per_sec
                 .unwrap_or(0)
@@ -149,6 +160,16 @@ pub(super) fn request_deadline(
 /// memory gate.
 const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
 
+/// Hard block-count cap on speculative look-ahead bookkeeping.
+///
+/// Defense-in-depth on the map/bookkeeping size only; the resident-memory
+/// budget is the primary bound on buffered bodies. This cap binds before the
+/// byte gate only when the average retained body is smaller than
+/// `effective_budget / (DESERIALIZED_MEM_FACTOR × 262_144)` wire bytes
+/// (~6.1 KB at the default budget), i.e. for tiny early-chain bodies whose
+/// per-entry bookkeeping overhead the flat resident factor does not model.
+pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
+
 /// Highest height exempt from look-ahead backpressure: the top of the commit window
 /// ([`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS`] above the verified tip). Anchored to the
 /// verified tip — which advances only on commit — so the window cannot escalate with
@@ -164,18 +185,47 @@ fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
     )
 }
 
+/// Wire bytes of block bodies retained by the pipeline: the single formula
+/// behind the `retained_pipeline_wire_bytes` trace field and the resident
+/// estimate, so every emitter and gate agrees on what "retained" means.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RetainedPipelineBytes {
+    pub(super) reorder_buffered_bytes: u64,
+    pub(super) applying_buffered_bytes: u64,
+    pub(super) sequencer_input_queued_bytes: u64,
+}
+
+impl RetainedPipelineBytes {
+    /// Total wire bytes of retained bodies (the `retained_pipeline_wire_bytes`
+    /// trace field).
+    pub(super) fn wire_bytes(self) -> u64 {
+        self.reorder_buffered_bytes
+            .saturating_add(self.applying_buffered_bytes)
+            .saturating_add(self.sequencer_input_queued_bytes)
+    }
+}
+
+impl AdmissionSnapshot {
+    fn retained(&self) -> RetainedPipelineBytes {
+        RetainedPipelineBytes {
+            reorder_buffered_bytes: self.reorder_buffered_bytes,
+            applying_buffered_bytes: self.applying_buffered_bytes,
+            sequencer_input_queued_bytes: self.sequencer_input_queued_bytes,
+        }
+    }
+}
+
 /// Estimated resident memory of block bodies retained by, or already committed
 /// to enter, the pipeline.
 ///
-/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`).Applying and
+/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`). Applying and
 /// sequencer queues already hold decoded blocks; reorder and reserved bytes may
 /// still be wire/in-flight, but a gap-fill can decode them into applying without
 /// another admission check.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     snapshot
-        .reorder_buffered_bytes
-        .saturating_add(snapshot.applying_buffered_bytes)
-        .saturating_add(snapshot.sequencer_input_queued_bytes)
+        .retained()
+        .wire_bytes()
         .saturating_add(snapshot.reserved_above_floor_bytes)
         .saturating_mul(DESERIALIZED_MEM_FACTOR)
 }
@@ -190,7 +240,7 @@ fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
 /// Whether the resident-memory look-ahead budget (or the block cap) is already full.
 fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSnapshot) -> bool {
     estimated_resident_pipeline_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
-        || held_blocks(snapshot) >= u64::from(config.max_reorder_lookahead_blocks)
+        || held_blocks(snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP
 }
 
 /// Plans one contiguous take starting at `start_height`: the single authority for
@@ -281,7 +331,7 @@ mod tests {
     const RESCUE: Duration = Duration::from_secs(2);
 
     #[test]
-    fn floor_request_uses_the_short_rescue_leash() {
+    fn floor_request_leash_is_size_aware() {
         let now = Instant::now();
         let deadline = request_deadline(
             RequestPriority::Floor,
@@ -291,8 +341,10 @@ mod tests {
             2_000_000,
             None,
         );
-        // The floor is rescued on the fixed leash regardless of size or measured rate.
-        assert_eq!(deadline, now + RESCUE);
+        assert_eq!(
+            deadline,
+            now + RESCUE + Duration::from_secs_f64(2_000_000_f64 / (1024_f64 * 1024_f64))
+        );
     }
 
     #[test]
@@ -411,25 +463,18 @@ mod tests {
         );
     }
 
-    /// A sub-range configured budget/block cap is clamped up so checkpoint sync cannot wedge.
+    /// A sub-range configured budget is clamped up so checkpoint sync cannot wedge.
     #[test]
     fn clamp_reorder_lookahead_floors_sub_range_configs() {
-        use super::super::config::{
-            BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
-        };
+        use super::super::config::BS_CHECKPOINT_RANGE_BYTE_FLOOR;
         let mut config = ZakuraBlockSyncConfig {
             max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB resident, far below one range
-            max_reorder_lookahead_blocks: 8,          // far below one range
             ..ZakuraBlockSyncConfig::default()
         };
         config.clamp_reorder_lookahead_to_floor();
         assert!(
             config.max_reorder_lookahead_bytes
                 >= BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR)
-        );
-        assert!(
-            config.max_reorder_lookahead_blocks as usize
-                >= MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
         );
     }
 }
