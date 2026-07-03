@@ -154,7 +154,7 @@ alike. The wire rejects roots a request opted out of, a root count that does not
 header count, and per-height misalignment as `MalformedMessage` (§8.1). When a header range
 commits via `CommitHeaderRange`, its roots are **persisted into the
 `commitment_roots_by_height` column family ahead of body commit** (§5.3). Only roots below
-the last checkpoint are ever *consumed* by the committer, and only after verify-before-commit
+the last checkpoint are ever _consumed_ by the committer, and only after verify-before-commit
 (§6); roots for header-ahead heights above it are provisional serving data only (§9). The committer then reads them per height through the `PeerSource` seam.
 The same header commit stores non-zero advertised body-size hints in
 `zakura_header_body_size_by_height`, so block sync can later request realistic ranges even
