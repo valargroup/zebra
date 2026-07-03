@@ -1167,7 +1167,7 @@ impl DiskWriteBatch {
         self.zs_insert(&orchard_anchors, root, ());
     }
 
-    /// POC: inserts only the Ironwood anchor `root` (value `()`), without writing a
+    /// Inserts only the Ironwood anchor `root` (value `()`), without writing a
     /// per-height tree. The Ironwood twin of [`Self::insert_sapling_anchor`].
     pub fn insert_ironwood_anchor(&mut self, zebra_db: &ZebraDb, root: &ironwood::tree::Root) {
         let ironwood_anchors = zebra_db.db.cf_handle("ironwood_anchors").unwrap();
