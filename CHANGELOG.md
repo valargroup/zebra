@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed an intermittent Zakura sync wedge on a node with a single block-sync
+  peer. When a node makes early block progress via another source — inbound
+  gossip or the legacy `BlocksByHash` path on a dual-stack node — its Zakura
+  block-sync peer stays "unproven" and pinned at the initial one-probe cap,
+  because that progress does not flow through the peer's own body handler. If it
+  is the node's only peer, the no-progress liveness reaper then disconnects it
+  and the node wedges below the tip with no way to pull the remaining backfill.
+  A non-destructive committed-view advance now credits the peer's no-progress
+  probe budget when the verified tip advances via any source, so a progressing
+  node's sole peer keeps probing. In addition, on regtest the body-sync stall
+  watchdog now falls back to the legacy downloader after 60s (rather than the
+  mainnet 10 minutes) so a stalled node recovers within the regtest e2e budget.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
