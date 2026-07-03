@@ -1050,15 +1050,17 @@ impl<'de> Deserialize<'de> for Config {
             non_zero_config_field.filter(|config_value| config_value > &0).unwrap_or(default_config_value)
         });
 
-        // Clamp the in-flight byte budget up to the checkpoint-range floor (with a
-        // warning) rather than rejecting too-small configs, so older configs keep
-        // starting while checkpoint sync stays deadlock-free.
+        // Clamp too-small budgets up (with a warning) rather than rejecting the
+        // config: the resident look-ahead budget up to one checkpoint range, so
+        // the resident-memory admission gate cannot deadlock checkpoint sync when
+        // verified_tip is pinned to the previous checkpoint; and the in-flight
+        // request budget up to just above one floor request, so stored configs
+        // written when that field also bounded retention keep starting.
         let mut zakura = zakura;
-        zakura.block_sync.clamp_inflight_block_bytes_to_floor();
-        // Likewise clamp the resident look-ahead budget (and its block cap) up to one
-        // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
-        // sync when verified_tip is pinned to the previous checkpoint.
         zakura.block_sync.clamp_reorder_lookahead_to_floor();
+        zakura
+            .block_sync
+            .clamp_inflight_block_bytes_to_request_floor();
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;

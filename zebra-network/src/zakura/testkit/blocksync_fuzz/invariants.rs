@@ -20,7 +20,8 @@ pub(crate) struct InvariantReport {
     pub(crate) state_samples: usize,
     /// Peak aggregate in-flight requests across all peers.
     pub(crate) max_outstanding: u64,
-    /// Peak reserved download bytes (memory pressure).
+    /// Peak reserved outstanding-request bytes (wire-limiter pressure; received
+    /// bodies release their reservation, so this excludes retained bodies).
     pub(crate) peak_budget_reserved: u64,
     /// Peak retained pipeline wire bytes (`sequencer_input + reorder + applying`), the
     /// wire-byte footprint of bodies actually held in memory. Multiplied by the
@@ -271,17 +272,36 @@ pub(crate) fn assert_core(
         outstanding_bound,
     );
 
-    // The global byte budget is never over-committed: peak reserved download bytes
-    // (in-flight + reorder + applying) must stay within the configured ceiling. Every
-    // per-peer routine reserves against the same CAS-guarded `ByteBudget`, so this must
-    // hold no matter how many peers race — the memory bound the spec requires. Vacuous
-    // only for scenarios that set an effectively unbounded budget (`u64::MAX`); the
-    // tight-ceiling scenarios make it bite.
+    // The global request budget is never over-committed beyond its bounded floor
+    // overdraft: peak reserved outstanding-request bytes stay within the configured
+    // ceiling plus at most one floor request's reservation. Every per-peer routine
+    // reserves against the same CAS-guarded `ByteBudget`, so this must hold no matter
+    // how many peers race. Vacuous only for scenarios that set an effectively
+    // unbounded budget (`u64::MAX`); the tight-ceiling scenarios make it bite.
+    let overdraft_slack = scenario.config.floor_request_byte_reservation();
     assert!(
-        report.peak_budget_reserved <= scenario.config.max_inflight_block_bytes,
-        "peak reserved bytes {} exceeded the global in-flight byte budget {}",
+        report.peak_budget_reserved
+            <= scenario
+                .config
+                .max_inflight_block_bytes
+                .saturating_add(overdraft_slack),
+        "peak reserved bytes {} exceeded the in-flight request budget {} (+{} floor-overdraft slack)",
         report.peak_budget_reserved,
         scenario.config.max_inflight_block_bytes,
+        overdraft_slack,
+    );
+
+    // Quiescence: `budget_reserved` tracks outstanding requests only, so every
+    // reservation must have drained (receipt, timeout, watchdog, floor GC, or
+    // reset — each exactly once). The receipt release is ordered *after* the body
+    // is handed to the sequencer, so the harness's final snapshot can race one
+    // in-flight release; allow at most that one request's worth of remnant.
+    assert!(
+        report.final_budget_reserved <= overdraft_slack,
+        "reserved request bytes {} must drain to zero at quiescence (allowing one \
+         in-flight receipt release, <= {})",
+        report.final_budget_reserved,
+        overdraft_slack,
     );
 }
 

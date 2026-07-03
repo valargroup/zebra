@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- The Zakura block-sync request budget (`max_inflight_block_bytes`) is now
+  purely an outstanding-request cap: a body's wire reservation is released
+  when it is received instead of being held until the block is durable, so the
+  resident look-ahead budget (`max_reorder_lookahead_bytes`) is the single
+  bound on retained memory. Operators who used `max_inflight_block_bytes` to
+  bound node memory should set `max_reorder_lookahead_bytes` instead. The
+  request budget is also no longer raised to one checkpoint range (~802 MB) at
+  config load: configured values load unchanged, except values too small to
+  cover a single block request (~32 MiB with default response limits), which
+  are clamped to just above that floor with a warning rather than failing to
+  start. The `budget_reserved` trace field and metric keep their names but now
+  report outstanding request bytes only (previously they included retained
+  body bytes).
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator
