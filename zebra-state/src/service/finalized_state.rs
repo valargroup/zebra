@@ -846,7 +846,7 @@ impl FinalizedState {
                         {
                             // Last checkpoint verification: verify the supplied frontiers against
                             // this block's verified roots.
-                            self.vct_verify_handoff_frontier_roots(
+                            self.vct_verify_last_checkpoint_frontier_roots(
                                 height,
                                 &sapling_frontier,
                                 &orchard_frontier,
@@ -1126,7 +1126,7 @@ impl FinalizedState {
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
-    fn vct_verify_handoff_frontier_roots(
+    fn vct_verify_last_checkpoint_frontier_roots(
         &mut self,
         height: block::Height,
         sapling_frontier: &sapling::tree::NoteCommitmentTree,
