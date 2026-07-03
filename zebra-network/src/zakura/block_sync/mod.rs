@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{self, Cursor, Read, Write},
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time,
+    time::{self, Instant},
 };
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{

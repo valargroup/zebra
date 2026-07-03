@@ -23,9 +23,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Mutex as StdMutex,
-    time::Instant,
 };
 
+use tokio::time::Instant;
 use zebra_chain::block;
 
 use super::{
