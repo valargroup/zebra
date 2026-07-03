@@ -278,7 +278,10 @@ impl VctState {
 /// fast path depends on, grouped so their invariants live next to the data they guard.
 #[derive(Clone, Debug)]
 pub(crate) struct VctCommitState {
-    /// The root source (peer/fixture/capture mode), or `None` for legacy recompute.
+    /// The root source (peer/fixture/capture mode), or `None` for any of:
+    /// - checkpoint sync is disabled
+    /// - vct fast sync is disabled
+    /// - legacy Zebra checkpoint sync
     source: Option<Arc<VctState>>,
 
     /// `(height, hash)` of the next block already validated by the previous fast

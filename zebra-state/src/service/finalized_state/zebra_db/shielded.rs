@@ -778,10 +778,6 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         fast_write: VctWriteData,
     ) {
-        let VctWriteData {
-            anchor_roots: vct_anchor_roots,
-            sync_below: vct_sync_below,
-        } = fast_write;
         let FinalizedBlock {
             height,
             treestate:
@@ -823,7 +819,7 @@ impl DiskWriteBatch {
         // below the checkpoint handoff height). Written in the same atomic batch as
         // every vct commit, so a vct-synced database always carries the marker and
         // the read/validity guards never see absent trees without it.
-        if let Some(handoff) = vct_sync_below {
+        if let Some(handoff) = fast_write.sync_below {
             self.update_vct_sync_marker(zebra_db, handoff);
         }
 
@@ -834,7 +830,7 @@ impl DiskWriteBatch {
         // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
         // modern checkpoint, so it is correctly left untouched here.
         // See docs/design/verified-commitment-trees.md.
-        if let Some((sapling_root, orchard_root)) = vct_anchor_roots {
+        if let Some((sapling_root, orchard_root)) = fast_write.anchor_roots {
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);
             // Persist the per-height roots into the serving index even though no per-height
