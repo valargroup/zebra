@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use super::{await_until, TraceCapture, ZakuraTestNode};
-use crate::{zakura::ZakuraPeerId, BoxError};
+use crate::{
+    zakura::{ZakuraConnId, ZakuraPeerId},
+    BoxError,
+};
 
 /// Supported deterministic topologies.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -306,7 +309,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let senders = self.senders.clone();
             let peer = peer.clone();
             tokio::spawn(async move {
@@ -379,7 +382,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let _ = self.events.send(TaskExitProbeEvent::Removed(peer.clone()));
         }
     }

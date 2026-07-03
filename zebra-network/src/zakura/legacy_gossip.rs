@@ -42,9 +42,9 @@ use crate::{
 use super::{
     spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
     FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
-    SinkReject, Stream, StreamMode, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES,
-    ZAKURA_CAP_LEGACY_GOSSIP,
+    SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId,
+    ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE,
+    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -1296,11 +1296,17 @@ impl LegacyGossipOutbound {
             .insert(session.peer_id().clone(), session);
     }
 
-    fn remove(&self, peer: &ZakuraPeerId) {
-        self.sessions
+    fn remove(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        let mut sessions = self
+            .sessions
             .lock()
-            .expect("legacy gossip outbound mutex is never poisoned")
-            .remove(peer);
+            .expect("legacy gossip outbound mutex is never poisoned");
+        if sessions
+            .get(peer)
+            .is_some_and(|session| session.conn_id() == conn_id)
+        {
+            sessions.remove(peer);
+        }
     }
 
     #[cfg(test)]
@@ -1386,17 +1392,26 @@ fn should_panic_legacy_gossip_recv_loop(peer: &ZakuraPeerId) -> bool {
 #[derive(Clone, Debug)]
 pub struct LegacyGossipPeerSession {
     peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
     send: FramedSend,
 }
 
 impl LegacyGossipPeerSession {
-    fn new(peer_id: ZakuraPeerId, send: FramedSend) -> Self {
-        Self { peer_id, send }
+    fn new(peer_id: ZakuraPeerId, conn_id: ZakuraConnId, send: FramedSend) -> Self {
+        Self {
+            peer_id,
+            conn_id,
+            send,
+        }
     }
 
     /// Authenticated peer identity for this legacy gossip stream.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    fn conn_id(&self) -> ZakuraConnId {
+        self.conn_id
     }
 
     /// Send an explicit block advertisement.
@@ -2325,8 +2340,9 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let peer_id = peer.id.clone();
+        let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
-        let session = LegacyGossipPeerSession::new(peer_id.clone(), send);
+        let session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, send);
 
         outbound.insert(session.clone());
         let replay_task_peer_id = peer_id.clone();
@@ -2338,7 +2354,7 @@ impl ZakuraService for LegacyGossipSink {
             || {},
             move || {
                 replay_panic_cancel.cancel();
-                replay_panic_outbound.remove(&replay_panic_peer_id);
+                replay_panic_outbound.remove(&replay_panic_peer_id, conn_id);
             },
             {
                 let outbound = outbound.clone();
@@ -2360,18 +2376,18 @@ impl ZakuraService for LegacyGossipSink {
             || {},
             move || {
                 recv_panic_cancel.cancel();
-                recv_panic_outbound.remove(&recv_panic_peer_id);
+                recv_panic_outbound.remove(&recv_panic_peer_id, conn_id);
             },
             async move {
                 loop {
                     let frame = tokio::select! {
                         _ = cancel_token.cancelled() => {
-                            outbound.remove(&peer_id);
+                            outbound.remove(&peer_id, conn_id);
                             return;
                         }
                         frame = recv.recv() => {
                             let Some(frame) = frame else {
-                                outbound.remove(&peer_id);
+                                outbound.remove(&peer_id, conn_id);
                                 return;
                             };
                             frame
@@ -2392,7 +2408,7 @@ impl ZakuraService for LegacyGossipSink {
                                 "legacy gossip stream rejected protocol-invalid frame"
                             );
                             cancel_token.cancel();
-                            outbound.remove(&peer_id);
+                            outbound.remove(&peer_id, conn_id);
                             return;
                         }
                         Err(SinkReject::Local(error)) => {
@@ -2405,8 +2421,8 @@ impl ZakuraService for LegacyGossipSink {
         );
     }
 
-    fn remove_peer(&self, peer: &ZakuraPeerId) {
-        self.outbound.remove(peer);
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.outbound.remove(peer, conn_id);
     }
 
     fn deliver_frame(
@@ -4138,8 +4154,8 @@ mod tests {
 
         let result = send_to_sessions(
             vec![
-                LegacyGossipPeerSession::new(saturated_peer, saturated),
-                LegacyGossipPeerSession::new(honest_peer, honest),
+                LegacyGossipPeerSession::new(saturated_peer, 0, saturated),
+                LegacyGossipPeerSession::new(honest_peer, 0, honest),
             ],
             LegacyGossipFrame::AdvertiseBlock(block_hash),
         );
@@ -4171,7 +4187,7 @@ mod tests {
 
         let peer_id = ZakuraPeerId::new(vec![91; 32]).expect("test peer id is within bounds");
         let (sender, mut receiver) = framed_channel(1);
-        let session = LegacyGossipPeerSession::new(peer_id, sender);
+        let session = LegacyGossipPeerSession::new(peer_id, 0, sender);
         broadcast.outbound.insert(session.clone());
         broadcast
             .outbound
@@ -4245,7 +4261,7 @@ mod tests {
         drop(rx);
 
         let error = send_to_sessions(
-            vec![LegacyGossipPeerSession::new(peer_id, disconnected)],
+            vec![LegacyGossipPeerSession::new(peer_id, 0, disconnected)],
             LegacyGossipFrame::AdvertiseBlock(block_hash(8)),
         )
         .expect_err("closed outbound queue reports an adapter error");
