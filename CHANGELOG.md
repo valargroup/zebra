@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
+  requests when an initial `Status` advertisement was dropped by a full outbound
+  queue. Status send bookkeeping now only records queued frames, header sync
+  retries unsent status advertisements, and block sync replies to the first
+  inbound status so peers converge after dropped connect-time advertisements.
+
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
