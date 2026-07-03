@@ -70,7 +70,7 @@ fn target(blocks: u32) -> block::Height {
 }
 
 /// Steady state: several fast, full-range peers. Baseline throughput + invariants.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_steady() {
     let blocks = 300;
     let scenario = Scenario::new(
@@ -90,7 +90,7 @@ async fn fuzz_steady() {
 /// work by reserved body bytes instead of request count. End-to-end seam check — the
 /// byte-denominated `available_slots` gate must still drive the real reactor to the tip
 /// without stalling.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_steady_bytes_unit() {
     let blocks = 300;
     let config = ZakuraBlockSyncConfig {
@@ -119,7 +119,7 @@ async fn fuzz_steady_bytes_unit() {
 /// behavior); the "not reaped" invariant is covered deterministically by
 /// `block_liveness_progress_before_deadline_keeps_peer_alive`, and the floor-HoL p99 is a
 /// live-trace metric.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_one_slow_peer_hol() {
     let blocks = 300;
     let config = ZakuraBlockSyncConfig {
@@ -172,12 +172,12 @@ async fn fuzz_one_slow_peer_hol() {
 // The `VerifiedReset` timeline shape is preserved in git history; the reanchor
 // "large → small" path is covered deterministically by `fuzz_large_to_small`.
 #[ignore = "needs high-fidelity Committer<MockVerifier> for mid-sync reorg epoch/reset semantics"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_reorg() {}
 
 /// Idle/withholding: one peer is missing a height window (answers `RangeUnavailable`);
 /// a covering peer serves it. The node must route around the gap. Deterministic.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_idle_peers() {
     let blocks = 300;
     let withholder = PeerSpec::with_serve(
@@ -204,7 +204,7 @@ async fn fuzz_idle_peers() {
 /// re-request path before a healthy peer covers it. The contiguous-commit invariant
 /// (`reached_target`) proves a silently-dropping peer never wedges sync, and the
 /// re-request count proves the timeout path was actually exercised (non-vacuous).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_silent_dropping_peer() {
     let blocks = 300;
     let config = ZakuraBlockSyncConfig {
@@ -247,7 +247,7 @@ async fn fuzz_silent_dropping_peer() {
 /// end-to-end proof (through the real routine) that the reliability discount engages,
 /// complementing the `bbr::bbr_tests` unit coverage. Sync still completes: the discount
 /// never latches the cwnd at zero, so the carrier keeps redeeming its dropped heights.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_reliability_discounts_dropping_carrier() {
     let blocks = 120;
     let half = block::Height(blocks / 2);
@@ -311,7 +311,7 @@ fn degrade_config() -> ZakuraBlockSyncConfig {
 /// progress (covered deterministically by the `block_liveness_*` unit tests in
 /// `block_sync/tests.rs`): here the peer is *proven* when it wedges, the harder case the
 /// ramp-to-zero seal exists for.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_peer_wedges_after_progress_is_disconnected() {
     let blocks = 400;
     // A carrier that serves at a finite rate (so it only gets partway through the chain),
@@ -386,6 +386,11 @@ async fn fuzz_peer_wedges_after_progress_is_disconnected() {
 /// arm specifically. A small transport queue depth makes the outbound fill quickly (the
 /// default 1024 is too large for the node to ever fill given the no-progress cap — which is
 /// exactly why this bug was invisible to the earlier tests).
+// Kept on real-time multi-thread (not `start_paused`): this sustained-backpressure
+// scenario drives a reactor<->sequencer<->routine feedback loop that stays
+// perpetually runnable, so tokio's virtual clock never auto-advances (it only
+// advances when every task is parked) and the test livelocks under paused time.
+// Real serve/commit sleeps space the events out and let it converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_peer_that_stops_reading_is_disconnected() {
     let blocks = 400;
@@ -459,7 +464,7 @@ async fn fuzz_peer_that_stops_reading_is_disconnected() {
 /// windowed-estimator freshness fix is what keeps its now-slow deliveries inside the
 /// (bandwidth-aware) request deadline instead of timing out on a stale-fast estimate and
 /// collapsing its reliability.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_peer_slows_radically_is_kept() {
     let blocks = 120;
     // Fast at first with a real RTT (so its BDP-derived byte window rises well above the
@@ -543,7 +548,7 @@ async fn fuzz_peer_slows_radically_is_kept() {
 /// peer covers until a covering peer joins later; while the floor sits in that window the
 /// withholder is asked and repeatedly answers `RangeUnavailable`, so its reliability must
 /// fall below 1000. Without the short-response charge those answers would be free.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_range_unavailable_penalizes_reliability() {
     let blocks = 300;
     // Long timeouts so *no request ever times out* in this fast-serving run: that isolates
@@ -592,7 +597,7 @@ async fn fuzz_range_unavailable_penalizes_reliability() {
 
 /// Churn storm: a stable peer plus several peers connecting and disconnecting on a
 /// staggered schedule. Progress must continue across the churn.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_churn_storm() {
     let blocks = 300;
     let stable = PeerSpec::fast(1, target(blocks));
@@ -618,7 +623,7 @@ async fn fuzz_churn_storm() {
 /// Large → small: the header target grows in steps, reanchors down below the current
 /// verified tip, then grows again to the full chain. Exercises header advance/reanchor
 /// handling and uniform serve jitter.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_large_to_small() {
     let blocks = 1000;
     let jittery = PeerSpec::with_serve(
@@ -713,7 +718,7 @@ async fn run_byte_size_run(
 /// runs that differ only in body size make the headline byte-cwnd property a direct,
 /// deterministic comparison (the blocks unit, by contrast, would hold the same request
 /// count in both).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_mixed_block_sizes() {
     let blocks = 400;
     let config = byte_window_config(512 * 1024);
@@ -785,6 +790,8 @@ async fn fuzz_mixed_block_sizes() {
 /// wedge). On top of that we assert the peak reserved bytes stayed within the configured
 /// ceiling (the queue did not grow toward the full chain) yet the ceiling was actually
 /// exercised (the stall created real backpressure — the bound is not vacuous).
+// Real-time multi-thread: the commit-stall backpressure loop livelocks under
+// `start_paused` (see `fuzz_peer_that_stops_reading_is_disconnected`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_commit_stall() {
     let blocks = 400;
@@ -862,7 +869,7 @@ async fn fuzz_commit_stall() {
 /// the pre-gate escalator did. The chain is longer than the exempt window so the gate
 /// genuinely binds, and the in-flight wire budget is left roomy so the *resident* gate,
 /// not the wire budget, is what bounds retention.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_commit_stall_resident_plateau() {
     let blocks = 1_200;
     let body_bytes = 32 * 1024usize;
@@ -951,7 +958,7 @@ async fn fuzz_commit_stall_resident_plateau() {
 /// commit-window slack is larger than a per-crossing overshoot at this block size, so
 /// the *pin* for the take geometry itself is the unit test
 /// `exempt_take_never_spans_the_commit_window_boundary` and the `admit` proptest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_commit_stall_resident_plateau_multiblock() {
     let blocks = 1_200;
     let body_bytes = 32 * 1024usize;
@@ -1034,7 +1041,7 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
 /// byte unit. The controller must drive a clean sync to the tip while keeping the byte
 /// window the binding constraint — a per-peer byte cwnd is traced and the in-flight
 /// reserved bytes track it (the controller reasons in bytes, not request slots).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_high_bw_fast_peer() {
     let blocks = 500;
     let config = byte_window_config(256 * 1024);
@@ -1073,7 +1080,7 @@ async fn fuzz_high_bw_fast_peer() {
 /// node's request-timeout / re-request path, while a covering fast peer can serve every
 /// height. The node must route around the drops and still commit a contiguous, correct
 /// prefix to the target. Drives the `drop_probability` serve knob no other scenario sets.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_lossy_peer() {
     let blocks = 300;
     let lossy = PeerSpec::with_serve(
@@ -1100,7 +1107,7 @@ async fn fuzz_lossy_peer() {
 /// `max_blocks_per_response = 16` lets the node issue multi-block ranges, so the reversal
 /// is non-trivial. The node must still commit a contiguous, hash-correct prefix to the
 /// target. Drives the `reorder` serve knob no other scenario sets.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn fuzz_reorder() {
     let blocks = 300;
     let reorder_serve = ServeProfile {
@@ -1127,6 +1134,8 @@ async fn fuzz_reorder() {
 /// under multi-peer contention — the spec's "concurrent reservations MUST NOT
 /// over-commit"); here we additionally assert the ceiling was genuinely approached, so
 /// that bound is not vacuous.
+// Real-time multi-thread: the tight-budget backpressure loop livelocks under
+// `start_paused` (see `fuzz_peer_that_stops_reading_is_disconnected`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_multi_peer_tight_budget() {
     let blocks = 400;
