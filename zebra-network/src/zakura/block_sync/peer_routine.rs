@@ -53,8 +53,8 @@ use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
     Admit, FramedRecv, OrderedSendError, SinkReject,
 };
-use std::{sync::Arc, time::Duration, time::Instant};
-use tokio::time;
+use std::{sync::Arc, time::Duration};
+use tokio::time::{self, Instant};
 use zebra_chain::{block, serialization::ZcashSerialize};
 
 /// How long a routine avoids re-taking a height it just returned on a failure
@@ -2291,10 +2291,10 @@ impl Drop for PeerRoutine {
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tokio::sync::{mpsc, watch};
-    use tokio::time::timeout;
+    use tokio::time::{timeout, Instant};
     use tokio_util::sync::CancellationToken;
     use zebra_chain::block;
 

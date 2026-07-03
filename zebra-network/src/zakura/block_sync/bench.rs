@@ -23,13 +23,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::Value;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
+    time::Instant,
 };
 use zebra_chain::block::{self, Block};
 use zebra_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
