@@ -640,6 +640,54 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
     assert_eq!(window.no_progress_request_cap(), 8);
 }
 
+/// Regression for the dual-stack single-peer wedge: an unproven peer that has spent its one
+/// initial probe is pinned at `no_progress_request_cap() == initial_block_probe_requests`. When
+/// the node's verified tip advances via *another* source (inbound gossip, a dual-stack node's
+/// legacy `BlocksByHash` path, or another peer), `clear_no_progress_probe_streak` must let the
+/// peer probe again *without* marking it proven. Without this, a sole-peer node that syncs its
+/// early blocks over legacy holds its only Zakura peer at the one-probe cap, the no-progress
+/// reaper disconnects it, and the node wedges below the tip with no way to pull the backfill
+/// (gossip only pushes new blocks). The `on_view_changed` non-destructive-advance path and the
+/// `check_block_liveness` sole-peer guard both call this.
+#[test]
+fn block_liveness_external_progress_reopens_unproven_probe_budget() {
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    // Spend the single initial probe: the unproven peer is now capped out.
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    assert_eq!(window.requests_without_block_progress, 1);
+    assert!(
+        window.requests_without_block_progress >= window.no_progress_request_cap(),
+        "the unproven peer is pinned at its one-probe cap"
+    );
+
+    // The node made block progress via another source — no body arrived through THIS peer.
+    window.clear_no_progress_probe_streak();
+
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert!(
+        window.requests_without_block_progress < window.no_progress_request_cap(),
+        "the peer may probe again instead of wedging at the cap"
+    );
+    assert!(
+        !window.has_block_progress(),
+        "external progress must not mark the peer proven"
+    );
+    assert_eq!(
+        window.no_progress_request_cap(),
+        1,
+        "still unproven: the cap stays at the initial probe budget"
+    );
+}
+
 #[test]
 fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();

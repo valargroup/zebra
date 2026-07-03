@@ -225,6 +225,10 @@ pub(super) struct PeerRoutine {
     /// Last `reset_epoch` this routine reacted to, so a `view.changed()` can tell
     /// a destructive reset (in-place clear of outstanding) from a plain advance.
     last_reset_epoch: u64,
+    /// Verified tip observed at the last committed-view change, so a non-destructive
+    /// advance (the node making block progress via any source) can credit an unproven
+    /// peer's probe streak instead of letting a sole peer wedge at its one-probe cap.
+    last_seen_verified_tip: block::Height,
     /// When our outbound queue to this peer *first* filled in the current continuous full
     /// stretch (`None` while it has capacity). Lets the liveness check tell transient local
     /// write congestion (just filled) from a peer that stopped reading for `request_timeout`
@@ -264,6 +268,7 @@ impl PeerRoutine {
     ) -> Self {
         let window = DownloadWindow::new(&config);
         let last_reset_epoch = sequencer_view.borrow().reset_epoch;
+        let last_seen_verified_tip = sequencer_view.borrow().verified_tip;
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -301,6 +306,7 @@ impl PeerRoutine {
             routine_to_reactor,
             sequencer_view,
             last_reset_epoch,
+            last_seen_verified_tip,
             outbound_full_since: None,
             cancel,
             trace,
@@ -551,15 +557,27 @@ impl PeerRoutine {
     /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
-        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
+        let view = *self.sequencer_view.borrow();
+        let reset_epoch = view.reset_epoch;
         if reset_epoch == self.last_reset_epoch {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
             // to do but let the want-work loop re-run at the top (a committed
             // floor advance may GC our fully-committed outstanding).
+            //
+            // If the committed verified tip advanced — via this peer *or* any other
+            // source (gossip, a dual-stack node's legacy `BlocksByHash` path, another
+            // block-sync peer) — credit an unproven peer's no-progress probe streak so a
+            // node that is progressing does not wedge its sole peer at the one-probe cap
+            // while its bodies arrive elsewhere.
+            if view.verified_tip > self.last_seen_verified_tip {
+                self.last_seen_verified_tip = view.verified_tip;
+                self.window.clear_no_progress_probe_streak();
+            }
             return;
         }
         self.last_reset_epoch = reset_epoch;
+        self.last_seen_verified_tip = view.verified_tip;
         self.trace_wake("view_reset");
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to

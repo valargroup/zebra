@@ -689,6 +689,22 @@ impl DownloadWindow {
         self.clear_liveness_if_idle();
     }
 
+    /// Clear only the no-progress *probe* streak, so an unproven peer may probe again up to
+    /// its [`no_progress_request_cap`](Self::no_progress_request_cap). `last_block_at` (proof)
+    /// and the liveness deadline are untouched — a peer that never serves a body is still
+    /// governed by the liveness deadline like any other unproven peer.
+    ///
+    /// Used when we do *not* want a sole unproven peer to stay wedged at the one-probe cap:
+    /// (1) the local verified tip advanced via another source (gossip / a dual-stack node's
+    /// legacy `BlocksByHash` path / another peer) — the node is progressing, so this peer's
+    /// probe budget should not stay charged; and (2) when the liveness reaper would otherwise
+    /// disconnect our *only* peer — we keep it and let it re-probe instead of wedging with no
+    /// way to pull the remaining backfill. Mirrors [`note_view_reset`](Self::note_view_reset)
+    /// for the non-reset cases.
+    pub(super) fn clear_no_progress_probe_streak(&mut self) {
+        self.requests_without_block_progress = 0;
+    }
+
     /// Push the block-liveness deadline out by `timeout` when a would-be disconnect is
     /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
     /// is full the routine stops draining inbound, so a useful body may be sitting unread.
