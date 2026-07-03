@@ -22,7 +22,7 @@ use zebra_chain::{
 
 use crate::zakura::{
     BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
+    ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId, MAX_BS_BLOCKS_PER_REQUEST,
     MAX_BS_RESPONSE_BYTES,
 };
 
@@ -1184,10 +1184,16 @@ impl fmt::Debug for ZakuraDiscoveryHandle {
 struct ZakuraDiscoveryInner {
     book: ZakuraDiscoveryBook,
     active_services: HashMap<NodeId, ZakuraActiveServiceEntry>,
-    admitted_peers: HashMap<ZakuraPeerId, ServicePeerDirection>,
+    admitted_peers: HashMap<ZakuraPeerId, ZakuraDiscoveryAdmittedPeer>,
     last_connected_node_ids: HashSet<NodeId>,
     local: ZakuraLocalDiscoveryState,
     config: ZakuraDiscoveryConfig,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ZakuraDiscoveryAdmittedPeer {
+    conn_id: ZakuraConnId,
+    direction: ServicePeerDirection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1519,12 +1525,13 @@ impl ZakuraDiscoveryHandle {
     /// Admit a typed discovery session if the service-specific cap has room.
     pub async fn admit_peer(
         &self,
+        conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
     ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
-        if let Some(peer_direction) = inner.admitted_peers.get_mut(&peer_id) {
-            *peer_direction = direction;
+        if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
+            *peer = ZakuraDiscoveryAdmittedPeer { conn_id, direction };
             self.publish_peer_snapshot_locked(&inner);
             return ServiceAdmissionDecision::Admit;
         }
@@ -1532,7 +1539,7 @@ impl ZakuraDiscoveryHandle {
         let admitted = inner
             .admitted_peers
             .values()
-            .filter(|peer_direction| **peer_direction == direction)
+            .filter(|peer| peer.direction == direction)
             .count();
         let cap = match direction {
             ServicePeerDirection::Inbound => inner.config.peer_limits.max_inbound_peers,
@@ -1542,16 +1549,24 @@ impl ZakuraDiscoveryHandle {
         if admitted >= cap {
             ServiceAdmissionDecision::RejectFull
         } else {
-            inner.admitted_peers.insert(peer_id, direction);
+            inner
+                .admitted_peers
+                .insert(peer_id, ZakuraDiscoveryAdmittedPeer { conn_id, direction });
             self.publish_peer_snapshot_locked(&inner);
             ServiceAdmissionDecision::Admit
         }
     }
 
     /// Remove a locally closed or disconnected discovery service session.
-    pub async fn remove_peer(&self, peer_id: &ZakuraPeerId) {
+    pub async fn remove_peer(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let mut inner = self.inner.lock().await;
-        inner.admitted_peers.remove(peer_id);
+        if inner
+            .admitted_peers
+            .get(peer_id)
+            .is_some_and(|peer| peer.conn_id == conn_id)
+        {
+            inner.admitted_peers.remove(peer_id);
+        }
         self.publish_peer_snapshot_locked(&inner);
     }
 
@@ -1559,12 +1574,12 @@ impl ZakuraDiscoveryHandle {
         let inbound = inner
             .admitted_peers
             .values()
-            .filter(|direction| **direction == ServicePeerDirection::Inbound)
+            .filter(|peer| peer.direction == ServicePeerDirection::Inbound)
             .count();
         let outbound = inner
             .admitted_peers
             .values()
-            .filter(|direction| **direction == ServicePeerDirection::Outbound)
+            .filter(|peer| peer.direction == ServicePeerDirection::Outbound)
             .count();
         let _ = self.peer_snapshot_tx.send(ServicePeerSnapshot::new(
             inbound,

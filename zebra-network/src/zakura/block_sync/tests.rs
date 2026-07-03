@@ -4721,7 +4721,7 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
         .await
         .expect("inbound status queues");
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert_eq!(service.peer_count(), 0);
     assert!(session.cancel_token().is_cancelled());
 }
@@ -4832,7 +4832,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
             .await
@@ -6698,7 +6698,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
 
     // Disconnect peer A mid-fetch (it never answers). Its routine's `Drop` guard
     // must return height 1 to `pending` and release its reservation.
-    service.remove_peer(&peer_a);
+    service.remove_peer(&peer_a, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if service.peer_count() == 0 {
@@ -7841,7 +7841,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         "the initial in-flight requests must cover the missing checkpoint hole"
     );
 
-    service.remove_peer(&old_peer);
+    service.remove_peer(&old_peer, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if handle.peer_snapshot().outbound_peers == 0 && service.peer_count() == 0 {

@@ -54,10 +54,10 @@ use crate::{
         Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
         Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
-        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
-        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
         ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
         CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
@@ -822,16 +822,53 @@ static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
-    active_by_peer: HashMap<ZakuraPeerId, [u8; TRANSCRIPT_HASH_BYTES]>,
-    outbound_by_peer: HashMap<ZakuraPeerId, ZakuraPeerHandle>,
-    disconnect_by_peer: HashMap<ZakuraPeerId, CancellationToken>,
-    caps_by_peer: HashMap<ZakuraPeerId, u64>,
-    /// When each authenticated peer's current connection registered, used to
-    /// decide whether a duplicate may evict a stale incumbent (see
-    /// [`ZAKURA_DUPLICATE_EVICT_MIN_AGE`]).
-    registered_at: HashMap<ZakuraPeerId, Instant>,
+    active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     active_by_ip: HashMap<IpAddr, usize>,
     max_connections_per_ip: usize,
+}
+
+#[derive(Debug)]
+struct ZakuraPeerConnectionEntry {
+    conn_id: ZakuraConnId,
+    outbound_handle: ZakuraPeerHandle,
+    disconnect_token: CancellationToken,
+    registered_at: Instant,
+    remote_ip: Option<IpAddr>,
+}
+
+impl ZakuraSupervisorState {
+    fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
+        if let Some(remote_ip) = remote_ip {
+            *self.active_by_ip.entry(remote_ip).or_default() += 1;
+        }
+    }
+
+    fn decrement_ip(&mut self, remote_ip: Option<IpAddr>) {
+        if let Some(remote_ip) = remote_ip {
+            if let Some(count) = self.active_by_ip.get_mut(&remote_ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.active_by_ip.remove(&remote_ip);
+                }
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_accounting(&self) {
+        let active_by_ip_total: usize = self.active_by_ip.values().sum();
+        debug_assert_eq!(
+            active_by_ip_total,
+            self.active_by_peer
+                .values()
+                .filter(|entry| entry.remote_ip.is_some())
+                .count(),
+            "Zakura active_by_ip totals must match active peer registrations with known IPs",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_accounting(&self) {}
 }
 
 /// Queue-backed outbound send handle for one authenticated Zakura peer.
@@ -915,10 +952,6 @@ impl ZakuraSupervisorHandle {
             inner: Arc::new(Mutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
-                outbound_by_peer: HashMap::new(),
-                disconnect_by_peer: HashMap::new(),
-                caps_by_peer: HashMap::new(),
-                registered_at: HashMap::new(),
                 active_by_ip: HashMap::new(),
                 max_connections_per_ip: max_connections_per_ip.max(1),
             })),
@@ -941,8 +974,9 @@ impl ZakuraSupervisorHandle {
     pub async fn outbound_peer_handles(&self) -> Vec<ZakuraPeerHandle> {
         let state = self.inner.lock().await;
         state
-            .outbound_by_peer
+            .active_by_peer
             .values()
+            .map(|entry| &entry.outbound_handle)
             .filter(|handle| handle.has_outbound_capacity())
             .cloned()
             .collect()
@@ -957,7 +991,10 @@ impl ZakuraSupervisorHandle {
     pub async fn disconnect_peer(&self, peer_id: &ZakuraPeerId) -> bool {
         let token = {
             let state = self.inner.lock().await;
-            state.disconnect_by_peer.get(peer_id).cloned()
+            state
+                .active_by_peer
+                .get(peer_id)
+                .map(|entry| entry.disconnect_token.clone())
         };
 
         if let Some(token) = token {
@@ -970,12 +1007,13 @@ impl ZakuraSupervisorHandle {
 
     async fn register(
         &self,
+        conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
         disconnect_token: CancellationToken,
-        accepted_capabilities: u64,
+        _accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         let mut state = self.inner.lock().await;
         // A re-registration for a peer id that is already active is a duplicate
@@ -1007,31 +1045,30 @@ impl ZakuraSupervisorHandle {
             .register_authenticated(peer_id.clone(), transcript_hash)
         {
             ZakuraUpgradeOutcome::Upgraded { .. } => {
-                if let Some(remote_ip) = remote_ip {
-                    *state.active_by_ip.entry(remote_ip).or_default() += 1;
+                let entry = ZakuraPeerConnectionEntry {
+                    conn_id,
+                    outbound_handle,
+                    disconnect_token,
+                    registered_at: Instant::now(),
+                    remote_ip,
+                };
+                if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
+                    state.decrement_ip(old_entry.remote_ip);
+                    old_entry.disconnect_token.cancel();
+                    metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
                 }
-                state
-                    .active_by_peer
-                    .insert(peer_id.clone(), transcript_hash);
-                state
-                    .outbound_by_peer
-                    .insert(peer_id.clone(), outbound_handle);
-                state
-                    .disconnect_by_peer
-                    .insert(peer_id.clone(), disconnect_token);
-                state
-                    .caps_by_peer
-                    .insert(peer_id.clone(), accepted_capabilities);
-                state.registered_at.insert(peer_id.clone(), Instant::now());
+                state.increment_ip(remote_ip);
+                state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
                 let disconnect_token = state
-                    .disconnect_by_peer
+                    .active_by_peer
                     .get(&peer_id)
-                    .cloned()
+                    .map(|entry| entry.disconnect_token.clone())
                     .expect("disconnect token exists because this peer was just registered");
                 ZakuraRegistration::Registered {
+                    conn_id,
                     peer_id,
                     remote_ip,
                     disconnect_token,
@@ -1049,10 +1086,10 @@ impl ZakuraSupervisorHandle {
                 // The newcomer is still closed (its redial reconnects cleanly
                 // once the slot is free), which avoids racing the incumbent's
                 // service-registration teardown.
-                if let Some(registered_at) = state.registered_at.get(&peer_id) {
-                    if registered_at.elapsed() >= ZAKURA_DUPLICATE_EVICT_MIN_AGE {
-                        if let Some(token) = state.disconnect_by_peer.get(&peer_id) {
-                            token.cancel();
+                if let Some(entry) = state.active_by_peer.get(&peer_id) {
+                    if entry.registered_at.elapsed() >= ZAKURA_DUPLICATE_EVICT_MIN_AGE {
+                        if !entry.disconnect_token.is_cancelled() {
+                            entry.disconnect_token.cancel();
                             metrics::counter!("zakura.p2p.conn.duplicate.evicted_stale")
                                 .increment(1);
                         }
@@ -1064,22 +1101,23 @@ impl ZakuraSupervisorHandle {
         }
     }
 
-    async fn deregister(&self, peer_id: &ZakuraPeerId, remote_ip: Option<IpAddr>) {
+    async fn deregister(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let mut state = self.inner.lock().await;
-        state.active_by_peer.remove(peer_id);
-        state.outbound_by_peer.remove(peer_id);
-        state.disconnect_by_peer.remove(peer_id);
-        state.caps_by_peer.remove(peer_id);
-        state.registered_at.remove(peer_id);
-        if let Some(remote_ip) = remote_ip {
-            if let Some(count) = state.active_by_ip.get_mut(&remote_ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.active_by_ip.remove(&remote_ip);
-                }
-            }
+        let Some(entry) = state.active_by_peer.get(peer_id) else {
+            state.debug_assert_accounting();
+            return;
+        };
+        if entry.conn_id != conn_id {
+            state.debug_assert_accounting();
+            return;
         }
+        let entry = state
+            .active_by_peer
+            .remove(peer_id)
+            .expect("peer entry exists because it was just checked");
+        state.decrement_ip(entry.remote_ip);
         state.supervisor.deregister_authenticated(peer_id);
+        state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
@@ -1117,6 +1155,7 @@ fn set_active_connection_gauge(active_connections: usize) {
 #[derive(Debug)]
 enum ZakuraRegistration {
     Registered {
+        conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         disconnect_token: CancellationToken,
@@ -1205,6 +1244,7 @@ struct ConnectionServeContext {
 struct RegisteredConnectionServeContext {
     limits: ZakuraConnectionLimits,
     conn: ZakuraConnTrace,
+    conn_id: ZakuraConnId,
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
@@ -1673,6 +1713,7 @@ impl ZakuraProtocolHandler {
     ) -> Result<(), ZakuraHandlerError> {
         let limits = context.limits;
         let conn = context.conn;
+        let conn_id = context.conn_id;
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
         let accepted_capabilities = context.accepted_capabilities;
@@ -1747,7 +1788,8 @@ impl ZakuraProtocolHandler {
 
         if negotiated_ordered_streams.is_empty() {
             self.registry
-                .add_peer(Peer::new_with_direction_and_close_cause(
+                .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
+                    conn_id,
                     peer_id.clone(),
                     remote_ip,
                     accepted_capabilities,
@@ -1807,6 +1849,7 @@ impl ZakuraProtocolHandler {
                 admitted_capabilities |=
                     self.registry
                         .add_escalated_peer(Peer::new_with_service_streams(
+                            conn_id,
                             peer_id.clone(),
                             remote_ip,
                             opened_capabilities,
@@ -1960,6 +2003,7 @@ impl ZakuraProtocolHandler {
                                 // this peer (see `can_admit_peer`).
                                 admitted_capabilities |= self.registry.add_escalated_peer(
                                     Peer::new_with_service_streams(
+                                        conn_id,
                                         peer_id.clone(),
                                         remote_ip,
                                         accepted_capabilities,
@@ -2044,9 +2088,10 @@ impl ZakuraProtocolHandler {
         }
         workers.abort_all();
         if admitted_capabilities != 0 {
-            self.registry.remove_peer(&peer_id, admitted_capabilities);
+            self.registry
+                .remove_peer(&peer_id, conn_id, admitted_capabilities);
         }
-        self.supervisor.deregister(&peer_id, remote_ip).await;
+        self.supervisor.deregister(&peer_id, conn_id).await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         self.trace.emit(
             CONN_TABLE,
@@ -2368,6 +2413,7 @@ impl ZakuraProtocolHandler {
         let registration = self
             .supervisor
             .register(
+                context.conn.id,
                 peer_id,
                 remote_ip,
                 context.transcript_hash,
@@ -2379,6 +2425,7 @@ impl ZakuraProtocolHandler {
 
         match registration {
             ZakuraRegistration::Registered {
+                conn_id,
                 peer_id,
                 remote_ip,
                 disconnect_token,
@@ -2400,6 +2447,7 @@ impl ZakuraProtocolHandler {
                     RegisteredConnectionServeContext {
                         limits: context.limits,
                         conn: context.conn,
+                        conn_id,
                         connection_token: disconnect_token,
                         close_cause,
                         accepted_capabilities: context.accepted_capabilities,
@@ -4428,7 +4476,7 @@ mod tests {
 
         fn add_peer(&self, _peer: Peer) {}
 
-        fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
 
         fn deliver_frame(
             &self,
@@ -4458,7 +4506,7 @@ mod tests {
 
         fn add_peer(&self, _peer: Peer) {}
 
-        fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
     }
 
     #[derive(Debug)]
@@ -4477,11 +4525,16 @@ mod tests {
 
         fn add_peer(&self, _peer: Peer) {}
 
-        fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
     }
 
     fn test_peer(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid")
+    }
+
+    fn test_conn_id() -> ZakuraConnId {
+        static NEXT_TEST_CONN_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]
@@ -4533,6 +4586,98 @@ mod tests {
             supervisor_b.register_authenticated(peer, losing_key),
             ZakuraUpgradeOutcome::Duplicate { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn upgraded_winner_registers_second_loser_cleanup_is_generation_guarded() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer = test_peer(11);
+        let remote_ip: IpAddr = "203.0.113.11".parse().expect("test ip parses");
+        let losing_conn = test_conn_id();
+        let winning_conn = test_conn_id();
+        let losing_hash = [0x80; TRANSCRIPT_HASH_BYTES];
+        let winning_hash = [0x10; TRANSCRIPT_HASH_BYTES];
+        let losing_token = CancellationToken::new();
+        let winning_token = CancellationToken::new();
+
+        async fn register_with_hash(
+            supervisor: &ZakuraSupervisorHandle,
+            conn_id: ZakuraConnId,
+            peer: &ZakuraPeerId,
+            remote_ip: IpAddr,
+            transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
+            token: CancellationToken,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    conn_id,
+                    peer.clone(),
+                    Some(remote_ip),
+                    transcript_hash,
+                    outbound_handle,
+                    token,
+                    ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+                )
+                .await
+        }
+
+        assert!(matches!(
+            register_with_hash(
+                &supervisor,
+                losing_conn,
+                &peer,
+                remote_ip,
+                losing_hash,
+                losing_token.clone(),
+            )
+            .await,
+            ZakuraRegistration::Registered { .. }
+        ));
+        assert!(matches!(
+            register_with_hash(
+                &supervisor,
+                winning_conn,
+                &peer,
+                remote_ip,
+                winning_hash,
+                winning_token.clone(),
+            )
+            .await,
+            ZakuraRegistration::Registered { conn_id, .. } if conn_id == winning_conn
+        ));
+
+        assert!(
+            losing_token.is_cancelled(),
+            "upgraded winner explicitly cancels the incumbent loser",
+        );
+        assert!(
+            !winning_token.is_cancelled(),
+            "the winning replacement remains live",
+        );
+
+        supervisor.deregister(&peer, losing_conn).await;
+
+        {
+            let state = supervisor.inner.lock().await;
+            let entry = state
+                .active_by_peer
+                .get(&peer)
+                .expect("winner remains registered after loser cleanup");
+            assert_eq!(entry.conn_id, winning_conn);
+            assert_eq!(entry.remote_ip, Some(remote_ip));
+            assert_eq!(state.active_by_ip.get(&remote_ip), Some(&1));
+            state.debug_assert_accounting();
+        }
+        assert_eq!(supervisor.registered_ids().await, vec![peer.clone()]);
+        assert_eq!(supervisor.outbound_peer_handles().await.len(), 1);
+
+        supervisor.deregister(&peer, winning_conn).await;
+        let state = supervisor.inner.lock().await;
+        assert!(state.active_by_peer.is_empty());
+        assert!(state.active_by_ip.is_empty());
+        state.debug_assert_accounting();
     }
 
     #[test]
@@ -4643,6 +4788,7 @@ mod tests {
         let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
         let registration = supervisor
             .register(
+                test_conn_id(),
                 peer.clone(),
                 None,
                 [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
@@ -5082,7 +5228,7 @@ mod tests {
         ));
 
         cancel_token.cancel();
-        service.remove_peer(&peer);
+        service.remove_peer(&peer, 0);
         shutdown.cancel();
         reactor_task.await?;
         Ok(())
@@ -5161,7 +5307,7 @@ mod tests {
                 msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
             })
             .await?;
-        registry.remove_peer(&peer, ZAKURA_CAP_HEADER_SYNC);
+        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
         tokio::time::sleep(Duration::from_millis(50)).await;
         header_sync
             .send(HeaderSyncEvent::WireMessage {
@@ -5276,7 +5422,7 @@ mod tests {
             );
         }
 
-        registry.remove_peer(&peer, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
+        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
         tokio::time::timeout(Duration::from_secs(1), async {
             let mut snapshots = discovery_handle.subscribe_peer_snapshot();
             while snapshots.borrow().inbound_peers != 0 {
@@ -5365,7 +5511,7 @@ mod tests {
             "discovery rejected peer must not receive discovery source messages"
         );
 
-        registry.remove_peer(&peer, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
+        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_DISCOVERY);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(header_sync.peer_snapshot().inbound_peers, 0);
 
@@ -5408,6 +5554,7 @@ mod tests {
             let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
             supervisor
                 .register(
+                    test_conn_id(),
                     peer.clone(),
                     None,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
@@ -5477,6 +5624,7 @@ mod tests {
             let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
             supervisor
                 .register(
+                    test_conn_id(),
                     peer.clone(),
                     Some(ip),
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
@@ -7022,6 +7170,7 @@ mod tests {
             let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
             supervisor
                 .register(
+                    test_conn_id(),
                     peer.clone(),
                     remote_ip,
                     [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
