@@ -4730,10 +4730,13 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
 async fn stale_block_sync_teardown_keeps_replacement_session() {
     let (service, mut events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
     let peer = peer(92);
+    let old_conn_id = 1;
+    let new_conn_id = 2;
 
     let (old_inbound_tx, old_inbound_rx) = framed_channel(4);
     let (old_outbound_tx, _old_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -4748,7 +4751,8 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
 
     let (new_inbound_tx, new_inbound_rx) = framed_channel(4);
     let (new_outbound_tx, _new_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        new_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -4760,6 +4764,9 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         next_event(&mut events).await,
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
+    assert_eq!(service.peer_count(), 1);
+
+    service.remove_peer(&peer, old_conn_id);
     assert_eq!(service.peer_count(), 1);
 
     drop(old_inbound_tx);

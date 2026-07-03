@@ -139,6 +139,7 @@ impl Peer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_conn_id_and_direction_and_close_cause(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,
@@ -170,6 +171,7 @@ impl Peer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_streams(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,

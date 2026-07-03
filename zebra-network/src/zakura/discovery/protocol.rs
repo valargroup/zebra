@@ -1531,6 +1531,10 @@ impl ZakuraDiscoveryHandle {
     ) -> ServiceAdmissionDecision {
         let mut inner = self.inner.lock().await;
         if let Some(peer) = inner.admitted_peers.get_mut(&peer_id) {
+            if conn_id < peer.conn_id {
+                return ServiceAdmissionDecision::RejectNotUseful;
+            }
+
             *peer = ZakuraDiscoveryAdmittedPeer { conn_id, direction };
             self.publish_peer_snapshot_locked(&inner);
             return ServiceAdmissionDecision::Admit;
@@ -7639,6 +7643,39 @@ mod tests {
             .await;
 
         assert_eq!(sample, vec![matching]);
+    }
+
+    #[tokio::test]
+    async fn stale_discovery_admit_cannot_overwrite_newer_session() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let peer = peer_id_for(secret_key().public());
+
+        assert_eq!(
+            handle
+                .admit_peer(2, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        assert_eq!(handle.peer_snapshot().inbound_peers, 1);
+
+        assert_eq!(
+            handle
+                .admit_peer(1, peer.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::RejectNotUseful
+        );
+        assert_eq!(handle.peer_snapshot().inbound_peers, 1);
+
+        handle.remove_peer(&peer, 1).await;
+        assert_eq!(
+            handle.peer_snapshot().inbound_peers,
+            1,
+            "stale discovery cleanup must not remove the newer admission",
+        );
+
+        handle.remove_peer(&peer, 2).await;
+        assert_eq!(handle.peer_snapshot().inbound_peers, 0);
     }
 
     #[tokio::test]
