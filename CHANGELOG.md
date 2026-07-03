@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed a block-sync busy-spin under sustained byte-budget backpressure. The
+  sequencer re-published its progress view (waking the reactor and every per-peer
+  routine) even when no schedulable field had changed, which combined with the
+  per-attempt floor-funding request to spin a routine's refill loop with no timer
+  while the budget was pinned. The sequencer now wakes watchers only when a
+  scheduling-relevant field actually changes.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
