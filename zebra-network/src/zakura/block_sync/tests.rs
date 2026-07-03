@@ -641,6 +641,49 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
 }
 
 #[test]
+fn block_liveness_default_probe_cap_allows_four_unproven_requests() {
+    let config = ZakuraBlockSyncConfig::default();
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    for request in 1..DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS {
+        window.outstanding.push(window_request(request));
+        window.arm_liveness(now + Duration::from_millis(request.into()), timeout);
+        assert_eq!(window.requests_without_block_progress, request);
+        assert!(
+            window.requests_without_block_progress < window.no_progress_request_cap(),
+            "the default lets an unproven peer receive another probe"
+        );
+    }
+
+    window
+        .outstanding
+        .push(window_request(DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS));
+    window.arm_liveness(
+        now + Duration::from_millis(DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS.into()),
+        timeout,
+    );
+    assert_eq!(
+        window.requests_without_block_progress,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS
+    );
+    assert!(
+        window.requests_without_block_progress >= window.no_progress_request_cap(),
+        "the fourth unproven request spends the default cap"
+    );
+    assert!(
+        !window.has_block_progress(),
+        "extra probes must not mark the peer proven"
+    );
+    assert_eq!(
+        window.no_progress_request_cap(),
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+        "still unproven: the peer stays on the initial probe cap"
+    );
+}
+
+#[test]
 fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
@@ -3007,7 +3050,15 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
         bs_trace::BLOCK_GET_BLOCKS_SENT,
         &[
             ("requests_without_block_progress", TraceValue::U64(1)),
-            ("no_progress_request_cap", TraceValue::U64(1)),
+            ("no_progress_request_cap", TraceValue::U64(4)),
+            ("block_progress_proven", TraceValue::U64(0)),
+        ],
+    );
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_GET_BLOCKS_SENT,
+        &[
+            ("requests_without_block_progress", TraceValue::U64(4)),
+            ("no_progress_request_cap", TraceValue::U64(4)),
             ("block_progress_proven", TraceValue::U64(0)),
         ],
     );

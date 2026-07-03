@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed an intermittent Zakura sync wedge on a node with a single block-sync
+  peer by allowing four initial `GetBlocks` probes before an unproven peer is
+  capped. A peer still has to deliver an accepted body to become proven, and the
+  normal no-progress liveness deadline still disconnects peers that do not serve
+  blocks. In addition, on regtest the body-sync stall watchdog now falls back to
+  the legacy downloader after 60s (rather than the mainnet 10 minutes) so a
+  stalled node recovers within the regtest e2e budget.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted

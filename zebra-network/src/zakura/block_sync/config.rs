@@ -83,7 +83,7 @@ pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness disconnects.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
 /// Default `GetBlocks` probes sent to a new peer before it proves block-body progress.
-pub const DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS: u32 = 1;
+pub const DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS: u32 = 4;
 /// Maximum `GetBlocks` requests sent to one peer without an accepted block body.
 pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 /// Default cooldown before a no-progress peer may be admitted again.
