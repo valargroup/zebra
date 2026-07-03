@@ -1177,6 +1177,80 @@ enum ZakuraRegistration {
     Rejected(ZakuraRejectReason),
 }
 
+#[derive(Debug)]
+struct RegisteredPeerCleanupGuard {
+    supervisor: ZakuraSupervisorHandle,
+    registry: Arc<ServiceRegistry>,
+    peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    disconnect_token: CancellationToken,
+    admitted_capabilities: u64,
+    armed: bool,
+}
+
+impl RegisteredPeerCleanupGuard {
+    fn new(
+        supervisor: ZakuraSupervisorHandle,
+        registry: Arc<ServiceRegistry>,
+        peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        disconnect_token: CancellationToken,
+    ) -> Self {
+        Self {
+            supervisor,
+            registry,
+            peer_id,
+            conn_id,
+            disconnect_token,
+            admitted_capabilities: 0,
+            armed: true,
+        }
+    }
+
+    fn add_admitted_capabilities(&mut self, capabilities: u64) {
+        self.admitted_capabilities |= capabilities;
+    }
+
+    fn remove_admitted_services(&mut self) {
+        if self.admitted_capabilities != 0 {
+            self.registry
+                .remove_peer(&self.peer_id, self.conn_id, self.admitted_capabilities);
+            self.admitted_capabilities = 0;
+        }
+    }
+
+    async fn cleanup_registered_peer(mut self) {
+        if self.armed {
+            self.disconnect_token.cancel();
+            self.remove_admitted_services();
+            self.supervisor
+                .deregister(&self.peer_id, self.conn_id)
+                .await;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for RegisteredPeerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        self.disconnect_token.cancel();
+        self.remove_admitted_services();
+
+        let supervisor = self.supervisor.clone();
+        let peer_id = self.peer_id.clone();
+        let conn_id = self.conn_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _task = handle.spawn(async move {
+                supervisor.deregister(&peer_id, conn_id).await;
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ZakuraConnTrace {
     id: u64,
@@ -1721,6 +1795,7 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         mut outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
         context: RegisteredConnectionServeContext,
+        mut cleanup_guard: RegisteredPeerCleanupGuard,
     ) -> Result<(), ZakuraHandlerError> {
         let limits = context.limits;
         let conn = context.conn;
@@ -1793,7 +1868,6 @@ impl ZakuraProtocolHandler {
         // loop to detect same-kind collisions (both sides opened the kind).
         let mut opened_kinds: HashSet<u16> = HashSet::new();
         let mut accepted_ordered_kinds = HashSet::new();
-        let mut admitted_capabilities = 0;
         let run_freshness_reaper =
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
@@ -1809,7 +1883,7 @@ impl ZakuraProtocolHandler {
                     connection_token.clone(),
                     close_cause.clone(),
                 ));
-            admitted_capabilities = accepted_capabilities;
+            cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
@@ -1857,7 +1931,7 @@ impl ZakuraProtocolHandler {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
-                admitted_capabilities |=
+                let admitted_capabilities =
                     self.registry
                         .add_escalated_peer(Peer::new_with_service_streams(
                             conn_id,
@@ -1869,6 +1943,7 @@ impl ZakuraProtocolHandler {
                             connection_token.clone(),
                             close_cause.clone(),
                         ));
+                cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
 
@@ -2012,7 +2087,7 @@ impl ZakuraProtocolHandler {
                                 // a lost collision, `add_escalated_peer` →
                                 // `add_peer` replaces our own opened session for
                                 // this peer (see `can_admit_peer`).
-                                admitted_capabilities |= self.registry.add_escalated_peer(
+                                let admitted_capabilities = self.registry.add_escalated_peer(
                                     Peer::new_with_service_streams(
                                         conn_id,
                                         peer_id.clone(),
@@ -2024,6 +2099,7 @@ impl ZakuraProtocolHandler {
                                         close_cause.clone(),
                                     ),
                                 );
+                                cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                             }
                         }
                         Err(error) => {
@@ -2098,11 +2174,7 @@ impl ZakuraProtocolHandler {
             }
         }
         workers.abort_all();
-        if admitted_capabilities != 0 {
-            self.registry
-                .remove_peer(&peer_id, conn_id, admitted_capabilities);
-        }
-        self.supervisor.deregister(&peer_id, conn_id).await;
+        cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         self.trace.emit(
             CONN_TABLE,
@@ -2450,6 +2522,13 @@ impl ZakuraProtocolHandler {
                         .role(context.role)
                         .direction(context.direction.trace_label()),
                 );
+                let cleanup_guard = RegisteredPeerCleanupGuard::new(
+                    self.supervisor.clone(),
+                    self.registry.clone(),
+                    peer_id.clone(),
+                    conn_id,
+                    disconnect_token.clone(),
+                );
                 self.serve_connection(
                     connection,
                     peer_id,
@@ -2466,6 +2545,7 @@ impl ZakuraProtocolHandler {
                         i_open_collision_winner: context.i_open_collision_winner,
                         direction: context.direction,
                     },
+                    cleanup_guard,
                 )
                 .await
             }
@@ -4936,8 +5016,10 @@ mod tests {
             mode: StreamMode::Ordered,
         };
         let service = GenerationGuardedRecordingService::new(vec![stream]);
-        let registry = ServiceRegistry::new(vec![service.clone()])
-            .expect("test service declares a valid stream");
+        let registry = Arc::new(
+            ServiceRegistry::new(vec![service.clone()])
+                .expect("test service declares a valid stream"),
+        );
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
         let streams = HashMap::from([(stream.kind, (inbound_rx, outbound_tx))]);
@@ -5007,6 +5089,110 @@ mod tests {
 
         registry.remove_peer(&peer, winning_conn, ZAKURA_CAP_LEGACY_GOSSIP);
         supervisor.deregister(&peer, winning_conn).await;
+    }
+
+    #[tokio::test]
+    async fn registered_peer_cleanup_guard_drop_deregisters_and_allows_redial() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let peer = test_peer(24);
+        let transcript_hash = [0x24; TRANSCRIPT_HASH_BYTES];
+        let disconnect_token = CancellationToken::new();
+        let conn_id = registered_conn_id(
+            register_test_peer_with_hash_and_ip(
+                &supervisor,
+                test_conn_id(),
+                &peer,
+                None,
+                transcript_hash,
+                disconnect_token.clone(),
+            )
+            .await,
+        );
+
+        let duplicate = register_test_peer_with_hash_and_ip(
+            &supervisor,
+            test_conn_id(),
+            &peer,
+            None,
+            transcript_hash,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(duplicate, ZakuraRegistration::Duplicate { .. }),
+            "an exact same-direction redial is a duplicate while the incumbent is registered",
+        );
+
+        let stream = Stream {
+            kind: 62,
+            version: 1,
+            frame_cap: 1024,
+            capability: ZAKURA_CAP_LEGACY_GOSSIP,
+            mode: StreamMode::Ordered,
+        };
+        let service = GenerationGuardedRecordingService::new(vec![stream]);
+        let registry = Arc::new(
+            ServiceRegistry::new(vec![service.clone()])
+                .expect("test service declares a valid stream"),
+        );
+        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
+        let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
+        registry.add_peer(Peer::new_with_conn_id_and_direction(
+            conn_id,
+            peer.clone(),
+            None,
+            ZAKURA_CAP_LEGACY_GOSSIP,
+            ServicePeerDirection::Inbound,
+            HashMap::from([(stream.kind, (inbound_rx, outbound_tx))]),
+            disconnect_token.clone(),
+        ));
+        assert_eq!(service.active_conn(&peer), Some(conn_id));
+
+        let mut cleanup_guard = RegisteredPeerCleanupGuard::new(
+            supervisor.clone(),
+            registry,
+            peer.clone(),
+            conn_id,
+            disconnect_token.clone(),
+        );
+        cleanup_guard.add_admitted_capabilities(ZAKURA_CAP_LEGACY_GOSSIP);
+        drop(cleanup_guard);
+
+        assert!(
+            disconnect_token.is_cancelled(),
+            "drop cleanup cancels the registered connection token",
+        );
+        assert_eq!(
+            service.active_conn(&peer),
+            None,
+            "drop cleanup removes admitted service state synchronously",
+        );
+        assert_eq!(service.disconnected(), vec![(peer.clone(), conn_id)]);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if supervisor.registered_ids().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop cleanup deregisters the supervisor entry promptly");
+
+        let redial = register_test_peer_with_hash_and_ip(
+            &supervisor,
+            test_conn_id(),
+            &peer,
+            None,
+            transcript_hash,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(redial, ZakuraRegistration::Registered { .. }),
+            "after drop cleanup, the deterministic same-direction redial can register again",
+        );
     }
 
     #[test]
