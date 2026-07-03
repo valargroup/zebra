@@ -217,6 +217,13 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// State evicted a rejected VCT root and needs a replacement from peers.
+    RefetchTreeAuxRoot {
+        /// Height whose root should be fetched again.
+        height: block::Height,
+        /// Hash of the parent header for `height`.
+        anchor_hash: block::Hash,
+    },
     /// State successfully committed a header range.
     HeaderRangeCommitted {
         /// First committed height.

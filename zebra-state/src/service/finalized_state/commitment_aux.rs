@@ -3,9 +3,13 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use thiserror::Error;
+use tokio::sync::broadcast;
 use zebra_chain::{
     block::{self, merkle::AuthDataRoot},
     ironwood, orchard, sapling, sprout,
@@ -317,6 +321,32 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// than the committer re-reading the same rejected root forever. The default is a no-op
     /// for test-only local sources; the peer source overrides it.
     fn invalidate(&self, _height: block::Height) {}
+}
+
+/// Process-global signal used by the finalized committer to request a targeted root refetch.
+static PEER_ROOT_REFETCH: OnceLock<broadcast::Sender<block::Height>> = OnceLock::new();
+
+fn peer_root_refetch_sender() -> &'static broadcast::Sender<block::Height> {
+    PEER_ROOT_REFETCH.get_or_init(|| {
+        let (sender, _receiver) = broadcast::channel(64);
+        sender
+    })
+}
+
+/// Subscribe to targeted peer-root refetch requests.
+pub fn peer_root_refetch_receiver() -> broadcast::Receiver<block::Height> {
+    peer_root_refetch_sender().subscribe()
+}
+
+/// Request a targeted peer-root refetch for `height`.
+pub(crate) fn request_peer_root_refetch(height: block::Height) {
+    if peer_root_refetch_sender().send(height).is_err() {
+        metrics::counter!("state.vct.root.refetch.no_receiver.count").increment(1);
+        tracing::debug!(
+            ?height,
+            "VCT: requested peer root refetch but no header-sync driver is subscribed"
+        );
+    }
 }
 
 /// Test-only local source over a height-keyed roots map.

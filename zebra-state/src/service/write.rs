@@ -24,7 +24,7 @@ use crate::{
     error::CommitHeaderRangeError,
     service::{
         check,
-        finalized_state::{FinalizedState, ZebraDb},
+        finalized_state::{request_peer_root_refetch, FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
@@ -477,6 +477,9 @@ impl WriteBlockWorkerTask {
                     // the next block to be downloaded into the look-ahead, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let needs_refetch = error.vct_supplied_root_unavailable_height();
+                        if let Some(refetch_height) = needs_refetch {
+                            request_peer_root_refetch(refetch_height);
+                        }
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         let wait = vct_write_manager.on_retryable_error(

@@ -161,6 +161,10 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await;
             }
+            HeaderSyncEvent::RefetchTreeAuxRoot {
+                height,
+                anchor_hash,
+            } => self.handle_refetch_tree_aux_root(height, anchor_hash).await,
             HeaderSyncEvent::HeaderRangeCommitted {
                 start_height,
                 tip_height,
@@ -247,6 +251,24 @@ impl HeaderSyncReactor {
             }
             FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {}
         }
+    }
+
+    async fn handle_refetch_tree_aux_root(
+        &mut self,
+        height: block::Height,
+        anchor_hash: block::Hash,
+    ) {
+        let range = RangeRequest {
+            start_height: height,
+            count: 1,
+            anchor_hash,
+            finalized: true,
+            want_tree_aux_roots: true,
+            priority: RangePriority::Backward,
+        };
+
+        self.state.schedule.refetch_tree_aux(range);
+        self.schedule().await;
     }
 
     fn admitted_count(&self, direction: ServicePeerDirection) -> usize {
@@ -1518,6 +1540,14 @@ impl HeaderSyncReactor {
                 insert_optional_str(row, hs_trace::KIND, Some("state_frontiers_changed"));
                 insert_height(row, "finalized_height", frontiers.finalized_height);
                 insert_height(row, "verified_block_tip", frontiers.verified_block_tip);
+            }
+            HeaderSyncEvent::RefetchTreeAuxRoot {
+                height,
+                anchor_hash,
+            } => {
+                insert_optional_str(row, hs_trace::KIND, Some("refetch_tree_aux_root"));
+                insert_height(row, hs_trace::HEIGHT, *height);
+                insert_hash(row, hs_trace::HASH, *anchor_hash);
             }
             HeaderSyncEvent::HeaderRangeCommitted {
                 start_height,

@@ -91,8 +91,9 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use column_family::{TypedColumnFamily, WriteTypedBatch};
-pub(crate) use commitment_aux::serve_block_roots;
+pub use commitment_aux::peer_root_refetch_receiver;
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
+pub(crate) use commitment_aux::{request_peer_root_refetch, serve_block_roots};
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
 #[allow(unused_imports)]

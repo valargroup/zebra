@@ -151,6 +151,21 @@ impl RangeScheduler {
         }
     }
 
+    pub(super) fn refetch_tree_aux(&mut self, range: RangeRequest) {
+        self.assigned.retain(|assigned, _| {
+            !(assigned.start_height == range.start_height && assigned.priority == range.priority)
+        });
+
+        let queue = match range.priority {
+            RangePriority::Forward => &mut self.forward,
+            RangePriority::Backward => &mut self.backward,
+        };
+
+        if !queue.contains(&range) {
+            queue.push_front(range);
+        }
+    }
+
     pub(super) fn forget_peer(&mut self, peer: &ZakuraPeerId) {
         for peers in self.assigned.values_mut() {
             peers.remove(peer);

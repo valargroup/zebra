@@ -174,6 +174,103 @@ pub(crate) fn block_roots_cover_range(
     })
 }
 
+async fn request_tree_aux_root_refetch<ReadState>(
+    read_state: ReadState,
+    handles: &ZakuraHeaderSyncDriverHandles,
+    height: block::Height,
+    trace: &ZakuraTrace,
+) where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Ok(parent_height) = height.previous() else {
+        debug!(?height, "cannot refetch VCT root for genesis");
+        return;
+    };
+
+    trace_state_read_start(trace, "vct_root_refetch_parent", None, parent_height, 1);
+    let started = Instant::now();
+    let parent_hash = match read_state
+        .oneshot(zebra_state::ReadRequest::HeadersByHeightRange {
+            start: parent_height,
+            count: 1,
+        })
+        .await
+    {
+        Ok(zebra_state::ReadResponse::Headers(headers)) => match headers.first() {
+            Some((_, hash, _)) => *hash,
+            None => {
+                trace_state_read_error(
+                    trace,
+                    "vct_root_refetch_parent",
+                    None,
+                    parent_height,
+                    1,
+                    "missing_parent_header",
+                    started,
+                );
+                debug!(
+                    ?height,
+                    ?parent_height,
+                    "cannot refetch VCT root without the parent header"
+                );
+                return;
+            }
+        },
+        Ok(response) => {
+            trace_state_read_error(
+                trace,
+                "vct_root_refetch_parent",
+                None,
+                parent_height,
+                1,
+                "unexpected_response",
+                started,
+            );
+            warn!(
+                ?height,
+                ?parent_height,
+                ?response,
+                "unexpected response while preparing VCT root refetch"
+            );
+            return;
+        }
+        Err(error) => {
+            trace_state_read_error(
+                trace,
+                "vct_root_refetch_parent",
+                None,
+                parent_height,
+                1,
+                &format!("{error}"),
+                started,
+            );
+            warn!(
+                ?height,
+                ?parent_height,
+                ?error,
+                "failed to read parent header for VCT root refetch"
+            );
+            return;
+        }
+    };
+
+    trace_header_reactor_event(trace, "vct_root_refetch", None, height, parent_hash, 1);
+    metrics::counter!("state.vct.root.refetch.request.count").increment(1);
+    let _ = handles
+        .header_sync
+        .send(HeaderSyncEvent::RefetchTreeAuxRoot {
+            height,
+            anchor_hash: parent_hash,
+        })
+        .await;
+}
+
 #[derive(Clone)]
 pub(crate) struct ZakuraHeaderSyncDriverHandles {
     pub(crate) endpoint: ZakuraEndpoint,
@@ -211,9 +308,32 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     BlockVerifier::Future: Send + 'static,
 {
     pin!(shutdown);
+    let mut root_refetch_rx = zebra_state::peer_root_refetch_receiver();
     loop {
         let action = select! {
             _ = &mut shutdown => return,
+            refetch = root_refetch_rx.recv() => {
+                match refetch {
+                    Ok(height) => {
+                        request_tree_aux_root_refetch(
+                            read_state.clone(),
+                            &handles,
+                            height,
+                            &trace,
+                        )
+                        .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        metrics::counter!("state.vct.root.refetch.lagged.count").increment(skipped);
+                        warn!(
+                            skipped,
+                            "VCT root refetch receiver lagged; waiting for next request"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+                continue;
+            }
             action = actions.recv() => {
                 let Some(action) = action else {
                     return;
@@ -892,6 +1012,8 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     &trace,
                 );
             }
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 }
@@ -1430,6 +1552,10 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_height(row, cs_trace::HEIGHT, *height);
                 insert_cs_hash(row, cs_trace::HASH, *hash);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                insert_cs_str(row, cs_trace::ACTION, "test_observation");
             }
         },
     );
