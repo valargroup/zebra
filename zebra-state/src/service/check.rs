@@ -165,16 +165,24 @@ where
     Ok(())
 }
 
-/// Check that `block` is contextually valid for `network`, using
-/// the `history_tree` up to and including the previous block.
-#[tracing::instrument(skip(block, history_tree))]
-pub(crate) fn block_commitment_is_valid_for_chain_history(
-    block: Arc<Block>,
+/// Check that a block's header commitment is valid for `network`, using the
+/// `history_tree` up to and including the previous block, the block's `height`, and a
+/// resolved ZIP-244 `auth_data_root`.
+///
+/// This is the body-free core of [`block_commitment_is_valid_for_chain_history`]: it
+/// reads only header fields, so the verified-commitment-trees fast path can confirm a
+/// block's supplied note-commitment roots against its already-committed *successor's*
+/// header before the successor's body has been downloaded. The `auth_data_root` is the
+/// successor's own ZIP-244 auth-data root, carried over header sync (it cannot be
+/// recomputed without the successor body).
+pub(crate) fn header_commitment_is_valid_for_chain_history(
+    header: &block::Header,
+    height: block::Height,
     network: &Network,
     history_tree: &HistoryTree,
-    precomputed_auth_data_root: Option<AuthDataRoot>,
+    auth_data_root: AuthDataRoot,
 ) -> Result<(), ValidateContextError> {
-    match block.commitment(network)? {
+    match header.commitment(network, height)? {
         block::Commitment::PreSaplingReserved(_)
         | block::Commitment::FinalSaplingRoot(_)
         | block::Commitment::ChainHistoryActivationReserved => {
@@ -200,7 +208,7 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
             //
             // https://zips.z.cash/protocol/protocol.pdf#blockheader
             //
-            // The network is checked by [`Block::commitment`] above; it will only
+            // The network is checked by [`Header::commitment`] above; it will only
             // return the chain history root if it's Heartwood or Canopy.
             let history_tree_root = history_tree
                 .hash()
@@ -222,25 +230,18 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
             // > [NU5 onward] hashBlockCommitments MUST be set to the value of
             // > hashBlockCommitments for this block, as specified in [ZIP-244].
             //
-            // The network is checked by [`Block::commitment`] above; it will only
+            // The network is checked by [`Header::commitment`] above; it will only
             // return the block commitments if it's NU5 onward.
             let history_tree_root = history_tree
                 .hash()
                 .or_else(|| {
-                    (NetworkUpgrade::Heartwood.activation_height(network)
-                        == block.coinbase_height())
-                    .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+                    (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
+                        .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
                 })
                 .expect(
                     "the history tree of the previous block must exist \
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
-            // Use the auth data root precomputed by the verifier when available
-            // (it is byte-identical to recomputing it here), so the committer
-            // does not repeat the per-transaction auth-digest work on its
-            // single-threaded critical path.
-            let auth_data_root =
-                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
 
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
@@ -259,6 +260,38 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
             }
         }
     }
+}
+
+/// Check that `block` is contextually valid for `network`, using
+/// the `history_tree` up to and including the previous block.
+#[tracing::instrument(skip(block, history_tree))]
+pub(crate) fn block_commitment_is_valid_for_chain_history(
+    block: Arc<Block>,
+    network: &Network,
+    history_tree: &HistoryTree,
+    precomputed_auth_data_root: Option<AuthDataRoot>,
+) -> Result<(), ValidateContextError> {
+    // The original `Block::commitment` errored with `MissingBlockHeight` for a block with
+    // no coinbase height; preserve that here.
+    let height = block
+        .coinbase_height()
+        .ok_or(CommitmentError::MissingBlockHeight {
+            block_hash: block.hash(),
+        })?;
+
+    // Use the auth data root precomputed by the verifier when available (it is
+    // byte-identical to recomputing it here), so the committer does not repeat the
+    // per-transaction auth-digest work on its single-threaded critical path. Only the
+    // NU5+ commitment actually consumes it.
+    let auth_data_root = precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
+
+    header_commitment_is_valid_for_chain_history(
+        &block.header,
+        height,
+        network,
+        history_tree,
+        auth_data_root,
+    )
 }
 
 /// Returns `ValidateContextError::OrphanedBlock` if the height of the given

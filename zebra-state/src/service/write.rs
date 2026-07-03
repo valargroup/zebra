@@ -486,17 +486,34 @@ impl WriteBlockWorkerTask {
                 }
             }
 
-            // A non-handoff VCT fast block's supplied roots are authenticated by
-            // its successor's header. If the successor is not buffered yet, keep
-            // this block local and wait instead of surfacing a checkpoint commit
-            // error through the invalid-block reset path.
-            if finalized_lookahead.is_empty()
+            // A non-handoff VCT fast block's supplied roots are authenticated by its
+            // successor's header (a block's roots are only committed by the next block's
+            // header). Source the successor's header, height, and ZIP-244 auth-data root
+            // from the buffered look-ahead when present, otherwise from the already-committed
+            // header chain — header sync runs far ahead of the body frontier, so the
+            // committer authenticates against the successor *header* and never has to wait
+            // on the successor *body*.
+            let next_checkpoint = match finalized_lookahead.front() {
+                Some(next) => Some((
+                    next.0.block.header.clone(),
+                    next.0.height,
+                    next.0
+                        .auth_data_root
+                        .unwrap_or_else(|| next.0.block.auth_data_root()),
+                )),
+                None => finalized_state.successor_header_auth_for(ordered_block.0.height),
+            };
+
+            // Only when neither the successor body nor its committed header is available
+            // (we are at the header tip) keep this block local and wait, instead of
+            // surfacing a checkpoint commit error through the invalid-block reset path.
+            if next_checkpoint.is_none()
                 && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
             {
                 tracing::trace!(
                     height = ?ordered_block.0.height,
                     hash = ?ordered_block.0.hash,
-                    "VCT: deferring fast checkpoint commit until successor is buffered"
+                    "VCT: deferring fast checkpoint commit until the successor header is committed"
                 );
                 retry_finalized_block = Some(ordered_block);
                 std::thread::park_timeout(Duration::from_millis(10));
@@ -539,13 +556,9 @@ impl WriteBlockWorkerTask {
                 }
             }
 
-            // The buffered successor (if any) lets the committer verify this block's
-            // verified-commitment-trees fixture roots before trusting them: a block's
-            // roots are only committed by the next block's header. Its auth data root
-            // is already precomputed by the checkpoint verifier.
-            let next_checkpoint = finalized_lookahead
-                .front()
-                .map(|next| (next.0.block.clone(), next.0.auth_data_root));
+            // `next_checkpoint` (the successor header + height + auth-data root used to
+            // authenticate this block's fixture roots) was resolved above, from the
+            // buffered successor or the committed header chain.
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 

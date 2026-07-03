@@ -29,8 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supplied roots against its own header commitments during header sync, without downloading the
   block body. Rows grow to 152 bytes with a backward-compatible `FromDisk`; still consolidated
   under `27.3.0`. Carried in the (already breaking, still version 5) Zakura header-sync stream
-  format, with `auth_data_root` serialized last. This is the data-carrying half only — nothing
-  consumes the new fields yet.
+  format, with `auth_data_root` serialized last.
+- The finalized committer now authenticates a verified-commitment-trees fast block against its
+  already-committed successor *header* (the header chain runs far ahead of the body frontier)
+  plus that stored auth-data root, instead of waiting for the successor *body*, removing a
+  commit-pipeline stall at checkpoint/VCT boundaries. Heights whose serving-index row predates
+  the auth-data root (an earlier pre-release build, zero root) fall back to the body-wait commit
+  path until re-served.
 - Added the `vct_upgrade_metadata` column family, recording the upgrade height `U` (the lowest
   height this binary committed). `tree_aux` root serving now stitches the per-height trees below
   `U` with the serving index at and above `U`, so a node that upgraded mid-chain serves a range

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use zebra_chain::{
-    block::{merkle::AuthDataRoot, Block, Height},
+    block::{merkle::AuthDataRoot, Block, Header, Height},
     history_tree::HistoryTree,
     orchard,
     parameters::{Network, NetworkUpgrade},
@@ -29,9 +29,16 @@ use crate::{service::check, ValidateContextError};
 /// One block-sized step in supplied commitment-root verification.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
-    pub(crate) block: Arc<Block>,
+    pub(crate) header: Arc<Header>,
+    pub(crate) height: Height,
+    /// The full block, needed only to fold this block's supplied roots into the MMR
+    /// (`tree.push` builds the leaf from the body). `None` for a header-only successor
+    /// confirmation item, whose body may not be downloaded yet.
+    pub(crate) block: Option<Arc<Block>>,
     pub(crate) roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
-    pub(crate) precomputed_auth_data_root: Option<AuthDataRoot>,
+    /// This block's own ZIP-244 auth-data root — the co-input to its NU5+ header
+    /// commitment. Resolved at construction because the body may be absent later.
+    pub(crate) auth_data_root: AuthDataRoot,
     pub(crate) skip_parent_check: bool,
 }
 
@@ -43,22 +50,35 @@ impl CommitmentRootVerification {
         precomputed_auth_data_root: Option<AuthDataRoot>,
         skip_parent_check: bool,
     ) -> Self {
+        let height = block
+            .coinbase_height()
+            .expect("checkpoint-verified blocks have a coinbase height");
+        let auth_data_root = precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
         CommitmentRootVerification {
-            block,
+            header: block.header.clone(),
+            height,
+            block: Some(block),
             roots: Some((sapling_root, orchard_root)),
-            precomputed_auth_data_root,
+            auth_data_root,
             skip_parent_check,
         }
     }
 
+    /// A confirmation-only item built from a block's already-committed *successor*: its
+    /// header authenticates the predecessor's folded roots, and `auth_data_root` is the
+    /// successor's own ZIP-244 auth-data root (carried over header sync), so no successor
+    /// body is needed.
     pub(crate) fn header_only(
-        block: Arc<Block>,
-        precomputed_auth_data_root: Option<AuthDataRoot>,
+        header: Arc<Header>,
+        height: Height,
+        auth_data_root: AuthDataRoot,
     ) -> Self {
         CommitmentRootVerification {
-            block,
+            header,
+            height,
+            block: None,
             roots: None,
-            precomputed_auth_data_root,
+            auth_data_root,
             skip_parent_check: false,
         }
     }
@@ -168,24 +188,25 @@ where
 {
     for item in items {
         let CommitmentRootVerification {
+            header,
+            height,
             block,
             roots,
-            precomputed_auth_data_root,
+            auth_data_root,
             skip_parent_check,
         } = item;
 
-        let height = block
-            .coinbase_height()
-            .expect("checkpoint-verified blocks have a coinbase height");
-
         // Validate this block's header commitment against the current (parent) tree,
-        // i.e. against every root already folded in.
+        // i.e. against every root already folded in. Driven by the header (+ height +
+        // auth-data root) so a header-only successor item can confirm the predecessor
+        // without its own body.
         if !skip_parent_check {
-            check::block_commitment_is_valid_for_chain_history(
-                block.clone(),
+            check::header_commitment_is_valid_for_chain_history(
+                &header,
+                height,
                 network,
                 &tree,
-                precomputed_auth_data_root,
+                auth_data_root,
             )
             .map_err(|error| (height, error))?;
         }
@@ -193,6 +214,9 @@ where
         let Some((sapling_root, orchard_root)) = roots else {
             continue;
         };
+
+        // An item that folds roots into the MMR always carries its block body.
+        let block = block.expect("a root-folding verification item carries its block body");
 
         verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
             .map_err(|error| (height, error))?;
@@ -391,6 +415,87 @@ mod tests {
             fail_height.0,
             activation + 1,
             "a wrong root at H is detected at H+1 (the lag)"
+        );
+    }
+
+    /// The successor that confirms a block's folded roots can be a *header-only* item —
+    /// its header plus ZIP-244 auth-data root, with no body. This is the body-free path
+    /// the committer uses to authenticate a block against its already-committed successor
+    /// header before the successor's body has been downloaded. The folded root is still
+    /// confirmed, and a wrong folded root is still rejected — purely from the successor
+    /// header.
+    #[test]
+    fn header_only_successor_confirms_and_rejects_wrong_root() {
+        let (blocks, sapling_roots) = Mainnet.block_sapling_roots_map();
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let block_at = |height: u32| -> Arc<Block> {
+            Arc::new(
+                blocks
+                    .get(&height)
+                    .expect("test vector block exists")
+                    .zcash_deserialize_into::<Block>()
+                    .expect("block deserializes"),
+            )
+        };
+        let root_at = |height: u32| -> sapling::tree::Root {
+            sapling::tree::Root::try_from(**sapling_roots.get(&height).expect("root vector exists"))
+                .expect("valid root")
+        };
+
+        let act_block = block_at(activation);
+        let next_block = block_at(activation + 1);
+        let act_root = root_at(activation);
+        let next_root = root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let next_height = Height(activation + 1);
+        let next_auth = next_block.auth_data_root();
+
+        // Positive: `with_roots(act)` folds the real root, and a *header-only* successor
+        // item (no body) confirms it.
+        let ok_items = vec![
+            CommitmentRootVerification::with_roots(
+                act_block.clone(),
+                act_root,
+                empty_orchard_root,
+                None,
+                false,
+            ),
+            CommitmentRootVerification::header_only(
+                next_block.header.clone(),
+                next_height,
+                next_auth,
+            ),
+        ];
+        verify_commitment_roots(&Mainnet, empty_history_tree(), ok_items)
+            .expect("a header-only successor confirms the real folded root");
+
+        // Negative: a wrong folded root is rejected by the header-only successor alone.
+        assert_ne!(act_root, next_root, "test needs two distinct roots");
+        let bad_items = vec![
+            CommitmentRootVerification::with_roots(
+                act_block,
+                next_root,
+                empty_orchard_root,
+                None,
+                false,
+            ),
+            CommitmentRootVerification::header_only(
+                next_block.header.clone(),
+                next_height,
+                next_auth,
+            ),
+        ];
+        let (fail_height, _error) =
+            verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)
+                .expect_err("a wrong folded root must be rejected by the header-only successor");
+        assert_eq!(
+            fail_height.0,
+            activation + 1,
+            "the wrong root at H is detected at the header-only successor H+1"
         );
     }
 
