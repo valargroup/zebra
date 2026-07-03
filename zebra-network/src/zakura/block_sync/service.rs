@@ -429,6 +429,32 @@ impl Service for BlockSyncService {
         // nothing is lost by dropping it.
         drop(send);
 
+        {
+            let mut peers = self
+                .inner
+                .peers
+                .lock()
+                .expect("block-sync peer map mutex is never poisoned");
+            if peers
+                .get(&peer_id)
+                .is_some_and(|record| record.conn_id > peer.conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
+            if let Some(old_record) = peers.insert(
+                peer_id.clone(),
+                BlockSyncPeerRecord {
+                    conn_id: peer.conn_id,
+                    session_id,
+                    direction: peer.direction,
+                    cancel_token: service_cancel_token.clone(),
+                },
+            ) {
+                old_record.cancel_token.cancel();
+            }
+        }
+
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
             let lifecycle = self.inner.lifecycle.clone();
@@ -516,25 +542,6 @@ impl Service for BlockSyncService {
             on_panic,
             pipe,
         );
-
-        {
-            let mut peers = self
-                .inner
-                .peers
-                .lock()
-                .expect("block-sync peer map mutex is never poisoned");
-            if let Some(old_record) = peers.insert(
-                peer_id.clone(),
-                BlockSyncPeerRecord {
-                    conn_id: peer.conn_id,
-                    session_id,
-                    direction: peer.direction,
-                    cancel_token: service_cancel_token,
-                },
-            ) {
-                old_record.cancel_token.cancel();
-            }
-        }
 
         let _ = self
             .inner

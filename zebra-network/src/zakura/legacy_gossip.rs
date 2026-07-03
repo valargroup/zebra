@@ -1289,11 +1289,19 @@ struct LegacyGossipOutbound {
 }
 
 impl LegacyGossipOutbound {
-    fn insert(&self, session: LegacyGossipPeerSession) {
-        self.sessions
+    fn insert(&self, session: LegacyGossipPeerSession) -> bool {
+        let mut sessions = self
+            .sessions
             .lock()
-            .expect("legacy gossip outbound mutex is never poisoned")
-            .insert(session.peer_id().clone(), session);
+            .expect("legacy gossip outbound mutex is never poisoned");
+        if sessions
+            .get(session.peer_id())
+            .is_some_and(|active| active.conn_id() > session.conn_id())
+        {
+            return false;
+        }
+        sessions.insert(session.peer_id().clone(), session);
+        true
     }
 
     fn remove(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
@@ -2344,7 +2352,9 @@ impl ZakuraService for LegacyGossipSink {
         let cancel_token = peer.cancel_token();
         let session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, send);
 
-        outbound.insert(session.clone());
+        if !outbound.insert(session.clone()) {
+            return;
+        }
         let replay_task_peer_id = peer_id.clone();
         let replay_panic_peer_id = replay_task_peer_id.clone();
         let replay_panic_outbound = outbound.clone();
@@ -2915,7 +2925,7 @@ mod tests {
     use crate::zakura::{
         framed_channel,
         testkit::{HostilePeer, ZakuraTestNode, TEST_NET_TIMEOUT},
-        ZAKURA_CAP_LEGACY_GOSSIP,
+        Peer, ServicePeerDirection, ZAKURA_CAP_LEGACY_GOSSIP,
     };
 
     fn block_hash(byte: u8) -> block::Hash {
@@ -3399,12 +3409,22 @@ mod tests {
         peer_id: ZakuraPeerId,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> (Peer, FramedSend) {
+        legacy_gossip_peer_with_conn(peer_id, 0, cancel_token)
+    }
+
+    fn legacy_gossip_peer_with_conn(
+        peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> (Peer, FramedSend) {
         let (peer_send, service_recv) = framed_channel(8);
         let (service_send, _peer_recv) = framed_channel(8);
-        let peer = Peer::new(
+        let peer = Peer::new_with_conn_id_and_direction(
+            conn_id,
             peer_id,
             None,
             ZAKURA_CAP_LEGACY_GOSSIP,
+            ServicePeerDirection::Inbound,
             HashMap::from([(ZAKURA_STREAM_GOSSIP, (service_recv, service_send))]),
             cancel_token,
         );
@@ -4252,6 +4272,56 @@ mod tests {
             .map_err(|_| -> BoxError { "failed to send test gossip frame".into() })?;
 
         wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_gossip_teardown_keeps_replacement_session() {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![94; 32]).expect("test peer id is within bounds");
+        let old_conn_id = 1;
+        let new_conn_id = 2;
+        let old_cancel = tokio_util::sync::CancellationToken::new();
+        let new_cancel = tokio_util::sync::CancellationToken::new();
+        let (old_peer, _old_peer_send) =
+            legacy_gossip_peer_with_conn(peer_id.clone(), old_conn_id, old_cancel);
+        let (new_peer, _new_peer_send) =
+            legacy_gossip_peer_with_conn(peer_id.clone(), new_conn_id, new_cancel);
+
+        sink.add_peer(old_peer);
+        assert!(
+            outbound.contains(&peer_id),
+            "old legacy gossip session is registered",
+        );
+        sink.add_peer(new_peer);
+        assert!(
+            outbound.contains(&peer_id),
+            "replacement legacy gossip session is registered",
+        );
+
+        let (stale_peer, _stale_peer_send) = legacy_gossip_peer_with_conn(
+            peer_id.clone(),
+            old_conn_id,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        sink.add_peer(stale_peer);
+
+        sink.remove_peer(&peer_id, old_conn_id);
+        assert!(
+            outbound.contains(&peer_id),
+            "stale cleanup must not remove the replacement legacy gossip session",
+        );
+
+        sink.remove_peer(&peer_id, new_conn_id);
+        assert!(
+            !outbound.contains(&peer_id),
+            "live cleanup removes the replacement legacy gossip session",
+        );
     }
 
     #[tokio::test]

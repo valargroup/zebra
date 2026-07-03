@@ -825,10 +825,13 @@ struct ZakuraSupervisorState {
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     active_by_ip: HashMap<IpAddr, usize>,
     max_connections_per_ip: usize,
+    next_registration_id: ZakuraConnId,
 }
 
 #[derive(Debug)]
 struct ZakuraPeerConnectionEntry {
+    /// Monotonic supervisor registration generation used by services to ignore
+    /// stale add/remove work from a superseded connection.
     conn_id: ZakuraConnId,
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
@@ -954,6 +957,7 @@ impl ZakuraSupervisorHandle {
                 active_by_peer: HashMap::new(),
                 active_by_ip: HashMap::new(),
                 max_connections_per_ip: max_connections_per_ip.max(1),
+                next_registration_id: 1,
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
@@ -1008,7 +1012,7 @@ impl ZakuraSupervisorHandle {
     #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
-        conn_id: ZakuraConnId,
+        _trace_conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
@@ -1048,6 +1052,11 @@ impl ZakuraSupervisorHandle {
             .register_authenticated(peer_id.clone(), transcript_hash)
         {
             ZakuraUpgradeOutcome::Upgraded { .. } => {
+                let conn_id = state.next_registration_id;
+                state.next_registration_id = state
+                    .next_registration_id
+                    .checked_add(1)
+                    .expect("registration ids do not exhaust u64 in a single process");
                 let entry = ZakuraPeerConnectionEntry {
                     conn_id,
                     outbound_handle,
@@ -4580,10 +4589,22 @@ mod tests {
         }
 
         fn add_peer(&self, peer: Peer) {
-            self.active
+            let mut active = self
+                .active
                 .lock()
-                .expect("recording service active map is never poisoned")
-                .insert(peer.id.clone(), (peer.conn_id, peer.service_cancel_token()));
+                .expect("recording service active map is never poisoned");
+            if active
+                .get(&peer.id)
+                .is_some_and(|(active_conn_id, _token)| *active_conn_id > peer.conn_id)
+            {
+                peer.service_cancel_token().cancel();
+                return;
+            }
+            if let Some((_old_conn_id, old_token)) =
+                active.insert(peer.id.clone(), (peer.conn_id, peer.service_cancel_token()))
+            {
+                old_token.cancel();
+            }
         }
 
         fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
@@ -4619,6 +4640,13 @@ mod tests {
     fn test_conn_id() -> ZakuraConnId {
         static NEXT_TEST_CONN_ID: AtomicU64 = AtomicU64::new(1);
         NEXT_TEST_CONN_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn registered_conn_id(registration: ZakuraRegistration) -> ZakuraConnId {
+        match registration {
+            ZakuraRegistration::Registered { conn_id, .. } => conn_id,
+            other => panic!("expected peer registration to succeed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4677,8 +4705,8 @@ mod tests {
         let supervisor = ZakuraSupervisorHandle::new(1);
         let peer = test_peer(11);
         let remote_ip: IpAddr = "203.0.113.11".parse().expect("test ip parses");
-        let losing_conn = test_conn_id();
-        let winning_conn = test_conn_id();
+        let losing_trace_conn = 100;
+        let winning_trace_conn = 1;
         let losing_hash = [0x80; TRANSCRIPT_HASH_BYTES];
         let winning_hash = [0x10; TRANSCRIPT_HASH_BYTES];
         let losing_token = CancellationToken::new();
@@ -4707,30 +4735,36 @@ mod tests {
                 .await
         }
 
-        assert!(matches!(
+        let losing_conn = registered_conn_id(
             register_with_hash(
                 &supervisor,
-                losing_conn,
+                losing_trace_conn,
                 &peer,
                 remote_ip,
                 losing_hash,
                 losing_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { .. }
-        ));
-        assert!(matches!(
+        );
+        let winning_conn = registered_conn_id(
             register_with_hash(
                 &supervisor,
-                winning_conn,
+                winning_trace_conn,
                 &peer,
                 remote_ip,
                 winning_hash,
                 winning_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { conn_id, .. } if conn_id == winning_conn
-        ));
+        );
+        assert!(
+            winning_trace_conn < losing_trace_conn,
+            "the test deliberately inverts raw trace-id order",
+        );
+        assert!(
+            winning_conn > losing_conn,
+            "service generations follow successful registration order",
+        );
 
         assert!(
             losing_token.is_cancelled(),
@@ -4781,7 +4815,7 @@ mod tests {
         let peer_b_token = CancellationToken::new();
         let peer_a_winning_token = CancellationToken::new();
 
-        assert!(matches!(
+        let peer_a_losing_generation = registered_conn_id(
             register_test_peer_with_hash_and_ip(
                 &supervisor,
                 peer_a_losing_conn,
@@ -4791,9 +4825,8 @@ mod tests {
                 peer_a_losing_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { .. }
-        ));
-        assert!(matches!(
+        );
+        let peer_b_generation = registered_conn_id(
             register_test_peer_with_hash_and_ip(
                 &supervisor,
                 peer_b_conn,
@@ -4803,8 +4836,7 @@ mod tests {
                 peer_b_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { .. }
-        ));
+        );
 
         let registration = register_test_peer_with_hash_and_ip(
             &supervisor,
@@ -4842,7 +4874,7 @@ mod tests {
                 .get(&peer_a)
                 .expect("peer A incumbent remains registered")
                 .conn_id,
-            peer_a_losing_conn
+            peer_a_losing_generation
         );
         assert_eq!(
             state
@@ -4850,7 +4882,7 @@ mod tests {
                 .get(&peer_b)
                 .expect("peer B remains registered")
                 .conn_id,
-            peer_b_conn
+            peer_b_generation
         );
         assert_eq!(state.active_by_ip.get(&ip1), Some(&1));
         assert_eq!(state.active_by_ip.get(&ip2), Some(&1));
@@ -4869,7 +4901,7 @@ mod tests {
         let losing_token = CancellationToken::new();
         let winning_token = CancellationToken::new();
 
-        assert!(matches!(
+        let losing_conn = registered_conn_id(
             register_test_peer_with_hash_and_ip(
                 &supervisor,
                 losing_conn,
@@ -4879,9 +4911,8 @@ mod tests {
                 losing_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { .. }
-        ));
-        assert!(matches!(
+        );
+        let winning_conn = registered_conn_id(
             register_test_peer_with_hash_and_ip(
                 &supervisor,
                 winning_conn,
@@ -4891,8 +4922,11 @@ mod tests {
                 winning_token.clone(),
             )
             .await,
-            ZakuraRegistration::Registered { conn_id, .. } if conn_id == winning_conn
-        ));
+        );
+        assert!(
+            winning_conn > losing_conn,
+            "winner must have a later service generation",
+        );
 
         let stream = Stream {
             kind: 61,
@@ -4907,7 +4941,7 @@ mod tests {
         let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(1);
         let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(1);
         let streams = HashMap::from([(stream.kind, (inbound_rx, outbound_tx))]);
-        let service_token = CancellationToken::new();
+        let winning_service_token = CancellationToken::new();
 
         registry.add_peer(Peer::new_with_conn_id_and_direction(
             winning_conn,
@@ -4916,9 +4950,32 @@ mod tests {
             ZAKURA_CAP_LEGACY_GOSSIP,
             ServicePeerDirection::Inbound,
             streams,
-            service_token.clone(),
+            winning_service_token.clone(),
         ));
         assert_eq!(service.active_conn(&peer), Some(winning_conn));
+
+        let (_stale_inbound_tx, stale_inbound_rx) = crate::zakura::framed_channel(1);
+        let (stale_outbound_tx, _stale_outbound_rx) = crate::zakura::framed_channel(1);
+        let stale_streams = HashMap::from([(stream.kind, (stale_inbound_rx, stale_outbound_tx))]);
+        let stale_service_token = CancellationToken::new();
+        registry.add_peer(Peer::new_with_conn_id_and_direction(
+            losing_conn,
+            peer.clone(),
+            Some(remote_ip),
+            ZAKURA_CAP_LEGACY_GOSSIP,
+            ServicePeerDirection::Inbound,
+            stale_streams,
+            stale_service_token.clone(),
+        ));
+        assert_eq!(
+            service.active_conn(&peer),
+            Some(winning_conn),
+            "stale loser add must not overwrite the winner's service session",
+        );
+        assert!(
+            matches!(service.active_token_cancelled(&peer), Some(false)),
+            "stale loser add must not cancel the winner's service token",
+        );
 
         registry.remove_peer(&peer, losing_conn, ZAKURA_CAP_LEGACY_GOSSIP);
         supervisor.deregister(&peer, losing_conn).await;

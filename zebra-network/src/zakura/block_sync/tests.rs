@@ -4766,6 +4766,26 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     ));
     assert_eq!(service.peer_count(), 1);
 
+    let (_stale_inbound_tx, stale_inbound_rx) = framed_channel(4);
+    let (stale_outbound_tx, _stale_outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            (stale_inbound_rx, stale_outbound_tx),
+        )]),
+        CancellationToken::new(),
+    ));
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "stale add must not overwrite the replacement block-sync session",
+    );
+
     service.remove_peer(&peer, old_conn_id);
     assert_eq!(service.peer_count(), 1);
 

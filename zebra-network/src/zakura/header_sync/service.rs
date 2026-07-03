@@ -369,6 +369,13 @@ impl Service for HeaderSyncService {
                 .peers
                 .lock()
                 .expect("header-sync peer map mutex is never poisoned");
+            if peers
+                .get(&peer_id)
+                .is_some_and(|record| record.conn_id > conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
             if let Some(old_record) = peers.insert(
                 peer_id.clone(),
                 HeaderSyncPeerRecord {

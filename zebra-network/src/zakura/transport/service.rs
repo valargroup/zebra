@@ -63,7 +63,7 @@ impl ServiceStream {
 pub struct Peer {
     /// Authenticated Zakura peer identity.
     pub id: ZakuraPeerId,
-    /// Transport connection generation that owns this service session.
+    /// Supervisor registration generation that owns this service session.
     pub conn_id: ZakuraConnId,
     /// Remote IP address when the transport knows it.
     pub remote_ip: Option<IpAddr>,
