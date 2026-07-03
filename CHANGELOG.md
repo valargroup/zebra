@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Zebra now tags the coinbase input of every block it mines with a `🌸`. The
+  `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
+  Zebra refuses to start if it is exceeded.
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator
@@ -244,6 +250,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   root block or reconsider the same invalidated block twice.
 - Compare RPC authentication cookies in constant time after checking their
   length.
+- Make the Zakura body-sync stall watchdog use verified-tip progress only,
+  ignoring the best-header gap so fast header sync cannot trigger a false
+  fallback while block verification is still advancing.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so
