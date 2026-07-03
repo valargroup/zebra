@@ -138,6 +138,14 @@ pub enum HeaderSyncWireError {
         threshold: ExpandedDifficulty,
     },
 
+    /// A header commitment did not match its supplied auxiliary data.
+    #[error("invalid Zakura header-sync header commitment: {0}")]
+    InvalidHeaderCommitment(#[from] block::CommitmentError),
+
+    /// The supplied auxiliary roots could not extend the history tree.
+    #[error("invalid Zakura header-sync history tree update: {0}")]
+    HistoryTree(#[from] Arc<zebra_chain::history_tree::HistoryTreeError>),
+
     /// A numeric conversion failed while handling bounded data.
     #[error("numeric overflow while encoding Zakura header-sync {0}")]
     NumericOverflow(&'static str),

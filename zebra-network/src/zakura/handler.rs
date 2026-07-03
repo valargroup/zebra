@@ -32,6 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{self, Block, CountedHeader},
+    history_tree::HistoryTree,
     parameters::Network,
     serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
@@ -469,6 +470,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// History tree for the durable best header tip.
+    pub best_header_history_tree: Option<Arc<HistoryTree>>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
 }
@@ -2573,6 +2576,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     startup.frontier_updates = sync_frontier
         .as_ref()
         .map(ZakuraSyncExchange::subscribe_frontier);
+    startup.best_header_history_tree = header_sync_driver_startup
+        .as_ref()
+        .and_then(|startup| startup.best_header_history_tree.clone());
     let header_sync_shutdown = CancellationToken::new();
     startup.shutdown = header_sync_shutdown.clone();
     if header_sync_driver_startup.is_some() {

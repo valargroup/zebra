@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Zakura header-sync stream-5 wire constants, bounded message codecs,
   stateless header validation, and the default `network.zakura.header_sync`
   config surface.
+- Added Zakura header-sync auxiliary commitment validation APIs and startup
+  history-tree wiring for checking received header ranges before state commit.
 
 ### Changed
 

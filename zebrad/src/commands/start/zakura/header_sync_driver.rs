@@ -1,4 +1,4 @@
-use std::{future::Future, time::Instant};
+use std::{future::Future, sync::Arc, time::Instant};
 
 use color_eyre::eyre::{eyre, Report};
 use tokio::{pin, select, sync::mpsc};
@@ -8,12 +8,15 @@ use tracing::{debug, warn};
 use zebra_chain::{
     block::{self},
     chain_tip::ChainTip,
+    history_tree::HistoryTree,
     parallel::commitment_aux::BlockCommitmentRoots,
+    parameters::Network,
 };
 use zebra_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
-    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
-    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    commit_state_trace as cs_trace, validate_header_aux_commitments, BlockSyncFrontiers, Frontier,
+    FrontierChange, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+    HeaderSyncFrontiers, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace,
+    DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -62,12 +65,37 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let best_header_tip = root_covered_best_header_tip_or_verified(
-        read_state,
+    let mut best_header_tip = root_covered_best_header_tip_or_verified(
+        read_state.clone(),
         best_header_tip.unwrap_or(empty_state_tip),
         verified_block_tip,
     )
     .await?;
+    let mut best_header_history_tree =
+        history_tree_at(read_state.clone(), verified_block_tip.0).await?;
+
+    if best_header_tip.0 > verified_block_tip.0 {
+        match extend_header_history_tree(
+            read_state,
+            network,
+            best_header_history_tree.clone(),
+            verified_block_tip,
+            best_header_tip,
+        )
+        .await
+        {
+            Ok(history_tree) => best_header_history_tree = Some(Arc::new(history_tree)),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    ?best_header_tip,
+                    ?verified_block_tip,
+                    "failed to rebuild Zakura best-header history tree, falling back to verified block tip"
+                );
+                best_header_tip = verified_block_tip;
+            }
+        }
+    }
 
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
@@ -76,8 +104,114 @@ pub(crate) async fn zakura_header_sync_driver_startup(
             verified_block_hash: verified_block_tip.1,
         },
         best_header_tip: Some(best_header_tip),
+        best_header_history_tree,
         verified_block_tip_hash: verified_block_tip.1,
     })
+}
+
+async fn history_tree_at<ReadState>(
+    read_state: ReadState,
+    height: block::Height,
+) -> Result<Option<Arc<HistoryTree>>, Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match read_state
+        .oneshot(zebra_state::ReadRequest::HistoryTree(height.into()))
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::HistoryTree(history_tree) => Ok(history_tree),
+        response => Err(eyre!("unexpected HistoryTree response: {response:?}")),
+    }
+}
+
+async fn extend_header_history_tree<ReadState>(
+    read_state: ReadState,
+    network: &Network,
+    history_tree: Option<Arc<HistoryTree>>,
+    verified_block_tip: (block::Height, block::Hash),
+    best_header_tip: (block::Height, block::Hash),
+) -> Result<HistoryTree, Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some(history_tree) = history_tree else {
+        return Err(eyre!("missing history tree at {verified_block_tip:?}"));
+    };
+    let start_height = verified_block_tip
+        .0
+        .next()
+        .map_err(|_| eyre!("verified block tip has no next height"))?;
+    let count = best_header_tip
+        .0
+         .0
+        .checked_sub(verified_block_tip.0 .0)
+        .ok_or_else(|| eyre!("best header tip is below verified block tip"))?;
+
+    let headers = match read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::HeadersByHeightRange {
+            start: start_height,
+            count,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::Headers(headers) => headers,
+        response => Err(eyre!(
+            "unexpected HeadersByHeightRange response: {response:?}"
+        ))?,
+    };
+    let roots = match read_state
+        .oneshot(zebra_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::BlockRoots(roots) => roots,
+        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
+    };
+
+    if headers.len() != usize::try_from(count).unwrap_or(usize::MAX)
+        || !block_roots_cover_range(start_height, count, &roots)
+    {
+        return Err(eyre!(
+            "stored headers or roots do not cover {start_height:?}..={:?}",
+            best_header_tip.0
+        ));
+    }
+    let Some((_, tip_hash, _)) = headers.last() else {
+        return Err(eyre!("missing stored best header"));
+    };
+    if *tip_hash != best_header_tip.1 {
+        return Err(eyre!(
+            "stored best header hash {tip_hash:?} does not match expected {:?}",
+            best_header_tip.1
+        ));
+    }
+
+    let headers = headers
+        .into_iter()
+        .map(|(_height, _hash, header)| header)
+        .collect::<Vec<_>>();
+    validate_header_aux_commitments(network, &history_tree, &headers, &roots)
+        .map_err(|error| eyre!("{error}"))
 }
 
 async fn root_covered_best_header_tip_or_verified<ReadState>(

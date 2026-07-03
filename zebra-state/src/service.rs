@@ -1832,6 +1832,10 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
+            ReadRequest::HistoryTree(hash_or_height) => Ok(ReadResponse::HistoryTree(
+                read::history_tree(state.latest_best_chain(), &state.db, hash_or_height),
+            )),
+
             ReadRequest::MissingBlockBodies { from, limit } => {
                 let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
                 let best_header_tip = state

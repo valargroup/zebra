@@ -14,6 +14,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use zebra_chain::{
+    history_tree::HistoryTree,
     orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
@@ -4454,6 +4455,30 @@ fn range_link_validation_rejects_non_linking_headers() {
     assert!(matches!(
         validate_header_range_links(genesis.hash(), &[block1, Arc::new(bad_second)]),
         Err(HeaderSyncWireError::NonContiguousHeaders)
+    ));
+}
+
+#[test]
+fn header_aux_validation_rejects_wrong_pre_sapling_root() {
+    let genesis = mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES);
+    let mut roots = root_at(block::Height(0));
+    roots.sapling_root = sapling::tree::Root::try_from([0u8; 32])
+        .expect("zero is a valid Sapling note commitment tree root");
+    assert_ne!(
+        roots.sapling_root,
+        sapling::tree::NoteCommitmentTree::default().root()
+    );
+
+    assert!(matches!(
+        validate_header_aux_commitments(
+            &Network::Mainnet,
+            &HistoryTree::default(),
+            &[genesis],
+            &[roots],
+        ),
+        Err(HeaderSyncWireError::InvalidHeaderCommitment(
+            block::CommitmentError::InvalidFinalSaplingRoot { .. }
+        ))
     ));
 }
 

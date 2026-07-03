@@ -1,4 +1,9 @@
 use super::{error::*, events::*, wire::*, *};
+use zebra_chain::{
+    block::{ChainHistoryBlockTxAuthCommitmentHash, Commitment},
+    history_tree::{HistoryTree, HistoryTreeBlockParts},
+    sapling,
+};
 
 pub(super) fn validate_anchor(
     network: &Network,
@@ -191,6 +196,114 @@ pub fn validate_header_range_links(
     }
 
     validate_internal_continuity(headers)
+}
+
+/// Validate supplied per-header auxiliary roots and return the extended
+/// [`HistoryTree`] for the last header in the received range.
+pub fn validate_header_aux_commitments(
+    network: &Network,
+    parent_history_tree: &HistoryTree,
+    headers: &[Arc<block::Header>],
+    tree_aux_roots: &[BlockCommitmentRoots],
+) -> Result<HistoryTree, HeaderSyncWireError> {
+    validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
+
+    let mut history_tree = parent_history_tree.clone();
+    for (header, roots) in headers.iter().zip(tree_aux_roots) {
+        validate_header_aux_commitment(network, header, &history_tree, roots)?;
+        history_tree
+            .push_from_parts(network, header_aux_parts(header, roots))
+            .map_err(Arc::new)?;
+    }
+
+    Ok(history_tree)
+}
+
+fn validate_header_aux_commitment(
+    network: &Network,
+    header: &block::Header,
+    parent_history_tree: &HistoryTree,
+    roots: &BlockCommitmentRoots,
+) -> Result<(), HeaderSyncWireError> {
+    match header.commitment(network, roots.height)? {
+        Commitment::PreSaplingReserved(_) => {
+            let expected = sapling::tree::NoteCommitmentTree::default().root();
+            if roots.sapling_root != expected {
+                return Err(block::CommitmentError::InvalidFinalSaplingRoot {
+                    expected: expected.into(),
+                    actual: roots.sapling_root.into(),
+                }
+                .into());
+            }
+        }
+        Commitment::FinalSaplingRoot(expected) => {
+            if roots.sapling_root != expected {
+                return Err(block::CommitmentError::InvalidFinalSaplingRoot {
+                    expected: expected.into(),
+                    actual: roots.sapling_root.into(),
+                }
+                .into());
+            }
+        }
+        Commitment::ChainHistoryActivationReserved => {}
+        Commitment::ChainHistoryRoot(actual) => {
+            let expected = parent_history_tree.hash().ok_or_else(|| {
+                block::CommitmentError::InvalidChainHistoryRoot {
+                    expected: [0; 32],
+                    actual: actual.into(),
+                }
+            })?;
+            if actual != expected {
+                return Err(block::CommitmentError::InvalidChainHistoryRoot {
+                    expected: expected.into(),
+                    actual: actual.into(),
+                }
+                .into());
+            }
+        }
+        Commitment::ChainHistoryBlockTxAuthCommitment(actual) => {
+            let Some(history_tree_root) = parent_history_tree.hash() else {
+                return Err(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        expected: [0; 32],
+                        actual: actual.into(),
+                    }
+                    .into(),
+                );
+            };
+            let expected = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &history_tree_root,
+                &roots.auth_data_root,
+            );
+            if actual != expected {
+                return Err(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        expected: expected.into(),
+                        actual: actual.into(),
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn header_aux_parts<'a>(
+    header: &'a block::Header,
+    roots: &'a BlockCommitmentRoots,
+) -> HistoryTreeBlockParts<'a> {
+    HistoryTreeBlockParts {
+        header,
+        height: roots.height,
+        sapling_root: &roots.sapling_root,
+        orchard_root: &roots.orchard_root,
+        ironwood_root: &roots.ironwood_root,
+        sapling_tx: roots.sapling_tx,
+        orchard_tx: roots.orchard_tx,
+        ironwood_tx: roots.ironwood_tx,
+    }
 }
 
 /// Run all context-free validation checks for an inbound full-block tip flood.

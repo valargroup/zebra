@@ -3,6 +3,7 @@ use crate::zakura::{
     FrontierUpdate, HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
     ZakuraHeaderSyncCandidateState,
 };
+use zebra_chain::history_tree::HistoryTree;
 
 /// Cached state frontiers used by the header-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -26,6 +27,8 @@ pub struct HeaderSyncStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// History tree for [`Self::best_header_tip`].
+    pub best_header_history_tree: Option<Arc<HistoryTree>>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local stream-5 advertisement.
@@ -61,6 +64,7 @@ impl HeaderSyncStartup {
             anchor,
             frontiers,
             best_header_tip,
+            best_header_history_tree: None,
             frontier_updates: None,
             config,
             max_frame_bytes,

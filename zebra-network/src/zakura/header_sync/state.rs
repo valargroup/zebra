@@ -2,6 +2,7 @@ use super::{error::*, events::*, scheduler::*, validation::*, wire::*, *};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
 };
+use zebra_chain::history_tree::HistoryTree;
 
 pub(super) const HEADER_SYNC_ADVISORY_BACKOFF_FAILURES: u32 = 2;
 pub(super) const HEADER_SYNC_ADVISORY_BACKOFF: Duration = Duration::from_secs(60);
@@ -17,12 +18,13 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) best_header_history_tree: Option<Arc<HistoryTree>>,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: RangeScheduler,
-    pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) pending_commits: HashMap<PendingCommitKey, PendingHeaderCommit>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
 }
@@ -31,6 +33,9 @@ impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
         let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
+        let best_header_history_tree = startup.best_header_history_tree.clone().or_else(|| {
+            (best_header_tip == block::Height(0)).then(|| Arc::new(HistoryTree::default()))
+        });
 
         Ok(Self {
             anchor: startup.anchor,
@@ -39,6 +44,7 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            best_header_history_tree,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
@@ -121,6 +127,12 @@ impl HeaderSyncCore {
             priority: RangePriority::Backward,
         });
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingHeaderCommit {
+    pub(super) range: RangeRequest,
+    pub(super) history_tree: Option<Arc<HistoryTree>>,
 }
 
 #[derive(Clone, Debug, Default)]

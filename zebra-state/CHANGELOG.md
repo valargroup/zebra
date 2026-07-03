@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `ReadRequest::HistoryTree` and `ReadResponse::HistoryTree` for reading
+  the best-chain history tree at a hash or height.
+
 ### Changed
 
 - Bumped the state database format to 28 during upgrade, backfilling empty

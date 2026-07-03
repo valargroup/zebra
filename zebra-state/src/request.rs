@@ -1407,6 +1407,19 @@ pub enum ReadRequest {
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
+    /// Looks up a history tree by hash or height in the current best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::HistoryTree(Some(_))`](crate::ReadResponse::HistoryTree)
+    ///   if the corresponding block has a history tree.
+    /// * [`ReadResponse::HistoryTree(None)`](crate::ReadResponse::HistoryTree)
+    ///   otherwise.
+    ///
+    /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
+    /// [`block::Height`] using `.into()`.
+    HistoryTree(HashOrHeight),
+
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
         /// First height to consider.
@@ -1627,6 +1640,7 @@ impl ReadRequest {
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
+            ReadRequest::HistoryTree(_) => "history_tree",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",

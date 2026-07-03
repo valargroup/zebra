@@ -3,6 +3,7 @@ use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
     ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
 };
+use zebra_chain::history_tree::HistoryTree;
 
 /// Spawn a header-sync reactor and return its handle plus action stream.
 pub fn spawn_header_sync_reactor(
@@ -571,9 +572,7 @@ impl HeaderSyncReactor {
             None,
             None,
         );
-        self.state
-            .pending_commits
-            .retain(|_, range| !range.is_within(start_height, tip_height));
+        let committed_history_tree = self.pending_header_history_tree(start_height, tip_height);
         self.state
             .schedule
             .mark_range_covered(start_height, tip_height);
@@ -581,8 +580,12 @@ impl HeaderSyncReactor {
         // startup. In that path start==tip, so covered-range side effects are bounded.
         self.cancel_covered_outstanding();
         if tip_height > self.state.best_header_tip {
+            self.state.best_header_history_tree = committed_history_tree;
             self.publish_best_tip(tip_height, tip_hash).await;
         }
+        self.state
+            .pending_commits
+            .retain(|_, commit| !commit.range.is_within(start_height, tip_height));
         self.notify_body_gaps().await;
         self.schedule().await;
     }
@@ -611,11 +614,11 @@ impl HeaderSyncReactor {
             start_height,
             count,
         };
-        if let Some(range) = self.state.pending_commits.remove(&key) {
+        if let Some(commit) = self.state.pending_commits.remove(&key) {
             if kind == HeaderSyncCommitFailureKind::Local {
-                self.state.schedule.clear_assignment(range);
+                self.state.schedule.clear_assignment(commit.range);
             }
-            self.state.schedule.retry(range);
+            self.state.schedule.retry(commit.range);
         }
         self.schedule().await;
     }
@@ -1128,13 +1131,47 @@ impl HeaderSyncReactor {
             }
         }
 
+        let pending_history_tree = match self.validate_forward_header_aux_commitments(
+            &peer,
+            outstanding.range,
+            header_count,
+            &headers,
+            &tree_aux_roots,
+        ) {
+            Ok(history_tree) => history_tree.map(Arc::new),
+            Err(error) => {
+                debug!(
+                    ?peer,
+                    ?error,
+                    start_height = ?outstanding.range.start_height,
+                    count = ?header_count,
+                    "Zakura header-sync rejected header auxiliary data"
+                );
+                self.trace_range_validation_rejected(
+                    &peer,
+                    outstanding.range,
+                    header_count,
+                    "header_aux",
+                    header_sync_wire_error_kind(&error),
+                );
+                self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                    .await;
+                self.state.schedule.retry(outstanding.range);
+                self.schedule().await;
+                return;
+            }
+        };
+
         self.state.pending_commits.insert(
             PendingCommitKey {
                 peer: peer.clone(),
                 start_height: outstanding.range.start_height,
                 count: header_count,
             },
-            outstanding.range,
+            PendingHeaderCommit {
+                range: outstanding.range,
+                history_tree: pending_history_tree,
+            },
         );
         let _ = self.dispatch_action(HeaderSyncAction::CommitHeaderRange {
             peer,
@@ -1145,6 +1182,54 @@ impl HeaderSyncReactor {
             tree_aux_roots,
             finalized: outstanding.range.finalized,
         });
+    }
+
+    fn validate_forward_header_aux_commitments(
+        &self,
+        peer: &ZakuraPeerId,
+        range: RangeRequest,
+        header_count: u32,
+        headers: &[Arc<block::Header>],
+        tree_aux_roots: &[BlockCommitmentRoots],
+    ) -> Result<Option<HistoryTree>, HeaderSyncWireError> {
+        if range.priority != RangePriority::Forward
+            || previous_height(range.start_height) != Some(self.state.best_header_tip)
+            || range.anchor_hash != self.state.best_header_hash
+        {
+            return Ok(None);
+        }
+
+        let Some(parent_history_tree) = self.state.best_header_history_tree.as_deref() else {
+            debug!(
+                ?peer,
+                start_height = ?range.start_height,
+                count = ?header_count,
+                "Zakura header-sync cannot validate header auxiliary data without parent history tree"
+            );
+            return Ok(None);
+        };
+
+        validate_header_aux_commitments(
+            &self.startup.network,
+            parent_history_tree,
+            headers,
+            tree_aux_roots,
+        )
+        .map(Some)
+    }
+
+    fn pending_header_history_tree(
+        &self,
+        start_height: block::Height,
+        tip_height: block::Height,
+    ) -> Option<Arc<HistoryTree>> {
+        self.state
+            .pending_commits
+            .values()
+            .find(|commit| {
+                commit.range.start_height == start_height && commit.range.end_height() == tip_height
+            })
+            .and_then(|commit| commit.history_tree.clone())
     }
 
     async fn handle_possible_stale_anchor_link_failure(
@@ -1184,7 +1269,8 @@ impl HeaderSyncReactor {
         self.state.schedule.clear_forward();
         self.state
             .pending_commits
-            .retain(|_, range| range.priority != RangePriority::Forward);
+            .retain(|_, commit| commit.range.priority != RangePriority::Forward);
+        self.state.best_header_history_tree = None;
         self.cancel_forward_outstanding();
         self.publish_best_tip_reanchored(height, hash).await;
     }
@@ -2006,6 +2092,8 @@ fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'static str {
         HeaderSyncWireError::WrongEquihashSolutionSize => "wrong_equihash_solution_size",
         HeaderSyncWireError::InvalidDifficultyThreshold => "invalid_difficulty_threshold",
         HeaderSyncWireError::DifficultyFilter { .. } => "difficulty_filter",
+        HeaderSyncWireError::InvalidHeaderCommitment(_) => "invalid_header_commitment",
+        HeaderSyncWireError::HistoryTree(_) => "history_tree",
         HeaderSyncWireError::NumericOverflow(_) => "numeric_overflow",
         HeaderSyncWireError::Io(_) => "io",
         HeaderSyncWireError::Serialization(_) => "serialization",

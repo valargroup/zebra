@@ -8,6 +8,7 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
     block_info::BlockInfo,
+    history_tree::HistoryTree,
     ironwood, orchard,
     parameters::Network,
     sapling,
@@ -395,6 +396,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
+    /// Response to [`ReadRequest::HistoryTree`].
+    HistoryTree(Option<Arc<HistoryTree>>),
+
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
 
@@ -591,6 +595,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
             | ReadResponse::BestHeaderTip(_)
+            | ReadResponse::HistoryTree(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
