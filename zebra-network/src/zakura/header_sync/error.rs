@@ -146,6 +146,15 @@ pub enum HeaderSyncWireError {
     #[error("invalid Zakura header-sync history tree update: {0}")]
     HistoryTree(#[from] Arc<zebra_chain::history_tree::HistoryTreeError>),
 
+    /// The parent history tree needed to validate a header range is unavailable.
+    #[error("missing Zakura header-sync parent history tree at height {height:?}, hash {hash:?}")]
+    MissingHeaderHistoryTree {
+        /// Parent height for the received header range.
+        height: block::Height,
+        /// Parent hash for the received header range.
+        hash: block::Hash,
+    },
+
     /// A numeric conversion failed while handling bounded data.
     #[error("numeric overflow while encoding Zakura header-sync {0}")]
     NumericOverflow(&'static str),

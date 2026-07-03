@@ -644,6 +644,20 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .await?,
         ReadResponse::BestHeaderTip(Some((Height(2), block2_hash))),
     );
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::HistoryTree(Height(0).into()))
+            .await?,
+        ReadResponse::HistoryTree(Some(_))
+    ));
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::HistoryTree(Height(1).into()))
+            .await?,
+        ReadResponse::HistoryTree(None),
+    );
     assert_eq!(
         read_state
             .clone()

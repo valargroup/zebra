@@ -1134,11 +1134,10 @@ impl HeaderSyncReactor {
         let pending_history_tree = match self.validate_forward_header_aux_commitments(
             &peer,
             outstanding.range,
-            header_count,
             &headers,
             &tree_aux_roots,
         ) {
-            Ok(history_tree) => history_tree.map(Arc::new),
+            Ok(history_tree) => Arc::new(history_tree),
             Err(error) => {
                 debug!(
                     ?peer,
@@ -1170,7 +1169,7 @@ impl HeaderSyncReactor {
             },
             PendingHeaderCommit {
                 range: outstanding.range,
-                history_tree: pending_history_tree,
+                history_tree: Some(pending_history_tree),
             },
         );
         let _ = self.dispatch_action(HeaderSyncAction::CommitHeaderRange {
@@ -1188,25 +1187,31 @@ impl HeaderSyncReactor {
         &self,
         peer: &ZakuraPeerId,
         range: RangeRequest,
-        header_count: u32,
         headers: &[Arc<block::Header>],
         tree_aux_roots: &[BlockCommitmentRoots],
-    ) -> Result<Option<HistoryTree>, HeaderSyncWireError> {
+    ) -> Result<HistoryTree, HeaderSyncWireError> {
+        let parent_height = previous_height(range.start_height)
+            .ok_or(HeaderSyncWireError::HeightOutOfRange(range.start_height.0))?;
         if range.priority != RangePriority::Forward
-            || previous_height(range.start_height) != Some(self.state.best_header_tip)
+            || parent_height != self.state.best_header_tip
             || range.anchor_hash != self.state.best_header_hash
         {
-            return Ok(None);
+            return Err(HeaderSyncWireError::MissingHeaderHistoryTree {
+                height: parent_height,
+                hash: range.anchor_hash,
+            });
         }
 
         let Some(parent_history_tree) = self.state.best_header_history_tree.as_deref() else {
             debug!(
                 ?peer,
                 start_height = ?range.start_height,
-                count = ?header_count,
                 "Zakura header-sync cannot validate header auxiliary data without parent history tree"
             );
-            return Ok(None);
+            return Err(HeaderSyncWireError::MissingHeaderHistoryTree {
+                height: parent_height,
+                hash: range.anchor_hash,
+            });
         };
 
         validate_header_aux_commitments(
@@ -1215,7 +1220,6 @@ impl HeaderSyncReactor {
             headers,
             tree_aux_roots,
         )
-        .map(Some)
     }
 
     fn pending_header_history_tree(
@@ -2094,6 +2098,7 @@ fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'static str {
         HeaderSyncWireError::DifficultyFilter { .. } => "difficulty_filter",
         HeaderSyncWireError::InvalidHeaderCommitment(_) => "invalid_header_commitment",
         HeaderSyncWireError::HistoryTree(_) => "history_tree",
+        HeaderSyncWireError::MissingHeaderHistoryTree { .. } => "missing_header_history_tree",
         HeaderSyncWireError::NumericOverflow(_) => "numeric_overflow",
         HeaderSyncWireError::Io(_) => "io",
         HeaderSyncWireError::Serialization(_) => "serialization",

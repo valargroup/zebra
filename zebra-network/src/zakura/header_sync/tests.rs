@@ -392,6 +392,7 @@ fn startup_for(
     );
     startup.range_state_actions_enabled = true;
     startup.inbound_new_block_acceptance_enabled = true;
+    startup.best_header_history_tree = Some(Arc::new(HistoryTree::default()));
     startup
 }
 
@@ -1783,6 +1784,54 @@ async fn incoming_headers_match_outstanding_before_commit() {
         }
         action => panic!("unexpected action: {action:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn incoming_headers_without_parent_history_tree_do_not_commit() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let first_checkpoint = block::Height(3);
+    let start = block::Height(4);
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((first_checkpoint, checkpoint_hash)),
+    );
+    startup.best_header_history_tree = None;
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(81);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), block::Height(0), start, 1, 1).await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders { .. },
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
