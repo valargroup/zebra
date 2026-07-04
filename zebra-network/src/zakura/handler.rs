@@ -520,8 +520,10 @@ struct HeaderSyncBackgroundTasks {
 pub struct ZakuraHeaderSyncDriverStartup {
     /// Durable state frontiers loaded at node startup.
     pub frontiers: HeaderSyncFrontiers,
-    /// Durable best header tip loaded from state.
+    /// Root-covered best header tip used to start header sync.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Durable best header tip used to start body sync.
+    pub body_sync_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
 }
@@ -2735,11 +2737,11 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         },
         |startup| startup.frontiers,
     );
-    let best_header_tip = header_sync_driver_startup
+    let root_covered_best_header_tip = header_sync_driver_startup
         .as_ref()
         .map_or(Some(anchor), |startup| startup.best_header_tip);
     let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
-        let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+        let best_header_tip = driver_startup.body_sync_header_tip.unwrap_or(anchor);
         let initial = FrontierUpdate {
             frontier: crate::zakura::chain_frontier_from_parts(
                 driver_startup.frontiers.finalized_height,
@@ -2757,7 +2759,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.network.clone(),
         anchor,
         frontiers,
-        best_header_tip,
+        root_covered_best_header_tip,
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
@@ -2776,7 +2778,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let best_header_tip = driver_startup.body_sync_header_tip.unwrap_or(anchor);
             let frontier_updates = sync_frontier
                 .as_ref()
                 .expect("sync frontier is initialized when block sync driver is enabled")

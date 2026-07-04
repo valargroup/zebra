@@ -62,9 +62,10 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
+    let body_sync_header_tip = best_header_tip.unwrap_or(empty_state_tip);
     let best_header_tip = root_covered_best_header_tip_or_verified(
         read_state,
-        best_header_tip.unwrap_or(empty_state_tip),
+        body_sync_header_tip,
         verified_block_tip,
     )
     .await?;
@@ -76,6 +77,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
             verified_block_hash: verified_block_tip.1,
         },
         best_header_tip: Some(best_header_tip),
+        body_sync_header_tip: Some(body_sync_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
     })
 }
@@ -787,52 +789,57 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(zebra_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
-                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
-                            read_state.clone(),
-                            best_header_tip,
-                        )
-                        .await
-                        {
-                            Ok(tip) => tip,
-                            Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "query_best_header_tip_roots",
-                                    None,
-                                    best_header_tip.0,
-                                    1,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?error,
-                                    "failed to apply Zakura root coverage to best header tip"
-                                );
-                                continue;
-                            }
-                        };
+                        let (root_covered_tip_height, root_covered_tip_hash) =
+                            match root_covered_query_best_header_tip(
+                                read_state.clone(),
+                                best_header_tip,
+                            )
+                            .await
+                            {
+                                Ok(tip) => tip,
+                                Err(error) => {
+                                    trace_state_read_error(
+                                        &trace,
+                                        "query_best_header_tip_roots",
+                                        None,
+                                        best_header_tip.0,
+                                        1,
+                                        &format!("{error}"),
+                                        started,
+                                    );
+                                    warn!(
+                                        ?error,
+                                        "failed to apply Zakura root coverage to best header tip"
+                                    );
+                                    continue;
+                                }
+                            };
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
                             "header_sync_driver",
                             |row| {
                                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-                                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, tip_height);
-                                insert_cs_hash(row, cs_trace::HASH, tip_hash);
+                                insert_cs_height(
+                                    row,
+                                    cs_trace::BEST_HEADER_TIP,
+                                    root_covered_tip_height,
+                                );
+                                insert_cs_hash(row, cs_trace::HASH, root_covered_tip_hash);
                             },
                         );
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitted {
-                                start_height: tip_height,
-                                tip_height,
-                                tip_hash,
+                                start_height: root_covered_tip_height,
+                                tip_height: root_covered_tip_height,
+                                tip_hash: root_covered_tip_hash,
                             })
                             .await;
                         publish_header_frontier(
                             &handles.endpoint,
-                            tip_height,
-                            tip_hash,
+                            best_header_tip.0,
+                            best_header_tip.1,
                             FrontierChange::HeaderAdvanced,
                             &trace,
                         );

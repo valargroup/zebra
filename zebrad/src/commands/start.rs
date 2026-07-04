@@ -2733,6 +2733,7 @@ mod zakura_header_sync_driver_tests {
                     verified_block_hash: genesis_hash,
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
+                body_sync_header_tip: Some((block::Height(2), block::Hash([2; 32]))),
                 verified_block_tip_hash: genesis_hash,
             }),
         )
@@ -2744,7 +2745,7 @@ mod zakura_header_sync_driver_tests {
             .current_sync_frontier()
             .expect("driver startup initializes exchange");
         assert_eq!(initial.frontier.verified_body.height, block::Height(0));
-        assert_eq!(initial.frontier.best_header.height, block::Height(0));
+        assert_eq!(initial.frontier.best_header.height, block::Height(2));
 
         let (action_tx, action_rx) = mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

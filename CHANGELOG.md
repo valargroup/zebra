@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed Zakura body sync getting stuck idle after restart when the durable
+  header tip was ahead of the verified body tip but commitment roots were not
+  backfilled through that header tip. Body sync now uses the durable header
+  frontier for missing-body downloads while header sync keeps using the
+  root-covered frontier for serving root-bearing header ranges.
 - Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
   requests when an initial `Status` advertisement was dropped by a full outbound
   queue. Status send bookkeeping now only records queued frames, header sync
