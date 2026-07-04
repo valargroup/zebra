@@ -87,7 +87,7 @@ fn ensure_peer_connection_limits_consistent() {
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_disable_pow(true)
             .to_network()
@@ -95,6 +95,7 @@ fn testnet_params_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
