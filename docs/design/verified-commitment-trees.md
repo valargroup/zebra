@@ -342,14 +342,17 @@ Wire and DoS bounds:
   the header count (`TreeAuxRootCountMismatch`); and the root vector is preallocated only with
   the already-bounded header count, never an independent untrusted length.
 - The reactor additionally checks each root's height is `start_height + offset`
-  (`TreeAuxRootHeightMismatch` / `validate_tree_aux_root_heights`) before the roots reach
-  state. State re-checks the count and alignment invariants in `CommitHeaderRange`
-  (`prepare_header_range_batch_with_roots`) as defense in depth, and never
+  (`TreeAuxRootHeightMismatch` / `validate_tree_aux_root_heights`) and authenticates the roots
+  against the header commitments (§6.4) before the range reaches state. State re-checks the
+  alignment invariants in `CommitHeaderRange` (`prepare_header_range_batch_with_roots`) as
+  defense in depth, persists only the header-authenticated confirmed prefix (one shorter than the
+  headers; the range tip's root is confirmed by the next overlapping range, §6.4), and never
   writes peer-supplied roots for a height whose body is already committed — a re-delivered header range over committed heights cannot overwrite the verified serving-index rows.
 
 `BlockCommitmentRoots` still carries no trust: a recipient re-verifies every root against its
-own checkpoint-committed headers (§6) before folding it in, so a forwarding/serving node is
-exactly as trustworthy as an originating one.
+own checkpoint-committed headers — at the header-sync reactor before persisting (§6.4) and again
+at block commit (§6) — before folding it in, so a forwarding/serving node is exactly as
+trustworthy as an originating one.
 
 ## 6. Verification — verify-before-commit
 
@@ -416,6 +419,36 @@ is now locked together: `auth_data_root` is `pub(crate)`, `CheckpointVerifiedBlo
 `DerefMut`, the one legitimately-post-set field goes through
 `set_deferred_pool_balance_change`, and the semantic verifier builds blocks through
 `from_semantic_data` (auth-data root left unset). Compile-time enforced (fix in commit #192).
+
+### 6.4 Header-sync-layer authentication and startup reconstruction
+
+§6.1–§6.3 are the consensus-critical gate at block-commit time. Header sync adds an *earlier* gate
+in the network reactor, so the roots it persists to `commitment_roots_by_height` and serves to
+other peers are already header-authenticated, and so a restart never trusts an unconfirmed root.
+
+- **Verify before persisting.** When a header range arrives, the reactor folds its supplied roots
+  into the running header-frontier history tree and checks each header's commitment against it
+  (`verify_supplied_roots_from_parts` in `zebra-chain/src/parallel/commitment_aux_verify.rs`,
+  reusing the same header-commitment check plus the §6.1 below-Heartwood/NU5/`Nu6_3` pins — no new
+  crypto). A well-formed but wrong root fails this check and the range is rejected and scored
+  through header sync's misbehavior path before any root reaches state. If the parent history tree
+  is not yet positioned (e.g. just after a re-anchor, while the tree is being reloaded) the range is
+  retried rather than committed — fail closed.
+- **Persist only the confirmed prefix.** A block's commitment binds the history tree as of its
+  parent, so a range `[start..=end]` authenticates the roots for `[start..=end-1]`; the tip's own
+  root is only confirmed once the next range delivers `end+1`. Forward ranges therefore overlap by
+  one block — the next request re-anchors at the tip's parent — and `CommitHeaderRange` persists
+  only the header-authenticated confirmed prefix; the range tip's root is never written. The state
+  writes exactly the roots it is handed (`prepare_header_range_batch_with_roots` accepts a prefix one
+  shorter than the headers), so the "one root per header" wire invariant (§5.4) and the persisted
+  set are deliberately distinct.
+- **Reconstruct at startup.** The durable roots CF therefore holds a contiguous run of confirmed
+  roots above the verified body tip, but never the header tip's own root. On startup
+  `ReadRequest::BestHeaderHistoryTree` folds the durable confirmed roots onto the verified-tip
+  history tree up to the highest *contiguous* frontier and returns that frontier `(height, hash)`.
+  Header sync resumes from `frontier + 1` with an overlapping range that re-validates the next root,
+  so a restart never folds an unauthenticated root into the header-frontier tree and never caps back
+  to the verified tip on a one-block gap in the persisted roots.
 
 ## 7. The fast commit path and checkpoint last checkpoint height
 
@@ -607,12 +640,16 @@ commitment before it influences the anchor set or the history MMR.** Consequence
 - The below-NU5 Orchard pin and below-Heartwood Sapling check (§6.1) close the only ranges the
   MMR cannot vouch for. Skipping either would let an untrusted source inject an anchor the
   legacy recompute never produces — a consensus-equivalence break, not just a slowdown.
-- The frozen-frontier fail-closed policy (§8) means a hostile root never corrupts state: it is
-  deleted and refused. A malformed root set is rejected at the header-sync reactor before it
-  reaches state and is scored through header sync's misbehavior path; a well-formed wrong root
-  is evicted on verify-before-commit and the commit stays parked (§8.1). The trade-off is
-  availability, not integrity: a settled bad root stalls the fast sync at that height instead
-  of writing wrong state (§8.1).
+- Peer-supplied roots are authenticated against header commitments at the header-sync reactor
+  **before they are persisted** (§6.4): a malformed root set is rejected on decode, and a
+  well-formed wrong root fails the header-commitment fold (confirmed by the next range, one-block
+  lag) and is rejected and scored through header sync's misbehavior path — so only the
+  header-authenticated confirmed prefix is ever written, and a restart rebuilds the header-frontier
+  tree from those durable confirmed roots (never an unconfirmed tip root).
+- The frozen-frontier fail-closed policy (§8) is the second, consensus-critical gate at block
+  commit: a hostile root that reached state anyway is deleted and refused, and the commit stays
+  parked (§8.1). The trade-off is availability, not integrity: a settled bad root stalls the fast
+  sync at that height instead of writing wrong state (§8.1).
 - DoS bounds on the header-sync roots fields (§5.4) — the all-or-nothing count check, the
   per-height alignment check, the bounded preallocation, and the message byte budget — protect
   the serving and client paths from unbounded memory growth.
@@ -630,14 +667,21 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   network.
 - **Increment 6b — adversarial peer policy.** A `zebrad` driver recorded height→peer provenance
   and ran a roots-specific cooldown/demotion/disconnect policy over the `tree_aux` stream.
-- **Increment 6c — fold roots into header sync (current).** The standalone `tree_aux` stream,
+- **Increment 6c — fold roots into header sync.** The standalone `tree_aux` stream,
   its driver, in-memory cache writer, and bespoke peer policy are **removed**. Roots now ride the
   header-sync `Headers` message as all-or-nothing metadata (§4.2, §5.4), are
-  persisted provisionally to `commitment_roots_by_height` ahead of body commit, and
+  persisted to `commitment_roots_by_height` ahead of body commit, and
   are read back by a DB-backed `PeerSource`. Recovery from a bad/missing root is an in-place
   commit retry fed only by an in-flight fanout re-delivery of the same header range — roots
   are not individually re-requested, so a settled hole is a fail-closed stall (§8.1); peer
   accountability rides header sync's existing misbehavior scoring.
+- **Increment 6d — authenticate roots before persisting; reconstruct on restart (current).**
+  Header sync now verifies supplied roots against the header commitments before writing them,
+  persists only the header-authenticated confirmed prefix (the range tip's root is confirmed by the
+  next overlapping range), and rebuilds the header-frontier history tree from the durable confirmed
+  roots on startup — resuming from the highest contiguous frontier (§6.4). This closes the gap
+  where roots were persisted ahead of authentication and a restart could fold an unconfirmed tip
+  root into the header-frontier tree.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.
