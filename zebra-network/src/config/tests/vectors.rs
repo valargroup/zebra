@@ -491,7 +491,7 @@ fn funding_streams_serialization_roundtrip() {
         .map(ConfiguredFundingStreams::from)
         .collect();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_funding_streams(fs)
             .to_network()
@@ -499,6 +499,7 @@ fn funding_streams_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -514,7 +515,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
 
     let soft_fork_height = Height(2_000_000);
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_temporary_orchard_disabling_soft_fork_height(soft_fork_height)
             .to_network()
@@ -522,6 +523,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
