@@ -4116,6 +4116,8 @@ async fn valid_header_aux_roots_reach_commit_before_advancing_tip() {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start_height, block::Height(1));
                 assert_eq!(headers.len(), 1);
+                let verified_roots =
+                    verified_roots.expect("forward header range carries verified roots");
                 assert!(
                     verified_roots.confirmed_roots().is_empty(),
                     "a one-header range verifies but has no confirmed prefix yet"
@@ -4425,7 +4427,15 @@ async fn reanchor_dispatches_history_tree_rebuild_and_resumes_forward() {
 
     for peer_id in peers.iter().cloned() {
         connect_peer(&fixture, peer_id.clone()).await;
-        advertise_tip(&fixture, peer_id, verified.0, block::Height(4), DEFAULT_HS_RANGE, 1).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            verified.0,
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
     }
 
     // Drive the forward-link failures that trip the re-anchor.
@@ -4436,7 +4446,10 @@ async fn reanchor_dispatches_history_tree_rebuild_and_resumes_forward() {
             .handle
             .send(HeaderSyncEvent::WireMessage {
                 peer: served_peer,
-                msg: headers_message_from(start_height, vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+                msg: headers_message_from(
+                    start_height,
+                    vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                ),
             })
             .await
             .unwrap();
