@@ -115,7 +115,8 @@ where
     })
 }
 
-/// Header-driven commitment check against `history_tree`, the history tree as of the parent.
+/// Header-driven commitment check against `history_tree`, the history tree as
+/// of the parent.
 pub fn header_commitment_is_valid_for_chain_history(
     header: &block::Header,
     height: block::Height,
@@ -123,11 +124,22 @@ pub fn header_commitment_is_valid_for_chain_history(
     history_tree: &HistoryTree,
     auth_data_root: AuthDataRoot,
 ) -> Result<(), SuppliedRootsError> {
+    // Header-sync receives auxiliary roots alongside each header, but a
+    // header's chain-history commitment authenticates the history tree built
+    // from the *previous* block's auxiliary roots. So this function checks the
+    // current header against the tree already folded by the receive pipeline.
+    //
+    // In a contiguous range, header H + 1 confirms the supplied roots for H.
+    // The caller folds roots only after this check succeeds, which keeps
+    // unconfirmed roots out of the returned history tree.
     match header.commitment(network, height)? {
         Commitment::PreSaplingReserved(_)
         | Commitment::FinalSaplingRoot(_)
         | Commitment::ChainHistoryActivationReserved => Ok(()),
         Commitment::ChainHistoryRoot(actual_history_tree_root) => {
+            // Heartwood through NU6_2 commits directly to the parent history
+            // tree root, so the current header confirms the roots that were
+            // folded into `history_tree` before this block.
             let history_tree_root = history_tree
                 .hash()
                 .expect("the previous block history tree exists because current header has a ChainHistoryRoot");
@@ -142,6 +154,11 @@ pub fn header_commitment_is_valid_for_chain_history(
             }
         }
         Commitment::ChainHistoryBlockTxAuthCommitment(actual_hash_block_commitments) => {
+            // NU6_3 onward commits to both the parent history tree root and
+            // this block's auth data root. That still preserves the one-block
+            // lag for supplied note commitment roots: `history_tree` is the
+            // parent tree, while `auth_data_root` belongs to the current
+            // header's block.
             let history_tree_root = history_tree
                 .hash()
                 .or_else(|| {
